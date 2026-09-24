@@ -1,0 +1,55 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Logs / temp
+*.log
+logs/
+tmp/
+.cache/
+
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+build/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Go
+/vendor/
+
+# Local agent state
+# Temporary scripts go in .agents/ (see AGENTS.md). The whole folder is
+# ignored except tracked skills, so a scratch script cannot be committed.
+.agents/*
+!.agents/skills/

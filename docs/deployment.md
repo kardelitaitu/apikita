@@ -1,0 +1,187 @@
+# Deployment & Migrations
+
+How code reaches production, and how the database schema changes without breaking
+a running system.
+
+> **Stack:** Cloudflare Pages (frontend) + **edge relay VPS** + Rust on Northflank
+> (API) + PostgreSQL. Relay: [`edge-relay.md`](edge-relay.md).
+> See [`architecture.md`](architecture.md).
+
+## The core problem
+
+**Two platforms, one push, no atomic deploy.**
+
+Cloudflare Pages and Northflank deploy independently. A push to `main` starts
+both, but they finish at different times, and either can fail while the other
+succeeds. So there is always a window where:
+
+- the **new frontend** talks to the **old API**, or
+- the **new API** runs against the **old schema**, or
+- the **new API** exists while the **old frontend** still calls the old shape.
+
+Every rule below exists to make that window safe.
+
+## The three rules
+
+### R1 — Migrations are additive and backward compatible
+
+A migration must not break the *currently deployed* server. That means:
+
+**Allowed in one step:**
+
+- `ADD COLUMN` (nullable, or with a default)
+- `CREATE TABLE`
+- `CREATE INDEX` (`CONCURRENTLY` in production, to avoid locking)
+- Adding a nullable column plus a backfill
+
+**Never allowed in one step:**
+
+- `DROP COLUMN`
+- `RENAME COLUMN` or `RENAME TABLE`
+- `ALTER COLUMN ... SET NOT NULL` on an existing populated column
+- Changing a column's type
+- `DROP TABLE`
+
+Those are **two-step** operations — see expand/contract below.
+
+### R2 — The server deploys before the frontend
+
+The API must tolerate the **previous** frontend for at least one release.
+
+- Never remove an endpoint the deployed frontend still calls.
+- Never make an optional request field required without a deprecation window.
+- Never change a response field's meaning in place — add a new field.
+
+### R3 — The frontend never assumes an endpoint exists
+
+During the gap the API may be older than the frontend expects. Handle `404` and
+missing fields gracefully — degrade, do not crash the page.
+
+## Expand / contract — the only safe way to make breaking changes
+
+Every destructive change becomes three deploys.
+
+**Example: renaming `balance_idr` to `balance_minor`.**
+
+| Deploy | Action | Why safe |
+| --- | --- | --- |
+| 1 — **expand** | `ADD COLUMN balance_minor BIGINT`; write to **both**; read from the old | Old server and new server both work |
+| 2 — **backfill** | `UPDATE ... SET balance_minor = balance_idr` where null; verify counts match | Data is copied while both are live |
+| 3 — **switch** | Code reads/writes only the new column | Old column is now unused |
+| 4 — **contract** | `DROP COLUMN balance_idr` | Safe only after nothing reads it |
+
+**A `DROP` is a separate deploy from the code that stopped using the column.**
+Collapsing steps 3 and 4 is the classic way to break a deploy window.
+
+**For money columns specifically:** verify the backfill before switching. A
+partially-backfilled balance is a wrong balance.
+
+## Pipeline
+
+### Trigger
+
+Push to `main`. Feature work happens on branches; `main` is always deployable.
+
+### Recommended gate order
+
+```
+push to main
+   |
+   v
+[1] build + test (Rust)        -- must pass before anything deploys
+   |
+   v
+[2] run migrations             -- against the production DB, forward-only
+   |
+   v
+[3] deploy Rust server         -- Northflank
+   |
+   v
+[4] health check the API       -- /health returns OK
+   |
+   v
+[5] deploy frontend            -- Cloudflare Pages
+[5b] reload relay config       -- only if nginx.conf changed (rare)
+   |
+   v
+[6] smoke test                 -- login + balance endpoint reachable
+```
+
+**Order matters: migrations before the server, server before the frontend.** The
+new server may need the new column; the new frontend may need the new endpoint.
+
+### If a step fails
+
+- **Migrations fail** → nothing deployed; fix and retry. Safe.
+- **Server fails after migrating** → the old server is still running against the
+  new schema. This is why migrations must be additive (R1). Roll back the server
+  deploy; the schema can stay.
+- **Frontend fails** → the new API is live with the old UI. Usually fine, because
+  the API tolerates the previous frontend (R2). Roll back the frontend.
+
+**Never roll back a migration by hand in production.** Write a new forward
+migration that undoes it. Down-migrations on live data are how you lose rows.
+
+## Health checks
+
+The Rust server needs a `/health` endpoint that:
+
+- Returns 200 only when the process **and** the database are reachable.
+- Does **not** require authentication.
+- Does **not** hit upstream LLM providers — an upstream outage must not make the
+  server look dead and trigger a restart loop.
+
+Deploy step [4] gates on this. Without it, a bad release takes down auth for
+everyone.
+
+## Configuration
+
+| Setting | Platform | When read | Secret? |
+| --- | --- | --- | --- |
+| `PUBLIC_API_BASE_URL` | Cloudflare Pages | **Build time** | No |
+| `PUBLIC_MIDTRANS_CLIENT_KEY` | Cloudflare Pages | **Build time** | No |
+| `DATABASE_URL` | Northflank | Runtime | **Yes** |
+| Provider API keys | Northflank | Runtime | **Yes** |
+| `MIDTRANS_SERVER_KEY` | Northflank | Runtime | **Yes** |
+| Google OAuth secret | Northflank | Runtime | **Yes** |
+
+**Pages variables are baked in at build time.** Changing one requires a rebuild,
+not a restart. That is a common source of "I changed the env var and nothing
+happened".
+
+**`PUBLIC_*` is inlined into browser JavaScript.** It is not secret. Putting a real
+secret there publishes it.
+
+## Database backups
+
+The wallet ledger is the business.
+
+- **PITR, or at minimum daily snapshots**, retained off-host.
+- **Test a restore before launch.** An untested backup is a belief.
+- Back up **before every migration** — the cheapest rollback is a restore.
+- PocketBase needs backing up too: losing it loses logins, though not money.
+
+## What can go wrong, and the response
+
+| Failure | Effect | Response |
+| --- | --- | --- |
+| Server deploys, frontend does not | New API, old UI | Usually fine (R2); roll back if not |
+| Migration is non-additive | Old server crashes on new schema | Never do this — R1 |
+| Frontend deploys before server | Calls a 404 endpoint | R3 handles it; redeploy in order |
+| Bad migration, data damaged | Possible data loss | Restore from the pre-migration backup |
+| Env var changed on Pages | No effect until rebuild | Rebuild |
+| Relay config changed | Not automatic — it is not part of the app deploy | SSH or a config repo; test `nginx -t` first |
+| **Relay down** | **Total outage**; the backend is unreachable | It is a single point of failure — see [\`edge-relay.md\`](edge-relay.md) |
+| Postgres volume lost | **Total loss of funds data** | Restore; this is why backups are tested |
+
+## Open items
+
+- [ ] CI provider — GitHub Actions assumed. Stages specified in
+      [`ci-cd.md`](ci-cd.md).
+- [x] Migration tool: **sqlx migrate** — [`ci-cd.md`](ci-cd.md).
+- [x] Migrations run in CI, after a snapshot and before the server deploy —
+      see [`ci-cd.md`](ci-cd.md).
+- [ ] Rollback drill: rehearse a bad deploy and a restore before launch — procedure
+      in [`backup-and-restore.md`](backup-and-restore.md).
+- [ ] Staging environment, or deploy straight to production? (Currently no staging
+      is specified anywhere.)

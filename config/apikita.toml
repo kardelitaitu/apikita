@@ -1,0 +1,399 @@
+# apikita configuration — SINGLE SOURCE OF TRUTH
+#
+# Consolidated from the former apikita.toml and models.example.toml, which
+# disagreed: no env var names overlapped and .env satisfied only one of them.
+# Two configs with the same rates and different keys is a startup failure.
+#
+# SECRETS: this file names ENVIRONMENT VARIABLES only. Never inline a key.
+# The names here must match .env.example exactly.
+#
+# Deployment: docs/deployment.md · Decisions: docs/decisions.md
+
+# ===========================================================================
+# CURRENCY CONVERSION -- READ FIRST
+# ===========================================================================
+#
+#   1 CNY = 2,676.78 IDR
+#   source: Google Finance, 24 Sept 21:00 UTC
+#
+#   The upstream price list is quoted in CNY per 1M tokens. Every IDR figure
+#   below is that CNY price x 2,676.78. To re-derive after an FX move:
+#
+#     IDR_rate = CNY_rate * 2676.78
+#
+#   RATES DRIFT. We collect IDR and pay CNY, so an FX move changes our cost
+#   with no change in the upstream price list. Re-check before repricing, and
+#   do not hand-edit the IDR values without updating this line.
+#
+#   (At USD/IDR 18,000 this implies USD/CNY ~6.72, close to market.)
+#
+
+# ===========================================================================
+# PRICING AND WALLET
+# ===========================================================================
+
+[pricing]
+# Margin is set PER MODEL (see [[models]] price = ...), not globally.
+# Different models carry different wholesale costs, so one global multiplier
+# cannot work: pro-tier output costs ~3.4x flash, and a single rate would make
+# one unsellable and the other unprofitable.
+#
+# There is deliberately NO global default. Every model MUST declare its price,
+# so a missing value is a startup error rather than a silent wrong margin.
+#
+# RATIONALE FOR 2.0: at M=1.50 a 20M-token/month customer is contribution-
+# negative against the assumed support cost; M=2.00 roughly halves the volume
+# needed to break even. See docs/business/03-financial-model.md.
+#
+# OPEN: revisit downward once real support cost is measured. This is the single
+# most sensitive commercial input in the model.
+
+currency = "IDR"
+
+[wallet]
+# Re-top-up minimum. Small deposits are cheap to accept via QRIS but each
+# one is a support surface; this is a nuisance filter, not a profitability
+# filter.
+min_topup = 10000
+
+# First deposit minimum. Higher than min_topup deliberately: the first
+# deposit is where per-customer support cost is incurred.
+min_first_deposit = 50000
+
+# Contribution scales with tokens consumed, not deposit size. A volume gate
+# is the only thing that filters a negative-contribution customer.
+# Set to 0 to disable.
+min_monthly_tokens = 0
+
+# Days of inactivity before an account is treated as dormant (0 = disabled).
+# The model has no mechanism for this yet; see docs/business/03-financial-model.md.
+dormancy_days = 0
+
+# Upstream prepaid float policy. Hold roughly one settlement cycle of
+# unpurchased liability so a provider outage does not stall paid customers.
+reserve_settlement_cycles = 1
+
+# Low-balance warning, sent by the Telegram bot as a DM (never in a shared
+# room). Capped so it cannot become spam.
+low_balance_threshold_idr = 10000
+low_balance_max_per_day = 1
+
+# ===========================================================================
+# SESSIONS
+# ===========================================================================
+
+[sessions]
+# Cookie sessions, stored server-side in Postgres. Logout revokes the row,
+# so these are hard bounds rather than advisory.
+#
+# Absolute: the session dies at this age regardless of activity.
+# Idle:     the session dies after this much inactivity.
+#
+# Shorter bounds limit a stolen cookie; longer bounds mean fewer logins.
+# 30d/7d is a deliberate middle for a prepaid financial tool.
+absolute_days = 30
+idle_days = 7
+
+# ===========================================================================
+# RATE LIMITS
+# ===========================================================================
+
+[limits]
+# Per-account caps. These are abuse guards, not pricing. The per-KEY rate
+# limit is separate and set on each api_keys row (rate_limit_rpm).
+#
+# Edge-level limits live in nginx and are blunter; see docs/edge-relay.md.
+
+# Money path: creates a top-up and a Midtrans session.
+topup_per_hour = 5
+
+# Protects the wallet mutation path generally.
+wallet_mutations_per_minute = 10
+
+# Blunts limit circumvention by key-spam.
+key_creation_per_day = 10
+
+# Review submissions. Edits are legitimate; flooding is not.
+review_per_hour = 3
+
+# How long the proxy caches API key metadata (limits, model allowlist,
+# revoked state) before re-reading from Postgres.
+#
+# This is the window in which a revoked key still works and a lowered limit
+# has not applied. Documented in decisions.md as 60s: short enough to bound
+# the risk, long enough to keep the database off the request hot path.
+key_metadata_cache_seconds = 60
+
+# ===========================================================================
+# REALTIME (SSE)
+# ===========================================================================
+
+[realtime]
+# Events replayed to a client that reconnects with Last-Event-ID. Bounded so
+# memory cannot grow without limit.
+replay_buffer_events = 100
+
+# Concurrent SSE connections per account. One per tab, with headroom.
+max_connections_per_account = 5
+
+# Seconds before the server closes a stream so the client reconnects cleanly.
+# Intermediaries close idle streams anyway; a planned reconnect beats a
+# surprise drop the client has to detect.
+max_stream_seconds = 1800
+
+# ===========================================================================
+# KEY POOL
+# ===========================================================================AND RESILIENCE
+# ===========================================================================
+
+[key_pool]
+# HTTP status treated as "this key is saturated, rotate to the next".
+rate_limit_status = [429]
+
+# Seconds a key stays out of rotation after being throttled. Short: the
+# provider's own concurrency window frees up quickly.
+key_cooldown_seconds = 5
+
+# Attempts across DIFFERENT keys before giving up on a request. With 3 keys
+# this allows up to 3 tries; keep below the pool size or it retries dead keys.
+max_key_attempts = 3
+
+# When every key on every healthy endpoint is saturated, what to do.
+#   "queue"      - hold the request until capacity frees (needs a queue)
+#   "reject_503" - fail fast with Retry-After
+# "reject_503" is the honest default for a proxy: the caller can retry.
+on_pool_exhausted = "reject_503"
+
+[circuit_breaker]
+# Consecutive failures before marking a provider unhealthy.
+failure_threshold = 3
+
+# Seconds before a tripped provider is retried (the first cooldown).
+cooldown_seconds = 30
+
+# On each consecutive failure the cooldown doubles, up to this ceiling.
+#
+# 30 -> 60 -> 120 -> 240 -> 480 -> 900. After ~5 failures the endpoint is
+# retried every 15 minutes: long enough to stop hammering a dead provider,
+# short enough that recovery is noticed without a manual restart.
+cooldown_max_seconds = 900
+
+# Multiplier applied to the cooldown on each consecutive failure.
+# 2.0 means doubling. Set to 1.0 to disable backoff and retry always at
+# cooldown_seconds.
+cooldown_multiplier = 2.0
+
+# Per-request upstream timeout, seconds.
+request_timeout_seconds = 120
+
+# External health check interval for relay/backend failover (see topology.md).
+health_check_interval_seconds = 30
+# Consecutive failed checks before failing over.
+health_check_failures = 2
+
+[streaming]
+# On balance exhaustion, reject at pre-flight rather than cutting a stream
+# mid-answer. A truncated answer on non-refundable funds is the most likely
+# source of a delivery dispute. See docs/business/05-risk.md R3.
+allow_negative_balance_overdraft = true
+mid_stream_cutoff = false
+
+# Hard cap on output tokens per request when the caller does not specify one.
+# Worst-case cost reservation is computed against this.
+# Model allows up to 384K output on a 1M context.
+default_max_output_tokens = 4096
+hard_max_output_tokens = 384000
+
+# Context window, for pre-flight input validation.
+max_context_tokens = 1000000
+
+# ===========================================================================
+# PROVIDERS AND MODELS
+# ===========================================================================
+#
+# ONE VERIFIED PROVIDER. The endpoint list below has three entries, but only
+# the first is a real, terms-checked supplier:
+#
+#   primary    - the reseller in config/provider1.md. VERIFIED.
+#   secondary  - PLACEHOLDER URL. No provider identified, terms unread.
+#   tertiary   - PLACEHOLDER URL. weight 0, so never routed.
+#
+# The placeholder URLs are NOT real endpoints. They exist so the config shape
+# is visible; replace them before deploying, or delete the entries.
+#
+# Consequence for failover: with one real provider there is nothing to fail
+# over TO. Circuit breaking and key rotation work today; cross-provider
+# failover does not. See docs/failover.md.
+#
+# A provider must not be enabled until its resale terms are read - the config
+# enforces this with weight = 0 on unverified entries.
+
+# ===========================================================================
+# MODEL LIST
+# ===========================================================================
+#
+# SOURCE OF TRUTH FOR COST: the provider's own price list (screenshot), which
+# quotes CNY per 1M tokens.
+#
+#   PROVIDER IS A RESELLER, NOT DEEPSEEK DIRECT.
+#   Both flash models come in at ~46% of DeepSeek's own list price, verified
+#   against the official USD price list. The reseller is a genuine saving.
+#
+#   Its "Official $..." comparison column is NOT a currency conversion --
+#   every ratio in it is exactly 3.33 CNY/USD (market is ~6.7), so the
+#   "Save 50%" badge is arithmetic, not a market price. Ignore the badge;
+#   the CNY column is what we actually pay.
+#
+#   SCOPE: flash only. deepseek-v4-pro is deliberately NOT offered -- it is
+#   7x the output cost of flash and the arbitrage there is unproven.
+#
+# Off-peak is exactly HALF of peak. Peak is 01:00-04:00 and 06:00-10:00 UTC,
+# Mon-Fri, excluding Chinese public holidays -- about 21% of the week.
+# billing_basis="peak" reserves at the PEAK rate so a request can never lose
+# money; adjust once real traffic shows the actual peak/off-peak split.
+#
+# Customer price = rate x price, per token class.
+
+# ===========================================================================
+# KEY POOL BEHAVIOUR (global defaults; endpoints may override)
+# ===========================================================================
+#
+# A provider key has a concurrency ceiling, not just a rate limit. The pool
+# exists so one saturated key degrades throughput instead of failing requests.
+
+# ===========================================================================
+# flash -- the cheap, high-concurrency workhorse. THIS IS WHERE THE MARGIN IS.
+# ===========================================================================
+
+[[models]]
+name = "flash"
+description = "Fast, low-cost general model. 1M context, vision capable."
+price = 2.0                    # markup over wholesale
+
+max_context_tokens = 1000000
+max_output_tokens = 384000
+supports_vision = true
+supports_thinking = true
+
+billing_basis = "peak"
+
+[models.rates]
+# IDR per 1M = CNY price x 2676.78.
+# CNY source: off 0.01/0.5/2.0, peak 0.02/1.0/4.0
+cache_read_offpeak = 26.77     # ¥0.01
+cache_read_peak    = 53.54     # ¥0.02
+input_offpeak      = 1338.39   # ¥0.50
+input_peak         = 2676.78   # ¥1.00
+output_offpeak     = 5353.56   # ¥2.00
+output_peak        = 10707.12  # ¥4.00
+
+# --- endpoints: primary, secondary, tertiary -------------------------------
+#
+# An endpoint is a (url + upstream_model) pair. It may hold SEVERAL API keys,
+# because one key usually has its own concurrency ceiling and a single key
+# becomes the bottleneck long before the provider does.
+#
+# KEY POOL SEMANTICS (what the router must implement per endpoint):
+#
+#   - api_key_envs is a POOL. Requests pick a key from it.
+#   - A key that returns 429, or a concurrency-limit error, is put on
+#     cooldown INDIVIDUALLY. One throttled key does NOT mark the endpoint
+#     unhealthy -- only an endpoint-wide failure (5xx, timeout) does that.
+#   - Capacity is CONCURRENT REQUESTS, not requests/minute. Track in-flight
+#     count per key and prefer the least-loaded key.
+#   - Keys are provider-scoped: a key listed under one endpoint is meaningless
+#     at another endpoint's url. Do not share a pool across endpoints.
+#   - Key values come from ENV VARS ONLY, named here. Never inline a key.
+#
+# concurrency_per_key: the ceiling the provider enforces for ONE key.
+#   0 = unknown, in which case the router should learn it from 429s and back
+#   off, and a warning should be logged because capacity is then a guess.
+#
+# weight is relative; 0 = registered but never routed (unverified terms).
+# Selection is weighted-random across weight>0; set precedence explicitly if
+# strict primary->secondary->tertiary order is wanted.
+
+[[models.endpoints]]
+name = "primary"
+url = "https://api.abc.com/v1"
+upstream_model = "deepseek-flash"
+api_key_envs = [
+  "APK_FLASH_PRIMARY_KEY_1",
+  "APK_FLASH_PRIMARY_KEY_2",
+  "APK_FLASH_PRIMARY_KEY_3",
+]
+concurrency_per_key = 0        # unknown; learn from 429s
+weight = 1.0
+
+[[models.endpoints]]
+name = "secondary"
+url = "https://api.xyz.com/v1"
+upstream_model = "deepseek-flash"
+api_key_envs = [
+  "APK_FLASH_SECONDARY_KEY_1",
+  "APK_FLASH_SECONDARY_KEY_2",
+]
+concurrency_per_key = 0
+weight = 1.0
+
+[[models.endpoints]]
+name = "tertiary"
+url = "https://api.def.com/v1"
+upstream_model = "deepseek-flash"
+api_key_envs = [
+  "APK_FLASH_TERTIARY_KEY_1",
+]
+concurrency_per_key = 0        # terms unverified -- weight 0, never routed
+weight = 0.0
+
+# ===========================================================================
+# deepseek-v4-flash -- legacy alias, SAME price as flash
+# ===========================================================================
+#
+# Sold separately but identical in cost to deepseek-flash (both CNY
+# 0.5/1.0 input, 2.0/4.0 output). Model version DeepSeek-V4-Flash-0731.
+# Expose it only if customers ask by that name; it is the same product.
+
+[[models]]
+name = "deepseek-v4-flash"
+description = "Legacy alias of flash. Identical pricing."
+price = 2.0
+
+max_context_tokens = 1000000
+max_output_tokens = 384000
+supports_vision = true
+supports_thinking = true
+
+billing_basis = "peak"
+
+[models.rates]
+# IDR per 1M = CNY price x 2676.78. Same prices as flash.
+cache_read_offpeak = 26.77     # ¥0.01
+cache_read_peak    = 53.54     # ¥0.02
+input_offpeak      = 1338.39   # ¥0.50
+input_peak         = 2676.78   # ¥1.00
+output_offpeak     = 5353.56   # ¥2.00
+output_peak        = 10707.12  # ¥4.00
+
+[[models.endpoints]]
+name = "primary"
+url = "https://api.abc.com/v1"
+upstream_model = "deepseek-v4-flash"
+api_key_envs = [
+  "APK_V4FLASH_PRIMARY_KEY_1",
+  "APK_V4FLASH_PRIMARY_KEY_2",
+]
+concurrency_per_key = 0
+weight = 1.0
+
+# ===========================================================================
+# What a customer pays (rate x price), IDR per 1M, at the PEAK basis
+# ===========================================================================
+#
+#   deepseek-flash      in 5,354    out 21,414    cache 107
+#   deepseek-v4-flash   in 5,354    out 21,414    cache 107
+#
+# Both models cost the same upstream and are priced the same. The only
+# difference is the version behind the name (V4.1-Flash-0910 vs
+# V4-Flash-0731). If only one needs to be public, keep "flash" and drop the
+# alias -- offering both means maintaining two names for one product.
