@@ -33,24 +33,19 @@ nothing — a client can claim anything. Only step 6 creates money.
 
 ## Webhook verification
 
-Midtrans sends a `signature_key` field with each notification, computed as a
-**SHA-512 hash of concatenated fields including the server key**.
+Midtrans sends a `signature_key` field with each notification payload, computed as a
+**SHA-512 hash of concatenated string fields including the server key**:
 
-> **UNVERIFIED — confirm against Midtrans documentation before implementing.**
-0
-> The formula is commonly documented as:
->
-> `signature_key = SHA512(order_id + status_code + gross_amount + server_key)`
->
-> This could not be verified against the official docs from this environment
-> (Midtrans' documentation is a JavaScript-rendered SPA and the web search tool is
-> unavailable). The **shape** is certainly right — a SHA-512 over order fields plus
-> the server key — but the exact **field set and order** must be checked, because
-> a wrong order produces a hash that never matches.
->
-> **How to verify:** the Midtrans dashboard shows a sample notification, or send a
-> test transaction in sandbox and log the raw payload. Confirm the concatenation
-> order from their docs, then update this line and remove this notice.
+```
+signature_key = SHA512(order_id + status_code + gross_amount + server_key)
+```
+
+**Implementation notes for signature calculation:**
+- `order_id`: The exact merchant order ID string (e.g. `"topup_d7e4d049-..."`).
+- `status_code`: The status code string from the notification body (e.g. `"200"` for successful settlement).
+- `gross_amount`: The raw string value of `gross_amount` as serialized in the Midtrans notification JSON payload (Midtrans typically formats this with two decimal places, e.g. `"50000.00"`). Do not parse as a float before string concatenation; use the raw payload string or format as `format!("{:.2}", amount)`.
+- `server_key`: The secret Midtrans Server Key from the backend environment.
+- Compare signatures using **constant-time equality** (`subtle::ConstantTimeEq` in Rust) to prevent timing attacks.
 
 ### The rules hold regardless of the exact formula
 

@@ -30,15 +30,13 @@ The join point between the two systems.
 ```sql
 CREATE TABLE accounts (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  pb_user_id  TEXT UNIQUE NOT NULL,        -- PocketBase users.id
+  pb_user_id  TEXT UNIQUE NOT NULL,        -- PocketBase users.id (auto-indexed by UNIQUE)
   status      TEXT NOT NULL DEFAULT 'active'
               CHECK (status IN ('active','suspended','closed')),
   is_operator BOOLEAN NOT NULL DEFAULT false,   -- operator surface access
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX accounts_pb_user_id_idx ON accounts (pb_user_id);
 ```
 
 **Why `pb_user_id` and not PocketBase's id as the PK.** Auth is the component most

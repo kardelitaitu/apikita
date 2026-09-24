@@ -72,38 +72,31 @@ data live in Postgres, which PocketBase does not stream. Contract:
 [`docs/realtime.md`](../realtime.md).
 ## Auth token handling
 
-- PocketBase issues a stateless auth token; there are **no server-side sessions
-  and no logout endpoint**. "Logout" is discarding the token client-side.
-- **Tokens ARE revocable**, but not by logging out. Every auth record carries a
-  `tokenKey` mixed into the JWT signing key; rotating it invalidates all of that
-  user's tokens instantly. PocketBase rotates it automatically on password or
-  email change, and `RefreshTokenKey()` does it explicitly. See
-  [05-security-decisions.md](05-security-decisions.md) D2.
-- Store the token in an **HttpOnly, Secure, SameSite cookie** set by the Rust API
-  rather than localStorage, so XSS cannot read it.
-- Never put provider keys or the Midtrans server key in client-visible config.
+- PocketBase handles initial authentication (password, Google OAuth2) and issues a short-lived token.
+- The browser immediately exchanges this token with the Rust backend via `POST /auth/exchange`.
+- The Rust server verifies the token, resolves or registers `accounts.pb_user_id`, and issues an **opaque server-side session cookie** (`HttpOnly, Secure, SameSite=Lax`) backed by PostgreSQL.
+- **Logout is explicit and immediate**: `POST /auth/logout` revokes the session row in PostgreSQL; `POST /auth/logout-all` revokes all active sessions for the account.
+- Never put upstream provider keys, database URLs, or the Midtrans server key in client-visible config.
 
 ## Secrets
 
 | Secret | Where | Browser-visible? |
 | --- | --- | --- |
-| Midtrans server key | Pages env | **No** |
-| Midtrans client key | Pages env | Yes (by design) |
-| PocketBase superuser creds | Pages env | **No** |
-| Upstream provider keys | Northflank (server) | **No** |
-| Telegram bot token | Northflank (bot) | **No** |
+| Midtrans server key | Northflank (Rust env) | **No** |
+| Midtrans client key | Pages env (`PUBLIC_MIDTRANS_CLIENT_KEY`) | Yes (by design) |
+| PocketBase admin / internal URL | Northflank (Rust env) | **No** |
+| Upstream provider keys | Northflank (Rust env) | **No** |
+| Telegram bot token | Northflank (Rust / bot env) | **No** |
+| Database connection string | Northflank (Rust env) | **No** |
 
 Only `PUBLIC_*` variables may reach the client. See `.env.example`.
 
 ## Deployment
 
-- **Static assets + Functions** → Cloudflare Pages, built from the repo.
-- **PocketBase** → needs a persistent disk (SQLite). It cannot run on Pages.
-  Host it on a VPS or a container host with a volume, and **back it up** — the
-  wallet ledger lives there. See [02-data-model.md](02-data-model.md) on backups.
-- **Region:** keep PocketBase geographically close to the Midtrans webhook
-  receiver and to your customers. Webhooks arriving late is not a correctness
-  problem, but a slow dashboard is.
+- **Static assets (Astro)** → Cloudflare Pages, built from the repo.
+- **API + Proxy (Rust) & PostgreSQL** → Northflank with persistent volume. The wallet ledger lives in PostgreSQL.
+- **PocketBase** → Northflank or container host with persistent volume (SQLite for identity only).
+- **Region:** keep Northflank and database geographically close to the Midtrans webhook receiver and Indonesian users (e.g. Singapore region).
 
 ## Frontend choice — decided
 

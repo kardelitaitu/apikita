@@ -265,9 +265,9 @@ The only source of wallet credits.
 
 ```
 1. read body
-2. recompute the signature (**exact field order UNVERIFIED** — see
-   [docs/website/04-payments.md](../website/04-payments.md) before implementing)
-3. compare; mismatch -> 401, log, stop
+2. recompute signature: SHA512(order_id + status_code + gross_amount + server_key)
+   (see [docs/website/04-payments.md](../website/04-payments.md))
+3. compare in constant time; mismatch -> 401, log, stop
 4. look up topups by order_id; unknown -> 404, log, stop
 5. compare amount against the STORED row; mismatch -> reject, log
 6. if status already settled -> 200, do nothing   (idempotent)

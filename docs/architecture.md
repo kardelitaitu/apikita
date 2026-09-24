@@ -171,8 +171,8 @@ rest of the system never has to speak PocketBase's token format.
 ```
 
 - Cookie is **HttpOnly, Secure, SameSite=Lax** — opaque random value, hash stored.
-- **Logout deletes the row** → immediate revocation, on every product surface.
-- Sign out everywhere = delete all rows for the account.
+- **Logout revokes the row** (`revoked_at = now()`) → immediate revocation on every surface, preserving the audit trail.
+- Sign out everywhere = revokes all active session rows for the account (`revoked_at = now()`). Expired rows are swept periodically.
 - This is better than trusting a third-party token lifetime, and it costs one table.
 
 ### Password reset and email verification
