@@ -30,7 +30,7 @@ document covers the frontend's internal structure.
 > Postgres. Superseded sections below are marked; the frontend internals remain
 > valid.
 
-Astro is a recommendation, not a hard requirement — see [Why Astro](#why-astro).
+**Astro is decided** — reasoning and rejected alternatives are below.
 
 ## Topology
 

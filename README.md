@@ -14,6 +14,7 @@ surface, priced at a fixed margin over wholesale cost.
 | Document | Covers |
 | --- | --- |
 | [`docs/decisions.md`](docs/decisions.md) | **Settled decisions — the register.** Check here first |
+| [`docs/plan-audit.md`](docs/plan-audit.md) | **Plan review — what holds, what doesn't** |
 | [`docs/launch-checklist.md`](docs/launch-checklist.md) | **Launch tasks, gated.** What must be true before taking money |
 | [`docs/architecture.md`](docs/architecture.md) | The system end to end — the authoritative stack |
 | [`docs/topology.md`](docs/topology.md) | The triangle: Cloudflare, relay, Northflank, failover |
