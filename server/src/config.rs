@@ -86,9 +86,7 @@ pub struct CircuitBreakerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamingConfig {
-    pub allow_negative_balance_overdraft: bool,
     pub mid_stream_cutoff: bool,
-    pub default_max_output_tokens: u64,
     pub hard_max_output_tokens: u64,
     pub max_context_tokens: u64,
 }
@@ -129,6 +127,8 @@ pub struct ModelEndpoint {
     pub concurrency_per_key: usize,
     #[serde(default)]
     pub weight: f64,
+    #[serde(default)]
+    pub supports_stream_options: bool,
 }
 
 impl AppConfig {

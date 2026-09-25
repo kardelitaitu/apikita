@@ -150,6 +150,7 @@ struct EndpointEntry {
     weight: f64,
     pool: KeyPool,
     breaker: CircuitBreaker,
+    supports_stream_options: bool,
 }
 
 /// One configured model with its endpoints.
@@ -268,7 +269,10 @@ impl UpstreamClient {
     /// restart, which is preferable to reading `std::env` on the hot path.
     pub fn new(config: Arc<AppConfig>) -> Self {
         let timeout_seconds = config.circuit_breaker.request_timeout_seconds;
-        let mut builder = reqwest::Client::builder().pool_max_idle_per_host(100);
+        let mut builder = reqwest::Client::builder()
+            .tcp_nodelay(true)  // SSE: disable Nagle so small frequent frames land immediately
+            .pool_idle_timeout(std::time::Duration::from_secs(30))  // 30s: with pool_max_idle_per_host(100) and 3 endpoints the 90s default holds 300 idle sockets on a 256 MB container
+            .pool_max_idle_per_host(100);
         if timeout_seconds > 0 {
             // A per-read timeout, not a total one: it catches an upstream that
             // stalls with no bytes (docs/failover.md, "Upstream stalls"), while
@@ -305,6 +309,7 @@ impl UpstreamClient {
                             config.key_pool.max_key_attempts,
                         ),
                         breaker: CircuitBreaker::new(config.circuit_breaker.clone()),
+                    supports_stream_options: endpoint.supports_stream_options,
                     })
                     .collect(),
             })
@@ -360,7 +365,7 @@ impl UpstreamClient {
                 continue;
             }
 
-            let payload = prepare_body(&body, &endpoint.upstream_model);
+            let payload = prepare_body(&body, &endpoint.upstream_model, endpoint.supports_stream_options);
 
             for _ in 0..endpoint.pool.max_attempts() {
                 let Some(lease) = endpoint.pool.acquire() else {
@@ -452,7 +457,7 @@ impl UpstreamClient {
 /// Rewrite the caller's payload for one endpoint: the upstream knows the model
 /// by its own name, this layer only ever streams, and it must ask for the usage
 /// block that settlement is built on.
-fn prepare_body(body: &Value, upstream_model: &str) -> Value {
+fn prepare_body(body: &Value, upstream_model: &str, supports_stream_options: bool) -> Value {
     let mut payload = body.clone();
     if let Some(object) = payload.as_object_mut() {
         // A caller that says nothing about streaming is treated as a streaming
@@ -473,7 +478,7 @@ fn prepare_body(body: &Value, upstream_model: &str) -> Value {
         // A caller may legitimately send stream_options of their own, so their
         // object is merged into, never replaced: only include_usage is set and
         // every other key they sent survives.
-        if streaming {
+        if streaming && supports_stream_options {
             let options = object
                 .entry("stream_options".to_string())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -539,6 +544,7 @@ mod tests {
             api_key_envs: vec![format!("APK_TEST_{}_KEY_1", name.to_uppercase())],
             concurrency_per_key: 0,
             weight,
+            supports_stream_options: true,
         }
     }
 
@@ -610,9 +616,7 @@ mod tests {
                 health_check_failures: 2,
             },
             streaming: StreamingConfig {
-                allow_negative_balance_overdraft: true,
                 mid_stream_cutoff: false,
-                default_max_output_tokens: 4096,
                 hard_max_output_tokens: 384_000,
                 max_context_tokens: 1_000_000,
             },
@@ -880,6 +884,7 @@ mod tests {
         let payload = prepare_body(
             &json!({ "model": "flash", "messages": [] }),
             "deepseek-flash",
+            true,
         );
 
         assert_eq!(payload["model"], json!("deepseek-flash"));
@@ -900,6 +905,7 @@ mod tests {
                 "stream_options": { "foo": "bar", "include_usage": false }
             }),
             "deepseek-flash",
+            true,
         );
 
         // The caller's own key survives, and only include_usage is forced.
@@ -912,11 +918,26 @@ mod tests {
         let payload = prepare_body(
             &json!({ "model": "flash", "stream": false, "messages": [] }),
             "deepseek-flash",
+            true,
         );
 
         assert!(
             payload.get("stream_options").is_none(),
             "a non-streaming request has no SSE usage block to opt into: {payload}"
+        );
+    }
+
+    #[test]
+    fn prepare_body_skips_stream_options_when_endpoint_does_not_support_it() {
+        let payload = prepare_body(
+            &json!({ "model": "flash", "stream": true, "messages": [] }),
+            "deepseek-flash",
+            false,
+        );
+
+        assert!(
+            payload.get("stream_options").is_none(),
+            "an endpoint without stream_options support must not receive the parameter: {payload}"
         );
     }
 }

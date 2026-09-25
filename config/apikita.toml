@@ -212,13 +212,8 @@ health_check_failures = 2
 # On balance exhaustion, reject at pre-flight rather than cutting a stream
 # mid-answer. A truncated answer on non-refundable funds is the most likely
 # source of a delivery dispute. See docs/business/05-risk.md R3.
-allow_negative_balance_overdraft = true
 mid_stream_cutoff = false
 
-# Hard cap on output tokens per request when the caller does not specify one.
-# Worst-case cost reservation is computed against this.
-# Model allows up to 384K output on a 1M context.
-default_max_output_tokens = 4096
 hard_max_output_tokens = 384000
 
 # Context window, for pre-flight input validation.
@@ -341,6 +336,7 @@ api_key_envs = [
 ]
 concurrency_per_key = 0        # unknown; learn from 429s
 weight = 1.0
+supports_stream_options = true
 
 [[models.endpoints]]
 name = "secondary"
@@ -352,6 +348,7 @@ api_key_envs = [
 ]
 concurrency_per_key = 0
 weight = 1.0
+supports_stream_options = true
 
 [[models.endpoints]]
 name = "tertiary"
@@ -362,6 +359,7 @@ api_key_envs = [
 ]
 concurrency_per_key = 0        # terms unverified -- weight 0, never routed
 weight = 0.0
+supports_stream_options = true
 
 # ===========================================================================
 # deepseek-v4-flash -- legacy alias, SAME price as flash
