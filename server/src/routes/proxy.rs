@@ -2089,4 +2089,763 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------------
+    // LIVE POSTGRES: the money path of chat_completions.
+    //
+    // Every test above this line is pure. chat_completions is the ONLY handler
+    // that spends money, and until now not one of its database-visible steps had
+    // ever been executed: the real api_keys lookup in load_key_metadata, the
+    // HOLD taken by reserve_balance_transaction, and the settlement
+    // (debit_usage_transaction / release_reservation_transaction) that follows
+    // the upstream call.
+    //
+    // An upstream provider is unreachable from a test, and faking one would only
+    // prove the fake works. So the database half is driven the way the handler
+    // drives it, and nothing is faked:
+    //
+    //   * the FAILURE path goes through the real handler end to end. With no
+    //     provider key in the environment the pool is empty, stream_chat refuses
+    //     before any socket is opened, and the handler's release arm runs - which
+    //     is the arm that decides whether a refused request strands money.
+    //   * the SETTLEMENT path calls settle_after_stream itself, the very function
+    //     the handler spawns, with the same ReservationGuard, the same ref and the
+    //     same amounts the handler computes.
+    //
+    //   DATABASE_URL=... cargo test --lib -- --ignored --test-threads=1 routes::proxy
+    // ---------------------------------------------------------------------
+
+    use crate::config::AppConfig;
+    use crate::db::{credit_topup_transaction, init_pool, unpaired_hold_rows, TopupCreditResult};
+    use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
+    use crate::routes::events::RealtimeHub;
+
+    fn live_config() -> Arc<AppConfig> {
+        for path in ["../config/apikita.toml", "config/apikita.toml"] {
+            if std::path::Path::new(path).exists() {
+                return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
+            }
+        }
+        panic!("could not find apikita.toml for testing");
+    }
+
+    /// The real application state, built the way main.rs builds it, so the
+    /// handler runs against the same config and the same process-wide key cache
+    /// the serving process uses.
+    fn test_state(pool: PgPool) -> AppState {
+        let config = live_config();
+        let events = Arc::new(RealtimeHub::new(&config.realtime));
+        let trusted_proxies: Arc<[IpCidr]> = Arc::from(
+            parse_cidrs(&config.network.trusted_proxy_cidrs)
+                .expect("config CIDRs parse")
+                .into_boxed_slice(),
+        );
+        AppState {
+            pool,
+            config,
+            http_client: reqwest::Client::new(),
+            events,
+            ip_salt: Arc::new(DailySalt::new()),
+            trusted_proxies,
+        }
+    }
+
+    async fn live_pool() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+        init_pool(&database_url).await.expect("connect to Postgres")
+    }
+
+    async fn create_account(pool: &PgPool) -> Uuid {
+        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+            .bind(format!("test_proxy_{}", Uuid::new_v4().simple()))
+            .fetch_one(pool)
+            .await
+            .expect("create account")
+    }
+
+    /// Money enters a wallet ONLY through credit_topup_transaction, which writes
+    /// the matching +ledger row in the same transaction. Writing
+    /// wallets.balance_idr directly manufactures exactly the drift the
+    /// reconciliation assertion at the end of every test looks for.
+    async fn open_wallet(pool: &PgPool, account_id: Uuid, opening_idr: i64) {
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
+            .bind(account_id)
+            .execute(pool)
+            .await
+            .expect("create the zero-balance wallet the login path would create");
+
+        let order_id = format!("test_proxy_topup_{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
+            .bind(account_id)
+            .bind(opening_idr)
+            .bind(&order_id)
+            .execute(pool)
+            .await
+            .expect("create topup");
+
+        assert_eq!(
+            credit_topup_transaction(pool, &order_id, opening_idr)
+                .await
+                .expect("credit the opening balance"),
+            TopupCreditResult::Settled {
+                new_balance: opening_idr
+            },
+            "the fixture must open the wallet through the real top-up path"
+        );
+    }
+
+    /// An api_keys row whose key_hash is the SAME hash chat_completions derives
+    /// from the bearer token, so the lookup under test is the production one and
+    /// not a bypass around it.
+    async fn create_api_key(
+        pool: &PgPool,
+        account_id: Uuid,
+        plaintext: &str,
+        models: &[&str],
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO api_keys (account_id, key_hash, prefix, label, models)
+             VALUES ($1, $2, 'apk_test', 'proxy-live', $3) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(hash_string(plaintext))
+        .bind(serde_json::to_value(models).expect("models as JSON"))
+        .fetch_one(pool)
+        .await
+        .expect("create api key")
+    }
+
+    /// Deletes every row the fixture created, in FK order (ledger, wallets and
+    /// topups are ON DELETE RESTRICT).
+    ///
+    /// usage_daily BEFORE api_keys, always: usage_daily.api_key_id is NOT NULL
+    /// and part of the primary key, so the ON DELETE SET NULL on that column is
+    /// unreachable - deleting the key first would violate the NOT NULL instead of
+    /// nulling the column.
+    async fn delete_fixture_rows(pool: &PgPool, account_id: Uuid) {
+        for statement in [
+            "DELETE FROM usage_daily WHERE account_id = $1",
+            "DELETE FROM api_keys WHERE account_id = $1",
+            "DELETE FROM ledger WHERE account_id = $1",
+            "DELETE FROM topups WHERE account_id = $1",
+            "DELETE FROM wallets WHERE account_id = $1",
+            "DELETE FROM sessions WHERE account_id = $1",
+            "DELETE FROM accounts WHERE id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(account_id)
+                .execute(pool)
+                .await
+                .unwrap_or_else(|err| panic!("cleanup failed on {statement}: {err}"));
+        }
+    }
+
+    /// INVARIANT (a), scoped to THIS fixture's account: wallets.balance_idr must
+    /// equal SUM(ledger.delta_idr). It must return 0 rows.
+    async fn drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT w.account_id
+                FROM wallets w
+                LEFT JOIN ledger l ON l.account_id = w.account_id
+                WHERE w.account_id = $1
+                GROUP BY w.account_id, w.balance_idr
+                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+            ) AS drift
+            "#,
+        )
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
+        .expect("reconciliation query")
+    }
+
+    /// Every ledger move of the fixture, in order: (delta_idr, ref).
+    async fn ledger_deltas(pool: &PgPool, account_id: Uuid) -> Vec<(i64, Option<String>)> {
+        sqlx::query_as("SELECT delta_idr, ref FROM ledger WHERE account_id = $1 ORDER BY id")
+            .bind(account_id)
+            .fetch_all(pool)
+            .await
+            .expect("read ledger")
+    }
+
+    async fn wallet_balance(pool: &PgPool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(pool)
+            .await
+            .expect("read balance")
+    }
+
+    /// Today's usage row for the account: the three token classes SEPARATELY
+    /// plus the cost. None means nothing was ever billed.
+    async fn usage_today(pool: &PgPool, account_id: Uuid) -> Option<(i64, i64, i64, i64)> {
+        sqlx::query_as(
+            "SELECT input_tokens, cache_read_tokens, output_tokens, cost_idr
+             FROM usage_daily WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read usage_daily")
+    }
+
+    /// The worst-case hold chat_completions MUST take for this body, recomputed
+    /// independently from the config: the DEAREST endpoint's worst case, over
+    /// max(requested, the model's own ceiling) clamped to the hard limit. The
+    /// input side is estimated from the raw body length at ~4 bytes per token,
+    /// floored at 1 - the same lens the handler uses.
+    fn expected_hold_idr(
+        config: &AppConfig,
+        model: &str,
+        body: &[u8],
+        max_tokens: Option<u64>,
+    ) -> i64 {
+        let model_cfg = config
+            .models
+            .iter()
+            .find(|m| m.name == model)
+            .expect("the model must be in the config");
+        let estimated_input = (body.len() as u64 / 4).max(1);
+        let max_output = max_tokens
+            .unwrap_or(0)
+            .max(model_cfg.max_output_tokens)
+            .min(config.streaming.hard_max_output_tokens);
+        (0..model_cfg.endpoints.len().max(1))
+            .map(|_| {
+                calculate_preflight_reservation_idr(
+                    model_cfg.price,
+                    estimated_input,
+                    model_cfg.rates.input_peak,
+                    max_output,
+                    model_cfg.rates.output_peak,
+                )
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// POST /v1/chat/completions reached through the REAL handler, with the peer
+    /// address supplied the way the router supplies it. The response is returned
+    /// as-is: a streaming success and an AppError are both real outcomes here.
+    async fn call_chat_completions(
+        state: &AppState,
+        bearer: &str,
+        body: &str,
+    ) -> Result<Response<Body>, AppError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {bearer}").parse().unwrap(),
+        );
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+
+        chat_completions(
+            State(state.clone()),
+            axum::extract::connect_info::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))),
+            headers,
+            Bytes::from(body.to_string()),
+        )
+        .await
+    }
+
+    /// Runs the money assertions, then deletes the fixture whether they passed or
+    /// panicked, so a failing run cannot leave rows in a database other runs
+    /// share (the db.rs pattern).
+    async fn with_fixture<F>(pool: PgPool, account_id: Uuid, assertions: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let outcome = tokio::spawn(assertions).await;
+        delete_fixture_rows(&pool, account_id).await;
+        outcome.expect("the money-path assertions panicked");
+    }
+
+    /// THE FAILURE PATH, THROUGH THE REAL HANDLER. A request that never reaches a
+    /// provider must cost nothing and must leave no stranded hold.
+    ///
+    /// This is the property that decides whether a refused customer loses money:
+    /// the hold is out of the wallet for the whole upstream call, so an exit that
+    /// forgets to give it back is money debited against a request that was never
+    /// billed. INVARIANT (b): unpaired_hold_rows must be 0.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn a_failed_upstream_releases_the_whole_hold_and_never_strands_it() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let expected_hold = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        assert!(
+            expected_hold > 0,
+            "the worst case must be a real hold, otherwise the test asserts nothing: {expected_hold}"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(pool.clone(), account_id, async move {
+            let err = call_chat_completions(&state, &key, body)
+                .await
+                .err()
+                .expect("with no provider key in the environment the upstream is unreachable");
+            assert_eq!(
+                err.status_code(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an unreachable upstream is a 503, got {err:?}"
+            );
+            assert_eq!(err.code(), "no_upstream_available");
+
+            let deltas = ledger_deltas(&pool_for_assertions, account_id).await;
+
+            // The HOLD was really taken, at the dearest endpoint's worst case -
+            // not skipped, and not sized by whatever endpoint happened to answer.
+            let holds: Vec<i64> = deltas
+                .iter()
+                .filter(|(delta, reference)| {
+                    *delta < 0
+                        && reference
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with("reserve_"))
+                })
+                .map(|(delta, _)| *delta)
+                .collect();
+            assert_eq!(
+                holds,
+                vec![-expected_hold],
+                "the handler must place exactly one hold, for the dearest endpoint's worst case"
+            );
+
+            // ... and it came back IN FULL, under the SAME ref, so the sweep can
+            // pair the two rows.
+            let reservation_ref = deltas
+                .iter()
+                .find(|(delta, _)| *delta == -expected_hold)
+                .and_then(|(_, reference)| reference.clone())
+                .expect("the hold carries its reservation ref");
+            let released: i64 = deltas
+                .iter()
+                .filter(|(delta, reference)| {
+                    *delta > 0 && reference.as_deref() == Some(reservation_ref.as_str())
+                })
+                .map(|(delta, _)| *delta)
+                .sum();
+            assert_eq!(
+                released, expected_hold,
+                "a request that never reached a provider must give the whole hold back"
+            );
+
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr,
+                "a refused request must cost the customer nothing"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a failed request must leave ZERO stranded holds"
+            );
+            assert_eq!(
+                usage_today(&pool_for_assertions, account_id).await,
+                None,
+                "nothing was generated, so nothing may be billed"
+            );
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
+    /// THE SETTLEMENT PATH, THROUGH THE FUNCTION THE HANDLER SPAWNS.
+    ///
+    /// The hold is taken the way the handler takes it, then settle_after_stream is
+    /// handed the very outcome a completed stream would hand it. INVARIANTS (a)
+    /// and (c): the wallet ends exactly -cost_idr from the opening balance, the
+    /// ledger's whole move for the request is exactly -cost_idr, and the three
+    /// token classes are recorded SEPARATELY - never summed.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn settlement_debits_the_real_usage_and_releases_the_rest_of_the_hold() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let held_idr = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        let model_cfg = state
+            .config
+            .models
+            .iter()
+            .find(|m| m.name == "flash")
+            .expect("flash is configured");
+
+        let usage = Usage {
+            input_tokens: 1_000,
+            cache_read_tokens: 400,
+            output_tokens: 2_000,
+        };
+        let cost_idr = calculate_token_cost_idr(
+            model_cfg.price,
+            usage.input_tokens as u64,
+            model_cfg.rates.input_peak,
+            usage.cache_read_tokens as u64,
+            model_cfg.rates.cache_read_peak,
+            usage.output_tokens as u64,
+            model_cfg.rates.output_peak,
+        );
+        assert!(
+            held_idr > cost_idr,
+            "the worst-case hold must cover the real cost, or the fixture proves nothing ({held_idr} vs {cost_idr})"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(pool.clone(), account_id, async move {
+            // Step 6 of the handler: the HOLD, before the upstream call.
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            let held = reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+            assert!(
+                matches!(&held, ReservationResult::Held { reserved_idr, .. } if *reserved_idr == held_idr),
+                "the wallet must cover the worst case, got {held:?}"
+            );
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr - held_idr,
+                "the hold must be OUT of the wallet for the whole upstream call"
+            );
+
+            // Step 8: the settlement task, with the guard, the ref and the
+            // outcome a completed stream reports.
+            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+            let guard = ReservationGuard::new(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                &reservation_ref,
+                "flash",
+            );
+            assert!(
+                settle_tx.send(StreamEnd::Settled(usage)).is_ok(),
+                "the settlement task must still be listening"
+            );
+
+            settle_after_stream(
+                settle_rx,
+                pool_for_assertions.clone(),
+                state.config.clone(),
+                state.events.clone(),
+                account_id,
+                key_id,
+                "flash".to_string(),
+                held_idr,
+                guard,
+            )
+            .await;
+
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr - cost_idr,
+                "the request must cost exactly the reported usage, not the hold"
+            );
+
+            let (input, cache_read, output, cost) = usage_today(&pool_for_assertions, account_id)
+                .await
+                .expect("a billed request writes its usage row");
+            assert_eq!(
+                (input, cache_read, output),
+                (
+                    usage.input_tokens,
+                    usage.cache_read_tokens,
+                    usage.output_tokens
+                ),
+                "the three token classes are ALWAYS separate - never summed"
+            );
+            assert_eq!(cost, cost_idr, "usage_daily carries what the request cost");
+
+            // Scoped to THIS request's reservation ref: the opening top-up is in
+            // the same ledger, so the account-wide sum would be dominated by it.
+            // Every row the request wrote carries the one ref it reserved under.
+            let request_rows: Vec<i64> = ledger_deltas(&pool_for_assertions, account_id)
+                .await
+                .into_iter()
+                .filter(|(_, reference)| reference.as_deref() == Some(reservation_ref.as_str()))
+                .map(|(delta, _)| delta)
+                .collect();
+            assert_eq!(
+                request_rows,
+                vec![-held_idr, held_idr, -cost_idr],
+                "the request's ledger move is -hold, +hold, -cost, in that order"
+            );
+            assert_eq!(
+                request_rows.iter().sum::<i64>(),
+                -cost_idr,
+                "the whole request's ledger move is exactly -cost_idr: -hold +hold -cost"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a settled hold must be paired, not stranded"
+            );
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
+    /// THE WASHED CASE. A stream that ended without a usage report is billed
+    /// NOTHING and gives the whole hold back (docs/failover.md:138-144). Token
+    /// counts are never invented to fill the gap.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn a_stream_without_usage_is_washed_and_the_whole_hold_returns() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let held_idr = expected_hold_idr(
+            &state.config,
+            "flash",
+            r#"{"model":"flash","stream":true}"#.as_bytes(),
+            None,
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(pool.clone(), account_id, async move {
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            assert!(matches!(
+                reserve_balance_transaction(
+                    &pool_for_assertions,
+                    account_id,
+                    held_idr,
+                    Some(&reservation_ref)
+                )
+                .await
+                .expect("place the hold"),
+                ReservationResult::Held { .. }
+            ));
+
+            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+            let guard = ReservationGuard::new(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                &reservation_ref,
+                "flash",
+            );
+            assert!(
+                settle_tx.send(StreamEnd::NoUsage).is_ok(),
+                "the settlement task must still be listening"
+            );
+
+            settle_after_stream(
+                settle_rx,
+                pool_for_assertions.clone(),
+                state.config.clone(),
+                state.events.clone(),
+                account_id,
+                key_id,
+                "flash".to_string(),
+                held_idr,
+                guard,
+            )
+            .await;
+
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr,
+                "an unreported stream must not be billed against invented token counts"
+            );
+            assert_eq!(
+                usage_today(&pool_for_assertions, account_id).await,
+                None,
+                "no usage was reported, so no usage row may exist"
+            );
+            // Scoped to this request's ref: the opening top-up lives in the same
+            // ledger and must not be counted as part of the request's move.
+            let request_rows: Vec<i64> = ledger_deltas(&pool_for_assertions, account_id)
+                .await
+                .into_iter()
+                .filter(|(_, reference)| reference.as_deref() == Some(reservation_ref.as_str()))
+                .map(|(delta, _)| delta)
+                .collect();
+            assert_eq!(
+                request_rows,
+                vec![-held_idr, held_idr],
+                "the hold went out and came back under the same ref"
+            );
+            assert_eq!(
+                request_rows.iter().sum::<i64>(),
+                0,
+                "the hold went out and came back: the ledger nets to zero"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a washed request must leave ZERO stranded holds"
+            );
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
+    /// A PARTIAL SETTLEMENT STILL BILLS (clamp_debit / UsageSettlement::Partial).
+    ///
+    /// The answer was already streamed and the usage WAS reported, so it is on the
+    /// books even when the wallet cannot cover it: the debit is clamped to the
+    /// balance, usage_daily still carries the FULL cost, and reconciliation still
+    /// holds because the ledger records only what was actually taken. The balance
+    /// never goes negative (docs/decisions.md D3).
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn a_clamped_debit_still_records_the_full_usage_and_stays_reconciled() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let opening_idr = 1_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(pool.clone(), account_id, async move {
+            // The whole balance is held, so the settlement has nothing left to
+            // collect from once the hold is released.
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            assert!(matches!(
+                reserve_balance_transaction(
+                    &pool_for_assertions,
+                    account_id,
+                    opening_idr,
+                    Some(&reservation_ref)
+                )
+                .await
+                .expect("place the hold"),
+                ReservationResult::Held { .. }
+            ));
+
+            let cost_idr = 2_500;
+            let outcome = debit_usage_transaction(
+                &pool_for_assertions,
+                account_id,
+                Some(key_id),
+                500,
+                100,
+                1_000,
+                cost_idr,
+                Some(&reservation_ref),
+                opening_idr,
+            )
+            .await
+            .expect("the settlement must record the usage, not discard it");
+
+            assert_eq!(
+                outcome,
+                UsageSettlement::Partial {
+                    new_balance: 0,
+                    debited_idr: opening_idr,
+                    shortfall_idr: cost_idr - opening_idr,
+                },
+                "a wallet that cannot cover the cost is a recorded shortfall, not a dropped charge"
+            );
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                0,
+                "the clamped debit lands on 0 and never below it"
+            );
+
+            let (input, cache_read, output, cost) = usage_today(&pool_for_assertions, account_id)
+                .await
+                .expect("the tokens were consumed, so the usage row exists");
+            assert_eq!(
+                (input, cache_read, output),
+                (500, 100, 1_000),
+                "the real counters are recorded, and the three classes stay separate"
+            );
+            assert_eq!(
+                cost, cost_idr,
+                "usage_daily carries the FULL cost: the 30-day spend window must not be understated"
+            );
+
+            // Scoped to this request's ref: the ledger records only what was
+            // ACTUALLY taken, so it still matches the wallet.
+            let request_rows: Vec<i64> = ledger_deltas(&pool_for_assertions, account_id)
+                .await
+                .into_iter()
+                .filter(|(_, reference)| reference.as_deref() == Some(reservation_ref.as_str()))
+                .map(|(delta, _)| delta)
+                .collect();
+            assert_eq!(
+                request_rows,
+                vec![-opening_idr, opening_idr, -opening_idr],
+                "the ledger records the hold, its release, and only the clamped debit"
+            );
+            assert_eq!(
+                request_rows.iter().sum::<i64>(),
+                -opening_idr,
+                "the ledger records only what was ACTUALLY taken, so it still matches the wallet"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a clamped settlement still pairs its hold"
+            );
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): a clamped debit must not break balance_idr = SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
 }
