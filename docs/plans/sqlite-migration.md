@@ -3,10 +3,12 @@
 **Status:** draft for review · **Date:** 2026-09-25 · **Branch:** `0.0.1`
 **Supersedes:** the untitled "Remove PocketBase and Migrate to Embedded SQLite + Custom Admin UI" draft
 **Amends:** [`decisions.md`](../decisions.md) — see [§3](#3-decisions-this-forces-the-register-to-change)
+**Companion:** [`proxy-hot-path-audit.md`](proxy-hot-path-audit.md) — the request path; this plan is the storage path
 
 **Settled in this revision:** identity strategy is **Google + email/password**
 ([§6](#6-phase-2--identity-the-real-cost)); low-code admin tooling assessed for the
-read-only surface only ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)).
+read-only surface only ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)); all
+decisions consolidated in [§11](#11-decisions).
 
 ---
 
@@ -138,7 +140,7 @@ loss-making at any markup"*, with cache reads priced separately
 `decisions.md` → Operations: *"Migrations: `sqlx migrate`, forward-only"* and
 *"Migration timing: In CI, after a snapshot, before the server — **never on
 application boot**."* The plan uses a dedicated `migrate` binary
-([§5.3](#53-migration-mechanism)).
+([§5.3](#53-phase-3--migration-mechanism)).
 
 Note a pre-existing gap this exposes: **no `sqlx::migrate!` call exists in the
 tree.** The Postgres schema is applied by `docker-entrypoint-initdb.d`
@@ -167,11 +169,14 @@ register is edited **first**, in Phase 0, and the docs follow.
 | --- | --- | --- |
 | Money store | PostgreSQL | **SQLite (embedded, WAL)** |
 | Identity store | PocketBase | **Rust-owned (`accounts` + `identities`)** |
+| SQL driver | `sqlx` (`postgres` feature) | **`sqlx` + `sqlite` feature — not `rusqlite`.** Decided; reasoning in [`proxy-hot-path-audit.md` §3](proxy-hot-path-audit.md) |
 | Account key | *"Postgres owns the id; PocketBase id is a linked column"* | **`accounts.id` is the only key; `pb_user_id` dropped** |
 | Login methods | *"Google + email/password, with reset"* | **unchanged as a product decision — but Rust now owns all of it.** Settled 2026-09-25 ([§6](#6-phase-2--identity-the-real-cost)) |
 | Password hashing | *"Argon2id — PocketBase owns this if it stays the auth provider — **verify which applies**"* | **Rust owns Argon2id.** The qualifier is now resolved: PocketBase is going, so it is ours. |
-| Transaction mode | — | **`BEGIN IMMEDIATE` for read-then-write transactions** ([§4.2](#42-connection-setup--three-traps)) |
-| Instance count | — | **exactly one.** SQLite cannot be shared across replicas |
+| Transaction mode | — | **`BEGIN IMMEDIATE` for read-then-write transactions** ([§4.2](#43-connection-setup--four-traps-all-measured)) |
+| Instance count | — | **exactly one** — and Northflank enforces it: a Single Read/Write volume *"limited to 1 instance"* ([§8](#8-operations-backup-rpo-and-the-volume)) |
+| Deploy downtime | — | **accepted.** A Single Read/Write volume forbids rolling restarts; every deploy is a brief outage |
+| Timestamp representation | — | **uniform RFC3339 with a format `CHECK`; time is never written in SQL** ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped)) |
 | Migrations | `sqlx migrate`, forward-only | **unchanged**, but now actually implemented |
 | Backup tooling | Managed PITR, else `pg_dump` + `wal-g` | **Litestream → Cloudflare R2** (or `VACUUM INTO` + offsite) |
 | RPO 15 min / RTO 4 h | — | **unchanged target**; the mechanism changes, the target does not |
@@ -188,84 +193,138 @@ Two further register additions:
 
 ## 4. Target schema
 
-### 4.1 Dialect translation rules
+### 4.1 The measured port inventory
 
-Applied mechanically across all SQL. **106 `$N` placeholders** across 9 files.
+Counted against the tree, not estimated. This is the actual work list.
+
+| Construct | Sites | Where | Action |
+| --- | --- | --- | --- |
+| `$N` placeholders | **106** | 9 files | → `?` |
+| SQL-side `now()` | **17** | `db.rs` 8, `auth.rs` 4, `keys.rs` 2, `events.rs` 1, `account.rs` 1, `abuse.rs` 1 | → bound from Rust ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped)) |
+| `::bigint` / `::integer` casts | **18** | aggregate `SELECT`s in `abuse.rs`, `db.rs`, `account.rs`, `events.rs`, `keys.rs`, `ip_tracking.rs` | → **remove**; safe because every column is `INTEGER` ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped) note 3) |
+| `SELECT … FOR UPDATE` | **2** | `db.rs:32`, `db.rs:155` | → conditional UPDATE + `rows_affected()` ([§4.4](#45-the-two-for-update-sites)) |
+| `ON CONFLICT … DO UPDATE` | **2** | `db.rs:466`, `ip_tracking.rs:201` | → **keep**; measured working, including the table-qualified form |
+| `ON CONFLICT … DO NOTHING` | **2** | `ip_tracking.rs:196`, `auth.rs:233` | → `auth.rs` goes with PocketBase; `ip_tracking.rs` is blocked by the CTE below |
+| **Data-modifying CTE** | **1** | `ip_tracking.rs:190-205` | → **no SQLite equivalent; must be rewritten** ([§4.7](#47-the-data-modifying-cte--one-function-must-be-rewritten)) |
+| `interval '2 hours'` | **1** | `abuse.rs:309` | → `datetime('now','-2 hours')` (test helper) |
+| `SELECT now() - interval …` | 0 | — | not used in production SQL |
+| `= ANY($1)` array bind | **0** | — | the 3 `ANY(` hits are Rust `.iter().any()` |
+| `GREATEST` / `LEAST` | **0** | — | the 12 `LEAST` hits are prose ("at least") |
+| `jsonb` / `->>` operators | **0** | — | `models` is bound as a `serde_json::Value`, not queried as JSON |
+| `CREATE EXTENSION` | 1 | migration | → delete |
+| `gen_random_uuid()` | — | schema defaults | → `Uuid::new_v4()` in Rust |
+
+**Two pieces of good news that shrink the port:**
+
+1. **Zero compile-time SQL macros.** No `sqlx::query!`, no `.sqlx` offline cache, no
+   `DATABASE_URL` needed at build time. Every query is runtime-checked
+   `sqlx::query`/`query_scalar`/`query_as`. The port is compiler-verified with no
+   schema-drift build step to maintain.
+2. **No array binds and no Postgres-only JSON operators.** Those are the two dialect
+   gaps that usually force genuine rewrites. Neither is present.
+
+### 4.2 Dialect translation rules
 
 | Postgres | SQLite | Notes |
 | --- | --- | --- |
 | `$1`, `$2` | `?` | sqlx SQLite is positional. Reused binds need `?1` form. |
 | `PgPool` | `SqlitePool` | |
 | `Transaction<'_, Postgres>` | `Transaction<'_, Sqlite>` | |
-| `now()` | `CURRENT_TIMESTAMP` | |
+| `now()` | **bind from Rust** | Not `CURRENT_TIMESTAMP` — see [§4.6](#46-timestamps--the-hazard-that-would-have-shipped). |
 | `gen_random_uuid()` | `Uuid::new_v4()` in Rust | `uuid` crate already a dependency. |
-| `::bigint` cast | removed | |
-| `RETURNING` | **keep** | SQLite ≥ 3.35. Preserves the guarded-UPDATE-then-read pattern. |
-| `ON CONFLICT … DO UPDATE` | **keep**, `EXCLUDED` → `excluded` | SQLite ≥ 3.24. |
-| `SELECT … FOR UPDATE` | **remove** | See [§4.4](#44-the-two-for-update-sites). |
+| `::bigint`, `::integer` | removed | Syntax error otherwise: `unrecognized token: ":"` (measured). |
+| `RETURNING` | **keep** | Measured working, including on an UPSERT. |
+| `ON CONFLICT … DO UPDATE` | **keep** | Measured working, including the table-qualified `t.n = t.n + excluded.n` form. |
+| `SELECT … FOR UPDATE` | **remove** | Syntax error (measured). See [§4.4](#45-the-two-for-update-sites). |
+| `WITH x AS (INSERT … RETURNING …)` | **remove** | No SQLite equivalent (measured). See [§4.7](#47-the-data-modifying-cte--one-function-must-be-rewritten). |
+| `interval '2 hours'` | `datetime('now','-2 hours')` | `interval` is parsed as a column name (measured). |
 | `CREATE EXTENSION pgcrypto` | removed | |
-| `TIMESTAMPTZ`, `DATE` | `TEXT` | |
-| `JSONB` | `TEXT` | sqlx `json` feature. |
+| `TIMESTAMPTZ`, `DATE` | `TEXT` | With a format `CHECK` — [§4.6](#46-timestamps--the-hazard-that-would-have-shipped). |
+| `JSONB` | `TEXT` | sqlx `json` feature. Measured: `serde_json::Value` binds and decodes. |
 | `UUID` | `TEXT` | sqlx `uuid` feature decodes `TEXT`. |
 | `BIGSERIAL` | `INTEGER PRIMARY KEY AUTOINCREMENT` | |
-| `BOOLEAN` | `INTEGER` (0/1) | |
+| `BOOLEAN` | `INTEGER` (0/1) | `TRUE`/`FALSE` literals are accepted (measured) and evaluate to 1/0. |
 | `SMALLINT` | `INTEGER` | |
-| Partial indexes, `CHECK` | **keep** | Both supported. |
+| Partial indexes, `CHECK`, `COALESCE` | **keep** | All supported. |
+| `MAX(a, b)` | **keep, but note** | SQLite's `MAX` is dual-purpose: aggregate with 1 arg, scalar with 2+. |
 
-**Good news that shrinks the port:** the codebase uses **zero compile-time SQL
-macros** — no `sqlx::query!`, no `.sqlx` offline cache, no `DATABASE_URL` needed at
-build time. Every query is runtime-checked `sqlx::query`/`query_scalar`/`query_as`.
-The port is therefore mechanical and compiler-verified, with no schema-drift build
-step to maintain. This is a real advantage over most sqlx codebases.
+**A note on the last row, because it matters.** The draft's
+`MAX(0.0, balance - ?)` would **not** be a syntax error in SQLite — it is the valid
+scalar form and evaluates to 0 for a shortfall (measured). The defect is semantic, not
+syntactic: it would run, silently clamp, and corrupt the ledger invariant. That is a
+worse failure mode than a crash, and it is the reason §2.2 is a rejection rather than a
+preference.
 
-### 4.2 Connection setup — three traps
+### 4.3 Connection setup — four traps, all measured
+
+Every claim below is reproducible by running
+[`tools/sqlite-probes/sqlite-port-probe.py`](../../tools/sqlite-probes/sqlite-port-probe.py) (SQLite 3.53.1).
+They are measured, not recalled, because three of the four fail **silently**.
 
 ```rust
 let options = SqliteConnectOptions::from_str(&database_url)?
     .create_if_missing(true)
-    .journal_mode(SqliteJournalMode::Wal)      // persistent in the file
+    .journal_mode(SqliteJournalMode::Wal)      // persists in the file (measured)
     .synchronous(SqliteSynchronous::Normal)    // safe with WAL; avoids fsync per commit
     .busy_timeout(Duration::from_secs(5))      // replaces FOR UPDATE waiting
-    .foreign_keys(true);                       // <-- see trap 1
+    .foreign_keys(true);                       // <-- trap 1
 
 let pool = SqlitePoolOptions::new().max_connections(8).connect_with(options).await?;
 ```
 
-**Trap 1 — foreign keys are OFF by default in SQLite.** This is per-connection, not
-per-database. Without `.foreign_keys(true)` every `ON DELETE CASCADE` in the schema
-silently does nothing. The schema leans on cascade heavily (`api_keys`, `sessions`,
-`usage_daily`, `key_ip_daily`, `telegram_links`, `link_codes`). Missing this does not
-fail loudly — it leaks orphan rows and breaks reconciliation.
+**Trap 1 — foreign keys are OFF by default.** Measured: `PRAGMA foreign_keys` → `0`.
+It is **per-connection**, not per-database. With it off, an insert referencing a
+non-existent parent is **accepted** — measured, not inferred. Every `ON DELETE
+CASCADE` in the schema silently does nothing (`api_keys`, `sessions`, `usage_daily`,
+`key_ip_daily`, `telegram_links`, `link_codes`), and the `ON DELETE RESTRICT` that is
+supposed to make a hard delete of a funded account *impossible* stops working. This
+is the single most dangerous omission in the port: it fails silently and it removes a
+money backstop.
 
 **Trap 2 — deferred transactions that read then write can fail unrecoverably.**
-SQLite's default `BEGIN` is deferred: a transaction that `SELECT`s and later
-`UPDATE`s may get `SQLITE_BUSY_SNAPSHOT` on upgrade, and that error **cannot be
-resolved by retrying** — the transaction must be rolled back and restarted. Two
-existing functions are exactly this shape: `credit_topup_transaction` (SELECT then
-UPDATE) and `refund_topup_transaction` (SELECT then UPDATE). Both must use
-`BEGIN IMMEDIATE`. sqlx's `pool.begin()` issues a deferred `BEGIN`, so add a helper
-that acquires a connection and issues `BEGIN IMMEDIATE` explicitly, and route those
-two call sites through it.
+SQLite's default `BEGIN` is deferred. A transaction that `SELECT`s and later `UPDATE`s
+can get `SQLITE_BUSY_SNAPSHOT` on upgrade, and that error **cannot be resolved by
+retrying** — the transaction must be rolled back and restarted. Two existing functions
+are exactly this shape: `credit_topup_transaction` and `refund_topup_transaction`.
+Both must use `BEGIN IMMEDIATE` (measured: accepted). sqlx's `pool.begin()` issues a
+deferred `BEGIN`, so add a helper that acquires a connection and issues
+`BEGIN IMMEDIATE` explicitly, and route both call sites through it.
 
-**Trap 3 — `NULL` in a composite primary key.** In Postgres a PK column is implicitly
-`NOT NULL`. **SQLite does not enforce this** (a documented legacy behaviour), and
-`NULL`s compare as distinct in unique indexes. `usage_daily`'s key is
-`(account_id, api_key_id, day)` and `api_key_id` is *deliberately nullable*
-(`ON DELETE SET NULL`). Under SQLite the `ON CONFLICT (account_id, api_key_id, day)`
-upsert would **never match when `api_key_id IS NULL`** and would insert duplicate
-rows every request — silently corrupting usage accounting. Fix: add an explicit
-partial unique index plus a sentinel-free design, or declare the column `NOT NULL`
-and use a sentinel. Recommended: keep it nullable but add
+**Trap 3 — `NULL` in a composite primary key duplicates rows.** In Postgres a PK
+column is implicitly `NOT NULL`; **SQLite does not enforce this.** Measured: a `NULL`
+in a composite PK is **accepted** (Postgres would refuse the row outright).
+
+The consequence, measured: with `PRIMARY KEY (account_id, api_key_id, day)` and
+`api_key_id` nullable, three identical `ON CONFLICT (account_id, api_key_id, day)`
+upserts produced **3 rows instead of 1**. The conflict target never matches, because
+SQLite treats `NULL`s as distinct in unique indexes, so the upsert degrades into a
+plain insert — every call adds a row.
+
+**Severity, stated precisely: this is latent today, not live.** The production call
+site passes `Some(key_id)` (`proxy.rs:1337`), so `api_key_id` is never `NULL` on the
+settlement path. It becomes live the moment a key row is hard-deleted
+(`ON DELETE SET NULL`), or a test or future caller passes `None` — and
+`debit_usage_transaction` accepts `Option<Uuid>` by signature. It would then surface
+as unbounded table growth and wrong per-key aggregates, with no error.
+
+The fix is verified: a `COALESCE` unique index plus a matching conflict target makes
+three calls produce **1 row with the correct accumulated total** (measured).
 
 ```sql
 CREATE UNIQUE INDEX usage_daily_scope_uniq
   ON usage_daily (account_id, day, COALESCE(api_key_id, ''));
 ```
 
-and target that index in the upsert. **This must have a regression test** — it fails
-silently and only surfaces as wrong money on the dashboard.
+and target **that index** in the upsert. Cheap insurance for an invariant that is
+otherwise unenforced.
 
-### 4.3 `usage_events` — the one genuinely new table
+**Trap 4 — `VACUUM INTO` cannot run inside a transaction.** Measured: it succeeds in
+autocommit and is **refused** with `cannot VACUUM from within a transaction` otherwise.
+This matters for [§8](#8-operations-backup-rpo-and-the-volume) — the backup path must
+either run on a dedicated autocommit connection or commit first, and a backup script
+that shares the application's pooled connection will fail.
+
+### 4.4 `usage_events` — the one genuinely new table
 
 The draft's "Recent Usage Feed" needs per-request rows with model, tokens and cost.
 `usage_daily` cannot serve it (daily granularity) and `ledger` has no token counts.
@@ -282,13 +341,14 @@ CREATE TABLE usage_events (
   output_tokens     INTEGER NOT NULL DEFAULT 0,
   cost_idr          INTEGER NOT NULL DEFAULT 0,
   ref               TEXT,
-  created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at        TEXT NOT NULL
+                    CHECK (created_at GLOB '????-??-??T??:??:??*+00:00')
 );
 CREATE INDEX usage_events_recent_idx ON usage_events (created_at DESC);
 CREATE INDEX usage_events_account_idx ON usage_events (account_id, created_at DESC);
 ```
 
-Three constraints on it:
+Four constraints on it:
 
 1. **Three token counters**, never `prompt`/`completion` — see [§2.5](#25-prompt_tokens--completion_tokens--rejected).
 2. **`cost_idr` is `INTEGER`**, never `REAL`.
@@ -296,25 +356,133 @@ Three constraints on it:
    logging verified in code and logs"*. A per-request table is a retention liability;
    it gets a sweep job alongside the existing `ip-purge` binary, and an entry in
    [`data-retention.md`](../data-retention.md).
+4. **No `DEFAULT CURRENT_TIMESTAMP`**, and the format `CHECK` is mandatory — see
+   [§4.6](#46-timestamps--the-hazard-that-would-have-shipped). This applies to every
+   timestamp column in the schema, not just this one.
 
-### 4.4 The two `FOR UPDATE` sites
+### 4.5 The two `FOR UPDATE` sites
 
-`server/src/db.rs:32` and `server/src/db.rs:155`. SQLite has no row locks; `FOR
-UPDATE` is a syntax error. Both are top-up idempotency guards, and both are better
-served by a **conditional UPDATE plus `rows_affected()`** — which needs no lock at
-all and is correct under any isolation level:
+`server/src/db.rs:32` and `server/src/db.rs:155`. SQLite has no row locks, and
+`SELECT … FOR UPDATE` is a **syntax error** (measured). Both are top-up idempotency
+guards, and both are better served by a **conditional UPDATE plus
+`rows_affected()`** — which needs no lock at all and is correct under any isolation
+level:
 
 ```sql
-UPDATE topups SET status = 'settled', settled_at = CURRENT_TIMESTAMP
+UPDATE topups SET status = 'settled', settled_at = ?
 WHERE order_id = ? AND status = 'pending' AND amount_idr = ?;
 ```
+
+(`settled_at` is bound from Rust — [§4.6](#46-timestamps--the-hazard-that-would-have-shipped).)
 
 If `rows_affected() == 0`, one disambiguating `SELECT` decides between
 `AlreadySettled`, `NotFound` and `AmountMismatch` — the same three outcomes
 `TopupCreditResult` already models. This removes the lock instead of emulating it,
 and keeps the existing tests meaningful.
 
-### 4.5 Suspension and soft delete — already the design, with one correction
+### 4.6 Timestamps — the hazard that would have shipped
+
+This is the finding most likely to have caused a production incident, and it is
+invisible unless you read sqlx's encoder.
+
+**The two sides disagree on format.**
+
+| Source | Produces |
+| --- | --- |
+| Rust binding a `DateTime<Utc>` | `'2026-10-25T06:27:22+00:00'` — sqlx-sqlite 0.8.6 encodes via `to_rfc3339_opts(SecondsFormat::AutoSi, false)` |
+| SQLite `CURRENT_TIMESTAMP` | `'2026-09-25 06:28:31'` — space separator, no offset, no fraction |
+
+Both land in the same `TEXT` columns. **SQLite compares `TEXT` lexicographically**, so
+the formats are not interchangeable — measured, and the consequences are not cosmetic:
+
+- **Same instant, two formats, compares unequal.** Measured: `'2026-10-25T06:27:22+00:00'
+  = '2026-10-25 06:27:22'` → `0`.
+- **Session expiry breaks in the unsafe direction.** The session guard is
+  `expires_at > now()`. Measured with `expires_at` written by Rust and `now()` by
+  SQLite, for a session that expired **7.5 hours earlier**: the predicate returns
+  **1 — still valid**. `'T'` (0x54) sorts after `' '` (0x20), so on the expiry *date*
+  the RFC3339 value always outranks the space-format value regardless of the time. The
+  session survives until midnight instead of until its expiry instant. Up to ~24 hours
+  of extra session life, silently, on a money-bearing session.
+
+**The rule: one representation, enforced by the database.**
+
+1. **Never write time in SQL.** All 17 `now()` sites become a Rust bind. SQLite has no
+   `now()` anyway (measured: `no such function: now`), so this is forced — but the
+   *reason* is the format, not the syntax.
+2. **No `DEFAULT CURRENT_TIMESTAMP` anywhere in the schema.** A default that fires
+   writes the other format. Every timestamp column is `NOT NULL` with no default, so
+   forgetting a bind is a loud error rather than silent drift.
+3. **Every timestamp column carries a format `CHECK`.** Measured against 8 inputs:
+
+   ```sql
+   CHECK (created_at GLOB '????-??-??T??:??:??*+00:00')
+   ```
+
+   accepts `…T06:27:22+00:00`, `…T06:27:22.890+00:00` and `…T06:27:22.000000+00:00`;
+   refuses the space format, the `Z` form, the offset-less form, and garbage. This
+   makes the invariant structural rather than a convention — the same reasoning that
+   puts `CHECK (balance_idr >= 0)` in the schema as the authoritative backstop.
+
+**Verified safe:** with a uniform RFC3339-offset format, lexicographic ordering is
+correct even when the fractional part varies in length (measured across 3 boundary
+cases), because the offset always follows the seconds. Fixed-millisecond precision
+removes the last ambiguity and is what the DDL uses. If SQL-side time is ever needed
+in a pinch, the matching form is
+`strftime('%Y-%m-%dT%H:%M:%f','now') || '+00:00'` (measured).
+
+**Decoding is fine.** sqlx-sqlite's `decode_datetime_from_text` tries RFC3339 first,
+then a table of fallbacks including `%F %T%.f`. So RFC3339 round-trips, and — worth
+knowing — the space format would *also* have decoded. The bug is in comparison, not
+decoding, which is exactly why it would have gone unnoticed.
+
+**Rejected alternative, recorded:** store `INTEGER` unix seconds. sqlx decodes an
+`INTEGER` as unix seconds natively (`Utc.timestamp_opt(v, 0)`), comparisons are
+numeric and unambiguous, and there is no format to get wrong. It is arguably the more
+robust choice. It was rejected because it forces every Rust bind to `i64` and makes
+`sqlite3` output unreadable during the incident you most want to read it in. If the
+format `CHECK` proves annoying in practice, this is the fallback — and it is a
+one-migration change.
+
+**Why this also settles the `::bigint` removal.** Measured: `SUM()` over an `INTEGER`
+column returns `typeof` `integer`, but over a `REAL` column returns `real`. The 18
+`::bigint` casts exist precisely to force an integer type before decoding into `i64`
+(`events.rs:666` records the panic that motivated them). With every money and token
+column declared `INTEGER`, `SUM` returns an integer and the casts are unnecessary —
+**and this is the concrete reason `balance REAL` in the draft would have broken
+decoding**, not just violated a convention.
+
+### 4.7 The data-modifying CTE — one function must be rewritten
+
+`ip_tracking.rs:190-205` uses a Postgres-only construct:
+
+```sql
+WITH inserted AS (
+    INSERT INTO key_ip_seen (...) VALUES (...) ON CONFLICT DO NOTHING RETURNING 1
+)
+INSERT INTO key_ip_daily (...)
+VALUES ($1, $2, (SELECT COUNT(*) FROM inserted)::integer, 1)
+ON CONFLICT (api_key_id, day) DO UPDATE ...
+```
+
+Measured: SQLite **rejects** this with `near "INSERT": syntax error`. SQLite's `WITH`
+clause accepts only `SELECT` in a CTE; data-modifying CTEs do not exist. There is no
+dialect translation for this — it is a rewrite.
+
+The pattern's purpose is to answer "was this `(api_key, day, ip_hash)` pair already
+seen today?" inside one statement, so `distinct_ips` cannot race. The port must
+preserve that property. Two candidate shapes, to be settled in the phase:
+
+| Approach | Shape | Trade-off |
+| --- | --- | --- |
+| **Two statements in one `BEGIN IMMEDIATE`** | `INSERT … ON CONFLICT DO NOTHING` → `changes()`; then the `key_ip_daily` upsert using that count | Preserves atomicity and the no-race property. Two round trips on one connection instead of one statement. **Preferred.** |
+| `INSERT … RETURNING` then read | Insert and use `rows_affected()` directly | One statement, but the count must reach the second statement, so it still needs a transaction |
+
+**Either way it is one function, not a pattern.** Worth noting explicitly because
+`ip_tracking.rs` is 782 lines and only this one statement is affected — the rest of the
+file is ordinary SQL.
+
+### 4.8 Suspension and soft delete — already the design, with one correction
 
 The draft proposes `is_active INTEGER DEFAULT 1` and `is_deleted INTEGER DEFAULT 0`
 on the user table. **Do not add them.** The schema already models both, more
@@ -333,7 +501,7 @@ The FK behaviour the draft worries about is already deliberate and correct:
 so a hard delete is refused by the database rather than orphaning money. `api_keys`,
 `sessions`, `usage_daily`, `link_codes` and `telegram_links` use `ON DELETE CASCADE`.
 Under SQLite the `RESTRICT` half only holds if `foreign_keys(true)` is set —
-[§4.2](#42-connection-setup--three-traps), trap 1.
+[§4.2](#43-connection-setup--four-traps-all-measured), trap 1.
 
 **The correction that matters: a status flag alone does not stop `/v1/*` traffic.**
 The proxy's key lookup is
@@ -358,9 +526,85 @@ path would buy a read per request to achieve what revocation already achieves.
   **in-process**. `proxy.rs:567-572` records the residual staleness for a *second*
   instance. Pinning to **exactly one instance** ([§3](#3-decisions-this-forces-the-register-to-change))
   removes that window entirely — a genuine side benefit of the SQLite constraint.
-- `decisions.md` fixes the cache TTL at 60 s, so an *un-invalidated* change (a
+- `decisions.md` fixes the cache TTL at 60 s, so an *un-initialised* change (a
   narrowed model allowlist) is honest about its window. Revocation is not in that
   class.
+
+### 4.9 `STRICT` tables — make the money rule structural
+
+**Measured, and it changes the DDL: an `INTEGER` declaration in SQLite is only
+*affinity*, not enforcement.**
+
+```sql
+CREATE TABLE plain (v INTEGER NOT NULL CHECK (v >= 0));
+INSERT INTO plain VALUES (1.5);   -- accepted; stored as REAL, typeof = 'real'
+```
+
+A `REAL` value lands in a money column, and `CHECK (v >= 0)` does not stop it. For a
+codebase whose register says *"Money type: `BIGINT` IDR — never floating point"*, that
+is the same class of silent failure as the `MAX(0, …)` clamp: it does not crash, it
+corrupts.
+
+`STRICT` tables (SQLite ≥ 3.37) enforce the declared type. Measured:
+
+| Test | Ordinary table | `STRICT` table |
+| --- | --- | --- |
+| `INSERT 1.5` into `INTEGER` | accepted, stored as `real` | **refused**: `cannot store REAL value in INTEGER column` |
+| `INSERT 'yes'` into `INTEGER` | accepted | **refused**: `cannot store TEXT value in INTEGER column` |
+| `INSERT NULL` into a composite PK column | accepted | **refused**: `NOT NULL constraint failed` |
+
+Three consequences, all good:
+
+1. **"Money is never floating point" becomes a database backstop**, not a convention.
+   This is the same reasoning that puts `CHECK (balance_idr >= 0)` in the schema.
+2. **The composite-PK `NULL` trap is fixed structurally for PK columns** — `STRICT`
+   implies `NOT NULL` on them. (The `usage_daily` case still needs its `COALESCE`
+   unique index, because there `api_key_id` is deliberately *outside* the key so it can
+   stay nullable for `ON DELETE SET NULL`.)
+3. **It is compatible with everything else in the schema** — measured against the
+   `GLOB` timestamp `CHECK`, the `'[]'` JSON default, and partial indexes: all fine.
+
+**Therefore: every table in [Appendix A](#appendix-a--target-sqlite-schema) is declared
+`STRICT`.** Requires SQLite ≥ 3.37; sqlx-sqlite 0.8.6 bundles well past that, but the
+build must pin it rather than assume.
+
+This is the single highest-value change in the whole plan after the timestamp rule: it
+converts the register's money rule from something reviewers enforce into something the
+database enforces.
+
+### 4.10 `ON DELETE SET NULL` collides with the `COALESCE` unique index
+
+Found by running [Appendix A](#appendix-a--target-sqlite-schema) rather than by reading
+it — which is the argument for validating a schema before porting against it.
+
+The ported `usage_daily.api_key_id` was `ON DELETE SET NULL`, matching Postgres. Under
+SQLite that combination is **broken**, and it fails only in a specific ordering:
+
+1. A row exists for `(account, NULL, day)` — reachable because
+   `debit_usage_transaction` takes `Option<Uuid>`.
+2. A key with its own `(account, key, day)` row is deleted.
+3. `SET NULL` fires and tries to write `NULL` into a row that now collides with the
+   existing `NULL` row on `usage_daily_scope_uniq`.
+
+Measured result: `UNIQUE constraint failed: index 'usage_daily_scope_uniq'`. The delete
+**fails**, so a key deletion can be blocked by an unrelated NULL-keyed aggregate row.
+
+**Fix: `usage_daily.api_key_id` becomes `ON DELETE RESTRICT`.** Three reasons, in order
+of weight:
+
+1. It matches the money tables. `wallets`, `ledger` and `topups` all use `RESTRICT`,
+   and `admin-surface.md:151` says *"No hard deletes, ever."* A key with billing
+   history should not be deletable at all — revoking is `revoked_at`.
+2. It removes the failure mode entirely, rather than depending on which rows happen to
+   exist.
+3. `usage_daily` is a financial aggregate and is never swept. Destroying it via
+   `CASCADE` would be worse than refusing the delete; orphaning it via `SET NULL` is
+   what breaks.
+
+`usage_events.api_key_id` keeps `ON DELETE SET NULL`, deliberately: that table **is**
+swept for retention, so it must not be able to block a key purge, and it carries no
+unique index that a NULL could collide with. The asymmetry is intentional and is
+recorded here so it does not look like an oversight.
 
 ---
 
@@ -374,7 +618,7 @@ Nothing else starts until this lands, because every later document reads from it
 ### 5.1 Phase 1 — Dependency and config
 
 - `server/Cargo.toml`: swap `postgres` → `sqlite` in the `sqlx` feature list. Keep
-  `uuid`, `chrono`, `json`. **Drop `migrate` unless [§5.3](#53-migration-mechanism) is adopted.**
+  `uuid`, `chrono`, `json`. **Drop `migrate` unless [§5.3](#53-phase-3--migration-mechanism) is adopted.**
 - `DATABASE_URL=sqlite://data/server.db` (a file path, not a network URL).
 - `data/` must be on the **persistent volume** ([§8](#8-operations-backup-rpo-and-the-volume)).
 - Delete `POSTGRES_PASSWORD`, `POCKETBASE_URL` from `.env.example`.
@@ -384,7 +628,7 @@ Nothing else starts until this lands, because every later document reads from it
 ### 5.2 Phase 2 — Schema port
 
 Rewrite `server/migrations/20260925000000_initial_schema.sql` in SQLite dialect per
-[§4.1](#41-dialect-translation-rules). **Replace in place** — there is no production
+[§4.1](#42-dialect-translation-rules). **Replace in place** — there is no production
 data to preserve, and a single migration is honest about that.
 
 ### 5.3 Phase 3 — Migration mechanism
@@ -424,14 +668,14 @@ they can **run in CI by default**, including
 proof that is currently never executed automatically.
 
 Re-point them at `tempfile::TempDir` (dev-dependency), drop the `#[ignore]`, and add
-the two new regression tests [§4.2](#42-connection-setup--three-traps) demands
+the two new regression tests [§4.2](#43-connection-setup--four-traps-all-measured) demands
 (the `NULL`-`api_key_id` upsert, and the `BEGIN IMMEDIATE` read-then-write path).
 
 ### 5.6 Phase 6 — Identity
 
 [§6](#6-phase-2--identity-the-real-cost). Sequenced after the database port because it
 is the largest phase and the only one that depends on decisions outside the codebase
-(open decisions 1 and 2). The strategy itself is settled — Google + email/password —
+(§11.2 items 1 and 2). The strategy itself is settled — Google + email/password —
 so this phase is unblocked and can run in parallel with Phase 8 if there is capacity.
 
 ### 5.7 Phase 7 — Admin surface
@@ -611,60 +855,126 @@ endpoints.
 
 **Net:** a low-code tool is a real saving on the read-only surface and a real hazard on
 the money surface. Use it for the former; keep the latter behind audited endpoints and
-a purpose-built form. This is open decision 4 in [§11](#11-open-decisions).
+a purpose-built form. Decided as 10 in [§11.1](#111-decided).
 
 ---
 
 ## 8. Operations: backup, RPO, and the volume
 
-Three things the draft does not address, all of which are load-bearing.
+Five things the draft does not address, all load-bearing. The first four are answered
+by Northflank's own documentation
+([volumes](https://northflank.com/docs/v1/application/databases-and-persistence/add-a-volume),
+[pricing](https://northflank.com/docs/v1/application/billing/pricing-on-northflank)) —
+read, not assumed.
 
-**1. Persistent volume.** SQLite is a file. Northflank containers are ephemeral
-without an attached volume, and a redeploy would silently discard the ledger. The
-`data/` directory **must** be a mounted volume, and this must be verified by a
-restore drill, not assumed.
+**1. The volume is mandatory, and it is not just a formality.** SQLite is a file.
+Northflank volumes "persist data across restarts"; without one, a redeploy silently
+discards the ledger. Mount the `data/` directory and verify by restore drill.
 
-**2. Backup and the 15-minute RPO.** `decisions.md` requires *"PITR plus offsite;
+**2. Single-instance is enforced by the platform — which is better than a convention.**
+Northflank's volume access modes: *Single Read/Write* is the default and means
+*"Services are limited to 1 instance … Cannot scale services horizontally (replicas >
+1) with the same volume attached … Cannot enable high availability."* Their docs also
+state that *Multi Read/Write* is *"Not suitable for databases or applications
+expecting exclusive write access."*
+
+So attaching the volume in Single Read/Write mode makes [§3](#3-decisions-this-forces-the-register-to-change)'s
+"exactly one instance" **structural rather than a convention someone can violate.**
+That is a genuine safety win: the failure mode the register addition guards against
+becomes impossible rather than discouraged.
+
+**3. Deploys cause downtime, and that is a real cost.** The same documentation:
+*"During restarts, the running container will always be terminated before the new one
+starts (regardless of health check settings)."* With a Single Read/Write volume there
+is **no rolling deploy and no zero-downtime restart** — every deploy is a hard stop
+followed by a start. For a prepaid API this means a brief outage per release and it
+needs a maintenance window, not a silent push. The register's deploy order
+(*"Migrate → server → health → frontend"*) still holds, but it now has an outage
+attached to it, and that belongs in the launch checklist.
+
+**4. Two operational traps that will otherwise cost a debugging session.**
+
+- **File permissions.** *"Ownership of persistent volumes will be given to the group
+  specified in the Docker image, determined at build time. This may cause issues if
+  your application attempts to read, write, or execute with a different user."*
+  SQLite will fail to open the database with `unable to open database file` — an error
+  that reads like a path bug and is actually an ownership bug. Fix with `USER` in the
+  Dockerfile, or a `chown` in the entrypoint. Must be verified on the real volume, not
+  locally.
+- **Volumes cannot shrink.** *"Volume storage cannot be scaled down after creation."*
+  Pick the size deliberately; it is a one-way decision.
+
+**5. Backup and the 15-minute RPO.** `decisions.md` requires *"PITR plus offsite;
 restore drill required"* with **RPO 15 minutes**. WAL alone does not provide this.
-Two options:
 
 | Option | RPO | Cost |
 | --- | --- | --- |
-| **Litestream → Cloudflare R2** (recommended) | seconds | One sidecar process, ~20-30 MB RSS. Continuous WAL shipping. Cloudflare is already in the stack. |
-| Cron `VACUUM INTO` + upload | up to the interval | Simpler; needs a separate job; a 15-min interval means 15-min RPO at best. |
+| **Litestream → Cloudflare R2** (recommended) | seconds | Continuous WAL shipping. Cloudflare is already in the stack. |
+| Cron `VACUUM INTO` + upload | up to the interval | Simpler; a 15-min interval means 15-min RPO at best. |
 
-Budget Litestream's memory against the 256 MB limit — it is affordable, but it is not
-free, and the plan's *"< 50 MB RSS"* target in the draft did not account for it.
+**Litestream must run as a sidecar process inside the API container, not as a second
+service.** This is forced, not preferred: a second service mounting the same volume is
+impossible under Single Read/Write (one pod), and Multi Read/Write is documented as
+unsuitable for databases. The architecture decision follows from the access mode.
+
+Two consequences to budget:
+
+- **Memory.** Litestream adds ~20-30 MB RSS against a 256 MB limit. The draft's
+  *"< 50 MB RSS"* target did not account for it.
+- **`VACUUM INTO` cannot run inside a transaction** ([§4.3](#43-connection-setup--four-traps-all-measured),
+  trap 4). If the cron route is chosen, the backup connection must be in autocommit —
+  a script reusing the application's pooled connection will fail.
+
 Launch Gate 1 (`docs/launch-checklist.md`) changes from `pg_dump`/WAL archiving to
 whichever is chosen, **and the restore drill must be re-run.**
 
-**3. Exactly one instance.** Two replicas on two volumes is two divergent ledgers.
-Pin replicas to 1 in the deploy config and record it in the register.
+**A further platform constraint worth recording.** The free Developer Sandbox plan
+allows *"2 services, 2 jobs, 1 addon"*, and Northflank states it *"should not be used
+for production applications"*. Two implications: the sidecar decision above keeps the
+service count at one, which the 2-service limit makes worthwhile; and taking customer
+money on a tier the vendor says is not for production is a real risk. `decisions.md`
+already carries *"Northflank actual prices — a quote"* as genuinely open, and this
+sharpens what the quote is for.
 
 ---
 
 ## 9. Verification
 
-Ordered by what would fail silently if skipped.
+Ordered by what would fail silently if skipped. Checks 1–3 and 7 are already
+**implemented as runnable probes** in `tools/sqlite-probes/` — they were used to write
+[§4.3](#43-connection-setup--four-traps-all-measured) and
+[§4.6](#46-timestamps--the-hazard-that-would-have-shipped), so they are evidence, not
+proposals.
 
-| # | Check | Command / method |
-| --- | --- | --- |
-| 1 | Foreign keys actually on | Insert a child with a bad FK; it must **fail**. If it succeeds, `foreign_keys(true)` is missing. |
-| 2 | `NULL` `api_key_id` upsert | Record usage twice with `api_key_id = NULL`; `usage_daily` must have **one** row, not two. |
-| 3 | Read-then-write under contention | Concurrent `refund_topup_transaction` calls must not raise `SQLITE_BUSY_SNAPSHOT`. |
-| 4 | Ledger invariant | `SELECT COUNT(*) FROM (SELECT w.account_id FROM wallets w LEFT JOIN ledger l ON l.account_id=w.account_id GROUP BY w.account_id, w.balance_idr HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr),0))` → **0**. This is Launch Gate 2. |
-| 5 | Stranded holds | `unpaired_hold_rows` → **0** for every account (`db.rs:1692`). |
-| 6 | Overdraw proof | `cargo test --lib` — the concurrency test now runs **without** `--ignored`. |
-| 7 | WAL is actually on | `PRAGMA journal_mode;` → `wal`. Confirm it survives a reconnect. |
-| 8 | Concurrent readers unblocked | Read while a write transaction is open; must not block. |
-| 9 | Memory | Re-measure RSS. `docs/benchmark.md` claims 34 MB with 1,000 concurrent streams — **re-run it**; that number was measured against Postgres and is now unverified. |
-| 10 | Write throughput ceiling | Single-writer serialisation is the new bottleneck. Re-run `bin/benchmark.rs` and record the write rate, not just token throughput. |
-| 11 | Build | `cargo check && cargo build --release`. |
-| 12 | Restore drill | Restore from Litestream/backup into a clean volume and run check 4 against the restored file. |
+| # | Check | Command / method | Status |
+| --- | --- | --- | --- |
+| 1 | Foreign keys actually on | `PRAGMA foreign_keys` → `1`; and a bad FK insert must **fail** | **probe: PASS** |
+| 2 | `NULL` `api_key_id` upsert | Two calls with `api_key_id = NULL` must yield **one** row | **probe: reproduces the bug, and the `COALESCE` index fix** |
+| 3 | Timestamp format uniformity | Every column rejects the space format; mixed-format expiry comparison must not return "still valid" | **probe: reproduces the 7.5-hour session overrun** |
+| 4 | Read-then-write under contention | Concurrent `refund_topup_transaction` calls must not raise `SQLITE_BUSY_SNAPSHOT` | new test |
+| 5 | Ledger invariant | `SELECT COUNT(*) FROM (SELECT w.account_id FROM wallets w LEFT JOIN ledger l ON l.account_id=w.account_id GROUP BY w.account_id, w.balance_idr HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr),0))` → **0**. This is Launch Gate 2 | existing query |
+| 6 | Stranded holds | `unpaired_hold_rows` → **0** for every account (`db.rs:1692`) | existing |
+| 7 | WAL is actually on and persists | `PRAGMA journal_mode` → `wal`, and still `wal` on a fresh connection | **probe: PASS** |
+| 8 | `::bigint` removal is safe | `typeof(SUM(col))` → `integer` for every money and token column | **probe: PASS** |
+| 9 | Overdraw proof | `cargo test --lib` — the concurrency test now runs **without** `--ignored` | existing test, newly unblocked |
+| 10 | Volume permissions | The container user can create, write and reopen the DB file **on the real volume** | new, deploy-time |
+| 11 | Memory | Re-measure RSS, including the Litestream sidecar | re-run `docs/benchmark.md` |
+| 12 | Write throughput ceiling | Single-writer serialisation is the new bottleneck. Record the write rate, not just token throughput | re-run `bin/benchmark.rs` |
+| 13 | Build | `cargo check && cargo build --release` | — |
+| 14 | Restore drill | Restore from Litestream/backup into a clean volume and run check 5 against the restored file | Launch Gate 1 |
+
+**Run the probes first, before writing any Rust.** They take seconds and they confirm
+the dialect assumptions the whole port rests on:
+
+```bash
+python tools/sqlite-probes/sqlite-port-probe.py
+python tools/sqlite-probes/sqlite-timestamp-probe.py
+python tools/sqlite-probes/validate-appendix-schema.py
+```
 
 **Claims that must not be repeated without re-measurement:** the 63,750 tok/s and
 34 MB figures in `docs/benchmark.md` and `todo.md` were measured against Postgres.
-They are now unverified for SQLite and must be re-measured or marked stale.
+They are unverified for SQLite and must be re-measured or marked stale.
 
 ---
 
@@ -689,10 +999,17 @@ Stated plainly, because the register's own culture is to record what is given up
 - **Concurrent writes serialise.** One writer at a time. Settlement is detached from
   the response path (`proxy.rs`), so client latency is unaffected, but balance
   catch-up and the SSE feed have a new ceiling.
-- **No horizontal scaling.** One instance, permanently, unless the storage layer
-  changes again.
+- **No horizontal scaling, permanently.** And now enforced by the storage layer rather
+  than by policy — a Single Read/Write volume cannot be mounted twice.
+- **Every deploy is an outage.** A Single Read/Write volume forbids rolling restarts
+  ([§8](#8-operations-backup-rpo-and-the-volume)). This is the loss the draft did not
+  mention at all, and it is the one an operator will feel weekly.
+- **A sidecar process is now mandatory** for backup, competing for the same 256 MB.
 - **The API is container-bound.** A future Cloudflare Workers migration would need D1.
 - **Auth is now ours.** Whatever PocketBase was doing right, we now have to do right.
+- **One more format to police.** Timestamps need a schema-enforced representation
+  ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped)) where Postgres enforced
+  it for us.
 
 **Not given up:** the ledger, the non-negative balance, three-class token accounting,
 idempotent top-ups, server-side sessions, the audit trail, or any admin capability.
@@ -700,21 +1017,39 @@ Those are the parts that matter, and none of them depend on Postgres.
 
 ---
 
-## 11. Open decisions
+## 11. Decisions
 
-| # | Decision | Blocks |
+### 11.1 Decided
+
+Settled 2026-09-25. Each is technical and evidence-backed; none needs an owner sign-off.
+
+| # | Decision | Why |
 | --- | --- | --- |
-| 1 | **Email provider** for verification and reset — a new hard dependency | Phase 6 |
-| 2 | Whether OTP and MFA are still wanted now that PocketBase no longer supplies them | Phase 6 |
-| 3 | **Backup mechanism** — Litestream vs `VACUUM INTO` cron | Phase 8, Launch Gate 1 |
-| 4 | **Low-code admin tool** — adopt for the read-only surface, or hand-build ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)) | Phase 7 scope |
-| 5 | **`usage_events` retention window** | `data-retention.md`, the sweep job |
-| 6 | Whether admin money actions ship now or behind a flag | Phase 7 scope |
-| 7 | Whether the 30-day rolling spend window stays a query over `usage_daily` or moves to `usage_events` | Phase 4 (`routes/keys.rs`) |
-| 8 | Whether a low-code tool's access to customer data needs a ToS / privacy-notice amendment | Launch Gate 0 |
+| 1 | **Identity: Google + email/password** | Keeps the register's product decision; ownership moves to Rust ([§6](#6-phase-2--identity-the-real-cost)) |
+| 2 | **Driver: `sqlx` + `sqlite` feature, not `rusqlite`** | `sqlx-sqlite` is already in `Cargo.lock`; the port is a 106-site dialect change, not an API rewrite; `sqlx::migrate` is a settled register decision; and the bottleneck is the single writer, not the binding. Full reasoning: [`proxy-hot-path-audit.md` §3](proxy-hot-path-audit.md) |
+| 3 | **Backup: Litestream sidecar → Cloudflare R2** | Seconds-level RPO against a 15-minute requirement. A sidecar is *forced* by the Single Read/Write volume, not merely preferred ([§8](#8-operations-backup-rpo-and-the-volume)) |
+| 4 | **Timestamps: uniform RFC3339 + `GLOB` `CHECK`, never written in SQL** | The measured mixed-format hazard silently extended session life by up to ~24h ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped)) |
+| 5 | **All tables `STRICT`** | Without it `INTEGER` is only affinity and a `REAL` lands in a money column ([§4.9](#49-strict-tables--make-the-money-rule-structural)) |
+| 6 | **`usage_daily.api_key_id` → `ON DELETE RESTRICT`** | `SET NULL` collides with the `COALESCE` unique index (measured); `RESTRICT` also matches the money tables ([§4.10](#410-on-delete-set-null-collides-with-the-coalesce-unique-index)) |
+| 7 | **30-day rolling spend window stays a query over `usage_daily`** | It is an indexed aggregate. Moving it to `usage_events` would make the **billing** window depend on a **retention** sweep — a retention change would silently change what a customer is charged. `usage_events` is display-only |
+| 8 | **`usage_events` retention: 90 days** | Must outlast the 30-day rolling window plus a dispute window. 90 days is already the codebase's precedent for `key_ip_daily` (`ip-tracking.md:69`) and the top of the *"Logs 30-90 days"* band (`data-retention.md:60`). Beyond that, `usage_daily` is the permanent record |
+| 9 | **Admin money actions ship behind a config flag** | Follows `admin-surface.md:181-189`: read-only plus suspend/restore/key-revoke at launch; money actions *"once there is revenue to misfile"* |
+| 10 | **Low-code tool: adopt for the read-only launch surface only** | Real saving on reads, real hazard on money ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)) |
+| 11 | **Volume: 10 GB, provisioned once** | It cannot be shrunk. Estimate: `usage_events` at ~100 B/request is ~300 MB for 90 days at 1M requests/month; the rest is ledger and headroom. Generous because the decision is one-way |
+| 12 | **Publish a maintenance window for deploys** | A Single Read/Write volume forbids rolling restarts, so every deploy is an outage ([§8](#8-operations-backup-rpo-and-the-volume)). An undocumented one is worse than a documented one |
 
-**Settled this round:** identity strategy — **C, Google + email/password, with reset**
-(2026-09-25). See [§6](#6-phase-2--identity-the-real-cost).
+### 11.2 Still needs you
+
+These are not technical. They need a cost, a vendor, or a business position — deciding
+them from inside the codebase would be guessing.
+
+| # | Decision | Why it is yours | Blocks |
+| --- | --- | --- | --- |
+| 1 | **Email provider** for verification and reset | Vendor choice, cost, and deliverability reputation. Recommendation: Resend or Postmark — both have usable free tiers and a simple API; pick on deliverability, not price | Phase 6 |
+| 2 | **OTP and MFA — still wanted?** | Product scope. PocketBase supplied both and `identity.md:37-38` counts them; nothing does now. If yes it is new work; if no, the doc must stop claiming it | Phase 6 |
+| 3 | **Northflank free tier vs paid** | Business/cost. The vendor states the free Developer Sandbox *"should not be used for production applications"*, and taking money on it is a real risk. `decisions.md` already has *"Northflank actual prices — a quote"* open | Launch |
+| 4 | **Low-code tool and customer data** | Privacy/legal. A cloud tool means customer rows transit a third party, which the ToS and `data-retention.md` do not mention | Launch Gate 0 |
+| 5 | **Mid-stream disconnect billing in the ToS** | Business/legal. The proxy bills usage the upstream already generated; that is defensible but must be stated, not emergent (see [`proxy-hot-path-audit.md` §4.5](proxy-hot-path-audit.md)) | Launch Gate 0 |
 
 ---
 
@@ -727,7 +1062,7 @@ Those are the parts that matter, and none of them depend on Postgres.
    whole plan. **Nothing here depends on the identity decision, so it can start
    immediately** — which is why it is sequenced ahead of the larger phase.
 3. Phase 6 — identity (Google + email/password). The largest phase. Unblocked, but
-   open decisions 1 and 2 need answers first.
+   §11.2 items 1 and 2 need answers first.
 4. Phase 7 — admin surface endpoints, then the UI choice ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)).
 5. Phase 8 — tooling and the docs sweep.
 
@@ -740,3 +1075,327 @@ the repository reads from the register, and the register currently says the stac
 Postgres and PocketBase. Leaving it stale while the code moves is exactly the failure
 mode its own *"How to change a decision"* section warns about — *"a stale decision is
 worse than none, because it is followed."*
+
+---
+
+## Appendix A — Target SQLite schema
+
+The complete replacement for `server/migrations/20260925000000_initial_schema.sql`.
+Conventions applied throughout, and why:
+
+| Convention | Reason |
+| --- | --- |
+| **Every table is `STRICT`** | The single most important line in this appendix. Without it `INTEGER` is only *affinity* and a `REAL` lands in a money column silently ([§4.9](#49-strict-tables--make-the-money-rule-structural)). Requires SQLite ≥ 3.37. |
+| `TEXT` ids | Postgres `UUID` → `TEXT`. sqlx's `uuid` feature decodes it. Generated by `Uuid::new_v4()` in Rust, so no `gen_random_uuid()`. |
+| `INTEGER` for every money and token column | The register's *"never floating point"* rule — now **enforced**, not merely declared, because of `STRICT`. This is also what makes the `::bigint` casts removable: `SUM` over `INTEGER` returns an integer. |
+| `TEXT` timestamps with a `GLOB` format `CHECK` | [§4.6](#46-timestamps--the-hazard-that-would-have-shipped). **No `DEFAULT CURRENT_TIMESTAMP` anywhere** — a default that fires writes the wrong format. |
+| `TEXT` for JSON | Postgres `JSONB` → `TEXT`; sqlx's `json` feature handles the conversion. |
+| `INTEGER PRIMARY KEY` (no `AUTOINCREMENT`) for append-only tables | The schema never deletes from `ledger` or `admin_audit`, so rowids cannot be reused. Plain `INTEGER PRIMARY KEY` is a rowid alias and avoids the extra `sqlite_sequence` write on **every insert** — which matters on the settlement hot path. |
+| Explicit `NOT NULL` on every key column | `STRICT` now implies it for PK columns, but being explicit documents intent and survives a table created non-`STRICT` by mistake. |
+| `ON DELETE RESTRICT` on money references | Makes a hard delete of a funded account **refused by the database**. Requires `foreign_keys(true)` to mean anything. |
+| `COALESCE` unique index on `usage_daily` | Fixes the `NULL`-key upsert duplication (verified). Still required under `STRICT`, because `api_key_id` is deliberately outside the key so it can stay nullable. |
+
+```sql
+-- =============================================================================
+-- apikita — SQLite schema (replaces the PostgreSQL initial schema)
+--
+-- PREREQUISITES
+--   1. SQLite >= 3.37.0  — every table below is STRICT, which is what makes
+--      "money is INTEGER" enforced rather than merely declared.
+--   2. PRAGMA foreign_keys = ON on EVERY connection. Without it every ON DELETE
+--      clause below is silently inert and the RESTRICT backstop is gone.
+--   3. Every timestamp is bound from Rust. Never write time in SQL: SQLite's
+--      CURRENT_TIMESTAMP emits a format that does not compare against RFC3339,
+--      which silently extends session lifetimes (see the plan, section 4.6).
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- Accounts and identity
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE accounts (
+  id          TEXT PRIMARY KEY,
+  status      TEXT NOT NULL DEFAULT 'active'
+              CHECK (status IN ('active','suspended','closed')),
+  is_operator INTEGER NOT NULL DEFAULT 0 CHECK (is_operator IN (0,1)),
+  created_at  TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00'),
+  updated_at  TEXT NOT NULL CHECK (updated_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+-- Replaces PocketBase. One account, many identities (identity.md invariant 1).
+-- `pb_user_id` is gone: accounts.id is the only key.
+CREATE TABLE identities (
+  id             TEXT PRIMARY KEY,
+  account_id     TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  provider       TEXT NOT NULL CHECK (provider IN ('google','password')),
+  subject        TEXT NOT NULL,   -- provider's stable subject id
+  email          TEXT NOT NULL,
+  email_verified INTEGER NOT NULL DEFAULT 0 CHECK (email_verified IN (0,1)),
+  password_hash  TEXT,            -- Argon2id; NULL for OAuth-only identities
+  created_at     TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00'),
+  updated_at     TEXT NOT NULL CHECK (updated_at GLOB '????-??-??T??:??:??*+00:00'),
+
+  UNIQUE (provider, subject),
+
+  -- A password identity must carry a hash; an OAuth identity must not.
+  CHECK ((provider = 'password') = (password_hash IS NOT NULL)),
+
+  -- Google guarantees a verified address (identity.md:100). Encode that so an
+  -- unverified Google identity cannot exist, rather than trusting the callback.
+  CHECK (provider <> 'google' OR email_verified = 1)
+) STRICT;
+
+CREATE INDEX identities_account_idx ON identities (account_id);
+CREATE UNIQUE INDEX identities_provider_email_uniq ON identities (provider, email);
+
+-- ---------------------------------------------------------------------------
+-- Money
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE wallets (
+  account_id  TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE RESTRICT,
+  balance_idr INTEGER NOT NULL DEFAULT 0 CHECK (balance_idr >= 0),
+  updated_at  TEXT NOT NULL CHECK (updated_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+-- Append-only. Never UPDATE, never DELETE. Corrections are new rows.
+CREATE TABLE ledger (
+  id            INTEGER PRIMARY KEY,
+  account_id    TEXT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  delta_idr     INTEGER NOT NULL,
+  reason        TEXT NOT NULL
+                CHECK (reason IN ('topup','usage','adjustment','refund')),
+  ref           TEXT,
+  balance_after INTEGER NOT NULL,
+  created_at    TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE INDEX ledger_account_created_idx ON ledger (account_id, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Sessions
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE sessions (
+  id           TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  token_hash   TEXT NOT NULL UNIQUE,
+  expires_at   TEXT NOT NULL CHECK (expires_at GLOB '????-??-??T??:??:??*+00:00'),
+  -- NEW. The register specifies "30d absolute, 7d idle" but the Postgres schema
+  -- had no column for the idle bound, so only the absolute half was enforceable
+  -- (auth.rs:255 notes this). Adding it now, while the schema is being rewritten.
+  last_seen_at TEXT NOT NULL CHECK (last_seen_at GLOB '????-??-??T??:??:??*+00:00'),
+  revoked_at   TEXT CHECK (revoked_at IS NULL
+                           OR revoked_at GLOB '????-??-??T??:??:??*+00:00'),
+  user_agent   TEXT,
+  ip_hash      TEXT,
+  created_at   TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE INDEX sessions_account_idx ON sessions (account_id) WHERE revoked_at IS NULL;
+CREATE INDEX sessions_expires_idx ON sessions (expires_at);
+
+-- ---------------------------------------------------------------------------
+-- API keys
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE api_keys (
+  id              TEXT PRIMARY KEY,
+  account_id      TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  key_hash        TEXT NOT NULL UNIQUE,
+  prefix          TEXT NOT NULL,
+  label           TEXT,
+  models          TEXT NOT NULL DEFAULT '[]',
+  spend_limit_idr INTEGER NOT NULL DEFAULT 0,
+  token_limit     INTEGER NOT NULL DEFAULT 0,
+  rate_limit_rpm  INTEGER NOT NULL DEFAULT 0,
+  expires_at      TEXT CHECK (expires_at IS NULL
+                              OR expires_at GLOB '????-??-??T??:??:??*+00:00'),
+  last_used_at    TEXT CHECK (last_used_at IS NULL
+                              OR last_used_at GLOB '????-??-??T??:??:??*+00:00'),
+  revoked_at      TEXT CHECK (revoked_at IS NULL
+                              OR revoked_at GLOB '????-??-??T??:??:??*+00:00'),
+  created_at      TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE INDEX api_keys_hash_idx ON api_keys (key_hash) WHERE revoked_at IS NULL;
+CREATE INDEX api_keys_account_idx ON api_keys (account_id);
+
+-- ---------------------------------------------------------------------------
+-- Top-ups
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE topups (
+  id          TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  amount_idr  INTEGER NOT NULL CHECK (amount_idr > 0),
+  order_id    TEXT NOT NULL UNIQUE,     -- idempotency, enforced by the DB
+  status      TEXT NOT NULL DEFAULT 'pending'
+              CHECK (status IN ('pending','settled','denied','expired','refunded')),
+  snap_token  TEXT,
+  created_at  TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00'),
+  settled_at  TEXT CHECK (settled_at IS NULL
+                          OR settled_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE INDEX topups_account_created_idx ON topups (account_id, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Usage
+-- ---------------------------------------------------------------------------
+
+-- NO PRIMARY KEY. A COALESCE expression cannot appear in a PK, and the
+-- NULL-key duplication fix requires it (section 4.3, trap 3). The unique index
+-- below IS the key, and the upsert must target it by name.
+--
+-- api_key_id is RESTRICT, not SET NULL. Measured: SET NULL collides with the
+-- COALESCE unique index the moment a NULL-keyed row already exists for the same
+-- (account_id, day) -- "UNIQUE constraint failed: usage_daily_scope_uniq". RESTRICT
+-- also matches wallets/ledger/topups and enforces "no hard deletes" for a key that
+-- has billing history. See section 4.10.
+CREATE TABLE usage_daily (
+  account_id        TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  api_key_id        TEXT REFERENCES api_keys(id) ON DELETE RESTRICT,
+  day               TEXT NOT NULL CHECK (day GLOB '????-??-??'),
+  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens     INTEGER NOT NULL DEFAULT 0,
+  cost_idr          INTEGER NOT NULL DEFAULT 0
+) STRICT;
+
+CREATE UNIQUE INDEX usage_daily_scope_uniq
+  ON usage_daily (account_id, day, COALESCE(api_key_id, ''));
+CREATE INDEX usage_daily_account_day_idx ON usage_daily (account_id, day DESC);
+
+-- Per-request rows, for the admin "recent usage" feed. Never stores prompt or
+-- completion text (Launch Gate 4). Retention: 90 days, swept (§11.1 item 8).
+CREATE TABLE usage_events (
+  id                TEXT PRIMARY KEY,
+  account_id        TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  api_key_id        TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
+  model             TEXT NOT NULL,
+  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens     INTEGER NOT NULL DEFAULT 0,
+  cost_idr          INTEGER NOT NULL DEFAULT 0,
+  ref               TEXT,
+  created_at        TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE INDEX usage_events_recent_idx ON usage_events (created_at DESC);
+CREATE INDEX usage_events_account_idx ON usage_events (account_id, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Telegram
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE link_codes (
+  code       TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL CHECK (expires_at GLOB '????-??-??T??:??:??*+00:00'),
+  used_at    TEXT CHECK (used_at IS NULL
+                         OR used_at GLOB '????-??-??T??:??:??*+00:00'),
+  created_at TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE TABLE telegram_links (
+  telegram_id TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  linked_at   TEXT NOT NULL CHECK (linked_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE INDEX telegram_links_account_idx ON telegram_links (account_id);
+
+-- ---------------------------------------------------------------------------
+-- Reviews
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE reviews (
+  id           TEXT PRIMARY KEY,
+  account_id   TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+  telegram_id  TEXT,
+  rating       INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  body         TEXT CHECK (length(body) <= 1000),
+  is_customer  INTEGER NOT NULL DEFAULT 0 CHECK (is_customer IN (0,1)),
+  withdrawn_at TEXT CHECK (withdrawn_at IS NULL
+                           OR withdrawn_at GLOB '????-??-??T??:??:??*+00:00'),
+  created_at   TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00'),
+  updated_at   TEXT NOT NULL CHECK (updated_at GLOB '????-??-??T??:??:??*+00:00'),
+
+  CHECK (account_id IS NOT NULL OR telegram_id IS NOT NULL)
+) STRICT;
+
+CREATE UNIQUE INDEX reviews_account_uniq ON reviews (account_id)
+  WHERE account_id IS NOT NULL;
+CREATE UNIQUE INDEX reviews_telegram_uniq ON reviews (telegram_id)
+  WHERE account_id IS NULL;
+
+CREATE TABLE review_history (
+  id          INTEGER PRIMARY KEY,
+  review_id   TEXT NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  rating      INTEGER NOT NULL,
+  body        TEXT,
+  replaced_at TEXT NOT NULL CHECK (replaced_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE TABLE review_sessions (
+  telegram_id TEXT PRIMARY KEY,
+  step        TEXT NOT NULL,
+  rating      INTEGER,
+  body        TEXT,
+  editing     INTEGER NOT NULL DEFAULT 0 CHECK (editing IN (0,1)),
+  expires_at  TEXT NOT NULL CHECK (expires_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+-- ---------------------------------------------------------------------------
+-- Admin audit
+-- ---------------------------------------------------------------------------
+
+-- Append-only. Written in the SAME transaction as the effect it records.
+CREATE TABLE admin_audit (
+  id          INTEGER PRIMARY KEY,
+  operator_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  action      TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id   TEXT NOT NULL,
+  detail      TEXT,
+  created_at  TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+CREATE INDEX admin_audit_operator_idx ON admin_audit (operator_id, created_at DESC);
+CREATE INDEX admin_audit_target_idx   ON admin_audit (target_type, target_id);
+
+-- ---------------------------------------------------------------------------
+-- Abuse signals (salted IP hashes only; no raw IP is ever stored)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE key_ip_daily (
+  api_key_id    TEXT NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+  day           TEXT NOT NULL CHECK (day GLOB '????-??-??'),
+  distinct_ips  INTEGER NOT NULL DEFAULT 0,
+  request_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (api_key_id, day)
+) STRICT;
+
+CREATE TABLE key_ip_seen (
+  api_key_id TEXT NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+  day        TEXT NOT NULL CHECK (day GLOB '????-??-??'),
+  ip_hash    TEXT NOT NULL,
+  PRIMARY KEY (api_key_id, day, ip_hash)
+) STRICT;
+```
+
+**Three notes on this schema that the phase must not lose:**
+
+1. **`usage_daily` has no `PRIMARY KEY`, deliberately.** The `COALESCE` unique index
+   *is* the key, and `db.rs:466`'s upsert must be retargeted to it. Leaving the
+   original `ON CONFLICT (account_id, api_key_id, day)` would be a syntax-valid,
+   silently-wrong statement.
+2. **`identities` encodes the Google-verified rule as a constraint.** `identity.md`
+   asks for a hook and an audit; a `CHECK` is stronger and free. It does not replace
+   the hook for the *password* provider, where provenance genuinely cannot be expressed
+   in SQL — that stays application-level.
+3. **`sessions.last_seen_at` is new and required.** Without it the register's *"7 days
+   idle"* half is unimplementable, which is a pre-existing gap this migration is the
+   right moment to close. Adding it means `auth.rs` must touch the row on use, which
+   is a write on the session path — measure that against the single-writer ceiling.
