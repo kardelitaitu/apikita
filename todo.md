@@ -79,15 +79,15 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [x] Landing page with pricing table ($M = 1.50$ rates)
   - [x] Quick-start developer guide & cURL examples
   - [x] Zero JavaScript payload on marketing pages
-- [ ] **Interactive Client Islands**
-  - [ ] Auth island: Google OAuth2 & email/password via PocketBase SDK
-  - [ ] Dashboard layout with sticky Live Balance badge wired to `/events` SSE
-  - [ ] Polling fallback to `GET /api/me` with stale indicator if SSE disconnects
-  - [ ] API Key Management island:
-    - [ ] Create key modal with show-once plaintext key and copy button
-    - [ ] Key list with prefix, labels, 30-day spend limits, and revoke actions
-  - [ ] Usage Analytics island:
-    - [ ] 3-counter daily breakdown (Standard Input, Cache Read, Output tokens)
+- [x] **Interactive Client Islands**
+  - [x] Auth island: Google OAuth2 & email/password via PocketBase SDK
+  - [x] Dashboard layout with sticky Live Balance badge wired to `/events` SSE
+  - [x] Polling fallback to `GET /api/me` with stale indicator if SSE disconnects
+  - [x] API Key Management island:
+    - [x] Create key modal with show-once plaintext key and copy button
+    - [x] Key list with prefix, labels, 30-day spend limits, and revoke actions
+  - [x] Usage Analytics island:
+    - [x] 3-counter daily breakdown (Standard Input, Cache Read, Output tokens)
 
 ---
 
