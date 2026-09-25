@@ -13,8 +13,7 @@ use crate::db::{
 };
 use crate::error::AppError;
 use crate::money::{
-    evaluate_payment_status, terminal_status, verify_midtrans_signature, MidtransNotification,
-    PaymentAction,
+    evaluate_payment_status, verify_midtrans_signature, MidtransNotification, PaymentAction,
 };
 use crate::routes::events::publish_balance;
 use crate::routes::proxy::AppState;
@@ -351,6 +350,9 @@ pub async fn handle_midtrans_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests exercise the raw status mapping: production code reaches it
+    // through `evaluate_payment_status`, which is what the import above names.
+    use crate::money::terminal_status;
 
     /// Bug B: Midtrans' vocabulary is not the schema's. Every mapped value must
     /// be one the topups_status_check constraint accepts
