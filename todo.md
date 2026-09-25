@@ -60,12 +60,12 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [x] Half-open trial request logic
 - [ ] **Streaming Pipeline (`POST /v1/chat/completions`)**
   - [ ] Bearer API key validation with 60-second in-memory TTL cache
-  - [ ] Model allowlist verification
-  - [ ] Pre-flight worst-case balance reservation check (`402 Payment Required` on breach)
-  - [ ] Non-buffering SSE chunk forwarding (client $\leftarrow$ server $\leftarrow$ upstream)
-  - [ ] Parse usage summary from final SSE chunk
-  - [ ] Execute atomic usage settlement (`debit_usage_transaction`) on stream completion
-  - [ ] Ensure mid-stream errors do not retry silently
+  - [x] Model allowlist verification
+  - [x] Pre-flight worst-case balance reservation check (`402 Payment Required` on breach)
+  - [x] Non-buffering SSE chunk forwarding (client $\leftarrow$ server $\leftarrow$ upstream)
+  - [x] Parse usage summary from final SSE chunk
+  - [x] Execute atomic usage settlement (`debit_usage_transaction`) on stream completion
+  - [x] Ensure mid-stream errors do not retry silently
 - [ ] **Session Auth & Realtime Event Stream**
   - [x] Wire `POST /auth/exchange` to verify PocketBase JWTs and issue cookie
   - [x] Implement session revocation on `POST /auth/logout` and `POST /auth/logout-all`
