@@ -1640,6 +1640,752 @@ mod tests {
             "balance_idr must equal SUM(ledger.delta_idr) after a paired settlement"
         );
     }
+
+    // =====================================================================
+    // Live-database tests for the money-moving transactions that had none:
+    // the four documented outcomes of credit_topup_transaction,
+    // refund_topup_transaction, release_reservation_transaction,
+    // verify_wallet_reconciliation and unpaired_hold_rows.
+    //
+    // FIXTURE RULE (the one this repo has broken repeatedly): every wallet is
+    // opened through the REAL path - the zero-balance row the login path creates,
+    // then credit_topup_transaction, which writes the matching +ledger row in the
+    // same transaction. Writing wallets.balance_idr directly manufactures the very
+    // drift these tests then assert against, i.e. a fixture that cannot pass while
+    // the code under test is correct. Teardown is delete_fixture_rows in FK order,
+    // and it runs whether the assertions pass or panic.
+    // =====================================================================
+
+    async fn live_pool() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+        init_pool(&database_url).await.expect("connect to Postgres")
+    }
+
+    /// Runs the assertions against a fresh account, then deletes the fixture in FK
+    /// order whether it passed or panicked. The future is spawned, so a panic
+    /// inside it arrives as a JoinError rather than unwinding through the teardown
+    /// - which is what makes the cleanup unconditional.
+    async fn run_with_teardown<F, Fut>(pool: PgPool, assertions: F)
+    where
+        F: FnOnce(PgPool, Uuid) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
+        let account_id: Uuid =
+            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+                .bind(&pb_user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("create account");
+
+        let outcome = tokio::spawn(assertions(pool.clone(), account_id)).await;
+
+        delete_fixture_rows(&pool, account_id).await;
+
+        outcome.expect("the live assertions panicked");
+    }
+
+    /// A second, wallet-less account for the "no wallet row" arms. Callers own its
+    /// teardown.
+    async fn bare_account(pool: &PgPool) -> Uuid {
+        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
+        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+            .bind(&pb_user_id)
+            .fetch_one(pool)
+            .await
+            .expect("create account")
+    }
+
+    /// The zero-balance wallet the login path creates (routes/auth.rs).
+    async fn open_zero_balance_wallet(pool: &PgPool, account_id: Uuid) {
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
+            .bind(account_id)
+            .execute(pool)
+            .await
+            .expect("create the zero-balance wallet the login path would create");
+    }
+
+    async fn create_topup(pool: &PgPool, account_id: Uuid, amount_idr: i64, order_id: &str) {
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
+            .bind(account_id)
+            .bind(amount_idr)
+            .bind(order_id)
+            .execute(pool)
+            .await
+            .expect("create topup");
+    }
+
+    /// Funds the wallet through the real path and returns the order id that did it.
+    async fn fund_through_topup(pool: &PgPool, account_id: Uuid, amount_idr: i64) -> String {
+        open_zero_balance_wallet(pool, account_id).await;
+
+        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
+        create_topup(pool, account_id, amount_idr, &order_id).await;
+
+        assert_eq!(
+            credit_topup_transaction(pool, &order_id, amount_idr)
+                .await
+                .expect("credit the opening balance"),
+            TopupCreditResult::Settled {
+                new_balance: amount_idr
+            },
+            "the fixture must open the wallet through the real top-up path"
+        );
+
+        order_id
+    }
+
+    async fn create_api_key(pool: &PgPool, account_id: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES ($1, $2, 'apk_test') RETURNING id",
+        )
+        .bind(account_id)
+        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
+        .fetch_one(pool)
+        .await
+        .expect("create api key")
+    }
+
+    async fn wallet_balance(pool: &PgPool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(pool)
+            .await
+            .expect("read balance")
+    }
+
+    async fn topup_id(pool: &PgPool, order_id: &str) -> Uuid {
+        sqlx::query_scalar("SELECT id FROM topups WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(pool)
+            .await
+            .expect("read topup id")
+    }
+
+    async fn topup_status(pool: &PgPool, order_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM topups WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(pool)
+            .await
+            .expect("read topup status")
+    }
+
+    /// Every ledger row for the account with that reason, oldest first, as
+    /// (delta_idr, ref). Ordering by id keeps the assertion about the append order,
+    /// not about whatever the planner returns.
+    async fn ledger_rows(
+        pool: &PgPool,
+        account_id: Uuid,
+        reason: &str,
+    ) -> Vec<(i64, Option<String>)> {
+        sqlx::query_as(
+            "SELECT delta_idr, ref FROM ledger WHERE account_id = $1 AND reason = $2 ORDER BY id",
+        )
+        .bind(account_id)
+        .bind(reason)
+        .fetch_all(pool)
+        .await
+        .expect("read ledger rows")
+    }
+
+    async fn ledger_row_count(pool: &PgPool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(pool)
+            .await
+            .expect("count ledger rows")
+    }
+
+    /// The net ledger move under one ref. A hold and its release must sum to zero.
+    async fn ledger_sum_for_ref(pool: &PgPool, account_id: Uuid, reference: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COALESCE(SUM(delta_idr), 0)::bigint FROM ledger WHERE account_id = $1 AND ref = $2",
+        )
+        .bind(account_id)
+        .bind(reference)
+        .fetch_one(pool)
+        .await
+        .expect("sum ledger rows for ref")
+    }
+
+    /// The four outcomes credit_topup_transaction documents: a fresh credit settles
+    /// and writes exactly ONE +topup row; a replay credits exactly once
+    /// (AlreadySettled, no second row, balance unchanged); an amount disagreeing with
+    /// the stored topup is AmountMismatch with NO write; an unknown order id is
+    /// NotFound with NO write.
+    ///
+    /// Needs a live, migrated Postgres - DATABASE_URL=... cargo test --lib -- --ignored.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn credit_topup_settles_replays_and_refuses_bad_input() {
+        run_with_teardown(live_pool().await, credit_topup_assertions).await;
+    }
+
+    async fn credit_topup_assertions(pool: PgPool, account_id: Uuid) {
+        const AMOUNT: i64 = 50_000;
+        const OTHER: i64 = 10_000;
+
+        open_zero_balance_wallet(&pool, account_id).await;
+
+        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
+        create_topup(&pool, account_id, AMOUNT, &order_id).await;
+        let stored_id = topup_id(&pool, &order_id).await;
+
+        // 1. A fresh credit moves the wallet and writes exactly ONE +ledger row.
+        assert_eq!(
+            credit_topup_transaction(&pool, &order_id, AMOUNT)
+                .await
+                .expect("a fresh top-up must settle"),
+            TopupCreditResult::Settled { new_balance: AMOUNT },
+            "a fresh credit must move the wallet by the stored amount"
+        );
+        assert_eq!(wallet_balance(&pool, account_id).await, AMOUNT);
+        assert_eq!(topup_status(&pool, &order_id).await, "settled");
+        assert_eq!(
+            ledger_rows(&pool, account_id, "topup").await,
+            vec![(AMOUNT, Some(stored_id.to_string()))],
+            "the credit must append exactly one +topup row, ref'd to the topup id"
+        );
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr) after a credit"
+        );
+
+        // 2. A REPLAY of the same order credits exactly once: idempotency is the
+        //    unique order_id plus the settled status, not a second credit.
+        assert_eq!(
+            credit_topup_transaction(&pool, &order_id, AMOUNT)
+                .await
+                .expect("a replay is a recorded outcome, not an error"),
+            TopupCreditResult::AlreadySettled,
+            "the second webhook for one order must not credit again"
+        );
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            AMOUNT,
+            "a replayed top-up must leave the balance alone"
+        );
+        assert_eq!(
+            ledger_rows(&pool, account_id, "topup").await.len(),
+            1,
+            "a replayed top-up must not append a second ledger row"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        // 3. An amount that disagrees with the stored topup is refused with NO
+        //    write: not the topup status, not the wallet, not the ledger. The webhook
+        //    payload is never trusted over the stored record (docs/decisions.md:
+        //    "Credit source - Midtrans webhook only ... never the payload amount").
+        let mismatch_order = format!("test_topup_{}", Uuid::new_v4().simple());
+        create_topup(&pool, account_id, OTHER, &mismatch_order).await;
+        let mismatch_id = topup_id(&pool, &mismatch_order).await;
+        let ledger_before = ledger_row_count(&pool, account_id).await;
+
+        assert_eq!(
+            credit_topup_transaction(&pool, &mismatch_order, OTHER - 1)
+                .await
+                .expect("a mismatch is a recorded outcome, not an error"),
+            TopupCreditResult::AmountMismatch,
+            "an amount that disagrees with the stored topup must be refused"
+        );
+        assert_eq!(
+            topup_status(&pool, &mismatch_order).await,
+            "pending",
+            "a refused credit must not settle the topup"
+        );
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            AMOUNT,
+            "a refused credit must not move the wallet"
+        );
+        assert_eq!(
+            ledger_row_count(&pool, account_id).await,
+            ledger_before,
+            "a refused credit must not append a ledger row"
+        );
+        assert_eq!(
+            ledger_rows(&pool, account_id, "topup").await,
+            vec![(AMOUNT, Some(stored_id.to_string()))],
+            "the only topup ledger row must still be the first order's"
+        );
+        assert_eq!(
+            ledger_sum_for_ref(&pool, account_id, &mismatch_id.to_string()).await,
+            0,
+            "the mismatched order must have written nothing at all"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        // 4. An unknown order id is NotFound, with nothing written.
+        let unknown = format!("test_topup_unknown_{}", Uuid::new_v4().simple());
+        assert_eq!(
+            credit_topup_transaction(&pool, &unknown, AMOUNT)
+                .await
+                .expect("an unknown order is a recorded outcome, not an error"),
+            TopupCreditResult::NotFound,
+            "an unknown order_id must be reported as NotFound"
+        );
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            AMOUNT,
+            "an unknown order must not move the wallet"
+        );
+        assert_eq!(
+            ledger_row_count(&pool, account_id).await,
+            ledger_before,
+            "an unknown order must not append a ledger row"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+    }
+
+    /// The refund TRANSACTION, not just the pure decision: refunding a settled topup
+    /// debits the wallet by the amount and appends a refund row with a NEGATIVE
+    /// delta; a replay does not debit twice; a topup that never settled is refused
+    /// (refunding it would create money); and a refund the balance cannot cover
+    /// writes NOTHING and leaves the topup settled for an operator. The reconciliation
+    /// invariant is asserted after EVERY case.
+    ///
+    /// Needs a live, migrated Postgres - DATABASE_URL=... cargo test --lib -- --ignored.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn refund_debits_once_refuses_unsettled_and_writes_nothing_when_short() {
+        run_with_teardown(live_pool().await, refund_assertions).await;
+    }
+
+    async fn refund_assertions(pool: PgPool, account_id: Uuid) {
+        const TOPUP: i64 = 50_000;
+        const REFUND: i64 = 20_000;
+
+        let settled_order = fund_through_topup(&pool, account_id, TOPUP).await;
+
+        // 1. A settled topup is refunded: the wallet is DEBITED and the ledger gains
+        //    a NEGATIVE row under the order id.
+        assert_eq!(
+            refund_topup_transaction(&pool, &settled_order, REFUND)
+                .await
+                .expect("refunding a settled topup"),
+            RefundResult::Refunded {
+                new_balance: TOPUP - REFUND
+            },
+            "the refund must debit the wallet by the refunded amount"
+        );
+        assert_eq!(wallet_balance(&pool, account_id).await, TOPUP - REFUND);
+        assert_eq!(
+            ledger_rows(&pool, account_id, "refund").await,
+            vec![(-REFUND, Some(settled_order.clone()))],
+            "the refund must append ONE row with reason=refund and a negative delta"
+        );
+        assert_eq!(
+            topup_status(&pool, &settled_order).await,
+            "refunded",
+            "a completed refund must mark the topup refunded"
+        );
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr) after a refund"
+        );
+
+        // 2. REPLAYED refund: a second webhook for the same order is a no-op. The
+        //    check is on the status, so it cannot debit twice.
+        assert_eq!(
+            refund_topup_transaction(&pool, &settled_order, REFUND)
+                .await
+                .expect("a replayed refund is a recorded outcome, not an error"),
+            RefundResult::AlreadyRefunded,
+            "a replayed refund must not debit twice"
+        );
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            TOPUP - REFUND,
+            "a replayed refund must leave the balance alone"
+        );
+        assert_eq!(
+            ledger_rows(&pool, account_id, "refund").await.len(),
+            1,
+            "a replayed refund must not append a second ledger row"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        // 3. A topup that was NEVER settled is refused. Its money never arrived, so
+        //    a refund would take it from the customer's existing balance - money
+        //    created out of nothing.
+        let pending_order = format!("test_topup_{}", Uuid::new_v4().simple());
+        create_topup(&pool, account_id, 10_000, &pending_order).await;
+        assert_eq!(
+            refund_topup_transaction(&pool, &pending_order, 10_000)
+                .await
+                .expect("an unsettled topup is a recorded outcome, not an error"),
+            RefundResult::NotSettled {
+                status: "pending".to_string()
+            },
+            "refunding a topup that never settled must be refused"
+        );
+        assert_eq!(
+            topup_status(&pool, &pending_order).await,
+            "pending",
+            "a refused refund must not touch the topup"
+        );
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            TOPUP - REFUND,
+            "a refused refund must not move the wallet"
+        );
+        assert_eq!(
+            ledger_rows(&pool, account_id, "refund").await.len(),
+            1,
+            "a refused refund must not append a ledger row"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        // 4. A refund the balance cannot cover: the money has already been spent.
+        //    NOTHING is written - not the ledger, not the topup status - so the topup
+        //    stays visible as settled for a human, and the balance does not go negative
+        //    (docs/decisions.md: "Overdraft - Not permitted").
+        let short_order = format!("test_topup_{}", Uuid::new_v4().simple());
+        create_topup(&pool, account_id, 10_000, &short_order).await;
+        assert_eq!(
+            credit_topup_transaction(&pool, &short_order, 10_000)
+                .await
+                .expect("settle the topup to be refunded"),
+            TopupCreditResult::Settled {
+                new_balance: TOPUP - REFUND + 10_000
+            }
+        );
+
+        // Spend the whole balance, so the refund has nothing to draw on.
+        let key_id = create_api_key(&pool, account_id).await;
+        assert_eq!(
+            debit_usage_transaction(
+                &pool,
+                account_id,
+                Some(key_id),
+                100,
+                0,
+                50,
+                TOPUP - REFUND + 10_000,
+                Some("test_refund_drain"),
+                0,
+            )
+            .await
+            .expect("drain the wallet"),
+            UsageSettlement::Settled { new_balance: 0 }
+        );
+        assert_eq!(wallet_balance(&pool, account_id).await, 0);
+
+        let ledger_before = ledger_row_count(&pool, account_id).await;
+        assert_eq!(
+            refund_topup_transaction(&pool, &short_order, 10_000)
+                .await
+                .expect("an unaffordable refund is a recorded outcome, not an error"),
+            RefundResult::InsufficientBalance {
+                balance_idr: 0,
+                required_idr: 10_000
+            },
+            "a refund the balance cannot cover must be reported, not forced"
+        );
+        assert_eq!(
+            topup_status(&pool, &short_order).await,
+            "settled",
+            "an unaffordable refund must leave the topup settled, so an operator can see it"
+        );
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            0,
+            "an unaffordable refund must not drive the balance negative"
+        );
+        assert_eq!(
+            ledger_row_count(&pool, account_id).await,
+            ledger_before,
+            "an unaffordable refund must write nothing"
+        );
+        assert_eq!(
+            ledger_rows(&pool, account_id, "refund").await.len(),
+            1,
+            "an unaffordable refund must not append a refund row"
+        );
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr) after an unaffordable refund"
+        );
+    }
+
+    /// release_reservation_transaction had no direct test. Releasing a hold must
+    /// credit the wallet by exactly the held amount and append a matching POSITIVE
+    /// row under the SAME reserve_% ref, so the pair nets to zero, the stranded-hold
+    /// detector returns 0, and the wallet is back where it started.
+    ///
+    /// Needs a live, migrated Postgres - DATABASE_URL=... cargo test --lib -- --ignored.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn release_reservation_returns_the_hold_and_pairs_the_ledger() {
+        run_with_teardown(live_pool().await, release_reservation_assertions).await;
+    }
+
+    async fn release_reservation_assertions(pool: PgPool, account_id: Uuid) {
+        const FUNDING: i64 = 50_000;
+        const HOLD: i64 = 10_000;
+
+        fund_through_topup(&pool, account_id, FUNDING).await;
+
+        let hold_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        assert_eq!(
+            reserve_balance_transaction(&pool, account_id, HOLD, Some(&hold_ref))
+                .await
+                .expect("reserve"),
+            ReservationResult::Held {
+                reserved_idr: HOLD,
+                new_balance: FUNDING - HOLD
+            },
+            "the hold must be a real, guarded debit"
+        );
+        assert_eq!(wallet_balance(&pool, account_id).await, FUNDING - HOLD);
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id)
+                .await
+                .expect("detect the live hold"),
+            1,
+            "a hold with no release yet is money the wallet cannot explain"
+        );
+
+        // The release: exactly the held amount back, under the SAME ref.
+        assert_eq!(
+            release_reservation_transaction(&pool, account_id, HOLD, Some(&hold_ref))
+                .await
+                .expect("the hold comes back"),
+            Some(FUNDING),
+            "the release must credit the whole hold back"
+        );
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            FUNDING,
+            "after the release the wallet must be exactly where it started"
+        );
+        assert_eq!(
+            ledger_rows(&pool, account_id, "usage").await,
+            vec![
+                (-HOLD, Some(hold_ref.clone())),
+                (HOLD, Some(hold_ref.clone()))
+            ],
+            "the release must append a POSITIVE row under the same reserve_ ref"
+        );
+        assert_eq!(
+            ledger_sum_for_ref(&pool, account_id, &hold_ref).await,
+            0,
+            "the hold and its release must net to zero"
+        );
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id)
+                .await
+                .expect("detect after release"),
+            0,
+            "the pair must no longer appear in the unpaired-hold detector"
+        );
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr) after a release"
+        );
+
+        // Nothing held, nothing released: a zero-delta ledger row is noise in an
+        // append-only money log.
+        let rows_before = ledger_row_count(&pool, account_id).await;
+        assert_eq!(
+            release_reservation_transaction(&pool, account_id, 0, Some("reserve_zero"))
+                .await
+                .expect("a zero release is not an error"),
+            None,
+            "a zero reservation has nothing to release"
+        );
+        assert_eq!(
+            ledger_row_count(&pool, account_id).await,
+            rows_before,
+            "a zero release must not append a zero-delta ledger row"
+        );
+        assert_eq!(wallet_balance(&pool, account_id).await, FUNDING);
+
+        // No wallet row: nothing was ever held, so a credit would be money the
+        // ledger cannot back.
+        let bare = bare_account(&pool).await;
+        assert_eq!(
+            release_reservation_transaction(&pool, bare, HOLD, Some("reserve_no_wallet"))
+                .await
+                .expect("releasing against a wallet-less account"),
+            None,
+            "an account with no wallet row has nothing to release"
+        );
+        assert_eq!(
+            ledger_row_count(&pool, bare).await,
+            0,
+            "a release with no wallet row must write no ledger row"
+        );
+        delete_fixture_rows(&pool, bare).await;
+    }
+
+    /// verify_wallet_reconciliation had no direct test, and a checker that always
+    /// returns true is worse than none: the property under test is its ability to
+    /// DETECT. A consistent fixture reports clean; a deliberate direct UPDATE of
+    /// balance_idr (the one thing production never does) is REPORTED as drift;
+    /// restoring it reports clean again.
+    ///
+    /// Needs a live, migrated Postgres - DATABASE_URL=... cargo test --lib -- --ignored.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn reconciliation_reports_drift_instead_of_always_passing() {
+        run_with_teardown(live_pool().await, reconciliation_assertions).await;
+    }
+
+    async fn reconciliation_assertions(pool: PgPool, account_id: Uuid) {
+        const AMOUNT: i64 = 50_000;
+
+        fund_through_topup(&pool, account_id, AMOUNT).await;
+
+        // 1. A consistent fixture is clean.
+        assert!(
+            verify_wallet_reconciliation(&pool, account_id)
+                .await
+                .expect("verify a consistent wallet"),
+            "a wallet whose balance is its ledger sum must verify clean"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        // 2. Manufacture drift the only way it can happen: a balance the ledger
+        //    cannot explain. The checker must SEE it.
+        sqlx::query("UPDATE wallets SET balance_idr = balance_idr + 1 WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&pool)
+            .await
+            .expect("manufacture drift");
+
+        assert!(
+            !verify_wallet_reconciliation(&pool, account_id)
+                .await
+                .expect("verify a drifted wallet"),
+            "the checker must report a balance the ledger cannot explain: {}",
+            drift_report(&pool, account_id).await
+        );
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            1,
+            "the drift the checker reports must be the drift the sweep finds"
+        );
+
+        // 3. Restore, and the checker agrees again - so it is reading the data, not
+        //    answering from a constant.
+        sqlx::query("UPDATE wallets SET balance_idr = balance_idr - 1 WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&pool)
+            .await
+            .expect("restore the balance");
+
+        assert!(
+            verify_wallet_reconciliation(&pool, account_id)
+                .await
+                .expect("verify the restored wallet"),
+            "after restoring the balance the checker must report clean again"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        // 4. No wallet at all is an error, not a silent "clean".
+        let bare = bare_account(&pool).await;
+        match verify_wallet_reconciliation(&pool, bare).await {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("a missing wallet must be NotFound, got {other:?}"),
+        }
+        delete_fixture_rows(&pool, bare).await;
+    }
+
+    /// unpaired_hold_rows: a hold with no matching release is money that left the
+    /// wallet and came back nowhere, so it must be COUNTED; a matched pair and a
+    /// clean account must both be zero. This is the detector the hold sweep and the
+    /// operator rely on, so a detector that never fires is the failure mode.
+    ///
+    /// Needs a live, migrated Postgres - DATABASE_URL=... cargo test --lib -- --ignored.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn unpaired_hold_rows_counts_a_stranded_hold_and_clears_a_matched_one() {
+        run_with_teardown(live_pool().await, unpaired_hold_assertions).await;
+    }
+
+    async fn unpaired_hold_assertions(pool: PgPool, account_id: Uuid) {
+        const FUNDING: i64 = 50_000;
+        const HOLD: i64 = 10_000;
+
+        fund_through_topup(&pool, account_id, FUNDING).await;
+
+        // A clean account: the topup row is not a hold.
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id)
+                .await
+                .expect("sweep a clean account"),
+            0,
+            "a clean account has no stranded holds"
+        );
+
+        // A hold with no release.
+        let stranded_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        assert!(matches!(
+            reserve_balance_transaction(&pool, account_id, HOLD, Some(&stranded_ref))
+                .await
+                .expect("reserve"),
+            ReservationResult::Held { .. }
+        ));
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id)
+                .await
+                .expect("sweep a stranded hold"),
+            1,
+            "a hold with no matching release must be counted"
+        );
+
+        // The matching release clears it.
+        assert_eq!(
+            release_reservation_transaction(&pool, account_id, HOLD, Some(&stranded_ref))
+                .await
+                .expect("release the hold"),
+            Some(FUNDING)
+        );
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id)
+                .await
+                .expect("sweep a matched pair"),
+            0,
+            "a matched pair must not be reported as stranded"
+        );
+
+        // The detector is scoped to the reserve_% refs the proxy writes (see the
+        // docs on unpaired_hold_rows). A hold under any other ref is outside its
+        // scope by construction, so it is not counted - which is exactly why the
+        // reservation ref must stay reserve_<uuid> on every call site.
+        let other_ref = format!("other_{}", Uuid::new_v4().simple());
+        assert!(matches!(
+            reserve_balance_transaction(&pool, account_id, HOLD, Some(&other_ref))
+                .await
+                .expect("reserve under a non-reserve ref"),
+            ReservationResult::Held { .. }
+        ));
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id)
+                .await
+                .expect("sweep a non-reserve ref"),
+            0,
+            "the detector is scoped to reserve_% refs"
+        );
+        assert_eq!(
+            release_reservation_transaction(&pool, account_id, HOLD, Some(&other_ref))
+                .await
+                .expect("release the non-reserve hold"),
+            Some(FUNDING)
+        );
+        assert_eq!(wallet_balance(&pool, account_id).await, FUNDING);
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr) after every case"
+        );
+    }
 }
 
 /// Verification query: confirms that wallet balance equals sum of ledger entries.
@@ -1651,7 +2397,10 @@ pub async fn verify_wallet_reconciliation(
         r#"
         SELECT
             w.balance_idr AS wallet_balance,
-            COALESCE(SUM(l.delta_idr), 0) AS ledger_sum
+            -- Cast: Postgres SUM(bigint) is NUMERIC, and sqlx refuses to decode
+            -- NUMERIC into i64, so without this the query fails on EVERY wallet
+            -- and the checker never returns an answer at all.
+            COALESCE(SUM(l.delta_idr), 0)::bigint AS ledger_sum
         FROM wallets w
         LEFT JOIN ledger l ON l.account_id = w.account_id
         WHERE w.account_id = $1
