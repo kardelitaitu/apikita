@@ -857,9 +857,12 @@ fn requested_stream_flag(body: &Value) -> Option<bool> {
 /// "unset".
 fn stream_flag_allowed(requested: Option<bool>) -> Result<(), AppError> {
     match requested {
-        Some(false) => Err(AppError::ValidationFailed(
-            "stream must be true: this endpoint serves text/event-stream only; set stream to true or omit the field".into(),
-        )),
+        Some(false) => Err(AppError::ValidationFailed {
+            message: "stream must be true: this endpoint serves text/event-stream only; set stream to true or omit the field".into(),
+            // docs/error-model.md rule 5: name the field so the caller can
+            // point at `stream` in their body without parsing the prose.
+            field: "stream".into(),
+        }),
         _ => Ok(()),
     }
 }
@@ -1843,9 +1846,17 @@ mod tests {
     #[test]
     fn an_explicit_non_streaming_request_is_refused_not_silently_streamed() {
         let err = stream_flag_allowed(Some(false)).unwrap_err();
-        assert!(matches!(&err, AppError::ValidationFailed(_)));
+        assert!(matches!(&err, AppError::ValidationFailed { .. }));
         assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(err.to_string().contains("stream"), "the field is named");
+        assert!(err.to_string().contains("stream"), "the message names it");
+
+        // docs/error-model.md rule 5: the machine-readable field name, so the
+        // UI highlights the input instead of matching on the prose.
+        assert_eq!(
+            err.details(),
+            Some(json!({ "field": "stream" })),
+            "a 422 from this site must carry details.field = \"stream\""
+        );
 
         assert!(stream_flag_allowed(Some(true)).is_ok());
         assert!(stream_flag_allowed(None).is_ok(), "absent keeps the default");

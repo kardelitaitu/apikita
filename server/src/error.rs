@@ -61,8 +61,12 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
-    #[error("Validation failed: {0}")]
-    ValidationFailed(String),
+    /// Carries the offending field, not just prose. docs/error-model.md:165
+    /// (rule 5) requires `details.field` so a UI can highlight the input
+    /// without parsing the message; making it a required field means a new
+    /// call site cannot forget it.
+    #[error("Validation failed: {message}")]
+    ValidationFailed { message: String, field: String },
 
     #[error("Rate limited")]
     RateLimited { retry_after_secs: u64 },
@@ -91,7 +95,7 @@ impl AppError {
             Self::ModelNotAllowed(_) | Self::WrongCredentialType(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::ValidationFailed(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::ValidationFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::NoUpstreamAvailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -110,7 +114,7 @@ impl AppError {
             Self::WrongCredentialType(_) => "wrong_credential_type",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
-            Self::ValidationFailed(_) => "validation_failed",
+            Self::ValidationFailed { .. } => "validation_failed",
             Self::RateLimited { .. } => "rate_limited",
             Self::NoUpstreamAvailable => "no_upstream_available",
             Self::Database(_) | Self::Internal(_) => "internal_error",
@@ -133,6 +137,12 @@ impl AppError {
         match self {
             Self::InsufficientBalance { details } | Self::KeyLimitExceeded { details } => {
                 details.clone()
+            }
+            // docs/error-model.md rule 5: the field name travels as
+            // `details.field`, so the client highlights the input instead of
+            // matching on prose.
+            Self::ValidationFailed { field, .. } => {
+                Some(serde_json::json!({ "field": field }))
             }
             _ => None,
         }
@@ -223,7 +233,10 @@ mod tests {
             AppError::WrongCredentialType("cookie where an API key is required".into()),
             AppError::NotFound("key_7f3a".into()),
             AppError::Conflict("telegram account already linked".into()),
-            AppError::ValidationFailed("amount_idr must be at least 10000".into()),
+            AppError::ValidationFailed {
+                message: "amount_idr must be at least 10000".into(),
+                field: "amount_idr".into(),
+            },
             AppError::RateLimited { retry_after_secs: 42 },
             AppError::NoUpstreamAvailable,
             AppError::Database(sqlx::Error::RowNotFound),
@@ -244,7 +257,14 @@ mod tests {
             (AppError::WrongCredentialType("c".into()), 403, "wrong_credential_type"),
             (AppError::NotFound("id".into()), 404, "not_found"),
             (AppError::Conflict("dup".into()), 409, "conflict"),
-            (AppError::ValidationFailed("v".into()), 422, "validation_failed"),
+            (
+                AppError::ValidationFailed {
+                    message: "v".into(),
+                    field: "v".into(),
+                },
+                422,
+                "validation_failed",
+            ),
             (AppError::RateLimited { retry_after_secs: 1 }, 429, "rate_limited"),
             (AppError::NoUpstreamAvailable, 503, "no_upstream_available"),
             (AppError::Database(sqlx::Error::RowNotFound), 500, "internal_error"),
@@ -593,8 +613,11 @@ mod tests {
     #[tokio::test]
     async fn a_validation_error_names_the_offending_field_in_details() {
         // docs/error-model.md:165, rule 5 - validation errors name the field.
-        let (status, _, body) =
-            respond(AppError::ValidationFailed("amount_idr must be at least 10000".into())).await;
+        let (status, _, body) = respond(AppError::ValidationFailed {
+            message: "amount_idr must be at least 10000".into(),
+            field: "amount_idr".into(),
+        })
+        .await;
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let e = error_object(&body);

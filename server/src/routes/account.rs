@@ -295,9 +295,12 @@ fn check_deposit_limit(
         } else {
             "top-up"
         };
-        return Err(AppError::ValidationFailed(format!(
-            "Amount must be at least {min_required} IDR for a {which}"
-        )));
+        return Err(AppError::ValidationFailed {
+            message: format!("Amount must be at least {min_required} IDR for a {which}"),
+            // docs/error-model.md rule 5: name the field so the top-up form can
+            // highlight the amount input without parsing the message.
+            field: "amount_idr".into(),
+        });
     }
 
     Ok(())
@@ -551,6 +554,14 @@ mod tests {
         assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
         let message = err.to_string();
         assert!(message.contains("50000"), "message was {message}");
+
+        // docs/error-model.md rule 5: the top-up form needs the field name to
+        // highlight the amount input without parsing the message.
+        assert_eq!(
+            err.details(),
+            Some(serde_json::json!({ "field": "amount_idr" })),
+            "a 422 from the deposit check must carry details.field = \"amount_idr\""
+        );
     }
 
     #[test]
