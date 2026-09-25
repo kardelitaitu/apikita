@@ -450,12 +450,42 @@ impl UpstreamClient {
 }
 
 /// Rewrite the caller's payload for one endpoint: the upstream knows the model
-/// by its own name, and this layer only ever streams.
+/// by its own name, this layer only ever streams, and it must ask for the usage
+/// block that settlement is built on.
 fn prepare_body(body: &Value, upstream_model: &str) -> Value {
     let mut payload = body.clone();
     if let Some(object) = payload.as_object_mut() {
+        // A caller that says nothing about streaming is treated as a streaming
+        // caller, because that is what this client is for. Only an explicit
+        // "stream": false opts out of the usage opt-in below.
+        let streaming = object.get("stream").and_then(Value::as_bool).unwrap_or(true);
+
         object.insert("model".to_string(), json!(upstream_model));
         object.insert("stream".to_string(), json!(true));
+
+        // OpenAI-compatible upstreams emit the final usage block on SSE only
+        // when this opt-in is present; otherwise they assume a human is
+        // watching and omit it. Settlement reads that block
+        // (parse_usage_from_sse) and settles nothing without it, so a stream
+        // that skipped the opt-in would deliver tokens and bill zero — the one
+        // error an arbitrage gateway cannot make.
+        //
+        // A caller may legitimately send stream_options of their own, so their
+        // object is merged into, never replaced: only include_usage is set and
+        // every other key they sent survives.
+        if streaming {
+            let options = object
+                .entry("stream_options".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if !options.is_object() {
+                // A non-object stream_options is not a shape the upstream would
+                // accept anyway, so there is nothing meaningful to preserve.
+                *options = Value::Object(serde_json::Map::new());
+            }
+            if let Some(options) = options.as_object_mut() {
+                options.insert("include_usage".to_string(), json!(true));
+            }
+        }
     }
     payload
 }
@@ -839,5 +869,49 @@ mod tests {
             .expect_err("empty key pool");
         assert!(matches!(keyless, UpstreamError::NoHealthyUpstream(_)));
     }
-}
 
+    #[test]
+    fn prepare_body_asks_for_usage_when_streaming() {
+        let payload = prepare_body(
+            &json!({ "model": "flash", "messages": [] }),
+            "deepseek-flash",
+        );
+
+        assert_eq!(payload["model"], json!("deepseek-flash"));
+        assert_eq!(payload["stream"], json!(true));
+        assert_eq!(
+            payload["stream_options"],
+            json!({ "include_usage": true }),
+            "without the opt-in the upstream omits usage and nothing gets billed"
+        );
+    }
+
+    #[test]
+    fn prepare_body_merges_into_a_caller_supplied_stream_options() {
+        let payload = prepare_body(
+            &json!({
+                "model": "flash",
+                "stream": true,
+                "stream_options": { "foo": "bar", "include_usage": false }
+            }),
+            "deepseek-flash",
+        );
+
+        // The caller's own key survives, and only include_usage is forced.
+        assert_eq!(payload["stream_options"]["foo"], json!("bar"));
+        assert_eq!(payload["stream_options"]["include_usage"], json!(true));
+    }
+
+    #[test]
+    fn prepare_body_leaves_a_non_streaming_body_alone() {
+        let payload = prepare_body(
+            &json!({ "model": "flash", "stream": false, "messages": [] }),
+            "deepseek-flash",
+        );
+
+        assert!(
+            payload.get("stream_options").is_none(),
+            "a non-streaming request has no SSE usage block to opt into: {payload}"
+        );
+    }
+}
