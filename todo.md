@@ -111,8 +111,8 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [ ] Verify signature verification rejection on invalid signatures
   - [ ] Verify idempotency: replayed webhook with same `order_id` credits wallet exactly once
 - [ ] **Midtrans Snap Client**
-  - [ ] Implement `POST /api/topups` calling Midtrans Snap API (`/snap/v1/transactions`)
-  - [ ] Enforce deposit limits (50k IDR initial, 10k IDR subsequent)
+  - [x] Implement `POST /api/topups` calling Midtrans Snap API (`/snap/v1/transactions`)
+  - [x] Enforce deposit limits (50k IDR initial, 10k IDR subsequent)
   - [x] Integrate Midtrans Snap.js popup modal in Web wallet island
 - [ ] **Midtrans Sandbox Verification**
   - [ ] Run live end-to-end sandbox top-up with test QRIS code
