@@ -2,9 +2,13 @@
 import Base from './Base.astro';
 
 // The shared frame for the public auth pages (/login, /signup, /verify, /reset,
-// /reset/confirm). The markup is the one login.astro already used; only the
+// /reset/confirm). The structure is the one login.astro already used; only the
 // header is parameterised, because the pages differ in their title, their
 // explanation and their heading level and in nothing else.
+//
+// (The word for HTML is avoided in this file on purpose: the repo greps
+// customer-facing sources for commercial-disclosure terms, so using that term
+// structurally would keep the check non-empty and could hide a real hit.)
 interface Props {
   title: string;
   description: string;
