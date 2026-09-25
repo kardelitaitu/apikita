@@ -1,0 +1,120 @@
+---
+import AuthLayout from '../../layouts/AuthLayout.astro';
+
+// docs/website/03-functional-spec.md lines 88-95, step 3: "/reset/confirm: new
+// password -> saved -> all sessions invalidated". Line 95 is the token rule this
+// page has to keep: "never echoed back in a URL that gets logged".
+const heading = 'Set a new password';
+const lead = 'Choose a new password. Saving it signs out every session on this account, including any device you are not holding.';
+---
+
+<AuthLayout
+  title="Set a new password — apikita"
+  description="Choose a new password for your apikita account."
+  heading={heading}
+  lead={lead}
+>
+  <form id="reset-confirm" class="mt-6 space-y-4">
+    <div>
+      <label for="password" class="block text-sm font-medium">New password</label>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        autocomplete="new-password"
+        minlength="8"
+        required
+        aria-describedby="password-rules"
+        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+      />
+      <p id="password-rules" class="mt-1 text-xs text-slate-500">
+        At least 8 characters. Shown before you submit, not after it fails.
+      </p>
+    </div>
+    <div>
+      <label for="password-confirm" class="block text-sm font-medium">Confirm new password</label>
+      <input
+        id="password-confirm"
+        name="passwordConfirm"
+        type="password"
+        autocomplete="new-password"
+        minlength="8"
+        required
+        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+      />
+    </div>
+    <button
+      id="reset-confirm-submit"
+      type="submit"
+      class="w-full rounded-md bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+    >
+      Save new password
+    </button>
+  </form>
+</AuthLayout>
+
+<script>
+  import { pb } from '../../lib/pocketbase';
+  import { confirmationError, describeAuthError, passwordRuleError, PASSWORD_RESET_DONE_MESSAGE, readAuthToken, withoutAuthToken } from '../../lib/auth-flow';
+
+  const errorBox = document.getElementById('auth-error') as HTMLDivElement;
+  const done = document.getElementById('auth-done') as HTMLDivElement;
+  const doneMessage = document.getElementById('auth-done-message') as HTMLDivElement;
+  const form = document.getElementById('reset-confirm') as HTMLFormElement;
+  const submit = document.getElementById('reset-confirm-submit') as HTMLButtonElement;
+
+  const token = readAuthToken(window.location.search);
+
+  // Spec line 95: the token must not be echoed back in a URL that gets logged.
+  // Removed from the address bar before the request, so it is not in the history
+  // entry, in a copied link, or in the referrer of the next navigation. The token
+  // is never written to the title, to storage, or to any other place — it lives
+  // in this closure and in PocketBase's own auth store.
+  if (token !== null) {
+    window.history.replaceState(null, '', withoutAuthToken(window.location.href));
+  }
+
+  function showError(message: string): void {
+    errorBox.textContent = message;
+    errorBox.hidden = false;
+  }
+
+  function setBusy(busy: boolean): void {
+    submit.disabled = busy;
+  }
+
+  if (token === null) {
+    form.hidden = true;
+    showError('This reset link is invalid or has expired. Request a new one.');
+    document.getElementById('auth-done')!.hidden = false;
+  } else {
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      errorBox.hidden = true;
+      errorBox.textContent = '';
+
+      const data = new FormData(form);
+      const password = String(data.get('password') ?? '');
+      const confirmation = String(data.get('passwordConfirm') ?? '');
+
+      const local = passwordRuleError(password) ?? confirmationError(password, confirmation);
+      if (local !== null) {
+        showError(local);
+        return;
+      }
+
+      setBusy(true);
+      // PocketBase invalidates the token on use and rotates the record's tokenKey
+      // with the new password, so every session on the account is signed out.
+      void pb.collection('users').confirmPasswordReset(token, password, confirmation)
+        .then(() => {
+          pb.authStore.clear();
+          form.hidden = true;
+          doneMessage.textContent = PASSWORD_RESET_DONE_MESSAGE;
+          done.hidden = false;
+        })
+        .catch((err: unknown) => showError(describeAuthError(err, 'Request a new reset link.')))
+        .finally(() => setBusy(false));
+    });
+  }
+</script>

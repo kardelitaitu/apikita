@@ -1,0 +1,178 @@
+---
+import AuthLayout from '../layouts/AuthLayout.astro';
+
+// docs/website/03-functional-spec.md lines 23-43. Path A is Google (one click,
+// email already verified by Google); Path B is email + password, which creates
+// the account and sends the verification email. The account cannot hold a
+// balance until that address is verified, so the page says so.
+const heading = 'Create an account';
+const lead = 'Two ways in. Google creates the account on first sign-in and its email arrives already verified; an email and password sends you a verification link instead. Either way, the account cannot hold a balance until the address is verified.';
+---
+
+<AuthLayout
+  title="Create an account — apikita"
+  description="Create an apikita account with Google or an email address and password."
+  heading={heading}
+  lead={lead}
+>
+  <button
+    id="google-signup"
+    type="button"
+    class="mt-6 w-full rounded-md border border-slate-300 px-4 py-2.5 text-sm font-medium hover:border-slate-400 disabled:opacity-50"
+  >
+    Continue with Google
+  </button>
+
+  <div class="my-6 flex items-center gap-3 text-xs uppercase tracking-wide text-slate-400">
+    <span class="h-px flex-1 bg-slate-200"></span>
+    or
+    <span class="h-px flex-1 bg-slate-200"></span>
+  </div>
+
+  <form id="signup" class="space-y-4">
+    <div>
+      <label for="email" class="block text-sm font-medium">Email</label>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        autocomplete="email"
+        required
+        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+      />
+    </div>
+    <div>
+      <label for="password" class="block text-sm font-medium">Password</label>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        autocomplete="new-password"
+        minlength="8"
+        required
+        aria-describedby="password-rules"
+        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+      />
+      <p id="password-rules" class="mt-1 text-xs text-slate-500">
+        At least 8 characters. Shown before you submit, not after it fails.
+      </p>
+    </div>
+    <div>
+      <label for="password-confirm" class="block text-sm font-medium">Confirm password</label>
+      <input
+        id="password-confirm"
+        name="passwordConfirm"
+        type="password"
+        autocomplete="new-password"
+        minlength="8"
+        required
+        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+      />
+    </div>
+
+    <div class="rounded-lg border border-slate-300 bg-slate-50 p-3 text-xs leading-relaxed text-slate-700">
+      <p class="font-medium text-slate-900">Where your prompts go</p>
+      <p class="mt-1">
+        Prompts are forwarded to an upstream provider in mainland China, whose own
+        retention policy applies and is outside our control.
+      </p>
+      <p class="mt-2">
+        We do not store your prompts or completions. We keep the token counts
+        needed to bill you and your wallet ledger.
+      </p>
+    </div>
+
+    <button
+      id="signup-submit"
+      type="submit"
+      class="w-full rounded-md bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+    >
+      Create account
+    </button>
+  </form>
+
+  <p class="mt-6 text-xs text-slate-500">
+    Already have an account? <a href="/login" class="underline">Sign in</a>.
+  </p>
+</AuthLayout>
+
+<script>
+  import { pb, exchangeForSession } from '../lib/pocketbase';
+  import { confirmationError, describeAuthError, DUPLICATE_SIGNUP_MESSAGE, isUnreachable, passwordRuleError, signupReply } from '../lib/auth-flow';
+
+  const errorBox = document.getElementById('auth-error') as HTMLDivElement;
+  const done = document.getElementById('auth-done') as HTMLDivElement;
+  const doneMessage = document.getElementById('auth-done-message') as HTMLDivElement;
+  const googleButton = document.getElementById('google-signup') as HTMLButtonElement;
+  const form = document.getElementById('signup') as HTMLFormElement;
+  const submit = document.getElementById('signup-submit') as HTMLButtonElement;
+
+  function showError(message: string): void {
+    errorBox.textContent = message;
+    errorBox.hidden = false;
+  }
+
+  function clearError(): void {
+    errorBox.hidden = true;
+    errorBox.textContent = '';
+  }
+
+  /** The neutral reply replaces the form, so it cannot be read as a failure. */
+  function showNeutralReply(message: string): void {
+    form.hidden = true;
+    doneMessage.textContent = message;
+    done.hidden = false;
+  }
+
+  function setBusy(busy: boolean): void {
+    googleButton.disabled = busy;
+    submit.disabled = busy;
+  }
+
+  googleButton.addEventListener('click', () => {
+    clearError();
+    setBusy(true);
+    void pb.collection('users').authWithOAuth2({ provider: 'google' })
+      .then(exchangeForSession)
+      .then(() => window.location.assign('/dashboard'))
+      .catch((err: unknown) => showError(describeAuthError(err, DUPLICATE_SIGNUP_MESSAGE)))
+      .finally(() => setBusy(false));
+  });
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    clearError();
+    const data = new FormData(form);
+    const email = String(data.get('email') ?? '');
+    const password = String(data.get('password') ?? '');
+    const confirmation = String(data.get('passwordConfirm') ?? '');
+
+    // Both are decided locally, before anything is sent: a typo in the
+    // confirmation must not reach the server, and it is not about the account.
+    const local = passwordRuleError(password) ?? confirmationError(password, confirmation);
+    if (local !== null) {
+      showError(local);
+      return;
+    }
+
+    setBusy(true);
+    void pb.collection('users').create({ email, password, passwordConfirm: confirmation })
+      .then(() => {
+        // Spec line 31: the verification email follows registration. Its failure
+        // does not change what the user is told — the reply stays neutral.
+        void pb.collection('users').requestVerification(email).catch(() => undefined);
+        showNeutralReply(signupReply(null));
+      })
+      .catch((err: unknown) => {
+        // Spec lines 38-43: a taken address must not be distinguishable from a
+        // free one. The server's 400 is not shown; the neutral reply is.
+        if (!isUnreachable(err)) {
+          void pb.collection('users').requestVerification(email).catch(() => undefined);
+          showNeutralReply(signupReply(err));
+          return;
+        }
+        showError(describeAuthError(err, DUPLICATE_SIGNUP_MESSAGE));
+      })
+      .finally(() => setBusy(false));
+  });
+</script>

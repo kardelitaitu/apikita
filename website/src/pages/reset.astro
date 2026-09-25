@@ -1,0 +1,87 @@
+---
+import AuthLayout from '../layouts/AuthLayout.astro';
+
+// docs/website/03-functional-spec.md lines 88-95, step 1: "/reset: enter email.
+// Always respond with the same neutral message." The page therefore has exactly
+// one answer, and nothing in it branches on whether the address exists.
+const heading = 'Reset your password';
+const lead = 'Enter the email address on your account and we will send a single-use reset link. The link expires quickly and stops working the moment it is used.';
+---
+
+<AuthLayout
+  title="Reset your password — apikita"
+  description="Request a password reset link for your apikita account."
+  heading={heading}
+  lead={lead}
+>
+  <form id="reset" class="mt-6 space-y-4">
+    <div>
+      <label for="email" class="block text-sm font-medium">Email</label>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        autocomplete="email"
+        required
+        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+      />
+    </div>
+    <button
+      id="reset-submit"
+      type="submit"
+      class="w-full rounded-md bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+    >
+      Send reset link
+    </button>
+  </form>
+
+  <p class="mt-6 text-xs text-slate-500">
+    Remembered it? <a href="/login" class="underline">Sign in</a>.
+  </p>
+</AuthLayout>
+
+<script>
+  import { pb } from '../lib/pocketbase';
+  import { isUnreachable, resetRequestReply } from '../lib/auth-flow';
+
+  const errorBox = document.getElementById('auth-error') as HTMLDivElement;
+  const done = document.getElementById('auth-done') as HTMLDivElement;
+  const doneMessage = document.getElementById('auth-done-message') as HTMLDivElement;
+  const form = document.getElementById('reset') as HTMLFormElement;
+  const submit = document.getElementById('reset-submit') as HTMLButtonElement;
+
+  function showError(message: string): void {
+    errorBox.textContent = message;
+    errorBox.hidden = false;
+  }
+
+  /** The neutral reply replaces the form, so it cannot be read as a failure. */
+  function showNeutralReply(message: string): void {
+    form.hidden = true;
+    doneMessage.textContent = message;
+    done.hidden = false;
+  }
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    errorBox.hidden = true;
+    errorBox.textContent = '';
+    setBusy(true);
+
+    const email = String(new FormData(form).get('email') ?? '');
+    void pb.collection('users').requestPasswordReset(email)
+      // Spec line 90: every server answer produces the same message. The reply
+      // is built from the error only to tell "we asked and were answered" apart
+      // from "the request never left" — never to tell one account from another.
+      .then(() => showNeutralReply(resetRequestReply(null)))
+      .catch((err: unknown) => {
+        if (isUnreachable(err)) showError(resetRequestReply(err));
+        else showNeutralReply(resetRequestReply(err));
+      })
+      .finally(() => setBusy(false));
+  });
+
+  function setBusy(busy: boolean): void {
+    submit.disabled = busy;
+  }
+</script>
