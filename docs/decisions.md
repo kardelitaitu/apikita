@@ -51,6 +51,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Money type | **`BIGINT` IDR** | Never floating point |
 | Ledger | **Append-only; balance derivable** | Corrections are new rows, never edits |
 | Balance floor | **`CHECK (balance_idr >= 0)`** | The database refuses a negative balance |
+| Overdraft | **Not permitted — no flag** | The balance is non-negative by decision. `server/migrations/20260925000000_initial_schema.sql:18` is the authoritative backstop; the pre-flight in `server/src/routes/proxy.rs` always rejects when the reservation exceeds the balance. Gate 2 of [`launch-checklist.md`](launch-checklist.md) requires the constraint present and exercised |
 | Refund policy | **Non-refundable, with a non-delivery exception** | The exception is what makes the clause defensible |
 
 ### API behaviour
@@ -181,6 +182,7 @@ Decided *values* that the running system reads are in `config/apikita.toml`:
 | `[realtime]` | SSE replay buffer, connection cap, stream lifetime |
 | `[key_pool]` | Rotation, cooldowns, attempts |
 | `[circuit_breaker]` | Trip threshold, cooldown + backoff cap, upstream timeout, health checks |
+| `[streaming]` | Mid-stream cutoff, max output tokens, context cap. `allow_negative_balance_overdraft` was **removed** — overdraft is not permitted |
 | `[[models]]` | Per-model margin, rates, endpoints, key env names |
 
 **A decision here without a corresponding config value cannot be enforced.** If you
