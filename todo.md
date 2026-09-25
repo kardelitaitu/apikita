@@ -66,10 +66,10 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [x] Parse usage summary from final SSE chunk
   - [x] Execute atomic usage settlement (`debit_usage_transaction`) on stream completion
   - [x] Ensure mid-stream errors do not retry silently
-- [ ] **Session Auth & Realtime Event Stream**
+- [x] **Session Auth & Realtime Event Stream**
   - [x] Wire `POST /auth/exchange` to verify PocketBase JWTs and issue cookie
   - [x] Implement session revocation on `POST /auth/logout` and `POST /auth/logout-all`
-  - [ ] Realtime SSE stream (`GET /events`) with heartbeat and live balance broadcast
+  - [x] Realtime SSE stream (`GET /events`) with heartbeat and live balance broadcast
 
 ---
 
