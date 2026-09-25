@@ -45,6 +45,76 @@ impl axum::extract::FromRef<AppState> for PgPool {
     }
 }
 
+/// Owns a held reservation and gives it back if dropped before the settlement
+/// transaction has committed and credited the hold back.
+///
+/// The hold is taken in the handler BEFORE the upstream call and released inside
+/// the settlement transaction (`debit_usage_transaction`). Between those two
+/// points the money is out of the wallet and must come back on EVERY exit: a
+/// client reset (this future dropped mid-await), a `?`, an early return, or a
+/// failed settlement. Carrying the hold in a guard makes that structural
+/// instead of depending on every exit site remembering to call `release_quietly`.
+///
+/// `Drop` cannot await, so the release is fire-and-forget: it spawns a task. A
+/// dropped guard means the settlement did NOT claim the hold (it only releases
+/// inside its committed transaction), so crediting it back is always correct and
+/// never double-counts. On the success path the caller consumes the guard with
+/// `defuse` once the debit has committed - the exact moment the money is already
+/// back in the wallet.
+struct ReservationGuard {
+    pool: PgPool,
+    account_id: Uuid,
+    reserved_idr: i64,
+    reservation_ref: String,
+    model: String,
+    defused: bool,
+}
+
+impl ReservationGuard {
+    fn new(
+        pool: &PgPool,
+        account_id: Uuid,
+        reserved_idr: i64,
+        reservation_ref: &str,
+        model: &str,
+    ) -> Self {
+        Self {
+            pool: pool.clone(),
+            account_id,
+            reserved_idr,
+            reservation_ref: reservation_ref.to_string(),
+            model: model.to_string(),
+            defused: false,
+        }
+    }
+
+    /// The settlement transaction has committed and credited the hold back in the
+    /// same transaction, so dropping this guard must not release it again. Flip
+    /// the `defused` flag in place; callers may still read `reservation_ref` /
+    /// `model` afterwards to drive the explicit release.
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        let pool = self.pool.clone();
+        let account_id = self.account_id;
+        let reserved_idr = self.reserved_idr;
+        let reservation_ref = std::mem::take(&mut self.reservation_ref);
+        let model = std::mem::take(&mut self.model);
+        // Fire-and-forget: `Drop` cannot await and the hold must come back even
+        // if this future is being torn down.
+        tokio::spawn(async move {
+            release_quietly(&pool, account_id, reserved_idr, &reservation_ref, &model).await;
+        });
+    }
+}
+
 /// The only fields the enforcement order needs before forwarding. The body is
 /// forwarded verbatim, so this is a lens over it rather than the payload: a
 /// parameter this struct does not know about — `temperature`, `tools`, `stop`,
@@ -920,9 +990,23 @@ pub async fn chat_completions(
     // the one that happens to serve the request — otherwise a failover to a
     // dearer provider can overdraw the balance (docs/failover.md:162-165).
     let estimated_input = (body.len() as u64 / 4).max(1);
+    // The reservation must cover the worst case the upstream can actually emit,
+    // not just the client's cap. A request that omits max_tokens (or asks for
+    // less than the model can produce) still lets the upstream stream up to the
+    // model's own ceiling, so the hold is taken against
+    // max(requested, model.max_output_tokens) and then clamped to the hard limit.
+    // The earlier code reserved only min(requested, hard) - which with the
+    // defaults left a 4096-token hold guarding a model that emits up to 384000
+    // tokens, and an over-long answer overdrew the wallet. The tradeoff is
+    // deliberate: when the client asks for less than the model can give we hold
+    // more than their cap (never less), because the bound's job is to never
+    // under-reserve. The true cost is charged at settlement regardless, so only
+    // the over-askers benefit from the extra headroom and the under-reserved case
+    // is gone.
     let max_output = meta
         .max_tokens
-        .unwrap_or(state.config.streaming.default_max_output_tokens)
+        .unwrap_or(0)
+        .max(model_cfg.max_output_tokens)
         .min(state.config.streaming.hard_max_output_tokens);
 
     // One reservation per endpoint, and the dearest wins. The rates live on
@@ -988,6 +1072,14 @@ pub async fn chat_completions(
         ReservationResult::Zero => 0,
     };
 
+    // The hold is now out of the wallet. Carry it in a guard so that EVERY exit
+    // before the settlement transaction claims it gives the money back - a client
+    // reset that drops this future mid-await, a '?', or an early return. The
+    // settlement task takes ownership of the guard; if settlement commits the
+    // debit it defuses the guard (the hold was already credited back in that same
+    // transaction) and on every other path the guard's Drop releases it.
+    let mut guard = ReservationGuard::new(&state.pool, account_id, reserved_idr, &reservation_ref, &meta.model);
+
     // 7. Route and stream. The raw inbound body goes up with `stream: true`
     // ensured; the client rewrites `model` to the endpoint's upstream_model.
     //
@@ -997,6 +1089,10 @@ pub async fn chat_completions(
     let stream = match upstream.stream_chat(&meta.model, upstream_body).await {
         Ok(stream) => stream,
         Err(err) => {
+            // Upstream was never reached, so there is nothing to bill: the whole
+            // hold must come back. Defuse the guard so its Drop does not release
+            // the same hold a second time, then release synchronously here.
+            guard.defuse();
             release_quietly(&state.pool, account_id, reserved_idr, &reservation_ref, &meta.model)
                 .await;
             return Err(upstream_error(err, &meta.model, account_id));
@@ -1028,7 +1124,10 @@ pub async fn chat_completions(
         key_id,
         meta.model.clone(),
         reservation,
-        reservation_ref,
+        // Hand the guard to the settlement task. If the task commits the debit it
+        // defuses the guard; on any earlier exit the guard's Drop is the safety
+        // net that gives the hold back.
+        guard,
     ));
 
     Response::builder()
@@ -1083,7 +1182,12 @@ async fn settle_after_stream(
     key_id: Uuid,
     model: String,
     reserved_idr: i64,
-    reservation_ref: String,
+    // Owns the hold. The task takes it so that EVERY exit releases the hold:
+    // the guard's Drop is the safety net (client hangup, task cancellation, a
+    // panic), and the explicit `defuse` calls claim ownership only after a path
+    // has already credited the hold back in its own transaction. A guard can
+    // therefore never double-credit the wallet.
+    mut guard: ReservationGuard,
 ) {
     // Each arm reports only what the upstream actually said; the single rule below
     // then decides bill-or-wash, so there is exactly one place a hold can be
@@ -1141,7 +1245,10 @@ async fn settle_after_stream(
     // Bill exactly what the upstream reported, and give the whole hold back when it
     // reported nothing. No usage means no charge — never an invented one.
     let SettlementPlan::Bill(usage) = settlement_plan(reported) else {
-        release_quietly(&pool, account_id, reserved_idr, &reservation_ref, &model).await;
+        // No usage reported: nothing billed, so the whole hold must come back.
+        // Defuse the guard (its Drop must not release a second time) then release.
+        guard.defuse();
+        release_quietly(&pool, account_id, reserved_idr, &guard.reservation_ref, &guard.model).await;
         return;
     };
 
@@ -1155,7 +1262,10 @@ async fn settle_after_stream(
             reserved_idr,
             "Settled model is no longer configured; releasing the reservation"
         );
-        release_quietly(&pool, account_id, reserved_idr, &reservation_ref, &model).await;
+        // Stranded hold on a routing race: give it back, defusing the guard so
+        // its Drop does not release a second time.
+        guard.defuse();
+        release_quietly(&pool, account_id, reserved_idr, &guard.reservation_ref, &guard.model).await;
         return;
     };
 
@@ -1180,12 +1290,21 @@ async fn settle_after_stream(
         usage.cache_read_tokens,
         usage.output_tokens,
         cost_idr,
-        None,
+        // Pair this settlement's release with the exact hold that reserved the
+        // money. The ref ties the `-reserved` ledger row, the `+reserved`
+        // release, and the `-cost` charge into one traceable reservation. A
+        // missing ref (the old `None`) made the release unrecoverable as a
+        // stranded hold in the ledger.
+        Some(&guard.reservation_ref),
         reserved_idr,
     )
     .await
     {
         Ok(UsageSettlement::Settled { new_balance }) => {
+            // The debit already credited the hold back in the same committed
+            // transaction, so claim ownership now: defusing the guard stops its
+            // Drop from releasing the same hold a second time.
+            guard.defuse();
             info!(
                 account_id = %account_id,
                 cost_idr,
@@ -1235,6 +1354,10 @@ async fn settle_after_stream(
             debited_idr,
             shortfall_idr,
         }) => {
+            // The clamped debit still credited the hold back in its transaction
+            // (see db.rs), so claim it here: defusing stops the guard's Drop from
+            // releasing the same hold a second time.
+            guard.defuse();
             error!(
                 account_id = %account_id,
                 key_id = %key_id,
@@ -1269,13 +1392,21 @@ async fn settle_after_stream(
         }
         // Only a real failure reaches here now: the wallet being short is a
         // recorded outcome, not an error. What is left is the database being
-        // unreachable, or a clamped debit that still did not apply.
-        Err(err) => warn!(
-            account_id = %account_id,
-            cost_idr,
-            error = %err,
-            "Proxy settlement failed"
-        ),
+        // unreachable, or a clamped debit that still did not apply. The hold was
+        // NOT released by the debit (that only happens on the Ok arms), so the
+        // money is sitting out of the wallet. Defuse the guard and release it: a
+        // failed settlement must never strand the customer's money. This is the
+        // exact bug this fix closes - the old code warned and walked away.
+        Err(err) => {
+            warn!(
+                account_id = %account_id,
+                cost_idr,
+                error = %err,
+                "Proxy settlement failed"
+            );
+            guard.defuse();
+            release_quietly(&pool, account_id, reserved_idr, &guard.reservation_ref, &guard.model).await;
+        }
     }
 }
 /// Gives a reservation back, logging a failure instead of discarding it.

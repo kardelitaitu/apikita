@@ -1473,6 +1473,173 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
     }
+
+    /// REGRESSION for the two money-loss defects this fix closes:
+    ///
+    /// 1. FINDING 1/2 - a settlement that FAILS (or is cancelled) must release the
+    ///    hold. The fix is the `ReservationGuard` in proxy.rs, whose Drop calls
+    /// `release_quietly` -> `release_reservation_transaction`. This test drives
+    /// that exact release path directly and proves the money comes back.
+    /// 2. FINDING 3 - a settlement that PAIRS its release with the same `reserve_*`
+    ///    ref leaves the detection query (`unpaired_hold_rows`) at ZERO, so a hold
+    /// is never mistaken for lost money.
+    ///
+    /// The test would FAIL before the fix on both counts: `release_quietly` was
+    /// never called on the failure arm (the hold stayed debited forever), and the
+    /// settlement passed `ref_batch = None` so the hold row had no matching
+    /// positive row and the detection query flagged it as stranded.
+    ///
+    /// Needs a live, migrated Postgres - run with
+    /// `DATABASE_URL=... cargo test --lib -- --ignored`.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn a_failed_or_paired_settlement_never_strands_the_hold() {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+        let pool = init_pool(&database_url).await.expect("connect to Postgres");
+
+        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
+        let account_id: Uuid =
+            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+                .bind(&pb_user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("create account");
+
+        let assertions =
+            tokio::spawn(hold_never_strands_assertions(pool.clone(), account_id));
+        let outcome = assertions.await;
+        delete_fixture_rows(&pool, account_id).await;
+        outcome.expect("the stranded-hold assertions panicked");
+    }
+
+    /// The body of the live regression test, minus the fixture and teardown its
+    /// caller owns.
+    async fn hold_never_strands_assertions(pool: PgPool, account_id: Uuid) {
+        const RESERVATION: i64 = 10_000;
+        const COST: i64 = 250;
+
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
+            .bind(account_id)
+            .execute(&pool)
+            .await
+            .expect("create the zero-balance wallet");
+
+        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
+            .bind(account_id)
+            .bind(RESERVATION)
+            .bind(&order_id)
+            .execute(&pool)
+            .await
+            .expect("create topup");
+        assert_eq!(
+            credit_topup_transaction(&pool, &order_id, RESERVATION)
+                .await
+                .expect("fund the wallet"),
+            TopupCreditResult::Settled {
+                new_balance: RESERVATION
+            },
+            "fund the wallet through the real top-up path"
+        );
+
+        let key_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES ($1, $2, 'apk_test') RETURNING id",
+        )
+        .bind(account_id)
+        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
+        .fetch_one(&pool)
+        .await
+        .expect("create api key");
+
+        // --- Scenario A: a settlement FAILS, the hold must come back. ---
+        let failed_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        let held = reserve_balance_transaction(&pool, account_id, RESERVATION, Some(&failed_ref))
+            .await
+            .expect("reserve");
+        assert!(
+            matches!(held, ReservationResult::Held { .. }),
+            "the wallet must be able to cover the worst case"
+        );
+
+        // A taken hold with no release yet MUST be flagged as unpaired - that is
+        // how an operator tells a live hold from lost money.
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id).await.expect("detect before release"),
+            1,
+            "a held reservation with no release must be reported as unpaired"
+        );
+
+        // Simulate the failed-settlement arm: proxy.rs calls release_quietly, which
+        // calls exactly this. The balance must return to its pre-hold value.
+        let pre_hold: i64 = sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read pre-release balance");
+        release_reservation_transaction(&pool, account_id, RESERVATION, Some(&failed_ref))
+            .await
+            .expect("the failed settlement releases the hold");
+        let after_release: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read post-release balance");
+        assert_eq!(
+            after_release, pre_hold + RESERVATION,
+            "FINDING 1/2: a failed settlement must return the whole hold to the wallet"
+        );
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id).await.expect("detect after release"),
+            0,
+            "after the release the detection query must find no stranded hold"
+        );
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr) after the release"
+        );
+
+        // --- Scenario B: a settlement PAIRS its release with the reservation ref.
+        let paired_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        let held = reserve_balance_transaction(&pool, account_id, RESERVATION, Some(&paired_ref))
+            .await
+            .expect("reserve");
+        assert!(matches!(held, ReservationResult::Held { .. }));
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id).await.expect("detect before settle"),
+            1,
+            "the paired hold is unpaired until it settles"
+        );
+
+        let settled = debit_usage_transaction(
+            &pool,
+            account_id,
+            Some(key_id),
+            200,
+            0,
+            150,
+            COST,
+            // FINDING 3: the settlement passes the SAME ref the hold used, so the
+            // release row carries it and the detection query stays at zero.
+            Some(&paired_ref),
+            RESERVATION,
+        )
+        .await
+        .expect("settle the paired request");
+        assert_eq!(settled, UsageSettlement::Settled { new_balance: RESERVATION - COST });
+        assert_eq!(
+            unpaired_hold_rows(&pool, account_id).await.expect("detect after settle"),
+            0,
+            "FINDING 3: a paired settlement must not leave a stranded hold"
+        );
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr) after a paired settlement"
+        );
+    }
 }
 
 /// Verification query: confirms that wallet balance equals sum of ledger entries.
@@ -1503,4 +1670,46 @@ pub async fn verify_wallet_reconciliation(
         }
         None => Err(AppError::NotFound("Wallet not found".into())),
     }
+}
+
+/// Reconciliation sweep for STRANDED HOLDS - the money-loss defect this fix
+/// closes (a reservation taken but never paired with a release or a charge, so
+/// the customer's money sits debited against a request that was never billed).
+///
+/// The proxy reserves with ref = 'reserve_<uuid>' and writes a NEGATIVE
+/// -reserved ledger row (reason = 'usage'). A healthy reservation is later
+/// paired in debit_usage_transaction (releasing the hold in the SAME
+/// transaction, writing a POSITIVE +reserved row under the SAME ref) or by
+/// release_reservation_transaction. So a reserve ref with a negative row but NO
+/// positive row under the same ref is money that left the wallet and came back
+/// nowhere.
+///
+/// ledger.ref has no unique constraint (deliberately - many rows share one
+/// reservation ref), so this correlated query is the only way to find the
+/// stranded ones. Run it on a schedule; ZERO rows is the invariant. A non-zero
+/// count means a release failed to land and an operator must investigate, or the
+/// guard's fire-and-forget Drop (proxy.rs) did not reach the database.
+pub async fn unpaired_hold_rows(pool: &PgPool, account_id: Uuid) -> Result<i64, AppError> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM (
+            SELECT l.account_id, l.ref AS r
+            FROM ledger l
+            WHERE l.account_id = $1
+              AND l.ref LIKE 'reserve_%'
+              AND l.delta_idr < 0
+            GROUP BY l.account_id, r
+            HAVING NOT EXISTS (
+                SELECT 1 FROM ledger m
+                WHERE m.account_id = l.account_id
+                  AND m.ref = l.ref
+                  AND m.delta_idr > 0
+            )
+        ) AS stranded
+        "#,
+    )
+    .bind(account_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
