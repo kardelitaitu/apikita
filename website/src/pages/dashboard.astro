@@ -46,6 +46,12 @@ import DashboardLayout from '../layouts/DashboardLayout.astro';
 
   <section class="mt-10">
     <h2 class="text-lg font-semibold tracking-tight">API keys</h2>
-    <div id="keys-mount"></div>
+    <p class="mt-3 text-sm text-slate-600">
+      Keys are managed on their own page: prefix, label, model access, spend against
+      limit, last used, and revoke.
+    </p>
+    <a href="/dashboard/keys" class="mt-4 inline-block rounded-md border border-slate-300 px-4 py-2 text-sm font-medium hover:border-slate-400">
+      Manage API keys
+    </a>
   </section>
 </DashboardLayout>
