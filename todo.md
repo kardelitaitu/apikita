@@ -131,7 +131,24 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 - [ ] **Operational Gating (Gates 0–5 from [`docs/launch-checklist.md`](docs/launch-checklist.md))**
   - [ ] Gate 0: Terms of Service published with cross-border forwarding disclosure
   - [ ] Gate 1: Backup script running offsite (`pg_dump` / WAL archiving)
+    - [x] The tool itself: [`tools/backup/backup.sh`](tools/backup/README.md) — encrypted, verified
+          (`pg_restore --list`), retention-pruned, with an offsite hook and a documented exit-code
+          contract. Verified locally: real backup succeeds; missing key refuses and writes nothing;
+          a corrupt/empty dump fails rather than reporting success.
+    - [ ] Offsite storage provider + encryption key custody — **a human decision**, still open. Note
+          `backup.sh` is a daily logical dump, so it does NOT meet the 15-minute RPO; PITR/WAL
+          archiving remains to be chosen.
   - [ ] Gate 2: Reconciliation query script passing with 0 drift on live DB
+    - [x] `tools/reconcile/` exists and passes with 0 drift locally, mutation-verified (drift -> exit 1).
+    - [ ] Still requires a **live** DB to close.
   - [x] Gate 3: Cookie and API key auth separation verified
   - [x] Gate 4: Zero prompt/completion logging verified in code and logs
   - [ ] Gate 5: Production health check operational; restore drill executed
+    - [x] `/health` checks process + database only, never upstream — live-tested against real Postgres
+          and against a genuinely unusable pool.
+    - [x] `tools/drill/drill.sh` runs the drill end to end: restores into a scratch DB, reuses the
+          reconcile check, spot-checks a balance, measures the restore time, writes a drill log, and
+          tears the scratch DB down. A refusal guard makes it impossible to point at the live database.
+    - [ ] Run it against the **production** database once provisioned; that is the real RTO measurement.
+    - [ ] Alerts (webhook rejection, ledger drift, API down, circuit open) — the sweep scripts exist
+          but nothing schedules or alerts yet.
