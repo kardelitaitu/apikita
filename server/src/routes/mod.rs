@@ -1,4 +1,5 @@
 pub mod account;
+pub mod admin;
 pub mod auth;
 pub mod events;
 pub mod health;
@@ -100,6 +101,17 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/keys/{id}/revoke", post(keys::revoke_key))
         // Live updates (SSE)
         .route("/events", get(events::sse_events_handler))
+        // Admin (cookie + operator flag)
+        .route("/api/admin/accounts/{id}", get(admin::get_account))
+        .route(
+            "/api/admin/accounts/{id}/suspend",
+            post(admin::suspend_account),
+        )
+        .route(
+            "/api/admin/accounts/{id}/restore",
+            post(admin::resume_account),
+        )
+        .route("/api/admin/accounts/{id}/resume", post(admin::resume_account))
         // Webhooks
         .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook))
         // Proxy
@@ -688,6 +700,13 @@ mod tests {
         ("PATCH", "/api/keys/00000000-0000-0000-0000-000000000000", "{}"),
         ("POST", "/api/keys/00000000-0000-0000-0000-000000000000/revoke", ""),
         ("GET", "/events", ""),
+        // Admin: cookie + operator flag. A credential-free request stops at the
+        // guard (401), which is not 404/405 - so the router matched, which is all
+        // this table asserts.
+        ("GET", "/api/admin/accounts/00000000-0000-0000-0000-000000000000", ""),
+        ("POST", "/api/admin/accounts/00000000-0000-0000-0000-000000000000/suspend", ""),
+        ("POST", "/api/admin/accounts/00000000-0000-0000-0000-000000000000/restore", ""),
+        ("POST", "/api/admin/accounts/00000000-0000-0000-0000-000000000000/resume", ""),
         ("POST", "/webhooks/midtrans", "{}"),
         ("POST", "/v1/chat/completions", ""),
     ];
