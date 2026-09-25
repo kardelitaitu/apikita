@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::env;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -294,12 +295,52 @@ fn wallet_config() -> Result<&'static WalletConfig, AppError> {
     Ok(WALLET_CONFIG.get_or_init(|| loaded.wallet))
 }
 
+/// True only for an explicit "production". Anything else - including a typo -
+/// is not production, which is what keeps a typo off the live host.
+fn is_production(midtrans_env: Option<&str>) -> bool {
+    matches!(
+        midtrans_env.map(str::trim),
+        Some(env) if env.eq_ignore_ascii_case("production")
+    )
+}
+
 /// The Snap host for MIDTRANS_ENV. Anything other than an explicit
 /// "production" stays on sandbox, so a typo can never move real money.
 fn snap_endpoint(midtrans_env: Option<&str>) -> &'static str {
-    match midtrans_env.map(str::trim) {
-        Some(env) if env.eq_ignore_ascii_case("production") => SNAP_PRODUCTION_URL,
-        _ => SNAP_SANDBOX_URL,
+    if is_production(midtrans_env) {
+        SNAP_PRODUCTION_URL
+    } else {
+        SNAP_SANDBOX_URL
+    }
+}
+
+/// The Snap host this process will actually POST to.
+///
+/// `override_url` (from MIDTRANS_SNAP_URL) lets a live test point the handler at
+/// a loopback stub instead of Midtrans, so the success path below the Snap call
+/// is reachable without a network double in production code.
+///
+/// REFUSED IN PRODUCTION, and that is the whole point of the gate: this variable
+/// redirects a call that creates a payment session, so a stray value must never
+/// be able to send a customer's top-up to an attacker's host. When MIDTRANS_ENV
+/// is an explicit "production" the override is ignored entirely - fail closed,
+/// not "warn and continue".
+///
+/// Pure on purpose: both inputs are parameters, so the decision is testable
+/// without a database, without a socket, and without racing a sibling test over
+/// process-global env vars. The only env reads are at the call site.
+fn resolve_snap_endpoint(
+    midtrans_env: Option<&str>,
+    override_url: Option<&str>,
+) -> Cow<'static, str> {
+    let default = snap_endpoint(midtrans_env);
+    if is_production(midtrans_env) {
+        return Cow::Borrowed(default);
+    }
+
+    match override_url.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => Cow::Owned(url.to_string()),
+        None => Cow::Borrowed(default),
     }
 }
 
@@ -485,7 +526,13 @@ pub async fn create_topup(
     let server_key = env::var("MIDTRANS_SERVER_KEY").map_err(|_| {
         AppError::Internal("MIDTRANS_SERVER_KEY environment variable is not configured".to_string())
     })?;
-    let endpoint = snap_endpoint(env::var("MIDTRANS_ENV").ok().as_deref());
+    // MIDTRANS_SNAP_URL is a test seam and is ignored in production (see
+    // resolve_snap_endpoint); it is read here, at the call site, so the decision
+    // function itself stays pure.
+    let endpoint = resolve_snap_endpoint(
+        env::var("MIDTRANS_ENV").ok().as_deref(),
+        env::var("MIDTRANS_SNAP_URL").ok().as_deref(),
+    );
 
     let topup_id = Uuid::new_v4();
     let order_id = format!("topup_{}", topup_id);
@@ -511,7 +558,7 @@ pub async fn create_topup(
     // Midtrans first. Any failure here returns before a row exists, so a rejected
     // or unreachable Snap call never leaves a pending topup behind.
     let (snap_token, redirect_url) =
-        create_snap_transaction(&snap_http, &server_key, endpoint, &snap_payload).await?;
+        create_snap_transaction(&snap_http, &server_key, &endpoint, &snap_payload).await?;
 
     sqlx::query(
         "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token) VALUES ($1, $2, $3, $4, 'pending', $5)",
@@ -608,6 +655,58 @@ mod tests {
         // A typo must never reach the live host.
         assert_eq!(snap_endpoint(Some("prod")), SNAP_SANDBOX_URL);
         assert_eq!(snap_endpoint(Some("")), SNAP_SANDBOX_URL);
+    }
+
+    /// The MIDTRANS_SNAP_URL gate, pure: both inputs are arguments, so this needs
+    /// no database, no socket and no env mutation - and cannot race a sibling
+    /// test over a process-global variable.
+    #[test]
+    fn snap_endpoint_override_applies_only_outside_production() {
+        const STUB: &str = "http://127.0.0.1:9/snap/v1/transactions";
+
+        // (a) Honoured whenever MIDTRANS_ENV is not an explicit production.
+        assert_eq!(resolve_snap_endpoint(None, Some(STUB)), STUB);
+        assert_eq!(resolve_snap_endpoint(Some("sandbox"), Some(STUB)), STUB);
+        assert_eq!(
+            resolve_snap_endpoint(Some(" staging "), Some(STUB)),
+            STUB,
+            "anything that is not explicitly production may be overridden"
+        );
+        assert_eq!(
+            resolve_snap_endpoint(Some("prod"), Some(STUB)),
+            STUB,
+            "a typo is not production, so the override still applies - the same \
+             rule that keeps a typo off the live host"
+        );
+
+        // (b) IGNORED in production. This is the safety half: the variable
+        // redirects a payment-session call, so production must fail closed.
+        assert_eq!(
+            resolve_snap_endpoint(Some("production"), Some(STUB)),
+            SNAP_PRODUCTION_URL,
+            "a production process must never dial an overridden Snap host"
+        );
+        assert_eq!(
+            resolve_snap_endpoint(Some(" production "), Some(STUB)),
+            SNAP_PRODUCTION_URL,
+            "the gate is trimmed and case-insensitive, like snap_endpoint"
+        );
+        assert_eq!(
+            resolve_snap_endpoint(Some("Production"), Some(STUB)),
+            SNAP_PRODUCTION_URL
+        );
+
+        // No override: unchanged behaviour, borrowed not allocated.
+        assert_eq!(resolve_snap_endpoint(None, None), SNAP_SANDBOX_URL);
+        assert_eq!(
+            resolve_snap_endpoint(Some("sandbox"), Some("   ")),
+            SNAP_SANDBOX_URL,
+            "a blank override is not a host"
+        );
+        assert_eq!(
+            resolve_snap_endpoint(Some("production"), None),
+            SNAP_PRODUCTION_URL
+        );
     }
 
     #[test]
@@ -1884,20 +1983,19 @@ mod tests {
     // -----------------------------------------------------------------------
     // 7. create_topup: the in-handler 429, and the SUCCESS path
     //
-    // Every create_topup test above drives the handler to a FAILURE, so the
-    // branch that persists the 'pending' row (account.rs:516) and answers 201
-    // CREATED had never executed in this suite. The two tests below close that.
+    // Every create_topup test above drove the handler to a FAILURE, so the
+    // branch that persists the 'pending' row and answers 201 CREATED had never
+    // executed in this suite. The tests below close that, and the third pins the
+    // row contract against the migrated schema.
     //
     // The cap test needs no Snap at all, and is green.
     //
-    // The success test is RED BY DESIGN. `snap_endpoint` returns one of two
-    // hardcoded constants and create_topup reads it directly (account.rs:488),
-    // so the only Snap host this process can dial is the real sandbox - and a
-    // test server key is refused there (401) long before the INSERT. The seam is
-    // one production line: let `MIDTRANS_SNAP_URL` override the host, so the
-    // `snap_stub` below can answer instead. Nothing else about the handler needs
-    // to change, and no network is faked - the handler would still make a real
-    // HTTP call, to a real socket.
+    // The success test reaches the INSERT through the `MIDTRANS_SNAP_URL` seam:
+    // `resolve_snap_endpoint` lets the process point at the `snap_stub` below,
+    // which answers exactly as Snap does. No network is faked - create_topup
+    // still runs its real reqwest client against a real socket; only the peer it
+    // dials changes. The seam is refused when MIDTRANS_ENV is production, and
+    // the pure test above pins that.
     // -----------------------------------------------------------------------
 
     /// Seeds `count` topups rows for the account, each stamped `created_at`
@@ -2000,8 +2098,7 @@ mod tests {
         );
     }
 
-    #[ignore = "requires live Postgres AND the Snap seam (MIDTRANS_SNAP_URL): see the \
-                section comment - RED until snap_endpoint is overridable"]
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_create_topup_success_persists_a_pending_row_and_returns_201() {
         let pool = live_pool().await;
@@ -2031,9 +2128,28 @@ mod tests {
         ))
         .await;
 
+        // MIDTRANS_ENV is forced to a non-production value FIRST: the override is
+        // deliberately ignored in production (resolve_snap_endpoint), so without
+        // this a developer shell exporting MIDTRANS_ENV=production would send
+        // this test's request to the REAL Midtrans host. That must be impossible,
+        // not merely unlikely.
+        let previous_env = std::env::var_os("MIDTRANS_ENV");
         let previous_endpoint = std::env::var_os("MIDTRANS_SNAP_URL");
+        std::env::set_var("MIDTRANS_ENV", "sandbox");
         std::env::set_var("MIDTRANS_SNAP_URL", &endpoint);
         std::env::set_var("MIDTRANS_SERVER_KEY", "SB-Mid-server-LIVE-TEST-SUCCESS");
+
+        // Prove the seam is live before the handler runs, so a silently-ignored
+        // override fails HERE (clearly) rather than as a 15s timeout against
+        // Midtrans.
+        assert_eq!(
+            resolve_snap_endpoint(
+                std::env::var("MIDTRANS_ENV").ok().as_deref(),
+                std::env::var("MIDTRANS_SNAP_URL").ok().as_deref(),
+            ),
+            endpoint,
+            "the Snap override must resolve to the loopback stub, not to a real host"
+        );
 
         let state = live_app_state(pool.clone());
 
@@ -2066,6 +2182,10 @@ mod tests {
         match previous_endpoint {
             Some(value) => std::env::set_var("MIDTRANS_SNAP_URL", value),
             None => std::env::remove_var("MIDTRANS_SNAP_URL"),
+        }
+        match previous_env {
+            Some(value) => std::env::set_var("MIDTRANS_ENV", value),
+            None => std::env::remove_var("MIDTRANS_ENV"),
         }
 
         assert_eq!(
