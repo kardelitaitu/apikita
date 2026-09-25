@@ -89,6 +89,147 @@ pub async fn credit_topup_transaction(
     Ok(TopupCreditResult::Settled { new_balance })
 }
 
+/// What a refund attempt did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefundResult {
+    /// The wallet was debited and a `refund` ledger row appended.
+    Refunded { new_balance: i64 },
+    /// This order was already refunded - a replayed webhook. Nothing written.
+    AlreadyRefunded,
+    /// No such order.
+    NotFound,
+    /// The topup was never settled, so there is nothing to give back.
+    NotSettled { status: String },
+    /// The wallet cannot cover the refund: the money has already been spent.
+    ///
+    /// NOTHING was written - not the ledger, not the topup status - so the
+    /// operator can see the topup still sitting in `settled` and resolve it by
+    /// hand. Deliberately distinct from `Refunded`: a refund that cannot be
+    /// applied is a real-world event, not a success.
+    InsufficientBalance { balance_idr: i64, required_idr: i64 },
+}
+
+/// Whether a topup in `status` may be refunded, and if not, why.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefundDecision {
+    Refund,
+    AlreadyRefunded,
+    NotSettled,
+}
+
+/// The pure decision behind the refund, split out so it is testable without a
+/// database.
+///
+/// `refunded` is checked before `settled`: a second refund of the same order is
+/// a replay, not a refund, and must not debit twice.
+pub fn refund_decision(status: &str) -> RefundDecision {
+    match status {
+        "refunded" => RefundDecision::AlreadyRefunded,
+        "settled" => RefundDecision::Refund,
+        // `pending`, `denied`, `expired`: money never arrived, so there is
+        // nothing to give back. Refunding these would create money.
+        _ => RefundDecision::NotSettled,
+    }
+}
+
+/// Atomically refunds a settled topup: debits the wallet and appends a `refund`
+/// ledger row, in one transaction, so `balance_idr = SUM(delta_idr)` still holds.
+///
+/// The debit carries `balance_idr >= $amount` as a predicate on the UPDATE itself,
+/// the same guard `debit_usage_transaction` uses: a concurrent request cannot race
+/// the check, and `CHECK (balance_idr >= 0)` is the backstop rather than the thing
+/// that refuses the debit (docs/decisions.md D3 - wallets are non-negative).
+///
+/// Idempotent under replay: the topup row is locked `FOR UPDATE` and its status
+/// decides, so a second refund of the same order is a no-op.
+pub async fn refund_topup_transaction(
+    pool: &PgPool,
+    order_id: &str,
+    amount_idr: i64,
+) -> Result<RefundResult, AppError> {
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+
+    // 1. Lock the topups row, so two concurrent refunds cannot both pass the
+    //    status check below.
+    let topup =
+        sqlx::query("SELECT id, account_id, status FROM topups WHERE order_id = $1 FOR UPDATE")
+            .bind(order_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+    let Some(topup) = topup else {
+        return Ok(RefundResult::NotFound);
+    };
+
+    let topup_id: Uuid = topup.get("id");
+    let account_id: Uuid = topup.get("account_id");
+    let status: String = topup.get("status");
+
+    match refund_decision(&status) {
+        RefundDecision::AlreadyRefunded => return Ok(RefundResult::AlreadyRefunded),
+        RefundDecision::NotSettled => return Ok(RefundResult::NotSettled { status }),
+        RefundDecision::Refund => {}
+    }
+
+    // 2. Debit the wallet. The guard is inside the statement: when it matches no
+    //    row the account cannot cover the refund, and nothing may be written.
+    let wallet = sqlx::query(
+        "UPDATE wallets SET balance_idr = balance_idr - $1, updated_at = now() WHERE account_id = $2 AND balance_idr >= $1 RETURNING balance_idr",
+    )
+    .bind(amount_idr)
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let new_balance: i64 = match wallet {
+        Some(w) => w.get("balance_idr"),
+        None => {
+            // The decision was already made by the predicate; this read only fills
+            // in the error detail, and failing it must not turn a visible refusal
+            // into an opaque 500.
+            let balance_idr: i64 =
+                sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+                    .bind(account_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+            // Roll back explicitly: nothing is written, so the topup stays
+            // `settled` and the ledger gains no row it cannot back.
+            tx.rollback().await?;
+
+            return Ok(RefundResult::InsufficientBalance {
+                balance_idr,
+                required_idr: amount_idr,
+            });
+        }
+    };
+
+    // 3. Mark the topup refunded.
+    sqlx::query("UPDATE topups SET status = 'refunded' WHERE id = $1")
+        .bind(topup_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // 4. Append the refund row. `delta_idr` is negative: the ledger sums to the
+    //    balance, and a refund takes money out.
+    sqlx::query(
+        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES ($1, $2, 'refund', $3, $4, now())",
+    )
+    .bind(account_id)
+    .bind(-amount_idr)
+    .bind(order_id)
+    .bind(new_balance)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(RefundResult::Refunded { new_balance })
+}
+
 /// Atomically settles usage: debits wallet, inserts ledger row, and upserts daily usage.
 ///
 /// An unaffordable debit is rejected as `InsufficientBalance` (402) with nothing
@@ -368,6 +509,67 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup account");
+    }
+
+    /// A refund is only ever applied to a topup that actually settled, and only
+    /// once. `refunded` is checked first, so a replayed webhook cannot debit
+    /// twice; `pending`/`denied`/`expired` never had money, so refunding them
+    /// would create money out of nothing.
+    #[test]
+    fn refund_decision_only_refunds_a_settled_topup_once() {
+        assert_eq!(refund_decision("settled"), RefundDecision::Refund);
+
+        // Replay: the second refund of the same order must not debit again.
+        assert_eq!(refund_decision("refunded"), RefundDecision::AlreadyRefunded);
+
+        // No money ever arrived for these.
+        assert_eq!(refund_decision("pending"), RefundDecision::NotSettled);
+        assert_eq!(refund_decision("denied"), RefundDecision::NotSettled);
+        assert_eq!(refund_decision("expired"), RefundDecision::NotSettled);
+
+        // An unknown status is refused rather than assumed refundable.
+        assert_eq!(refund_decision("something-new"), RefundDecision::NotSettled);
+    }
+
+    /// The refund outcome must stay distinguishable: an operator has to be able
+    /// to tell a completed refund from one the wallet could not cover, because
+    /// the second leaves the topup `settled` and needs a human.
+    #[test]
+    fn refund_outcomes_are_distinct_and_carry_the_amounts() {
+        assert_ne!(
+            RefundResult::Refunded { new_balance: 0 },
+            RefundResult::InsufficientBalance {
+                balance_idr: 0,
+                required_idr: 0
+            }
+        );
+        assert_ne!(
+            RefundResult::Refunded { new_balance: 1 },
+            RefundResult::AlreadyRefunded
+        );
+        assert_ne!(
+            RefundResult::NotFound,
+            RefundResult::NotSettled {
+                status: "pending".to_string()
+            }
+        );
+
+        // The refusal carries both figures, so the log and the operator can see
+        // the shortfall without another query.
+        let refusal = RefundResult::InsufficientBalance {
+            balance_idr: 1000,
+            required_idr: 50000,
+        };
+        match refusal {
+            RefundResult::InsufficientBalance {
+                balance_idr,
+                required_idr,
+            } => {
+                assert_eq!(balance_idr, 1000);
+                assert_eq!(required_idr, 50000);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }
 
