@@ -76,6 +76,59 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # Maintenance scheduler. The jobs below were written and then never run by
+  # anything (docs/observability.md:161, docs/ip-tracking.md:203) — this is the
+  # service that ends that. Read .docker/maintenance/README.md before trusting a
+  # green run; it states exactly what is wired and what is not.
+  #
+  #   retention  RUNS HERE, for real. psql plus the exact SQL of
+  #              server/src/bin/ip-purge.rs (server/src/ip_tracking.rs:298-316):
+  #              key_ip_seen > 7d, key_ip_daily > 90d. This is the
+  #              docs/ip-tracking.md retention promise actually being kept.
+  #   reconcile  RUNS HERE, for real. tools/reconcile/reconcile.sh, exit code
+  #              preserved verbatim (1=drift 2=no DATABASE_URL 3=no psql
+  #              4=psql failed). No `|| true` anywhere near it.
+  #   ip-purge, hold-sweep
+  #              NOT WIRED. Both are Rust binaries and this compose file has no
+  #              server image and no Rust build stage, so no container in it can
+  #              contain them. This service logs that on startup and never
+  #              pretends to have run them — a scheduler that looks like it works
+  #              and does nothing is the same failure class as a money check that
+  #              returns 0 while the money is wrong. Run them on the host, on the
+  #              same cadence, until a server image exists.
+  # ---------------------------------------------------------------------------
+  scheduler:
+    # psql client only. NOT the money database — the postgres service above is.
+    image: postgres:16
+    container_name: apikita-scheduler
+    entrypoint: ["/bin/sh", "/usr/local/bin/maintenance-entrypoint.sh"]
+    # schedule = nightly loop. one-shot verbs for operators/CI: once, retention, reconcile.
+    command: ["schedule"]
+    environment:
+      # Same DSN as .env.example's local stack value, reached over the compose
+      # network by service name instead of localhost.
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-dev}@postgres:5432/apikita
+      # reconcile.sh reads this. Deliberately separate from DATABASE_URL so a bad
+      # DSN disarms the reconciliation job alone, not the retention sweep.
+      RECONCILE_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-dev}@postgres:5432/apikita
+      # Nightly run time, UTC hour 0-23. 03:00 UTC is a quiet hour for the stack.
+      SCHEDULE_HOUR_UTC: ${SCHEDULE_HOUR_UTC:-3}
+    volumes:
+      - ./.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro
+      # Read-only: reconcile.sh + reconcile.sql, unmodified and unowned by this job.
+      - ./tools/reconcile:/usr/local/share/reconcile:ro
+    # Never start sweeping before the database accepts connections.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No healthcheck on purpose: this container serves nothing and listens on
+    # nothing, so any probe would be theatre. Its liveness signal is the nightly
+    # job log line, and a failed job is a non-zero exit, not a silent success.
+    # Nightly cadence needs it back after a reboot, and `unless-stopped` matches
+    # every other service here.
+    restart: unless-stopped
+
 volumes:
   pgdata:
   pbdata:
