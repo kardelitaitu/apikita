@@ -477,4 +477,888 @@ mod tests {
         assert_eq!(details["spend_used_idr"], 12_340);
         assert_eq!(details["window_days"], 30);
     }
+
+    // -----------------------------------------------------------------------
+    // Live Postgres. Ignored rather than silently skipped, exactly like the
+    // settlement tests in db.rs and the cap tests in abuse.rs: a test that
+    // asserts nothing is worse than no test. Every handler in THIS module was
+    // previously covered only by the pure tests above, so not one DB-backed key
+    // handler had ever actually been executed.
+    //
+    //   DATABASE_URL=... cargo test --lib routes::keys:: -- --ignored
+    // -----------------------------------------------------------------------
+
+    use crate::config::AppConfig;
+    use crate::db::{
+        credit_topup_transaction, debit_usage_transaction, init_pool, TopupCreditResult,
+        UsageSettlement,
+    };
+    use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
+    use crate::routes::events::RealtimeHub;
+    use std::sync::Arc;
+
+    fn live_config() -> Arc<AppConfig> {
+        for path in ["../config/apikita.toml", "config/apikita.toml"] {
+            if std::path::Path::new(path).exists() {
+                return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
+            }
+        }
+        panic!("could not find apikita.toml for testing");
+    }
+
+    /// The real application state, built the way main.rs builds it, so the
+    /// handlers run against the same cache instance and the same config the
+    /// process serves with.
+    fn test_state(pool: PgPool) -> AppState {
+        let config = live_config();
+        let events = Arc::new(RealtimeHub::new(&config.realtime));
+        let trusted_proxies: Arc<[IpCidr]> = Arc::from(
+            parse_cidrs(&config.network.trusted_proxy_cidrs)
+                .expect("config CIDRs parse")
+                .into_boxed_slice(),
+        );
+        AppState {
+            pool,
+            config,
+            http_client: reqwest::Client::new(),
+            events,
+            ip_salt: Arc::new(DailySalt::new()),
+            trusted_proxies,
+        }
+    }
+
+    async fn live_pool() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+        init_pool(&database_url)
+            .await
+            .expect("connect to Postgres")
+    }
+
+    async fn create_account(pool: &PgPool) -> Uuid {
+        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+            .bind(format!("test_{}", Uuid::new_v4().simple()))
+            .fetch_one(pool)
+            .await
+            .expect("create account")
+    }
+
+    /// A real sessions row and the cookie that resolves to it, so every handler
+    /// below is reached through the production authentication path
+    /// (resolve_account_from_cookie) rather than a hand-passed account id.
+    async fn session_cookie(pool: &PgPool, account_id: Uuid) -> HeaderMap {
+        let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (account_id, token_hash, expires_at)
+             VALUES ($1, $2, now() + interval '30 days')",
+        )
+        .bind(account_id)
+        .bind(hash_token(&token))
+        .execute(pool)
+        .await
+        .expect("create session");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("a=1; session={token}; b=2").parse().unwrap(),
+        );
+        headers
+    }
+
+    /// Money enters a wallet ONLY through credit_topup_transaction, which writes
+    /// the matching + ledger row in the same transaction. Writing
+    /// wallets.balance_idr directly manufactures exactly the reconciliation drift
+    /// the drift_rows assertion at the end of every test looks for.
+    async fn open_wallet(pool: &PgPool, account_id: Uuid, opening_idr: i64) {
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
+            .bind(account_id)
+            .execute(pool)
+            .await
+            .expect("create the zero-balance wallet the login path would create");
+
+        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
+            .bind(account_id)
+            .bind(opening_idr)
+            .bind(&order_id)
+            .execute(pool)
+            .await
+            .expect("create topup");
+
+        assert_eq!(
+            credit_topup_transaction(pool, &order_id, opening_idr)
+                .await
+                .expect("credit the opening balance"),
+            TopupCreditResult::Settled {
+                new_balance: opening_idr
+            },
+            "the fixture must open the wallet through the real top-up path"
+        );
+    }
+
+    /// One usage_daily row on a chosen day.
+    ///
+    /// Written directly rather than through debit_usage_transaction because the
+    /// window boundary needs an arbitrary day and the settlement path can only
+    /// ever write today's. This touches neither wallets nor ledger, so it is
+    /// drift-neutral: the reconciliation invariant is unaffected by it.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_usage(
+        pool: &PgPool,
+        account_id: Uuid,
+        key_id: Uuid,
+        day: NaiveDate,
+        input_tokens: i64,
+        cache_read_tokens: i64,
+        output_tokens: i64,
+        cost_idr: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO usage_daily (
+                 account_id, api_key_id, day,
+                 input_tokens, cache_read_tokens, output_tokens, cost_idr
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(account_id)
+        .bind(key_id)
+        .bind(day)
+        .bind(input_tokens)
+        .bind(cache_read_tokens)
+        .bind(output_tokens)
+        .bind(cost_idr)
+        .execute(pool)
+        .await
+        .expect("insert usage_daily row");
+    }
+
+    /// Deletes every row a fixture created, in FK order (ledger and wallets are
+    /// ON DELETE RESTRICT). Unconditional: a panicking assertion must not leave
+    /// permanent drift in a database other runs share.
+    async fn delete_fixture_rows(pool: &PgPool, account_id: Uuid) {
+        for statement in [
+            "DELETE FROM usage_daily WHERE account_id = $1",
+            "DELETE FROM ledger WHERE account_id = $1",
+            "DELETE FROM api_keys WHERE account_id = $1",
+            "DELETE FROM topups WHERE account_id = $1",
+            "DELETE FROM sessions WHERE account_id = $1",
+            "DELETE FROM wallets WHERE account_id = $1",
+            "DELETE FROM accounts WHERE id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(account_id)
+                .execute(pool)
+                .await
+                .unwrap_or_else(|err| panic!("cleanup failed on {statement}: {err}"));
+        }
+    }
+
+    /// The reconciliation check from docs/observability.md, scoped to THIS
+    /// fixture's account: wallets.balance_idr must equal SUM(ledger.delta_idr).
+    /// It must return 0 rows.
+    async fn drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT w.account_id
+                FROM wallets w
+                LEFT JOIN ledger l ON l.account_id = w.account_id
+                WHERE w.account_id = $1
+                GROUP BY w.account_id, w.balance_idr
+                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+            ) AS drift
+            "#,
+        )
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
+        .expect("reconciliation query")
+    }
+
+    async fn json_body<T: serde::de::DeserializeOwned>(res: axum::response::Response) -> T {
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("read the response body");
+        serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            panic!(
+                "response body was not the expected JSON: {err}: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    }
+
+    /// create_key driven through the handler. Returns the id, the ONE-TIME
+    /// plaintext, and the display prefix.
+    async fn create_key_via_handler(
+        state: &AppState,
+        headers: &HeaderMap,
+        label: &str,
+        models: Vec<String>,
+        spend_limit_idr: i64,
+    ) -> (Uuid, String, String) {
+        let res = create_key(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateKeyRequest {
+                label: Some(label.to_string()),
+                models,
+                spend_limit_idr,
+                token_limit: 0,
+                rate_limit_rpm: 0,
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("create_key must succeed")
+        .into_response();
+
+        assert_eq!(res.status(), StatusCode::CREATED, "creation must answer 201");
+        let body: Value = json_body(res).await;
+        (
+            serde_json::from_value(body["id"].clone()).expect("id is a UUID"),
+            body["key"].as_str().expect("key is a string").to_string(),
+            body["prefix"]
+                .as_str()
+                .expect("prefix is a string")
+                .to_string(),
+        )
+    }
+
+    /// The whole application router, reached the way a caller reaches it: a real
+    /// request through create_router, with the peer address mocked so
+    /// ConnectInfo resolves. This is the only way to exercise the proxy's
+    /// documented enforcement order, which is where a spend limit actually
+    /// blocks.
+    fn proxy_app(state: AppState) -> axum::Router {
+        use axum::extract::connect_info::MockConnectInfo;
+        use std::net::SocketAddr;
+        crate::routes::create_router(state)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+    }
+
+    /// POST /v1/chat/completions with a bearer key, returning the status and the
+    /// parsed error/JSON body.
+    async fn call_proxy(app: &axum::Router, key: &str, model: &str) -> (StatusCode, Value) {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"model":"{model}","stream":true}}"#
+            )))
+            .expect("build the request");
+
+        let res = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("the router must respond");
+        let status = res.status();
+        (status, json_body(res).await)
+    }
+
+    /// CREATION stores a HASHED key, never the plaintext.
+    ///
+    /// docs/website/06-api-keys-and-limits.md: the stored form is a hash of the
+    /// full key, and the plaintext is shown exactly once. That is the property
+    /// that makes a database leak survivable, so it is asserted against the row
+    /// itself, not against the response.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn creating_a_key_stores_only_a_sha256_digest_never_the_plaintext() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (key_id, plaintext, prefix) =
+            create_key_via_handler(&state, &headers, "hashed", vec!["flash".into()], 0).await;
+
+        // The documented format: apk_live_ + 43 base62 chars. The prefix is the
+        // display head of that key - docs/website/06-api-keys-and-limits.md:84
+        // shows it as `apk_live_a1b2`, i.e. the 9-char marker plus the first 4
+        // body chars - and is explicitly not secret.
+        assert!(plaintext.starts_with("apk_live_"), "got {plaintext}");
+        assert_eq!(plaintext.len(), "apk_live_".len() + 43);
+        assert_eq!(
+            prefix,
+            &plaintext[..13],
+            "prefix is the display head of the key"
+        );
+        assert_eq!(prefix.len(), 13);
+
+        // The stored form is the SHA-256 digest, hex - never the key itself.
+        let stored: String = sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read key_hash");
+        assert_eq!(
+            stored,
+            hash_token(&plaintext),
+            "key_hash must be the SHA-256 of the returned plaintext"
+        );
+        assert_eq!(stored.len(), 64, "a SHA-256 digest in hex is 64 chars");
+        assert!(
+            stored
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "the digest must be lowercase hex: {stored}"
+        );
+        assert_ne!(stored, plaintext, "the plaintext must not be the stored value");
+
+        // And nowhere in the row: a dump must not yield a usable credential.
+        let row_text: String =
+            sqlx::query_scalar("SELECT row_to_json(k)::text FROM api_keys k WHERE id = $1")
+                .bind(key_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the whole row");
+        assert!(
+            !row_text.contains(&plaintext),
+            "the plaintext key appears in its own row: {row_text}"
+        );
+        assert!(
+            !row_text.contains(&plaintext[9..]),
+            "the secret body of the key appears in its own row: {row_text}"
+        );
+
+        // docs/website/06: key_hash is never returned by the Rust API handler.
+        let listed = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("list keys")
+            .into_response();
+        let listed_bytes = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .expect("read the list body");
+        let listed_text = String::from_utf8(listed_bytes.to_vec()).expect("list body is UTF-8");
+        assert!(
+            !listed_text.contains(&stored),
+            "GET /api/keys leaked key_hash: {listed_text}"
+        );
+        assert!(
+            !listed_text.contains(&plaintext),
+            "GET /api/keys leaked the plaintext key: {listed_text}"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// REVOCATION ACTUALLY REVOKES: after revoke_key, resolving that key through
+    /// the REAL lookup path must refuse it. A key that still works after
+    /// revocation is the failure this test exists to prevent.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn revoking_a_key_makes_the_real_lookup_path_refuse_it() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+        let app = proxy_app(state.clone());
+
+        // The control: a live key with an empty allowlist authenticates and is
+        // then refused for its model - 403, not 401. That proves the credential
+        // itself was accepted by the lookup path.
+        let (_, live_key, _) = create_key_via_handler(&state, &headers, "live", vec![], 0).await;
+        let (status, body) = call_proxy(&app, &live_key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a live key must authenticate and then be refused for its model: {body}"
+        );
+        assert_eq!(body["error"]["code"], "model_not_allowed");
+
+        // The key under test, revoked before it is ever presented.
+        let (revoked_id, revoked_key, _) =
+            create_key_via_handler(&state, &headers, "revoked", vec!["flash".into()], 0).await;
+
+        let res = revoke_key(State(state.clone()), Path(revoked_id), headers.clone())
+            .await
+            .expect("revoke must succeed")
+            .into_response();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let (status, body) = call_proxy(&app, &revoked_key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a revoked key must be refused by the lookup path: {body}"
+        );
+        assert_eq!(body["error"]["code"], "key_revoked");
+
+        // Durable, not merely a cache miss: the row itself says so.
+        let revoked_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
+                .bind(revoked_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read revoked_at");
+        assert!(
+            revoked_at.is_some(),
+            "revocation must be durable in the database, not only in the cache"
+        );
+
+        // Idempotent: a second revoke matches no row and is still 204.
+        let res = revoke_key(State(state.clone()), Path(revoked_id), headers.clone())
+            .await
+            .expect("a second revoke is not an error")
+            .into_response();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// CACHE INVALIDATION: the proxy caches key metadata for a TTL, so a
+    /// revocation that does not reach that cache stays honoured for up to
+    /// limits.key_metadata_cache_seconds. The revoke path is supposed to call
+    /// invalidate_key_cache; this proves the effect through the request path
+    /// rather than by poking at proxy.rs internals, which keys.rs cannot reach.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn revoking_a_key_invalidates_the_proxy_cache_instead_of_leaving_it_honoured_for_the_ttl()
+    {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+        let app = proxy_app(state.clone());
+
+        let ttl = state.config.limits.key_metadata_cache_seconds;
+        assert!(
+            ttl > 0,
+            "this test pins the behaviour of an ENABLED key-metadata cache;              key_metadata_cache_seconds is 0, which disables the cache entirely"
+        );
+
+        // PART A - the cache is real, and this is the documented tradeoff
+        // (docs/website/06-api-keys-and-limits.md, Caching): a revocation that
+        // does NOT go through the revoke handler is not seen until the TTL
+        // expires. Without this half, Part B could pass for the wrong reason.
+        let (stale_id, stale_key, _) =
+            create_key_via_handler(&state, &headers, "stale", vec![], 0).await;
+        let (status, body) = call_proxy(&app, &stale_key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the warm-up request must authenticate: {body}"
+        );
+        assert_eq!(body["error"]["code"], "model_not_allowed");
+
+        sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE id = $1")
+            .bind(stale_id)
+            .execute(&pool)
+            .await
+            .expect("revoke out of band, deliberately bypassing invalidate_key_cache");
+
+        let (status, body) = call_proxy(&app, &stale_key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a cache-warm key revoked out of band is served until the TTL expires              (that is the documented staleness); a 401 here means the entry was              never cached and Part B would prove nothing: {body}"
+        );
+
+        // PART B - the revoke path drops the cached record, so the very next
+        // request sees the revocation instead of the pre-revocation row.
+        let (id, key, _) = create_key_via_handler(&state, &headers, "invalidated", vec![], 0).await;
+        let (status, body) = call_proxy(&app, &key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the warm-up request must authenticate and be cached: {body}"
+        );
+
+        let res = revoke_key(State(state.clone()), Path(id), headers.clone())
+            .await
+            .expect("revoke must succeed")
+            .into_response();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let (status, body) = call_proxy(&app, &key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "revoke_key must invalidate the cached metadata; a 403 here means the              pre-revocation row is still being honoured from the cache: {body}"
+        );
+        assert_eq!(body["error"]["code"], "key_revoked");
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// LIST REPORTS REAL SPEND: list_keys returns spend_used_idr from
+    /// usage_daily, not a hardcoded 0.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn list_keys_reports_real_spend_from_usage_daily_not_a_hardcoded_zero() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (used_id, _, _) =
+            create_key_via_handler(&state, &headers, "used", vec!["flash".into()], 0).await;
+        let (unused_id, _, _) =
+            create_key_via_handler(&state, &headers, "unused", vec!["flash".into()], 0).await;
+
+        // Usage for ONE key only.
+        let cost_idr = 12_345;
+        insert_usage(
+            &pool,
+            account_id,
+            used_id,
+            Utc::now().date_naive(),
+            100,
+            20,
+            50,
+            cost_idr,
+        )
+        .await;
+
+        let res = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("list keys")
+            .into_response();
+        let body: Value = json_body(res).await;
+        let keys = body.as_array().expect("a JSON array of keys");
+        assert_eq!(keys.len(), 2, "both of this account's keys must be listed");
+
+        let spend_of = |id: Uuid| -> i64 {
+            let wanted = serde_json::to_value(id).expect("id serialises");
+            let row = keys
+                .iter()
+                .find(|k| k["id"] == wanted)
+                .unwrap_or_else(|| panic!("key {id} is missing from list_keys"));
+            row["spend_used_idr"]
+                .as_i64()
+                .expect("spend_used_idr is an integer")
+        };
+
+        assert_eq!(
+            spend_of(used_id),
+            cost_idr,
+            "the key with usage must report its real 30-day spend"
+        );
+        assert_eq!(
+            spend_of(unused_id),
+            0,
+            "a key with no usage in the window must report exactly 0"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// THE 30-DAY WINDOW IS REAL: the window is the trailing 30 days inclusive,
+    /// so a row exactly at its first day counts and one a single day earlier does
+    /// not. Asserted as an exact total, so any widening OR narrowing of the
+    /// window fails this test rather than passing it.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn the_thirty_day_window_is_real_and_only_in_window_usage_contributes() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (key_id, _, _) =
+            create_key_via_handler(&state, &headers, "window", vec!["flash".into()], 0).await;
+
+        let today = Utc::now().date_naive();
+
+        // The offsets are LITERALS, deliberately not derived from
+        // SPEND_WINDOW_DAYS: a fixture computed from the constant under test
+        // moves with it, so widening the window would drag the "outside" row
+        // back inside and the test would still pass. Pinning them to the
+        // DOCUMENTED contract instead - docs/website/06-api-keys-and-limits.md
+        // fixes the window at "the trailing 30 days" - is what makes a changed
+        // window fail here.
+        //
+        // The window holds exactly 30 day-values, so it starts 29 days back:
+        // `inside` is its first day (inclusive), `outside` is one day earlier.
+        let inside = today - chrono::Duration::days(29);
+        let outside = today - chrono::Duration::days(30);
+        insert_usage(&pool, account_id, key_id, inside, 10, 0, 10, 1_000).await;
+        insert_usage(&pool, account_id, key_id, outside, 10, 0, 10, 5_000).await;
+
+        // The proxy's enforcement read.
+        assert_eq!(
+            key_spend_used(&pool, account_id, key_id, today)
+                .await
+                .expect("key_spend_used"),
+            1_000,
+            "the out-of-window row must NOT contribute: the window is the trailing              {SPEND_WINDOW_DAYS} days inclusive"
+        );
+
+        // The dashboard read, which must apply the same window.
+        let res = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("list keys")
+            .into_response();
+        let body: Value = json_body(res).await;
+        let wanted = serde_json::to_value(key_id).expect("id serialises");
+        let row = body
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|k| k["id"] == wanted)
+            .expect("the key is listed");
+        assert_eq!(
+            row["spend_used_idr"].as_i64(),
+            Some(1_000),
+            "list_keys must apply the same window as the enforcement read"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// THE LIMIT ACTUALLY BLOCKS. The pure check_spend_limit test above only
+    /// exercises the argument validation; the integration - real usage rows, read
+    /// by the real enforcement path, refusing the request - is what it cannot see.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn real_usage_at_the_spend_limit_makes_the_proxy_refuse_the_request() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+        let app = proxy_app(state.clone());
+
+        // The wallet is funded through the real top-up path and the usage is
+        // recorded through the real settlement path, so the row the proxy reads
+        // is the row production would have written.
+        let opening_idr = 5_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+
+        let (at_limit_id, at_limit_key, _) = create_key_via_handler(
+            &state,
+            &headers,
+            "at-limit",
+            vec!["flash".into()],
+            opening_idr,
+        )
+        .await;
+        let (_, under_limit_key, _) = create_key_via_handler(
+            &state,
+            &headers,
+            "under-limit",
+            vec!["flash".into()],
+            opening_idr + 1_000,
+        )
+        .await;
+
+        let settled = debit_usage_transaction(
+            &pool,
+            account_id,
+            Some(at_limit_id),
+            10,
+            0,
+            10,
+            opening_idr,
+            Some("test_at_limit"),
+            0,
+        )
+        .await
+        .expect("record real usage");
+        assert_eq!(
+            settled,
+            UsageSettlement::Settled { new_balance: 0 },
+            "the real settlement path must record the usage and debit the wallet"
+        );
+
+        // The key is exactly AT its ceiling: the window total equals the limit.
+        assert_eq!(
+            key_spend_used(&pool, account_id, at_limit_id, Utc::now().date_naive())
+                .await
+                .expect("key_spend_used"),
+            opening_idr
+        );
+
+        let (status, body) = call_proxy(&app, &at_limit_key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "a key at its spend limit must be refused before anything is spent: {body}"
+        );
+        assert_eq!(body["error"]["code"], "key_limit_exceeded");
+        assert_eq!(
+            body["error"]["details"]["reason"],
+            "spend_limit_idr_reached"
+        );
+        assert_eq!(
+            body["error"]["details"]["spend_used_idr"].as_i64(),
+            Some(opening_idr),
+            "the refusal must report the real window spend"
+        );
+        assert_eq!(
+            body["error"]["details"]["window_days"].as_i64(),
+            Some(SPEND_WINDOW_DAYS)
+        );
+
+        // The control: the SAME account, the SAME wallet, the SAME body, a limit
+        // one rupiah higher. It is not the spend limit that stops it - it reaches
+        // the NEXT step of the documented enforcement order and fails there.
+        let (status, body) = call_proxy(&app, &under_limit_key, "flash").await;
+        assert_eq!(
+            body["error"]["code"], "insufficient_balance",
+            "a key UNDER its limit must get past the spend check and reach the wallet              check instead (status {status}): {body}"
+        );
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// CROSS-ACCOUNT ISOLATION: a key of account A must never appear in B's
+    /// list_keys, and B must not be able to revoke or update A's key. A tenancy
+    /// property a pure test cannot see.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn a_key_of_one_account_is_invisible_and_unrevokable_to_another() {
+        let pool = live_pool().await;
+        let account_a = create_account(&pool).await;
+        let account_b = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers_a = session_cookie(&pool, account_a).await;
+        let headers_b = session_cookie(&pool, account_b).await;
+
+        let (a_key_id, _, _) =
+            create_key_via_handler(&state, &headers_a, "a", vec!["flash".into()], 0).await;
+        let (b_key_id, _, _) =
+            create_key_via_handler(&state, &headers_b, "b", vec!["flash".into()], 0).await;
+
+        let listed_ids = |body: Value| -> Vec<Uuid> {
+            body.as_array()
+                .expect("a JSON array of keys")
+                .iter()
+                .map(|k| serde_json::from_value(k["id"].clone()).expect("id is a UUID"))
+                .collect()
+        };
+
+        let listed_a = json_body(
+            list_keys(State(pool.clone()), headers_a.clone())
+                .await
+                .expect("list keys as A")
+                .into_response(),
+        )
+        .await;
+        assert_eq!(
+            listed_ids(listed_a),
+            vec![a_key_id],
+            "A's list must hold A's key and nothing else"
+        );
+
+        let listed_b = json_body(
+            list_keys(State(pool.clone()), headers_b.clone())
+                .await
+                .expect("list keys as B")
+                .into_response(),
+        )
+        .await;
+        assert_eq!(
+            listed_ids(listed_b),
+            vec![b_key_id],
+            "B's list must hold B's key and nothing else"
+        );
+
+        // B cannot revoke A's key: the UPDATE is scoped by account_id, so it
+        // matches no row. docs/server/api-spec.md:163-166 fixes the response for
+        // this endpoint at "Sets revoked_at. Idempotent. 204" - a foreign key is
+        // a no-op that still answers 204, deliberately indistinguishable from a
+        // successful revoke so the response cannot be used to probe which key ids
+        // exist. The tenancy property is therefore not the status code but the
+        // EFFECT: A's key must still be active.
+        let res = revoke_key(State(state.clone()), Path(a_key_id), headers_b.clone())
+            .await
+            .expect("the documented revoke response is 204, including for a no-op")
+            .into_response();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // ...and A's key is untouched.
+        let revoked_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
+                .bind(a_key_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read revoked_at");
+        assert!(
+            revoked_at.is_none(),
+            "B's failed revoke must not have revoked A's key"
+        );
+
+        // The same scoping protects the update path.
+        let err = match update_key(
+            State(state.clone()),
+            Path(a_key_id),
+            headers_b.clone(),
+            Json(UpdateKeyRequest {
+                label: Some("hijacked".into()),
+                models: None,
+                spend_limit_idr: None,
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("B must not be able to update A's key"),
+            Err(err) => err,
+        };
+        assert_eq!(err.status_code(), StatusCode::NOT_FOUND);
+
+        let label: Option<String> = sqlx::query_scalar("SELECT label FROM api_keys WHERE id = $1")
+            .bind(a_key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read label");
+        assert_eq!(
+            label.as_deref(),
+            Some("a"),
+            "B's failed update must not have relabelled A's key"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_a).await,
+            0,
+            "fixture A must not drift"
+        );
+        assert_eq!(
+            drift_rows(&pool, account_b).await,
+            0,
+            "fixture B must not drift"
+        );
+        delete_fixture_rows(&pool, account_a).await;
+        delete_fixture_rows(&pool, account_b).await;
+    }
 }
