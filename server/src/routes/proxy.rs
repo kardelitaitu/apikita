@@ -1,6 +1,6 @@
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, HeaderMap, Response, StatusCode},
 };
 use futures_util::{Stream, StreamExt};
@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
@@ -22,6 +23,9 @@ use crate::db::{
     ReservationResult, UsageSettlement,
 };
 use crate::error::AppError;
+use crate::ip_tracking::{
+    ip_hash, record_key_ip, resolve_client_ip, today_utc, DailySalt, IpCidr,
+};
 use crate::money::{calculate_preflight_reservation_idr, calculate_token_cost_idr};
 use crate::routes::events::{publish_balance, publish_usage, todays_usage, RealtimeHub};
 // The 30-day window and the spend read are shared with the key-management routes
@@ -37,6 +41,40 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// The realtime fan-out behind `GET /events`.
     pub events: Arc<RealtimeHub>,
+    /// The daily salt behind every IP hash. One per process, not per request:
+    /// the whole point is that every request on a given day hashes under the
+    /// same salt, so the distinct count means something. Never persisted.
+    pub ip_salt: Arc<DailySalt>,
+    /// Parsed once at startup from `config.network.trusted_proxy_cidrs`; see
+    /// `resolve_client_ip` for why an untrusted peer's forwarded header is
+    /// ignored rather than believed.
+    pub trusted_proxies: Arc<[IpCidr]>,
+}
+
+/// Records which address a served request came from, against the key that
+/// served it.
+///
+/// FIRE-AND-FORGET, on purpose. This is an abuse signal on the streaming hot
+/// path, and it must never be the reason a request fails or a stream stalls: a
+/// database blip here should cost an operator a signal, not cost a customer
+/// their answer. The counts are a suspicion threshold, not enforcement —
+/// nothing downstream acts on them without a human — so losing one is a
+/// recoverable loss and blocking on one is not.
+fn record_request_source(state: &AppState, key_id: Uuid, peer: SocketAddr, headers: &HeaderMap) {
+    let ip = resolve_client_ip(peer.ip(), headers, &state.trusted_proxies);
+
+    // Both derived here, before the spawn, because the salt must be read for
+    // THIS day at THIS moment: after a spawn the day could roll over and the
+    // hash would then be under a different salt than the counter's row.
+    let day = today_utc();
+    let hash = ip_hash(&state.ip_salt.salt_for_day(day), &ip);
+
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        if let Err(err) = record_key_ip(&pool, key_id, day, &hash).await {
+            warn!(key_id = %key_id, error = %err, "Could not record the request source");
+        }
+    });
 }
 
 impl axum::extract::FromRef<AppState> for PgPool {
@@ -841,6 +879,11 @@ fn force_streaming(mut value: Value) -> Result<Value, AppError> {
 
 pub async fn chat_completions(
     State(state): State<AppState>,
+    // The TCP peer. Required by `resolve_client_ip`: behind the relay it is the
+    // relay, and the caller's address has to come from a header that is only
+    // trusted because of where the connection came from. Before `body`, because
+    // the body-consuming extractor has to be last.
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, AppError> {
@@ -1079,6 +1122,12 @@ pub async fn chat_completions(
     // debit it defuses the guard (the hold was already credited back in that same
     // transaction) and on every other path the guard's Drop releases it.
     let mut guard = ReservationGuard::new(&state.pool, account_id, reserved_idr, &reservation_ref, &meta.model);
+
+    // Every admission check has passed and the hold is out of the wallet, so
+    // this request is actually being served — which is what makes its source
+    // worth counting. Refused requests are not: an attacker must not be able to
+    // move a key's distinct-IP figure without spending money.
+    record_request_source(&state, key_id, peer, &headers);
 
     // 7. Route and stream. The raw inbound body goes up with `stream: true`
     // ensured; the client rewrites `model` to the endpoint's upstream_model.
