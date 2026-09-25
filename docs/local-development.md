@@ -24,6 +24,7 @@ real money.
 | Rust API | 8080 |
 | PostgreSQL | 5432 |
 | PocketBase | 8090 |
+| Nginx edge relay | 8000 |
 | Frontend dev server | 4321 (Astro default) |
 
 **Cookie domains are the trap.** Use `localhost` for everything and make the API
@@ -39,14 +40,14 @@ docker run -d --name apk-pg -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=apikita \
   -p 5432:5432 postgres:16
 
 # 2. schema
-psql postgresql://postgres:dev@localhost:5432/apikita -f schema.sql
+psql postgresql://postgres:dev@localhost:5432/apikita -f server/migrations/20260925000000_initial_schema.sql
 
 # 3. pocketbase (download the binary, then)
 ./pocketbase serve --http=127.0.0.1:8090
 
 # 4. api
 cp .env.example .env    # fill in what you need; fakes need nothing
-cargo run --bin api
+cargo run --bin apikita-server
 
 # 5. frontend (only for UI work)
 cd website && npm run dev
@@ -141,7 +142,7 @@ the cheapest guard against the most expensive accounting error.
 
 ## Open items
 
-- [ ] Whether fakes live in the repo or as a separate dev tool.
+- [x] Fakes live in the repo: `tools/fake-upstream/` and `tools/fake-midtrans/`.
 - [ ] Seed script contents.
 - [x] CI uses a real Postgres service container — see [`ci-cd.md`](ci-cd.md).
 - [ ] Whether PocketBase runs as a binary or in a container locally.

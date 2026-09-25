@@ -45,6 +45,7 @@ defences. Full reasoning and the failure matrix: [`topology.md`](topology.md).
 **One backend process does two jobs.** It serves the customer API (auth, wallet,
 keys) *and* proxies LLM requests. They can be split later; they are one service now
 because they share the database, the key lookup, and the usage accounting.
+
 ## Why the Rust server is the whole backend
 
 The earlier design put a BFF in Cloudflare Pages Functions and kept the Rust
@@ -198,8 +199,7 @@ database, and nothing cascades across the boundary.
 ## Database
 
 PostgreSQL. Schema outline; the full field list is in
-[website/02-data-model.md](website/02-data-model.md), which must be **rewritten**
-for Postgres (its PocketBase rules no longer apply).
+[website/02-data-model.md](website/02-data-model.md), which was **rewritten for Postgres** — PocketBase API rules are gone.
 
 | Table | Purpose |
 | --- | --- |
@@ -330,7 +330,7 @@ Documents that must be revised:
 
 ## Open items
 
-- [ ] Frontend language/framework on Pages (Astro was recommended, not chosen).
+- [x] Frontend language/framework on Pages: **Astro + islands** — decided, see [`website/01-architecture.md`](website/01-architecture.md).
 - [x] Session lifetime: **30d absolute / 7d idle** — [`decisions.md`](decisions.md).
 - [x] Migration tooling: **sqlx migrate** — [`decisions.md`](decisions.md).
 - [x] Backup and restore drill — see [`backup-and-restore.md`](backup-and-restore.md).

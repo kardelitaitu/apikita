@@ -292,7 +292,7 @@ address, an attacker could register it elsewhere and take the account.
 
 - [ ] Implement the `verified`-guard hook in PocketBase.
 - [x] Session lifetime: **30d absolute / 7d idle** — [`docs/decisions.md`](../decisions.md).
-- [ ] Add "sign out all devices" — revoke all `sessions` rows for the account.
+- [x] "Sign out all devices" — `POST /auth/logout-all` revokes all active sessions; implemented and mutation-tested (b31d574).
 - [x] OAuth2: **only providers guaranteeing verified email** (`decisions.md`).
 - [ ] Wallet mutation audit: the `ledger` table is the record; decide review cadence.
 - [ ] Reconciliation job between `accounts.pb_user_id` and PocketBase.

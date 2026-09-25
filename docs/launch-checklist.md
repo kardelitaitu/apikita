@@ -55,23 +55,23 @@ opinion.
 ### Ledger and balance
 
 - [ ] **No client-reachable path can write `balance_idr`.**
-- [ ] `ledger` is append-only; no UPDATE or DELETE exists in the codebase.
-- [ ] The reconciliation query returns **zero rows** on production data.
+- [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase.
+- [x] The reconciliation query returns **zero rows** on production data.
 - [ ] `CHECK (balance_idr >= 0)` present and exercised.
-- [ ] Money is `BIGINT` end to end; no float appears in any billing path.
+- [x] Money is `BIGINT` end to end; no float appears in any billing path.
 
 ### Billing accuracy
 
 - [ ] **Cache-read tokens are never counted as input tokens** — test with a payload
       containing cache hits.
-- [ ] Three token classes stored separately in `usage_daily`.
+- [x] Three token classes stored separately in `usage_daily`.
 - [ ] Peak/off-peak basis applied consistently between reservation and settlement.
 
 ## Gate 3 — Access control
 
-- [ ] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
+- [x] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
       dashboard endpoints.
-- [ ] Logout revokes the session row; "sign out everywhere" revokes all of them.
+- [x] Logout revokes the session row; "sign out everywhere" revokes all of them.
 - [ ] Suspension revokes sessions **and** keys atomically.
 - [ ] Admin endpoints require the operator flag; an operator cannot act on
       themselves.

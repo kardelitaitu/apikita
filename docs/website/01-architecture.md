@@ -157,7 +157,7 @@ is why it is safe to make now rather than continue deferring.
 
 - [x] Token revocation strategy — resolved, see
       [05-security-decisions.md](05-security-decisions.md) D2.
-- [ ] Decide `AuthToken.Duration` (token lifetime).
-- [ ] Does the dashboard read usage from the API or subscribe to the SSE stream?  (SSE is the design — confirm the aggregate endpoint is not polled in parallel)
+- [x] Session/token lifetime: **30d absolute / 7d idle** — [`decisions.md`](../decisions.md).
+- [x] Dashboard reads usage from the SSE stream (`GET /events`); polls `GET /api/me` as fallback only when SSE drops.
 - [ ] Backup and restore procedure for PocketBase.
 - [x] Wallet mutations: **10/min per account** (`decisions.md`).

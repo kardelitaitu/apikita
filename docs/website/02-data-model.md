@@ -339,6 +339,7 @@ account. Deleting an operator must not erase what they did.
 
 **Written in the same transaction as the effect it records.** An audit row for an
 action that rolled back is as misleading as no audit row at all.
+
 ## key_ip_daily / key_ip_seen
 
 Abuse signals without storing IP addresses. Full reasoning:
@@ -367,6 +368,7 @@ retained 7 days; the daily aggregate 90 days.
 
 **Do not carry this pattern into anything that builds a per-user history.** See
 [`docs/ip-tracking.md`](../ip-tracking.md) for what is deliberately not built.
+
 ## Transactions — the correctness rules
 
 These operations must be atomic. Getting one wrong is how balances drift.
@@ -413,11 +415,11 @@ CREATE TABLE review_sessions (
 **Staged values are not the review.** Nothing is written to `reviews` until the
 flow completes, so abandoning halfway leaves an existing review untouched.
 
-**Could live in Redis instead.** It is transient and does not need durability. SQLite
-via Postgres is specified because the stack already has it and the row count is tiny;
+**Could live in Redis instead.** It is transient and does not need durability. Postgres is specified because the stack already has it and the row count is tiny;
 move it to Redis only if the write volume justifies another dependency.
 
 Sweep expired rows on a schedule.
+
 ## Index coverage
 
 **Every documented lookup is covered.** Verified by mapping each hot-path query to
@@ -458,6 +460,7 @@ use it. No such query exists today; if one is added, it needs its own index.
 per request — not per report.** The proxy's key lookup is the one that matters most:
 it runs on every token, so it is a partial index on `key_hash` filtered to
 not-revoked rows.
+
 ## Backups
 
 The wallet ledger is the business.

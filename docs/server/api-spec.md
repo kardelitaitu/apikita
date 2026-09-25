@@ -268,6 +268,7 @@ Errors: `403` if called with a cookie instead of a bot token.
 
 Bot token only. Sets `withdrawn_at` — **does not delete**. A deleted row would
 free the unique slot and let the user submit a second review.
+
 ## Webhooks
 
 ### `POST /webhooks/midtrans`
