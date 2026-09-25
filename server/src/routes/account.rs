@@ -1880,4 +1880,424 @@ mod tests {
             "a tokenless 200 must be an error, never a fabricated token"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // 7. create_topup: the in-handler 429, and the SUCCESS path
+    //
+    // Every create_topup test above drives the handler to a FAILURE, so the
+    // branch that persists the 'pending' row (account.rs:516) and answers 201
+    // CREATED had never executed in this suite. The two tests below close that.
+    //
+    // The cap test needs no Snap at all, and is green.
+    //
+    // The success test is RED BY DESIGN. `snap_endpoint` returns one of two
+    // hardcoded constants and create_topup reads it directly (account.rs:488),
+    // so the only Snap host this process can dial is the real sandbox - and a
+    // test server key is refused there (401) long before the INSERT. The seam is
+    // one production line: let `MIDTRANS_SNAP_URL` override the host, so the
+    // `snap_stub` below can answer instead. Nothing else about the handler needs
+    // to change, and no network is faked - the handler would still make a real
+    // HTTP call, to a real socket.
+    // -----------------------------------------------------------------------
+
+    /// Seeds `count` topups rows for the account, each stamped `created_at`
+    /// inside the `topup_per_hour` window.
+    ///
+    /// Written directly rather than through create_topup: the subject is the
+    /// handler's decision on EXISTING history, and manufacturing that history
+    /// with the very code path under test would be circular. `created_at` is
+    /// pinned 90s back so the rows sit unambiguously inside the rolling window.
+    async fn seed_topups_inside_the_cap_window(pool: &PgPool, account_id: Uuid, count: i64) {
+        let created_at = Utc::now() - chrono::Duration::seconds(90);
+        for _ in 0..count {
+            let order_id = format!("test_cap_{}", Uuid::new_v4().simple());
+            sqlx::query(
+                "INSERT INTO topups (account_id, amount_idr, order_id, status, created_at) \
+                 VALUES ($1, $2, $3, 'pending', $4)",
+            )
+            .bind(account_id)
+            .bind(1_000_000_i64)
+            .bind(&order_id)
+            .bind(created_at)
+            .execute(pool)
+            .await
+            .expect("seed a topup inside the cap window");
+        }
+    }
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_create_topup_refuses_with_429_once_the_handler_cap_is_hit() {
+        let pool = live_pool().await;
+        let primary = live_account(&pool).await;
+
+        let outcome = tokio::spawn(create_topup_cap_assertions(
+            pool.clone(),
+            primary.account_id,
+            primary.token.clone(),
+        ));
+
+        let outcome = outcome.await;
+        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        outcome.expect("the create_topup cap assertions panicked");
+    }
+
+    async fn create_topup_cap_assertions(pool: PgPool, account_id: Uuid, token: String) {
+        let state = live_app_state(pool.clone());
+        let cap = state.config.limits.topup_per_hour as i64;
+        assert!(
+            cap > 0,
+            "a zero cap turns the guard off (abuse::cap_outcome), so this test \
+             would assert nothing"
+        );
+
+        seed_topups_inside_the_cap_window(&pool, account_id, cap).await;
+
+        // Deliberately BELOW every configured minimum. The abuse guard is the
+        // FIRST thing create_topup does (account.rs:462, before the deposit
+        // check at :483), so a full account is refused with 429 and never
+        // reaches a 422. Reordering those two guards fails this test - which is
+        // the documented order, not an incidental detail.
+        let (status, body) = respond(create_topup(
+            State(state),
+            cookie_header(&token),
+            Json(CreateTopupRequest { amount_idr: 1 }),
+        ))
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an account at its topup_per_hour cap must be refused by the handler \
+             itself, before it can create another Midtrans session. body: {body}"
+        );
+        assert_eq!(body["error"]["code"], json!("rate_limited"), "{body}");
+
+        // The refusal wrote nothing. The cap counts rows, so a refused request
+        // that still inserted one would refill its own budget.
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count topups");
+        assert_eq!(
+            rows, cap,
+            "a refused request must not create a row: {rows} rows, expected {cap}"
+        );
+
+        // And no money moved on the way to the refusal.
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read balance");
+        assert_eq!(balance, 0, "an abuse refusal must not touch the wallet");
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must still equal SUM(ledger.delta_idr)"
+        );
+    }
+
+    #[ignore = "requires live Postgres AND the Snap seam (MIDTRANS_SNAP_URL): see the \
+                section comment - RED until snap_endpoint is overridable"]
+    #[tokio::test]
+    async fn live_create_topup_success_persists_a_pending_row_and_returns_201() {
+        let pool = live_pool().await;
+        let primary = live_account(&pool).await;
+
+        let outcome = tokio::spawn(create_topup_success_assertions(
+            pool.clone(),
+            primary.account_id,
+            primary.token.clone(),
+        ));
+
+        let outcome = outcome.await;
+        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        outcome.expect("the create_topup success assertions panicked");
+    }
+
+    async fn create_topup_success_assertions(pool: PgPool, account_id: Uuid, token: String) {
+        let wallet = configured_wallet();
+        let amount = wallet.min_first_deposit as i64;
+
+        // A loopback peer answering exactly as Midtrans Snap does. create_topup
+        // runs its REAL reqwest client against a REAL socket - nothing about the
+        // handler is stubbed, only the peer it dials.
+        let endpoint = snap_stub(http_response(
+            "200 OK",
+            r#"{"token":"snap-token-from-midtrans","redirect_url":"https://app.sandbox.midtrans.com/snap/v3/redirection/abc"}"#,
+        ))
+        .await;
+
+        let previous_endpoint = std::env::var_os("MIDTRANS_SNAP_URL");
+        std::env::set_var("MIDTRANS_SNAP_URL", &endpoint);
+        std::env::set_var("MIDTRANS_SERVER_KEY", "SB-Mid-server-LIVE-TEST-SUCCESS");
+
+        let state = live_app_state(pool.clone());
+
+        // The cap must not be what refuses this request: a fresh fixture account
+        // is under it. Asserted rather than assumed, so a future config change
+        // cannot turn this test's 201 into a 429 for the wrong reason.
+        assert!(
+            crate::abuse::enforce_creation_cap(
+                &pool,
+                "topups",
+                crate::abuse::topup_window(),
+                state.config.limits.topup_per_hour,
+                account_id,
+                Utc::now(),
+            )
+            .await
+            .is_ok(),
+            "the fixture account starts under its top-up cap"
+        );
+
+        let (status, body) = respond(create_topup(
+            State(state),
+            cookie_header(&token),
+            Json(CreateTopupRequest { amount_idr: amount }),
+        ))
+        .await;
+
+        // Restore the host BEFORE asserting, so a failure here cannot leak the
+        // loopback endpoint into whatever test runs next.
+        match previous_endpoint {
+            Some(value) => std::env::set_var("MIDTRANS_SNAP_URL", value),
+            None => std::env::remove_var("MIDTRANS_SNAP_URL"),
+        }
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a Snap call that returns a token must create the top-up. body: {body}"
+        );
+
+        let topup_id = body["topup_id"].as_str().expect("topup_id is a string");
+        let order_id = body["order_id"].as_str().expect("order_id is a string");
+        assert_eq!(
+            order_id,
+            format!("topup_{topup_id}"),
+            "the order id is derived from the topup id: {body}"
+        );
+        assert_eq!(
+            body["snap_token"],
+            json!("snap-token-from-midtrans"),
+            "the response carries the token Snap returned, verbatim: {body}"
+        );
+
+        // The row the success INSERT wrote, read back column by column.
+        let row = sqlx::query(
+            "SELECT id, account_id, amount_idr, order_id, status, snap_token, settled_at \
+             FROM topups WHERE order_id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the success path must have inserted the topups row");
+
+        assert_eq!(row.get::<Uuid, _>("id"), Uuid::parse_str(topup_id).unwrap());
+        assert_eq!(row.get::<Uuid, _>("account_id"), account_id);
+        assert_eq!(row.get::<i64, _>("amount_idr"), amount);
+        assert_eq!(row.get::<String, _>("order_id"), order_id);
+        assert_eq!(
+            row.get::<String, _>("status"),
+            "pending",
+            "Midtrans first, settle later: the row starts pending"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("snap_token").as_deref(),
+            Some("snap-token-from-midtrans"),
+            "the token is persisted with the row, so the webhook can match it"
+        );
+        assert!(
+            row.get::<Option<chrono::DateTime<Utc>>, _>("settled_at")
+                .is_none(),
+            "a pending top-up carries no settled_at"
+        );
+
+        // The customer sees it through the read path, as pending.
+        let (status, history) = respond(get_topups(
+            State(pool.clone()),
+            cookie_header(&token),
+            Query(LimitQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {history}");
+        let listed = history
+            .as_array()
+            .expect("a top-up history is an array")
+            .iter()
+            .find(|r| r["id"] == json!(topup_id))
+            .unwrap_or_else(|| panic!("the created top-up is missing from {history}"));
+        assert_eq!(listed["status"], json!("pending"));
+        assert_eq!(listed["amount_idr"], json!(amount));
+        assert!(
+            listed["settled_at"].is_null(),
+            "pending means no settled_at: {listed}"
+        );
+        assert!(
+            !history.to_string().contains("snap_token"),
+            "the history must never expose the Midtrans token: {history}"
+        );
+
+        // The persisted row is real money: settle it through the documented
+        // path (the webhook's own function) and check the ledger follows.
+        let credited = credit_topup_transaction(&pool, order_id, amount)
+            .await
+            .expect("the pending row must be settleable");
+        assert_eq!(
+            credited,
+            crate::db::TopupCreditResult::Settled { new_balance: amount },
+            "the 201's row must settle to exactly its amount"
+        );
+
+        let settled = sqlx::query("SELECT status, settled_at FROM topups WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the settled topup");
+        assert_eq!(settled.get::<String, _>("status"), "settled");
+        assert!(
+            settled
+                .get::<Option<chrono::DateTime<Utc>>, _>("settled_at")
+                .is_some(),
+            "a settled top-up carries its settled_at"
+        );
+
+        let ledger = sqlx::query("SELECT delta_idr, reason, ref FROM ledger WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_all(&pool)
+            .await
+            .expect("read the ledger");
+        assert_eq!(ledger.len(), 1, "exactly one ledger row for one top-up");
+        assert_eq!(ledger[0].get::<i64, _>("delta_idr"), amount);
+        assert_eq!(ledger[0].get::<String, _>("reason"), "topup");
+        assert_eq!(ledger[0].get::<String, _>("ref"), topup_id);
+
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read balance");
+        assert_eq!(balance, amount, "the wallet holds the top-up");
+
+        // A replayed webhook must not pay twice.
+        assert_eq!(
+            credit_topup_transaction(&pool, order_id, amount)
+                .await
+                .expect("replay the settlement"),
+            crate::db::TopupCreditResult::AlreadySettled,
+            "a replayed settlement must be idempotent"
+        );
+        let after_replay: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read balance");
+        assert_eq!(after_replay, amount, "a replay must not move money");
+
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr)"
+        );
+    }
+
+    /// The success-path ROW CONTRACT, driven without a Snap token.
+    ///
+    /// This is NOT the handler and cannot prove create_topup reaches its INSERT.
+    /// What it proves is that the exact tuple that INSERT writes is accepted by
+    /// the migrated schema, and that the documented status vocabulary is the one
+    /// the CHECK constraint enforces - so a schema change that would break the
+    /// success path fails here instead of in production.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_topups_row_accepts_exactly_what_create_topups_insert_writes() {
+        let pool = live_pool().await;
+        let primary = live_account(&pool).await;
+
+        let outcome = tokio::spawn(topups_row_contract_assertions(
+            pool.clone(),
+            primary.account_id,
+        ));
+
+        let outcome = outcome.await;
+        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        outcome.expect("the topups row contract assertions panicked");
+    }
+
+    async fn topups_row_contract_assertions(pool: PgPool, account_id: Uuid) {
+        // Column list transcribed from create_topup's INSERT (account.rs:516),
+        // status literal included.
+        let topup_id = Uuid::new_v4();
+        let order_id = format!("topup_{topup_id}");
+        sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token) \
+             VALUES ($1, $2, $3, $4, 'pending', $5)",
+        )
+        .bind(topup_id)
+        .bind(account_id)
+        .bind(50_000_i64)
+        .bind(&order_id)
+        .bind("snap-token-from-midtrans")
+        .execute(&pool)
+        .await
+        .expect("the schema must accept the tuple create_topup writes");
+
+        let row = sqlx::query("SELECT status, snap_token, settled_at FROM topups WHERE id = $1")
+            .bind(topup_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read back the row");
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(
+            row.get::<Option<String>, _>("snap_token").as_deref(),
+            Some("snap-token-from-midtrans")
+        );
+        assert!(row
+            .get::<Option<chrono::DateTime<Utc>>, _>("settled_at")
+            .is_none());
+
+        // The documented vocabulary round-trips...
+        for status in ["pending", "settled", "denied", "expired", "refunded"] {
+            let order_id = format!("test_status_{}", Uuid::new_v4().simple());
+            sqlx::query(
+                "INSERT INTO topups (account_id, amount_idr, order_id, status) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(account_id)
+            .bind(1_000_i64)
+            .bind(&order_id)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{status} must be a documented status: {e}"));
+        }
+
+        // ...and anything outside it is refused, not silently stored.
+        let bad_order = format!("test_status_bad_{}", Uuid::new_v4().simple());
+        let refused = sqlx::query(
+            "INSERT INTO topups (account_id, amount_idr, order_id, status) \
+             VALUES ($1, $2, $3, 'partially_paid')",
+        )
+        .bind(account_id)
+        .bind(1_000_i64)
+        .bind(&bad_order)
+        .execute(&pool)
+        .await;
+        assert!(
+            refused.is_err(),
+            "an undocumented status must be refused by the CHECK constraint"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM topups WHERE order_id = $1")
+            .bind(&bad_order)
+            .fetch_one(&pool)
+            .await
+            .expect("count the refused row");
+        assert_eq!(rows, 0, "a refused status must leave no row");
+    }
 }
