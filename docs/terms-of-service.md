@@ -128,6 +128,27 @@ policy.** A summary at signup and before the first top-up.
 for the tokens actually produced. See [`failover.md`](failover.md) — a mid-stream
 upstream failure is billed per actual usage, not per customer expectation.
 
+### Billing when the client disconnects mid-answer
+
+**If the client disconnects before the answer finishes, the customer is still billed
+for the tokens the provider generated up to that point.**
+
+This follows from the same basis as the point above: billing is for what was produced,
+not for what was received. By the time a connection drops, the provider has already
+generated tokens for that request, and it reports that usage to us. We read the usage
+report and bill against it, rather than discarding it — the work was done and the
+provider has charged us for it.
+
+The charge is for tokens **actually generated**, at the rates in section 3. It is not a
+charge for the full answer, and it is not a minimum. A disconnect does not create a
+refund entitlement.
+
+Draft language:
+
+> Charges are based on the tokens the provider generates for a request. If your
+> connection ends before the response is complete, the tokens generated up to that
+> point are still billed.
+
 ## 7. Suspension and termination
 
 | Trigger | Action |

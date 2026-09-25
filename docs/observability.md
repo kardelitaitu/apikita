@@ -138,6 +138,42 @@ ledger exists to detect.
 
 See [`docs/website/04-payments.md`](website/04-payments.md) for webhook details.
 
+### And the check reconciliation cannot make: stranded holds
+
+**A reservation hold that is never released is invisible to the query above, and that
+is exactly why it needs its own check.**
+
+A reservation writes a negative `-reserved` ledger row, and its release writes a
+positive `+reserved` row under the **same** `ref` (`reserve_<uuid>`). When the release
+never lands, nothing is left out of the sum in a way the reconciliation query can see:
+the hold is gone from the wallet and no offsetting credit was written, so
+`balance_idr = SUM(ledger.delta_idr)` still holds and the query returns **no row**.
+Money is debited against a request that was never billed, and no alert fires.
+
+**Detection is a separate query with its own invariant.**
+`unpaired_hold_rows` (`server/src/db.rs`) counts `reserve_*` refs that have a negative
+row and **no positive row under the same ref**. **Zero rows is the invariant.** A
+non-zero count means a release failed to land — most often the fire-and-forget
+`ReservationGuard::drop` (`server/src/routes/proxy.rs`) never reached the database, or
+the process died between the response and the settlement commit.
+
+**Run the sweep on a schedule, alongside `ip-purge`.** Both are maintenance jobs that
+enforce a money or retention promise, and neither has a scheduler behind it yet
+([`docs/ip-tracking.md`](ip-tracking.md)); schedule them together, on the same cadence
+as the reconciliation query.
+
+**The bound.** A hold may legitimately be unpaired at the moment of a sweep — the
+request is still streaming, and the upstream timeout is deliberately **per read rather
+than total** so a long healthy stream is left alone. So the sweep reads
+`circuit_breaker.request_timeout_seconds` (`config/apikita.toml`) rather than assuming
+the request has finished, and **a hold still unpaired at the next sweep is an
+incident**: investigate the release path and credit the account if the hold is lost.
+
+| Rule | Bound |
+| --- | --- |
+| Younger than the per-read upstream timeout | Normal — the request may still be in flight |
+| Still unpaired at two consecutive sweeps | **Incident — investigate, then credit** |
+
 ## Request tracing
 
 One `request_id` generated at ingress and carried through:
