@@ -2,55 +2,24 @@
 #
 #   cp .env.example .env && docker compose up -d
 #
-# Postgres is money, PocketBase is identity, nginx is the edge relay.
+# nginx is the edge relay; it proxies to the Rust API running on the HOST.
 # Ports and the fake-provider strategy: docs/local-development.md.
-# Relay behaviour: docs/edge-relay.md. Migrations: .docker/postgres/README.md.
+# Relay behaviour: docs/edge-relay.md.
+#
+# There is no database container. The API uses embedded SQLite at the path in
+# DATABASE_URL (default sqlite://data/server.db) — a file on this host, not a
+# service. Postgres and the PocketBase container were removed by the SQLite
+# migration (docs/plans/sqlite-migration.md); PocketBase returns as a Rust
+# implementation in Phase 6, and it will not be a container either.
+#
+# Resetting the local database is now a file operation, not a volume:
+#   rm -f data/server.db data/server.db-wal data/server.db-shm
+# then re-run the migrate binary. The old postgres reset
+# (`docker compose down -v`) no longer touches any data.
 #
 # No top-level `version:` key — obsolete in Compose v2+.
 
 services:
-  # ---------------------------------------------------------------------------
-  # Money. Schema lives in server/migrations and is applied automatically on the
-  # FIRST boot of an empty volume (see .docker/postgres/README.md).
-  # ---------------------------------------------------------------------------
-  postgres:
-    image: postgres:16
-    container_name: apikita-postgres
-    environment:
-      POSTGRES_DB: apikita
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev}
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      # /docker-entrypoint-initdb.d runs *.sql once, on first boot only.
-      - ./server/migrations:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d apikita"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-
-  # ---------------------------------------------------------------------------
-  # Identity only. Holds no money: balances and ledger are in Postgres.
-  # ---------------------------------------------------------------------------
-  pocketbase:
-    image: ghcr.io/muchobien/pocketbase:latest
-    container_name: apikita-pocketbase
-    command: ["serve", "--http=0.0.0.0:8090"]
-    ports:
-      - "8090:8090"
-    volumes:
-      - pbdata:/pb_data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/api/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   # ---------------------------------------------------------------------------
   # Edge relay. Proxies to the Rust API running on the HOST (cargo run --bin api),
   # which is why the upstream is host.docker.internal:8080 and not a service name.
@@ -65,17 +34,11 @@ services:
     # Linux hosts need the gateway alias for host.docker.internal.
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # Wait for a migrated database before accepting traffic.
-    depends_on:
-      postgres:
-        condition: service_healthy
+    # No depends_on: there is no database service left to wait for. The API runs
+    # on the host, so this healthcheck reports unhealthy until it is started.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/healthz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
-
-volumes:
-  pgdata:
-  pbdata:
