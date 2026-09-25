@@ -159,6 +159,19 @@ event: error
 data: {"error":{"code":"upstream_failed","message":"...","request_id":"..."}}
 ```
 
+**Two codes travel this way, and neither has a status in the table above.** The
+status line is long gone, so they exist only as this frame.
+
+| Code | Meaning | Client action |
+| --- | --- | --- |
+| `upstream_failed` | The upstream stream **failed** — a transport or protocol error mid-answer | The answer is lost. Do not retry blindly: a retry appends a second answer and bills for both |
+| `upstream_incomplete` | The upstream stream **ended cleanly but did not complete** — it closed before any usage block arrived, so the answer is truncated | Keep the partial text, but mark it incomplete. Never present it as a finished answer |
+
+**These are different conditions.** `upstream_failed` means the upstream stream
+died mid-answer; `upstream_incomplete` means it ended without error but stopped
+before the answer completed. A client that collapses them cannot tell a cut-off
+answer from a broken connection, and cannot say which one happened to support.
+
 **Then close cleanly.** Do not silently stop — a client cannot distinguish a
 finished answer from a truncated one, and will treat a partial response as
 complete. See [`docs/failover.md`](failover.md) on mid-stream failure.
