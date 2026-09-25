@@ -53,6 +53,11 @@ venv/
 # ignored except tracked skills, so a scratch script cannot be committed.
 .agents/*
 !.agents/skills/
+# Same convention at any depth - a worker running a scratch build inside a
+# subdirectory (e.g. CARGO_TARGET_DIR=server/.agents/target-x) must not dirty
+# the tree either.
+**/.agents/
+!**/.agents/skills/
 # Local tool artifact
 .freebuff/
 # Workspace memory and agent state (see AGENTS.md conventions). Local notes,
