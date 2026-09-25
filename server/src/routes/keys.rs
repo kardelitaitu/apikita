@@ -498,7 +498,41 @@ mod tests {
     use chrono::SubsecRound;
     use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
     use crate::routes::events::RealtimeHub;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    /// The ONE process-wide lock over the proxy's key-metadata cache.
+    ///
+    /// `proxy.rs`'s `KEY_CACHE` is a process-global singleton shared by every
+    /// test in this binary AND by real request handling, but the cache tests in
+    /// this module warm it and then invalidate it, each assuming it is the ONLY
+    /// writer. Run in parallel, one test's `update_key`/`revoke_key` (which
+    /// invalidates) lands between the other's out-of-band write and its
+    /// "still stale" assertion - and both fail, intermittently, with
+    /// `key_limit_exceeded` where the test expects `insufficient_balance`.
+    ///
+    /// This is the same defect class as the MIDTRANS_* environment leak already
+    /// fixed in `routes::account` / `routes::webhooks`, and it gets the same
+    /// remedy: a process-wide lock held for the WHOLE body of every test that
+    /// touches the shared global, so no two can interleave. It serialises; it
+    /// does not bypass - every staleness assertion below still has to hold on
+    /// its own merits.
+    static KEY_CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Held for the whole body of a test that warms or invalidates `KEY_CACHE`.
+    struct CacheLock {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl CacheLock {
+        fn acquire() -> Self {
+            // A panicking test must not poison the lock for every later test:
+            // the cache entry it left behind is exactly what its own out-of-band
+            // write and `invalidate_key_cache` would have replaced anyway.
+            Self {
+                _lock: KEY_CACHE_LOCK.lock().unwrap_or_else(|err| err.into_inner()),
+            }
+        }
+    }
 
     fn live_config() -> Arc<AppConfig> {
         for path in ["../config/apikita.toml", "config/apikita.toml"] {
@@ -863,6 +897,7 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn revoking_a_key_makes_the_real_lookup_path_refuse_it() {
+        let _cache = CacheLock::acquire();
         let pool = live_pool().await;
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
@@ -935,6 +970,7 @@ mod tests {
     #[tokio::test]
     async fn revoking_a_key_invalidates_the_proxy_cache_instead_of_leaving_it_honoured_for_the_ttl()
     {
+        let _cache = CacheLock::acquire();
         let pool = live_pool().await;
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
@@ -1147,6 +1183,7 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn real_usage_at_the_spend_limit_makes_the_proxy_refuse_the_request() {
+        let _cache = CacheLock::acquire();
         let pool = live_pool().await;
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
@@ -1248,6 +1285,7 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_key_of_one_account_is_invisible_and_unrevokable_to_another() {
+        let _cache = CacheLock::acquire();
         let pool = live_pool().await;
         let account_a = create_account(&pool).await;
         let account_b = create_account(&pool).await;
@@ -1388,6 +1426,7 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn updating_a_key_persists_every_patched_column_to_the_row() {
+        let _cache = CacheLock::acquire();
         let pool = live_pool().await;
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
@@ -1468,6 +1507,7 @@ mod tests {
     #[tokio::test]
     async fn updating_a_key_invalidates_the_proxy_cache_instead_of_leaving_the_old_limit_honoured_for_the_ttl(
     ) {
+        let _cache = CacheLock::acquire();
         let pool = live_pool().await;
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
@@ -1601,6 +1641,7 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn an_empty_model_allowlist_after_an_update_denies_every_model() {
+        let _cache = CacheLock::acquire();
         let pool = live_pool().await;
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
