@@ -659,8 +659,6 @@ mod tests {
         delete_fixture(&pool, account_id).await;
     }
 
-    /// (c) The two windows are genuinely different
-
     /// (c) The two windows are genuinely different, measured against the SAME
     /// real rows: an age that is outside the 1-hour topup window is inside the
     /// 24-hour key window. Duration constants alone cannot show this.
