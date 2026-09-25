@@ -93,12 +93,12 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 
 ## Phase 4: Local End-to-End Integration Validation
 
-- [ ] **Full Local Stack Test (Web $\rightarrow$ Relay $\rightarrow$ Server $\rightarrow$ Fake Upstream)**
-  - [ ] Log in through local Web UI via PocketBase
-  - [ ] Generate an API key through Web UI
+- [x] **Full Local Stack Test (Web $\rightarrow$ Relay $\rightarrow$ Server $\rightarrow$ Fake Upstream)**
+  - [x] Log in through local Web UI via PocketBase
+  - [x] Generate an API key through Web UI
   - [x] Execute streaming request using `curl` against local Edge Relay on port `8000`
   - [x] Confirm request routes through Server to Fake Upstream
-  - [ ] Confirm balance decrements live on Web UI via SSE without browser refresh
+  - [x] Confirm balance decrements live on Web UI via SSE without browser refresh
   - [x] Verify database reconciliation query: $\sum \text{delta\_idr} \equiv \text{balance\_idr}$
   - [x] Test relay down failover: send requests directly to server port `8080`
 
