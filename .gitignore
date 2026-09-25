@@ -55,3 +55,6 @@ venv/
 !.agents/skills/
 # Local tool artifact
 .freebuff/
+# Workspace memory and agent state (see AGENTS.md conventions). Local notes,
+# not part of the build.
+.workbuddy-ai/
