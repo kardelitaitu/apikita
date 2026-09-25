@@ -246,4 +246,290 @@ mod tests {
         // customer @ 2.0 = 16.27484 -> ceil is 17 IDR
         assert_eq!(cost, 17);
     }
+
+    // =====================================================================
+    // Billing properties (docs/local-development.md:95-117)
+    //
+    // Rates below are transcribed from config/apikita.toml:300-305 (the `flash`
+    // model, IDR per 1M tokens at billing_basis="peak") and price = 1.5
+    // (config/apikita.toml:288). They are literals on purpose: a config edit
+    // that silently changes what a customer is billed should break a test, not
+    // quietly rewrite the expected value.
+    // =====================================================================
+
+    const PRICE: f64 = 1.5;
+    const R_IN: f64 = 2676.78;
+    const R_CACHE: f64 = 53.54;
+    const R_OUT: f64 = 10707.12;
+    const R_IN_OFFPEAK: f64 = 1338.39;
+    const R_CACHE_OFFPEAK: f64 = 26.77;
+    const R_OUT_OFFPEAK: f64 = 5353.56;
+
+    fn bill(input: u64, cache_read: u64, output: u64) -> i64 {
+        calculate_token_cost_idr(PRICE, input, R_IN, cache_read, R_CACHE, output, R_OUT)
+    }
+
+    fn reserve(estimated_input: u64, max_output: u64) -> i64 {
+        calculate_preflight_reservation_idr(PRICE, estimated_input, R_IN, max_output, R_OUT)
+    }
+
+    /// The property docs/local-development.md:113-117 calls "the cheapest guard
+    /// against the most expensive accounting error".
+    #[test]
+    fn cache_read_tokens_are_never_priced_as_input_tokens() {
+        let cache_tokens = 1_000_000;
+
+        // 1M cache reads at the cache rate: 1e6/1e6 * 53.54 * 1.5 = 80.31 -> 81
+        let billed_as_cache = bill(0, cache_tokens, 0);
+        // The same 1M tokens misclassified as plain input: 2676.78 * 1.5 = 4015.17 -> 4016
+        let billed_as_input = bill(cache_tokens, 0, 0);
+
+        assert_eq!(billed_as_cache, 81);
+        assert_eq!(billed_as_input, 4016);
+        assert_ne!(
+            billed_as_cache, billed_as_input,
+            "cache-read and input tokens must not be priced alike: they differ ~50x"
+        );
+        assert!(
+            billed_as_input > billed_as_cache,
+            "pricing cache hits as input overcharges the customer by {billed_as_input} vs {billed_as_cache}"
+        );
+
+        // The headline ratio the doc cites (~50x at these rates).
+        let ratio = R_IN / R_CACHE;
+        assert!(
+            ratio > 40.0 && ratio < 60.0,
+            "docs/local-development.md:115 - the classes differ ~50x, measured {ratio}"
+        );
+    }
+
+    /// The same total prompt, split between fresh and cached tokens, must bill
+    /// strictly less than the identical prompt with no cache hits.
+    #[test]
+    fn a_cache_hit_is_cheaper_than_the_same_tokens_sent_as_fresh_input() {
+        let with_cache = bill(100_000, 900_000, 0);
+        let without_cache = bill(1_000_000, 0, 0);
+
+        assert_eq!(with_cache, 474);
+        assert_eq!(without_cache, 4016);
+        assert!(
+            with_cache < without_cache,
+            "900k cached tokens must cost less than 900k fresh ones ({with_cache} vs {without_cache})"
+        );
+    }
+
+    /// `input_tokens` and `cache_read_tokens` are disjoint COUNTERS but they are
+    /// a partition of ONE prompt: upstream/client.rs:117-123 sets
+    /// `input_tokens = prompt_tokens - cached_tokens`, so the cached count is a
+    /// subset of the prompt. Folding it back into input double-counts it.
+    #[test]
+    fn a_cached_token_is_never_also_billed_as_an_input_token() {
+        let prompt_tokens = 1_000_000;
+        let cached = 1_000_000;
+
+        // The correct split: nothing fresh, the whole prompt served from cache.
+        let correctly_split = bill(prompt_tokens - cached, cached, 0);
+        assert_eq!(correctly_split, 81);
+
+        // The bug: adding the cached count on top of the prompt instead of
+        // splitting it out, so the same tokens are billed twice at the dearest rate.
+        // 2M input tokens: 2e6/1e6 * 2676.78 * 1.5 = 8030.34 -> 8031, i.e. ~99x
+        // the correctly-split charge for the very same prompt.
+        let double_counted = bill(prompt_tokens + cached, 0, 0);
+        assert_eq!(double_counted, 8031);
+        assert!(
+            correctly_split < double_counted,
+            "double-counting cache hits overcharges {correctly_split} -> {double_counted}"
+        );
+    }
+
+    #[test]
+    fn the_three_token_classes_are_priced_separately() {
+        assert_eq!(bill(1_000_000, 0, 0), 4016, "input only");
+        assert_eq!(bill(0, 1_000_000, 0), 81, "cache-read only");
+        assert_eq!(bill(0, 0, 1_000_000), 16061, "output only");
+
+        // The combined charge is the sum of the parts, per class.
+        assert_eq!(bill(1_000_000, 1_000_000, 1_000_000), 20157);
+        assert_eq!(4016 + 81 + 16061, 20158);
+        assert_eq!(
+            bill(1_000_000, 1_000_000, 1_000_000),
+            20158 - 1,
+            "the combined charge is the per-class total, off by at most one IDR of ceiling"
+        );
+    }
+
+    /// The function documents `ceil` (money.rs:127). Pin the direction with a
+    /// case whose exact value is an integer, so only the direction can differ.
+    #[test]
+    fn the_idr_cost_rounds_up_never_down_and_never_truncates_to_zero() {
+        // 1M tokens * 2.0 IDR/1M * 1.0 = exactly 2.0
+        assert_eq!(calculate_token_cost_idr(1.0, 1_000_000, 2.0, 0, 0.0, 0, 0.0), 2);
+        // just above an integer -> rounds UP, not to nearest, not down
+        assert_eq!(
+            calculate_token_cost_idr(1.0000001, 1_000_000, 2.0, 0, 0.0, 0, 0.0),
+            3
+        );
+        // just below an integer -> stays at the integer (rounding up is exact)
+        assert_eq!(
+            calculate_token_cost_idr(0.9999999, 1_000_000, 2.0, 0, 0.0, 0, 0.0),
+            2
+        );
+        // A sub-IDR charge rounds up to 1: free requests are the one thing a
+        // ceiling must never produce, because a free request is unbounded usage.
+        assert_eq!(calculate_token_cost_idr(1.0, 1, 1.0, 0, 0.0, 0, 0.0), 1);
+    }
+
+    #[test]
+    fn zero_tokens_or_zero_rates_produce_zero_not_a_negative_charge() {
+        assert_eq!(bill(0, 0, 0), 0);
+        assert_eq!(
+            calculate_token_cost_idr(PRICE, 1_000_000, 0.0, 1_000_000, 0.0, 1_000_000, 0.0),
+            0
+            , "a zero rate must charge zero, never a negative amount"
+        );
+        assert_eq!(
+            calculate_token_cost_idr(0.0, 1_000_000, R_IN, 1_000_000, R_CACHE, 1_000_000, R_OUT),
+            0
+            , "a zero multiplier must charge zero"
+        );
+        assert!(bill(0, 0, 0) >= 0);
+    }
+
+    #[test]
+    fn a_full_length_response_never_costs_more_than_its_reservation() {
+        let estimated_input = 1_000;
+        let max_output = 4096;
+        let reserved = reserve(estimated_input, max_output);
+        assert_eq!(reserved, 70);
+
+        // The hold is a ceiling over EVERY reachable settlement of that request:
+        // every cache split of the SAME prompt, and output anywhere up to the cap.
+        //
+        // `cache_read <= estimated_input` is the reachable domain, not a
+        // convenience: upstream/client.rs:117-123 defines
+        // `input_tokens = prompt_tokens - cached_tokens`, so the cached count is
+        // a subset of the prompt the estimate was taken from. A settlement with
+        // more cached tokens than the whole prompt is not a state the upstream
+        // can report.
+        for cache_read in [0u64, 1, 500, 1_000] {
+            let actual = bill(estimated_input - cache_read, cache_read, max_output);
+            assert!(
+                actual <= reserved,
+                "cache_read={cache_read}: charged {actual} but only {reserved} was held"
+            );
+        }
+        for output in [0u64, 1, 1_024, max_output] {
+            let actual = bill(estimated_input, 0, output);
+            assert!(
+                actual <= reserved,
+                "output={output}: charged {actual} but only {reserved} was held"
+            );
+        }
+
+        // The extreme: every prompt token arrives cached, and the response runs
+        // to the cap. Still inside the hold, because the hold prices input at
+        // the PEAK rate while a cache hit is the cheapest class there is.
+        let all_cached_actual = bill(0, estimated_input, max_output);
+        assert_eq!(all_cached_actual, 66);
+        assert!(all_cached_actual <= reserved);
+    }
+
+    #[test]
+    fn the_reservation_is_monotonic_in_output_tokens() {
+        let previous = [
+            (0u64, 5i64),
+            (1, 5),
+            (1_024, 21),
+            (65_536, 1057),
+            (384_000, 6172),
+        ];
+        for (tokens, expected) in previous {
+            assert_eq!(
+                reserve(1_000, tokens),
+                expected,
+                "reservation for {tokens} output tokens"
+            );
+        }
+
+        let mut last = -1;
+        for tokens in (0u64..=384_000).step_by(997) {
+            let r = reserve(1_000, tokens);
+            assert!(
+                r >= last,
+                "reservation fell from {last} to {r} at {tokens} output tokens"
+            );
+            last = r;
+        }
+    }
+
+    #[test]
+    fn the_reservation_is_monotonic_in_input_tokens() {
+        let mut last = -1;
+        for tokens in (0u64..=1_000_000).step_by(9_973) {
+            let r = reserve(tokens, 4096);
+            assert!(r >= last, "reservation fell at {tokens} input tokens");
+            last = r;
+        }
+        assert!(reserve(2_000, 4096) >= reserve(1_000, 4096));
+    }
+
+    /// config/apikita.toml:267-270: off-peak is exactly half of peak, and
+    /// billing_basis="peak" reserves at the PEAK rate so a request can never
+    /// lose money.
+    #[test]
+    fn the_off_peak_rate_path_is_exercised_and_is_exactly_half_of_peak() {
+        let peak = calculate_token_cost_idr(
+            PRICE, 1_000_000, R_IN, 1_000_000, R_CACHE, 1_000_000, R_OUT,
+        );
+        let off_peak = calculate_token_cost_idr(
+            PRICE, 1_000_000, R_IN_OFFPEAK, 1_000_000, R_CACHE_OFFPEAK, 1_000_000, R_OUT_OFFPEAK,
+        );
+
+        assert_eq!(peak, 20157);
+        assert_eq!(off_peak, 10079);
+        assert!(off_peak < peak, "off-peak must bill less than peak");
+
+        for (peak_rate, off_peak_rate) in [
+            (R_IN, R_IN_OFFPEAK),
+            (R_CACHE, R_CACHE_OFFPEAK),
+            (R_OUT, R_OUT_OFFPEAK),
+        ] {
+            assert_eq!(
+                peak_rate / 2.0,
+                off_peak_rate,
+                "config/apikita.toml:267 - off-peak is exactly HALF of peak"
+            );
+        }
+    }
+
+    /// config/apikita.toml:269 - the reservation uses the PEAK rate even when
+    /// the request will settle off-peak, so the hold can never under-reserve.
+    #[test]
+    fn the_reservation_uses_the_peak_rate_even_off_peak() {
+        let peak_reservation = reserve(1_000, 4096);
+        let off_peak_reservation = calculate_preflight_reservation_idr(
+            PRICE, 1_000, R_IN_OFFPEAK, 4096, R_OUT_OFFPEAK,
+        );
+
+        assert_eq!(peak_reservation, 70);
+        assert_eq!(off_peak_reservation, 35);
+        assert!(
+            peak_reservation > off_peak_reservation,
+            "reserving at off-peak would under-hold a peak-time request"
+        );
+    }
+
+    /// The documented property that ties the two functions together.
+    #[test]
+    fn the_reservation_covers_a_settlement_that_has_cache_hits() {
+        let reserved = reserve(1_000, 4096);
+        let actual = bill(1_000, 2_000, 4096);
+        assert_eq!(reserved, 70);
+        assert_eq!(actual, 70);
+        assert!(
+            actual <= reserved,
+            "the hold must cover a settlement with cache hits"
+        );
+    }
 }

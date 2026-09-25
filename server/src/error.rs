@@ -141,3 +141,358 @@ impl IntoResponse for AppError {
         res
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::{header, HeaderMap};
+    use serde_json::{json, Value as Json};
+
+    /// The literal contract from docs/error-model.md:35-50.
+    ///
+    /// Transcribed by hand from the document. The assertions below compare the
+    /// code against this table, not against itself, so any drift between
+    /// error.rs and the published contract fails a test.
+    const DOCUMENTED: &[(u16, &str)] = &[
+        (400, "invalid_request"),
+        (401, "unauthenticated"),
+        (401, "key_revoked"),
+        (401, "key_expired"),
+        (402, "insufficient_balance"),
+        (402, "key_limit_exceeded"),
+        (403, "model_not_allowed"),
+        (403, "wrong_credential_type"),
+        (404, "not_found"),
+        (409, "conflict"),
+        (422, "validation_failed"),
+        (429, "rate_limited"),
+        (500, "internal_error"),
+        (503, "no_upstream_available"),
+    ];
+
+    /// Every AppError variant, one of each. The response-level tests run over
+    /// this whole set, so a newly added variant is covered the day it lands
+    /// rather than the day someone remembers to extend a hand-picked list.
+    fn every_variant() -> Vec<AppError> {
+        vec![
+            AppError::InvalidRequest("body is not an object".into()),
+            AppError::Unauthenticated,
+            AppError::KeyRevoked,
+            AppError::KeyExpired,
+            AppError::InsufficientBalance { details: None },
+            AppError::KeyLimitExceeded { details: None },
+            AppError::ModelNotAllowed("deepseek-v4-pro".into()),
+            AppError::WrongCredentialType("cookie where an API key is required".into()),
+            AppError::NotFound("key_7f3a".into()),
+            AppError::Conflict("telegram account already linked".into()),
+            AppError::ValidationFailed("amount_idr must be at least 10000".into()),
+            AppError::RateLimited { retry_after_secs: 42 },
+            AppError::NoUpstreamAvailable,
+            AppError::Database(sqlx::Error::RowNotFound),
+            AppError::Internal("upstream request failed".into()),
+        ]
+    }
+
+    /// One variant per documented row, paired with the row it must match.
+    fn documented_cases() -> Vec<(AppError, u16, &'static str)> {
+        vec![
+            (AppError::InvalidRequest("x".into()), 400, "invalid_request"),
+            (AppError::Unauthenticated, 401, "unauthenticated"),
+            (AppError::KeyRevoked, 401, "key_revoked"),
+            (AppError::KeyExpired, 401, "key_expired"),
+            (AppError::InsufficientBalance { details: None }, 402, "insufficient_balance"),
+            (AppError::KeyLimitExceeded { details: None }, 402, "key_limit_exceeded"),
+            (AppError::ModelNotAllowed("m".into()), 403, "model_not_allowed"),
+            (AppError::WrongCredentialType("c".into()), 403, "wrong_credential_type"),
+            (AppError::NotFound("id".into()), 404, "not_found"),
+            (AppError::Conflict("dup".into()), 409, "conflict"),
+            (AppError::ValidationFailed("v".into()), 422, "validation_failed"),
+            (AppError::RateLimited { retry_after_secs: 1 }, 429, "rate_limited"),
+            (AppError::NoUpstreamAvailable, 503, "no_upstream_available"),
+            (AppError::Database(sqlx::Error::RowNotFound), 500, "internal_error"),
+            (AppError::Internal("boom".into()), 500, "internal_error"),
+        ]
+    }
+
+    async fn respond(err: AppError) -> (StatusCode, HeaderMap, Json) {
+        let res = err.into_response();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("an error response must have a readable body");
+        let body: Json = serde_json::from_slice(&bytes).expect(
+            "docs/error-model.md:10 - every error returns JSON; no bare HTML pages, no empty bodies",
+        );
+        (status, headers, body)
+    }
+
+    fn error_object(body: &Json) -> &Json {
+        body.get("error")
+            .expect("docs/error-model.md:12-20 - the shape is {error: {code, message, request_id}}")
+    }
+
+    fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+        headers.get(name).map(|v| v.to_str().expect("header is ASCII"))
+    }
+
+    // ---------------------------------------------------------------------
+    // The status/code contract
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn every_variant_matches_the_documented_status_and_code() {
+        for (err, status, code) in documented_cases() {
+            assert_eq!(
+                err.status_code().as_u16(),
+                status,
+                "HTTP status drift for code `{}` (docs/error-model.md:35-50)",
+                err.code()
+            );
+            assert_eq!(
+                err.code(),
+                code,
+                "machine-readable code drift for HTTP {status} (docs/error-model.md:35-50)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_code_set_is_exactly_the_documented_one() {
+        let mut actual: Vec<&'static str> = every_variant().iter().map(|e| e.code()).collect();
+        actual.sort_unstable();
+        actual.dedup();
+
+        let mut documented: Vec<&str> = DOCUMENTED.iter().map(|(_, c)| *c).collect();
+        documented.sort_unstable();
+        documented.dedup();
+
+        assert_eq!(
+            actual, documented,
+            "docs/error-model.md:164 - code values are permanent; adding is fine, changing meaning is not"
+        );
+    }
+
+    #[test]
+    fn a_bad_key_is_401_and_a_denied_model_is_403() {
+        // docs/error-model.md:52-62 - "Do not return 403 for a bad key."
+        for bad_credential in [
+            AppError::Unauthenticated,
+            AppError::KeyRevoked,
+            AppError::KeyExpired,
+        ] {
+            assert_eq!(bad_credential.status_code(), StatusCode::UNAUTHORIZED);
+        }
+        for known_but_denied in [
+            AppError::ModelNotAllowed("x".into()),
+            AppError::WrongCredentialType("x".into()),
+        ] {
+            assert_eq!(known_but_denied.status_code(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[test]
+    fn a_key_limit_is_402_never_429() {
+        // docs/error-model.md:64-77 - "A client must not retry a 402."
+        assert_eq!(
+            AppError::KeyLimitExceeded { details: None }.status_code(),
+            StatusCode::PAYMENT_REQUIRED
+        );
+        assert_ne!(
+            AppError::KeyLimitExceeded { details: None }.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Response shape
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_response_body_has_the_documented_shape() {
+        let (status, headers, body) = respond(AppError::InsufficientBalance {
+            details: Some(json!({ "required_idr": 1200, "balance_idr": 400 })),
+        })
+        .await;
+
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            header_str(&headers, header::CONTENT_TYPE),
+            Some("application/json")
+        );
+
+        let e = error_object(&body);
+        assert_eq!(e["code"], "insufficient_balance");
+        assert!(
+            e["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "message must be a non-empty human-readable string"
+        );
+        assert!(e["request_id"].as_str().is_some());
+        assert_eq!(e["details"]["required_idr"], 1200);
+        assert_eq!(e["details"]["balance_idr"], 400);
+    }
+
+    #[tokio::test]
+    async fn details_is_omitted_when_absent_never_null() {
+        let (_, _, body) = respond(AppError::InsufficientBalance { details: None }).await;
+        let e = error_object(&body);
+        assert!(
+            e.get("details").is_none(),
+            "docs/error-model.md:28 - details is optional; it must be absent, not null"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_error_carries_a_request_id_in_the_documented_format() {
+        for err in every_variant() {
+            let (_, _, body) = respond(err).await;
+            let id = error_object(&body)["request_id"]
+                .as_str()
+                .expect("docs/error-model.md:162 - always include request_id")
+                .to_string();
+            assert!(
+                id.starts_with("req_"),
+                "request_id must follow the documented req_... form, got {id}"
+            );
+            let hex = &id["req_".len()..];
+            assert_eq!(hex.len(), 32, "request_id suffix should be a bare uuid, got {id}");
+            assert!(
+                hex.chars().all(|c| c.is_ascii_hexdigit()),
+                "request_id suffix must be hex, got {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_id_is_stable_within_one_error_and_unique_across_errors() {
+        let (_, _, body) = respond(AppError::Unauthenticated).await;
+        let first = error_object(&body)["request_id"].as_str().unwrap().to_string();
+        let second = error_object(&body)["request_id"].as_str().unwrap().to_string();
+        assert_eq!(first, second, "one response must carry exactly one stable id");
+
+        let (_, _, other) = respond(AppError::Unauthenticated).await;
+        assert_ne!(
+            first,
+            error_object(&other)["request_id"].as_str().unwrap(),
+            "a constant request_id correlates with nothing (docs/error-model.md:27)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Retry-After
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rate_limited_carries_retry_after_in_seconds() {
+        let (status, headers, _) = respond(AppError::RateLimited { retry_after_secs: 42 }).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let value = header_str(&headers, header::RETRY_AFTER)
+            .expect("docs/error-model.md:81 - Retry-After is included on 429");
+        assert_eq!(value, "42");
+        assert!(
+            value.parse::<u64>().is_ok(),
+            "docs/error-model.md:81-82 - seconds, not a date"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_retry_after_is_never_zero() {
+        // docs/error-model.md:93-94 - "never below 1".
+        let (_, headers, _) = respond(AppError::RateLimited { retry_after_secs: 1 }).await;
+        assert_eq!(header_str(&headers, header::RETRY_AFTER), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_absent_on_every_error_that_does_not_document_it() {
+        for err in every_variant() {
+            if matches!(err, AppError::RateLimited { .. } | AppError::NoUpstreamAvailable) {
+                continue;
+            }
+            let (status, headers, _) = respond(err).await;
+            assert!(
+                headers.get(header::RETRY_AFTER).is_none(),
+                "unexpected Retry-After on {status} - a header that appears everywhere teaches callers to ignore it (docs/error-model.md:96)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_upstream_available_carries_retry_after() {
+        // docs/error-model.md:50  - 503 says "Retry after Retry-After".
+        // docs/error-model.md:81  - "Included on 429 and 503."
+        // docs/error-model.md:112 - "Floor it at 1 second."
+        let (status, headers, _) = respond(AppError::NoUpstreamAvailable).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The earliest moment a retry could plausibly succeed; a 503 without it
+        // tells the client nothing about when to come back, which is the very
+        // retry-loop the header exists to prevent.
+        let value = header_str(&headers, header::RETRY_AFTER)
+            .expect("docs/error-model.md:81 - Retry-After is included on 503");
+        let secs: u64 = value.parse().expect("Retry-After must be whole seconds");
+        assert!(secs >= 1, "docs/error-model.md:112 - floored at 1 second");
+    }
+
+    // ---------------------------------------------------------------------
+    // Never leak internals (docs/error-model.md:159, rule 1)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_database_error_does_not_leak_sql_or_schema_to_the_client() {
+        let raw_sql = "SELECT id, balance_idr FROM wallets WHERE account_id = $1";
+        let (status, _, body) =
+            respond(AppError::Database(sqlx::Error::Protocol(raw_sql.to_string()))).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let message = error_object(&body)["message"].as_str().unwrap();
+        assert!(
+            !message.contains("SELECT"),
+            "docs/error-model.md rule 1 - no SQL in customer-facing errors, got: {message}"
+        );
+        assert!(
+            !message.contains("wallets"),
+            "docs/error-model.md rule 1 - no schema names in customer-facing errors, got: {message}"
+        );
+        assert!(
+            !message.contains(raw_sql),
+            "the raw sqlx error string reached the client: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_internal_error_does_not_leak_infrastructure_detail() {
+        // The real call sites (routes/account.rs, routes/auth.rs) build the
+        // message by formatting the underlying failure into it.
+        let (status, _, body) = respond(AppError::Internal(
+            "Midtrans Snap request failed: connection refused to 10.0.0.7:443".into(),
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let message = error_object(&body)["message"].as_str().unwrap();
+        for leak in ["Midtrans", "10.0.0.7", "connection refused"] {
+            assert!(
+                !message.contains(leak),
+                "docs/error-model.md rule 1 - internals must not reach the client, leaked {leak} in: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_validation_error_names_the_offending_field_in_details() {
+        // docs/error-model.md:165, rule 5 - validation errors name the field.
+        let (status, _, body) =
+            respond(AppError::ValidationFailed("amount_idr must be at least 10000".into())).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let e = error_object(&body);
+        let field = e
+            .get("details")
+            .and_then(|d| d.get("field"))
+            .and_then(|f| f.as_str())
+            .expect(
+                "docs/error-model.md rule 5 requires details.field on a validation error so the UI can highlight the input without parsing the prose message",
+            );
+        assert_eq!(field, "amount_idr");
+    }
+}
