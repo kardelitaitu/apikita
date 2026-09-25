@@ -122,9 +122,12 @@ honestly:
   provider's job: object versioning/immutability, and treating the offsite bucket
   as write-only from the backup host. The SHA-256 printed at write time is for
   the size/anomaly alerting in the doc, not for authentication.
-- If an authenticated cipher is wanted, that is a deliberate change (e.g. `age`
-  or `gpg`), and both are absent from this host. `openssl` was chosen because it
-  is present and its CBC+PBKDF2 mode round-trips verified.
+- `age` is **not** installed on this host. `gpg` **is** (`/usr/bin/gpg`), and
+  `gpg --symmetric` would give authenticated encryption. `openssl` was chosen
+  because it is the standard tool here, is present, and covers the encryption
+  *and* the SHA-256 the size/anomaly alert wants in a single dependency - not
+  because GPG is unavailable. Moving to an authenticated cipher is a deliberate,
+  worthwhile change, not a limitation of this host.
 
 Restoring, once the key is at hand:
 
