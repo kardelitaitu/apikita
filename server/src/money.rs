@@ -532,4 +532,179 @@ mod tests {
             "the hold must cover a settlement with cache hits"
         );
     }
+
+    // =====================================================================
+    // Midtrans signature verification (docs/website/04-payments.md:36-48)
+    //
+    // This is the only control between a forged webhook and a credited wallet
+    // (server/src/routes/webhooks.rs:82 - a false return is the 401). The
+    // digests below are pinned as literals derived OUTSIDE Rust:
+    // `printf '%s' 'order1' '200' '50000.00' 'SB-Mid-server-TEST' | sha512sum`,
+    // cross-checked against Python's hashlib.sha512. Calling the function under
+    // test to produce its own expected value would prove nothing.
+    // =====================================================================
+
+    /// A notification whose signature is whatever the caller passes.
+    fn notif(
+        order_id: &str,
+        status_code: &str,
+        gross_amount: &str,
+        signature: &str,
+    ) -> MidtransNotification {
+        MidtransNotification {
+            order_id: order_id.to_string(),
+            status_code: status_code.to_string(),
+            gross_amount: gross_amount.to_string(),
+            transaction_status: "settlement".to_string(),
+            signature_key: signature.to_string(),
+            fraud_status: None,
+        }
+    }
+
+    /// Known vector: SHA512("order1" + "200" + "50000.00" + "SB-Mid-server-TEST"),
+    /// lowercase hex, computed by sha512sum and hashlib outside this crate.
+    const VECTOR_SIG: &str = "9157089d17e0d30f6c7b09a99d071a612e8a7a0d393e18bbd9d71c1d449eedd0e175ccf363204d9def23fa4c1e7eada72ac26b2fa43a236da0b683564918aefa";
+    const VECTOR_KEY: &str = "SB-Mid-server-TEST";
+
+    #[test]
+    fn the_signature_matches_an_independently_computed_sha512_digest() {
+        let sig = compute_midtrans_signature("order1", "200", "50000.00", VECTOR_KEY);
+        assert_eq!(sig, VECTOR_SIG);
+        assert_eq!(sig, sig.to_lowercase(), "hex::encode emits lowercase hex");
+    }
+
+    /// The digest is only a signature if the field order is load-bearing:
+    /// reordering any two fields must change it, or the concatenation is
+    /// ambiguous and two different payloads could share a signature.
+    #[test]
+    fn reordering_the_signed_fields_changes_the_digest() {
+        let correct = compute_midtrans_signature("order1", "200", "50000.00", VECTOR_KEY);
+        let reordered = [
+            (
+                "order_id/status_code",
+                compute_midtrans_signature("200", "order1", "50000.00", VECTOR_KEY),
+            ),
+            (
+                "order_id/gross_amount",
+                compute_midtrans_signature("50000.00", "200", "order1", VECTOR_KEY),
+            ),
+            (
+                "order_id/server_key",
+                compute_midtrans_signature(VECTOR_KEY, "200", "50000.00", "order1"),
+            ),
+            (
+                "gross_amount/server_key",
+                compute_midtrans_signature("order1", "200", VECTOR_KEY, "50000.00"),
+            ),
+            (
+                "status_code/gross_amount",
+                compute_midtrans_signature("order1", "50000.00", "200", VECTOR_KEY),
+            ),
+        ];
+        for (what, digest) in reordered {
+            assert_ne!(
+                digest, correct,
+                "reordering {what} produced the same digest - the concatenation is ambiguous"
+            );
+        }
+    }
+
+    /// THE REAL ATTACK: replay a genuine signature against a different amount,
+    /// order, or status. Every one of the three signed fields must break it.
+    #[test]
+    fn tampering_with_any_signed_field_is_rejected() {
+        let cases: [(&str, &str, &str, &str); 3] = [
+            ("gross_amount", "order1", "200", "50000.01"),
+            ("order_id", "order2", "200", "50000.00"),
+            ("status_code", "order1", "201", "50000.00"),
+        ];
+        for (field, order_id, status_code, gross_amount) in cases {
+            let tampered = notif(order_id, status_code, gross_amount, VECTOR_SIG);
+            assert!(
+                !verify_midtrans_signature(&tampered, VECTOR_KEY),
+                "tampering with {field} was ACCEPTED - a forged webhook would credit a wallet"
+            );
+        }
+        // The untampered payload still verifies, so the cases above are not
+        // passing merely because the verifier rejects everything.
+        assert!(verify_midtrans_signature(
+            &notif("order1", "200", "50000.00", VECTOR_SIG),
+            VECTOR_KEY
+        ));
+    }
+
+    /// Positive control: only the key that produced the signature verifies it.
+    #[test]
+    fn the_signature_verifies_only_with_the_key_that_produced_it() {
+        let good = notif("order1", "200", "50000.00", VECTOR_SIG);
+        assert!(verify_midtrans_signature(&good, VECTOR_KEY));
+        assert!(!verify_midtrans_signature(&good, "SB-Mid-server-OTHER"));
+        assert!(!verify_midtrans_signature(&good, ""));
+    }
+
+    /// Malformed signatures. Uppercase hex is REJECTED: the comparison is
+    /// byte-wise against the lowercase hex hex::encode emits.
+    #[test]
+    fn malformed_signatures_are_rejected() {
+        let long = format!("{VECTOR_SIG}00");
+        let non_hex = "z".repeat(128);
+        let cases: [(&str, &str); 4] = [
+            ("empty signature", ""),
+            ("wrong length (short)", "9157089d17e0d30f"),
+            ("wrong length (long)", &long),
+            ("non-hex, right length", &non_hex),
+        ];
+        for (what, signature) in cases {
+            assert!(
+                !verify_midtrans_signature(
+                    &notif("order1", "200", "50000.00", signature),
+                    VECTOR_KEY
+                ),
+                "{what} was accepted"
+            );
+        }
+
+        // Uppercase hex is the same digest in a different alphabet. Midtrans
+        // documents lowercase, so rejecting it is strict and correct.
+        let uppercase = VECTOR_SIG.to_uppercase();
+        assert_ne!(uppercase, VECTOR_SIG);
+        assert!(
+            !verify_midtrans_signature(
+                &notif("order1", "200", "50000.00", &uppercase),
+                VECTOR_KEY
+            ),
+            "uppercase hex must be rejected: the comparison is byte-wise, not case-insensitive"
+        );
+    }
+
+    /// A malformed notification must not silently bypass the check. Empty and
+    /// non-ASCII fields still hash deterministically and round-trip.
+    #[test]
+    fn empty_and_unicode_fields_still_round_trip() {
+        let vectors: [(&str, &str, &str); 3] = [
+            ("", "200", "50000.00"),
+            ("topup_中文–💸", "200", "50000.00"),
+            ("order1", "", ""),
+        ];
+        for (order_id, status_code, gross_amount) in vectors {
+            let sig = compute_midtrans_signature(order_id, status_code, gross_amount, VECTOR_KEY);
+            assert_eq!(sig.len(), 128, "SHA-512 hex is always 128 chars");
+            assert_eq!(
+                sig,
+                compute_midtrans_signature(order_id, status_code, gross_amount, VECTOR_KEY),
+                "hashing must be deterministic"
+            );
+            assert!(
+                verify_midtrans_signature(
+                    &notif(order_id, status_code, gross_amount, &sig),
+                    VECTOR_KEY
+                ),
+                "a valid signature over {order_id:?} must round-trip"
+            );
+            assert!(
+                !verify_midtrans_signature(&notif(order_id, status_code, gross_amount, ""), VECTOR_KEY),
+                "an empty signature must never verify, even for empty fields"
+            );
+        }
+    }
 }
