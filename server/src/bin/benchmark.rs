@@ -12,11 +12,12 @@ struct BenchmarkKey {
     cooldown_until: Arc<AtomicI64>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     println!("============================================================");
     println!("           APIKITA SERVER BENCHMARK & CAPACITY SUITE        ");
-    println!("           Target Environment: 0.2 vCPU / 256MB RAM         ");
+    println!("      Runtime Model: 1 SINGLE OS THREAD (current_thread)    ");
+    println!("      Simulating 0.2 vCPU / Single-Core Container Reality   ");
     println!("============================================================");
     println!();
 
@@ -29,8 +30,9 @@ async fn main() {
     // 3. 100-Key Pool Routing with 10% 429 Infiltration & Concurrency
     bench_100_key_pool_routing().await;
 
-    // 4. Concurrent SSE Streaming Memory & Throughput Simulation (500 Streams)
+    // 4. Concurrent SSE Streaming Memory & Throughput Simulation (500 & 1,000 Streams)
     bench_concurrent_streaming_streams(500).await;
+    bench_concurrent_streaming_streams(1_000).await;
 
     println!();
     println!("============================================================");
