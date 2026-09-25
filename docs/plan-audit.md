@@ -64,7 +64,7 @@ and CI. **No quotes have been obtained.** At $300 actual, break-even roughly dou
 | Component | Why it exists |
 | --- | --- |
 | Rust API + proxy | The product |
-| PostgreSQL | Money |
+| SQLite (embedded) | Money |
 | PocketBase | Identity |
 | VPS relay | Flood absorption, cost |
 | Cloudflare Pages | Frontend |

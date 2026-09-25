@@ -90,13 +90,22 @@ even the `settlement` scenario is rejected with `401 invalid signature`.
 ## Status: NOT verified end-to-end
 
 ```
-WARNING: Live end-to-end verification is NOT currently possible.
-The Docker daemon is down and no PostgreSQL instance is running, so the
-apikita server cannot be started and these webhook scenarios have NOT been
-verified against a running server. The signature formula and expected JSON
-fields are reproduced verbatim from server/src/money.rs and
-server/src/routes/webhooks.rs; the documented expected responses are inferred
-from that source and remain unverified until the stack can be brought up.
+WARNING: These webhook scenarios have NOT been verified against a running server.
+The signature formula and expected JSON fields are reproduced verbatim from
+server/src/money.rs and server/src/routes/webhooks.rs; the documented expected
+responses are inferred from that source and remain unverified until the stack
+can be brought up.
+```
+
+**The blocker this used to cite is gone.** It read "the Docker daemon is down and
+no PostgreSQL instance is running" — and the database is now a SQLite file, so
+neither Docker nor a database server is required to start the API. What remains is
+that nobody has run it:
+
+```sh
+DATABASE_URL=sqlite://data/server.db cargo run --bin migrate
+DATABASE_URL=sqlite://data/server.db cargo run --bin api
+node tools/fake-midtrans/send-webhook.mjs settlement
 ```
 
 ## Implementation notes

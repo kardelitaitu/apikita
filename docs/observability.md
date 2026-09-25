@@ -4,8 +4,8 @@ What to log, measure, and alert on. For a system holding customer money, the
 purpose is not dashboards — it is **noticing a billing or balance problem before a
 customer does**.
 
-> Stack: Cloudflare -> edge relay (nginx) -> Rust on Northflank, PostgreSQL,
-> PocketBase. See [`docs/architecture.md`](architecture.md) and
+> Stack: Cloudflare -> edge relay (nginx) -> Rust on Northflank with embedded
+> SQLite, plus PocketBase. See [`docs/architecture.md`](architecture.md) and
 > [`docs/edge-relay.md`](edge-relay.md).
 
 ## The principle

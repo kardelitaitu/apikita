@@ -28,7 +28,8 @@ recoverable.
 
 ## Gate 1 — Infrastructure
 
-- [ ] Postgres provisioned with a persistent volume.
+- [ ] A persistent volume provisioned for the SQLite database file (no database
+      instance to provision), and a backup of it tested by restore.
 - [ ] PocketBase deployed and reachable.
 - [ ] Edge relay deployed; nginx configured with `proxy_buffering off` on `/events`.
 - [ ] Automatic certificate renewal on the relay **and** on the backend.
