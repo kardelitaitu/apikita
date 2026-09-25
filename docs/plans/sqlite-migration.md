@@ -4,6 +4,10 @@
 **Supersedes:** the untitled "Remove PocketBase and Migrate to Embedded SQLite + Custom Admin UI" draft
 **Amends:** [`decisions.md`](../decisions.md) — see [§3](#3-decisions-this-forces-the-register-to-change)
 
+**Settled in this revision:** identity strategy is **Google + email/password**
+([§6](#6-phase-2--identity-the-real-cost)); low-code admin tooling assessed for the
+read-only surface only ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)).
+
 ---
 
 ## 1. Verdict
@@ -33,6 +37,11 @@ is not.
 decision is *"PITR plus offsite; restore drill required"* with *"RPO 15 minutes"*.
 That guarantee is **not free to replace** — see [§8](#8-operations-backup-rpo-and-the-volume). Litestream
 restores it at the cost of one more process in a 256 MB container.
+
+**Where the real cost is:** not the database. The database port is mechanical and
+compiler-verified. The cost is **identity**, because PocketBase is currently doing the
+hard half of authentication for free — see [§6](#6-phase-2--identity-the-real-cost). The
+plan therefore splits the work so the cheap, self-contained half ships first.
 
 ---
 
@@ -159,7 +168,10 @@ register is edited **first**, in Phase 0, and the docs follow.
 | Money store | PostgreSQL | **SQLite (embedded, WAL)** |
 | Identity store | PocketBase | **Rust-owned (`accounts` + `identities`)** |
 | Account key | *"Postgres owns the id; PocketBase id is a linked column"* | **`accounts.id` is the only key; `pb_user_id` dropped** |
-| Password hashing | *"Argon2id — PocketBase owns this if it stays the auth provider — verify which applies"* | **Rust owns Argon2id** (or is dropped entirely — see [§6](#6-phase-2--identity-the-real-cost)) |
+| Login methods | *"Google + email/password, with reset"* | **unchanged as a product decision — but Rust now owns all of it.** Settled 2026-09-25 ([§6](#6-phase-2--identity-the-real-cost)) |
+| Password hashing | *"Argon2id — PocketBase owns this if it stays the auth provider — **verify which applies**"* | **Rust owns Argon2id.** The qualifier is now resolved: PocketBase is going, so it is ours. |
+| Transaction mode | — | **`BEGIN IMMEDIATE` for read-then-write transactions** ([§4.2](#42-connection-setup--three-traps)) |
+| Instance count | — | **exactly one.** SQLite cannot be shared across replicas |
 | Migrations | `sqlx migrate`, forward-only | **unchanged**, but now actually implemented |
 | Backup tooling | Managed PITR, else `pg_dump` + `wal-g` | **Litestream → Cloudflare R2** (or `VACUUM INTO` + offsite) |
 | RPO 15 min / RTO 4 h | — | **unchanged target**; the mechanism changes, the target does not |
@@ -302,6 +314,54 @@ If `rows_affected() == 0`, one disambiguating `SELECT` decides between
 `TopupCreditResult` already models. This removes the lock instead of emulating it,
 and keeps the existing tests meaningful.
 
+### 4.5 Suspension and soft delete — already the design, with one correction
+
+The draft proposes `is_active INTEGER DEFAULT 1` and `is_deleted INTEGER DEFAULT 0`
+on the user table. **Do not add them.** The schema already models both, more
+precisely, and a second flag would be a second source of truth for "is this account
+usable" — the drift the register exists to prevent.
+
+| Need | Already exists | Note |
+| --- | --- | --- |
+| Account state | `accounts.status IN ('active','suspended','closed')` | Three states, not two. `closed` **is** the soft delete. |
+| Key revocation | `api_keys.revoked_at` | A timestamp, not a boolean — it preserves *when*, which an audit needs. The indexes are already partial on `revoked_at IS NULL`. |
+| Operator flag | `accounts.is_operator` | Unrelated to active/deleted; do not conflate the two. |
+| Never hard-delete | `admin-surface.md:151` — *"No hard deletes, ever"*; `identity.md` invariant 4 | Closure is a status, not a delete. |
+
+The FK behaviour the draft worries about is already deliberate and correct:
+`wallets`, `ledger` and `topups` reference `accounts` with **`ON DELETE RESTRICT`**,
+so a hard delete is refused by the database rather than orphaning money. `api_keys`,
+`sessions`, `usage_daily`, `link_codes` and `telegram_links` use `ON DELETE CASCADE`.
+Under SQLite the `RESTRICT` half only holds if `foreign_keys(true)` is set —
+[§4.2](#42-connection-setup--three-traps), trap 1.
+
+**The correction that matters: a status flag alone does not stop `/v1/*` traffic.**
+The proxy's key lookup is
+
+```sql
+SELECT id, account_id, models, spend_limit_idr, token_limit, rate_limit_rpm,
+       expires_at, revoked_at
+FROM api_keys
+WHERE key_hash = ?
+```
+
+— `server/src/routes/proxy.rs:517-523`. It does **not** join `accounts`, so the hot
+path never reads `accounts.status`. That is precisely why `admin-surface.md:126`
+insists *"Suspension must revoke sessions and keys"*: suspension works by setting
+`api_keys.revoked_at` and revoking the `sessions` rows, atomically. Adding
+`is_active` would change nothing on its own, and adding an `accounts` join to the hot
+path would buy a read per request to achieve what revocation already achieves.
+
+**Two residual windows, both already documented, and this plan narrows one:**
+
+- `keys.rs:410` calls `invalidate_key_cache` on revoke, so revocation is immediate
+  **in-process**. `proxy.rs:567-572` records the residual staleness for a *second*
+  instance. Pinning to **exactly one instance** ([§3](#3-decisions-this-forces-the-register-to-change))
+  removes that window entirely — a genuine side benefit of the SQLite constraint.
+- `decisions.md` fixes the cache TTL at 60 s, so an *un-invalidated* change (a
+  narrowed model allowlist) is honest about its window. Revocation is not in that
+  class.
+
 ---
 
 ## 5. Phases
@@ -369,9 +429,10 @@ the two new regression tests [§4.2](#42-connection-setup--three-traps) demands
 
 ### 5.6 Phase 6 — Identity
 
-[§6](#6-phase-2--identity-the-real-cost). Sequenced last among the code phases
-because it is the largest and because it is the only part that needs a **product
-decision** the code cannot make.
+[§6](#6-phase-2--identity-the-real-cost). Sequenced after the database port because it
+is the largest phase and the only one that depends on decisions outside the codebase
+(open decisions 1 and 2). The strategy itself is settled — Google + email/password —
+so this phase is unblocked and can run in parallel with Phase 8 if there is capacity.
 
 ### 5.7 Phase 7 — Admin surface
 
@@ -405,24 +466,47 @@ email verification, password reset, Google OAuth2, OTP, and MFA — plus the fou
 pre-hijacking defences documented in `identity.md:77-127`. Removing it means either
 re-implementing that in Rust, or changing the product.
 
-### The fork — a decision is required before this phase can be sized
+### Decision — settled 2026-09-25
 
-| Option | Rust must own | Cost | Notes |
+**Google + email/password, with reset.** The register's existing *product* decision is
+kept; the *ownership* of it moves from PocketBase to Rust.
+
+Options considered, recorded because this will otherwise be re-litigated:
+
+| Option | Rust must own | Cost | Outcome |
 | --- | --- | --- | --- |
-| **A. Google OAuth2 only** | OAuth2 code flow, ID-token verification, session | **Smallest** | Deletes the entire password surface: no Argon2id, no reset, no verification emails, and the four pre-hijacking cases in `identity.md` mostly evaporate — they are all password-related. |
-| **B. Email + password only** | Argon2id, verification, reset, rate limits | Medium | Keeps the register's Argon2id decision. Must re-derive the pre-hijacking matrix by hand. |
-| **C. Both (register's current value)** | All of the above | **Largest** | The register says *"Google + email/password, with reset"*. Honest estimate: this is weeks, not days, and it is where new security bugs will live. |
-| **D. A different hosted IdP** | Almost nothing | Small | But re-introduces a network hop on login, which is the latency the user is removing. Rejected unless login latency is judged irrelevant. |
+| A. Google OAuth2 only | OAuth2 code flow, ID-token verification, session | Smallest | Not chosen — drops password login, a settled product decision. |
+| B. Email + password only | Argon2id, verification, reset, rate limits | Medium | Not chosen — drops Google, also settled. |
+| **C. Both** | **All of the above** | **Largest** | **Chosen.** |
+| D. A different hosted IdP | Almost nothing | Small | Not chosen — re-introduces the login network hop this migration exists to remove. |
 
-**Recommendation: A, with B as a later addition.** It is the smallest correct
-surface, it removes the classes of bug that are hardest to get right, and it keeps the
-register's *"Only those guaranteeing verified email"* decision satisfied by
-construction. It does change a settled product decision, so it needs the register
-edit in Phase 0 — which is the correct place for it.
+**C is the largest option, and the plan should say so plainly: this phase is bigger
+than the database port.** It is where new security bugs will live, because every
+defence `identity.md:77-127` currently inherits from PocketBase becomes ours to get
+right.
 
-Whatever is chosen, `accounts` needs an `identities` table (one account, many
-identities — `identity.md` invariant 1) holding `provider`, `subject`, and
-`email`, with `UNIQUE (provider, subject)`. `accounts.pb_user_id` is dropped.
+### What C entails
+
+| Work | Note |
+| --- | --- |
+| Argon2id hashing | The register already decides this. Tune cost parameters; never a bare SHA. |
+| Email verification + reset | Needs **outbound email** — a new dependency, a new deliverability surface, and a new failure mode. The register does not currently account for an email provider. |
+| Google OAuth2 code flow + ID-token verification | Verify `email_verified` explicitly, per `identity.md:100`. |
+| Rate limiting on auth endpoints | Login, reset, verification. `abuse.rs` covers key creation and top-ups; auth is a new surface. |
+| The four pre-hijacking defences | `identity.md:77-127` documents them as *PocketBase* behaviour. Each must be re-derived in Rust and re-tested. The rule at `identity.md:118` (*"`verified` may only be set by PocketBase's own flows"*) becomes **"only by our own flows"** — and is better enforced as a schema constraint than as a hook. |
+
+**Two register additions this forces:**
+
+1. **An email provider** — outbound transactional email is now a hard dependency.
+2. **OTP and MFA are no longer provided.** PocketBase supplied both
+   (`identity.md:37-38` counted them). If they are still wanted they are new work; if
+   not, the document must stop claiming them.
+
+### Schema
+
+`accounts` gains an `identities` table (one account, many identities —
+`identity.md` invariant 1) holding `provider`, `subject`, `email`, `email_verified`,
+with `UNIQUE (provider, subject)`. `accounts.pb_user_id` is dropped.
 
 `auth.rs` loses the entire `verify_pb_token` / `parse_pb_user_id` /
 `normalize_pb_user_id` block and its three tests; `POST /auth/exchange` is replaced by
@@ -460,6 +544,74 @@ from all customer-facing responses (`admin-surface.md:56`).
 revoke, and add money actions *"once there is revenue to misfile"*. The plan follows
 that: build the read + state endpoints now, gate `/adjust` and `/refund` behind a
 config flag.
+
+### 7.1 UI: hand-built `/admin` page vs a low-code tool
+
+This choice is **only about the UI**. Every endpoint above must exist either way — a
+low-code tool is an HTTP client, and it cannot supply the `/adjust` semantics, the
+ledger row, or the `admin_audit` row. So adopting one does **not** shrink the endpoint
+work, which is the larger half of Phase 7.
+
+`admin-surface.md:62` already frames it correctly: *"A separate admin app is a later
+decision. The endpoints are the same either way; a dedicated UI is a convenience, not
+an architecture."*
+
+**Assessment: adopt one for the launch-phase read-only surface; do not make it the
+home for money actions.**
+
+| | Hand-built `/admin` page | Low-code (Retool / ToolJet / Appsmith) |
+| --- | --- | --- |
+| Time to a working table | Hours | **Minutes** |
+| Fits launch scope (read-only + suspend/restore/key revoke) | Yes | **Yes — this is the sweet spot** |
+| Money actions with note, audit and the 500k threshold | Natural | Awkward — needs purpose-built forms, not editable cells |
+| Credential custody | Session cookie, same origin | **A third party holds a credential that can move money** |
+| Customer data transits | Our infrastructure only | **A third party's infrastructure** |
+| Self-hosted on the 256 MB tier | n/a | **Not viable** — ToolJet/Appsmith need ~1–2 GB |
+
+**Three things to settle before pointing it at the admin API.**
+
+**1. The credential.** The draft's `X-Admin-Key` is the shared secret the register
+rejects ([§2.3](#23-a-static-admin_secret_key-bearer--rejected)). But a low-code tool
+cannot hold a browser session cookie, so it genuinely does need a machine credential.
+The way to get one without inventing a special-case header:
+
+> Create a real operator account (`is_operator = true`), issue it a **long-lived API
+> key through the normal key flow**, and give that key the admin scope. It is then an
+> ordinary credential in the existing model: revocable, visible in `api_keys`,
+> attributable in `admin_audit`, and it expires like any other.
+
+That keeps *"same API, same ledger, no back door"* intact. It is still a powerful
+credential, and it still belongs in the tool's secret store — not a header field on a
+shared dashboard, and never `sessionStorage`.
+
+**2. Credential and data custody.** Retool/ToolJet/Appsmith cloud call the API from
+**their** servers, so there is no CORS problem — but the credential then lives on their
+infrastructure and every customer row transits it. That is a data-processor
+relationship which the ToS and [`data-retention.md`](../data-retention.md) do not
+currently mention. `admin-surface.md:194` already carries an open item about
+restricting operator IP ranges, and cloud free tiers do not offer a stable egress IP.
+Decide this deliberately rather than discovering it at launch.
+
+**3. Editable tables are structurally wrong for this API.** A low-code editable table
+pointed at an accounts resource will happily emit a direct balance write — which is
+the **first** anti-pattern `admin-surface.md:17` names (*"`UPDATE wallets SET
+balance_idr = …` by hand"*). The convenience feature is the hazard. Configure the tool
+**read-only by default** and wire writes to explicit buttons calling the purpose-built
+endpoints.
+
+**Configuration rules, if adopted**
+
+| Rule | Why |
+| --- | --- |
+| Read-only tables; no inline editing | Prevents the direct balance edit by construction |
+| Writes are explicit buttons → `/adjust`, `/suspend`, `/restore`, `/keys/:id/revoke` | Each maps to an audited endpoint |
+| No `DELETE` mapped to anything | *"No hard deletes, ever."* Closure is `status='closed'` |
+| The credential is an operator key held in the tool's secret store | Not a header, not `sessionStorage` |
+| Money actions stay out until there is revenue | `admin-surface.md:181-189` rollout |
+
+**Net:** a low-code tool is a real saving on the read-only surface and a real hazard on
+the money surface. Use it for the former; keep the latter behind audited endpoints and
+a purpose-built form. This is open decision 4 in [§11](#11-open-decisions).
 
 ---
 
@@ -552,26 +704,39 @@ Those are the parts that matter, and none of them depend on Postgres.
 
 | # | Decision | Blocks |
 | --- | --- | --- |
-| 1 | **Identity strategy** — A/B/C/D in [§6](#6-phase-2--identity-the-real-cost) | Phase 6 entirely; the largest single cost. |
-| 2 | **Backup mechanism** — Litestream vs `VACUUM INTO` cron | Phase 8, Launch Gate 1 |
-| 3 | **`usage_events` retention window** | `data-retention.md`, the sweep job |
-| 4 | Whether admin money actions ship now or behind a flag | Phase 7 scope |
-| 5 | Whether the 30-day rolling spend window stays a query over `usage_daily` or moves to `usage_events` | Phase 4 (`routes/keys.rs`) |
+| 1 | **Email provider** for verification and reset — a new hard dependency | Phase 6 |
+| 2 | Whether OTP and MFA are still wanted now that PocketBase no longer supplies them | Phase 6 |
+| 3 | **Backup mechanism** — Litestream vs `VACUUM INTO` cron | Phase 8, Launch Gate 1 |
+| 4 | **Low-code admin tool** — adopt for the read-only surface, or hand-build ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)) | Phase 7 scope |
+| 5 | **`usage_events` retention window** | `data-retention.md`, the sweep job |
+| 6 | Whether admin money actions ship now or behind a flag | Phase 7 scope |
+| 7 | Whether the 30-day rolling spend window stays a query over `usage_daily` or moves to `usage_events` | Phase 4 (`routes/keys.rs`) |
+| 8 | Whether a low-code tool's access to customer data needs a ToS / privacy-notice amendment | Launch Gate 0 |
+
+**Settled this round:** identity strategy — **C, Google + email/password, with reset**
+(2026-09-25). See [§6](#6-phase-2--identity-the-real-cost).
 
 ---
 
 ## 12. Suggested execution order
 
 1. Phase 0 — register ([§3](#3-decisions-this-forces-the-register-to-change)). *Blocks everything.*
-2. Resolve open decision 1 (identity). *Blocks Phase 6.*
-3. Phases 1–5 — database port and tests. **Self-contained and independently
+2. Phases 1–5 — database port and tests. **Self-contained and independently
    shippable**: after Phase 5 the system runs on SQLite with PocketBase still
    present for identity, which is a legitimate intermediate state and de-risks the
-   whole plan.
-4. Phase 6 — identity.
-5. Phase 7 — admin surface.
-6. Phase 8 — tooling and the docs sweep.
+   whole plan. **Nothing here depends on the identity decision, so it can start
+   immediately** — which is why it is sequenced ahead of the larger phase.
+3. Phase 6 — identity (Google + email/password). The largest phase. Unblocked, but
+   open decisions 1 and 2 need answers first.
+4. Phase 7 — admin surface endpoints, then the UI choice ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)).
+5. Phase 8 — tooling and the docs sweep.
 
-Splitting at step 3 is the main structural improvement over the draft: it turns one
-large risky change into two smaller ones, and the first half is verifiable by
-existing tests.
+Splitting at step 2 is the main structural improvement over the draft: it turns one
+large risky change into two smaller ones, and the first half is verifiable by the
+tests that already exist.
+
+**A note on what to do first if only one thing is done:** Phase 0. Every document in
+the repository reads from the register, and the register currently says the stack is
+Postgres and PocketBase. Leaving it stale while the code moves is exactly the failure
+mode its own *"How to change a decision"* section warns about — *"a stale decision is
+worse than none, because it is followed."*
