@@ -21,7 +21,7 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 | Live | `GET /events` (SSE) | cookie |
 | Proxy | `POST /v1/chat/completions` | **API key** |
 | **Bot** | `POST /api/bot/link`, `GET /api/bot/account`, `GET /api/bot/reviews/mine`, `POST /api/bot/notify-topup` | **bot token** |
-| **Admin** | `POST /api/admin/*` (see below) | **cookie + operator flag** |
+| **Admin** | `GET /api/admin/accounts/:id`; `POST /api/admin/accounts/:id/suspend`; `POST /api/admin/accounts/:id/resume` (**alias `/restore`**) | **cookie + operator flag** |
 | Ops | `GET /health` | none |
 
 **Two authentication schemes, deliberately separate:**
@@ -421,13 +421,72 @@ back door.** Full design and the safety rules: [`admin-surface.md`](../admin-sur
 Authorization is the `accounts.is_operator` flag, plus a normal session cookie.
 **Not a separate admin credential.**
 
+### Implemented routes
+
+These four exist in `server/src/routes/mod.rs` and are the whole admin surface
+today. There is **no admin UI** — routes only.
+
+| Endpoint | Handler | Effect |
+| --- | --- | --- |
+| `GET /api/admin/accounts/:id` | `admin::get_account` | Read-only: `status`, `is_operator`, `created_at`, `balance_idr`, live session count, live key count. Never a credential hash |
+| `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'`; **revokes sessions and keys atomically**; one `admin_audit` row in the same transaction |
+| `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; audits it; does not restore keys |
+| `POST /api/admin/accounts/:id/restore` | `admin::resume_account` | **Alias of `/resume`** — same handler, same `action='resume'` audit row |
+
+**`/resume` and `/restore` are two spellings of one action.** Both are mounted;
+neither is deprecated. Pick either.
+
+**Response shape.** The read-only route returns
+`{account_id, status, is_operator, created_at, balance_idr, live_sessions, live_keys}`.
+Suspend/resume return
+`{account_id, status, sessions_revoked, keys_revoked}`; resume reports both counts
+as `0` explicitly, so the caller can see that nothing was handed back.
+
+### Enforcement order
+
+Identical in every handler, and **steps 1–3 run before the target is read**:
+
+1. Resolve the actor from the **session cookie** via `resolve_account_from_cookie`.
+2. Require `accounts.is_operator = true`.
+3. Refuse self-action.
+4. Only then read the target.
+
+| Case | Status | Code |
+| --- | --- | --- |
+| Missing, unknown, revoked or expired cookie | 401 | `unauthenticated` |
+| Authenticated, `is_operator = false` | 403 | `forbidden` |
+| Operator acting on their own account (including the read-only lookup) | 403 | `forbidden` |
+| Operator, target id absent | 404 | `not_found` |
+| Operator, target in the wrong state | 409 | `conflict` |
+
+Because steps 1–3 precede the target lookup, **a non-operator gets the same 403
+for an existing and an absent id** — the response cannot enumerate account ids.
+An operator gets an honest 404 for an absent target.
+
+**403 is authorization, not authentication** — the caller is authenticated, we
+know who they are, and they may not do this ([error-model.md](../error-model.md),
+the 401-vs-403 table). **`forbidden` is a new stable code**, added under
+error-model rule 4 ("code values are permanent; adding is fine"). It is not
+`model_not_allowed` (a model allowlist) and not `wrong_credential_type` (reserved,
+never emitted).
+
+**Resume does not resurrect credentials** — deliberate, not an oversight. The
+credentials were revoked because the account was abusive or compromised; restoring
+the *status* says nothing about credentials already in the wild. The customer
+re-authenticates and reissues a key.
+
+**Known limitation:** `proxy::invalidate_key_cache` is **process-local**. An
+instance behind the load balancer keeps honouring a revoked key for up to
+`limits.key_metadata_cache_seconds` (60s default). That residual window is the
+documented cost of the key-metadata cache and is **not closed by these routes**.
+
+### Planned, not built
+
 | Endpoint | Effect |
 | --- | --- |
-| `POST /api/admin/accounts/:id/suspend` | `status='suspended'`; **revokes sessions and keys atomically** |
-| `POST /api/admin/accounts/:id/restore` | `status='active'`; does not restore keys |
 | `POST /api/admin/accounts/:id/adjust` | Money: ledger row, `reason='adjustment'` |
 | `POST /api/admin/topups/:id/refund` | Money: `status='refunded'` + ledger debit |
-| `POST /api/admin/keys/:id/revoke` | `revoked_at` |
+| `POST /api/admin/keys/:id/revoke` | `revoked_at` (the customer route `POST /api/keys/:id/revoke` exists today) |
 | `POST /api/admin/accounts/:id/logout-all` | Revoke all sessions |
 | `DELETE /api/admin/link-codes/:id` | Invalidate a pending code |
 | `POST /api/admin/reviews/:id/hide` | Hidden flag — **never deletes** |
@@ -444,8 +503,9 @@ Authorization is the `accounts.is_operator` flag, plus a normal session cookie.
    from theft during an audit.
 6. **Nothing here can read prompts or plaintext keys** — neither is stored.
 
-Rollout: **read-only, suspend/restore, and key revoke at launch.** Money actions
-arrive with the first revenue, not on day one.
+Rollout: **read-only and suspend/restore are built; the admin key-revoke route is
+still planned.** Money actions arrive with the first revenue, not on day one.
+There is no admin UI.
 
 ## Cross-cutting rules
 
@@ -459,6 +519,8 @@ arrive with the first revenue, not on day one.
 | Money is `BIGINT` IDR end to end | No floats, ever |
 | Log every wallet mutation with actor and reason | The `ledger` table is that record |
 | Admin endpoints require the operator flag | Not a separate credential, and never a shared secret |
+| Admin endpoints return 403 `forbidden`, not 401, for a non-operator | The caller is authenticated; this is authorization, not authentication |
+| Admin revocation is process-local | `invalidate_key_cache` cannot reach other instances; the cache TTL is the residual window |
 
 ## Open items
 
