@@ -613,4 +613,698 @@ mod tests {
             );
         }
     }
+
+    // =====================================================================
+    // LIVE: the Midtrans webhook HANDLER
+    //
+    // Everything above this line is pure. The handler itself - the only thing
+    // in this process that turns an HTTP body into money - had never been
+    // executed by the suite. These tests drive it end to end against a live
+    // Postgres and assert the DOCUMENTED contract
+    // (docs/server/api-spec.md:266-294, docs/website/04-payments.md:31-64),
+    // then re-assert the one safety net this project has
+    // (docs/observability.md:112-139) after EVERY branch:
+    //     wallets.balance_idr = SUM(ledger.delta_idr)
+    //
+    // Run with:
+    //   DATABASE_URL=postgres://postgres:dev@localhost:5432/apikita \
+    //     cargo test --lib -- --ignored
+    //
+    // ENVIRONMENT SERIALISATION, chosen deliberately. The handler reads
+    // MIDTRANS_SERVER_KEY through `env::var`, and that variable is
+    // PROCESS-WIDE: a value one test sets is visible to every other test
+    // thread in this binary. BOTH halves are used together:
+    //
+    //   (a) SERVER_KEY_LOCK - a process-wide mutex that every live test here
+    //       holds for its whole body, so these tests cannot race EACH OTHER; and
+    //   (b) ServerKeyGuard - RAII that restores the PREVIOUS value on drop, on
+    //       the success path and the panic path alike, so no test leaks a key
+    //       into a later test or a later `cargo test` in the same process.
+    //
+    // (b) is the half that matters: a leaked key is worse than no test.
+    //
+    // Residual, documented risk: account.rs's live create_topup test sets the
+    // same variable to an invalid key and never restores it. That writer is
+    // outside this fence and takes no lock, so it is the one remaining source
+    // of interference; `assert_test_key_installed` fails LOUDLY and names it
+    // rather than letting a clobbered key surface as a mysterious 401.
+    // =====================================================================
+
+    use crate::config::AppConfig;
+    use crate::money::compute_midtrans_signature;
+    use crate::routes::events::RealtimeHub;
+    use axum::body::to_bytes;
+    use sqlx::PgPool;
+    use std::ffi::OsString;
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::Duration;
+
+    /// The key every live test here installs. Deliberately NOT the
+    /// fake-midtrans default, so a test that passes without installing it is
+    /// impossible to mistake for one that did.
+    const LIVE_TEST_SERVER_KEY: &str = "SB-Mid-server-WEBHOOK-LIVE-TEST";
+
+    /// Held for the whole body of every live test here - see the module note.
+    static SERVER_KEY_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Installs the test server key and puts the PREVIOUS value back on drop,
+    /// including when an assertion panics - which is exactly when a leaked key
+    /// would otherwise poison every later test in the process.
+    struct ServerKeyGuard {
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ServerKeyGuard {
+        fn install() -> Self {
+            let lock = SERVER_KEY_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let previous = std::env::var_os("MIDTRANS_SERVER_KEY");
+            std::env::set_var("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ServerKeyGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("MIDTRANS_SERVER_KEY", previous),
+                // Absent before this test: absent again afterwards, so the next
+                // test's precondition is the one this test started from.
+                None => std::env::remove_var("MIDTRANS_SERVER_KEY"),
+            }
+        }
+    }
+
+    async fn live_pool() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+        crate::db::init_pool(&database_url)
+            .await
+            .expect("connect to Postgres")
+    }
+
+    /// The AppState the router would hand the handler, built from the same
+    /// config file the server loads.
+    fn live_app_state(pool: PgPool) -> AppState {
+        let config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load for the live tests");
+        let trusted = crate::ip_tracking::parse_cidrs(&config.network.trusted_proxy_cidrs)
+            .expect("the config validates its own trusted proxy rules");
+
+        AppState {
+            pool,
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .expect("build a test HTTP client"),
+            events: Arc::new(RealtimeHub::new(&config.realtime)),
+            config: Arc::new(config),
+            ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
+            trusted_proxies: Arc::from(trusted.into_boxed_slice()),
+        }
+    }
+
+    /// Installs the server key, builds the fixture, runs the assertions in
+    /// their own task, then tears the fixture down in FK order whether they
+    /// passed or panicked - and only then restores the environment.
+    ///
+    /// The assertions are spawned so a panicking one arrives as a JoinError
+    /// instead of unwinding through the teardown. That is what makes the
+    /// cleanup unconditional, and it is why the key guard is held HERE rather
+    /// than inside the task (a MutexGuard is not Send).
+    async fn run_live<F, Fut>(assertions: F)
+    where
+        F: FnOnce(PgPool, Uuid, AppState) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let pool = live_pool().await;
+        let key_guard = ServerKeyGuard::install();
+
+        let account_id = fixture_account(&pool).await;
+        let state = live_app_state(pool.clone());
+
+        let outcome = tokio::spawn(assertions(pool.clone(), account_id, state)).await;
+
+        delete_fixture_rows(&pool, &[account_id]).await;
+
+        outcome.expect("the live webhook assertions panicked");
+        drop(key_guard);
+    }
+
+    /// An account with the zero-balance wallet the login path creates. A wallet
+    /// with no ledger rows is consistent on its own (0 = SUM of nothing), so
+    /// this starting point reconciles.
+    async fn fixture_account(pool: &PgPool) -> Uuid {
+        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
+        let account_id: Uuid =
+            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+                .bind(&pb_user_id)
+                .fetch_one(pool)
+                .await
+                .expect("create account");
+
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
+            .bind(account_id)
+            .execute(pool)
+            .await
+            .expect("create the zero-balance wallet the login path would create");
+
+        account_id
+    }
+
+    /// A `pending` topup, written the way routes/account.rs::create_topup writes
+    /// it (minus the Snap token, which needs a live Midtrans). Returns its
+    /// `order_id`, the key Midtrans notifies on.
+    async fn pending_topup(pool: &PgPool, account_id: Uuid, amount_idr: i64) -> String {
+        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
+            .bind(account_id)
+            .bind(amount_idr)
+            .bind(&order_id)
+            .execute(pool)
+            .await
+            .expect("create topup");
+        order_id
+    }
+
+    /// Deletes every row a fixture created, in FK order (ledger, topups and
+    /// wallets are ON DELETE RESTRICT, so the order is load-bearing).
+    async fn delete_fixture_rows(pool: &PgPool, account_ids: &[Uuid]) {
+        for account_id in account_ids {
+            for statement in [
+                "DELETE FROM usage_daily WHERE account_id = $1",
+                "DELETE FROM ledger WHERE account_id = $1",
+                "DELETE FROM api_keys WHERE account_id = $1",
+                "DELETE FROM topups WHERE account_id = $1",
+                "DELETE FROM sessions WHERE account_id = $1",
+                "DELETE FROM wallets WHERE account_id = $1",
+                "DELETE FROM accounts WHERE id = $1",
+            ] {
+                sqlx::query(statement)
+                    .bind(account_id)
+                    .execute(pool)
+                    .await
+                    .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
+            }
+        }
+    }
+
+    /// A Midtrans notification whose signature is computed by the REAL
+    /// `money::compute_midtrans_signature`, so this fixture cannot drift from
+    /// the implementation. `gross_amount` is passed as the exact signed STRING
+    /// (e.g. "50000.00"), never a number: the hash covers the string form, and
+    /// "50000" hashes differently from "50000.00".
+    fn notification(
+        order_id: &str,
+        status_code: &str,
+        gross_amount: &str,
+        transaction_status: &str,
+        signing_key: &str,
+    ) -> MidtransNotification {
+        MidtransNotification {
+            order_id: order_id.to_string(),
+            status_code: status_code.to_string(),
+            gross_amount: gross_amount.to_string(),
+            transaction_status: transaction_status.to_string(),
+            signature_key: compute_midtrans_signature(
+                order_id,
+                status_code,
+                gross_amount,
+                signing_key,
+            ),
+            fraud_status: None,
+        }
+    }
+
+    /// Drives the handler exactly the way the router does and reads its body.
+    ///
+    /// The key is RE-INSTALLED here, immediately before the call, and that is
+    /// deliberate rather than belt-and-braces. The handler reads
+    /// `MIDTRANS_SERVER_KEY` in its first statement - before any await - and the
+    /// variable is process-wide, so another test thread can clobber it between
+    /// this test's guard being installed and the handler reading it.
+    /// account.rs's live create_topup test does exactly that: it writes the
+    /// variable to an invalid key and never restores it. Measured here:
+    /// un-repaired, the full `--ignored` suite failed my refund test roughly
+    /// half the time with "invalid signature" on a signature this test had just
+    /// computed correctly. Repairing at the last possible instant removes that
+    /// interference WITHOUT weakening any assertion - no expectation is
+    /// relaxed, and no money assertion is skipped.
+    ///
+    /// The reverse direction is NOT repaired and does not need to be: that test
+    /// asserts Snap must FAIL, which it does for any fake key, so this key
+    /// cannot make it pass or fail spuriously. The RAII guard still owns
+    /// restoring the previous value afterwards.
+    async fn post(state: &AppState, payload: MidtransNotification) -> (StatusCode, serde_json::Value) {
+        std::env::set_var("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let res = handle_midtrans_webhook(State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("every response must have a readable body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("docs/error-model.md:10 - every response is JSON");
+        (status, body)
+    }
+
+    async fn balance_of(pool: &PgPool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(pool)
+            .await
+            .expect("read balance")
+    }
+
+    async fn topup_status_of(pool: &PgPool, order_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM topups WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(pool)
+            .await
+            .expect("read topup status")
+    }
+
+    async fn ledger_count(pool: &PgPool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(pool)
+            .await
+            .expect("count ledger rows")
+    }
+
+    /// Every ledger row for the account with that reason, oldest first, as
+    /// (delta_idr, ref).
+    async fn ledger_rows_of(
+        pool: &PgPool,
+        account_id: Uuid,
+        reason: &str,
+    ) -> Vec<(i64, Option<String>)> {
+        sqlx::query_as(
+            "SELECT delta_idr, ref FROM ledger WHERE account_id = $1 AND reason = $2 ORDER BY id",
+        )
+        .bind(account_id)
+        .bind(reason)
+        .fetch_all(pool)
+        .await
+        .expect("read ledger rows")
+    }
+
+    /// The reconciliation check from docs/observability.md: wallets.balance_idr
+    /// must equal SUM(ledger.delta_idr). Scoped to THIS fixture's account, so a
+    /// concurrent writer cannot fail it for a reason unrelated to the handler.
+    async fn drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT w.account_id
+                FROM wallets w
+                LEFT JOIN ledger l ON l.account_id = w.account_id
+                WHERE w.account_id = $1
+                GROUP BY w.account_id, w.balance_idr
+                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+            ) AS drift
+            "#,
+        )
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
+        .expect("reconciliation query")
+    }
+
+    /// THE INVARIANT, asserted after EVERY branch of every test below. A write
+    /// that lands on one side only - a credit with no ledger row, a debit with
+    /// no ledger row - cannot pass this, whatever the HTTP status said.
+    async fn assert_reconciled(pool: &PgPool, account_id: Uuid, context: &str) {
+        assert_eq!(
+            drift_rows(pool, account_id).await,
+            0,
+            "{context}: wallets.balance_idr must equal SUM(ledger.delta_idr)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. A BAD SIGNATURE is rejected and NOTHING changes.
+    // -----------------------------------------------------------------------
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_webhook_rejects_a_bad_signature_and_writes_nothing() {
+        run_live(bad_signature_assertions).await;
+    }
+
+    async fn bad_signature_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+        const AMOUNT: i64 = 50_000;
+        let order_id = pending_topup(&pool, account_id, AMOUNT).await;
+
+        // Internally consistent, but signed with SOMEBODY ELSE'S key: exactly
+        // the shape a forger without the secret produces.
+        let forged = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            "SB-Mid-server-SOMEONE-ELSE",
+        );
+
+        let (status, body) = post(&state, forged).await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "docs/server/api-spec.md:274 - a signature mismatch is 401. body: {body}"
+        );
+        assert_eq!(body["error"], json!("invalid signature"), "{body}");
+
+        // The assertions that matter, against DIRECT SELECTs rather than the
+        // HTTP status: a handler that answered 401 and credited anyway would
+        // pass a status-only test.
+        assert_eq!(
+            balance_of(&pool, account_id).await,
+            0,
+            "a rejected webhook must not credit the wallet"
+        );
+        assert_eq!(
+            topup_status_of(&pool, &order_id).await,
+            "pending",
+            "a rejected webhook must not settle the topup"
+        );
+        assert_eq!(
+            ledger_count(&pool, account_id).await,
+            0,
+            "a rejected webhook must append no ledger row"
+        );
+        assert_reconciled(&pool, account_id, "after a bad signature").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. A WRONG AMOUNT with a VALID signature is rejected, nothing changes.
+    // -----------------------------------------------------------------------
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_webhook_rejects_a_wrong_amount_with_a_valid_signature() {
+        run_live(wrong_amount_assertions).await;
+    }
+
+    async fn wrong_amount_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+        const STORED: i64 = 50_000;
+        let order_id = pending_topup(&pool, account_id, STORED).await;
+
+        // A genuine signature over an amount that is NOT the stored one. The
+        // amount must come from OUR row, never the payload
+        // (docs/server/api-spec.md:287).
+        let inflated = notification(
+            &order_id,
+            "200",
+            "60000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+
+        let (status, body) = post(&state, inflated).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "docs/server/api-spec.md:276 - an amount that disagrees with the stored row is              rejected. body: {body}"
+        );
+        assert_eq!(body["error"], json!("amount mismatch"), "{body}");
+
+        assert_eq!(
+            balance_of(&pool, account_id).await,
+            0,
+            "a mismatched amount must credit NOTHING - not the payload amount, not the stored one"
+        );
+        assert_eq!(
+            topup_status_of(&pool, &order_id).await,
+            "pending",
+            "a mismatched amount must leave the topup pending"
+        );
+        assert_eq!(ledger_count(&pool, account_id).await, 0);
+        assert_reconciled(&pool, account_id, "after a mismatched amount").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. SETTLEMENT credits EXACTLY ONCE; a REPLAY does not credit again.
+    // -----------------------------------------------------------------------
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_webhook_settlement_credits_exactly_once_and_a_replay_does_not() {
+        run_live(settlement_then_replay_assertions).await;
+    }
+
+    async fn settlement_then_replay_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+        const AMOUNT: i64 = 50_000;
+        let order_id = pending_topup(&pool, account_id, AMOUNT).await;
+
+        let settle = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+
+        let (status, body) = post(&state, settle.clone()).await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["status"],
+            json!("settled"),
+            "docs/server/api-spec.md:278-282 - the credit settles. body: {body}"
+        );
+
+        assert_eq!(
+            balance_of(&pool, account_id).await,
+            AMOUNT,
+            "the wallet must be up by EXACTLY the amount"
+        );
+        assert_eq!(topup_status_of(&pool, &order_id).await, "settled");
+
+        let rows = ledger_rows_of(&pool, account_id, "topup").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a settlement appends exactly ONE ledger row with reason='topup': {rows:?}"
+        );
+        assert_eq!(rows[0].0, AMOUNT, "and it is the full amount: {rows:?}");
+        assert_reconciled(&pool, account_id, "after a settlement").await;
+
+        // REPLAY: Midtrans retries. docs/website/04-payments.md:61 - return 200
+        // and do nothing. A double credit is real money.
+        let (status, body) = post(&state, settle).await;
+        assert_eq!(status, StatusCode::OK, "a replay is a 200, not an error: {body}");
+        assert_eq!(body["status"], json!("already_settled"), "{body}");
+
+        assert_eq!(
+            balance_of(&pool, account_id).await,
+            AMOUNT,
+            "a replayed webhook must NOT credit again"
+        );
+        assert_eq!(
+            ledger_count(&pool, account_id).await,
+            1,
+            "the ledger row COUNT must be unchanged by the replay"
+        );
+        assert_eq!(ledger_rows_of(&pool, account_id, "topup").await.len(), 1);
+        assert_eq!(topup_status_of(&pool, &order_id).await, "settled");
+        assert_reconciled(&pool, account_id, "after a replayed settlement").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. DENY / EXPIRE / CANCEL persist the SCHEMA vocabulary.
+    // -----------------------------------------------------------------------
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_webhook_terminal_statuses_persist_the_schema_vocabulary() {
+        run_live(terminal_status_assertions).await;
+    }
+
+    async fn terminal_status_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+        const AMOUNT: i64 = 50_000;
+
+        // Midtrans' word -> the word the topups_status_check constraint accepts
+        // (migration 20260925000000_initial_schema.sql:78). The defect this
+        // pins: Midtrans' vocabulary was bound straight through, the constraint
+        // rejected it, and the error was swallowed - 200 while the row stayed
+        // pending. So the ROW is asserted, not the response.
+        for (midtrans_status, expected) in [
+            ("deny", "denied"),
+            ("expire", "expired"),
+            ("cancel", "denied"),
+        ] {
+            let order_id = pending_topup(&pool, account_id, AMOUNT).await;
+            let payload = notification(
+                &order_id,
+                "200",
+                "50000.00",
+                midtrans_status,
+                LIVE_TEST_SERVER_KEY,
+            );
+
+            let (status, body) = post(&state, payload).await;
+
+            assert_eq!(status, StatusCode::OK, "{midtrans_status}: body: {body}");
+            assert_eq!(
+                topup_status_of(&pool, &order_id).await,
+                expected,
+                "{midtrans_status} must persist the SCHEMA word `{expected}`, not Midtrans'                  own. A silent no-op answers 200 too, so the row is the assertion. body: {body}"
+            );
+            assert_eq!(
+                balance_of(&pool, account_id).await,
+                0,
+                "{midtrans_status} must not move money"
+            );
+            assert_eq!(ledger_count(&pool, account_id).await, 0);
+            assert_reconciled(&pool, account_id, &format!("after {midtrans_status}")).await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. AN UNRECOGNISED status performs NO write and claims no credit.
+    // -----------------------------------------------------------------------
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_webhook_an_unrecognised_status_writes_nothing() {
+        run_live(unrecognised_status_assertions).await;
+    }
+
+    async fn unrecognised_status_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+        const AMOUNT: i64 = 50_000;
+        let order_id = pending_topup(&pool, account_id, AMOUNT).await;
+
+        // "foobar" is not a Midtrans status. The defect: an unknown value used
+        // to fall through to Pending, so the topup stayed pending forever while
+        // the handler answered 200 and logged nothing.
+        let payload = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "foobar",
+            LIVE_TEST_SERVER_KEY,
+        );
+
+        let (status, body) = post(&state, payload).await;
+
+        // The topup must be EXACTLY as it was - not merely "not settled".
+        assert_eq!(
+            topup_status_of(&pool, &order_id).await,
+            "pending",
+            "an unrecognised status performs NO write. body: {body}"
+        );
+        assert_eq!(balance_of(&pool, account_id).await, 0);
+        assert_eq!(ledger_count(&pool, account_id).await, 0);
+        assert_reconciled(&pool, account_id, "after an unrecognised status").await;
+
+        // ...and it must not report a money-moving outcome. The status code is
+        // 200 because docs/server/api-spec.md:293 requires a fast 2xx so
+        // Midtrans does not retry; the BODY is therefore the only signal, and
+        // it must not be any of the success words.
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "docs/server/api-spec.md:293 - respond 200 quickly so Midtrans does not retry: {body}"
+        );
+        for success in [
+            "settled",
+            "already_settled",
+            "refunded",
+            "already_refunded",
+            "terminal_recorded",
+            "pending",
+        ] {
+            assert_ne!(
+                body["status"],
+                json!(success),
+                "an unrecognised status must not report `{success}`: {body}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. REFUND debits once; a replayed refund does not debit twice.
+    // -----------------------------------------------------------------------
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_webhook_refund_debits_once_and_a_replay_does_not() {
+        run_live(refund_then_replay_assertions).await;
+    }
+
+    async fn refund_then_replay_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+        const AMOUNT: i64 = 50_000;
+
+        // Fund the wallet through the REAL path - a topups row, then
+        // credit_topup_transaction, which appends the matching +topup ledger
+        // row in the same transaction. Writing wallets.balance_idr directly
+        // would manufacture the very drift the reconciliation assertion below
+        // then reports.
+        let order_id = pending_topup(&pool, account_id, AMOUNT).await;
+        assert_eq!(
+            credit_topup_transaction(&pool, &order_id, AMOUNT)
+                .await
+                .expect("settle the fixture topup"),
+            TopupCreditResult::Settled {
+                new_balance: AMOUNT
+            },
+            "the fixture must fund the wallet through the real top-up path"
+        );
+        assert_reconciled(&pool, account_id, "after funding the fixture").await;
+
+        let refund = notification(&order_id, "200", "50000.00", "refund", LIVE_TEST_SERVER_KEY);
+
+        let (status, body) = post(&state, refund.clone()).await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["status"],
+            json!("refunded"),
+            "docs/server/api-spec.md:289-292 - refund is a DEBIT, even though the policy is              non-refundable. body: {body}"
+        );
+
+        assert_eq!(
+            balance_of(&pool, account_id).await,
+            0,
+            "the refund must debit the wallet by the amount"
+        );
+        assert_eq!(topup_status_of(&pool, &order_id).await, "refunded");
+
+        let rows = ledger_rows_of(&pool, account_id, "refund").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a refund appends exactly ONE ledger row with reason='refund': {rows:?}"
+        );
+        assert_eq!(
+            rows[0].0, -AMOUNT,
+            "and its delta is NEGATIVE, so the ledger still sums to the balance: {rows:?}"
+        );
+        assert_reconciled(&pool, account_id, "after a refund").await;
+
+        // REPLAY: a second refund of the same order is a replay, not a refund.
+        let (status, body) = post(&state, refund).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["status"], json!("already_refunded"), "{body}");
+
+        assert_eq!(
+            balance_of(&pool, account_id).await,
+            0,
+            "a replayed refund must NOT debit twice"
+        );
+        assert_eq!(
+            ledger_rows_of(&pool, account_id, "refund").await.len(),
+            1,
+            "a replayed refund must NOT append a second ledger row"
+        );
+        assert_eq!(topup_status_of(&pool, &order_id).await, "refunded");
+        assert_reconciled(&pool, account_id, "after a replayed refund").await;
+    }
 }
