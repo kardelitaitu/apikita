@@ -575,16 +575,21 @@ mod tests {
         assert!(limit > 0, "the fixture assumes a configured daily cap");
 
         // The OLDEST row is deliberately DISTINCT from the rest. Nine rows are a
-        // minute old (they would report ~86340s), and the tenth is pinned so it
-        // ages out 1800.5s from now. A Retry-After read off MAX(created_at), or
-        // off "now", or off the window length, cannot produce 1800.
+        // minute old (reading them would report ~86340s), and the tenth is
+        // pinned to age out EXACTLY 1800s after `now`. The handler runs a few
+        // milliseconds later, so it sees 1799.99x and rounds up to 1800 - a full
+        // second of headroom, against a few milliseconds of observed latency.
+        //
+        // 1800 is therefore discriminating: a Retry-After read off
+        // MAX(created_at) instead of MIN would answer ~86340, one read off the
+        // window length would answer 86400, and one read off "now" would answer
+        // 86400 as well. None of them can produce 1800.
         let now = Utc::now();
-        let ages_out_in_1800s =
-            now - key_creation_window() + Duration::seconds(1800) + Duration::milliseconds(500);
+        let ages_out_in_1800s = now - key_creation_window() + Duration::seconds(1800);
         insert_api_keys_at(&pool, account_id, now - Duration::seconds(60), limit - 1).await;
         insert_api_keys_at(&pool, account_id, ages_out_in_1800s, 1).await;
 
-        let (status, headers, body) = call_create_key(&state, &headers).await;
+        let (status, refusal, body) = call_create_key(&state, &headers).await;
 
         assert_eq!(
             status,
@@ -593,7 +598,7 @@ mod tests {
         );
         assert_eq!(body["error"]["code"], json!("rate_limited"), "{body}");
         assert_eq!(
-            header_str(&headers, header::RETRY_AFTER).as_deref(),
+            header_str(&refusal, header::RETRY_AFTER).as_deref(),
             Some("1800"),
             "the Retry-After must be the time until the OLDEST row ages out"
         );
@@ -626,31 +631,35 @@ mod tests {
 
         // (i) 300ms of window left. A client told "0" retries immediately and is
         // refused again, which reads as a broken limiter - so it must read 1.
+        // The 300ms is re-derived per call and the margin below absorbs the few
+        // milliseconds the handler takes, so the assertion cannot race itself.
         let almost_aged_out =
             Utc::now() - key_creation_window() + Duration::milliseconds(300);
         repin_api_keys(&pool, account_id, almost_aged_out).await;
-        let (status, headers, body) = call_create_key(&state, &headers).await;
+        let (status, refusal, body) = call_create_key(&state, &headers).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
         assert_eq!(
-            header_str(&headers, header::RETRY_AFTER).as_deref(),
+            header_str(&refusal, header::RETRY_AFTER).as_deref(),
             Some("1"),
             "a sub-second remainder must be reported as 1, never 0"
         );
 
         // (ii) 2.9s left rounds UP to 3; truncation would answer 2 and send the
-        // client back half a second early.
+        // client back before the window has actually freed.
         let just_under_three = Utc::now() - key_creation_window() + Duration::milliseconds(2900);
         repin_api_keys(&pool, account_id, just_under_three).await;
-        let (status, headers, body) = call_create_key(&state, &headers).await;
+        let (status, refusal, body) = call_create_key(&state, &headers).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
         assert_eq!(
-            header_str(&headers, header::RETRY_AFTER).as_deref(),
+            header_str(&refusal, header::RETRY_AFTER).as_deref(),
             Some("3"),
             "2.9s of window must round UP to 3"
         );
 
         delete_fixture(&pool, account_id).await;
     }
+
+    /// (c) The two windows are genuinely different
 
     /// (c) The two windows are genuinely different, measured against the SAME
     /// real rows: an age that is outside the 1-hour topup window is inside the
