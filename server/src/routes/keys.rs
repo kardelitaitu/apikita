@@ -282,11 +282,26 @@ pub async fn list_keys(
 }
 
 pub async fn create_key(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<CreateKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+    let account_id = resolve_account_from_cookie(&state.pool, &headers).await?;
+
+    // Abuse guard: `limits.key_creation_per_day` (docs/decisions.md) exists to
+    // blunt limit circumvention by key-spam. Enforced from the `api_keys` rows,
+    // so a revoked key still counts - revoking one to mint another is exactly
+    // the circumvention the cap is for. The cap comes from the config the app
+    // already owns.
+    crate::abuse::enforce_creation_cap(
+        &state.pool,
+        "api_keys",
+        crate::abuse::key_creation_window(),
+        state.config.limits.key_creation_per_day,
+        account_id,
+        Utc::now(),
+    )
+    .await?;
 
     let random_bytes: String = (0..43)
         .map(|_| {
@@ -324,7 +339,7 @@ pub async fn create_key(
     .bind(payload.token_limit)
     .bind(payload.rate_limit_rpm)
     .bind(payload.expires_at)
-    .fetch_one(&pool)
+    .fetch_one(&state.pool)
     .await?;
 
     let id: Uuid = key_record.get("id");

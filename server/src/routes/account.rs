@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::config::{AppConfig, WalletConfig};
 use crate::error::AppError;
+use crate::routes::proxy::AppState;
 
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
@@ -416,11 +417,26 @@ async fn create_snap_transaction(
 }
 
 pub async fn create_topup(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<CreateTopupRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+    let account_id = resolve_account_from_cookie(&state.pool, &headers).await?;
+
+    // Abuse guard FIRST, before anything expensive: `limits.topup_per_hour`
+    // (docs/decisions.md) is enforced from the `topups` rows, so a hammering
+    // account is refused without a PocketBase lookup or a Midtrans session
+    // being created. Same reasoning as the proxy throttling a key before it
+    // touches the wallet. The cap comes from the config the app already owns.
+    crate::abuse::enforce_creation_cap(
+        &state.pool,
+        "topups",
+        crate::abuse::topup_window(),
+        state.config.limits.topup_per_hour,
+        account_id,
+        Utc::now(),
+    )
+    .await?;
 
     // Minimums are configured, not hardcoded (docs/website/04-payments.md).
     let wallet = wallet_config()?;
@@ -429,7 +445,7 @@ pub async fn create_topup(
         "SELECT count(*) AS count FROM topups WHERE account_id = $1 AND status = 'settled'",
     )
     .bind(account_id)
-    .fetch_one(&pool)
+    .fetch_one(&state.pool)
     .await?;
 
     let settled_count: i64 = past_settled.try_get("count")?;
@@ -446,7 +462,7 @@ pub async fn create_topup(
     // accounts stores only the PocketBase record id; the email lives in PocketBase.
     let pb_user_id: String = sqlx::query("SELECT pb_user_id FROM accounts WHERE id = $1")
         .bind(account_id)
-        .fetch_one(&pool)
+        .fetch_one(&state.pool)
         .await?
         .try_get("pb_user_id")?;
 
@@ -474,7 +490,7 @@ pub async fn create_topup(
     .bind(payload.amount_idr)
     .bind(&order_id)
     .bind(&snap_token)
-    .execute(&pool)
+    .execute(&state.pool)
     .await?;
 
     info!(
