@@ -15,7 +15,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use crate::config::RealtimeConfig;
@@ -380,7 +380,21 @@ pub async fn sse_events_handler(
     // snapshot is being read must not fall into a gap and be lost. It reaches
     // the client after the snapshot, and because every event is absolute, the
     // newer value simply corrects the older one.
-    let live = BroadcastStream::new(state.events.subscribe());
+    let live = stream::unfold(state.events.subscribe(), |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => return Some((Ok(event.into_event()), rx)),
+                // Lagged: this client could not keep up and missed events.
+                // Keep the subscription rather than ending the stream — every
+                // event carries absolute values, so the next one it receives
+                // corrects the state on its own (docs/realtime.md:93).
+                Err(RecvError::Lagged(_)) => continue,
+                // Every sender is gone. The hub lives in AppState for the
+                // process lifetime, so this is shutdown.
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
 
     let snapshot = todays_usage(&state.pool, account_id).await?;
 
@@ -400,16 +414,6 @@ pub async fn sse_events_handler(
             .map(Ok)
             .collect(),
     };
-
-    let live = live.filter_map(|item| async move {
-        match item {
-            Ok(event) => Some(Ok(event.into_event())),
-            // Lagged: this client could not keep up and missed events. Every
-            // event carries absolute values, so the next one it does receive
-            // corrects the state on its own (docs/realtime.md:93).
-            Err(_) => None,
-        }
-    });
 
     // A stream outlives its welcome: the client reconnects, which is how a
     // session revoked mid-stream is actually dropped (docs/realtime.md:173).
