@@ -71,8 +71,11 @@ pub enum AppError {
     #[error("Rate limited")]
     RateLimited { retry_after_secs: u64 },
 
+    /// Every upstream is unhealthy (docs/error-model.md:50). Carries the
+    /// `Retry-After` the client must honour, sourced from the pool's shortest
+    /// remaining cooldown, so the wait is never guessed.
     #[error("No upstream available")]
-    NoUpstreamAvailable,
+    NoUpstreamAvailable { retry_after_secs: u64 },
 
     // Display keeps the full inner detail on purpose: it is load-bearing for
     // server-side observability (every `error = %err` log site). The
@@ -97,7 +100,7 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::ValidationFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
-            Self::NoUpstreamAvailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoUpstreamAvailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -116,7 +119,7 @@ impl AppError {
             Self::Conflict(_) => "conflict",
             Self::ValidationFailed { .. } => "validation_failed",
             Self::RateLimited { .. } => "rate_limited",
-            Self::NoUpstreamAvailable => "no_upstream_available",
+            Self::NoUpstreamAvailable { .. } => "no_upstream_available",
             Self::Database(_) | Self::Internal(_) => "internal_error",
         }
     }
@@ -180,8 +183,23 @@ impl IntoResponse for AppError {
         };
 
         let mut res = (status, Json(body)).into_response();
-        if let Self::RateLimited { retry_after_secs } = self {
-            if let Ok(val) = retry_after_secs.to_string().parse() {
+
+        // The ONE place a Retry-After is decided (docs/error-model.md:79-82:
+        // "Included on 429 and 503"). Both variants carry their value, so the
+        // header logic lives here rather than at either call site.
+        //
+        // For 503 the value is the pool's shortest remaining cooldown. When no
+        // breaker is open there is no cooldown to report, and the caller emits
+        // the documented 1-second floor - never a fabricated estimate
+        // (docs/error-model.md:96, :112). Which path produced the 503 is logged
+        // at the call site so the floor is explained, not silent.
+        let retry_after_secs = match self {
+            Self::RateLimited { retry_after_secs }
+            | Self::NoUpstreamAvailable { retry_after_secs } => Some(retry_after_secs),
+            _ => None,
+        };
+        if let Some(secs) = retry_after_secs {
+            if let Ok(val) = secs.to_string().parse() {
                 res.headers_mut().insert(axum::http::header::RETRY_AFTER, val);
             }
         }
@@ -238,7 +256,7 @@ mod tests {
                 field: "amount_idr".into(),
             },
             AppError::RateLimited { retry_after_secs: 42 },
-            AppError::NoUpstreamAvailable,
+            AppError::NoUpstreamAvailable { retry_after_secs: 30 },
             AppError::Database(sqlx::Error::RowNotFound),
             AppError::Internal("upstream request failed".into()),
         ]
@@ -266,7 +284,11 @@ mod tests {
                 "validation_failed",
             ),
             (AppError::RateLimited { retry_after_secs: 1 }, 429, "rate_limited"),
-            (AppError::NoUpstreamAvailable, 503, "no_upstream_available"),
+            (
+                AppError::NoUpstreamAvailable { retry_after_secs: 30 },
+                503,
+                "no_upstream_available",
+            ),
             (AppError::Database(sqlx::Error::RowNotFound), 500, "internal_error"),
             (AppError::Internal("boom".into()), 500, "internal_error"),
         ]
@@ -463,7 +485,10 @@ mod tests {
     #[tokio::test]
     async fn retry_after_is_absent_on_every_error_that_does_not_document_it() {
         for err in every_variant() {
-            if matches!(err, AppError::RateLimited { .. } | AppError::NoUpstreamAvailable) {
+            if matches!(
+                err,
+                AppError::RateLimited { .. } | AppError::NoUpstreamAvailable { .. }
+            ) {
                 continue;
             }
             let (status, headers, _) = respond(err).await;
@@ -479,7 +504,10 @@ mod tests {
         // docs/error-model.md:50  - 503 says "Retry after Retry-After".
         // docs/error-model.md:81  - "Included on 429 and 503."
         // docs/error-model.md:112 - "Floor it at 1 second."
-        let (status, headers, _) = respond(AppError::NoUpstreamAvailable).await;
+        let (status, headers, _) = respond(AppError::NoUpstreamAvailable {
+            retry_after_secs: 30,
+        })
+        .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         // The earliest moment a retry could plausibly succeed; a 503 without it
         // tells the client nothing about when to come back, which is the very
@@ -488,6 +516,22 @@ mod tests {
             .expect("docs/error-model.md:81 - Retry-After is included on 503");
         let secs: u64 = value.parse().expect("Retry-After must be whole seconds");
         assert!(secs >= 1, "docs/error-model.md:112 - floored at 1 second");
+        assert_eq!(
+            secs, 30,
+            "the header must carry the value the variant holds, not a constant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_503_with_the_documented_floor_still_reports_one() {
+        // The no-breaker-open path emits the documented floor of 1
+        // (docs/error-model.md:112). Pinned so a future change cannot turn the
+        // floor into a 0, which is a malformed header.
+        let (_, headers, _) = respond(AppError::NoUpstreamAvailable {
+            retry_after_secs: 1,
+        })
+        .await;
+        assert_eq!(header_str(&headers, header::RETRY_AFTER), Some("1"));
     }
 
     // ---------------------------------------------------------------------

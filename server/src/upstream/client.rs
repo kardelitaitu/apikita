@@ -338,6 +338,39 @@ impl UpstreamClient {
             .map(|entry| entry.worst_case_reservation_idr(max_output_tokens))
     }
 
+    /// The shortest remaining cooldown across `model`'s endpoint pool, in whole
+    /// seconds, floored at 1.
+    ///
+    /// This is the value docs/error-model.md:99-110 defines for a 503: "the
+    /// earliest moment a retry could plausibly succeed", i.e.
+    /// `min over endpoints of (cooldown_until - now)`.
+    ///
+    /// `None` means NO breaker in this model's pool is Open — so there is no
+    /// cooldown to report. That is a real, distinct outcome (the 503 may have
+    /// come from a path where nothing tripped), and it is deliberately NOT
+    /// collapsed into a number here: the caller decides what to emit and logs
+    /// the cause, so the header is never an unexplained guess
+    /// (docs/error-model.md:96). Also `None` when the model is unknown.
+    pub fn shortest_cooldown_secs(&self, model: &str) -> Option<u64> {
+        let entry = self.model(model)?;
+        entry
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.breaker.remaining_cooldown())
+            .min()
+            // Whole seconds, rounded UP, then floored at 1.
+            //
+            // Rounding up is the same rule the 429 path follows
+            // (docs/error-model.md:93-94) and it is the safe direction: a value
+            // that is too low tells the client to retry before a retry can
+            // succeed. Ceiling division by hand, as in abuse.rs:62.
+            //
+            // Floor at 1: docs/error-model.md:112 - "A zero or negative value
+            // is a malformed header", and a client that honours 0 retries into
+            // a refusal.
+            .map(|cooldown| ((cooldown.as_millis() as u64 + 999) / 1000).max(1))
+    }
+
     /// Send a streaming chat-completions request to the first endpoint that
     /// answers, rotating keys on a throttle and endpoints on a fault.
     ///
@@ -513,6 +546,7 @@ mod tests {
         CircuitBreakerConfig, KeyPoolConfig, LimitsConfig, ModelConfig, ModelEndpoint, ModelRates,
         NetworkConfig, PricingConfig, RealtimeConfig, SessionsConfig, StreamingConfig, WalletConfig,
     };
+    use crate::upstream::circuit_breaker::BreakerState;
 
     /// Serialize JSON chunks as an SSE body, the way an OpenAI-style upstream
     /// does: `data: <json>` followed by a blank line, per event.
@@ -758,6 +792,91 @@ mod tests {
         // A bigger output budget reserves more; an unknown model reserves none.
         assert!(client.worst_case_reservation_idr("flash", 8192).unwrap() > reserved);
         assert_eq!(client.worst_case_reservation_idr("ghost", 4096), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // shortest_cooldown_secs: the source of a 503 Retry-After
+    // (docs/error-model.md:99-110)
+    // ---------------------------------------------------------------------
+
+    /// Trips the breaker of endpoint `index` on `client`'s first model, the way
+    /// three consecutive 5xx responses would.
+    fn trip_endpoint(client: &UpstreamClient, index: usize) {
+        let breaker = &client.models[0].endpoints[index].breaker;
+        breaker.record_failure();
+        breaker.record_failure();
+        breaker.record_failure();
+        assert_eq!(breaker.state(), BreakerState::Open);
+    }
+
+    #[test]
+    fn no_open_breaker_reports_none_not_a_guessed_number() {
+        // The whole point of the Option: "nothing is open" is a real, distinct
+        // outcome the caller must handle explicitly, never a fabricated value.
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+        assert_eq!(client.shortest_cooldown_secs("flash"), None);
+    }
+
+    #[test]
+    fn an_unknown_model_reports_none() {
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+        assert_eq!(client.shortest_cooldown_secs("ghost"), None);
+    }
+
+    #[test]
+    fn the_cooldown_of_a_tripped_breaker_is_reported() {
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+        trip_endpoint(&client, 0);
+
+        let secs = client
+            .shortest_cooldown_secs("flash")
+            .expect("an Open breaker has a cooldown to report");
+        assert_eq!(secs, 30, "the base cooldown from config, floored at 1");
+    }
+
+    /// The accessor must scan the WHOLE pool. A `first()`-style implementation
+    /// would report None here, because the head endpoint is healthy.
+    #[test]
+    fn a_cooldown_is_found_even_when_only_a_later_endpoint_is_open() {
+        let client = client(vec![model(
+            "flash",
+            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
+        )]);
+
+        assert_eq!(client.models[0].endpoints[0].breaker.state(), BreakerState::Closed);
+        trip_endpoint(&client, 1);
+
+        assert_eq!(
+            client.shortest_cooldown_secs("flash"),
+            Some(30),
+            "the open endpoint is the second one; the pool must still be scanned"
+        );
+    }
+
+    #[test]
+    fn a_healthy_endpoint_does_not_mask_an_open_one() {
+        let client = client(vec![model(
+            "flash",
+            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
+        )]);
+        trip_endpoint(&client, 0);
+
+        // One Open, one Closed: the answer is the Open one's cooldown.
+        assert_eq!(client.shortest_cooldown_secs("flash"), Some(30));
+        assert!(
+            client.models[0].endpoints[1].breaker.allow_request(),
+            "the healthy endpoint is unaffected"
+        );
+    }
+
+    #[test]
+    fn the_reported_cooldown_is_never_zero() {
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+        trip_endpoint(&client, 0);
+
+        // docs/error-model.md:112 - a zero or negative Retry-After is a
+        // malformed header, so the floor is part of the accessor's contract.
+        assert!(client.shortest_cooldown_secs("flash").unwrap() >= 1);
     }
 
     #[test]

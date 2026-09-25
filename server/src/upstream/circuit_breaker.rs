@@ -87,6 +87,27 @@ impl CircuitBreaker {
         }
     }
 
+    /// How long until this breaker's Open window ends, or `None` when no Open
+    /// window is in effect (the breaker is Closed, or already HalfOpen).
+    ///
+    /// READ-ONLY AND SIDE-EFFECT-FREE, deliberately. It reads `open_until` under
+    /// the lock and returns; it does NOT call `expire_cooldown`, so asking this
+    /// question can never promote an Open breaker to HalfOpen and can never
+    /// change what `allow_request` will answer. A caller reporting a wait must
+    /// not perturb the thing it is reporting on.
+    ///
+    /// A cooldown that has already elapsed still reports `Some(0)` while the
+    /// breaker reads Open, because a retry is plausible immediately; the caller
+    /// floors the reported value (docs/error-model.md:112).
+    pub fn remaining_cooldown(&self) -> Option<Duration> {
+        let inner = self.lock();
+        if inner.state != BreakerState::Open {
+            return None;
+        }
+        let until = inner.open_until?;
+        Some(until.saturating_duration_since(self.now(&inner)))
+    }
+
     /// A request completed successfully. Closes the breaker and resets both the
     /// failure count and the backoff.
     pub fn record_success(&self) {
@@ -223,6 +244,84 @@ mod tests {
 
         b.record_failure();
         assert_eq!(b.state(), BreakerState::Open);
+    }
+
+    // The cooldown report is READ-ONLY: asking for it must never promote an
+    // Open breaker to HalfOpen nor change what allow_request answers.
+    /// The virtual clock only SHIFTS `Instant::now()` (see `now`); real time
+    /// still advances between a trip and the read, so an exact-equality
+    /// assertion on a live countdown is flaky by construction. Compare against
+    /// the expected value with a tolerance of the microseconds it takes to get
+    /// from one line to the next: the property is "reports the cooldown", not
+    /// "reports it to the nanosecond".
+    fn assert_cooldown_is(actual: Option<Duration>, expected_secs: u64) {
+        let actual = actual.expect("expected an open breaker with a cooldown");
+        let expected = Duration::from_secs(expected_secs);
+        let drift = actual.abs_diff(expected);
+        assert!(
+            drift < Duration::from_millis(100),
+            "expected about {expected:?}, got {actual:?} (drift {drift:?})"
+        );
+    }
+
+    #[test]
+    fn remaining_cooldown_is_none_until_the_breaker_opens() {
+        let b = CircuitBreaker::new(cfg());
+        assert_eq!(b.remaining_cooldown(), None, "a Closed breaker has no cooldown");
+
+        b.record_failure();
+        b.record_failure();
+        assert_eq!(b.remaining_cooldown(), None, "still Closed below the threshold");
+
+        b.record_failure();
+        assert_eq!(b.state(), BreakerState::Open);
+        assert_cooldown_is(b.remaining_cooldown(), 30);
+    }
+
+    #[test]
+    fn remaining_cooldown_counts_down_and_ends_with_the_open_window() {
+        let b = CircuitBreaker::new(cfg());
+        trip(&b);
+
+        advance(&b, 10);
+        assert_cooldown_is(b.remaining_cooldown(), 20);
+        advance(&b, 19);
+        assert_cooldown_is(b.remaining_cooldown(), 1);
+
+        // The window has elapsed: the breaker is HalfOpen and there is no
+        // cooldown left to report.
+        advance(&b, 1);
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        assert_eq!(b.remaining_cooldown(), None);
+    }
+
+    #[test]
+    fn asking_for_the_cooldown_does_not_disturb_the_breaker() {
+        let b = CircuitBreaker::new(cfg());
+        trip(&b);
+
+        // Reading repeatedly must not consume the wait or admit a request.
+        for _ in 0..5 {
+            assert_cooldown_is(b.remaining_cooldown(), 30);
+        }
+        assert_eq!(b.state(), BreakerState::Open);
+        assert!(
+            !b.allow_request(),
+            "a read-only report must not have promoted the breaker to HalfOpen"
+        );
+    }
+
+    #[test]
+    fn a_doubled_cooldown_is_reported_at_its_longer_value() {
+        let b = CircuitBreaker::new(cfg());
+        trip(&b);
+        advance(&b, 30);
+        assert!(b.allow_request(), "the HalfOpen trial is admitted");
+
+        // The trial failed: the breaker reopens with a doubled cooldown.
+        b.record_failure();
+        assert_eq!(b.state(), BreakerState::Open);
+        assert_cooldown_is(b.remaining_cooldown(), 60);
     }
 
     #[test]

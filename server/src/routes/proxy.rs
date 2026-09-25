@@ -747,16 +747,52 @@ impl Stream for MeteredStream {
     }
 }
 
+/// The Retry-After for a 503, from the pool's shortest remaining cooldown.
+///
+/// docs/error-model.md:99-110 defines the value as "the shortest remaining
+/// cooldown across the endpoint pool", floored at 1 second. A None from the
+/// accessor means NO breaker is open, so there is no cooldown to report: the
+/// documented 1-second floor applies, and `cause` records which path produced
+/// the 503 so an operator can see why the floor applied instead of a real
+/// number (docs/error-model.md:96 forbids an unexplained value).
+fn no_upstream_retry_after(cooldown: Option<u64>, model: &str, cause: &str, account_id: Uuid) -> u64 {
+    match cooldown {
+        Some(secs) => secs,
+        None => {
+            warn!(
+                account_id = %account_id,
+                model = %model,
+                cause = %cause,
+                "503 with no open breaker: emitting the documented 1-second Retry-After floor"
+            );
+            1
+        }
+    }
+}
+
 /// Maps a failed upstream call to the error the client may see.
 ///
 /// A transport error's Display embeds the provider URL, so it is logged and
 /// withheld: the client gets the generic upstream-unavailable error instead
 /// (DEFECT 3, docs/error-model.md:159). The other variants carry no provider URL
 /// or hostname.
-fn upstream_error(err: UpstreamError, model: &str, account_id: Uuid) -> AppError {
+fn upstream_error(
+    err: UpstreamError,
+    model: &str,
+    account_id: Uuid,
+    upstream: &UpstreamClient,
+) -> AppError {
     match err {
         UpstreamError::NoModel(_) => AppError::ModelNotAllowed(model.to_string()),
-        UpstreamError::NoHealthyUpstream(_) => AppError::NoUpstreamAvailable,
+        // A breaker trip: a real cooldown exists, so report it.
+        UpstreamError::NoHealthyUpstream(_) => AppError::NoUpstreamAvailable {
+            retry_after_secs: no_upstream_retry_after(
+                upstream.shortest_cooldown_secs(model),
+                model,
+                "every endpoint unhealthy",
+                account_id,
+            ),
+        },
         UpstreamError::Transport(detail) => {
             warn!(
                 account_id = %account_id,
@@ -764,7 +800,14 @@ fn upstream_error(err: UpstreamError, model: &str, account_id: Uuid) -> AppError
                 error = %detail,
                 "upstream transport error; detail withheld from client"
             );
-            AppError::NoUpstreamAvailable
+            AppError::NoUpstreamAvailable {
+                retry_after_secs: no_upstream_retry_after(
+                    upstream.shortest_cooldown_secs(model),
+                    model,
+                    "transport error",
+                    account_id,
+                ),
+            }
         }
         other => AppError::Internal(other.to_string()),
     }
@@ -1147,7 +1190,7 @@ pub async fn chat_completions(
             guard.defuse();
             release_quietly(&state.pool, account_id, reserved_idr, &reservation_ref, &meta.model)
                 .await;
-            return Err(upstream_error(err, &meta.model, account_id));
+            return Err(upstream_error(err, &meta.model, account_id, upstream));
         }
     };
 
@@ -1489,6 +1532,32 @@ async fn release_quietly(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // The 503 Retry-After decision (docs/error-model.md:99-112)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn an_available_cooldown_is_passed_through_unchanged() {
+        // docs/error-model.md:99-110: the value IS the pool's shortest
+        // remaining cooldown, so it must not be re-rounded or replaced.
+        assert_eq!(no_upstream_retry_after(Some(30), "flash", "t", Uuid::nil()), 30);
+        assert_eq!(no_upstream_retry_after(Some(1), "flash", "t", Uuid::nil()), 1);
+        assert_eq!(no_upstream_retry_after(Some(900), "flash", "t", Uuid::nil()), 900);
+    }
+
+    #[test]
+    fn no_open_breaker_falls_back_to_the_documented_one_second_floor() {
+        // docs/error-model.md:112 - "Floor it at 1 second. A zero or negative
+        // value is a malformed header." The floor is the documented value, not
+        // an estimate; the warn! inside records the cause.
+        assert_eq!(no_upstream_retry_after(None, "flash", "transport error", Uuid::nil()), 1);
+        assert_eq!(
+            no_upstream_retry_after(None, "flash", "every endpoint unhealthy", Uuid::nil()),
+            1
+            , "the floor must never be 0, which would be a malformed header"
+        );
+    }
 
     fn meta(revoked_at: Option<chrono::DateTime<chrono::Utc>>) -> KeyMetadata {
         KeyMetadata {
