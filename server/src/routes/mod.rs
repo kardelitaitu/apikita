@@ -673,7 +673,7 @@ mod tests {
 
     /// Every route `create_router` mounts: (method, path, body). One row per
     /// route CALL, so /api/topups and /api/keys - each a SINGLE `.route()` with
-    /// two methods chained - appear once per method. 13 route calls, 16 rows.
+    /// two methods chained - appear per method. 13 route calls, 15 rows.
     const MOUNTED: &[(&str, &str, &str)] = &[
         ("GET", "/health", ""),
         ("POST", "/auth/exchange", r#"{"pb_token":"probe"}"#),
