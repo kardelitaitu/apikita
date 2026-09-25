@@ -122,6 +122,26 @@ review_per_hour = 3
 key_metadata_cache_seconds = 60
 
 # ===========================================================================
+# NETWORK TRUST
+# ===========================================================================
+
+[network]
+# Reverse proxies allowed to speak for the caller via X-Forwarded-For.
+#
+# The backend sits behind the edge relay, so the TCP peer is the relay and
+# every key would otherwise show one source. Only a peer inside one of these
+# networks has its X-Forwarded-For consulted; from anywhere else the header is
+# ignored entirely, because a caller who can choose their recorded address can
+# hide key sharing — the exact signal docs/ip-tracking.md exists to raise.
+#
+# 127.0.0.1/32 and ::1/128 are for local development, where a relay is not in
+# the path at all. The Docker bridge ranges cover the nginx container in
+# docker-compose.yml, which has no fixed address. IN PRODUCTION THIS SHOULD
+# LIST THE RELAY ONLY: a rule broad enough to include a customer will trust a
+# header that customer forged.
+trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128", "172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
+
+# ===========================================================================
 # REALTIME (SSE)
 # ===========================================================================
 

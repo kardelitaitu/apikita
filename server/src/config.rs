@@ -12,7 +12,19 @@ pub struct AppConfig {
     pub key_pool: KeyPoolConfig,
     pub circuit_breaker: CircuitBreakerConfig,
     pub streaming: StreamingConfig,
+    pub network: NetworkConfig,
     pub models: Vec<ModelConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkConfig {
+    /// CIDRs of reverse proxies allowed to speak for the caller.
+    ///
+    /// Only a peer inside one of these networks has its `X-Forwarded-For`
+    /// consulted; from anywhere else the header is ignored and the TCP peer is
+    /// recorded. `docs/ip-tracking.md` — the header is client-controlled, and
+    /// trusting it blindly lets a caller pin its own recorded address.
+    pub trusted_proxy_cidrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +140,11 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // A malformed trust rule is a security decision, so it is rejected here
+        // rather than skipped at runtime: see `parse_cidrs`.
+        crate::ip_tracking::parse_cidrs(&self.network.trusted_proxy_cidrs)
+            .map_err(|err| format!("network.trusted_proxy_cidrs: {err}"))?;
+
         if self.models.is_empty() {
             return Err("At least one model must be configured in models".into());
         }

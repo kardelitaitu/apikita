@@ -273,9 +273,160 @@ pub async fn purge_expired(pool: &PgPool, today: NaiveDate) -> Result<PurgedRows
     Ok(PurgedRows { seen, daily })
 }
 
+// ---------------------------------------------------------------------------
+// Which address the request came from
+// ---------------------------------------------------------------------------
+//
+// The backend sits behind the edge relay, so the TCP peer is the relay, not the
+// caller, and every key would otherwise show one source. The caller's address
+// arrives in `X-Forwarded-For`.
+//
+// THAT HEADER IS CLIENT-CONTROLLED, AND THAT IS THE WHOLE PROBLEM HERE. A
+// caller who sets `X-Forwarded-For: 1.2.3.4` on a directly-received request
+// chooses what we record. For an abuse signal the dangerous direction is
+// under-counting: an account reselling one key would pin a single forged
+// address and sit at one distinct IP forever, which is precisely the signal
+// this module exists to raise. So the header is consulted ONLY when the peer
+// is a configured trusted proxy, and otherwise ignored entirely.
+//
+// This answers the open item in docs/ip-tracking.md ("whether the edge relay
+// or the backend computes the hash"): the backend does, because it is the side
+// that owns the salt and the tables, and because the relay has no database.
+
+/// An IP network in CIDR form.
+///
+/// Hand-rolled rather than pulled from a crate: it is ~30 lines of bit masking,
+/// and the proxy's hot path already carries enough dependencies for a feature
+/// that runs once per request and only needs `contains`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpCidr {
+    base: std::net::IpAddr,
+    prefix: u8,
+}
+
+impl IpCidr {
+    /// Parses `ADDRESS/PREFIX`. Rejects a prefix longer than the address family
+    /// allows rather than silently truncating it: `10.0.0.0/33` written by
+    /// mistake must not become a rule that matches everything.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let (address, prefix) = text
+            .split_once('/')
+            .ok_or_else(|| format!("{text}: expected ADDRESS/PREFIX"))?;
+
+        let base: std::net::IpAddr = address
+            .trim()
+            .parse()
+            .map_err(|_| format!("{address}: not an IP address"))?;
+        let prefix: u8 = prefix
+            .trim()
+            .parse()
+            .map_err(|_| format!("{prefix}: not a prefix length"))?;
+
+        let max = match base {
+            std::net::IpAddr::V4(_) => 32,
+            std::net::IpAddr::V6(_) => 128,
+        };
+        if prefix > max {
+            return Err(format!("{text}: prefix {prefix} exceeds {max} for this address family"));
+        }
+        Ok(Self { base, prefix })
+    }
+
+    /// Whether `ip` falls inside this network. Addresses of different families
+    /// never match, so an IPv6 relay rule cannot accidentally trust an IPv4 peer.
+    pub fn contains(&self, ip: &std::net::IpAddr) -> bool {
+        // `*ip` so the arms bind addresses, not references: `u32::from` takes
+        // an `Ipv4Addr` by value.
+        match (self.base, *ip) {
+            (std::net::IpAddr::V4(net), std::net::IpAddr::V4(addr)) => {
+                let mask = v4_mask(self.prefix);
+                u32::from(net) & mask == u32::from(addr) & mask
+            }
+            (std::net::IpAddr::V6(net), std::net::IpAddr::V6(addr)) => {
+                let mask = v6_mask(self.prefix);
+                u128::from(net) & mask == u128::from(addr) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `prefix == 0` is handled separately: shifting a 32-bit value by 32 is
+/// undefined, and it would panic in a debug build — on the request path.
+fn v4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn v6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+/// Parses the configured CIDR list, failing on the first malformed entry.
+///
+/// Fail fast, at startup: a typo in a trust rule is a security decision, and
+/// the two ways it can fail are both bad. Skipping the bad entry trusts less
+/// than intended (and silently), while accepting it may trust more.
+pub fn parse_cidrs(texts: &[String]) -> Result<Vec<IpCidr>, String> {
+    texts.iter().map(|text| IpCidr::parse(text)).collect()
+}
+
+/// The address the request came from.
+///
+/// `peer` is the TCP peer. When it is a trusted proxy, `X-Forwarded-For` is
+/// walked RIGHT TO LEFT and the first entry that is not itself a trusted proxy
+/// is the caller: each hop appends the address it received the connection from,
+/// so the closest trusted proxies are on the right and the caller is the first
+/// untrusted address before them. Walking left to right instead would stop on
+/// the caller's own forged entry.
+///
+/// If every entry is trusted — or the header is absent or unparseable — the
+/// peer is returned. That is the honest answer: the caller's address is not
+/// known, and inventing one from a spoofable header is worse than recording the
+/// relay, which at least cannot be chosen by the caller.
+pub fn resolve_client_ip(
+    peer: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+    trusted: &[IpCidr],
+) -> std::net::IpAddr {
+    // The header name is spelled out: `HeaderMap::get` accepts a `&str` and
+    // lowercases it, which keeps this independent of a re-exported constant.
+    let Some(raw) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return peer;
+    };
+
+    // An untrusted peer's header is never consulted — see the note above.
+    if !trusted.iter().any(|cidr| cidr.contains(&peer)) {
+        return peer;
+    }
+
+    for entry in raw.split(',').rev() {
+        let Ok(address) = entry.trim().parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if trusted.iter().any(|cidr| cidr.contains(&address)) {
+            continue;
+        }
+        return address;
+    }
+
+    peer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
     use std::net::IpAddr;
 
     fn ip(text: &str) -> IpAddr {
@@ -366,6 +517,102 @@ mod tests {
         // A zero salt is a salt anyone can guess, which defeats the point.
         assert_ne!(fresh_salt(), [0u8; 32]);
         assert_ne!(fresh_salt(), fresh_salt(), "two fresh salts must differ");
+    }
+
+    fn cidr(text: &str) -> IpCidr {
+        IpCidr::parse(text).expect("parse cidr")
+    }
+
+    fn forwarded_for(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("x-forwarded-for"),
+            value.parse().expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn cidrs_match_by_family_and_prefix() {
+        let slash24 = cidr("203.0.113.0/24");
+        assert!(slash24.contains(&ip("203.0.113.0")));
+        assert!(slash24.contains(&ip("203.0.113.255")));
+        assert!(!slash24.contains(&ip("203.0.114.1")));
+
+        assert!(cidr("10.0.0.0/8").contains(&ip("10.255.255.255")));
+        assert!(cidr("203.0.113.9/32").contains(&ip("203.0.113.9")));
+        assert!(!cidr("203.0.113.9/32").contains(&ip("203.0.113.10")));
+        assert!(cidr("0.0.0.0/0").contains(&ip("8.8.8.8")), "/0 covers everything");
+        assert!(!cidr("0.0.0.0/0").contains(&ip("::1")), "families never mix");
+
+        assert!(cidr("2001:db8::/32").contains(&ip("2001:db8::1")));
+        assert!(!cidr("2001:db8::/32").contains(&ip("2001:db9::1")));
+    }
+
+    #[test]
+    fn a_malformed_cidr_is_rejected_not_silently_truncated() {
+        assert!(IpCidr::parse("10.0.0.0").is_err(), "no prefix");
+        assert!(IpCidr::parse("10.0.0.0/33").is_err(), "prefix past the family");
+        assert!(IpCidr::parse("2001:db8::/129").is_err());
+        assert!(IpCidr::parse("not-an-ip/24").is_err());
+        assert!(IpCidr::parse("10.0.0.0/x").is_err());
+        assert!(parse_cidrs(&["10.0.0.0/8".to_string(), "bad".to_string()]).is_err());
+    }
+
+    #[test]
+    fn an_untrusted_peer_cannot_choose_its_own_address() {
+        // The attack this defends against: a reseller sends a fixed forged
+        // address so the key always shows one distinct source.
+        let trusted = vec![cidr("172.17.0.0/16")];
+        let spoofed = forwarded_for("1.2.3.4");
+
+        assert_eq!(
+            resolve_client_ip(ip("203.0.113.9"), &spoofed, &trusted),
+            ip("203.0.113.9"),
+            "a direct peer's X-Forwarded-For must be ignored"
+        );
+    }
+
+    #[test]
+    fn a_trusted_peer_yields_the_first_untrusted_entry_from_the_right() {
+        let trusted = vec![cidr("172.17.0.0/16")];
+        // "caller, relay": the rightmost is the relay itself, so the caller is
+        // the entry before it.
+        let headers = forwarded_for("203.0.113.9, 172.17.0.5");
+        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &headers, &trusted), ip("203.0.113.9"));
+
+        // Two hops of trusted proxy: still the caller, not a relay.
+        let chained = forwarded_for("203.0.113.9, 172.17.0.7, 172.17.0.5");
+        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &chained, &trusted), ip("203.0.113.9"));
+
+        // A forged entry to the LEFT of the real one is not where we look.
+        let forged = forwarded_for("1.2.3.4, 203.0.113.9, 172.17.0.5");
+        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &forged, &trusted), ip("203.0.113.9"));
+    }
+
+    #[test]
+    fn an_all_trusted_or_unusable_header_falls_back_to_the_peer() {
+        let trusted = vec![cidr("172.17.0.0/16")];
+
+        // Every claimed address is a trusted proxy: the caller is not known, so
+        // record the relay rather than trusting a header entry.
+        let all_trusted = forwarded_for("172.17.0.7, 172.17.0.5");
+        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &all_trusted, &trusted), ip("172.17.0.5"));
+
+        // Garbage entries are skipped, not crashed on.
+        let garbage = forwarded_for("not-an-ip, , 172.17.0.5");
+        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &garbage, &trusted), ip("172.17.0.5"));
+
+        // No header at all.
+        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &HeaderMap::new(), &trusted), ip("172.17.0.5"));
+    }
+
+    #[test]
+    fn with_no_trusted_proxies_configured_the_peer_always_wins() {
+        assert_eq!(
+            resolve_client_ip(ip("203.0.113.9"), &forwarded_for("1.2.3.4"), &[]),
+            ip("203.0.113.9")
+        );
     }
 
     #[test]

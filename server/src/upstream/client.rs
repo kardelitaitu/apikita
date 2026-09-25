@@ -506,7 +506,7 @@ mod tests {
     use super::*;
     use crate::config::{
         CircuitBreakerConfig, KeyPoolConfig, LimitsConfig, ModelConfig, ModelEndpoint, ModelRates,
-        PricingConfig, RealtimeConfig, SessionsConfig, StreamingConfig, WalletConfig,
+        NetworkConfig, PricingConfig, RealtimeConfig, SessionsConfig, StreamingConfig, WalletConfig,
     };
 
     /// Serialize JSON chunks as an SSE body, the way an OpenAI-style upstream
@@ -615,6 +615,11 @@ mod tests {
                 default_max_output_tokens: 4096,
                 hard_max_output_tokens: 384_000,
                 max_context_tokens: 1_000_000,
+            },
+            // These unit tests never resolve a client address, so no proxy is
+            // trusted: an empty list means the TCP peer is always recorded.
+            network: NetworkConfig {
+                trusted_proxy_cidrs: vec![],
             },
             models,
         }))
