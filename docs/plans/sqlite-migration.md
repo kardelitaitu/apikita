@@ -625,13 +625,53 @@ Nothing else starts until this lands, because every later document reads from it
 
 ### 5.1 Phase 1 — Dependency and config
 
-- `server/Cargo.toml`: swap `postgres` → `sqlite` in the `sqlx` feature list. Keep
-  `uuid`, `chrono`, `json`. **Drop `migrate` unless [§5.3](#53-phase-3--migration-mechanism) is adopted.**
-- `DATABASE_URL=sqlite://data/server.db` (a file path, not a network URL).
-- `data/` must be on the **persistent volume** ([§8](#8-operations-backup-rpo-and-the-volume)).
-- Delete `POSTGRES_PASSWORD`, `POCKETBASE_URL` from `.env.example`.
-- `docker-compose.yml`: delete the `postgres` and `pocketbase` services and the
-  `pgdata`/`pbdata` volumes. Keep `nginx`. Delete `.docker/postgres/`.
+Executed 2026-09-25 on branch `sqlite-port` in a worktree, per [§12](#12-suggested-execution-order).
+
+- `server/Cargo.toml`: `postgres` → `sqlite` in the `sqlx` feature list; keep
+  `uuid`, `chrono`, `json`. **Add `migrate`** — it was *absent*, not present, so the
+  draft's "drop `migrate`" instruction was inverted. [§5.3](#53-phase-3--migration-mechanism)
+  is adopted, so the feature is required. `sqlx`'s `sqlite` feature is the **bundled**
+  one (`sqlite = ["_sqlite", "sqlx-sqlite/bundled", …]`), which compiles SQLite from
+  source and therefore needs no system library and no `pkg-config`. The alternative,
+  `sqlite-unbundled`, is not wanted.
+- `DATABASE_URL=sqlite://data/server.db` — a file path, not a network URL.
+- `data/` must be on the **persistent volume** ([§8](#8-operations-backup-rpo-and-the-volume))
+  **and must be gitignored**, or the local database becomes committable.
+- Delete `POSTGRES_PASSWORD` and `REDIS_URL` from `.env.example`. **Keep
+  `POCKETBASE_URL`** — see correction 1.
+- `docker-compose.yml`: delete the `postgres` and `pocketbase` services, the
+  `pgdata`/`pbdata` volumes, **and `nginx`'s `depends_on: postgres`**. Keep `nginx`.
+  Delete `.docker/postgres/`.
+
+**Four corrections, none of which were visible on paper:**
+
+1. **`POCKETBASE_URL` must stay.** The draft said to delete it, but
+   `routes/auth.rs:90` and `routes/account.rs:328` still read it, and PocketBase is
+   present for identity until Phase 6 — which [§12](#12-suggested-execution-order)
+   deliberately allows. Deleting it here would strip the documented local address
+   while the code still calls it. The deletion belongs in Phase 6.
+2. **`nginx`'s `depends_on: postgres` would have broken compose outright.** Removing
+   the `postgres` service without removing the reference leaves `docker compose up`
+   failing on an undefined service. The draft does not mention it.
+3. **`REDIS_URL` was dead config.** Zero references in `server/src`, `config/` or
+   `docs/` — the same class of defect as the `allow_negative_balance_overdraft` flag
+   the hot-path audit found. Removed.
+4. **`DATABASE_URL` must not carry `?mode=rwc`, and this changes Phase 3.**
+   `sqlx-sqlite` 0.8.6 defaults `create_if_missing: false`
+   (`src/options/mod.rs:198`); `mode=rwc` is what sets it true
+   (`src/options/parse.rs:53`). So the server **fails loudly when the database is
+   absent** rather than creating an empty, schema-less one — the correct behaviour
+   given *"migrations never run on application boot"*. The consequence is a Phase 3
+   requirement: **the migrate binary must set `create_if_missing(true)`**, because it
+   is the component whose job is to create the database. Separately, SQLite creates
+   the file but never its parent directory, so `data/` must exist before either binary
+   opens the pool.
+
+**One instruction was lost, and is re-homed rather than dropped.**
+`.docker/postgres/README.md` documented how to reset the local database. That is still
+needed — it only changes form, from `docker compose down -v` to deleting
+`data/server.db` and its `-wal`/`-shm` sidecars. Phase 8 must move it into
+`docs/local-development.md`; the compose header carries the short version meanwhile.
 
 ### 5.2 Phase 2 — Schema port
 
@@ -1087,6 +1127,10 @@ window is a hazard: anyone else's `cargo check` fails for reasons that look like
 own. Either land Phases 1–5 as one continuous unit, or run them in a separate
 `git worktree` and merge once `cargo check` is green. Do not leave the shared tree
 mid-port.
+
+**Taken: the worktree.** Phases 1–5 are being executed on branch `sqlite-port` in
+`C:/dev/apikita-sqlite-port`, created from `0.0.1` at `0343c49`. `0.0.1` stays green
+throughout; the merge happens once `cargo check` passes there.
 
 **A note on what to do first if only one thing is done:** Phase 0. Every document in
 the repository reads from the register, and the register currently says the stack is
