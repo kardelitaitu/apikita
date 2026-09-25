@@ -18,6 +18,7 @@ use crate::config::AppConfig;
 use crate::db::debit_usage_transaction;
 use crate::error::AppError;
 use crate::money::{calculate_preflight_reservation_idr, calculate_token_cost_idr};
+use crate::routes::events::{publish_balance, publish_usage, todays_usage, RealtimeHub};
 use crate::upstream::{parse_usage_from_sse, UpstreamClient, UpstreamError, UpstreamStream, Usage};
 
 #[derive(Clone)]
@@ -25,6 +26,8 @@ pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
+    /// The realtime fan-out behind `GET /events`.
+    pub events: Arc<RealtimeHub>,
 }
 
 impl axum::extract::FromRef<AppState> for PgPool {
@@ -373,6 +376,7 @@ pub async fn chat_completions(
         settle_rx,
         state.pool.clone(),
         state.config.clone(),
+        state.events.clone(),
         account_id,
         key_id,
         meta.model.clone(),
@@ -392,6 +396,7 @@ async fn settle_after_stream(
     end: tokio::sync::oneshot::Receiver<StreamEnd>,
     pool: PgPool,
     config: Arc<AppConfig>,
+    events: Arc<RealtimeHub>,
     account_id: Uuid,
     key_id: Uuid,
     model: String,
@@ -446,15 +451,36 @@ async fn settle_after_stream(
     )
     .await
     {
-        Ok(new_balance) => info!(
-            account_id = %account_id,
-            cost_idr,
-            new_balance,
-            input_tokens = usage.input_tokens,
-            cache_read_tokens = usage.cache_read_tokens,
-            output_tokens = usage.output_tokens,
-            "Proxy request settled"
-        ),
+        Ok(new_balance) => {
+            info!(
+                account_id = %account_id,
+                cost_idr,
+                new_balance,
+                input_tokens = usage.input_tokens,
+                cache_read_tokens = usage.cache_read_tokens,
+                output_tokens = usage.output_tokens,
+                "Proxy request settled"
+            );
+
+            // Only now that the debit has committed. Emitting before commit
+            // could announce a balance that then rolls back
+            // (docs/realtime.md:146-157).
+            publish_balance(&events, new_balance);
+
+            // The event carries today's CUMULATIVE totals, not this request's
+            // delta: absolute values make a lost event self-healing
+            // (docs/realtime.md:93). If the read fails the balance event has
+            // already gone out and the next settlement will correct the
+            // usage figures, so this is logged, not fatal.
+            match todays_usage(&pool, account_id).await {
+                Ok(totals) => publish_usage(&events, totals),
+                Err(err) => warn!(
+                    account_id = %account_id,
+                    error = %err,
+                    "Usage event skipped: totals unavailable"
+                ),
+            }
+        }
         Err(err) => warn!(
             account_id = %account_id,
             cost_idr,

@@ -8,6 +8,7 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::AppConfig;
+use crate::routes::events::RealtimeHub;
 use crate::routes::proxy::AppState;
 
 #[tokio::main]
@@ -66,10 +67,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(std::time::Duration::from_secs(config.circuit_breaker.request_timeout_seconds))
         .build()?;
 
+    // The realtime fan-out is process-wide: every open /events stream and every
+    // publisher shares this one hub, so the replay buffer and the per-account
+    // connection count are global rather than per-request.
+    let events = Arc::new(RealtimeHub::new(&config.realtime));
+
     let state = AppState {
         pool,
         config,
         http_client,
+        events,
     };
 
     let app = routes::create_router(state);
