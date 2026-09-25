@@ -132,6 +132,7 @@ pub async fn enforce_creation_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{self, TestDb};
 
     #[test]
     fn a_zero_limit_turns_the_cap_off() {
@@ -206,11 +207,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Live Sqlite. Ignored rather than silently skipped, exactly like the
-    // settlement tests in `db.rs`: a test that asserts nothing is worse than no
-    // test.
-    //
-    //   DATABASE_URL=... cargo test --lib abuse:: -- --ignored
+    // Database tests. Each gets its own migrated database in a temp directory,
+    // so they run by default and cannot see each other's rows.
     // -----------------------------------------------------------------------
 
     /// The configured caps, read the way the application reads them.
@@ -226,70 +224,32 @@ mod tests {
         panic!("could not find apikita.toml for testing");
     }
 
-    async fn test_pool() -> SqlitePool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Sqlite instance");
-        crate::db::init_pool(&database_url)
-            .await
-            .expect("connect to Sqlite")
-    }
-
-    async fn create_account(pool: &SqlitePool) -> Uuid {
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES (?) RETURNING id")
-            .bind(&pb_user_id)
-            .fetch_one(pool)
-            .await
-            .expect("create account")
-    }
-
-    /// Deletes every row the fixture created, in FK order: `topups` references
-    /// `accounts` ON DELETE RESTRICT, so the children go first.
-    async fn delete_fixture(pool: &SqlitePool, account_id: Uuid) {
-        for statement in [
-            "DELETE FROM topups WHERE account_id = ?",
-            "DELETE FROM api_keys WHERE account_id = ?",
-            "DELETE FROM accounts WHERE id = ?",
-        ] {
-            sqlx::query(statement)
-                .bind(account_id.hyphenated())
-                .execute(pool)
-                .await
-                .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
-        }
-    }
-
+    /// One top-up at the configured amount, as the create path writes one.
     async fn insert_topup(pool: &SqlitePool, account_id: Uuid) {
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES (?, 10000, ?)")
-            .bind(account_id.hyphenated())
-            .bind(format!("test_cap_{}", Uuid::new_v4().simple()))
-            .execute(pool)
-            .await
-            .expect("insert topup");
+        test_support::pending_topup(pool, account_id, 10_000).await;
     }
 
-    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_topup_cap_lets_the_limit_through_and_refuses_the_next() {
-        let pool = test_pool().await;
-        let account_id = create_account(&pool).await;
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
         let limit = configured_limits().topup_per_hour;
         assert!(limit > 0, "the fixture assumes a configured hourly cap");
 
         let now = Utc::now();
         for _ in 0..limit - 1 {
-            insert_topup(&pool, account_id).await;
+            insert_topup(&db.pool, account_id).await;
         }
 
         assert!(
-            enforce_creation_cap(&pool, "topups", topup_window(), limit, account_id, now)
+            enforce_creation_cap(&db.pool, "topups", topup_window(), limit, account_id, now)
                 .await
                 .is_ok(),
             "one under the cap must be allowed"
         );
 
-        insert_topup(&pool, account_id).await;
-        let err = enforce_creation_cap(&pool, "topups", topup_window(), limit, account_id, now)
+        insert_topup(&db.pool, account_id).await;
+        let err = enforce_creation_cap(&db.pool, "topups", topup_window(), limit, account_id, now)
             .await
             .expect_err("a top-up at the cap must be refused");
 
@@ -314,13 +274,13 @@ mod tests {
         sqlx::query("UPDATE topups SET created_at = ? WHERE account_id = ?")
             .bind(Utc::now() - Duration::hours(2))
             .bind(account_id.hyphenated())
-            .execute(&pool)
+            .execute(&db.pool)
             .await
             .expect("age the rows out of the window");
 
         assert!(
             enforce_creation_cap(
-                &pool,
+                &db.pool,
                 "topups",
                 topup_window(),
                 limit,
@@ -332,31 +292,23 @@ mod tests {
             "rows outside the window must not count against the cap"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
-    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_key_creation_cap_refuses_past_the_configured_daily_limit() {
-        let pool = test_pool().await;
-        let account_id = create_account(&pool).await;
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
         let limit = configured_limits().key_creation_per_day;
         assert!(limit > 0, "the fixture assumes a configured daily cap");
 
         let now = Utc::now();
         for _ in 0..limit {
-            sqlx::query(
-                "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES (?, ?, 'apk_test')",
-            )
-            .bind(account_id.hyphenated())
-            .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-            .execute(&pool)
-            .await
-            .expect("insert api key");
+            test_support::api_key(&db.pool, account_id).await;
         }
 
         let err = enforce_creation_cap(
-            &pool,
+            &db.pool,
             "api_keys",
             key_creation_window(),
             limit,
@@ -377,6 +329,6 @@ mod tests {
             other => panic!("expected RateLimited, got {other:?}"),
         }
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 }

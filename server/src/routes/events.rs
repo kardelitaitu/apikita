@@ -491,6 +491,7 @@ pub async fn sse_events_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{self, TestDb};
     use axum::http::HeaderValue;
 
     fn hub_config(
@@ -705,5 +706,68 @@ mod tests {
         let frame = ": heartbeat";
         assert!(!frame.starts_with("event:"), "heartbeat must not be an event");
         assert!(frame.starts_with(": "), "heartbeat is a SSE comment line");
+    }
+
+    /// REGRESSION for the session-lifetime hazard plan section 4.6: an expired
+    /// session must not authenticate.
+    ///
+    /// The guard is `expires_at > ?` with the instant bound from Rust. It used to
+    /// compare against SQL `now()`, and under SQLite that returned TRUE for a
+    /// session already past its expiry — measured: `now()` emits the
+    /// space-separated format, `'T'` sorts after a space, so
+    /// `2026-09-25T07:00:00+00:00` compared greater than the current time
+    /// indefinitely and the session never expired. Silent, and it fails in the
+    /// direction that keeps access.
+    ///
+    /// The schema's GLOB CHECK now makes the mixed format unrepresentable. This is
+    /// the behavioural half: the real cookie path, against the real schema.
+    #[tokio::test]
+    async fn an_expired_session_is_refused_and_a_live_one_is_accepted() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
+
+        let now = chrono::Utc::now();
+        for (token, expires_at) in [
+            ("expired-token", now - chrono::Duration::hours(2)),
+            ("live-token", now + chrono::Duration::hours(2)),
+        ] {
+            sqlx::query(
+                "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
+            .bind(hash_string(token))
+            .bind(expires_at)
+            .bind(now)
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .expect("create the session");
+        }
+
+        let mut expired_headers = HeaderMap::new();
+        expired_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=expired-token"),
+        );
+        assert!(
+            resolve_account_from_cookie(&db.pool, &expired_headers)
+                .await
+                .is_err(),
+            "an expired session must not authenticate"
+        );
+
+        let mut live_headers = HeaderMap::new();
+        live_headers.insert(header::COOKIE, HeaderValue::from_static("session=live-token"));
+        assert_eq!(
+            resolve_account_from_cookie(&db.pool, &live_headers)
+                .await
+                .expect("a live session must authenticate"),
+            account_id,
+            "a live session must resolve to its own account"
+        );
+
+        db.close().await;
     }
 }

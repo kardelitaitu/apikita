@@ -911,6 +911,7 @@ async fn settle_partial_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{self, TestDb};
 
     /// Rows returned by the reconciliation check in docs/observability.md:
     /// wallets.balance_idr must equal SUM(ledger.delta_idr).
@@ -963,73 +964,25 @@ mod tests {
         format!("balance_idr={balance} ledger_sum={ledger_sum} rows={rows:?}")
     }
 
-    /// Deletes every row a fixture created, in FK order (`ledger` and `wallets`
-    /// are ON DELETE RESTRICT).
-    ///
-    /// A leftover wallet with no matching ledger row is not merely untidy: it is
-    /// permanent drift in a database other runs share, and it makes the next run
-    /// fail for a reason that has nothing to do with the code under test.
-    async fn delete_fixture_rows(pool: &SqlitePool, account_id: Uuid) {
-        for statement in [
-            "DELETE FROM usage_daily WHERE account_id = ?",
-            "DELETE FROM ledger WHERE account_id = ?",
-            "DELETE FROM api_keys WHERE account_id = ?",
-            "DELETE FROM topups WHERE account_id = ?",
-            "DELETE FROM wallets WHERE account_id = ?",
-            "DELETE FROM accounts WHERE id = ?",
-        ] {
-            sqlx::query(statement)
-                .bind(account_id.hyphenated())
-                .execute(pool)
-                .await
-                .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
-        }
-    }
-
     /// A debit the wallet cannot cover must NOT be discarded: the reported usage
     /// is recorded and the debit is clamped to the balance, so reconciliation
     /// still holds and the shortfall is visible. A debit it CAN cover still
     /// settles in full.
     ///
     /// Every reconciliation assertion is scoped to THIS fixture's `account_id`, not
-    /// to the whole database: this schema is shared with other tests and fixtures,
-    /// and a global drift check fails for concurrent writers rather than for the code
-    /// under test.
-    ///
-    /// This needs a live, migrated Sqlite, so it is #[ignore]d rather than
-    /// silently skipped or rewritten to assert nothing: run it with
-    /// `DATABASE_URL=... cargo test --lib -- --ignored`. The pure clamp rule it
-    /// depends on is unit-tested below without a database.
-    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
+    /// to the whole database: a global drift check would fail for a concurrent
+    /// writer rather than for the code under test.
     #[tokio::test]
     async fn overdraft_debit_is_clamped_to_the_balance_and_records_the_usage() {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Sqlite instance");
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
 
-        let pool = init_pool(&database_url).await.expect("connect to Sqlite");
+        overdraft_settlement_assertions(db.pool.clone(), account_id).await;
 
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES (?) RETURNING id")
-                .bind(&pb_user_id)
-                .fetch_one(&pool)
-                .await
-                .expect("create account");
-
-        // The assertions run in their own task so a panicking one still reaches the
-        // cleanup below. Tokio turns a task panic into a JoinError instead of
-        // unwinding through this frame, which is what makes the teardown
-        // unconditional.
-        let assertions = tokio::spawn(overdraft_settlement_assertions(pool.clone(), account_id));
-        let outcome = assertions.await;
-
-        delete_fixture_rows(&pool, account_id).await;
-
-        outcome.expect("the settlement assertions panicked");
+        db.close().await;
     }
 
-    /// The body of the live test, minus the fixture it is handed and the teardown
-    /// its caller owns.
+    /// The body of the test, minus the database its caller owns.
     async fn overdraft_settlement_assertions(pool: SqlitePool, account_id: Uuid) {
         let opening_balance: i64 = 1_000;
 
@@ -1041,20 +994,9 @@ mod tests {
         // asserts against - a fixture that cannot pass while the code under test is
         // correct. A zero-balance wallet with no ledger rows is consistent on its own
         // (0 = SUM of nothing), so this starting point reconciles.
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES (?, 0)")
-            .bind(account_id.hyphenated())
-            .execute(&pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
+        test_support::wallet(&pool, account_id).await;
 
-        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES (?, ?, ?)")
-            .bind(account_id.hyphenated())
-            .bind(opening_balance)
-            .bind(&order_id)
-            .execute(&pool)
-            .await
-            .expect("create topup");
+        let order_id = test_support::pending_topup(&pool, account_id, opening_balance).await;
 
         let credited = credit_topup_transaction(&pool, &order_id, opening_balance)
             .await
@@ -1070,14 +1012,7 @@ mod tests {
 
         // usage_daily.api_key_id is part of the primary key, so a real key row is
         // needed before any usage can be recorded.
-        let key_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES (?, ?, 'apk_test') RETURNING id",
-        )
-        .bind(account_id.hyphenated())
-        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-        .fetch_one(&pool)
-        .await
-        .expect("create api key");
+        let key_id = test_support::api_key(&pool, account_id).await;
 
         // 1. A cost one rupiah above the wallet. The answer was already streamed
         //    to the client by now, so the usage must still be recorded.
@@ -1156,14 +1091,7 @@ mod tests {
         //    balance used - a second top-up, which writes its own `+` ledger row.
         //    Never write `balance_idr` alone: that is the drift the fixture must not
         //    create.
-        let refill_order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES (?, ?, ?)")
-            .bind(account_id.hyphenated())
-            .bind(opening_balance)
-            .bind(&refill_order_id)
-            .execute(&pool)
-            .await
-            .expect("create refill topup");
+        let refill_order_id = test_support::pending_topup(&pool, account_id, opening_balance).await;
 
         credit_topup_transaction(&pool, &refill_order_id, opening_balance)
             .await
@@ -1214,49 +1142,27 @@ mod tests {
     /// settlement, sequential and concurrent, because a missing release row is
     /// exactly the money leak this invariant exists to catch.
     ///
-    /// Needs a live, migrated Sqlite, so it is #[ignore]d:
-    /// `DATABASE_URL=... cargo test --lib -- --ignored`.
-    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
+    /// This is the test that was `#[ignore = "requires live Postgres"]` and so was
+    /// never executed automatically. SQLite turned it into a temp file, so it now
+    /// runs on every CI pass — which is the whole benefit plan section 5.5 claims.
     #[tokio::test]
     async fn concurrent_requests_cannot_overdraw_a_one_request_balance() {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Sqlite instance");
-        let pool = init_pool(&database_url).await.expect("connect to Sqlite");
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
 
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES (?) RETURNING id")
-                .bind(&pb_user_id)
-                .fetch_one(&pool)
-                .await
-                .expect("create account");
+        overdraw_concurrency_assertions(db.pool.clone(), account_id).await;
 
-        let assertions = tokio::spawn(overdraw_concurrency_assertions(pool.clone(), account_id));
-        let outcome = assertions.await;
-        delete_fixture_rows(&pool, account_id).await;
-        outcome.expect("the concurrency assertions panicked");
+        db.close().await;
     }
 
-    /// The body of the live concurrency test, minus the fixture and teardown its
-    /// caller owns.
+    /// The body of the concurrency test, minus the database its caller owns.
     async fn overdraw_concurrency_assertions(pool: SqlitePool, account_id: Uuid) {
         const RESERVATION: i64 = 10_000;
         const CONCURRENCY: usize = 5;
 
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES (?, 0)")
-            .bind(account_id.hyphenated())
-            .execute(&pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
+        test_support::wallet(&pool, account_id).await;
 
-        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES (?, ?, ?)")
-            .bind(account_id.hyphenated())
-            .bind(RESERVATION)
-            .bind(&order_id)
-            .execute(&pool)
-            .await
-            .expect("create topup");
+        let order_id = test_support::pending_topup(&pool, account_id, RESERVATION).await;
 
         assert_eq!(
             credit_topup_transaction(&pool, &order_id, RESERVATION)
@@ -1320,14 +1226,7 @@ mod tests {
 
         // usage_daily.api_key_id is part of the primary key, so a real key row is
         // needed before any usage can be recorded.
-        let key_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES (?, ?, 'apk_test') RETURNING id",
-        )
-        .bind(account_id.hyphenated())
-        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-        .fetch_one(&pool)
-        .await
-        .expect("create api key");
+        let key_id = test_support::api_key(&pool, account_id).await;
 
         // The winner settles: the hold comes back and the true cost is charged, in
         // ONE transaction. Drift must be zero immediately afterwards — a release
@@ -1374,14 +1273,7 @@ mod tests {
         // settlement rather than only at the end. A drift that appears mid-run and
         // is later masked is the failure mode this catches.
         for round in 0..5 {
-            let refill = format!("test_topup_refill_{round}");
-            sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES (?, ?, ?)")
-                .bind(account_id.hyphenated())
-                .bind(RESERVATION)
-                .bind(&refill)
-                .execute(&pool)
-                .await
-                .expect("create refill topup");
+            let refill = test_support::pending_topup(&pool, account_id, RESERVATION).await;
             credit_topup_transaction(&pool, &refill, RESERVATION)
                 .await
                 .expect("refill through the real top-up path");
@@ -1483,9 +1375,9 @@ mod tests {
     /// The clamp rule behind a settlement the balance cannot cover in full.
     ///
     /// This is the whole money decision and it is pure, so it is tested here
-    /// without a database: the SQL path itself (the guarded UPDATE, the ledger
-    /// insert, the usage_daily upsert) is NOT unit-testable without a live
-    /// migrated Sqlite, and is covered by the #[ignore]d test above.
+    /// without a database. The SQL path itself (the guarded UPDATE, the ledger
+    /// insert, the usage_daily upsert) is covered by the database tests above,
+    /// which since phase 5 run by default rather than behind `#[ignore]`.
     #[test]
     fn clamp_debit_collects_at_most_the_balance() {
         // Covered in full: nothing clamped, nothing lost.
@@ -1637,51 +1529,24 @@ mod tests {
     /// never called on the failure arm (the hold stayed debited forever), and the
     /// settlement passed `ref_batch = None` so the hold row had no matching
     /// positive row and the detection query flagged it as stranded.
-    ///
-    /// Needs a live, migrated Sqlite - run with
-    /// `DATABASE_URL=... cargo test --lib -- --ignored`.
-    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_failed_or_paired_settlement_never_strands_the_hold() {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Sqlite instance");
-        let pool = init_pool(&database_url).await.expect("connect to Sqlite");
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
 
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES (?) RETURNING id")
-                .bind(&pb_user_id)
-                .fetch_one(&pool)
-                .await
-                .expect("create account");
+        hold_never_strands_assertions(db.pool.clone(), account_id).await;
 
-        let assertions =
-            tokio::spawn(hold_never_strands_assertions(pool.clone(), account_id));
-        let outcome = assertions.await;
-        delete_fixture_rows(&pool, account_id).await;
-        outcome.expect("the stranded-hold assertions panicked");
+        db.close().await;
     }
 
-    /// The body of the live regression test, minus the fixture and teardown its
-    /// caller owns.
+    /// The body of the regression test, minus the database its caller owns.
     async fn hold_never_strands_assertions(pool: SqlitePool, account_id: Uuid) {
         const RESERVATION: i64 = 10_000;
         const COST: i64 = 250;
 
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES (?, 0)")
-            .bind(account_id.hyphenated())
-            .execute(&pool)
-            .await
-            .expect("create the zero-balance wallet");
+        test_support::wallet(&pool, account_id).await;
 
-        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES (?, ?, ?)")
-            .bind(account_id.hyphenated())
-            .bind(RESERVATION)
-            .bind(&order_id)
-            .execute(&pool)
-            .await
-            .expect("create topup");
+        let order_id = test_support::pending_topup(&pool, account_id, RESERVATION).await;
         assert_eq!(
             credit_topup_transaction(&pool, &order_id, RESERVATION)
                 .await
@@ -1692,14 +1557,7 @@ mod tests {
             "fund the wallet through the real top-up path"
         );
 
-        let key_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES (?, ?, 'apk_test') RETURNING id",
-        )
-        .bind(account_id.hyphenated())
-        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-        .fetch_one(&pool)
-        .await
-        .expect("create api key");
+        let key_id = test_support::api_key(&pool, account_id).await;
 
         // --- Scenario A: a settlement FAILS, the hold must come back. ---
         let failed_ref = format!("reserve_{}", Uuid::new_v4().simple());
@@ -1788,6 +1646,249 @@ mod tests {
             0,
             "balance_idr must equal SUM(ledger.delta_idr) after a paired settlement"
         );
+    }
+
+    /// REGRESSION for plan section 4.3, trap 3: a `NULL` `api_key_id` must not
+    /// duplicate a usage row.
+    ///
+    /// SQLite does not enforce `NOT NULL` on a composite key, and it treats NULLs as
+    /// distinct in unique indexes. So an upsert targeted at a plain
+    /// `(account_id, api_key_id, day)` never fires its conflict clause for a
+    /// NULL-keyed row and degrades into a plain insert — one row per call, forever,
+    /// with a per-key aggregate that silently under-reports. Measured in the port:
+    /// three identical upserts produced three rows.
+    ///
+    /// Latent rather than live today, because the proxy always passes a key. It
+    /// becomes live the moment a caller passes `None`, which the signature allows.
+    /// The `COALESCE` unique index plus a matching conflict target is the fix, and
+    /// this is the test the naive port would have failed.
+    #[tokio::test]
+    async fn two_null_key_settlements_accumulate_into_one_usage_row() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account_id, 100_000).await;
+
+        // Account-level usage, twice on the same day: no key.
+        for _ in 0..2 {
+            debit_usage_transaction(&db.pool, account_id, None, 100, 10, 200, 5_000, None, 0)
+                .await
+                .expect("a settlement against a funded wallet");
+        }
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_daily WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count usage rows");
+        assert_eq!(
+            rows, 1,
+            "two NULL-keyed settlements must land on ONE row, not one each"
+        );
+
+        let (input, cache_read, output, cost): (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT input_tokens, cache_read_tokens, output_tokens, cost_idr
+             FROM usage_daily WHERE account_id = ?",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the accumulated row");
+        assert_eq!(
+            (input, cache_read, output, cost),
+            (200, 20, 400, 10_000),
+            "the second call must accumulate onto the first, not start a new row"
+        );
+
+        // A keyed settlement on the same day is a DIFFERENT scope and must get its
+        // own row, so the per-key aggregate stays separate from the account-level
+        // one. The fix must not collapse the two scopes into one.
+        let key_id = test_support::api_key(&db.pool, account_id).await;
+        debit_usage_transaction(
+            &db.pool,
+            account_id,
+            Some(key_id),
+            100,
+            10,
+            200,
+            5_000,
+            None,
+            0,
+        )
+        .await
+        .expect("a keyed settlement");
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_daily WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count usage rows");
+        assert_eq!(
+            rows, 2,
+            "a keyed row is a separate scope from the NULL-keyed one"
+        );
+
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// REGRESSION for the money-duplication defect plan section 4.5 found while
+    /// executing: settle → refund → the original SETTLEMENT webhook replays.
+    ///
+    /// The guard this replaced short-circuited only on `status == 'settled'`, so a
+    /// row that had already been refunded fell through and was settled a second
+    /// time: the wallet gained the top-up back and the row returned to `settled`,
+    /// silently undoing the refund. The money then existed twice.
+    ///
+    /// The fix is the `status = 'pending'` predicate — any row that is not pending
+    /// is refused — plus `TopupCreditResult::NotSettleable`, a fourth outcome,
+    /// because reporting a refunded order as "already settled" is a lie an operator
+    /// would act on.
+    #[tokio::test]
+    async fn a_settlement_replayed_after_a_refund_is_refused_and_credits_nothing() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        const AMOUNT: i64 = 10_000;
+
+        let order_id = test_support::pending_topup(&db.pool, account_id, AMOUNT).await;
+
+        assert_eq!(
+            credit_topup_transaction(&db.pool, &order_id, AMOUNT)
+                .await
+                .expect("settle"),
+            TopupCreditResult::Settled {
+                new_balance: AMOUNT
+            }
+        );
+        assert_eq!(test_support::balance(&db.pool, account_id).await, AMOUNT);
+
+        assert!(
+            matches!(
+                refund_topup_transaction(&db.pool, &order_id, AMOUNT)
+                    .await
+                    .expect("refund"),
+                RefundResult::Refunded { new_balance: 0 }
+            ),
+            "a settled topup must refund"
+        );
+        assert_eq!(test_support::balance(&db.pool, account_id).await, 0);
+        assert_eq!(
+            test_support::ledger_sum(&db.pool, account_id).await,
+            0,
+            "a settle followed by a refund must net to zero, not to a credit"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+
+        // The replayed SETTLEMENT. This is the defect: before the fix this
+        // credited AMOUNT again and flipped the row back to `settled`.
+        let replay = credit_topup_transaction(&db.pool, &order_id, AMOUNT)
+            .await
+            .expect("a replay is a recorded outcome, not an error");
+        assert!(
+            matches!(&replay, TopupCreditResult::NotSettleable { status } if status == "refunded"),
+            "a settlement replayed after a refund must be refused: {replay:?}"
+        );
+        assert_eq!(
+            test_support::balance(&db.pool, account_id).await,
+            0,
+            "the refund must stand: no money may be re-credited"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+
+        // The row itself must still say `refunded`, so an operator reading it does
+        // not see a settled order that has already been paid back.
+        let status: String = sqlx::query_scalar("SELECT status FROM topups WHERE order_id = ?")
+            .bind(&order_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the topup status");
+        assert_eq!(
+            status, "refunded",
+            "the replay must not flip the row back to settled"
+        );
+
+        db.close().await;
+    }
+
+    /// REGRESSION for plan section 4.3, trap 2, and the real concurrency test
+    /// section 9 check 4 still owed.
+    ///
+    /// A deferred `BEGIN` that reads and then writes can be refused at the lock
+    /// upgrade with `SQLITE_BUSY_SNAPSHOT` — an error that **cannot be resolved by
+    /// retrying**, because the transaction has to be rolled back and restarted. It
+    /// appears only under contention, so no test that opens one transaction at a
+    /// time can see it.
+    ///
+    /// Every transaction here takes the write lock up front through
+    /// `begin_immediate`, so five concurrent refunds serialize instead of
+    /// deadlocking on an upgrade: exactly one refunds, the rest observe the row
+    /// already refunded, and **none returns an error**. That last clause is the
+    /// assertion — an `Err` here would mean either the unrecoverable upgrade or a
+    /// `database is locked` once the bounded `busy_timeout` wait ran out.
+    #[tokio::test]
+    async fn concurrent_refunds_serialize_without_losing_the_write_lock() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        const AMOUNT: i64 = 10_000;
+        const CONCURRENCY: usize = 5;
+
+        let order_id = test_support::pending_topup(&db.pool, account_id, AMOUNT).await;
+        assert_eq!(
+            credit_topup_transaction(&db.pool, &order_id, AMOUNT)
+                .await
+                .expect("settle"),
+            TopupCreditResult::Settled {
+                new_balance: AMOUNT
+            }
+        );
+
+        let mut tasks = Vec::with_capacity(CONCURRENCY);
+        for _ in 0..CONCURRENCY {
+            let pool = db.pool.clone();
+            let order_id = order_id.clone();
+            tasks.push(tokio::spawn(async move {
+                refund_topup_transaction(&pool, &order_id, AMOUNT).await
+            }));
+        }
+
+        let mut refunded = 0;
+        let mut already = 0;
+        for task in tasks {
+            // This `expect` IS the check: a refund must either win the lock or see
+            // the row already refunded. An error means the port lost the write lock.
+            match task
+                .await
+                .expect("a refund task panicked")
+                .expect("a refund must never error under contention")
+            {
+                RefundResult::Refunded { .. } => refunded += 1,
+                RefundResult::AlreadyRefunded => already += 1,
+                other => panic!("unexpected refund outcome: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            refunded, 1,
+            "exactly one of five concurrent refunds may debit the wallet"
+        );
+        assert_eq!(
+            already,
+            CONCURRENCY - 1,
+            "the rest must see the row already refunded"
+        );
+
+        assert_eq!(
+            test_support::balance(&db.pool, account_id).await,
+            0,
+            "the refund must happen exactly once"
+        );
+        assert_eq!(
+            ledger_drift_rows(&db.pool, account_id).await,
+            0,
+            "{}",
+            drift_report(&db.pool, account_id).await
+        );
+
+        db.close().await;
     }
 }
 

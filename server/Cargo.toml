@@ -32,6 +32,10 @@ dotenvy = "0.15"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Phase 5: the money tests need a migrated database, and SQLite makes one a temp
+# file rather than a server. This is what lets them run in CI by default instead
+# of behind `#[ignore = "requires live Postgres"]`.
+tempfile = "3"
 
 [lib]
 name = "apikita_server"

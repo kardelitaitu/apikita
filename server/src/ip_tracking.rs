@@ -455,6 +455,7 @@ pub fn resolve_client_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{self, TestDb};
     use axum::http::HeaderMap;
     use std::net::IpAddr;
 
@@ -671,80 +672,38 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Live Sqlite. Ignored rather than silently skipped: a test that asserts
-    // nothing is worse than no test.
-    //
-    //   DATABASE_URL=... cargo test --lib ip_tracking:: -- --ignored
+    // Database tests. Each builds its own migrated database in a temp
+    // directory, so they run by default and share no rows with each other.
     // -----------------------------------------------------------------------
 
-    async fn test_pool() -> SqlitePool {
-        let database_url =
-            std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated Sqlite instance");
-        crate::db::init_pool(&database_url).await.expect("connect to Sqlite")
+    /// A key needs an account, so the fixture creates one and returns the key.
+    async fn create_key(pool: &SqlitePool) -> Uuid {
+        let account_id = test_support::account(pool).await;
+        test_support::api_key(pool, account_id).await
     }
 
-    /// A key needs an account. Returns (account_id, key_id).
-    async fn create_key(pool: &SqlitePool) -> (Uuid, Uuid) {
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES (?) RETURNING id")
-                .bind(&pb_user_id)
-                .fetch_one(pool)
-                .await
-                .expect("create account");
-
-        let key_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES (?, ?, 'apk_test') RETURNING id",
-        )
-        .bind(account_id.hyphenated())
-        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-        .fetch_one(pool)
-        .await
-        .expect("create api key");
-
-        (account_id, key_id)
-    }
-
-    async fn delete_fixture(pool: &SqlitePool, account_id: Uuid) {
-        // Children first: both IP tables reference api_keys, which references
-        // accounts, and api_keys is ON DELETE CASCADE from accounts.
-        for statement in [
-            "DELETE FROM key_ip_seen WHERE api_key_id IN (SELECT id FROM api_keys WHERE account_id = ?)",
-            "DELETE FROM key_ip_daily WHERE api_key_id IN (SELECT id FROM api_keys WHERE account_id = ?)",
-            "DELETE FROM api_keys WHERE account_id = ?",
-            "DELETE FROM accounts WHERE id = ?",
-        ] {
-            sqlx::query(statement)
-                .bind(account_id.hyphenated())
-                .execute(pool)
-                .await
-                .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
-        }
-    }
-
-    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_repeat_ip_counts_once_and_a_new_ip_counts_twice() {
-        let pool = test_pool().await;
-        let (account_id, key_id) = create_key(&pool).await;
+        let db = TestDb::new().await;
+        let key_id = create_key(&db.pool).await;
         let day = today_utc();
         let salt = [3u8; 32];
 
         let first = ip_hash(&salt, &ip("203.0.113.9"));
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &first).await.expect("first request"),
+            record_key_ip(&db.pool, key_id, day, &first).await.expect("first request"),
             KeyIpCounts { distinct_ips: 1, request_count: 1 }
         );
 
         // Same address again: the request counts, the distinct count does not.
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &first).await.expect("repeat request"),
+            record_key_ip(&db.pool, key_id, day, &first).await.expect("repeat request"),
             KeyIpCounts { distinct_ips: 1, request_count: 2 }
         );
 
         let second = ip_hash(&salt, &ip("203.0.113.10"));
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &second).await.expect("new ip"),
+            record_key_ip(&db.pool, key_id, day, &second).await.expect("new ip"),
             KeyIpCounts { distinct_ips: 2, request_count: 3 }
         );
 
@@ -753,41 +712,40 @@ mod tests {
         let tomorrow = day.succ_opt().expect("next day");
         let fresh = ip_hash(&[4u8; 32], &ip("203.0.113.9"));
         assert_eq!(
-            record_key_ip(&pool, key_id, tomorrow, &fresh).await.expect("next day"),
+            record_key_ip(&db.pool, key_id, tomorrow, &fresh).await.expect("next day"),
             KeyIpCounts { distinct_ips: 1, request_count: 1 }
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
-    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_purge_keeps_the_window_and_removes_what_is_past_it() {
-        let pool = test_pool().await;
-        let (account_id, key_id) = create_key(&pool).await;
+        let db = TestDb::new().await;
+        let key_id = create_key(&db.pool).await;
         let today = today_utc();
         let salt = [5u8; 32];
 
         // Inside both windows.
         let recent = today - chrono::Duration::days(SEEN_RETENTION_DAYS - 1);
-        record_key_ip(&pool, key_id, recent, &ip_hash(&salt, &ip("203.0.113.1")))
+        record_key_ip(&db.pool, key_id, recent, &ip_hash(&salt, &ip("203.0.113.1")))
             .await
             .expect("recent row");
 
         // Past the hash window but inside the aggregate window: the hash goes,
         // the count stays. That asymmetry is the privacy design.
         let older = today - chrono::Duration::days(SEEN_RETENTION_DAYS + 1);
-        record_key_ip(&pool, key_id, older, &ip_hash(&salt, &ip("203.0.113.2")))
+        record_key_ip(&db.pool, key_id, older, &ip_hash(&salt, &ip("203.0.113.2")))
             .await
             .expect("older row");
 
         // Past both.
         let ancient = today - chrono::Duration::days(DAILY_RETENTION_DAYS + 1);
-        record_key_ip(&pool, key_id, ancient, &ip_hash(&salt, &ip("203.0.113.3")))
+        record_key_ip(&db.pool, key_id, ancient, &ip_hash(&salt, &ip("203.0.113.3")))
             .await
             .expect("ancient row");
 
-        let purged = purge_expired(&pool, today).await.expect("purge");
+        let purged = purge_expired(&db.pool, today).await.expect("purge");
         assert!(
             purged.seen >= 2,
             "both rows past the hash window must go, got {}",
@@ -798,7 +756,7 @@ mod tests {
         let remaining_seen: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM key_ip_seen WHERE api_key_id = ?")
                 .bind(key_id.hyphenated())
-                .fetch_one(&pool)
+                .fetch_one(&db.pool)
                 .await
                 .expect("count remaining hashes");
         assert_eq!(
@@ -806,6 +764,6 @@ mod tests {
             "only the in-window hash survives: the aggregate outlives the hash"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 }
