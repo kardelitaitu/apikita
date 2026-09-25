@@ -635,9 +635,40 @@ Nothing else starts until this lands, because every later document reads from it
 
 ### 5.2 Phase 2 — Schema port
 
-Rewrite `server/migrations/20260925000000_initial_schema.sql` in SQLite dialect per
-[§4.2](#42-dialect-translation-rules). **Replace in place** — there is no production
-data to preserve, and a single migration is honest about that.
+Executed 2026-09-25 on branch `sqlite-port`.
+
+`server/migrations/20260925000000_initial_schema.sql` is **replaced in place** with the
+SQLite schema — there is no production data to preserve, and a single migration is
+honest about that. The file is now equivalent to
+[Appendix A](#appendix-a--target-sqlite-schema) apart from comments, and a script
+enforces that equivalence so the two cannot drift.
+
+The port is not a transcription: **17 tables, up from 15.** The two additions are
+`identities` (replacing PocketBase) and `usage_events` (the per-request admin feed).
+Six existing definitions also change shape:
+
+| Change | Why |
+| --- | --- |
+| `accounts.pb_user_id` **dropped** | `accounts.id` is the only key now ([§3](#3-decisions-this-forces-the-register-to-change)) |
+| `sessions.last_seen_at` **added, `NOT NULL`** | The register specifies *"30 days absolute, 7 days idle"*, but the Postgres schema had no column for the idle bound, so only the absolute half was enforceable. See warning 1 below |
+| `usage_daily` loses its `PRIMARY KEY` | A `COALESCE` expression cannot appear in a PK; the unique index *is* the key ([§4.3](#43-connection-setup--four-traps-all-measured) trap 3) |
+| `usage_daily.api_key_id` → `ON DELETE RESTRICT` | `SET NULL` collides with the `COALESCE` index ([§4.10](#410-on-delete-set-null-collides-with-the-coalesce-unique-index)) |
+| `BIGINT`/`BIGSERIAL` → `INTEGER`, `JSONB` → `TEXT`, `DATE` → `TEXT` | `STRICT` rejects `BIGINT` ([§11.1](#111-decided) item 13); `TEXT` for JSON; one representation for all time |
+| every `DEFAULT now()` → **no default** | Time is bound from Rust and never written in SQL ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped)) |
+
+**Verified by `tools/sqlite-probes/validate-migration-schema.py`: 32 checks, 0 failed.**
+It applies both the shipped migration and Appendix A, asserts the two create identical
+objects, then exercises the invariants against the shipped file.
+
+**Two consequences the later phases must not miss:**
+
+1. **`sessions.last_seen_at` is `NOT NULL` with no default.** Every `INSERT INTO
+   sessions` must supply it, so `auth.rs` has to be ported in the same phase as this
+   schema change or session creation fails **at runtime, not at compile time** — the
+   compiler cannot see this one. Phase 4.
+2. **`journal_mode = WAL` is not set here, deliberately.** WAL is a persistent database
+   property, but `PRAGMA journal_mode` cannot run inside a transaction and `sqlx` wraps
+   each migration in one. It belongs in the connection setup. Phase 4.
 
 ### 5.3 Phase 3 — Migration mechanism
 
@@ -977,7 +1008,7 @@ the dialect assumptions the whole port rests on:
 ```bash
 python tools/sqlite-probes/sqlite-port-probe.py
 python tools/sqlite-probes/sqlite-timestamp-probe.py
-python tools/sqlite-probes/validate-appendix-schema.py
+python tools/sqlite-probes/validate-migration-schema.py
 ```
 
 **Claims that must not be repeated without re-measurement:** the 63,750 tok/s and

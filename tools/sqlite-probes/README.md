@@ -10,7 +10,7 @@ assumptions the whole port rests on.
 ```bash
 python tools/sqlite-probes/sqlite-port-probe.py
 python tools/sqlite-probes/sqlite-timestamp-probe.py
-python tools/sqlite-probes/validate-appendix-schema.py
+python tools/sqlite-probes/validate-migration-schema.py
 ```
 
 Requires Python 3 with the standard-library `sqlite3` module. No packages.
@@ -54,25 +54,45 @@ outranks the space-format value. Up to ~24 hours of extra session life, silently
 Also confirms that with a *uniform* RFC3339-offset format, ordering is correct even when
 the fractional part varies in length. Plan reference: §4.6.
 
-## `validate-appendix-schema.py`
+## `validate-migration-schema.py`
 
-Extracts the ```` ```sql ```` block from Appendix A of the migration plan, applies it to
-a real in-memory SQLite with `foreign_keys = ON`, and asserts 24 invariants:
+The schema gate, and the only script here that inspects the shipped artefact rather
+than the plan. It does two jobs.
 
-- every table is `STRICT`;
+**1. Drift check.** It applies the plan's Appendix A *and* the shipped
+`server/migrations/20260925000000_initial_schema.sql` to separate in-memory databases
+and compares every object each one creates, normalised for comments and whitespace.
+If the plan and the schema disagree, the run fails. A plan that lies about the
+database is worse than no plan, and this is the only mechanism that stops the two
+drifting apart after the port lands.
+
+**2. Invariants**, asserted against the *shipped* migration — 32 checks:
+
+- the schema has exactly 17 tables, and every one is `STRICT`;
+- no `REAL`/`FLOAT`/`NUMERIC`/`DECIMAL` column exists anywhere;
+- all 30 date and time columns carry a `GLOB` format check;
+- no table has a `DEFAULT CURRENT_TIMESTAMP` — a default that fires writes the wrong
+  format (plan §4.6);
 - `REAL` and `TEXT` are refused in `INTEGER` money and flag columns;
 - the non-negative balance floor holds;
 - the timestamp `GLOB` check refuses the space and `Z` forms;
 - `email_verified` is forced for Google identities and the password-hash pairing holds;
 - `NULL` is refused in primary-key columns (`STRICT` implies `NOT NULL` there);
-- the `usage_daily` `COALESCE` upsert accumulates instead of duplicating;
+- `sessions.last_seen_at` is not optional, so the *"7 days idle"* half is enforceable;
+- the `usage_daily` `COALESCE` upsert accumulates instead of duplicating, and a
+  `NULL`-key row coexists with a keyed row for the same `(account, day)`;
 - `RESTRICT` blocks deleting a funded account and a key with billing history;
-- `topups.order_id` uniqueness is enforced.
+- `topups.order_id` uniqueness is enforced;
+- `accounts` has no `pb_user_id`.
 
-It also proves the schema *applies* — a syntax error in the appendix fails the run.
+It also proves the schema *applies* — a syntax error in either copy fails the run.
 
 This is what caught the `ON DELETE SET NULL` collision with the `COALESCE` unique index
 (plan §4.10), which reading the DDL did not reveal.
+
+It supersedes an earlier `validate-appendix-schema.py`, which checked only the plan's
+copy. Checking the plan alone cannot detect drift, because the plan is one of the two
+things that can be wrong.
 
 ## Why these are tracked
 

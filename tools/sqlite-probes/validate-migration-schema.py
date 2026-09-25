@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Validate the shipped SQLite migration, and prove Appendix A still matches it.
+
+Two jobs, in this order:
+
+  1. DRIFT CHECK. Apply the plan's Appendix A and the shipped migration to separate
+     in-memory databases and compare the objects each creates (tables, indexes, and
+     their SQL normalised for comments and whitespace). If the plan and the schema
+     disagree, the plan is a lie about the database, which is worse than no plan.
+
+  2. INVARIANTS. Apply the shipped migration for real and exercise every claim the
+     schema is supposed to enforce: STRICT type rejection, the money floor, the
+     timestamp format CHECK, the usage_daily NULL-key upsert, and RESTRICT.
+
+Tracked rather than scratch: the plan cites these results as evidence, and a probe
+nobody can run proves nothing (AGENTS.md rule 1 allows `.agents/` scratch, but that
+directory is gitignored).
+
+Run:  python tools/sqlite-probes/validate-migration-schema.py
+"""
+
+import io
+import os
+import re
+import sqlite3
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
+PLAN = os.path.join(ROOT, "docs", "plans", "sqlite-migration.md")
+MIGRATION = os.path.join(ROOT, "server", "migrations", "20260925000000_initial_schema.sql")
+
+# ---------------------------------------------------------------------------
+# Load both sources
+# ---------------------------------------------------------------------------
+
+plan_text = io.open(PLAN, encoding="utf-8").read()
+appendix = plan_text.split("## Appendix A")[1]
+blocks = re.findall(r"```sql\n(.*?)```", appendix, re.S)
+if not blocks:
+    sys.exit("FAIL: no sql block found in Appendix A")
+appendix_sql = blocks[-1]
+migration_sql = io.open(MIGRATION, encoding="utf-8").read()
+
+
+def norm(sql):
+    """Normalise a CREATE statement for comparison: drop comments, collapse space."""
+    sql = re.sub(r"--[^\n]*", "", sql)
+    return re.sub(r"\s+", " ", sql).strip()
+
+
+def objects(sql, label):
+    """Apply `sql` and return {kind: {name: normalised_sql}}."""
+    con = sqlite3.connect(":memory:")
+    con.execute("PRAGMA foreign_keys = ON")
+    try:
+        con.executescript(sql)
+    except sqlite3.Error as exc:
+        sys.exit(f"FAIL: {label} did not apply -> {exc}")
+    out = {"table": {}, "index": {}}
+    for kind, name, ddl in con.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL"
+    ):
+        out.setdefault(kind, {})[name] = norm(ddl)
+    con.close()
+    return out
+
+
+a_objs = objects(appendix_sql, "Appendix A")
+m_objs = objects(migration_sql, "the shipped migration")
+
+# ---------------------------------------------------------------------------
+# 1. Drift check
+# ---------------------------------------------------------------------------
+
+print("=" * 78)
+print("DRIFT CHECK — Appendix A vs server/migrations/20260925000000_initial_schema.sql")
+print("=" * 78)
+
+drift = []
+for kind in sorted(set(a_objs) | set(m_objs)):
+    a, m = a_objs.get(kind, {}), m_objs.get(kind, {})
+    only_a = sorted(set(a) - set(m))
+    only_m = sorted(set(m) - set(a))
+    differs = sorted(n for n in set(a) & set(m) if a[n] != m[n])
+    for n in only_a:
+        drift.append(f"{kind} {n}: in the plan but not in the migration")
+    for n in only_m:
+        drift.append(f"{kind} {n}: in the migration but not in the plan")
+    for n in differs:
+        drift.append(f"{kind} {n}: definitions differ")
+    print(f"  {kind:6} plan={len(a):2}  migration={len(m):2}  "
+          f"{'OK' if not (only_a or only_m or differs) else 'DRIFT'}")
+
+if drift:
+    print()
+    for d in drift:
+        print(f"  [DRIFT] {d}")
+    print()
+    print("The plan and the shipped schema disagree. Fix the plan, not the checker.")
+    sys.exit(1)
+print("\n  no drift: the plan's Appendix A and the shipped migration are equivalent.")
+
+# ---------------------------------------------------------------------------
+# 2. Invariants, against the shipped migration
+# ---------------------------------------------------------------------------
+
+con = sqlite3.connect(":memory:")
+con.execute("PRAGMA foreign_keys = ON")
+con.executescript(migration_sql)
+
+tables = [r[0] for r in con.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+indexes = [r[0] for r in con.execute(
+    "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+not_strict = [r[0] for r in con.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
+              if "STRICT" not in r[1]]
+
+print()
+print(f"migration applied: {len(tables)} tables, {len(indexes)} named indexes")
+
+TS = "2026-09-25T06:27:22.000+00:00"
+DAY = "2026-09-25"
+SPACE_TS = "2026-09-25 06:27:22"
+results = []
+
+
+def expect(name, sql, args, should_pass):
+    try:
+        con.execute(sql, args)
+        ok, detail = should_pass, "accepted"
+    except sqlite3.Error as exc:
+        ok, detail = (not should_pass), f"refused ({exc})"
+    results.append((ok, name, detail))
+
+
+results.append((len(tables) == 17, "the schema has 17 tables", f"{len(tables)}: {', '.join(tables)}"))
+results.append((not not_strict, "every table is declared STRICT",
+                "all 17" if not not_strict else f"missing on: {not_strict}"))
+
+# No money or token column may be REAL — STRICT would reject the type name, but
+# assert the *intent* too so a future non-STRICT table cannot slip through.
+floatish = []
+for t in tables:
+    for cid, cname, ctype, *_ in con.execute(f"PRAGMA table_xinfo('{t}')"):
+        if re.search(r"REAL|FLOAT|DOUB|NUMERIC|DECIMAL", ctype or "", re.I):
+            floatish.append(f"{t}.{cname} {ctype}")
+results.append((not floatish, "no REAL/FLOAT/NUMERIC column anywhere",
+                "none" if not floatish else ", ".join(floatish)))
+
+# Every TEXT timestamp column must carry a format CHECK. Find them by name suffix.
+ts_cols = []
+for t in tables:
+    for cid, cname, ctype, notnull, dflt, pk, *rest in con.execute(f"PRAGMA table_xinfo('{t}')"):
+        if re.search(r"(_at|expires_at)$", cname) or cname == "day":
+            ts_cols.append((t, cname))
+ddl = {t: con.execute("SELECT sql FROM sqlite_master WHERE name=?", (t,)).fetchone()[0] for t in tables}
+unchecked = [f"{t}.{c}" for t, c in ts_cols
+             if "GLOB" not in ddl[t] or f"{c} GLOB" not in ddl[t].replace("\n", " ")]
+results.append((not unchecked, f"all {len(ts_cols)} date/time columns have a GLOB CHECK",
+                "all guarded" if not unchecked else f"unguarded: {unchecked}"))
+
+# No time may be written by SQL: a DEFAULT CURRENT_TIMESTAMP would emit the wrong format.
+defaults = [f"{t}" for t in tables if "CURRENT_TIMESTAMP" in ddl[t].upper()]
+results.append((not defaults, "no DEFAULT CURRENT_TIMESTAMP anywhere",
+                "none" if not defaults else f"present on: {defaults}"))
+
+print("\n--- type enforcement (the STRICT payoff) ---")
+con.execute("INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)", ("a1", TS, TS))
+con.execute("INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?,?,?)", ("a1", 10000, TS))
+con.execute("INSERT INTO api_keys (id, account_id, key_hash, prefix, created_at) VALUES (?,?,?,?,?)",
+            ("k1", "a1", "h1", "apk_x", TS))
+expect("REAL refused in an INTEGER money column",
+       "INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?,?,?)",
+       ("a2", 1.5, TS), False)
+expect("TEXT refused in an INTEGER money column",
+       "INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?,?,?)",
+       ("a3", "lots", TS), False)
+expect("TEXT refused in an INTEGER flag column",
+       "INSERT INTO accounts (id, is_operator, created_at, updated_at) VALUES (?,?,?,?)",
+       ("a4", "yes", TS, TS), False)
+con.execute("INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)", ("a5", TS, TS))
+expect("INTEGER money accepted",
+       "INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?,?,?)",
+       ("a5", 50000, TS), True)
+expect("balance floor still enforced",
+       "INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?,?,?)",
+       ("a6", -1, TS), False)
+
+print("\n--- timestamps ---")
+expect("space format refused by the GLOB CHECK",
+       "INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)",
+       ("a7", SPACE_TS, SPACE_TS), False)
+expect("Z form refused by the GLOB CHECK",
+       "INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)",
+       ("a8", "2026-09-25T06:27:22Z", "2026-09-25T06:27:22Z"), False)
+expect("RFC3339 with offset accepted",
+       "INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)",
+       ("a9", TS, TS), True)
+
+print("\n--- identity constraints ---")
+expect("google identity must be email_verified",
+       "INSERT INTO identities (id, account_id, provider, subject, email, email_verified, "
+       "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+       ("i1", "a1", "google", "sub1", "u@example.com", 0, TS, TS), False)
+expect("password identity must carry a hash",
+       "INSERT INTO identities (id, account_id, provider, subject, email, email_verified, "
+       "password_hash, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+       ("i2", "a1", "password", "u@example.com", "u@example.com", 0, None, TS, TS), False)
+expect("password identity WITH a hash accepted",
+       "INSERT INTO identities (id, account_id, provider, subject, email, email_verified, "
+       "password_hash, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+       ("i3", "a1", "password", "u@example.com", "u@example.com", 0, "$argon2id$v=19$...", TS, TS), True)
+expect("unknown ledger reason refused",
+       "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) "
+       "VALUES (?,?,?,?,?)", ("a1", 100, "theft", 100, TS), False)
+expect("ledger 'adjustment' accepted (the admin path)",
+       "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) "
+       "VALUES (?,?,?,?,?)", ("a1", 100, "adjustment", 100, TS), True)
+
+print("\n--- STRICT implies NOT NULL on PRIMARY KEY columns ---")
+expect("NULL refused in a composite PRIMARY KEY",
+       "INSERT INTO key_ip_daily (api_key_id, day, distinct_ips, request_count) VALUES (?,?,?,?)",
+       (None, DAY, 1, 1), False)
+expect("NULL refused in a single-column TEXT PRIMARY KEY",
+       "INSERT INTO key_ip_seen (api_key_id, day, ip_hash) VALUES (?,?,?)",
+       ("k1", DAY, None), False)
+
+print("\n--- sessions.last_seen_at (new in this schema) ---")
+expect("a session without last_seen_at is refused (idle bound is not optional)",
+       "INSERT INTO sessions (id, account_id, token_hash, expires_at, created_at) VALUES (?,?,?,?,?)",
+       ("s1", "a1", "th1", TS, TS), False)
+expect("a session WITH last_seen_at is accepted",
+       "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at) "
+       "VALUES (?,?,?,?,?,?)", ("s2", "a1", "th2", TS, TS, TS), True)
+
+print("\n--- the usage_daily fix under STRICT ---")
+UP = ("INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens) VALUES (?,?,?,?) "
+      "ON CONFLICT (account_id, day, COALESCE(api_key_id, '')) DO UPDATE "
+      "SET input_tokens = input_tokens + excluded.input_tokens")
+for _ in range(3):
+    con.execute(UP, ("a1", None, DAY, 10))
+r = con.execute("SELECT COUNT(*), SUM(input_tokens) FROM usage_daily WHERE api_key_id IS NULL").fetchone()
+results.append((r == (1, 30), "NULL-key upsert accumulates to 1 row / 30 tokens", f"rows={r[0]} tokens={r[1]}"))
+for _ in range(3):
+    con.execute(UP, ("a1", "k1", DAY, 5))
+r = con.execute("SELECT COUNT(*), SUM(input_tokens) FROM usage_daily WHERE api_key_id='k1'").fetchone()
+results.append((r == (1, 15), "keyed upsert accumulates to 1 row / 15 tokens", f"rows={r[0]} tokens={r[1]}"))
+# A NULL-keyed row and a keyed row must coexist for the same (account, day).
+r = con.execute("SELECT COUNT(*) FROM usage_daily WHERE account_id='a1' AND day=?", (DAY,)).fetchone()[0]
+results.append((r == 2, "a NULL-key row and a keyed row coexist for one (account, day)", f"rows={r}"))
+
+print("\n--- referential integrity ---")
+expect("FK: a key referencing a ghost account is refused",
+       "INSERT INTO api_keys (id, account_id, key_hash, prefix, created_at) VALUES (?,?,?,?,?)",
+       ("k9", "ghost", "h9", "apk_y", TS), False)
+expect("RESTRICT: hard-deleting a funded account is refused",
+       "DELETE FROM accounts WHERE id = ?", ("a1",), False)
+expect("topups order_id uniqueness enforced",
+       "INSERT INTO topups (id, account_id, amount_idr, order_id, created_at) VALUES (?,?,?,?,?)",
+       ("t1", "a1", 50000, "ORD-1", TS), True)
+expect("topups duplicate order_id refused",
+       "INSERT INTO topups (id, account_id, amount_idr, order_id, created_at) VALUES (?,?,?,?,?)",
+       ("t2", "a1", 50000, "ORD-1", TS), False)
+
+# RESTRICT: a key with billing history cannot be hard-deleted (section 4.10).
+expect("RESTRICT: deleting a key with usage_daily history is refused",
+       "DELETE FROM api_keys WHERE id = ?", ("k1",), False)
+con.execute("DELETE FROM usage_daily WHERE api_key_id = 'k1'")
+con.execute("DELETE FROM api_keys WHERE id = 'k1'")
+left = con.execute("SELECT COUNT(*) FROM api_keys WHERE id = 'k1'").fetchone()[0]
+results.append((left == 0, "key delete succeeds once its usage_daily rows are gone", f"{left} remaining"))
+
+# The accounts.id-only rule: pb_user_id must be gone.
+cols = [r[1] for r in con.execute("PRAGMA table_xinfo('accounts')")]
+results.append(("pb_user_id" not in cols, "accounts has no pb_user_id (Rust owns the key)",
+                ", ".join(cols)))
+
+print()
+print("=" * 78)
+bad = 0
+for ok, name, detail in results:
+    print(f"[{'PASS' if ok else 'FAIL':4}] {name}\n        -> {detail}")
+    if not ok:
+        bad += 1
+print("=" * 78)
+print(f"{len(results)} checks, {bad} failed")
+sys.exit(1 if bad else 0)
