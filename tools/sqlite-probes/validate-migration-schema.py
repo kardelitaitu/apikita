@@ -167,7 +167,7 @@ results.append((not defaults, "no DEFAULT CURRENT_TIMESTAMP anywhere",
                 "none" if not defaults else f"present on: {defaults}"))
 
 print("\n--- type enforcement (the STRICT payoff) ---")
-con.execute("INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)", ("a1", TS, TS))
+con.execute("INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?,?,?,?)", ("a1", "pb_a1", TS, TS))
 con.execute("INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?,?,?)", ("a1", 10000, TS))
 con.execute("INSERT INTO api_keys (id, account_id, key_hash, prefix, created_at) VALUES (?,?,?,?,?)",
             ("k1", "a1", "h1", "apk_x", TS))
@@ -178,9 +178,9 @@ expect("TEXT refused in an INTEGER money column",
        "INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?,?,?)",
        ("a3", "lots", TS), False)
 expect("TEXT refused in an INTEGER flag column",
-       "INSERT INTO accounts (id, is_operator, created_at, updated_at) VALUES (?,?,?,?)",
-       ("a4", "yes", TS, TS), False)
-con.execute("INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)", ("a5", TS, TS))
+       "INSERT INTO accounts (id, pb_user_id, is_operator, created_at, updated_at) VALUES (?,?,?,?,?)",
+       ("a4", "pb_a4", "yes", TS, TS), False)
+con.execute("INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?,?,?,?)", ("a5", "pb_a5", TS, TS))
 expect("INTEGER money accepted",
        "INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?,?,?)",
        ("a5", 50000, TS), True)
@@ -190,14 +190,14 @@ expect("balance floor still enforced",
 
 print("\n--- timestamps ---")
 expect("space format refused by the GLOB CHECK",
-       "INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)",
-       ("a7", SPACE_TS, SPACE_TS), False)
+       "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?,?,?,?)",
+       ("a7", "pb_a7", SPACE_TS, SPACE_TS), False)
 expect("Z form refused by the GLOB CHECK",
-       "INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)",
-       ("a8", "2026-09-25T06:27:22Z", "2026-09-25T06:27:22Z"), False)
+       "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?,?,?,?)",
+       ("a8", "pb_a8", "2026-09-25T06:27:22Z", "2026-09-25T06:27:22Z"), False)
 expect("RFC3339 with offset accepted",
-       "INSERT INTO accounts (id, created_at, updated_at) VALUES (?,?,?)",
-       ("a9", TS, TS), True)
+       "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?,?,?,?)",
+       ("a9", "pb_a9", TS, TS), True)
 
 print("\n--- identity constraints ---")
 expect("google identity must be email_verified",
@@ -272,9 +272,12 @@ con.execute("DELETE FROM api_keys WHERE id = 'k1'")
 left = con.execute("SELECT COUNT(*) FROM api_keys WHERE id = 'k1'").fetchone()[0]
 results.append((left == 0, "key delete succeeds once its usage_daily rows are gone", f"{left} remaining"))
 
-# The accounts.id-only rule: pb_user_id must be gone.
+# `pb_user_id` must still be here: PocketBase remains the identity provider until
+# Phase 6, and auth.rs creates the account through this column. Dropping it in
+# Phase 2 would break login while the plan claims Phases 1-5 ship intact.
 cols = [r[1] for r in con.execute("PRAGMA table_xinfo('accounts')")]
-results.append(("pb_user_id" not in cols, "accounts has no pb_user_id (Rust owns the key)",
+results.append(("pb_user_id" in cols,
+                "accounts still carries pb_user_id (PocketBase owns identity until Phase 6)",
                 ", ".join(cols)))
 
 print()

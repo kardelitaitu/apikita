@@ -17,6 +17,12 @@
 
 CREATE TABLE accounts (
   id          TEXT PRIMARY KEY,
+  -- PocketBase link. STILL PRESENT and NOT NULL, because PocketBase remains the
+  -- identity provider through Phases 1-5: auth.rs creates the account with
+  -- `INSERT INTO accounts (pb_user_id) ... ON CONFLICT (pb_user_id)` and
+  -- account.rs reads it back. Dropping it here would break login, contradicting
+  -- the plan's claim that Phases 1-5 ship with identity intact. Phase 6 drops it.
+  pb_user_id  TEXT NOT NULL UNIQUE,
   status      TEXT NOT NULL DEFAULT 'active'
               CHECK (status IN ('active','suspended','closed')),
   is_operator INTEGER NOT NULL DEFAULT 0 CHECK (is_operator IN (0,1)),
@@ -25,7 +31,8 @@ CREATE TABLE accounts (
 ) STRICT;
 
 -- Replaces PocketBase. One account, many identities (identity.md invariant 1).
--- `pb_user_id` is gone: accounts.id is the only key.
+-- Additive for now: created empty in Phase 2 and populated in Phase 6, which is
+-- when `accounts.pb_user_id` is dropped and accounts.id becomes the only key.
 CREATE TABLE identities (
   id             TEXT PRIMARY KEY,
   account_id     TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
