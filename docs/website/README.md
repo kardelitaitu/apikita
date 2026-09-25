@@ -30,10 +30,11 @@ It does **not** proxy LLM requests. That is [`server/`](../../server/README.md).
 
 ## Status
 
-**The website is partly built and builds green.** Measured for this revision:
-`cd website && npm run build` emits **12 static pages** and `npm test` passes
-**18 tests** (`node --test "tests/**/*.test.ts"`). What follows separates what
-exists from what is designed-but-unbuilt; unbuilt items are marked, never deleted.
+**The website is built and builds green.** Measured for this revision:
+`cd website && npm run build` emits **14 static pages** and `npm test` passes
+**24 tests** (`node --test "tests/**/*.test.ts"`). Every route in the spec's table
+(lines 9-21) now has a page. What follows separates what exists from what is
+designed-but-unbuilt; unbuilt items are marked, never deleted.
 
 ### What exists today
 
@@ -51,6 +52,8 @@ Every route below has a file under `website/src/pages/` and is emitted by the bu
 | `/dashboard/keys` | `src/pages/dashboard/keys.astro` | Mounts the `KeyManagement` island |
 | `/dashboard/usage` | `src/pages/dashboard/usage.astro` | Mounts the `UsageAnalytics` island |
 | `/dashboard/wallet` | `src/pages/dashboard/wallet.astro` | Mounts the `TopUpForm` island |
+| `/dashboard/keys/new` | `src/pages/dashboard/keys/new.astro` | Create-key page: mounts the island, explains allowlist semantics |
+| `/dashboard/settings` | `src/pages/dashboard/settings.astro` | Profile, password change, linked accounts (read-only) |
 | `/docs` | `src/pages/docs/index.astro` | Index over the docs pages |
 | `/docs/quickstart` | `src/pages/docs/quickstart.astro` | The integration guide itself |
 
@@ -79,16 +82,25 @@ the islands call these; `website/tests/auth-flow.test.ts` and
 `/webhooks/midtrans`, `/v1/chat/completions`, and four `/api/admin/*` routes
 (see [admin-surface.md](../admin-surface.md)).
 
-**Specified but not built.** `docs/website/03-functional-spec.md` lists two routes
-that have no file under `src/pages/`:
+**Both remaining spec'd routes are now built** (`/dashboard/keys/new`,
+`/dashboard/settings`), so the route table above is complete: every route in
+`docs/website/03-functional-spec.md` lines 9-21 has a page.
 
-> **Status: NOT IMPLEMENTED.** `/dashboard/keys/new` — key creation happens
-> inside the `KeyManagement` island on `/dashboard/keys` instead.
-> `/dashboard/settings` — profile, password, linked accounts.
+`/dashboard/keys/new` does **not** duplicate key creation. It mounts the
+`KeyManagement` island and opens its create modal, so the island remains the single
+`POST /api/keys` call site; the page adds the allowlist-semantics explanation the
+modal cannot fit.
 
 > **Status: NOT IMPLEMENTED (no UI).** Logout and "sign out everywhere" have server
-> routes (`/auth/logout`, `/auth/logout-all`) but no control found in the dashboard
-> shell.
+> routes (`/auth/logout`, `/auth/logout-all`) and the dashboard shell carries both
+> controls (`layouts/DashboardLayout.astro`), but "sign out everywhere" is only in the
+> header today — `/dashboard/settings` links to it rather than repeating it.
+
+> **Status: NOT IMPLEMENTED.** Telegram link/unlink is read-only.
+> `docs/server/api-spec.md` specifies `POST /api/telegram/link-code` and
+> `DELETE /api/telegram`, but `server/src/routes/mod.rs` mounts **zero** telegram
+> routes. `/dashboard/settings` therefore shows the linked state and explains the flow
+> without shipping a control that could not work.
 
 **One decision has overtaken the code.** `src/lib/pocketbase.ts`, `login.astro`,
 `signup.astro` and `verify.astro` all speak to PocketBase, while
@@ -123,7 +135,7 @@ The page layer is largely written. What remains:
    **superseded**: [`docs/decisions.md`](../decisions.md) settles identity as
    Rust-owned with the PocketBase id column dropped, so this is no longer the work.
 2. ~~Astro pages and the dashboard islands~~ — **built**; see "What exists today".
-   The remaining page gaps are `/dashboard/keys/new` and `/dashboard/settings`.
+   No page gaps remain: every route in the spec's table has a file.
 3. **Proxy-side key enforcement and limit checks**
    ([06-api-keys-and-limits.md](06-api-keys-and-limits.md)) — `server/src/routes/proxy.rs`
    is mounted; whether it enforces every rule in that document was **not verified**
