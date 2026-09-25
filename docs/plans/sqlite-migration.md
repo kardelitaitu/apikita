@@ -91,10 +91,14 @@ also less code — the session extractor already exists.
 The draft's UI stores the key in `sessionStorage`, which is readable by any XSS on
 the origin. Even if a static key were wanted, `sessionStorage` is the wrong place.
 
-### 2.4 The four-table schema would delete fourteen tables
+### 2.4 The four-table schema would delete twelve tables
 
 The draft proposes `users`, `api_keys`, `usage_logs`, `balance_adjustments`. The
-existing schema has eighteen tables. What the draft drops, and what depends on it:
+existing schema has **fifteen** tables — counted, not recalled: fifteen `CREATE TABLE`
+statements in the single migration, and the same fifteen in
+[`website/02-data-model.md`](../website/02-data-model.md). *(This section previously said
+eighteen, which made the arithmetic look consistent while being wrong about the schema.)*
+What the draft drops, and what depends on it:
 
 | Dropped | Consequence |
 | --- | --- |
