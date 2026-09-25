@@ -420,6 +420,7 @@ pub async fn sse_events_handler(
             .into_iter()
             // DEFECT 1: only this account's replayed events escape to the wire.
             .filter(|e| e.account_id == account_id)
+            // DEFECT 1: only this account's replayed events escape to the wire.
             .map(|e| Ok(e.into_event()))
             .collect(),
         Resume::Snapshot => state
@@ -1370,6 +1371,317 @@ mod tests {
         assert!(
             !body.contains("\"input_tokens\":55"),
             "A's replay leaked B's usage: {body:?}"
+        );
+
+        for account_id in [a_id, b_id] {
+            assert_eq!(
+                drift_rows(&pool, account_id).await,
+                0,
+                "the fixture must not manufacture ledger drift"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. sse_events_handler - the LIVE broadcast branch, two streams at once
+    // -----------------------------------------------------------------------
+    //
+    // The snapshot tests (3, 4) and the replay test above never touch the branch a
+    // connected dashboard actually lives on: the live unfold at events.rs:386-407,
+    // where a process-wide broadcast is filtered per subscriber (events.rs:391).
+    // The replay test pins the filter at events.rs:422; its live twin was proven
+    // only in memory, by mirroring the filter by hand
+    // (a_subscriber_only_sees_its_own_account_events). This drives it end to end.
+    //
+    // HOW THE LIVE BRANCH IS REACHED - through the real socket, no fake:
+    // the handler subscribes to the hub at events.rs:386 BEFORE it reads the
+    // snapshot, and it owns the connection guard (events.rs:443). Awaiting the
+    // handler's response therefore proves the subscription is open and the guard
+    // is held, with no sleep-and-hope. Publishing then goes through the hub's real
+    // API (publish_balance, events.rs:306) and the frame is read off the real SSE
+    // body.
+    //
+    // WHY THE PUBLISH ORDER IS THE ASSERTION: RealtimeEvent::into_event
+    // (events.rs:110) puts only the id, the name and the JSON payload on the wire -
+    // account_id is deliberately NOT serialized, it exists solely to be filtered
+    // on. So isolation has to be proven by value. Both events are published before
+    // either stream is read, and the broadcast channel is FIFO per receiver, so on
+    // a stream that fails to filter, the OTHER account's frame is provably already
+    // in the buffer at the moment this account's own frame completes. That makes
+    // the leak deterministic rather than a race with a timeout.
+
+    /// One frame exactly as it came off the wire.
+    struct WireFrame {
+        event: String,
+        data: String,
+    }
+
+    /// The "event:"/"data:" lines of every complete frame in an SSE body.
+    ///
+    /// The "id:" line is deliberately not parsed: it carries the hub's global
+    /// monotonic id (events.rs:175), which is shared across accounts by design.
+    fn wire_frames(body: &str) -> Vec<WireFrame> {
+        body.split("\n\n")
+            .filter(|frame| !frame.trim().is_empty())
+            .map(|frame| {
+                let mut event = String::new();
+                let mut data = String::new();
+                for line in frame.lines() {
+                    if let Some(rest) = line.strip_prefix("event:") {
+                        event = rest.trim().to_string();
+                    } else if let Some(rest) = line.strip_prefix("data:") {
+                        data = rest.trim().to_string();
+                    }
+                }
+                WireFrame { event, data }
+            })
+            .collect()
+    }
+
+    /// The balance a frame carries, or None when it is not a balance frame (or is
+    /// still half-written). Never panics: this runs inside the read loop.
+    fn frame_balance(frame: &WireFrame) -> Option<i64> {
+        if frame.event != "balance" {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(&frame.data)
+            .ok()?
+            .get("balance_idr")?
+            .as_i64()
+    }
+
+    /// The balance values a stream carried on its LIVE half - everything after the
+    /// two snapshot frames. An empty vec means the live branch delivered nothing.
+    fn live_balances(body: &str) -> Vec<i64> {
+        wire_frames(body)
+            .into_iter()
+            .skip(2) // the snapshot is always one balance frame then one usage frame
+            .filter_map(|frame| frame_balance(&frame))
+            .collect()
+    }
+
+    /// Reads a live SSE body until it has seen a balance frame carrying
+    /// want_balance_idr, then returns everything read.
+    ///
+    /// Bounded by a deadline so a filter that drops the event FAILS the test
+    /// instead of hanging it. The stop condition is deliberately the account's own
+    /// value and not a frame count: an unfiltered stream delivers the other
+    /// account's frame FIRST, and a count-based read would stop there and never
+    /// notice the leak.
+    async fn read_until_balance(response: axum::response::Response, want_balance_idr: i64) -> String {
+        let mut stream = Box::pin(response.into_body().into_data_stream());
+        let mut buffer = String::new();
+        let deadline = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(deadline);
+
+        loop {
+            if wire_frames(&buffer)
+                .iter()
+                .any(|frame| frame_balance(frame) == Some(want_balance_idr))
+            {
+                return buffer;
+            }
+
+            tokio::select! {
+                chunk = stream.next() => match chunk {
+                    Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
+                    Some(Err(err)) => panic!("the SSE body failed mid-stream: {err}"),
+                    None => return buffer,
+                },
+                _ = &mut deadline => return buffer,
+            }
+        }
+    }
+
+    /// THE DEFECT 1 REGRESSION, on the live branch: two accounts hold their
+    /// subscriptions OPEN AT THE SAME TIME, on two real SSE bodies, and balances are
+    /// published to A and then to B while both are live. A's stream must carry only
+    /// A's event and B's only B's - asserted on the values, frame by frame, not on
+    /// "it did not panic".
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_sse_two_open_streams_never_cross_accounts_on_the_live_broadcast() {
+        let pool = live_pool().await;
+        let a = live_account(&pool).await;
+        let b = live_account(&pool).await;
+
+        let outcome = tokio::spawn(live_broadcast_isolation_assertions(
+            pool.clone(),
+            (a.account_id, a.token.clone(), a.key_id),
+            (b.account_id, b.token.clone(), b.key_id),
+        ));
+        let outcome = outcome.await;
+        delete_fixture_rows(&pool, &[a.account_id, b.account_id]).await;
+        outcome.expect("the live broadcast isolation assertions panicked");
+    }
+
+    async fn live_broadcast_isolation_assertions(
+        pool: PgPool,
+        a: (Uuid, String, Uuid),
+        b: (Uuid, String, Uuid),
+    ) {
+        let (a_id, a_token, a_key) = a;
+        let (b_id, b_token, b_key) = b;
+
+        // DIFFERENT money and DIFFERENT usage, so a leak is a value mismatch
+        // rather than a coincidence.
+        fund_wallet(&pool, a_id, 73_500).await;
+        fund_wallet(&pool, b_id, 12_345).await;
+        insert_usage(&pool, a_id, a_key, today(), 1_200, 8_000, 400, 812).await;
+        insert_usage(&pool, b_id, b_key, today(), 77_000, 66_000, 55_000, 44_000).await;
+
+        // ONE hub for both handlers, exactly as the process shares one AppState.
+        let state = live_app_state(pool.clone());
+        let hub = Arc::clone(&state.events);
+
+        // BOTH subscriptions are open before anything is published. Awaiting the
+        // handler is what proves it: it subscribes at events.rs:386 ahead of the
+        // snapshot read, and its response owns a connection guard (events.rs:443).
+        let stream_a = sse_events_handler(State(state.clone()), cookie_headers(&a_token))
+            .await
+            .expect("account A's live stream")
+            .into_response();
+        let stream_b = sse_events_handler(State(state.clone()), cookie_headers(&b_token))
+            .await
+            .expect("account B's live stream")
+            .into_response();
+
+        // Both live. A's balance, then B's - the order the brief asks for - then
+        // A's fence: because the fence is published LAST, it cannot arrive on A's
+        // stream until B's frame (published earlier) has already been delivered
+        // there. That is what turns the leak into a deterministic failure.
+        publish_balance(&hub, a_id, 111_111);
+        publish_balance(&hub, b_id, 222_222);
+        publish_balance(&hub, a_id, 333_333);
+
+        let body_a = read_until_balance(stream_a, 333_333).await;
+        let body_b = read_until_balance(stream_b, 222_222).await;
+
+        // A's snapshot still carries A's real row, read from the database.
+        assert_eq!(
+            frame_payload(&body_a, "balance")["balance_idr"],
+            73_500,
+            "A's opening frame is its own wallet: {body_a:?}"
+        );
+
+        // The live half, frame by frame. An unfiltered stream reads
+        // [111111, 222222, 333333] here - the other account's money, visible.
+        assert_eq!(
+            live_balances(&body_a),
+            vec![111_111, 333_333],
+            "account A's LIVE stream carried a frame that is not A's own balance: {body_a:?}"
+        );
+        assert_eq!(
+            live_balances(&body_b),
+            vec![222_222],
+            "account B's LIVE stream carried a frame that is not B's own balance: {body_b:?}"
+        );
+
+        // Not one byte of the other account's money on either live stream.
+        assert!(
+            !body_a.contains("222222"),
+            "A's live stream leaked B's balance: {body_a:?}"
+        );
+        assert!(
+            !body_b.contains("111111") && !body_b.contains("333333"),
+            "B's live stream leaked A's balance: {body_b:?}"
+        );
+        assert!(
+            !body_a.contains("77000") && !body_b.contains("1200"),
+            "a snapshot frame crossed accounts: A={body_a:?} B={body_b:?}"
+        );
+
+        for account_id in [a_id, b_id] {
+            assert_eq!(
+                drift_rows(&pool, account_id).await,
+                0,
+                "the fixture must not manufacture ledger drift"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. sse_events_handler - the connection cap is per account
+    // -----------------------------------------------------------------------
+
+    /// The cap at events.rs:261-265 is keyed by account (events.rs:259). Exhaust
+    /// account A's slots through the real handler - each held response owns one
+    /// guard (events.rs:443) - and account B must still be admitted: a runaway
+    /// client on one account must never deny another account its dashboard. Then
+    /// dropping A's streams must hand A its slots back.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_sse_connection_cap_is_per_account_not_process_wide() {
+        let pool = live_pool().await;
+        let a = live_account(&pool).await;
+        let b = live_account(&pool).await;
+
+        let outcome = tokio::spawn(connection_cap_is_per_account_assertions(
+            pool.clone(),
+            (a.account_id, a.token.clone(), a.key_id),
+            (b.account_id, b.token.clone(), b.key_id),
+        ));
+        let outcome = outcome.await;
+        delete_fixture_rows(&pool, &[a.account_id, b.account_id]).await;
+        outcome.expect("the connection cap assertions panicked");
+    }
+
+    async fn connection_cap_is_per_account_assertions(
+        pool: PgPool,
+        a: (Uuid, String, Uuid),
+        b: (Uuid, String, Uuid),
+    ) {
+        let (a_id, a_token, _a_key) = a;
+        let (b_id, b_token, _b_key) = b;
+
+        fund_wallet(&pool, a_id, 73_500).await;
+        fund_wallet(&pool, b_id, 12_345).await;
+
+        let state = live_app_state(pool.clone());
+        let cap = state.config.realtime.max_connections_per_account;
+        assert!(cap >= 1, "a cap of {cap} would refuse every stream");
+
+        // A takes every slot it is entitled to, and HOLDS them: the guards live
+        // inside the response streams, so these must stay in scope.
+        let mut held = Vec::new();
+        for index in 0..cap {
+            held.push(
+                sse_events_handler(State(state.clone()), cookie_headers(&a_token))
+                    .await
+                    .unwrap_or_else(|_| panic!("A's stream {index} must be admitted")),
+            );
+        }
+
+        // One more for A is refused, and refused for the documented reason.
+        let refused = sse_events_handler(State(state.clone()), cookie_headers(&a_token)).await;
+        assert!(
+            matches!(refused, Err(AppError::RateLimited { .. })),
+            "A's {}th stream must be refused with RateLimited, not admitted",
+            cap + 1
+        );
+
+        // B's budget is untouched by A's exhaustion.
+        let b_response = sse_events_handler(State(state.clone()), cookie_headers(&b_token))
+            .await
+            .expect("B must not be refused because A exhausted A's own slots")
+            .into_response();
+        assert_eq!(b_response.status(), StatusCode::OK);
+
+        // B's stream genuinely works, not merely "did not error": its own balance
+        // arrives on its own socket.
+        let body_b = read_frames(b_response, 2).await;
+        assert_eq!(
+            frame_payload(&body_b, "balance")["balance_idr"],
+            12_345,
+            "the account admitted while A was capped must get its own wallet: {body_b:?}"
+        );
+
+        // Releasing A's streams frees A's slots.
+        drop(held);
+        let readmitted = sse_events_handler(State(state.clone()), cookie_headers(&a_token)).await;
+        assert!(
+            readmitted.is_ok(),
+            "dropping A's streams must return A's slots to A"
         );
 
         for account_id in [a_id, b_id] {
