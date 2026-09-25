@@ -944,19 +944,54 @@ parallel model.
 
 ### 5.8 Phase 8 — Tooling, harnesses, docs
 
-- `tools/reconcile/reconcile.sql` + `reconcile.sh` → SQLite (`sqlite3`, not `psql`).
-- `.agents/` harnesses: `e2e-money/bin/psql`, `psql.sh`, `e2e-sse/psql.sh`,
-  `e2e-sse/seed.sql`, `e2e-ui/*.mjs`, and every `e2e.toml` referencing Postgres.
-- **Docs sweep — 33 files mention PocketBase, 30 mention Postgres.** The heavy ones,
-  by mention count: `docs/architecture.md` (40 + 21), `docs/website/05-security-decisions.md`
-  (30 + 12), `docs/architecture/identity.md` (23 + 14), `docs/website/02-data-model.md`,
-  `docs/website/01-architecture.md`, `docs/local-development.md`,
-  `docs/backup-and-restore.md`, `docs/deployment.md`, `docs/ci-cd.md`,
-  `docs/data-retention.md`, `docs/cost-and-sizing.md`, `docs/observability.md`,
-  `docs/server/api-spec.md`, `docs/launch-checklist.md`, `docs/abuse-runbook.md`,
-  `docs/plan-audit.md`, plus `README.md` (the stack table) and `todo.md`.
-- `README.md` stack table: `Money | Northflank | PostgreSQL` and
-  `Identity | Northflank | PocketBase` both become one row: `Money + identity | Northflank | SQLite (embedded)`.
+Partly executed.
+
+- **DONE — `tools/reconcile/reconcile.sh`** now runs the `sqlite3` CLI instead of
+  `psql`. `reconcile.sql` needed no change: the query is plain ANSI SQL and runs
+  unchanged. Every exit path is verified by execution (0 clean, 1 drift, 2 bad URL,
+  3 `sqlite3` missing, 4 SQL/file error, 5 file absent), and the drift path is proven
+  by fault injection — a check that cannot fail is not a check. Two deliberate
+  choices: it opens `-readonly` so reconciliation can never write, and it matches the
+  URL prefix with a `case` rather than stripping it, so a leftover `postgres://…`
+  fails loudly instead of being rewritten into a plausible filename.
+- **DONE — `docs/local-development.md`** no longer describes a Postgres container or
+  `psql -f schema.sql`. It documents `cargo run --bin migrate`, and owns the
+  local-database-reset instructions that had been left in the `docker-compose.yml`
+  header (now a pointer).
+
+**Correction: the `.agents/` harness bullet below is stale and has been removed.** It
+listed `e2e-money/bin/psql`, `psql.sh`, `e2e-sse/psql.sh`, `e2e-sse/seed.sql`,
+`e2e-ui/*.mjs` and "every `e2e.toml` referencing Postgres". Measured: **none of them
+exist** — `git ls-files | grep e2e` returns nothing. The bullet was written before the
+tree was read. Anything that cannot be found has no port cost, and listing it makes the
+phase look larger than it is.
+
+**Correction: the file counts were low, and one of them points the wrong way.**
+Re-measured against `git ls-files`: **43** tracked files mention `postgres|psql|5432`
+(not 30) and **38** mention PocketBase (not 33). The first number overstates the work:
+most of those hits are `server/src/*.rs` and the migration, where "replaces the
+PostgreSQL …" is an intentional comment recording what the port changed, and deleting
+it would destroy the very explanation a reader needs.
+
+The PocketBase number is the one that matters and it does **not** mean 38 files to
+rewrite: **PocketBase is still the identity provider until Phase 6**
+([§6](#6-phase-2--identity-the-real-cost)), so the great majority of those mentions are
+*correct as written* and a find-and-replace would make the docs lie. The sweep is
+therefore a judgment pass, not a mechanical one — change the claim only where the
+document asserts PocketBase owns something SQLite now owns, or where it pre-announces
+Phase 6 as done.
+
+Remaining: `README.md` (the stack table), `config/apikita.toml`, `server/README.md`,
+`todo.md`, and the doc files named below, in descending mention count —
+`docs/architecture.md`, `docs/website/05-security-decisions.md`,
+`docs/architecture/identity.md`, `docs/website/02-data-model.md`,
+`docs/website/01-architecture.md`, `docs/backup-and-restore.md`, `docs/deployment.md`,
+`docs/ci-cd.md`, `docs/data-retention.md`, `docs/cost-and-sizing.md`,
+`docs/observability.md`, `docs/server/api-spec.md`, `docs/launch-checklist.md`,
+`docs/abuse-runbook.md`, `docs/plan-audit.md`.
+- `README.md` stack table: `Money | Northflank | PostgreSQL` becomes
+  `Money | Northflank | SQLite (embedded)`. The `Identity | Northflank | PocketBase`
+  row stays until Phase 6.
 
 ---
 
