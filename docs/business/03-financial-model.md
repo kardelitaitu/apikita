@@ -40,7 +40,8 @@ function of tokens, so the model is built bottom-up from token volume rather
 than top-down from market size.
 
 **Headline:** the decisive input is not price or margin — it is **support cost
-per customer**. At 20M tokens/month, M=1.50 customers are contribution-negative
+per customer**, which is set by how support is delivered — see
+[`docs/support-model.md`](../support-model.md). At 20M tokens/month, M=1.50 customers are contribution-negative
 against a 25,000 IDR support cost. See [Volume, not deposit size](#volume-not-deposit-size-is-the-real-gate).
 
 ## Input parameters
@@ -55,7 +56,7 @@ against a 25,000 IDR support cost. See [Volume, not deposit size](#volume-not-de
 | `growth_mo` | MoM customer growth | 15% | 5–40% | `[ASSUMPTION]` |
 | `churn_mo` | Monthly logo churn | 8% | 3–15% | `[ASSUMPTION]` |
 | `infra_fixed` | Edge + DB + monitoring | 3,000,000 IDR | — | `[ASSUMPTION]` |
-| `cost_support` | Support per customer/mo | 25,000 IDR | 5k–50k | `[ASSUMPTION]` — **most sensitive input** |
+| `cost_support` | Support per customer/mo | 25,000 IDR | 5k–50k | `[ASSUMPTION]` — **most sensitive input**. Delivery model: [`docs/support-model.md`](../support-model.md) |
 | `qris_fee` | Top-up processing | 0.7% | 0.7–2.0% | `[ASSUMPTION]` |
 | `settle_lag` | Settlement delay | T+1 | T+1/T+2 | `[ASSUMPTION]` |
 | `wastage` | Upstream spend not billed to anyone | 5% of GM | 2–15% | `[ASSUMPTION]` |
