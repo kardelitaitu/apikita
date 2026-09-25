@@ -134,12 +134,36 @@ key_metadata_cache_seconds = 60
 # ignored entirely, because a caller who can choose their recorded address can
 # hide key sharing — the exact signal docs/ip-tracking.md exists to raise.
 #
-# 127.0.0.1/32 and ::1/128 are for local development, where a relay is not in
-# the path at all. The Docker bridge ranges cover the nginx container in
-# docker-compose.yml, which has no fixed address. IN PRODUCTION THIS SHOULD
-# LIST THE RELAY ONLY: a rule broad enough to include a customer will trust a
-# header that customer forged.
-trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128", "172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
+# THIS DEFAULT IS THE LOCAL DEVELOPMENT STACK ONLY. The relay is an nginx
+# container (docker-compose.yml) that proxies to the API on the host, so the
+# peer the API observes is a host-side address, not the container's. Verified
+# on this machine: the compose bridge is 172.21.0.0/16 (docker network inspect
+# apikita_default), the nginx container's own address is 172.21.0.4, and a
+# request from that container to a server on the host arrives with peer
+# 127.0.0.1 — Docker Desktop publishes it through the host gateway
+# (192.168.65.254). So loopback covers both the direct and the relayed path
+# here, and 172.21.0.0/16 covers a native Linux daemon, where the container's
+# 172.21.0.x address is the peer. The relay has no fixed address, which is why
+# the bridge SUBNET is named rather than a single address.
+#
+# The sweeping RFC1918 ranges that used to sit here (10.0.0.0/8,
+# 192.168.0.0/16, 172.16.0.0/12) are gone: they are not what local development
+# needs, and per docs/topology.md:39-42 the backend stays directly reachable
+# for failover, so "on the private network" is not a security boundary. Any
+# co-tenant or dev box in those ranges could set X-Forwarded-For and choose the
+# address it is recorded as.
+#
+# THIS LINE MUST BE SET PER ENVIRONMENT, AND IN PRODUCTION IT MUST NAME THE
+# RELAY ONLY — one address, e.g. "203.0.113.7/32", never a range that merely
+# contains it. There is no deploy-time injection today: the server reads
+# APIKITA_CONFIG_PATH (default "config/apikita.toml", relative to the working
+# directory — server/src/main.rs), so production ships its own copy of this
+# file with this line replaced. A rule broad enough to include a customer will
+# trust a header that customer forged.
+#
+# server/src/config.rs refuses to start on a default route (0.0.0.0/0, ::/0) or
+# on any prefix shorter than /16, so this cannot be widened by accident.
+trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128", "172.21.0.0/16"]
 
 # ===========================================================================
 # REALTIME (SSE)
