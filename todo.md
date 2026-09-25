@@ -10,7 +10,9 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 
 - [x] **Documentation & Architecture**
   - [x] Settle core decisions register ([`docs/decisions.md`](docs/decisions.md))
-  - [x] Design PostgreSQL schema ([`docs/website/02-data-model.md`](docs/website/02-data-model.md))
+  - [x] Design the schema — PostgreSQL at the time; the tree is now SQLite
+    ([`docs/website/02-data-model.md`](docs/website/02-data-model.md),
+    [`docs/plans/sqlite-migration.md`](docs/plans/sqlite-migration.md))
   - [x] Define HTTP API specification ([`docs/server/api-spec.md`](docs/server/api-spec.md))
   - [x] Audit cross-document consistency and patch obsolete PocketBase/Pages references
   - [x] Confirm official Midtrans SHA-512 constant-time signature formula
@@ -19,7 +21,8 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [x] Initialize Git on branch `main` and remote `kardelitaitu/apikita.git`
   - [x] Branch out to active development branch `0.0.1`
 - [x] **Scaffolding & Foundations**
-  - [x] Initial PostgreSQL migration script ([`server/migrations/20260925000000_initial_schema.sql`](server/migrations/20260925000000_initial_schema.sql))
+  - [x] Initial migration script — the file below is now the SQLite schema
+    ([`server/migrations/20260925000000_initial_schema.sql`](server/migrations/20260925000000_initial_schema.sql))
   - [x] Strongly-typed config parser and validator ([`server/src/config.rs`](server/src/config.rs))
   - [x] Core money calculations & constant-time signature verification ([`server/src/money.rs`](server/src/money.rs))
   - [x] Atomic ledger transaction functions ([`server/src/db.rs`](server/src/db.rs))
@@ -35,6 +38,7 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 
 - [x] **Docker Compose Local Environment (`docker-compose.yml`)**
   - [x] PostgreSQL 16 container on port `5432` with automatic migration runner
+    — later removed: the database is a file, applied by `cargo run --bin migrate`
   - [x] PocketBase container on port `8090` (identity only)
   - [x] Nginx Edge Relay container on port `8000` (proxying to server `8080`, with `proxy_buffering off` on `/events` and `/v1/*`)
 - [x] **Fake Upstream Provider Service**
@@ -124,7 +128,8 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 
 - [ ] **Infrastructure Setup**
   - [ ] Deploy Astro frontend to **Cloudflare Pages**
-  - [ ] Provision **PostgreSQL** instance with persistent volume
+  - [ ] Provision a **persistent volume** for the SQLite database file (not a
+        database instance — there is none to provision)
   - [ ] Deploy PocketBase auth instance on Northflank
   - [ ] Deploy Rust API container to **Northflank** (0.2 vCPU developer tier)
   - [ ] Configure custom domain and SSL certificates on Cloudflare

@@ -12,8 +12,10 @@ and operator alerts (see [`telegram/`](../telegram/README.md)).
 
 ## Stack
 
-**Rust, deployed on Northflank.** Runs alongside PostgreSQL (money) and
-PocketBase (identity) — see [`docs/architecture.md`](../docs/architecture.md).
+**Rust, deployed on Northflank.** Money lives in embedded SQLite — a file, not a
+service — and identity comes from PocketBase until Phase 6 replaces it in Rust. See
+[`docs/architecture.md`](../docs/architecture.md) and
+[`docs/plans/sqlite-migration.md`](../docs/plans/sqlite-migration.md).
 
 Framework is not yet fixed; Tokio is assumed, with `axum` for HTTP as the
 whitepaper implies.

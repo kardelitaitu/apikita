@@ -80,7 +80,7 @@ low_balance_max_per_day = 1
 # ===========================================================================
 
 [sessions]
-# Cookie sessions, stored server-side in Postgres. Logout revokes the row,
+# Cookie sessions, stored server-side in SQLite. Logout revokes the row,
 # so these are hard bounds rather than advisory.
 #
 # Absolute: the session dies at this age regardless of activity.
@@ -114,7 +114,7 @@ key_creation_per_day = 10
 review_per_hour = 3
 
 # How long the proxy caches API key metadata (limits, model allowlist,
-# revoked state) before re-reading from Postgres.
+# revoked state) before re-reading from SQLite.
 #
 # This is the window in which a revoked key still works and a lowered limit
 # has not applied. Documented in decisions.md as 60s: short enough to bound
