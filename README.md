@@ -94,15 +94,26 @@ Push to `main` deploys. Reasoning and consequences:
 
 ## Status
 
-**Planning complete; implementation not started.** Nothing is deployed and no
-application code exists.
+**Built locally; nothing deployed.** The server and the website both exist and
+pass their test suites — but no environment is live and no customer has been served.
 
 Settled (41 documents): the stack and topology, the identity model, the PostgreSQL
 schema (validated with a SQL parser), the full HTTP API, payments, API keys and
 limits, realtime, failover, the relay, deployment, cost, observability, backup,
 abuse handling, data retention, and the Terms of Service outline.
 
-Not yet: any application code.
+What exists today:
+
+| Surface | State |
+| --- | --- |
+| [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → 200 passed / 75 ignored; the live database suite passes against real Postgres. |
+| [`website/`](website/README.md) | Astro site. `npm run build` → 12 pages; `npm test` → 18 passed. |
+| [`tools/`](tools/) | `reconcile`, `backup`, `drill`, `alert`, `fake-upstream`, `fake-midtrans` — each with a documented exit-code contract. |
+| [`telegram/`](telegram/README.md) | Design only — no code yet. |
+
+Not yet: a deployment, a live Midtrans round-trip, and the operational gates in
+[`docs/launch-checklist.md`](docs/launch-checklist.md) — Gate 0 (legal) blocks the
+rest.
 
 ## Secrets
 
