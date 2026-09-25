@@ -1,0 +1,290 @@
+---
+// /dashboard/settings — docs/website/03-functional-spec.md line 20:
+// "Profile, password, linked accounts", and section "## Settings" (lines 149-154).
+//
+// What this page deliberately does NOT contain: a "Sign out everywhere" control.
+// DashboardLayout.astro already renders one in the header of every dashboard page
+// (spec lines 76-86 require both controls, labelled differently). A second button
+// here would be a second copy of one action, and the two would drift in wording
+// and in what they warn about. The page points at the header instead.
+//
+// Linked accounts are shown as state, not as controls. The Telegram link/unlink
+// endpoints (docs/server/api-spec.md, POST /api/telegram/link-code and
+// DELETE /api/telegram) are specified but are NOT mounted by
+// server/src/routes/mod.rs, so a button calling them would be a dead control.
+// GET /api/me reports telegram_linked, which is what is displayed.
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+---
+
+<DashboardLayout title="Settings">
+  <h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
+  <p class="mt-3 max-w-2xl text-sm text-slate-600">
+    Your profile, your password, and the identities linked to this account. The
+    account owns the wallet and the API keys; a linked identity is a way in, not a
+    second account.
+  </p>
+
+  <!-- One error surface for the page. A failed fetch says so; it never leaves a
+       stale value on screen looking current (spec lines 109-118). -->
+  <div id="settings-error" hidden role="alert"
+    class="mt-6 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900">
+    <span id="settings-error-text"></span>
+    <span id="settings-error-id" class="ml-1 font-mono text-xs text-red-700"></span>
+  </div>
+
+  <!-- Profile ------------------------------------------------------------- -->
+  <section class="mt-8 max-w-2xl rounded-lg border border-slate-200 p-4">
+    <h2 class="text-lg font-semibold tracking-tight">Profile</h2>
+    <dl class="mt-3 space-y-2 text-sm">
+      <div class="flex flex-wrap gap-x-3">
+        <dt class="w-40 shrink-0 text-slate-500">Email</dt>
+        <dd id="profile-email" class="font-mono">Loading…</dd>
+      </div>
+      <div class="flex flex-wrap gap-x-3">
+        <dt class="w-40 shrink-0 text-slate-500">Email verified</dt>
+        <dd id="profile-verified" class="font-mono">Loading…</dd>
+      </div>
+      <div class="flex flex-wrap gap-x-3">
+        <dt class="w-40 shrink-0 text-slate-500">Account id</dt>
+        <dd id="profile-account" class="break-all font-mono">Loading…</dd>
+      </div>
+      <div class="flex flex-wrap gap-x-3">
+        <dt class="w-40 shrink-0 text-slate-500">Account status</dt>
+        <dd id="profile-status" class="font-mono">Loading…</dd>
+      </div>
+    </dl>
+    <p class="mt-3 text-xs text-slate-500">
+      An unverified address cannot hold a balance: an unverified email is not proof
+      the address belongs to the person, and deposits are non-refundable.
+    </p>
+  </section>
+
+  <!-- Password ------------------------------------------------------------ -->
+  <section class="mt-8 max-w-2xl rounded-lg border border-slate-200 p-4">
+    <h2 class="text-lg font-semibold tracking-tight">Password</h2>
+    <p class="mt-2 text-sm text-slate-600">
+      Changing your password signs every device out, including this one — that is
+      the point of changing it after a suspected compromise. Minimum 8 characters.
+    </p>
+
+    <div id="password-done" hidden role="status"
+      class="mt-3 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm text-emerald-900"></div>
+
+    <form id="password-form" class="mt-4 space-y-4">
+      <div>
+        <label for="current-password" class="block text-sm font-medium">Current password</label>
+        <input id="current-password" name="currentPassword" type="password"
+          autocomplete="current-password" required
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+      </div>
+      <div>
+        <label for="new-password" class="block text-sm font-medium">New password</label>
+        <input id="new-password" name="password" type="password"
+          autocomplete="new-password" required minlength="8"
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+      </div>
+      <div>
+        <label for="confirm-password" class="block text-sm font-medium">Confirm new password</label>
+        <input id="confirm-password" name="passwordConfirm" type="password"
+          autocomplete="new-password" required minlength="8"
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+      </div>
+
+      <div id="password-error" hidden role="alert"
+        class="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-900"></div>
+
+      <button id="password-submit" type="submit"
+        class="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50">
+        Change password
+      </button>
+    </form>
+  </section>
+
+  <!-- Linked accounts ----------------------------------------------------- -->
+  <section class="mt-8 max-w-2xl rounded-lg border border-slate-200 p-4">
+    <h2 class="text-lg font-semibold tracking-tight">Linked accounts</h2>
+
+    <dl class="mt-3 space-y-3 text-sm">
+      <div class="flex flex-wrap items-baseline gap-x-3">
+        <dt class="w-40 shrink-0 text-slate-500">Google</dt>
+        <dd id="linked-google" class="font-mono">Checking…</dd>
+      </div>
+      <div class="flex flex-wrap items-baseline gap-x-3">
+        <dt class="w-40 shrink-0 text-slate-500">Telegram</dt>
+        <dd id="linked-telegram" class="font-mono">Loading…</dd>
+      </div>
+    </dl>
+
+    <p class="mt-3 text-sm text-slate-600">
+      A linked Telegram account is bound with a single-use, five-minute
+      <code class="font-mono">/link</code> code issued here and sent to the bot, so
+      the code proves control of this account and the chat proves control of the
+      Telegram account.
+    </p>
+    <p class="mt-2 text-sm text-slate-600">
+      Unlinking removes only the link: <strong>the account and its balance remain</strong>,
+      and the Telegram account can be relinked later. Linking is not yet available
+      from the dashboard — the endpoints are specified but not deployed — so the
+      current link state is shown read-only above.
+    </p>
+  </section>
+
+  <!-- Session controls ---------------------------------------------------- -->
+  <section class="mt-8 max-w-2xl rounded-lg border border-slate-200 p-4 text-sm text-slate-600">
+    <h2 class="text-lg font-semibold tracking-tight text-slate-900">Sessions</h2>
+    <p class="mt-2">
+      <strong>Log out</strong> (this device only) and <strong>Sign out everywhere</strong>
+      (real revocation, every device at once) are both in the dashboard header, on
+      every page. They are one control each, in one place, rather than a second copy
+      here that could drift from them.
+    </p>
+    <p class="mt-2">
+      Logging out discards this device's token; the token itself stays
+      cryptographically valid until it expires. Only "Sign out everywhere" revokes
+      every token immediately.
+    </p>
+  </section>
+</DashboardLayout>
+
+<script>
+  import { apiFetch, ApiError } from '../../lib/api';
+  import type { Me } from '../../lib/api';
+  import { describeError, renderNotice } from '../../lib/errors';
+  import { pb } from '../../lib/pocketbase';
+  import { describeAuthError } from '../../lib/auth-flow';
+  import { passwordChangeError } from '../../lib/dashboard-form';
+
+  /** Spec line 71: a password change invalidates every session, by design. */
+  const PASSWORD_CHANGED_MESSAGE =
+    'Password updated. Every session on this account has been signed out \u2014 sign in again with the new password.';
+
+  const errorBox = document.getElementById('settings-error') as HTMLElement;
+  const errorTarget = {
+    message: document.getElementById('settings-error-text') as HTMLElement,
+    correlation: document.getElementById('settings-error-id') as HTMLElement,
+  };
+  const passwordForm = document.getElementById('password-form') as HTMLFormElement;
+  const passwordSubmit = document.getElementById('password-submit') as HTMLButtonElement;
+  const passwordError = document.getElementById('password-error') as HTMLElement;
+  const passwordDone = document.getElementById('password-done') as HTMLElement;
+
+  const $ = (id: string) => document.getElementById(id) as HTMLElement;
+
+  /** Never render a raw error body (spec rule 5): the mapped view is shown. */
+  function showError(err: unknown): void {
+    renderNotice(errorTarget, describeError(err));
+    errorBox.hidden = false;
+  }
+
+  function showPasswordError(message: string): void {
+    passwordError.textContent = message;
+    passwordError.hidden = false;
+  }
+
+  // --- Profile ------------------------------------------------------------
+  // The email and its verified flag come from the PocketBase record the session
+  // was exchanged from; everything the wallet owns comes from GET /api/me. Neither
+  // is guessed: a missing value shows a dash, never a zero.
+  function renderIdentity(): void {
+    const record = pb.authStore.record as { email?: unknown; verified?: unknown } | null;
+    $('profile-email').textContent =
+      typeof record?.email === 'string' && record.email.length > 0 ? record.email : '\u2014';
+    $('profile-verified').textContent =
+      typeof record?.verified === 'boolean' ? (record.verified ? 'Yes' : 'No') : '\u2014';
+  }
+
+  async function loadProfile(): Promise<void> {
+    renderIdentity();
+    try {
+      const me = await apiFetch<Me>('/api/me');
+      $('profile-account').textContent = me.account_id;
+      $('profile-status').textContent = me.status;
+      // The balance is not repeated here — the header already shows it live.
+      $('linked-telegram').textContent = me.telegram_linked ? 'Linked' : 'Not linked';
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      // A failed fetch says so. The placeholders stay dashes, not stale values.
+      $('profile-account').textContent = '\u2014';
+      $('profile-status').textContent = '\u2014';
+      $('linked-telegram').textContent = '\u2014';
+      showError(err);
+    }
+  }
+
+  // --- Linked Google identity ---------------------------------------------
+  // listExternalAuths is the SDK's own wrapper over
+  // GET /api/collections/users/records/{id}/external-auths. It is marked
+  // @deprecated in favour of the _externalAuths collection, which needs a filter
+  // over a system collection; the wrapper endpoint is the stable one.
+  async function loadLinkedGoogle(): Promise<void> {
+    const id = pb.authStore.record?.id;
+    if (typeof id !== 'string' || id.length === 0) {
+      $('linked-google').textContent = '\u2014';
+      return;
+    }
+    try {
+      const auths = await pb.collection('users').listExternalAuths(id);
+      const providers = auths.map((a: { provider?: unknown }) => String(a.provider ?? ''));
+      $('linked-google').textContent = providers.includes('google')
+        ? 'Linked'
+        : 'Not linked';
+    } catch {
+      // The identity service is not reachable, or the record is not readable.
+      // This is not a dashboard failure, so it does not raise the page banner.
+      $('linked-google').textContent = 'Unknown';
+    }
+  }
+
+  // --- Password -----------------------------------------------------------
+  passwordForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    passwordError.hidden = true;
+    passwordError.textContent = '';
+    passwordDone.hidden = true;
+
+    const data = new FormData(passwordForm);
+    const current = String(data.get('currentPassword') ?? '');
+    const next = String(data.get('password') ?? '');
+    const confirmation = String(data.get('passwordConfirm') ?? '');
+
+    // Decided locally first: a typo in the confirmation is not about the account
+    // and must not be sent. The current password is only checked for presence —
+    // only the identity service can say whether it is right.
+    const local = passwordChangeError(current, next, confirmation);
+    if (local !== null) {
+      showPasswordError(local);
+      return;
+    }
+
+    const id = pb.authStore.record?.id;
+    if (typeof id !== 'string' || id.length === 0) {
+      showPasswordError('Your session has ended. Sign in again.');
+      return;
+    }
+
+    passwordSubmit.disabled = true;
+    passwordSubmit.textContent = 'Changing\u2026';
+    // Password change is PocketBase-side (docs/architecture/identity.md line 38:
+    // password hashing is deliberately not ours). oldPassword is required, so a
+    // stolen session alone cannot set a new password.
+    void pb.collection('users')
+      .update(id, { oldPassword: current, password: next, passwordConfirm: confirmation })
+      .then(() => {
+        passwordForm.hidden = true;
+        passwordDone.textContent = PASSWORD_CHANGED_MESSAGE;
+        passwordDone.hidden = false;
+        // The change rotated the token key, so this device's token is already
+        // dead. Drop it here rather than leaving a token that will 401.
+        pb.authStore.clear();
+        window.setTimeout(() => window.location.assign('/login'), 2500);
+      })
+      .catch((err: unknown) => showPasswordError(describeAuthError(err, 'That did not work.')))
+      .finally(() => {
+        passwordSubmit.disabled = false;
+        passwordSubmit.textContent = 'Change password';
+      });
+  });
+
+  void loadProfile();
+  void loadLinkedGoogle();
+</script>

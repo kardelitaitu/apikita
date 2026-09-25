@@ -1,0 +1,67 @@
+---
+// /dashboard/keys/new — docs/website/03-functional-spec.md line 17:
+// "Create key: models + limits".
+//
+// This page does NOT implement a second key-creation form. The one island that
+// creates keys is src/islands/keys/KeyManagement.astro, mounted by
+// /dashboard/keys; a second POST /api/keys here would be a second source of
+// truth for the same credential, and the two would drift.
+//
+// So this route is a deep link that opens that island's existing create form: it
+// renders the same island, tells it to open the modal on load, and spells out the
+// model-allowlist semantics the form's own one-line hint has no room for.
+// KeyManagement.astro is untouched by design (it is outside this change's fence).
+import DashboardLayout from '../../../layouts/DashboardLayout.astro';
+import KeyManagement from '../../../islands/keys/KeyManagement.astro';
+import { describeModelAccess, ENABLED_MODELS } from '../../../lib/dashboard-form.ts';
+
+const modelAccess = describeModelAccess(ENABLED_MODELS);
+---
+
+<DashboardLayout title="Create API key">
+  <h1 class="text-2xl font-semibold tracking-tight">Create API key</h1>
+  <p class="mt-3 max-w-2xl text-sm text-slate-600">
+    Only a label is required. Spend, token and rate limits default to unlimited
+    (0 means "no limit") and expiry defaults to never, so the common case is one
+    click. The plaintext key is shown <strong>once</strong>, immediately after
+    creation — the server stores only its SHA-256 hash, so a key that is lost is
+    revoked and replaced, never recovered.
+  </p>
+
+  <section class="mt-6 max-w-2xl rounded-lg border border-slate-200 p-4 text-sm text-slate-600">
+    <h2 class="font-medium text-slate-900">Model access: deny by default</h2>
+    <p class="mt-2">
+      The allowlist is an <strong>explicit list, not a boolean</strong>. A key whose
+      allowlist is <strong>empty can call nothing at all</strong>. "All models" is a
+      shortcut that writes the full current list into the key, so enabling a new
+      model later does not silently grant it to every key that already exists.
+    </p>
+    <p class="mt-2">
+      The form therefore arrives with every currently enabled model already ticked.
+      Untick them all and the key still authenticates, but is permitted nothing:
+    </p>
+    <p id="models-summary" class="mt-2 font-mono text-xs text-slate-700">{modelAccess}</p>
+  </section>
+
+  <KeyManagement />
+</DashboardLayout>
+
+<script>
+  // The island above is the only thing that creates a key; this only asks it to
+  // open its existing create form, so /dashboard/keys/new is a real deep link
+  // rather than a second implementation. The modal is opened by clicking the
+  // island's own button, not by unhiding its nodes here, so the island stays the
+  // sole owner of its state.
+  //
+  // Deferred to DOMContentLoaded: this is an ES module and the island's script is
+  // a separate module that binds its listener when it evaluates. A synchronous
+  // click in module body position could fire before that listener exists, and the
+  // two modules' relative order is the bundler's to decide. DOMContentLoaded runs
+  // after every module script has executed, whatever the order.
+  const openCreateForm = () => document.getElementById('create-key-btn')?.click();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', openCreateForm, { once: true });
+  } else {
+    openCreateForm();
+  }
+</script>
