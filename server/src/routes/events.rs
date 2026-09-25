@@ -1,10 +1,9 @@
 use axum::{
     extract::State,
-    http::{header, HeaderMap},
+    http::HeaderMap,
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::{stream, Stream, StreamExt};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::{
     collections::{HashMap, VecDeque},
@@ -21,6 +20,7 @@ use uuid::Uuid;
 use crate::config::RealtimeConfig;
 use crate::error::AppError;
 use crate::routes::proxy::AppState;
+use crate::routes::resolve_account_from_cookie;
 
 /// Heartbeat period. docs/realtime.md:82 asks for every 20-30 seconds: too rare
 /// and an intermediary closes the idle stream, too often and it is pure noise.
@@ -351,38 +351,6 @@ pub async fn todays_usage(pool: &PgPool, account_id: Uuid) -> Result<UsageDelta,
         output_tokens: row.get("output_tokens"),
         cost_idr: row.get("cost_idr"),
     })
-}
-
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, AppError> {
-    let cookie_hdr = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthenticated)?;
-
-    for piece in cookie_hdr.split(';') {
-        let piece = piece.trim();
-        if let Some(token) = piece.strip_prefix("session=") {
-            let token_hash = hash_string(token);
-            let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
-            )
-            .bind(token_hash)
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some(s) = session {
-                return Ok(s.try_get("account_id")?);
-            }
-        }
-    }
-
-    Err(AppError::Unauthenticated)
 }
 
 /// The browser's Last-Event-ID, when it is reconnecting.

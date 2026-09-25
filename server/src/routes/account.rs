@@ -4,13 +4,12 @@ use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tracing::info;
 use uuid::Uuid;
@@ -18,6 +17,7 @@ use uuid::Uuid;
 use crate::config::{AppConfig, WalletConfig};
 use crate::error::AppError;
 use crate::routes::proxy::AppState;
+use crate::routes::resolve_account_from_cookie;
 
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
@@ -51,38 +51,6 @@ pub struct CreateTopupResponse {
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
     pub limit: Option<i64>,
-}
-
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, AppError> {
-    let cookie_hdr = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthenticated)?;
-
-    for piece in cookie_hdr.split(';') {
-        let piece = piece.trim();
-        if let Some(token) = piece.strip_prefix("session=") {
-            let token_hash = hash_string(token);
-            let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
-            )
-            .bind(token_hash)
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some(s) = session {
-                return Ok(s.try_get("account_id")?);
-            }
-        }
-    }
-
-    Err(AppError::Unauthenticated)
 }
 
 pub async fn get_me(

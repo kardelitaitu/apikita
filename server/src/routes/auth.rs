@@ -8,16 +8,12 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::config::{AppConfig, SessionsConfig};
 use crate::error::AppError;
-
-/// Cookie carrying the opaque session value. Only its SHA-256 is stored
-/// (docs/website/02-data-model.md, sessions).
-const SESSION_COOKIE: &str = "session";
+use crate::routes::{hash_token, session_token_from_cookie_header, SESSION_COOKIE};
 
 /// PocketBase collection whose auth tokens are accepted. Identity lives in
 /// PocketBase; Postgres holds only the pb_user_id reference
@@ -51,12 +47,6 @@ struct PbAuthRefreshResponse {
 #[derive(Debug, Deserialize)]
 struct PbRecord {
     id: String,
-}
-
-fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 /// Endpoint that re-validates a PocketBase auth token and returns the current
@@ -162,7 +152,7 @@ fn sessions_config() -> Result<&'static SessionsConfig, AppError> {
 
 /// The opaque session cookie. Attributes per docs/server/api-spec.md:
 /// HttpOnly; Secure; SameSite=Lax.
-fn session_cookie(value: String, max_age_days: i64) -> HeaderMap {
+pub(crate) fn session_cookie(value: String, max_age_days: i64) -> HeaderMap {
     let cookie = Cookie::build((SESSION_COOKIE, value))
         .path("/")
         .http_only(true)
@@ -174,17 +164,6 @@ fn session_cookie(value: String, max_age_days: i64) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, cookie.to_string().parse().unwrap());
     headers
-}
-
-/// Read the session cookie value out of a raw Cookie: header.
-fn session_token_from_cookie_header(cookie_header: &str) -> Option<&str> {
-    cookie_header.split(';').find_map(|piece| {
-        let piece = piece.trim();
-        piece
-            .strip_prefix(SESSION_COOKIE)
-            .and_then(|rest| rest.strip_prefix('='))
-            .filter(|token| !token.is_empty())
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -384,23 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_session_token_from_cookie_header() {
-        assert_eq!(
-            session_token_from_cookie_header("a=1; session=apk_sess_deadbeef; b=2"),
-            Some("apk_sess_deadbeef")
-        );
-        assert_eq!(
-            session_token_from_cookie_header("session=apk_sess_x"),
-            Some("apk_sess_x")
-        );
-        assert_eq!(session_token_from_cookie_header("other=1"), None);
-        assert_eq!(session_token_from_cookie_header("session="), None);
-        assert_eq!(session_token_from_cookie_header(""), None);
-        // A cookie whose name merely ends in "session" is not ours.
-        assert_eq!(session_token_from_cookie_header("notsession=1"), None);
-    }
-
-    #[test]
     fn session_cookie_carries_expected_attributes() {
         let headers = session_cookie("apk_sess_abc".into(), 30);
         let value = headers
@@ -420,16 +382,5 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .expect("set-cookie present");
         assert!(value.contains("Max-Age=0"), "got {value}");
-    }
-
-    #[test]
-    fn session_hash_is_sha256_hex_and_never_the_token() {
-        // Only the hash reaches Postgres; the cookie value never does.
-        assert_eq!(
-            hash_token("apk_sess_abc"),
-            "c943c9214781fe698239bd2827dda2ed0fd7c0c746cd3ab44785da20083a1a9e"
-        );
-        assert_eq!(hash_token(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_ne!(hash_token("apk_sess_abc"), hash_token("apk_sess_abd"));
     }
 }

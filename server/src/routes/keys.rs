@@ -1,19 +1,19 @@
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::routes::proxy::{invalidate_key_cache, AppState};
+use crate::routes::{hash_token, resolve_account_from_cookie};
 
 #[derive(Debug, Serialize)]
 pub struct ApiKeyDto {
@@ -58,12 +58,6 @@ pub struct UpdateKeyRequest {
     pub token_limit: Option<i64>,
     pub rate_limit_rpm: Option<i32>,
     pub expires_at: Option<DateTime<Utc>>,
-}
-
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 /// Length of the rolling `spend_limit_idr` window, in days, inclusive of today.
@@ -187,32 +181,6 @@ fn check_spend_limit(requested_idr: i64, spend_used_idr: i64) -> Result<(), AppE
     Ok(())
 }
 
-async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, AppError> {
-    let cookie_hdr = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthenticated)?;
-
-    for piece in cookie_hdr.split(';') {
-        let piece = piece.trim();
-        if let Some(token) = piece.strip_prefix("session=") {
-            let token_hash = hash_string(token);
-            let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
-            )
-            .bind(token_hash)
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some(s) = session {
-                return Ok(s.get("account_id"));
-            }
-        }
-    }
-
-    Err(AppError::Unauthenticated)
-}
-
 pub async fn list_keys(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -312,7 +280,7 @@ pub async fn create_key(
 
     let full_key = format!("apk_live_{}", random_bytes);
     let prefix = format!("apk_live_{}", &random_bytes[..4]);
-    let key_hash = hash_string(&full_key);
+    let key_hash = hash_token(&full_key);
 
     let models_json = serde_json::to_value(&payload.models).unwrap_or(json!([]));
 
