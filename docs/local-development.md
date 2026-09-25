@@ -11,18 +11,21 @@ real money.
 | Component | Required? | Note |
 | --- | --- | --- |
 | Rust API + proxy | **Yes** | The thing under development |
-| PostgreSQL | **Yes** | Docker or a local install |
-| PocketBase | **Yes** | One binary, no install ceremony |
+| SQLite | **No server** | A file at `data/server.db`, created by the migrate binary |
+| PocketBase | **Yes** | One binary, no install ceremony — until Phase 6 replaces it |
 | Frontend dev server | Only for UI work | Pages Functions are not used |
 | Midtrans | **No** | Faked locally — see below |
 | Upstream providers | **No** | Faked locally |
+
+There is no database container and no `5432`. The port table below has no row for
+one because there is nothing to listen — SQLite is a library, and the API opens the
+file directly.
 
 ## Ports
 
 | Service | Port |
 | --- | --- |
 | Rust API | 8080 |
-| PostgreSQL | 5432 |
 | PocketBase | 8090 |
 | Frontend dev server | 4321 (Astro default) |
 
@@ -34,26 +37,58 @@ production subdomain decision in [`docs/architecture.md`](architecture.md).
 ## First run
 
 ```
-# 1. database
-docker run -d --name apk-pg -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=apikita \
-  -p 5432:5432 postgres:16
+# 1. database — a file, created and migrated by the migrate binary
+DATABASE_URL=sqlite://data/server.db cargo run --bin migrate
 
-# 2. schema
-psql postgresql://postgres:dev@localhost:5432/apikita -f schema.sql
-
-# 3. pocketbase (download the binary, then)
+# 2. pocketbase (download the binary, then)
 ./pocketbase serve --http=127.0.0.1:8090
 
-# 4. api
+# 3. api
 cp .env.example .env    # fill in what you need; fakes need nothing
 cargo run --bin api
 
-# 5. frontend (only for UI work)
+# 4. frontend (only for UI work)
 cd website && npm run dev
 ```
 
-**`schema.sql` is generated from the documents**, not hand-written elsewhere — see
-[`docs/website/02-data-model.md`](website/02-data-model.md). Keep one source.
+**The migration is applied by `bin/migrate.rs`, never on server boot** — the deploy
+order is *migrate → server → health → frontend*, and the server deliberately opens
+SQLite with `create_if_missing: false` so a missing database is a loud "you have not
+migrated" rather than an empty, schema-less file. The schema lives in
+`server/migrations/`; there is no `schema.sql` to apply by hand.
+
+## Resetting the local database
+
+Because the database is a file, a reset is a file operation, not a volume one:
+
+```sh
+rm -f data/server.db data/server.db-wal data/server.db-shm
+DATABASE_URL=sqlite://data/server.db cargo run --bin migrate
+```
+
+Delete all three. `-wal` and `-shm` are the write-ahead log and its shared-memory
+index; removing only `server.db` leaves a write-ahead log behind with no database to
+replay into, and the next `migrate` produces a file whose contents are not what the
+log was written against.
+
+`docker compose down -v` does **not** touch any of this — there is no database
+volume to remove any more.
+
+## Tests need no database set up
+
+`cargo test` builds its own migrated SQLite file in a temp directory, per test
+(`server/src/test_support.rs`). `DATABASE_URL` is not read by the suite, so a
+forgotten env var cannot make tests pass against the wrong database. The money
+tests — including the real-concurrency overdraw proof — run by default; nothing
+is `#[ignore]`d.
+
+To check the ledger invariant against a database you have been hammering on:
+
+```sh
+DATABASE_URL=sqlite://data/server.db sh tools/reconcile/reconcile.sh
+```
+
+Non-zero exit means drift. See [`tools/reconcile/README.md`](../tools/reconcile/README.md).
 
 ## Fakes — the part that makes this workable
 
@@ -120,7 +155,7 @@ the cheapest guard against the most expensive accounting error.
 
 | Variable | Local value |
 | --- | --- |
-| `DATABASE_URL` | `postgres://postgres:dev@localhost:5432/apikita` |
+| `DATABASE_URL` | `sqlite://data/server.db` — relative to `server/` |
 | `POCKETBASE_URL` | `http://127.0.0.1:8090` |
 | `MIDTRANS_SERVER_KEY` | a dev constant the fake signs with |
 | `MIDTRANS_ENV` | `sandbox` |
@@ -131,17 +166,24 @@ the cheapest guard against the most expensive accounting error.
 
 ## Rules
 
-1. **Never point local development at production Postgres.** One mistaken migration
-   against live data is unrecoverable.
+1. **Never point local development at the production database file.** One mistaken
+   migration against live data is unrecoverable, and with SQLite "pointing at it"
+   is copying a file — which is easier to do by accident than editing a connection
+   string, and leaves no connection log behind.
 2. **Never use real provider keys locally.** A bug that loops retries produces a
    real bill.
 3. **The fake must be able to fail.** A fake that only succeeds tests nothing.
 4. **Seed data for the awkward cases** — an account with a negative-trending
    balance, a revoked key, an expired limit.
+5. **Back up before a destructive local experiment.** `cp data/server.db …` is now
+   a complete backup, provided you also take `-wal` — or better, use
+   `VACUUM INTO` (see [`docs/backup-and-restore.md`](backup-and-restore.md)).
 
 ## Open items
 
 - [ ] Whether fakes live in the repo or as a separate dev tool.
 - [ ] Seed script contents.
-- [x] CI uses a real Postgres service container — see [`ci-cd.md`](ci-cd.md).
-- [ ] Whether PocketBase runs as a binary or in a container locally.
+- [x] CI needs **no** database service container — the suite builds its own SQLite
+      file per test. See [`ci-cd.md`](ci-cd.md).
+- [ ] Whether PocketBase runs as a binary or in a container locally — moot after
+      Phase 6, which replaces it with a Rust implementation that runs in-process.

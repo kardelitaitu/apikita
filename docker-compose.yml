@@ -12,10 +12,10 @@
 # migration (docs/plans/sqlite-migration.md); PocketBase returns as a Rust
 # implementation in Phase 6, and it will not be a container either.
 #
-# Resetting the local database is now a file operation, not a volume:
-#   rm -f data/server.db data/server.db-wal data/server.db-shm
-# then re-run the migrate binary. The old postgres reset
-# (`docker compose down -v`) no longer touches any data.
+# Resetting the local database is a file operation, not a volume one, and the
+# instructions live with the rest of the dev loop in docs/local-development.md —
+# `docker compose down -v` no longer touches any data, so there is nothing here to
+# reset.
 #
 # No top-level `version:` key — obsolete in Compose v2+.
 
