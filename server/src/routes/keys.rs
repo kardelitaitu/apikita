@@ -199,9 +199,10 @@ async fn resolve_account_from_cookie(pool: &SqlitePool, headers: &HeaderMap) -> 
         if let Some(token) = piece.strip_prefix("session=") {
             let token_hash = hash_string(token);
             let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()",
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
             )
             .bind(token_hash)
+            .bind(Utc::now())
             .fetch_optional(pool)
             .await?;
 
@@ -321,16 +322,21 @@ pub async fn create_key(
     // requested limit against that before storing it.
     check_spend_limit(payload.spend_limit_idr, 0)?;
 
+    // `id` and `created_at` are bound, not defaulted: both had Postgres defaults
+    // (`gen_random_uuid()`, `now()`) which the SQLite schema deliberately removed
+    // (plan section 4.6). Returning `id` rather than echoing the generated value
+    // keeps this honest if the insert ever gains an upsert clause.
     let key_record = sqlx::query(
         r#"
         INSERT INTO api_keys (
-            account_id, key_hash, prefix, label, models,
-            spend_limit_idr, token_limit, rate_limit_rpm, expires_at
+            id, account_id, key_hash, prefix, label, models,
+            spend_limit_idr, token_limit, rate_limit_rpm, expires_at, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         "#,
     )
+    .bind(Uuid::new_v4().hyphenated())
     .bind(account_id.hyphenated())
     .bind(key_hash)
     .bind(&prefix)
@@ -340,6 +346,7 @@ pub async fn create_key(
     .bind(payload.token_limit)
     .bind(payload.rate_limit_rpm)
     .bind(payload.expires_at)
+    .bind(Utc::now())
     .fetch_one(&state.pool)
     .await?;
 
@@ -430,11 +437,12 @@ pub async fn revoke_key(
     // the plaintext never has to be reconstructed to evict an entry.
     let revoked_hash: Option<String> = sqlx::query_scalar(
         r#"
-        UPDATE api_keys SET revoked_at = now()
+        UPDATE api_keys SET revoked_at = ?
         WHERE id = ? AND account_id = ? AND revoked_at IS NULL
         RETURNING key_hash
         "#,
     )
+    .bind(Utc::now())
     .bind(id.hyphenated())
     .bind(account_id.hyphenated())
     .fetch_optional(&state.pool)

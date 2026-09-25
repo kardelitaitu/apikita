@@ -371,9 +371,10 @@ async fn resolve_account_from_cookie(pool: &SqlitePool, headers: &HeaderMap) -> 
         if let Some(token) = piece.strip_prefix("session=") {
             let token_hash = hash_string(token);
             let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()",
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
             )
             .bind(token_hash)
+            .bind(chrono::Utc::now())
             .fetch_optional(pool)
             .await?;
 
@@ -664,10 +665,20 @@ mod tests {
         assert_eq!(last_event_id(&headers), None);
     }
 
-    /// The fix for the panic decodes token sums into `i64` via a `::bigint`
-    /// cast. This proves the chosen representation survives values near the
-    /// i64 ceiling: had anyone "simplified" to a narrower type (i32/INT4) the
-    /// SUM would silently overflow. Sums must stay exact for large usage.
+    /// Realtime totals are `i64` end to end, and this proves the representation
+    /// survives values near the i64 ceiling: had anyone "simplified" to a narrower
+    /// type (i32) the value would wrap or fail to serialise. Sums must stay exact
+    /// for large usage.
+    ///
+    /// Note what this does NOT cover: it builds the event in memory, so it says
+    /// nothing about the SQL that produces the totals. The Postgres schema forced
+    /// those aggregates to carry a `::bigint` cast precisely so they decoded into
+    /// `i64`; the SQLite schema makes the cast unnecessary by declaring every money
+    /// and token column `INTEGER`, so `SUM()` already returns an integer type (plan
+    /// section 4.6). The cast has been removed, so the guarantee now rests on the
+    /// column declarations rather than on the query text — which is the stronger
+    /// place for it, and also the reason `STRICT` plus `INTEGER` money matters
+    /// beyond convention.
     #[test]
     fn token_sums_preserve_large_i64_values() {
         // A realistic heavy-tenant day, well above i32::MAX (2_147_483_647).

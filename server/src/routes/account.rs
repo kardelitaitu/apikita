@@ -71,9 +71,10 @@ async fn resolve_account_from_cookie(pool: &SqlitePool, headers: &HeaderMap) -> 
         if let Some(token) = piece.strip_prefix("session=") {
             let token_hash = hash_string(token);
             let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()",
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
             )
             .bind(token_hash)
+            .bind(Utc::now())
             .fetch_optional(pool)
             .await?;
 
@@ -483,14 +484,18 @@ pub async fn create_topup(
     let (snap_token, redirect_url) =
         create_snap_transaction(&snap_http, &server_key, endpoint, &snap_payload).await?;
 
+    // `created_at` has no default: the Postgres schema defaulted it to `now()`,
+    // and that default was removed so that no SQL-side time can ever be written
+    // in the other format (plan section 4.6, rule 2).
     sqlx::query(
-        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token) VALUES (?, ?, ?, ?, 'pending', ?)",
+        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
     )
     .bind(topup_id.hyphenated())
     .bind(account_id.hyphenated())
     .bind(payload.amount_idr)
     .bind(&order_id)
     .bind(&snap_token)
+    .bind(Utc::now())
     .execute(&state.pool)
     .await?;
 

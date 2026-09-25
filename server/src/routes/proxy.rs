@@ -1079,9 +1079,10 @@ pub async fn chat_completions(
     //    the worst case in a guarded, committed transaction BEFORE the upstream is
     //    called, and the release happens at settlement.
     //
-    // The guard is `balance_idr >= $amount` inside the UPDATE, not a read: two
-    // concurrent requests from the same account are serialized by the row lock, so
-    // only as many as the balance can actually cover are admitted. The previous
+    // The guard is `balance_idr >= ?1` inside the UPDATE, not a read: SQLite
+    // admits one writer at a time, so two concurrent requests from the same
+    // account cannot both pass against one stale balance, and only as many as the
+    // balance can cover are admitted. The previous
     // code read the balance here and debited nothing, which let an account holding
     // 1 IDR run unbounded concurrent expensive requests — and with
     // `allow_negative_balance_overdraft = true` the 402 branch below was dead, so

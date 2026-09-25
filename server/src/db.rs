@@ -1,87 +1,192 @@
 use crate::error::AppError;
 use chrono::Utc;
-use sqlx::{SqlitePool, Sqlite, Row, Transaction};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::str::FromStr;
+use std::time::Duration;
 use tracing::error;
-use uuid::Uuid;
 use uuid::fmt::Hyphenated;
+use uuid::Uuid;
 
+/// Opens the application pool.
+///
+/// The options are not decoration. Each is a measured trap from the plan's
+/// section 4.3, and each was re-measured against this exact option set:
+///
+/// - `foreign_keys(true)` — `PRAGMA foreign_keys` is **per connection**, not per
+///   database. sqlx already defaults it ON (unlike raw SQLite, where it is OFF),
+///   but it is set explicitly because with it off every `ON DELETE CASCADE` in
+///   the schema is silently inert and the `ON DELETE RESTRICT` that is supposed
+///   to make hard-deleting a funded account impossible stops working. Measured
+///   with this option set: a dangling reference is refused, code 787.
+/// - `journal_mode(Wal)` — a persistent property of the file, and `bin/migrate.rs`
+///   sets it too. Setting it here as well means a database that somehow lost WAL
+///   is put back into it rather than quietly running in rollback-journal mode.
+///   Measured: `PRAGMA journal_mode` reads back `wal`.
+/// - `synchronous(Normal)` — safe under WAL (a power loss can lose the last few
+///   transactions, it cannot corrupt the database) and avoids an fsync per
+///   commit, which is most of what WAL buys on this write-heavy path. Measured:
+///   `PRAGMA synchronous` reads back 1, i.e. NORMAL.
+/// - `busy_timeout(5s)` — this is what replaces the `FOR UPDATE` waiting the
+///   Postgres code relied on. sqlx's default is already 5s; it is set here so the
+///   number is visible and does not silently depend on a dependency default.
+///   Measured: `PRAGMA busy_timeout` reads back 5000.
+///
+/// `create_if_missing` is deliberately NOT set. Creation belongs to
+/// `bin/migrate.rs`, which the deploy order runs before the server. Measured: with
+/// it unset, connecting to an absent file fails with `unable to open database
+/// file` — which is the failure this wants, because a server that silently
+/// creates an empty, schema-less database fails later and far less legibly.
 pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(20)
-        .connect(database_url)
+    let options = SqliteConnectOptions::from_str(database_url)?
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true);
+
+    SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(options)
         .await
+}
+
+/// Begins a transaction that takes SQLite's write lock up front.
+///
+/// `pool.begin()` issues a DEFERRED `BEGIN`. A deferred transaction that reads
+/// and then writes can be refused at the lock upgrade with
+/// `SQLITE_BUSY_SNAPSHOT`, and that error **cannot be resolved by retrying** —
+/// the transaction has to be rolled back and restarted (plan section 4.3, trap 2).
+/// `BEGIN IMMEDIATE` takes the write lock at the start, so there is no upgrade to
+/// lose.
+///
+/// Every transaction in this module writes, and every one of them now begins with
+/// its write rather than a preceding read, so the specific hazard is already
+/// absent. This helper is used anyway: it makes the lock acquisition explicit
+/// rather than a consequence of statement ordering, so a later edit that adds a
+/// read to the top of one of these functions cannot reintroduce the trap.
+///
+/// sqlx executes the statement and then verifies the connection really is in a
+/// transaction, failing with `BeginFailed` otherwise (measured: a statement that
+/// does not open one is refused), so a typo here is loud rather than silent.
+pub(crate) async fn begin_immediate(
+    pool: &SqlitePool,
+) -> Result<Transaction<'static, Sqlite>, AppError> {
+    Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TopupCreditResult {
+    /// The topup was settled and the wallet credited.
     Settled { new_balance: i64 },
+    /// This order was already settled - a replayed webhook. Nothing written.
     AlreadySettled,
+    /// No such order.
     NotFound,
+    /// The order exists but the stored amount disagrees with the webhook's.
+    /// Nothing written.
     AmountMismatch,
+    /// The order exists and the amount agrees, but its status is not `pending`,
+    /// so there is nothing to settle. `denied`, `expired` and `refunded` all
+    /// land here. Nothing was written.
+    ///
+    /// This variant exists because the settlement guard is now
+    /// `status = 'pending'` in SQL, which is STRICTER than the Rust check it
+    /// replaced. That check short-circuited only on `'settled'`, so a replayed
+    /// settlement webhook arriving after a refund fell through to settlement and
+    /// RE-CREDITED the wallet, flipping the row back to `settled` and duplicating
+    /// money. The stricter predicate closes that. Reporting the closed case as
+    /// `AlreadySettled` would be a lie about a refunded order, so it gets its own
+    /// variant, mirroring `RefundResult::NotSettled`.
+    NotSettleable { status: String },
 }
 
 /// Atomically settles a topup and credits the wallet, recording an append-only ledger row.
+///
+/// The whole decision is one conditional `UPDATE`. The Postgres original took a
+/// row lock (`SELECT ... FOR UPDATE`) and then decided in Rust; SQLite has no
+/// row locks and rejects `FOR UPDATE` as a syntax error (measured), so the guard
+/// moves into the `WHERE` clause and `RETURNING` supplies the row identity the
+/// credit needs. This needs no lock at all and is correct under any isolation
+/// level: the write lock SQLite takes for the `UPDATE` is what serializes the
+/// check against the write.
 pub async fn credit_topup_transaction(
     pool: &SqlitePool,
     order_id: &str,
     webhook_amount_idr: i64,
 ) -> Result<TopupCreditResult, AppError> {
-    let mut tx: Transaction<'_, Sqlite> = pool.begin().await?;
+    let mut tx = begin_immediate(pool).await?;
 
-    // 1. Lock the topups row
-    let topup = sqlx::query(
-        "SELECT id, account_id, amount_idr, status FROM topups WHERE order_id = ? FOR UPDATE",
+    // 1. Settle the row in one statement. `status = 'pending'` and the amount
+    //    check are the guard; `rows_affected()` decides whether it fired.
+    let now = Utc::now();
+    let settled = sqlx::query(
+        "UPDATE topups SET status = 'settled', settled_at = ? \
+         WHERE order_id = ? AND status = 'pending' AND amount_idr = ? \
+         RETURNING id, account_id",
     )
+    .bind(now)
     .bind(order_id)
+    .bind(webhook_amount_idr)
     .fetch_optional(&mut *tx)
     .await?;
 
-    let topup = match topup {
-        Some(t) => t,
-        None => return Ok(TopupCreditResult::NotFound),
+    let Some(settled) = settled else {
+        // 2. Nothing was written. One SELECT decides which refusal this is.
+        //    Status is tested before the amount, matching the precedence the
+        //    original Rust checks had: a `settled` row with a mismatched amount
+        //    is a replay, not a mismatch.
+        let existing = sqlx::query("SELECT status, amount_idr FROM topups WHERE order_id = ?")
+            .bind(order_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        tx.rollback().await?;
+
+        return Ok(match existing {
+            None => TopupCreditResult::NotFound,
+            Some(row) => {
+                let status: String = row.get("status");
+                let stored_amount_idr: i64 = row.get("amount_idr");
+                if status == "settled" {
+                    TopupCreditResult::AlreadySettled
+                } else if stored_amount_idr != webhook_amount_idr {
+                    TopupCreditResult::AmountMismatch
+                } else {
+                    TopupCreditResult::NotSettleable { status }
+                }
+            }
+        });
     };
 
-    let topup_id: Uuid = topup.get::<Hyphenated, _>("id").into_uuid();
-    let account_id: Uuid = topup.get::<Hyphenated, _>("account_id").into_uuid();
-    let amount_idr: i64 = topup.get("amount_idr");
-    let status: String = topup.get("status");
+    let topup_id: Uuid = settled.get::<Hyphenated, _>("id").into_uuid();
+    let account_id: Uuid = settled.get::<Hyphenated, _>("account_id").into_uuid();
 
-    // 2. Check idempotency
-    if status == "settled" {
-        return Ok(TopupCreditResult::AlreadySettled);
-    }
-
-    // 3. Amount must match stored row
-    if amount_idr != webhook_amount_idr {
-        return Ok(TopupCreditResult::AmountMismatch);
-    }
-
-    // 4. Update topups row
-    sqlx::query("UPDATE topups SET status = 'settled', settled_at = now() WHERE id = ?")
-        .bind(topup_id.hyphenated())
-        .execute(&mut *tx)
-        .await?;
-
-    // 5. Update wallet balance
+    // 3. Credit the wallet. `webhook_amount_idr` is the same value the guard
+    //    proved equal to the stored amount, so it is what the ledger must carry.
     let wallet = sqlx::query(
-        "UPDATE wallets SET balance_idr = balance_idr + ?, updated_at = now() WHERE account_id = ? RETURNING balance_idr",
+        "UPDATE wallets SET balance_idr = balance_idr + ?, updated_at = ? WHERE account_id = ? RETURNING balance_idr",
     )
-    .bind(amount_idr)
+    .bind(webhook_amount_idr)
+    .bind(now)
     .bind(account_id.hyphenated())
     .fetch_one(&mut *tx)
     .await?;
 
     let new_balance: i64 = wallet.get("balance_idr");
 
-    // 6. Append to ledger
+    // 4. Append to ledger. `created_at` shares the settle instant, so the row,
+    //    the wallet and the ledger all carry one timestamp.
     let ref_str = topup_id.to_string();
     sqlx::query(
-        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'topup', ?, ?, now())",
+        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'topup', ?, ?, ?)",
     )
     .bind(account_id.hyphenated())
-    .bind(amount_idr)
+    .bind(webhook_amount_idr)
     .bind(ref_str)
     .bind(new_balance)
+    .bind(now)
     .execute(&mut *tx)
     .await?;
 
@@ -136,48 +241,75 @@ pub fn refund_decision(status: &str) -> RefundDecision {
 /// Atomically refunds a settled topup: debits the wallet and appends a `refund`
 /// ledger row, in one transaction, so `balance_idr = SUM(delta_idr)` still holds.
 ///
-/// The debit carries `balance_idr >= $amount` as a predicate on the UPDATE itself,
+/// The debit carries `balance_idr >= ?1` as a predicate on the UPDATE itself,
 /// the same guard `debit_usage_transaction` uses: a concurrent request cannot race
 /// the check, and `CHECK (balance_idr >= 0)` is the backstop rather than the thing
 /// that refuses the debit (docs/decisions.md D3 - wallets are non-negative).
 ///
-/// Idempotent under replay: the topup row is locked `FOR UPDATE` and its status
-/// decides, so a second refund of the same order is a no-op.
+/// Idempotent under replay: the row is moved out of `settled` by a conditional
+/// UPDATE, and only the statement that performs that move proceeds, so a second
+/// refund of the same order is a no-op.
 pub async fn refund_topup_transaction(
     pool: &SqlitePool,
     order_id: &str,
     amount_idr: i64,
 ) -> Result<RefundResult, AppError> {
-    let mut tx: Transaction<'_, Sqlite> = pool.begin().await?;
+    let mut tx = begin_immediate(pool).await?;
 
-    // 1. Lock the topups row, so two concurrent refunds cannot both pass the
-    //    status check below.
-    let topup =
-        sqlx::query("SELECT id, account_id, status FROM topups WHERE order_id = ? FOR UPDATE")
+    // 1. Claim the refund by moving the row out of `settled`, in one conditional
+    //    statement. The Postgres original locked the row with `FOR UPDATE` and
+    //    then decided in Rust; SQLite has no row locks and rejects `FOR UPDATE`
+    //    (measured), so the status transition IS the guard and the write lock it
+    //    takes is what serializes two concurrent refunds.
+    //
+    //    Claiming before debiting is safe because both happen in this one
+    //    transaction: the insufficient-balance path below rolls the claim back,
+    //    leaving the topup `settled` exactly as the original did.
+    let claimed = sqlx::query(
+        "UPDATE topups SET status = 'refunded' WHERE order_id = ? AND status = 'settled' \
+         RETURNING account_id",
+    )
+    .bind(order_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(claimed) = claimed else {
+        // 2. Nothing was written. One SELECT decides which refusal this is.
+        let existing = sqlx::query("SELECT status FROM topups WHERE order_id = ?")
             .bind(order_id)
             .fetch_optional(&mut *tx)
             .await?;
 
-    let Some(topup) = topup else {
-        return Ok(RefundResult::NotFound);
+        tx.rollback().await?;
+
+        return Ok(match existing {
+            None => RefundResult::NotFound,
+            Some(row) => {
+                let status: String = row.get("status");
+                match refund_decision(&status) {
+                    RefundDecision::AlreadyRefunded => RefundResult::AlreadyRefunded,
+                    // `Refund` is unreachable: the claim above would have matched
+                    // a `settled` row. Every other status had no money arrive, so
+                    // there is nothing to give back.
+                    RefundDecision::Refund | RefundDecision::NotSettled => {
+                        RefundResult::NotSettled { status }
+                    }
+                }
+            }
+        });
     };
 
-    let topup_id: Uuid = topup.get::<Hyphenated, _>("id").into_uuid();
-    let account_id: Uuid = topup.get::<Hyphenated, _>("account_id").into_uuid();
-    let status: String = topup.get("status");
+    let account_id: Uuid = claimed.get::<Hyphenated, _>("account_id").into_uuid();
 
-    match refund_decision(&status) {
-        RefundDecision::AlreadyRefunded => return Ok(RefundResult::AlreadyRefunded),
-        RefundDecision::NotSettled => return Ok(RefundResult::NotSettled { status }),
-        RefundDecision::Refund => {}
-    }
-
-    // 2. Debit the wallet. The guard is inside the statement: when it matches no
+    // 3. Debit the wallet. The guard is inside the statement: when it matches no
     //    row the account cannot cover the refund, and nothing may be written.
+    //    `?1` is referenced twice, as the debit and as the floor (measured
+    //    working, with three binds for `?1 ?2`).
     let wallet = sqlx::query(
-        "UPDATE wallets SET balance_idr = balance_idr - $1, updated_at = now() WHERE account_id = $2 AND balance_idr >= $1 RETURNING balance_idr",
+        "UPDATE wallets SET balance_idr = balance_idr - ?1, updated_at = ?2 WHERE account_id = ?3 AND balance_idr >= ?1 RETURNING balance_idr",
     )
     .bind(amount_idr)
+    .bind(Utc::now())
     .bind(account_id.hyphenated())
     .fetch_optional(&mut *tx)
     .await?;
@@ -197,8 +329,9 @@ pub async fn refund_topup_transaction(
                     .flatten()
                     .unwrap_or(0);
 
-            // Roll back explicitly: nothing is written, so the topup stays
-            // `settled` and the ledger gains no row it cannot back.
+            // Roll back explicitly: nothing is written - including the status
+            // claim above - so the topup stays `settled` and the ledger gains no
+            // row it cannot back.
             tx.rollback().await?;
 
             return Ok(RefundResult::InsufficientBalance {
@@ -208,21 +341,16 @@ pub async fn refund_topup_transaction(
         }
     };
 
-    // 3. Mark the topup refunded.
-    sqlx::query("UPDATE topups SET status = 'refunded' WHERE id = ?")
-        .bind(topup_id.hyphenated())
-        .execute(&mut *tx)
-        .await?;
-
     // 4. Append the refund row. `delta_idr` is negative: the ledger sums to the
     //    balance, and a refund takes money out.
     sqlx::query(
-        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'refund', ?, ?, now())",
+        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'refund', ?, ?, ?)",
     )
     .bind(account_id.hyphenated())
     .bind(-amount_idr)
     .bind(order_id)
     .bind(new_balance)
+    .bind(Utc::now())
     .execute(&mut *tx)
     .await?;
 
@@ -318,7 +446,7 @@ pub async fn debit_usage_transaction(
     ref_batch: Option<&str>,
     reserved_idr: i64,
 ) -> Result<UsageSettlement, AppError> {
-    let mut tx: Transaction<'_, Sqlite> = pool.begin().await?;
+    let mut tx = begin_immediate(pool).await?;
 
     // 0. Release the hold first. The guard is the same one the take used: the
     //    wallet can never have spent more than its own balance, so the release
@@ -345,10 +473,10 @@ pub async fn debit_usage_transaction(
 
     // 1. Debit wallet.
     //
-    // `balance_idr >= $1` is the guard and it lives inside the statement, not in a
-    // preceding read: when a concurrent transaction has already updated the row,
-    // Sqlite re-evaluates the predicate against the latest row version under the
-    // row lock, so two racing debits cannot both pass against one stale balance.
+    // `balance_idr >= ?1` is the guard and it lives inside the statement, not in a
+    // preceding read: the statement is its own check, and because SQLite admits one
+    // writer at a time, two racing debits cannot both pass against one stale
+    // balance.
     let new_balance: i64 = match try_debit(&mut tx, account_id, cost_idr).await? {
         Some(new_balance) => new_balance,
         None => {
@@ -455,7 +583,17 @@ async fn record_usage(
 
     insert_ledger_row(&mut tx, account_id, charge_delta, ref_batch, new_balance).await?;
 
-    // Upsert usage_daily
+    // Upsert usage_daily.
+    //
+    // The conflict target is the expression index, not a column list. Measured:
+    // the Postgres-shaped `ON CONFLICT (account_id, api_key_id, day)` is refused
+    // outright with "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+    // constraint", because the real key is
+    // `usage_daily_scope_uniq (account_id, day, COALESCE(api_key_id, ''))`.
+    // SQLite has no `ON CONFLICT ON CONSTRAINT <name>` form, so the expression
+    // has to be spelled out. Measured: the expression form accumulates a NULL
+    // key and a real key into two separate rows (15 and 10 from 10+5 and 7+3),
+    // which is the behaviour the COALESCE index exists to provide.
     let today = Utc::now().date_naive();
     sqlx::query(
         r#"
@@ -464,7 +602,7 @@ async fn record_usage(
             input_tokens, cache_read_tokens, output_tokens, cost_idr
         )
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (account_id, api_key_id, day) DO UPDATE
+        ON CONFLICT (account_id, day, COALESCE(api_key_id, '')) DO UPDATE
         SET input_tokens = usage_daily.input_tokens + EXCLUDED.input_tokens,
             cache_read_tokens = usage_daily.cache_read_tokens + EXCLUDED.cache_read_tokens,
             output_tokens = usage_daily.output_tokens + EXCLUDED.output_tokens,
@@ -492,7 +630,8 @@ async fn read_balance(
     account_id: Uuid,
 ) -> Result<i64, AppError> {
     // Annotated, not inferred: `unwrap_or(0)` alone would leave the scalar type to
-    // default to i32, which Sqlite decodes as INT4 and rejects against BIGINT.
+    // default to i32, which is wrong for money. `balance_idr` is a 64-bit INTEGER,
+    // and a balance above `i32::MAX` would fail to decode rather than read back.
     let balance: i64 = sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
         .bind(account_id.hyphenated())
         .fetch_optional(&mut **tx)
@@ -512,10 +651,17 @@ async fn try_debit(
     account_id: Uuid,
     amount: i64,
 ) -> Result<Option<i64>, AppError> {
+    // `?1` is referenced twice — once as the debit, once as the balance floor.
+    // Measured: sqlx accepts the numbered form, takes three binds for `?1 ?2 ?3`,
+    // and the reuse really does compare against the one value (a 150 wallet
+    // debited by 100 leaves 50, and the same statement against 50 matches no
+    // row). Plain `?` with a duplicated bind also works; the numbered form is
+    // used because it cannot drift out of sync with the predicate.
     let wallet = sqlx::query(
-        "UPDATE wallets SET balance_idr = balance_idr - $1, updated_at = now() WHERE account_id = $2 AND balance_idr >= $1 RETURNING balance_idr",
+        "UPDATE wallets SET balance_idr = balance_idr - ?1, updated_at = ?2 WHERE account_id = ?3 AND balance_idr >= ?1 RETURNING balance_idr",
     )
     .bind(amount)
+    .bind(Utc::now())
     .bind(account_id.hyphenated())
     .fetch_optional(&mut **tx)
     .await?;
@@ -534,12 +680,13 @@ async fn insert_ledger_row(
     balance_after: i64,
 ) -> Result<(), AppError> {
     sqlx::query(
-        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'usage', ?, ?, now())",
+        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'usage', ?, ?, ?)",
     )
     .bind(account_id.hyphenated())
     .bind(delta_idr)
     .bind(ref_batch)
     .bind(balance_after)
+    .bind(Utc::now())
     .execute(&mut **tx)
     .await?;
 
@@ -558,9 +705,10 @@ async fn try_credit(
     amount: i64,
 ) -> Result<Option<i64>, AppError> {
     let wallet = sqlx::query(
-        "UPDATE wallets SET balance_idr = balance_idr + ?, updated_at = now() WHERE account_id = ? RETURNING balance_idr",
+        "UPDATE wallets SET balance_idr = balance_idr + ?, updated_at = ? WHERE account_id = ? RETURNING balance_idr",
     )
     .bind(amount)
+    .bind(Utc::now())
     .bind(account_id.hyphenated())
     .fetch_optional(&mut **tx)
     .await?;
@@ -590,10 +738,10 @@ pub enum ReservationResult {
 /// one statement and debited nothing, so N concurrent requests from one account
 /// all passed the same point-in-time value and an account holding 1 IDR could run
 /// unbounded expensive requests. Here the check IS the debit:
-/// `balance_idr >= $amount` is a predicate on the UPDATE, and Sqlite re-evaluates
-/// it against the latest row version under the row lock, so exactly as many
-/// concurrent requests as the balance can pay for are admitted and the rest match
-/// no row. Concurrency is serialized by the database, not by a read.
+/// `balance_idr >= ?1` is a predicate on the UPDATE, and the UPDATE is its own
+/// check: SQLite admits one writer at a time, so exactly as many concurrent
+/// requests as the balance can pay for are admitted and the rest match no row.
+/// Concurrency is serialized by the database's write lock, not by a read.
 ///
 /// The hold is a real, guarded debit with its own ledger row, taken in one
 /// transaction and committed before the upstream is called. `balance_idr` and
@@ -613,7 +761,7 @@ pub async fn reserve_balance_transaction(
         return Ok(ReservationResult::Zero);
     }
 
-    let mut tx: Transaction<'_, Sqlite> = pool.begin().await?;
+    let mut tx = begin_immediate(pool).await?;
 
     // The guard lives inside the statement, never in a preceding read.
     match try_debit(&mut tx, account_id, reserved_idr).await? {
@@ -658,7 +806,7 @@ pub async fn release_reservation_transaction(
         return Ok(None);
     }
 
-    let mut tx: Transaction<'_, Sqlite> = pool.begin().await?;
+    let mut tx = begin_immediate(pool).await?;
 
     let Some(new_balance) = try_credit(&mut tx, account_id, reserved_idr).await? else {
         // No wallet row: nothing was ever held, so nothing is released and no

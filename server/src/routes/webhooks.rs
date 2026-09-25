@@ -164,6 +164,29 @@ pub async fn handle_midtrans_webhook(
                         Json(json!({"error": "amount mismatch"})),
                     )
                 }
+                Ok(TopupCreditResult::NotSettleable { status }) => {
+                    // A settlement webhook arrived for a row that is not
+                    // `pending` - the order was denied, expired, or refunded and
+                    // then settled again. NO money moved: the guard in
+                    // `credit_topup_transaction` refused the transition, which is
+                    // what stops a replayed settlement webhook from re-crediting a
+                    // refunded order.
+                    //
+                    // Logged at error level because the delivery is contradictory
+                    // and worth seeing, but answered 200: a non-2xx would make
+                    // Midtrans retry a webhook that can never succeed. The refund
+                    // path's 409 is a different situation - there an operator has
+                    // money to resolve by hand.
+                    error!(
+                        order_id = %payload.order_id,
+                        status = %status,
+                        "Webhook ignored: order is not settleable"
+                    );
+                    (
+                        StatusCode::OK,
+                        Json(json!({"status": "not_settleable", "order_status": status})),
+                    )
+                }
                 Err(err) => {
                     error!(
                         order_id = %payload.order_id,
@@ -509,6 +532,9 @@ mod tests {
             Ok(TopupCreditResult::AlreadySettled),
             Ok(TopupCreditResult::NotFound),
             Ok(TopupCreditResult::AmountMismatch),
+            Ok(TopupCreditResult::NotSettleable {
+                status: "refunded".into(),
+            }),
             Err(AppError::NotFound("no such order".into())),
         ] {
             assert_eq!(

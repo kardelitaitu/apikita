@@ -206,17 +206,30 @@ pub async fn exchange_token(
 
     let sessions = sessions_config()?;
 
-    let mut tx = pool.begin().await?;
+    // `BEGIN IMMEDIATE`, not sqlx's default deferred `BEGIN`: this transaction
+    // writes, and taking the write lock up front means no lock upgrade can fail
+    // with SQLITE_BUSY_SNAPSHOT (plan section 4.3, trap 2).
+    let mut tx = crate::db::begin_immediate(&pool).await?;
 
+    // `id`, `created_at` and `updated_at` are all bound. The Postgres schema
+    // defaulted them to `gen_random_uuid()` and `now()`; both defaults were
+    // deliberately removed so no SQL-side time can be written (plan section 4.6).
+    // On conflict the freshly generated `id` is discarded and only `updated_at`
+    // moves — the same semantics the Postgres `DO UPDATE SET updated_at = now()`
+    // had, expressed through `excluded` so one instant serves the whole insert.
+    let now = Utc::now();
     let account = sqlx::query(
         r#"
-        INSERT INTO accounts (pb_user_id)
-        VALUES (?)
-        ON CONFLICT (pb_user_id) DO UPDATE SET updated_at = now()
+        INSERT INTO accounts (id, pb_user_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (pb_user_id) DO UPDATE SET updated_at = excluded.updated_at
         RETURNING id, status
         "#,
     )
+    .bind(Uuid::new_v4().hyphenated())
     .bind(&pb_user_id)
+    .bind(now)
+    .bind(now)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -227,15 +240,17 @@ pub async fn exchange_token(
         return Err(AppError::Unauthenticated);
     }
 
+    // `updated_at` had a Postgres `now()` default and is now bound.
     let wallet = sqlx::query(
         r#"
-        INSERT INTO wallets (account_id, balance_idr)
-        VALUES (?, 0)
+        INSERT INTO wallets (account_id, balance_idr, updated_at)
+        VALUES (?, 0, ?)
         ON CONFLICT (account_id) DO NOTHING
         RETURNING balance_idr
         "#,
     )
     .bind(account_id.hyphenated())
+    .bind(now)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -252,22 +267,29 @@ pub async fn exchange_token(
 
     let session_token = format!("apk_sess_{}", Uuid::new_v4().simple());
     let token_hash = hash_token(&session_token);
-    // Absolute lifetime from config. The idle bound needs a last-seen column the
-    // schema does not have yet (docs/website/02-data-model.md, sessions).
-    let expires_at = Utc::now() + Duration::days(sessions.absolute_days as i64);
+    // Absolute lifetime from config. The idle bound (7d) is measured from
+    // `last_seen_at`, which the schema now carries and this insert seeds. The
+    // expiry is derived from the same instant as the row's other timestamps.
+    let expires_at = now + Duration::days(sessions.absolute_days as i64);
 
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // `id` had a Postgres `gen_random_uuid()` default; `last_seen_at` and
+    // `created_at` had `now()`. All three are bound now. Seeding `last_seen_at`
+    // with the login instant means an unused session dies on the idle bound.
     sqlx::query(
-        "INSERT INTO sessions (account_id, token_hash, expires_at, user_agent) VALUES (?, ?, ?, ?)",
+        "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, user_agent, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(Uuid::new_v4().hyphenated())
     .bind(account_id.hyphenated())
     .bind(token_hash)
     .bind(expires_at)
+    .bind(now)
     .bind(user_agent)
+    .bind(now)
     .execute(&mut *tx)
     .await?;
 
@@ -297,8 +319,9 @@ pub async fn logout(
         .and_then(session_token_from_cookie_header)
     {
         sqlx::query(
-            "UPDATE sessions SET revoked_at = now() WHERE token_hash = ? AND revoked_at IS NULL",
+            "UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
         )
+        .bind(Utc::now())
         .bind(hash_token(token))
         .execute(&pool)
         .await?;
@@ -319,17 +342,19 @@ pub async fn logout_all(
         .and_then(session_token_from_cookie_header)
     {
         let session = sqlx::query(
-            "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()",
+            "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
         )
         .bind(hash_token(token))
+        .bind(Utc::now())
         .fetch_optional(&pool)
         .await?;
 
         if let Some(s) = session {
             let account_id: Uuid = s.get::<Hyphenated, _>("account_id").into_uuid();
             sqlx::query(
-                "UPDATE sessions SET revoked_at = now() WHERE account_id = ? AND revoked_at IS NULL",
+                "UPDATE sessions SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL",
             )
+            .bind(Utc::now())
             .bind(account_id.hyphenated())
             .execute(&pool)
             .await?;

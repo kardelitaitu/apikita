@@ -305,13 +305,18 @@ mod tests {
         }
 
         // A row older than the window no longer counts, so the cap frees.
-        sqlx::query(
-            "UPDATE topups SET created_at = now() - interval '2 hours' WHERE account_id = ?",
-        )
-        .bind(account_id.hyphenated())
-        .execute(&pool)
-        .await
-        .expect("age the rows out of the window");
+        //
+        // Bound from Rust, not `datetime('now','-2 hours')`: the SQLite function
+        // emits the space-separated format, which the `created_at` GLOB CHECK
+        // refuses (plan section 4.6, rule 3). The Postgres `now() - interval`
+        // form has no equivalent that both computes the offset and keeps the
+        // RFC3339-offset representation.
+        sqlx::query("UPDATE topups SET created_at = ? WHERE account_id = ?")
+            .bind(Utc::now() - Duration::hours(2))
+            .bind(account_id.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("age the rows out of the window");
 
         assert!(
             enforce_creation_cap(

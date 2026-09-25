@@ -173,11 +173,21 @@ pub fn ip_hash(salt: &[u8], ip: &std::net::IpAddr) -> String {
 
 /// Records one request from `ip` against `key_id` for `day`.
 ///
-/// ONE STATEMENT, so the two tables cannot disagree: the `key_ip_seen` insert
-/// reports whether this hash is new for the day, and that single fact drives
-/// whether `distinct_ips` moves. Upserting `distinct_ips` from a separate
-/// `COUNT(*)` read would race — two first-seen IPs in flight at once could both
-/// read the pre-insert count and settle on the same value.
+/// The Postgres original did this in ONE statement with a data-modifying CTE.
+/// SQLite has no such construct — its `WITH` clause accepts only `SELECT` in a
+/// CTE, and the original is rejected with `near "INSERT": syntax error`
+/// (measured) — so it becomes two statements inside one `BEGIN IMMEDIATE`.
+///
+/// The property that must survive is the reason the CTE existed: the insert into
+/// `key_ip_seen` reports whether this hash is new for the day, and that ONE fact
+/// drives whether `distinct_ips` moves. Deriving it from a separate `COUNT(*)`
+/// read would race — two first-seen IPs in flight at once could both read the
+/// pre-insert count and settle on the same value. Here the fact comes from
+/// `rows_affected()` on the insert itself (measured: 1 for a new pair, 0 when
+/// `ON CONFLICT DO NOTHING` fires), read inside the same transaction that holds
+/// the write lock, so the two tables still cannot disagree. Measured on the
+/// sequence h1, h1, h2: `distinct_ips` goes 1, 1, 2 while `request_count` goes
+/// 1, 2, 3.
 ///
 /// Returns the counts as they stand AFTER this request.
 pub async fn record_key_ip(
@@ -186,29 +196,48 @@ pub async fn record_key_ip(
     day: NaiveDate,
     ip_hash: &str,
 ) -> Result<KeyIpCounts, AppError> {
-    let row = sqlx::query(
-        // `inserted` yields one row when this hash is new for the day and none
-        // when it was already present; `COUNT(*)` over it is the 1 or 0 that
-        // decides whether the distinct counter moves.
-        "WITH inserted AS (
-             INSERT INTO key_ip_seen (api_key_id, day, ip_hash)
-             VALUES ($1, $2, $3)
-             ON CONFLICT DO NOTHING
-             RETURNING 1
-         )
-         INSERT INTO key_ip_daily (api_key_id, day, distinct_ips, request_count)
-         VALUES ($1, $2, (SELECT COUNT(*) FROM inserted)::integer, 1)
-         ON CONFLICT (api_key_id, day) DO UPDATE
-             SET request_count = key_ip_daily.request_count + 1,
-                 distinct_ips  = key_ip_daily.distinct_ips
-                                 + (SELECT COUNT(*) FROM inserted)::integer
-         RETURNING distinct_ips, request_count",
+    let mut tx = crate::db::begin_immediate(pool).await?;
+
+    // 1. Was this (key, day, ip_hash) already seen today? `ON CONFLICT DO
+    //    NOTHING` makes the insert itself answer, and `rows_affected()` is the
+    //    1 or 0. The conflict target is `key_ip_seen`'s primary key, all three
+    //    columns NOT NULL; it is spelled out rather than left bare so a future
+    //    second unique index cannot silently capture this insert.
+    let inserted = sqlx::query(
+        "INSERT INTO key_ip_seen (api_key_id, day, ip_hash)
+         VALUES (?, ?, ?)
+         ON CONFLICT (api_key_id, day, ip_hash) DO NOTHING",
     )
     .bind(key_id.hyphenated())
     .bind(day)
     .bind(ip_hash)
-    .fetch_one(pool)
+    .execute(&mut *tx)
     .await?;
+
+    let new_ip = inserted.rows_affected() as i64;
+
+    // 2. Always move `request_count`; move `distinct_ips` only when step 1
+    //    actually inserted. `key_ip_daily`'s key is the composite primary key
+    //    (api_key_id, day), both NOT NULL, so the plain column-list conflict
+    //    target is correct here — unlike `usage_daily`, whose key is an
+    //    expression index and cannot be named by columns (plan section 4.3,
+    //    trap 3). The fourth `?` is the one inside the `DO UPDATE` clause.
+    let row = sqlx::query(
+        "INSERT INTO key_ip_daily (api_key_id, day, distinct_ips, request_count)
+         VALUES (?, ?, ?, 1)
+         ON CONFLICT (api_key_id, day) DO UPDATE
+             SET request_count = key_ip_daily.request_count + 1,
+                 distinct_ips  = key_ip_daily.distinct_ips + ?
+         RETURNING distinct_ips, request_count",
+    )
+    .bind(key_id.hyphenated())
+    .bind(day)
+    .bind(new_ip)
+    .bind(new_ip)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
 
     let counts = KeyIpCounts {
         distinct_ips: row.get("distinct_ips"),
