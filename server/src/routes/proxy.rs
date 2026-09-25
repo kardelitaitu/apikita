@@ -24,6 +24,10 @@ use crate::db::{
 use crate::error::AppError;
 use crate::money::{calculate_preflight_reservation_idr, calculate_token_cost_idr};
 use crate::routes::events::{publish_balance, publish_usage, todays_usage, RealtimeHub};
+// The 30-day window and the spend read are shared with the key-management routes
+// on purpose: the limit the proxy enforces and the number the dashboard shows
+// must come from one definition, not two that can drift.
+use crate::routes::keys::{key_spend_used, SPEND_WINDOW_DAYS};
 use crate::upstream::{parse_usage_from_sse, UpstreamClient, UpstreamError, UpstreamStream, Usage};
 
 #[derive(Clone)]
@@ -81,6 +85,18 @@ fn is_model_allowed(allowed_models: &[String], model: &str) -> bool {
     allowed_models.iter().any(|m| m == model)
 }
 
+/// Whether a key's rolling 30-day spend has reached its ceiling.
+///
+/// 0 (or a negative value, which key management refuses to store) means "no
+/// limit" (docs/website/06-api-keys-and-limits.md), so it never blocks. The
+/// comparison is `>=`, not `>`: the window total is what has already been
+/// spent, so a key sitting exactly on its ceiling is out of budget and the next
+/// request is the one that would exceed it. Pure, so the boundary is tested
+/// without a database or a request.
+fn spend_limit_hit(spend_limit_idr: i64, spend_used_idr: i64) -> bool {
+    spend_limit_idr > 0 && spend_used_idr >= spend_limit_idr
+}
+
 /// Maximum cached API-key records.
 ///
 /// The cache can only ever be filled by a key that actually exists in the
@@ -99,6 +115,12 @@ struct KeyMetadata {
     key_id: Uuid,
     account_id: Uuid,
     models: Value,
+    /// The key's rolling 30-day spend ceiling, in IDR; 0 means "no limit"
+    /// (docs/website/06-api-keys-and-limits.md). It lives in the cached record
+    /// because it is a column of the same `api_keys` row every other check
+    /// reads: a cache HIT must decide exactly like a MISS, and a limit that
+    /// existed only on the miss path would make the two paths disagree.
+    spend_limit_idr: i64,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -131,6 +153,11 @@ struct KeyCache {
     order: std::collections::VecDeque<String>,
     ttl: Duration,
     capacity: usize,
+    /// Bumped by every invalidation. A lookup that read the row BEFORE an
+    /// invalidation landed must not put its pre-change record back into the map
+    /// (see `insert_if_unchanged`), or the invalidation would be undone by a
+    /// request that was already in flight.
+    generation: u64,
 }
 
 impl KeyCache {
@@ -140,7 +167,23 @@ impl KeyCache {
             order: std::collections::VecDeque::new(),
             ttl,
             capacity: capacity.max(1),
+            generation: 0,
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Forget one key, and mark the generation so a lookup already in flight
+    /// cannot re-insert what it read before this call.
+    ///
+    /// Both containers are cleaned: leaving the hash in `order` would grow the
+    /// queue with slots no map entry owns.
+    fn remove(&mut self, key_hash: &str) {
+        self.entries.remove(key_hash);
+        self.order.retain(|key| key != key_hash);
+        self.generation += 1;
     }
 
     /// The cached record, or None when it is absent or past its TTL.
@@ -191,6 +234,28 @@ impl KeyCache {
         }
     }
 
+    /// Insert only when nothing has been invalidated since `seen_generation`.
+    ///
+    /// The lookup reads the row outside the lock, so a revocation can land in
+    /// between: without this check that lookup would write a pre-revocation
+    /// record back into the cache, where it would live out a fresh full TTL and
+    /// silently undo the invalidation. The value read is still returned to the
+    /// caller (the read genuinely preceded the change) but it is not cached; the
+    /// next request re-reads and caches the post-change row.
+    fn insert_if_unchanged(
+        &mut self,
+        key_hash: String,
+        meta: KeyMetadata,
+        now: Instant,
+        seen_generation: u64,
+    ) -> bool {
+        if self.generation != seen_generation {
+            return false;
+        }
+        self.insert(key_hash, meta, now);
+        true
+    }
+
     fn purge_expired(&mut self, now: Instant) {
         let ttl = self.ttl;
         self.entries
@@ -229,16 +294,17 @@ async fn load_key_metadata(
     key_hash: &str,
 ) -> Result<KeyMetadata, AppError> {
     // The guard is scoped so the std Mutex is never held across the await below.
-    {
+    let seen_generation = {
         let cache = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(meta) = cache.get(key_hash, Instant::now()) {
             return Ok(meta);
         }
-    }
+        cache.generation()
+    };
 
     let row = sqlx::query(
         r#"
-        SELECT id, account_id, models, expires_at, revoked_at
+        SELECT id, account_id, models, spend_limit_idr, expires_at, revoked_at
         FROM api_keys
         WHERE key_hash = $1
         "#,
@@ -255,17 +321,45 @@ async fn load_key_metadata(
         key_id: row.get("id"),
         account_id: row.get("account_id"),
         models: row.get("models"),
+        spend_limit_idr: row.get("spend_limit_idr"),
         expires_at: row.get("expires_at"),
         revoked_at: row.get("revoked_at"),
     };
 
-    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
+    // Not cached if an invalidation landed while this row was being read.
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert_if_unchanged(
         key_hash.to_string(),
         meta.clone(),
         Instant::now(),
+        seen_generation,
     );
 
     Ok(meta)
+}
+
+/// Drop one key from the metadata cache, addressed by its HASH.
+
+/// The hash is the only identifier the cache ever holds — the plaintext key
+/// exists nowhere but the caller's Authorization header — so this is the only
+/// handle an invalidation could take, and it keeps the function safe to call
+/// with a value that has already been logged or stored.
+
+/// Call this whenever a key's enforcement inputs change: revocation, and a
+/// narrowed limit or allowlist. `config` is needed only to reach the same
+/// `OnceLock` instance the request path uses, so the process-wide cache stays
+/// the single source the two paths share.
+
+/// RESIDUAL STALENESS, stated plainly: this cache lives in THIS process. An
+/// invalidation here does not reach any other instance behind the load
+/// balancer, so a key revoked on instance A can still be honoured by instance B
+/// for up to `limits.key_metadata_cache_seconds`. This narrows the window; it
+/// does not make revocation global. Setting that config value to 0 is the only
+/// way to make it immediate everywhere.
+pub fn invalidate_key_cache(config: &AppConfig, key_hash: &str) {
+    key_cache(config)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(key_hash);
 }
 /// What the tee saw once the upstream stream ended.
 enum StreamEnd {
@@ -522,10 +616,45 @@ fn error_event(code: &str, message: &str) -> String {
     format!("event: error\ndata: {payload}\n\n")
 }
 
+/// The caller's explicit `stream` flag, if they sent one.
+///
+/// `None` covers both "the field is absent" and "it is present but not a bool"
+/// (including `null`): neither is an explicit `false`, and the OpenAI contract
+/// makes the field optional with a server default.
+fn requested_stream_flag(body: &Value) -> Option<bool> {
+    body.as_object()?.get("stream")?.as_bool()
+}
+
+/// The stream-flag decision, pure so it is testable without a body parser.
+///
+/// DEFECT 3 was that an explicit `stream: false` was silently answered with SSE:
+/// the field was overwritten with `true` and the response was always
+/// `text/event-stream`, so a client that asked for one JSON object got an event
+/// stream and could not parse it. This gateway only serves the streaming path
+/// (it is the one that carries the usage block settlement is built on), so the
+/// honest answer is to refuse — the caller learns at the status line, with the
+/// offending field named, instead of at the first unparseable byte.
+///
+/// 422, not 400: the body is well-formed and the value is a legitimate type, it
+/// is simply a value this endpoint does not serve — the `validation_failed`
+/// row in docs/error-model.md. `null`/absent/garbage all fall through to the
+/// streaming path, because `stream: null` is what several OpenAI SDKs send for
+/// "unset".
+fn stream_flag_allowed(requested: Option<bool>) -> Result<(), AppError> {
+    match requested {
+        Some(false) => Err(AppError::ValidationFailed(
+            "stream must be true: this endpoint serves text/event-stream only; set stream to true or omit the field".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The inbound body with `"stream": true` guaranteed and nothing else changed.
-fn ensure_streaming(body: &[u8]) -> Result<Value, AppError> {
-    let mut value: Value = serde_json::from_slice(body)
-        .map_err(|err| AppError::InvalidRequest(format!("malformed request body: {err}")))?;
+///
+/// A body that is not a JSON object is refused here — before any money moves
+/// (validation precedes the debit). Malformed JSON is refused even earlier,
+/// when the body is parsed.
+fn force_streaming(mut value: Value) -> Result<Value, AppError> {
     value
         .as_object_mut()
         .ok_or_else(|| AppError::InvalidRequest("request body must be a JSON object".into()))?
@@ -558,6 +687,7 @@ pub async fn chat_completions(
     let key_id = key.key_id;
     let account_id = key.account_id;
     let models_val = key.models.clone();
+    let spend_limit_idr = key.spend_limit_idr;
     let expires_at = key.expires_at;
     let revoked_at = key.revoked_at;
 
@@ -576,8 +706,17 @@ pub async fn chat_completions(
     let upstream = UPSTREAM.get_or_init(|| UpstreamClient::new(state.config.clone()));
 
     // Read only what the checks below need; the body itself goes upstream as-is.
-    let meta: RequestMeta = serde_json::from_slice(&body)
+    // Parsed once into a Value and lensed into `RequestMeta`: the stream-flag
+    // contract check and the rewrite in step 5 both need the same parse.
+    let parsed: Value = serde_json::from_slice(&body)
         .map_err(|err| AppError::InvalidRequest(format!("malformed request body: {err}")))?;
+    let meta: RequestMeta = serde_json::from_value(parsed.clone())
+        .map_err(|err| AppError::InvalidRequest(format!("malformed request body: {err}")))?;
+
+    // An explicit `stream: false` is refused rather than silently answered with
+    // SSE (DEFECT 3): this endpoint has one honest mode, and a caller who asked
+    // for JSON learns it here instead of from an unparseable response body.
+    stream_flag_allowed(requested_stream_flag(&parsed))?;
 
     // 2. Authorize model. DENY BY DEFAULT: an empty allowlist permits nothing.
     // docs/website/06-api-keys-and-limits.md:41 states the contract explicitly —
@@ -595,6 +734,37 @@ pub async fn chat_completions(
         .iter()
         .find(|m| m.name == meta.model)
         .ok_or_else(|| AppError::ModelNotAllowed(meta.model.clone()))?;
+
+    // The key's own rolling 30-day spend limit — step 4 of the documented
+    // enforcement order (docs/failover.md:154, docs/server/api-spec.md:334):
+    // authenticate, allowlist, throttle, KEY LIMIT, then wallet. It is checked
+    // here, before the reservation and before the upstream is called, so a key
+    // over its limit costs nothing and reaches no provider.
+    //
+    // The number is the same one the dashboard shows, because it is literally the
+    // same read: `keys::key_spend_used` sums `usage_daily.cost_idr` over
+    // `keys::SPEND_WINDOW_DAYS` (trailing 30 days, inclusive of today). Reusing
+    // the function rather than re-deriving the window is what keeps the two from
+    // disagreeing: a key the proxy blocks is a key the dashboard shows at or over
+    // its limit, and a key the dashboard shows over its limit is one the proxy
+    // refuses.
+    //
+    // Only a limited key pays for the query; a limit of 0 means "no limit".
+    if spend_limit_idr > 0 {
+        let spend_used_idr =
+            key_spend_used(&state.pool, account_id, key_id, chrono::Utc::now().date_naive())
+                .await?;
+        if spend_limit_hit(spend_limit_idr, spend_used_idr) {
+            return Err(AppError::KeyLimitExceeded {
+                details: Some(json!({
+                    "reason": "spend_limit_idr_reached",
+                    "spend_limit_idr": spend_limit_idr,
+                    "spend_used_idr": spend_used_idr,
+                    "window_days": SPEND_WINDOW_DAYS,
+                })),
+            });
+        }
+    }
 
     // 3. Pre-flight worst-case reservation, taken BEFORE routing.
     //
@@ -629,7 +799,7 @@ pub async fn chat_completions(
 
     // 5. The inbound body with `stream: true` guaranteed. Parsed BEFORE the hold so
     //    a malformed body can never take money: validation precedes the debit.
-    let upstream_body = ensure_streaming(&body)?;
+    let upstream_body = force_streaming(parsed)?;
 
     // 6. HOLD the reservation. This is the money step: the wallet is debited by
     //    the worst case in a guarded, committed transaction BEFORE the upstream is
@@ -996,6 +1166,7 @@ mod tests {
             key_id: Uuid::new_v4(),
             account_id: Uuid::new_v4(),
             models: json!(["deepseek-flash"]),
+            spend_limit_idr: 0,
             expires_at: None,
             revoked_at,
         }
@@ -1197,5 +1368,93 @@ mod tests {
         assert!(!is_model_allowed(&allowed, "gpt-4o"));
         // A non-empty list does not fall back to allowing anything else.
         assert!(!is_model_allowed(&allowed, "deepseek-flash-v2"));
+    }
+
+    // DEFECT 1 regression: the per-key 30-day spend limit now has a decision on
+    // the request path. 0 is unlimited, the ceiling itself already blocks, and
+    // spending past it keeps blocking.
+    #[test]
+    fn a_spend_limit_blocks_at_and_above_the_ceiling() {
+        assert!(!spend_limit_hit(0, 0), "0 means no limit");
+        assert!(!spend_limit_hit(0, 10_000_000), "0 never blocks, whatever was spent");
+        assert!(!spend_limit_hit(50_000, 49_999), "one IDR under the ceiling is fine");
+        assert!(spend_limit_hit(50_000, 50_000), "exactly at the ceiling is out of budget");
+        assert!(spend_limit_hit(50_000, 60_000), "over the ceiling stays blocked");
+        // A negative limit is refused at key-management time, so it can never be
+        // stored; it is treated as "no limit" rather than blocking every request.
+        assert!(!spend_limit_hit(-1, 10));
+    }
+
+    // DEFECT 2 regression: the invalidation drops the entry, and a lookup that
+    // read the row before the invalidation cannot put it back.
+    #[test]
+    fn invalidation_drops_one_key_and_stops_a_stale_re_insert() {
+        let mut c = cache(60, 16);
+        let now = Instant::now();
+        c.insert("hash-a".into(), meta(None), now);
+        c.insert("hash-b".into(), meta(None), now);
+
+        c.remove("hash-a");
+
+        assert_eq!(c.get("hash-a", now), None, "the revoked key is gone immediately");
+        assert!(c.get("hash-b", now).is_some(), "only the named key is dropped");
+        assert_eq!(c.order.len(), c.len(), "no orphaned eviction slot");
+    }
+
+    #[test]
+    fn a_lookup_that_predates_an_invalidation_does_not_re_cache() {
+        let mut c = cache(60, 16);
+        let now = Instant::now();
+        c.insert("hash-a".into(), meta(None), now);
+
+        // The request read this generation, then went to the database. A
+        // revocation lands while it is in flight.
+        let seen = c.generation();
+        c.remove("hash-a");
+
+        // Without the generation guard this would restore the pre-revocation
+        // record for a fresh full TTL, silently undoing the invalidation.
+        assert!(!c.insert_if_unchanged("hash-a".into(), meta(None), now, seen));
+        assert_eq!(c.get("hash-a", now), None);
+
+        // A lookup that started after the invalidation caches normally.
+        let seen = c.generation();
+        assert!(c.insert_if_unchanged("hash-a".into(), meta(None), now, seen));
+        assert!(c.get("hash-a", now).is_some());
+    }
+
+    // DEFECT 3 regression: an explicit `stream: false` is refused rather than
+    // answered with SSE; absent, null and non-bool values keep the streaming
+    // default (OpenAI SDKs send `stream: null` for "unset").
+    #[test]
+    fn an_explicit_non_streaming_request_is_refused_not_silently_streamed() {
+        let err = stream_flag_allowed(Some(false)).unwrap_err();
+        assert!(matches!(&err, AppError::ValidationFailed(_)));
+        assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.to_string().contains("stream"), "the field is named");
+
+        assert!(stream_flag_allowed(Some(true)).is_ok());
+        assert!(stream_flag_allowed(None).is_ok(), "absent keeps the default");
+    }
+
+    #[test]
+    fn the_stream_flag_is_read_only_from_a_real_bool() {
+        assert_eq!(requested_stream_flag(&json!({"stream": false})), Some(false));
+        assert_eq!(requested_stream_flag(&json!({"stream": true})), Some(true));
+        assert_eq!(requested_stream_flag(&json!({"stream": null})), None);
+        assert_eq!(requested_stream_flag(&json!({"stream": "false"})), None);
+        assert_eq!(requested_stream_flag(&json!({"model": "flash"})), None);
+        assert_eq!(requested_stream_flag(&json!([1, 2])), None);
+    }
+
+    #[test]
+    fn a_streamed_body_is_forced_true_and_other_fields_survive() {
+        let forced = force_streaming(json!({"model": "flash", "stream": true, "temperature": 0.2}))
+            .expect("a JSON object is accepted");
+        assert_eq!(forced["stream"], json!(true));
+        assert_eq!(forced["temperature"], json!(0.2), "the body is otherwise untouched");
+
+        // A non-object body is refused before any money moves.
+        assert!(force_streaming(json!([1, 2])).is_err());
     }
 }

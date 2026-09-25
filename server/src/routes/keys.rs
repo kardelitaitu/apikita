@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::routes::proxy::{invalidate_key_cache, AppState};
 
 #[derive(Debug, Serialize)]
 pub struct ApiKeyDto {
@@ -70,11 +71,15 @@ fn hash_string(s: &str) -> String {
 /// docs/website/06-api-keys-and-limits.md fixes this at "the trailing 30 days"
 /// (a rolling window, deliberately not a calendar month). No window length is
 /// configured in config.rs, so there is nothing to read instead of this.
-const SPEND_WINDOW_DAYS: i64 = 30;
+///
+/// Public because the PROXY enforces this same window on the request path: one
+/// constant, so the limit the proxy blocks on and the spend the dashboard shows
+/// cannot drift apart.
+pub const SPEND_WINDOW_DAYS: i64 = 30;
 
 /// First day (inclusive) of the rolling spend window ending on `today`.
 /// The window holds exactly 30 day-values, so it starts 29 days back.
-fn spend_window_start(today: NaiveDate) -> NaiveDate {
+pub(crate) fn spend_window_start(today: NaiveDate) -> NaiveDate {
     today - chrono::Duration::days(SPEND_WINDOW_DAYS - 1)
 }
 
@@ -100,7 +105,13 @@ fn fold_spend_in_window(rows: &[(Uuid, NaiveDate, i64)], today: NaiveDate) -> Ha
 }
 
 /// 30-day spend already recorded against one key, in IDR.
-async fn key_spend_used(
+///
+/// Public because the proxy enforces the per-key limit with this exact read
+/// (DEFECT 1): same table, same column, same window. A second formula on the
+/// request path is how the dashboard number and the enforcement number start
+/// disagreeing, and a key showing "limit reached" that still gets served is
+/// precisely the defect this closes.
+pub(crate) async fn key_spend_used(
     pool: &PgPool,
     account_id: Uuid,
     key_id: Uuid,
@@ -295,24 +306,27 @@ pub async fn create_key(
 }
 
 pub async fn update_key(
-    State(pool): State<PgPool>,
+    // The whole state, not just the pool: the invalidation below reaches the
+    // proxy's process-wide cache, which is built from `config`.
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(payload): Json<UpdateKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+    let account_id = resolve_account_from_cookie(&state.pool, &headers).await?;
 
     // Lowering a limit below what the key has already spent in the window leaves
     // it immediately over limit. Validate against the real spend so the operator
     // sees the number rather than a silently ineffective limit.
     if let Some(requested) = payload.spend_limit_idr {
-        let spend_used_idr = key_spend_used(&pool, account_id, id, Utc::now().date_naive()).await?;
+        let spend_used_idr =
+            key_spend_used(&state.pool, account_id, id, Utc::now().date_naive()).await?;
         check_spend_limit(requested, spend_used_idr)?;
     }
 
     let models_json = payload.models.map(|m| serde_json::to_value(m).unwrap());
 
-    let res = sqlx::query(
+    let res: Option<String> = sqlx::query_scalar(
         r#"
         UPDATE api_keys
         SET
@@ -323,7 +337,7 @@ pub async fn update_key(
             rate_limit_rpm = COALESCE($5, rate_limit_rpm),
             expires_at = COALESCE($6, expires_at)
         WHERE id = $7 AND account_id = $8 AND revoked_at IS NULL
-        RETURNING id
+        RETURNING key_hash
         "#,
     )
     .bind(payload.label)
@@ -334,28 +348,61 @@ pub async fn update_key(
     .bind(payload.expires_at)
     .bind(id)
     .bind(account_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.pool)
     .await?;
 
-    if res.is_none() {
+    // A narrowed limit, allowlist or expiry is an enforcement input too: the
+    // cached record still holds the old values, so without this the proxy would
+    // keep honouring the previous (looser) limit for up to the cache TTL.
+    // Dropped after the update commits, and only in THIS process.
+    let Some(key_hash) = res else {
         return Err(AppError::NotFound("Key not found or revoked".into()));
-    }
+    };
+    invalidate_key_cache(&state.config, &key_hash);
 
     Ok(StatusCode::OK)
 }
 
 pub async fn revoke_key(
-    State(pool): State<PgPool>,
+    // The whole state, not just the pool: the proxy's key-metadata cache is a
+    // process-wide singleton built from `config`, so reaching the same instance
+    // the request path uses needs the config it was built from.
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+    let account_id = resolve_account_from_cookie(&state.pool, &headers).await?;
 
-    sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND account_id = $2")
-        .bind(id)
-        .bind(account_id)
-        .execute(&pool)
-        .await?;
+    // RETURNING the hash is what makes the invalidation below possible: the
+    // proxy cache is keyed by the SHA-256 of the presented token, and the
+    // plaintext key exists nowhere in the database (it was shown once, at
+    // creation). The hash is also all `invalidate_key_cache` will ever take, so
+    // the plaintext never has to be reconstructed to evict an entry.
+    let revoked_hash: Option<String> = sqlx::query_scalar(
+        r#"
+        UPDATE api_keys SET revoked_at = now()
+        WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
+        RETURNING key_hash
+        "#,
+    )
+    .bind(id)
+    .bind(account_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    // The update committed, so the revocation is durable; dropping the cached
+    // record is what makes it take effect NOW instead of at the TTL boundary
+    // (DEFECT 2: a revoked key used to stay usable for up to
+    // `limits.key_metadata_cache_seconds`). A second revoke matches no row and
+    // returns None — there is nothing left to invalidate, and the response is
+    // the same 204 either way, so the call stays idempotent.
+    //
+    // Only THIS process's cache is dropped. Instances behind the load balancer
+    // keep their own copy until its TTL expires; that residual window is the
+    // documented cost of the cache and is not closed by this call.
+    if let Some(key_hash) = revoked_hash {
+        invalidate_key_cache(&state.config, &key_hash);
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
