@@ -58,8 +58,8 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [x] Consecutive failure counter (3 failures to trip to `Open`)
   - [x] Exponential cooldown backoff (30s $\rightarrow$ 60s $\rightarrow$ capped at 900s)
   - [x] Half-open trial request logic
-- [ ] **Streaming Pipeline (`POST /v1/chat/completions`)**
-  - [ ] Bearer API key validation with 60-second in-memory TTL cache
+- [x] **Streaming Pipeline (`POST /v1/chat/completions`)**
+  - [x] Bearer API key validation with 60-second in-memory TTL cache
   - [x] Model allowlist verification
   - [x] Pre-flight worst-case balance reservation check (`402 Payment Required` on breach)
   - [x] Non-buffering SSE chunk forwarding (client $\leftarrow$ server $\leftarrow$ upstream)
@@ -106,11 +106,11 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 
 ## Phase 5: Midtrans Payment Integration (Done Last)
 
-- [ ] **Fake Midtrans Webhook Harness**
+- [x] **Fake Midtrans Webhook Harness**
   - [x] Local test runner firing synthetic signed webhooks to `POST /webhooks/midtrans`
   - [x] Verify signature verification rejection on invalid signatures
   - [x] Verify idempotency: replayed webhook with same `order_id` credits wallet exactly once
-- [ ] **Midtrans Snap Client**
+- [x] **Midtrans Snap Client**
   - [x] Implement `POST /api/topups` calling Midtrans Snap API (`/snap/v1/transactions`)
   - [x] Enforce deposit limits (50k IDR initial, 10k IDR subsequent)
   - [x] Integrate Midtrans Snap.js popup modal in Web wallet island
