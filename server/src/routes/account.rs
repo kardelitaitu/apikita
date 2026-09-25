@@ -53,6 +53,17 @@ pub struct LimitQuery {
     pub limit: Option<i64>,
 }
 
+/// The window parameters docs/server/api-spec.md:97 advertises on
+/// `GET /api/usage`. Held as raw strings, not `NaiveDate`, so a malformed
+/// value produces OUR JSON 422 naming the field instead of axum's plain-text
+/// extractor rejection - docs/error-model.md:10 requires every response to be
+/// JSON.
+#[derive(Debug, Deserialize)]
+pub struct UsageQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
 pub async fn get_me(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -112,11 +123,55 @@ pub async fn get_me(
     }))
 }
 
+/// One bound of the `GET /api/usage` window, parsed from `?from=`/`?to=`.
+///
+/// An absent or empty parameter is "unbounded"; anything else must be a date,
+/// because a silently dropped bound is the bug this exists to fix. The format
+/// is the ISO date the rest of the API already emits for `day`
+/// (`YYYY-MM-DD`), and the error is a 422 naming the offending field, per
+/// docs/error-model.md rule 5.
+fn parse_usage_day(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<chrono::NaiveDate>, AppError> {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+
+    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|_| AppError::ValidationFailed {
+            message: format!("{field} must be a date in YYYY-MM-DD form, got \"{raw}\""),
+            field: field.to_string(),
+        })
+}
+
+/// Buckets returned when the caller asks for no window at all. The spec names
+/// `?from=&to=` but documents no default, so the historical behaviour - the
+/// last 30 buckets - is preserved rather than invented anew.
+const USAGE_DEFAULT_LIMIT: i64 = 30;
+
 pub async fn get_usage(
     State(pool): State<PgPool>,
     headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+
+    let from = parse_usage_day(query.from.as_deref(), "from")?;
+    let to = parse_usage_day(query.to.as_deref(), "to")?;
+
+    // docs/server/api-spec.md:97 advertises `?from=&to=`. Both bounds are
+    // INCLUSIVE - the spec draws no exclusive boundary, so `from == to` must
+    // return that one day - and a bound that is not supplied simply does not
+    // constrain the window: the caller asked a bounded question, so an
+    // undisclosed default must not quietly narrow the answer. A range that
+    // matches nothing returns an empty array, not the default window.
+    let limit = if from.is_none() && to.is_none() {
+        USAGE_DEFAULT_LIMIT
+    } else {
+        i64::MAX
+    };
 
     let rows = sqlx::query(
         r#"
@@ -128,12 +183,17 @@ pub async fn get_usage(
             SUM(cost_idr)::bigint AS cost_idr
         FROM usage_daily
         WHERE account_id = $1
+          AND ($2::date IS NULL OR day >= $2::date)
+          AND ($3::date IS NULL OR day <= $3::date)
         GROUP BY day
         ORDER BY day DESC
-        LIMIT 30
+        LIMIT $4
         "#,
     )
     .bind(account_id)
+    .bind(from)
+    .bind(to)
+    .bind(limit)
     .fetch_all(&pool)
     .await?;
 
@@ -572,6 +632,39 @@ mod tests {
         );
     }
 
+    /// The window parser, without a database. The live test covers the whole
+    /// handler; this one keeps the malformed-date contract checked in the
+    /// default suite, where no Postgres is running.
+    #[test]
+    fn usage_bounds_are_optional_dates_and_a_bad_one_names_its_field() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+
+        // docs/server/api-spec.md:97 writes the params as `?from=&to=`: an
+        // empty value means "not supplied", not "parse this".
+        assert_eq!(parse_usage_day(None, "from").unwrap(), None);
+        assert_eq!(parse_usage_day(Some(""), "from").unwrap(), None);
+        assert_eq!(parse_usage_day(Some("  "), "to").unwrap(), None);
+        assert_eq!(
+            parse_usage_day(Some("2026-01-31"), "from").unwrap(),
+            Some(day)
+        );
+
+        // docs/error-model.md rule 5: name the offending field.
+        for (value, field) in [
+            ("not-a-date", "from"),
+            ("2026-02-30", "from"),
+            ("31/01/2026", "to"),
+        ] {
+            let err = parse_usage_day(Some(value), field).unwrap_err();
+            assert_eq!(
+                err.status_code(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{value}"
+            );
+            assert_eq!(err.details(), Some(json!({ "field": field })), "{value}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // LIVE-DATABASE TESTS
     //
@@ -978,7 +1071,9 @@ mod tests {
         )
         .await;
 
-        let (status, body) = respond(get_usage(State(pool.clone()), cookie_header(&token))).await;
+        let (status, body) =
+            respond(get_usage(State(pool.clone()), cookie_header(&token), usage_query(None, None)))
+                .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         let rows = body
@@ -1062,6 +1157,251 @@ mod tests {
                 "another account usage leaked into the response: {body}"
             );
         }
+    }
+
+    /// Builds the extractor the router hands get_usage from `?from=..&to=..`.
+    fn usage_query(from: Option<&str>, to: Option<&str>) -> Query<UsageQuery> {
+        Query(UsageQuery {
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // 2b. get_usage?from=&to= - docs/server/api-spec.md:97
+    //
+    // The gap: the spec advertises `?from=&to=` and the handler took no query
+    // extractor at all, answering every request with the last 30 days. A client
+    // that asked a bounded question got a plausible answer to a different one.
+    // -----------------------------------------------------------------------
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_get_usage_honours_the_documented_from_to_range() {
+        let pool = live_pool().await;
+        let primary = live_account(&pool).await;
+        let other = live_account(&pool).await;
+
+        let outcome = tokio::spawn(usage_range_assertions(
+            pool.clone(),
+            primary.account_id,
+            primary.token.clone(),
+            other.account_id,
+        ));
+
+        let outcome = outcome.await;
+        delete_fixture_rows(&pool, &[primary.account_id, other.account_id]).await;
+        outcome.expect("the usage range assertions panicked");
+    }
+
+    async fn usage_range_assertions(
+        pool: PgPool,
+        account_id: Uuid,
+        token: String,
+        other_account_id: Uuid,
+    ) {
+        let today = Utc::now().date_naive();
+        let key = create_api_key(&pool, account_id).await;
+        let other_key = create_api_key(&pool, other_account_id).await;
+
+        // Four consecutive days, each carrying a value only that day has, so a
+        // row from OUTSIDE the asked-for window is identifiable by its numbers
+        // and not merely by its date.
+        let days: Vec<chrono::NaiveDate> =
+            (0..4).map(|d| today - chrono::Duration::days(d)).collect();
+        let values = [101i64, 202i64, 303i64, 404i64];
+        for (day, value) in days.iter().zip(values) {
+            insert_usage(&pool, account_id, key, *day, (value, value, value, value)).await;
+        }
+
+        // The SAME days on the other account, with numbers that cannot be
+        // confused with the primary's: a lost account scope shows up here.
+        for day in &days {
+            insert_usage(
+                &pool,
+                other_account_id,
+                other_key,
+                *day,
+                (9_000_001, 9_000_002, 9_000_003, 9_000_004),
+            )
+            .await;
+        }
+
+        // --- A bounded range returns ONLY the days inside it. ---
+        // days[3] (oldest) ..= days[1]: days 3, 2 and 1. days[0] - the most
+        // recent, and the row a `LIMIT 30` would return first - is OUTSIDE and
+        // must not appear, which is precisely what the old handler got wrong.
+        let (status, body) = respond(get_usage(
+            State(pool.clone()),
+            cookie_header(&token),
+            usage_query(Some(&days[3].to_string()), Some(&days[1].to_string())),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let rows = body.as_array().expect("daily buckets are an array");
+        assert_eq!(
+            rows.len(),
+            3,
+            "docs/server/api-spec.md:97 - a bounded range must return ONLY the days \
+             inside it, so today ({}) is excluded by from={} to={}. body: {body}",
+            days[0],
+            days[3],
+            days[1]
+        );
+        assert_eq!(rows[0]["day"], json!(days[1]), "day DESC: {body}");
+        assert_eq!(rows[1]["day"], json!(days[2]), "day DESC: {body}");
+        assert_eq!(rows[2]["day"], json!(days[3]), "day DESC: {body}");
+        assert_eq!(rows[0]["input_tokens"], json!(202), "{body}");
+        assert_eq!(rows[1]["input_tokens"], json!(303), "{body}");
+        assert_eq!(rows[2]["input_tokens"], json!(404), "{body}");
+
+        // The three token classes stay separate inside a range too.
+        let mut keys: Vec<&str> = rows[0]
+            .as_object()
+            .expect("a bucket is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "cache_read_tokens",
+                "cost_idr",
+                "day",
+                "input_tokens",
+                "output_tokens"
+            ],
+            "three token classes, never summed: {body}"
+        );
+
+        // TENANCY: a range must not widen the account scope.
+        let rendered = body.to_string();
+        for leaked in ["9000001", "9000002", "9000003", "9000004"] {
+            assert!(
+                !rendered.contains(leaked),
+                "another account usage leaked into a ranged response: {body}"
+            );
+        }
+
+        // --- BOTH BOUNDS ARE INCLUSIVE. ---
+        let (status, body) = respond(get_usage(
+            State(pool.clone()),
+            cookie_header(&token),
+            usage_query(Some(&days[1].to_string()), Some(&days[1].to_string())),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let rows = body.as_array().expect("an array");
+        assert_eq!(
+            rows.len(),
+            1,
+            "from == to must include that one day on both ends: {body}"
+        );
+        assert_eq!(rows[0]["day"], json!(days[1]), "{body}");
+        assert_eq!(rows[0]["input_tokens"], json!(202), "{body}");
+
+        // --- A range with no rows is EMPTY, never a fallback. ---
+        let (status, body) = respond(get_usage(
+            State(pool.clone()),
+            cookie_header(&token),
+            usage_query(Some("2001-01-01"), Some("2001-01-31")),
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an empty range is a valid answer, not an error: {body}"
+        );
+        assert_eq!(
+            body,
+            json!([]),
+            "a range excluding every row must return an EMPTY array - never an error \
+             and never the silent last-30-days fallback this test exists to forbid: {body}"
+        );
+
+        // --- A range that starts after today is still empty, not a fallback. ---
+        let (status, body) = respond(get_usage(
+            State(pool.clone()),
+            cookie_header(&token),
+            usage_query(
+                Some(&(today + chrono::Duration::days(10)).to_string()),
+                Some(&(today + chrono::Duration::days(20)).to_string()),
+            ),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body, json!([]), "a future range is empty: {body}");
+
+        // --- No params: the documented default window still holds. ---
+        let (status, body) =
+            respond(get_usage(State(pool.clone()), cookie_header(&token), usage_query(None, None)))
+                .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let rows = body.as_array().expect("an array");
+        assert_eq!(
+            rows.len(),
+            4,
+            "the default window must still cover the last 30 days: {body}"
+        );
+    }
+
+    /// A malformed date must be REJECTED, naming the field - not silently
+    /// ignored, which is exactly how the original bug behaved.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_get_usage_rejects_a_malformed_date_naming_the_field() {
+        let pool = live_pool().await;
+        let primary = live_account(&pool).await;
+
+        let outcome = tokio::spawn(usage_validation_assertions(
+            pool.clone(),
+            primary.account_id,
+            primary.token.clone(),
+        ));
+
+        let outcome = outcome.await;
+        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        outcome.expect("the usage validation assertions panicked");
+    }
+
+    async fn usage_validation_assertions(pool: PgPool, account_id: Uuid, token: String) {
+        let key = create_api_key(&pool, account_id).await;
+        insert_usage(&pool, account_id, key, Utc::now().date_naive(), (7, 8, 9, 10)).await;
+
+        for (from, to, field) in [
+            (Some("not-a-date"), None, "from"),
+            (None, Some("01/03/2026"), "to"),
+            (Some("2026-02-30"), None, "from"),
+        ] {
+            let (status, body) = respond(get_usage(
+                State(pool.clone()),
+                cookie_header(&token),
+                usage_query(from, to),
+            ))
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "docs/error-model.md rule 5: from={from:?} to={to:?} is not a date and must be \
+                 REJECTED, not silently ignored. body: {body}"
+            );
+            assert_eq!(body["error"]["code"], json!("validation_failed"), "{body}");
+            assert_eq!(
+                body["error"]["details"]["field"],
+                json!(field),
+                "the error must name the offending field: {body}"
+            );
+        }
+
+        // The valid path is untouched by the refusals above.
+        let (status, body) =
+            respond(get_usage(State(pool.clone()), cookie_header(&token), usage_query(None, None)))
+                .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
     }
 
     // -----------------------------------------------------------------------
