@@ -18,8 +18,9 @@ open. Do not re-open a settled decision in a document — change it here instead
 | --- | --- | --- |
 | Frontend | **Astro + islands** | Native Pages fit, zero JS on marketing pages, reversible |
 | Backend | **Rust on Northflank** | I/O-bound proxy; one service does API + proxy |
-| Money store | **PostgreSQL** | Transactions, constraints, the ledger |
-| Identity store | **PocketBase** | Auth only — never money |
+| Money store | **SQLite (embedded, WAL)** | Transactions, constraints, the ledger — on the same host as the API, so a ledger write is a local file write rather than a network round trip |
+| SQL driver | **`sqlx` with the `sqlite` feature** | Not `rusqlite`. The port is a 106-site dialect change, not an API rewrite; `sqlx migrate` is already settled below; and the bottleneck is the single writer, not the binding. Reasoning: [`plans/proxy-hot-path-audit.md`](plans/proxy-hot-path-audit.md) §3 |
+| Identity store | **Rust-owned** — the `accounts` + `identities` tables | Auth only — never money. No external auth service remains |
 | Payments | **Midtrans, QRIS only** | Card excluded: a flat fee is ~20% of a small top-up |
 | Relay | **nginx on a VPS, L7** | TLS + filtering; absorbs load before the backend |
 | CDN / edge | **Cloudflare** | Free tier; also where Pages lives |
@@ -32,9 +33,9 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Relay role | **Optimisation, not a security boundary** | Failover requires a reachable backend, so the relay cannot be a hard boundary |
 | Failover model | **Relay primary, backend fallback** | Relay down degrades, does not stop |
 | Second relay | **No** | The backend is already the fallback; a second relay is cost without benefit |
-| Session storage | **Server-side rows in Postgres** | Makes logout revoke immediately |
+| Session storage | **Server-side rows in the local SQLite database** | Makes logout revoke immediately |
 | SSE auth | **Session cookie, same-site subdomain** | A token in a query string lands in logs and history |
-| Account key | **Postgres owns the id; PocketBase id is a linked column** | Auth is the component most likely to change |
+| Account key | **`accounts.id` is the only key; the PocketBase id column is dropped** | Auth is the component most likely to change, so it must not own the identity |
 | Proxy/API split | **One service for now** | They share the database, key lookup, and usage accounting |
 
 ### Money
@@ -48,10 +49,10 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Billing periods | **Peak + off-peak, billed at peak** | Off-peak is exactly half price; pricing at peak never loses |
 | Credit source | **Midtrans webhook only** | Never the client callback, never the payload amount |
 | Idempotency | **Unique `order_id`** | Enforced by the database, not by application logic |
-| Money type | **`BIGINT` IDR** | Never floating point |
+| Money type | **`INTEGER` IDR** | Never floating point. Was `BIGINT` while the store was Postgres; a `STRICT` table accepts only `INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB`, `ANY`, and **rejects `BIGINT` outright** (measured). The name had to change for the no-floating-point rule to stay structural rather than declared |
 | Ledger | **Append-only; balance derivable** | Corrections are new rows, never edits |
 | Balance floor | **`CHECK (balance_idr >= 0)`** | The database refuses a negative balance |
-| Overdraft | **Not permitted — no flag** | The balance is non-negative by decision. `server/migrations/20260925000000_initial_schema.sql:18` is the authoritative backstop; the pre-flight in `server/src/routes/proxy.rs` always rejects when the reservation exceeds the balance. Gate 2 of [`launch-checklist.md`](launch-checklist.md) requires the constraint present and exercised |
+| Overdraft | **Not permitted — no flag** | The balance is non-negative by decision. The `CHECK (balance_idr >= 0)` on `wallets` in `server/migrations/20260925000000_initial_schema.sql` is the authoritative backstop; the pre-flight in `server/src/routes/proxy.rs` always rejects when the reservation exceeds the balance. Gate 2 of [`launch-checklist.md`](launch-checklist.md) requires the constraint present and exercised |
 | Refund policy | **Non-refundable, with a non-delivery exception** | The exception is what makes the clause defensible |
 
 ### API behaviour
@@ -71,8 +72,8 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Decision | Value | Rationale |
 | --- | --- | --- |
 | Session lifetime | **30 days absolute, 7 days idle** | Rare re-login; bounded exposure on a stolen token |
-| Password hashing | **Argon2id** | PocketBase owns this if it stays the auth provider — verify which applies |
-| Login methods | **Google + email/password, with reset** | |
+| Password hashing | **Argon2id, owned by the Rust API** | The qualifier is resolved: PocketBase is going, so nothing else can own it. Parameters and the rehash-on-login policy become ours to set |
+| Login methods | **Google + email/password, with reset** | Unchanged as a product decision; what changes is that the Rust API implements all of it, including the pre-hijacking defences in [`architecture/identity.md`](architecture/identity.md) |
 | Telegram | **A linked surface, not an identity provider** | One wallet, two surfaces |
 | Review writes | **Telegram only** | A second writer makes "who reviewed" ambiguous |
 | Review identity | **Keyed on the account, re-attributed on link** | Otherwise linking creates a second review slot |
@@ -93,6 +94,11 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Suspension | **Revokes sessions and keys atomically** | A status flag alone does not suspend anything |
 | IP storage | **Salted hash only, salt deleted daily** | No raw IP is stored anywhere |
 | Backup | **PITR plus offsite; restore drill required** | An untested backup is a belief |
+| Instance count | **Exactly one** | SQLite cannot be shared across replicas. Northflank enforces it too — a Single Read/Write volume is *"limited to 1 instance"*. Left unwritten, someone scales the service and corrupts the database |
+| Deploy downtime | **Accepted — every deploy is a brief outage** | A Single Read/Write volume forbids a rolling restart: the old container is terminated before the new one starts. A published window beats a discovered one |
+| Transaction mode | **`BEGIN IMMEDIATE` for any read-then-write transaction** | SQLite upgrades a deferred read transaction to a write lock, and `SQLITE_BUSY_SNAPSHOT` on that upgrade is unrecoverable — the transaction cannot be retried, only restarted |
+| Timestamp representation | **Uniform RFC3339 with a format `CHECK`; time is never written in SQL** | SQLite compares `TEXT` lexicographically, so a second format is a silent correctness bug. Measured: mixing `CURRENT_TIMESTAMP` with sqlx's encoding extended session life by up to ~24h |
+| API deployability | **Container-bound — no Cloudflare Workers path** | Workers has no filesystem, so a local database forecloses it; that route would need D1 and a second dialect |
 
 ### Product
 
@@ -145,9 +151,23 @@ open. Do not re-open a settled decision in a document — change it here instead
 
 | Decision | Value | Rationale |
 | --- | --- | --- |
-| Backup tooling | **Managed PITR**, else `pg_dump` + `wal-g` | PITR gives minutes of RPO; simplest thing that meets it |
+| Backup tooling | **Litestream → Cloudflare R2**; `VACUUM INTO` + offsite as the fallback | Continuous WAL shipping gives seconds-level RPO against a 15-minute requirement. A sidecar is *forced* by the Single Read/Write volume, not merely preferred — and `VACUUM INTO` cannot run inside a transaction |
 | RPO | **15 minutes** | The ledger is the business |
 | RTO | **4 hours** | Achievable by restoring to a new host |
+
+### Migration in flight — decided, not yet in the code
+
+The entries this changes — Money store, SQL driver, Identity store, Account key,
+Money type, Backup tooling, and the Operations additions — are **decided**. The code
+has not moved yet. Until Phase 5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md)
+lands, `server/` still builds against Postgres and still calls PocketBase for
+`auth-refresh`.
+
+This marker exists so the register does not lie in the other direction. Here,
+**settled means the direction is chosen, not that the tree matches it** — the register
+is read by agents working in parallel with the port, and a value flipped ahead of the
+code is the same failure as a value left behind it.
+
 ## Genuinely open
 
 These need information that does not exist yet, not a design decision:

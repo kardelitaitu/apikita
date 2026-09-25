@@ -119,7 +119,7 @@ benefit:
 | --- | --- |
 | `users` | `accounts` + `wallets` |
 | `api_keys` | `api_keys` |
-| `usage_logs` | `usage_events` (**new**, see [§4.3](#43-usage_events--the-one-genuinely-new-table)) |
+| `usage_logs` | `usage_events` (**new**, see [§4.4](#44-usage_events--the-one-genuinely-new-table)) |
 | `balance_adjustments` | `ledger` rows with `reason='adjustment'` — **not a second ledger** |
 
 `balance_adjustments` as a parallel audit table is the specific anti-pattern
@@ -168,12 +168,13 @@ register is edited **first**, in Phase 0, and the docs follow.
 | Register entry | Current | Becomes |
 | --- | --- | --- |
 | Money store | PostgreSQL | **SQLite (embedded, WAL)** |
+| Money type | `BIGINT` IDR | **`INTEGER` IDR** — `STRICT` accepts only `INT`/`INTEGER`/`REAL`/`TEXT`/`BLOB`/`ANY` and **rejects `BIGINT`** (measured). [§11.1](#111-decided) item 5 forces this, so the register's money-type row had to move with it |
 | Identity store | PocketBase | **Rust-owned (`accounts` + `identities`)** |
 | SQL driver | `sqlx` (`postgres` feature) | **`sqlx` + `sqlite` feature — not `rusqlite`.** Decided; reasoning in [`proxy-hot-path-audit.md` §3](proxy-hot-path-audit.md) |
 | Account key | *"Postgres owns the id; PocketBase id is a linked column"* | **`accounts.id` is the only key; `pb_user_id` dropped** |
 | Login methods | *"Google + email/password, with reset"* | **unchanged as a product decision — but Rust now owns all of it.** Settled 2026-09-25 ([§6](#6-phase-2--identity-the-real-cost)) |
 | Password hashing | *"Argon2id — PocketBase owns this if it stays the auth provider — **verify which applies**"* | **Rust owns Argon2id.** The qualifier is now resolved: PocketBase is going, so it is ours. |
-| Transaction mode | — | **`BEGIN IMMEDIATE` for read-then-write transactions** ([§4.2](#43-connection-setup--four-traps-all-measured)) |
+| Transaction mode | — | **`BEGIN IMMEDIATE` for read-then-write transactions** ([§4.3](#43-connection-setup--four-traps-all-measured)) |
 | Instance count | — | **exactly one** — and Northflank enforces it: a Single Read/Write volume *"limited to 1 instance"* ([§8](#8-operations-backup-rpo-and-the-volume)) |
 | Deploy downtime | — | **accepted.** A Single Read/Write volume forbids rolling restarts; every deploy is a brief outage |
 | Timestamp representation | — | **uniform RFC3339 with a format `CHECK`; time is never written in SQL** ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped)) |
@@ -189,6 +190,13 @@ Two further register additions:
 - **The API is container-bound.** Local SQLite forecloses a future Cloudflare
   Workers deployment (Workers has no filesystem; that path would need D1).
 
+**The register carries a status marker.** [`decisions.md`](../decisions.md) gains a
+*Migration in flight* subsection recording that these values are decided but not yet
+in the tree. Without it, Phase 0 would swap one stale register for another: the
+register is read by agents working in parallel with the port, and a value flipped
+ahead of the code misleads exactly as a value left behind it does. *Settled* means the
+direction is chosen, not that the tree matches it.
+
 ---
 
 ## 4. Target schema
@@ -202,7 +210,7 @@ Counted against the tree, not estimated. This is the actual work list.
 | `$N` placeholders | **106** | 9 files | → `?` |
 | SQL-side `now()` | **17** | `db.rs` 8, `auth.rs` 4, `keys.rs` 2, `events.rs` 1, `account.rs` 1, `abuse.rs` 1 | → bound from Rust ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped)) |
 | `::bigint` / `::integer` casts | **18** | aggregate `SELECT`s in `abuse.rs`, `db.rs`, `account.rs`, `events.rs`, `keys.rs`, `ip_tracking.rs` | → **remove**; safe because every column is `INTEGER` ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped) note 3) |
-| `SELECT … FOR UPDATE` | **2** | `db.rs:32`, `db.rs:155` | → conditional UPDATE + `rows_affected()` ([§4.4](#45-the-two-for-update-sites)) |
+| `SELECT … FOR UPDATE` | **2** | `db.rs:32`, `db.rs:155` | → conditional UPDATE + `rows_affected()` ([§4.5](#45-the-two-for-update-sites)) |
 | `ON CONFLICT … DO UPDATE` | **2** | `db.rs:466`, `ip_tracking.rs:201` | → **keep**; measured working, including the table-qualified form |
 | `ON CONFLICT … DO NOTHING` | **2** | `ip_tracking.rs:196`, `auth.rs:233` | → `auth.rs` goes with PocketBase; `ip_tracking.rs` is blocked by the CTE below |
 | **Data-modifying CTE** | **1** | `ip_tracking.rs:190-205` | → **no SQLite equivalent; must be rewritten** ([§4.7](#47-the-data-modifying-cte--one-function-must-be-rewritten)) |
@@ -235,7 +243,7 @@ Counted against the tree, not estimated. This is the actual work list.
 | `::bigint`, `::integer` | removed | Syntax error otherwise: `unrecognized token: ":"` (measured). |
 | `RETURNING` | **keep** | Measured working, including on an UPSERT. |
 | `ON CONFLICT … DO UPDATE` | **keep** | Measured working, including the table-qualified `t.n = t.n + excluded.n` form. |
-| `SELECT … FOR UPDATE` | **remove** | Syntax error (measured). See [§4.4](#45-the-two-for-update-sites). |
+| `SELECT … FOR UPDATE` | **remove** | Syntax error (measured). See [§4.5](#45-the-two-for-update-sites). |
 | `WITH x AS (INSERT … RETURNING …)` | **remove** | No SQLite equivalent (measured). See [§4.7](#47-the-data-modifying-cte--one-function-must-be-rewritten). |
 | `interval '2 hours'` | `datetime('now','-2 hours')` | `interval` is parsed as a column name (measured). |
 | `CREATE EXTENSION pgcrypto` | removed | |
@@ -501,7 +509,7 @@ The FK behaviour the draft worries about is already deliberate and correct:
 so a hard delete is refused by the database rather than orphaning money. `api_keys`,
 `sessions`, `usage_daily`, `link_codes` and `telegram_links` use `ON DELETE CASCADE`.
 Under SQLite the `RESTRICT` half only holds if `foreign_keys(true)` is set —
-[§4.2](#43-connection-setup--four-traps-all-measured), trap 1.
+[§4.3](#43-connection-setup--four-traps-all-measured), trap 1.
 
 **The correction that matters: a status flag alone does not stop `/v1/*` traffic.**
 The proxy's key lookup is
@@ -628,7 +636,7 @@ Nothing else starts until this lands, because every later document reads from it
 ### 5.2 Phase 2 — Schema port
 
 Rewrite `server/migrations/20260925000000_initial_schema.sql` in SQLite dialect per
-[§4.1](#42-dialect-translation-rules). **Replace in place** — there is no production
+[§4.2](#42-dialect-translation-rules). **Replace in place** — there is no production
 data to preserve, and a single migration is honest about that.
 
 ### 5.3 Phase 3 — Migration mechanism
@@ -668,7 +676,7 @@ they can **run in CI by default**, including
 proof that is currently never executed automatically.
 
 Re-point them at `tempfile::TempDir` (dev-dependency), drop the `#[ignore]`, and add
-the two new regression tests [§4.2](#43-connection-setup--four-traps-all-measured) demands
+the two new regression tests [§4.3](#43-connection-setup--four-traps-all-measured) demands
 (the `NULL`-`api_key_id` upsert, and the `BEGIN IMMEDIATE` read-then-write path).
 
 ### 5.6 Phase 6 — Identity
@@ -1037,6 +1045,7 @@ Settled 2026-09-25. Each is technical and evidence-backed; none needs an owner s
 | 10 | **Low-code tool: adopt for the read-only launch surface only** | Real saving on reads, real hazard on money ([§7.1](#71-ui-hand-built-admin-page-vs-a-low-code-tool)) |
 | 11 | **Volume: 10 GB, provisioned once** | It cannot be shrunk. Estimate: `usage_events` at ~100 B/request is ~300 MB for 90 days at 1M requests/month; the rest is ledger and headroom. Generous because the decision is one-way |
 | 12 | **Publish a maintenance window for deploys** | A Single Read/Write volume forbids rolling restarts, so every deploy is an outage ([§8](#8-operations-backup-rpo-and-the-volume)). An undocumented one is worse than a documented one |
+| 13 | **Money type `BIGINT` → `INTEGER`** | `STRICT` accepts only `INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB`, `ANY`; `BIGINT` is rejected outright (measured). Item 5 forces it, so the register's money-type row had to change with it — a contradiction between the two documents that only surfaced while writing Phase 0 |
 
 ### 11.2 Still needs you
 
@@ -1069,6 +1078,15 @@ them from inside the codebase would be guessing.
 Splitting at step 2 is the main structural improvement over the draft: it turns one
 large risky change into two smaller ones, and the first half is verifiable by the
 tests that already exist.
+
+**One caveat on that split, found while executing Phase 0.** "Independently shippable"
+describes the *result* of Phases 1–5, not every point inside them. Phase 1 swaps the
+`sqlx` feature in `Cargo.toml` while Phases 2–4 have not yet ported the queries, so the
+tree **does not compile in between**. In a checkout shared with parallel agents that
+window is a hazard: anyone else's `cargo check` fails for reasons that look like their
+own. Either land Phases 1–5 as one continuous unit, or run them in a separate
+`git worktree` and merge once `cargo check` is green. Do not leave the shared tree
+mid-port.
 
 **A note on what to do first if only one thing is done:** Phase 0. Every document in
 the repository reads from the register, and the register currently says the stack is
