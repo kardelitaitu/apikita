@@ -1,0 +1,358 @@
+---
+// API Key Management island — key list + create-key modal.
+// Frontend contract: docs/server/api-spec.md (Keys), docs/error-model.md,
+// docs/website/06-api-keys-and-limits.md, docs/website/03-functional-spec.md.
+// This is a script-island (plain <script>), not a UI-framework component:
+// astro.config and package.json are owned by another worker and must not change.
+const MODELS = ['flash', 'deepseek-v4-flash'];
+---
+
+<div id="key-island" class="mt-6">
+  <!-- List ----------------------------------------------------------------- -->
+  <div class="flex items-center justify-between">
+    <div id="key-list-status" class="text-sm text-slate-500" aria-live="polite">Loading keys…</div>
+    <button id="create-key-btn" type="button"
+      class="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">Create key</button>
+  </div>
+
+  <div id="key-error" hidden class="mt-4 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900"></div>
+
+  <ul id="key-list" class="mt-4 divide-y divide-slate-200 rounded-lg border border-slate-200"></ul>
+
+  <div id="key-empty" hidden class="mt-4 rounded-lg border border-slate-200 p-6 text-sm text-slate-600">
+    <p class="font-medium text-slate-900">No API keys yet</p>
+    <p class="mt-1">A key is the credential your program sends to
+      <code class="font-mono">POST /v1/chat/completions</code>. Create one, then call the API —
+      see the <a href="/docs/quickstart" class="underline">quickstart</a>.</p>
+    <button id="key-empty-create" type="button"
+      class="mt-4 rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">Create your first key</button>
+  </div>
+
+  <!-- Create-key modal ------------------------------------------------------ -->
+  <div id="key-modal" hidden class="fixed inset-0 z-20 flex items-center justify-center bg-slate-900/40 p-4"
+    role="dialog" aria-modal="true" aria-labelledby="key-modal-title">
+    <div class="w-full max-w-lg rounded-xl bg-white p-6 shadow-xl">
+      <!-- Step 1: the form -->
+      <div id="key-form-step">
+        <h2 id="key-modal-title" class="text-lg font-semibold tracking-tight">Create API key</h2>
+        <p class="mt-2 text-sm text-slate-600">Only a label is required. Leave limits at 0 for unlimited.</p>
+
+        <form id="key-form" class="mt-4 space-y-4">
+          <div>
+            <label for="k-label" class="block text-sm font-medium">Label</label>
+            <input id="k-label" name="label" type="text" required autocomplete="off" placeholder="e.g. prod"
+              class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" />
+          </div>
+
+          <fieldset>
+            <legend class="text-sm font-medium">Models</legend>
+            <p class="text-xs text-slate-500">Omitting models = all currently enabled models.</p>
+            <div class="mt-2 flex flex-wrap gap-3">
+              {MODELS.map((m) => (
+                <label class="inline-flex items-center gap-2 text-sm">
+                  <input type="checkbox" name="models" value={m} checked />
+                  <span class="font-mono">{m}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <div class="grid gap-4 sm:grid-cols-3">
+            <div>
+              <label for="k-spend" class="block text-sm font-medium">Spend limit (IDR)</label>
+              <input id="k-spend" name="spend_limit_idr" type="number" min="0" value="0"
+                class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label for="k-token" class="block text-sm font-medium">Token limit</label>
+              <input id="k-token" name="token_limit" type="number" min="0" value="0"
+                class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label for="k-rate" class="block text-sm font-medium">Rate (req/min)</label>
+              <input id="k-rate" name="rate_limit_rpm" type="number" min="0" value="0"
+                class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" />
+            </div>
+          </div>
+
+          <div id="key-form-error" hidden class="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-900"></div>
+
+          <div class="flex justify-end gap-3 pt-2">
+            <button id="key-cancel" type="button"
+              class="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium hover:border-slate-400">Cancel</button>
+            <button id="key-submit" type="submit"
+              class="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">Create key</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Step 2: the plaintext key, shown exactly once -->
+      <div id="key-secret-step" hidden>
+        <h2 class="text-lg font-semibold tracking-tight">Your new API key</h2>
+        <div class="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+          <strong>You will not see this key again.</strong> Store it somewhere safe now.
+          The server keeps only its hash — if you lose it, revoke it and create a new one.
+        </div>
+
+        <div id="key-secret-missing" hidden class="mt-3 rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-900">
+          The server created the key but did not return the plaintext value. This is unexpected —
+          the key cannot be retrieved later. Treat it as unusable and revoke it from the list.
+        </div>
+
+        <div id="key-secret-wrap" class="mt-3 flex items-center gap-2">
+          <code id="key-secret" class="block flex-1 break-all rounded-md border border-slate-300 bg-slate-50 px-3 py-2 font-mono text-sm"></code>
+          <button id="key-copy" type="button"
+            class="shrink-0 rounded-md border border-slate-300 px-3 py-2 text-sm font-medium hover:border-slate-400">Copy</button>
+        </div>
+
+        <div class="flex justify-end pt-4">
+          <button id="key-done" type="button"
+            class="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">I've saved it</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  import { apiFetch, ApiError } from '../../lib/api';
+  import { describeError } from '../../lib/errors';
+  import { formatIdr } from '../../lib/format';
+
+  const MODELS_ALL = ['flash', 'deepseek-v4-flash'];
+
+  interface ApiKey {
+    id: string;
+    prefix: string;
+    label: string;
+    models: string[];
+    spend_limit_idr: number;
+    spend_used_idr: number;
+    rate_limit_rpm: number;
+    expires_at: string | null;
+    last_used_at: string | null;
+    revoked_at: string | null;
+  }
+
+  const $ = (id: string) => document.getElementById(id) as HTMLElement;
+  const listEl = $('key-list');
+  const statusEl = $('key-list-status');
+  const errorEl = $('key-error');
+  const emptyEl = $('key-empty');
+  const modal = $('key-modal');
+
+  function showError(msg: string): void {
+    errorEl.textContent = msg;
+    errorEl.hidden = false;
+  }
+  function clearError(): void {
+    errorEl.hidden = true;
+    errorEl.textContent = '';
+  }
+
+  function statusLabel(k: ApiKey): string {
+    if (k.revoked_at) {
+      const d = new Date(k.revoked_at);
+      return 'Revoked' + (isNaN(d.getTime()) ? '' : ' · ' + d.toLocaleDateString());
+    }
+    if (k.expires_at) {
+      const d = new Date(k.expires_at);
+      if (!isNaN(d.getTime()) && d.getTime() <= Date.now()) return 'Expired';
+    }
+    return 'Active';
+  }
+
+  function spendText(k: ApiKey): string {
+    if (!k.spend_limit_idr || k.spend_limit_idr <= 0) return 'Unlimited';
+    return formatIdr(k.spend_used_idr) + ' / ' + formatIdr(k.spend_limit_idr) + ' (30d)';
+  }
+
+  function modelsText(k: ApiKey): string {
+    if (!k.models || k.models.length === 0) return 'None (deny by default)';
+    if (k.models.length >= MODELS_ALL.length) return 'All models';
+    return k.models.length + ' model' + (k.models.length === 1 ? '' : 's');
+  }
+
+  function lastUsedText(k: ApiKey): string {
+    if (!k.last_used_at) return 'Never';
+    const d = new Date(k.last_used_at);
+    return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  }
+
+  function escapeHtml(s: string): string {
+    return s.replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c] as string));
+  }
+
+  function render(keys: ApiKey[]): void {
+    const hasAny = keys.length > 0;
+    emptyEl.toggleAttribute('hidden', hasAny);
+    listEl.toggleAttribute('hidden', !hasAny);
+    statusEl.textContent = hasAny ? keys.length + ' key' + (keys.length === 1 ? '' : 's') : '';
+
+    listEl.replaceChildren();
+    for (const k of keys) {
+      const li = document.createElement('li');
+      li.className = 'flex flex-wrap items-center justify-between gap-4 p-4';
+      const left = document.createElement('div');
+      left.innerHTML =
+        '<div class="flex items-center gap-2">' +
+          '<span class="font-medium">' + escapeHtml(k.label || '(unlabeled)') + '</span>' +
+          '<span class="rounded-full border border-slate-300 px-2 py-0.5 text-xs text-slate-500">' + statusLabel(k) + '</span>' +
+        '</div>' +
+        '<div class="mt-1 font-mono text-sm text-slate-500">' + escapeHtml(k.prefix) + '…</div>' +
+        '<div class="mt-1 text-xs text-slate-500">Models: ' + modelsText(k) + ' · Spend: ' + spendText(k) + ' · Last used: ' + lastUsedText(k) + '</div>';
+      const right = document.createElement('div');
+      if (!k.revoked_at) {
+        const revoke = document.createElement('button');
+        revoke.type = 'button';
+        revoke.className = 'rounded-md border border-red-300 px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50';
+        revoke.textContent = 'Revoke';
+        revoke.addEventListener('click', () => confirmAndRevoke(k));
+        right.appendChild(revoke);
+      }
+      li.append(left, right);
+      listEl.appendChild(li);
+    }
+  }
+
+  async function loadKeys(): Promise<void> {
+    clearError();
+    statusEl.textContent = 'Loading keys…';
+    try {
+      const keys = await apiFetch<ApiKey[]>('/api/keys');
+      render(keys);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      const view = describeError(err);
+      showError(view.message + (view.requestId ? ' (' + view.requestId + ')' : ''));
+      render([]);
+    }
+  }
+
+  function openModal(): void {
+    clearError();
+    ($('key-form-step') as HTMLElement).hidden = false;
+    ($('key-secret-step') as HTMLElement).hidden = true;
+    ($('key-secret-missing') as HTMLElement).hidden = true;
+    ($('key-secret-wrap') as HTMLElement).toggleAttribute('hidden', false);
+    (modal as HTMLElement).hidden = false;
+    ($('k-label') as HTMLInputElement).focus();
+  }
+  function closeModal(): void {
+    (modal as HTMLElement).hidden = true;
+    ($('key-form') as HTMLFormElement).reset();
+    void loadKeys();
+  }
+
+  function openSecretStep(key: string | undefined): void {
+    ($('key-form-step') as HTMLElement).hidden = true;
+    ($('key-secret-step') as HTMLElement).hidden = false;
+    const missing = ($('key-secret-missing') as HTMLElement);
+    const wrap = ($('key-secret-wrap') as HTMLElement);
+    const secret = $('key-secret') as HTMLElement;
+    if (key) {
+      missing.hidden = true;
+      wrap.hidden = false;
+      secret.textContent = key;
+    } else {
+      // Requirement #3: never invent a key. Surface the missing field instead.
+      missing.hidden = false;
+      wrap.hidden = true;
+      secret.textContent = '';
+    }
+  }
+
+  async function submitCreate(e: Event): Promise<void> {
+    e.preventDefault();
+    clearError();
+    const form = e.currentTarget as HTMLFormElement;
+    const fd = new FormData(form);
+    const label = String(fd.get('label') ?? '').trim();
+    const models = Array.from(fd.getAll('models')).map(String);
+    const num = (n: string) => {
+      const v = Number(n);
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    };
+    const body = {
+      label,
+      models,
+      spend_limit_idr: num(String(fd.get('spend_limit_idr') ?? '0')),
+      token_limit: num(String(fd.get('token_limit') ?? '0')),
+      rate_limit_rpm: num(String(fd.get('rate_limit_rpm') ?? '0')),
+      expires_at: null,
+    };
+
+    const submitBtn = $('key-submit') as HTMLButtonElement;
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Creating…';
+    try {
+      const res = await apiFetch<{ id: string; key: string; prefix: string }>('/api/keys', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      if (typeof res.key !== 'string' || res.key.length === 0) {
+        // Missing plaintext field — stop, do not invent one.
+        openSecretStep(undefined);
+        return;
+      }
+      openSecretStep(res.key);
+    } catch (err) {
+      const formErr = $('key-form-error') as HTMLElement;
+      if (err instanceof ApiError) {
+        const view = describeError(err);
+        formErr.textContent = view.message + (view.requestId ? ' (' + view.requestId + ')' : '');
+      } else {
+        formErr.textContent = err instanceof Error ? err.message : 'Could not create the key.';
+      }
+      formErr.hidden = false;
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Create key';
+    }
+  }
+
+  async function confirmAndRevoke(k: ApiKey): Promise<void> {
+    const ok = window.confirm(
+      'Revoke "' + (k.label || k.prefix) + '"?' +
+      '\n\nRevocation takes effect within about a minute (the proxy cache TTL), not instantly. ' +
+      'This affects ALL surfaces — a key used via Telegram dies here too. This cannot be undone.'
+    );
+    if (!ok) return;
+    clearError();
+    try {
+      await apiFetch<void>('/api/keys/' + k.id + '/revoke', { method: 'POST' });
+      await loadKeys();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      const view = describeError(err);
+      showError(view.message + (view.requestId ? ' (' + view.requestId + ')' : ''));
+    }
+  }
+
+  async function copyKey(): Promise<void> {
+    const secret = ($('key-secret') as HTMLElement).textContent ?? '';
+    const btn = $('key-copy') as HTMLButtonElement;
+    try {
+      await navigator.clipboard.writeText(secret);
+      btn.textContent = 'Copied';
+      window.setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    } catch {
+      btn.textContent = 'Copy failed';
+      window.setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    }
+  }
+
+  $('create-key-btn').addEventListener('click', openModal);
+  $('key-empty-create')?.addEventListener('click', openModal);
+  $('key-cancel').addEventListener('click', closeModal);
+  $('key-done').addEventListener('click', closeModal);
+  ($('key-form') as HTMLFormElement).addEventListener('submit', submitCreate);
+  $('key-copy').addEventListener('click', copyKey);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal && !($('key-secret-step') as HTMLElement).hidden) closeModal();
+  });
+
+  void loadKeys();
+</script>

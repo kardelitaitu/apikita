@@ -1,0 +1,15 @@
+---
+// API Key Management page. Auth = session cookie from POST /auth/exchange.
+// Imports the interactive island, which ships JS (marketing pages stay JS-free).
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import KeyManagement from '../../islands/keys/KeyManagement.astro';
+---
+
+<DashboardLayout title="API keys">
+  <h1 class="text-2xl font-semibold tracking-tight">API keys</h1>
+  <p class="mt-3 max-w-2xl text-sm text-slate-600">
+    Keys authenticate programs against <code class="font-mono">POST /v1/chat/completions</code>.
+    The server stores only a SHA-256 hash; the plaintext exists once, at creation.
+  </p>
+  <KeyManagement />
+</DashboardLayout>

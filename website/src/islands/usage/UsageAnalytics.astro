@@ -1,0 +1,170 @@
+---
+// Usage Analytics island — the daily token breakdown.
+// Frontend contract: docs/server/api-spec.md (GET /api/usage) and docs/realtime.md.
+// The three token classes — input, cache_read, output — are kept as THREE SEPARATE
+// counters and are NEVER summed into one figure. Cache-read is priced ~200x below
+// output (docs/website/06-api-keys-and-limits.md), so a merged total cannot be
+// reconciled against an invoice.
+//
+// Script-island (plain <script>), not a UI-framework component: astro.config and
+// package.json are owned by another worker and must not change.
+---
+
+<div id="usage-island" class="mt-6">
+  <div id="usage-error" hidden class="mb-4 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900"></div>
+
+  <section aria-labelledby="usage-today-h">
+    <h2 id="usage-today-h" class="text-lg font-semibold tracking-tight">Today</h2>
+    <p class="mt-1 text-sm text-slate-500">
+      Three separate counters. They are never added together — each class is billed on its own rate.
+    </p>
+    <div id="usage-today-grid" class="mt-4 grid gap-4 sm:grid-cols-3">
+      <div class="rounded-lg border border-slate-200 p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500">Input tokens</div>
+        <div id="u-in" class="mt-1 font-mono text-lg tabular-nums">—</div>
+      </div>
+      <div class="rounded-lg border border-slate-200 p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500">Cache-read tokens</div>
+        <div id="u-cache" class="mt-1 font-mono text-lg tabular-nums">—</div>
+      </div>
+      <div class="rounded-lg border border-slate-200 p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500">Output tokens</div>
+        <div id="u-out" class="mt-1 font-mono text-lg tabular-nums">—</div>
+      </div>
+    </div>
+    <p class="mt-2 text-xs text-slate-500">
+      Cost today is shown for reference only; the token counters above are the source of truth for billing.
+    </p>
+  </section>
+
+  <section class="mt-10" aria-labelledby="usage-daily-h">
+    <div class="flex items-center justify-between">
+      <h2 id="usage-daily-h" class="text-lg font-semibold tracking-tight">Daily breakdown</h2>
+      <div class="text-sm text-slate-500" id="usage-daily-status" aria-live="polite">Loading…</div>
+    </div>
+    <p class="mt-1 text-sm text-slate-500">Token classes are reported per day, separately — never as one summed number.</p>
+
+    <div id="usage-empty" hidden class="mt-4 rounded-lg border border-slate-200 p-6 text-sm text-slate-600">
+      No usage recorded in this period yet. Create an API key, then call
+      <code class="font-mono">POST /v1/chat/completions</code> — see the
+      <a href="/docs/quickstart" class="underline">quickstart</a>.
+    </div>
+
+    <div class="mt-4 overflow-x-auto">
+      <table class="w-full border-collapse text-left text-sm">
+        <thead>
+          <tr class="border-b border-slate-300 text-slate-600">
+            <th scope="col" class="py-2 pr-4 font-medium">Date</th>
+            <th scope="col" class="py-2 pr-4 text-right font-medium">Input</th>
+            <th scope="col" class="py-2 pr-4 text-right font-medium">Cache-read</th>
+            <th scope="col" class="py-2 pr-4 text-right font-medium">Output</th>
+            <th scope="col" class="py-2 text-right font-medium">Cost (IDR)</th>
+          </tr>
+        </thead>
+        <tbody id="usage-rows" class="divide-y divide-slate-200"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+  import { apiFetch, ApiError } from '../../lib/api';
+  import { describeError } from '../../lib/errors';
+  import { formatIdr, formatCount } from '../../lib/format';
+
+  interface UsageBucket {
+    date: string;
+    input_tokens: number;
+    cache_read_tokens: number;
+    output_tokens: number;
+    cost_idr: number;
+  }
+
+  const $ = (id: string) => document.getElementById(id) as HTMLElement;
+  const errorEl = $('usage-error');
+  const statusEl = $('usage-daily-status');
+  const rowsEl = $('usage-rows');
+  const emptyEl = $('usage-empty');
+
+  function showError(msg: string): void {
+    errorEl.textContent = msg;
+    errorEl.hidden = false;
+  }
+  function clearError(): void {
+    errorEl.hidden = true;
+    errorEl.textContent = '';
+  }
+
+  // Three counters, displayed separately. We never sum them. The only place a
+  // single number appears is cost_idr, which is a money figure, not a token total.
+  function renderToday(b: UsageBucket | null): void {
+    $('u-in').textContent = b ? formatCount(b.input_tokens) : '—';
+    $('u-cache').textContent = b ? formatCount(b.cache_read_tokens) : '—';
+    $('u-out').textContent = b ? formatCount(b.output_tokens) : '—';
+  }
+
+  function renderRows(buckets: UsageBucket[]): void {
+    const hasAny = buckets.some((b) =>
+      b.input_tokens + b.cache_read_tokens + b.output_tokens > 0);
+    emptyEl.toggleAttribute('hidden', hasAny);
+    rowsEl.toggleAttribute('hidden', !hasAny);
+    statusEl.textContent = hasAny ? buckets.length + ' day' + (buckets.length === 1 ? '' : 's') : '';
+
+    rowsEl.replaceChildren();
+    for (const b of buckets) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<th scope="row" class="py-2 pr-4 font-normal">' + escapeHtml(b.date || '—') + '</th>' +
+        '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.input_tokens) + '</td>' +
+        '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.cache_read_tokens) + '</td>' +
+        '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.output_tokens) + '</td>' +
+        '<td class="py-2 text-right font-mono tabular-nums">' + formatIdr(b.cost_idr) + '</td>';
+      rowsEl.appendChild(tr);
+    }
+  }
+
+  function escapeHtml(s: string): string {
+    return s.replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c] as string));
+  }
+
+  // GET /api/usage returns daily buckets. Accept either a bare array or an
+  // envelope ({ buckets | days | data }), and a trailing "today" snapshot if present.
+  function parseUsage(payload: unknown): { buckets: UsageBucket[]; today: UsageBucket | null } {
+    let buckets: UsageBucket[] = [];
+    if (Array.isArray(payload)) {
+      buckets = payload as UsageBucket[];
+    } else if (payload && typeof payload === 'object') {
+      const o = payload as Record<string, unknown>;
+      const arr =
+        (Array.isArray(o.buckets) && o.buckets) ||
+        (Array.isArray(o.days) && o.days) ||
+        (Array.isArray(o.data) && o.data) ||
+        [];
+      buckets = arr as UsageBucket[];
+    }
+    const today = buckets.length ? buckets[buckets.length - 1] : null;
+    return { buckets, today };
+  }
+
+  async function loadUsage(): Promise<void> {
+    clearError();
+    statusEl.textContent = 'Loading…';
+    try {
+      const payload = await apiFetch<unknown>('/api/usage?from=-30d');
+      const { buckets, today } = parseUsage(payload);
+      renderToday(today);
+      renderRows(buckets);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      const view = describeError(err);
+      showError(view.message + (view.requestId ? ' (' + view.requestId + ')' : ''));
+      renderToday(null);
+      renderRows([]);
+      statusEl.textContent = '';
+    }
+  }
+
+  void loadUsage();
+</script>
