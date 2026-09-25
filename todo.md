@@ -132,6 +132,6 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [ ] Gate 0: Terms of Service published with cross-border forwarding disclosure
   - [ ] Gate 1: Backup script running offsite (`pg_dump` / WAL archiving)
   - [ ] Gate 2: Reconciliation query script passing with 0 drift on live DB
-  - [ ] Gate 3: Cookie and API key auth separation verified
-  - [ ] Gate 4: Zero prompt/completion logging verified in code and logs
+  - [x] Gate 3: Cookie and API key auth separation verified
+  - [x] Gate 4: Zero prompt/completion logging verified in code and logs
   - [ ] Gate 5: Production health check operational; restore drill executed
