@@ -493,6 +493,9 @@ mod tests {
         credit_topup_transaction, debit_usage_transaction, init_pool, TopupCreditResult,
         UsageSettlement,
     };
+    // Postgres keeps timestamptz at microsecond resolution, so the live tests
+    // truncate a computed instant before comparing it to the stored value.
+    use chrono::SubsecRound;
     use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
     use crate::routes::events::RealtimeHub;
     use std::sync::Arc;
@@ -1316,15 +1319,17 @@ mod tests {
             "B's failed revoke must not have revoked A's key"
         );
 
-        // The same scoping protects the update path.
+        // The same scoping protects the update path. Every enforcement input is
+        // in the payload, because a no-op that only skips the label but writes
+        // the allowlist would be a cross-account privilege escalation.
         let err = match update_key(
             State(state.clone()),
             Path(a_key_id),
             headers_b.clone(),
             Json(UpdateKeyRequest {
                 label: Some("hijacked".into()),
-                models: None,
-                spend_limit_idr: None,
+                models: Some(vec![]),
+                spend_limit_idr: Some(0),
                 token_limit: None,
                 rate_limit_rpm: None,
                 expires_at: None,
@@ -1348,6 +1353,19 @@ mod tests {
             "B's failed update must not have relabelled A's key"
         );
 
+        // ...and B's payload did not widen A's key into an empty allowlist: the
+        // no-op is complete, not partial.
+        let a_models: Value = sqlx::query_scalar("SELECT models FROM api_keys WHERE id = $1")
+            .bind(a_key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read models");
+        assert_eq!(
+            a_models,
+            json!(["flash"]),
+            "B's failed update must not have touched A's allowlist"
+        );
+
         assert_eq!(
             drift_rows(&pool, account_a).await,
             0,
@@ -1360,5 +1378,292 @@ mod tests {
         );
         delete_fixture_rows(&pool, account_a).await;
         delete_fixture_rows(&pool, account_b).await;
+    }
+
+    /// A SUCCESSFUL UPDATE PERSISTS. The 200 is not the property - the ROW is.
+    /// Every patched column is read back from `api_keys`: a handler that
+    /// answered 200 without writing (or wrote only some of the columns) leaves
+    /// the key enforcing its OLD limits while the operator believes otherwise,
+    /// which is a silent security hole, not a cosmetic bug.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn updating_a_key_persists_every_patched_column_to_the_row() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (key_id, _, _) =
+            create_key_via_handler(&state, &headers, "before", vec!["flash".into()], 1_000).await;
+
+        // Truncated to microseconds: Postgres stores timestamptz at microsecond
+        // resolution, so a nanosecond-precision instant would not round-trip and
+        // the assertion below would fail for a reason that is not the handler.
+        let new_expiry = (Utc::now() + chrono::Duration::days(7)).trunc_subsecs(6);
+
+        let res = update_key(
+            State(state.clone()),
+            Path(key_id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: Some("after".into()),
+                models: Some(vec!["flash".into(), "pro".into()]),
+                spend_limit_idr: Some(5_000),
+                token_limit: Some(12_345),
+                rate_limit_rpm: Some(7),
+                expires_at: Some(new_expiry),
+            }),
+        )
+        .await
+        .expect("a valid update must succeed")
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK, "the documented update response");
+
+        let row = sqlx::query(
+            "SELECT label, models, spend_limit_idr, token_limit, rate_limit_rpm, expires_at
+             FROM api_keys WHERE id = $1",
+        )
+        .bind(key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the updated row back");
+
+        let label: Option<String> = row.get("label");
+        let models: Value = row.get("models");
+        let spend_limit_idr: i64 = row.get("spend_limit_idr");
+        let token_limit: i64 = row.get("token_limit");
+        let rate_limit_rpm: i32 = row.get("rate_limit_rpm");
+        let expires_at: Option<DateTime<Utc>> = row.get("expires_at");
+
+        assert_eq!(label.as_deref(), Some("after"), "label must persist");
+        assert_eq!(
+            models,
+            json!(["flash", "pro"]),
+            "models must persist, not stay at the pre-update allowlist"
+        );
+        assert_eq!(spend_limit_idr, 5_000, "spend_limit_idr must persist");
+        assert_eq!(token_limit, 12_345, "token_limit must persist");
+        assert_eq!(rate_limit_rpm, 7, "rate_limit_rpm must persist");
+        assert_eq!(expires_at, Some(new_expiry), "expires_at must persist");
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// UPDATE INVALIDATES THE PROXY CACHE. The proxy caches key metadata for a
+    /// TTL, so a limit narrowed through update_key that does not reach that cache
+    /// keeps the OLD limit honoured for up to
+    /// limits.key_metadata_cache_seconds. update_key is supposed to call
+    /// invalidate_key_cache; this proves the effect through the REAL request path
+    /// rather than by poking at proxy.rs internals, which keys.rs cannot reach.
+    ///
+    /// Two parts, exactly like the revocation test above: Part A shows the cache
+    /// is genuinely warm and that a change bypassing the handler is not seen, so
+    /// Part B cannot pass merely because the entry was never cached.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn updating_a_key_invalidates_the_proxy_cache_instead_of_leaving_the_old_limit_honoured_for_the_ttl(
+    ) {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+        let app = proxy_app(state.clone());
+
+        let ttl = state.config.limits.key_metadata_cache_seconds;
+        assert!(
+            ttl > 0,
+            "this test pins the behaviour of an ENABLED key-metadata cache;              key_metadata_cache_seconds is 0, which disables the cache entirely"
+        );
+
+        // 5 IDR of real window spend on each key under test, recorded through the
+        // drift-neutral usage_daily path: a key narrowed to a 5 IDR ceiling is
+        // then exactly AT its limit, so a fresh read refuses it while a stale
+        // record (limit 0 = unlimited) lets it through to the wallet check.
+        let spend_idr = 5;
+
+        // PART A - the cache is real, and this is the documented tradeoff
+        // (docs/website/06-api-keys-and-limits.md, Caching): a limit change that
+        // does NOT go through update_key is not seen until the TTL expires.
+        let (stale_id, stale_key, _) =
+            create_key_via_handler(&state, &headers, "stale", vec!["flash".into()], 0).await;
+        insert_usage(
+            &pool,
+            account_id,
+            stale_id,
+            Utc::now().date_naive(),
+            100,
+            20,
+            50,
+            spend_idr,
+        )
+        .await;
+
+        let (status, body) = call_proxy(&app, &stale_key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "the warm-up request must authenticate and be cached: {body}"
+        );
+        assert_eq!(
+            body["error"]["code"], "insufficient_balance",
+            "an UNLIMITED key must get past the spend check and reach the wallet check: {body}"
+        );
+
+        sqlx::query("UPDATE api_keys SET spend_limit_idr = $2 WHERE id = $1")
+            .bind(stale_id)
+            .bind(spend_idr)
+            .execute(&pool)
+            .await
+            .expect("lower the limit out of band, deliberately bypassing invalidate_key_cache");
+
+        let (status, body) = call_proxy(&app, &stale_key, "flash").await;
+        assert_eq!(
+            body["error"]["code"], "insufficient_balance",
+            "a cache-warm key whose limit was lowered out of band keeps its OLD              (unlimited) limit until the TTL expires - that is the documented              staleness; a key_limit_exceeded here means the entry was never              cached and Part B would prove nothing: {body}"
+        );
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+
+        // PART B - the update path drops the cached record, so the very next
+        // request enforces the NEW limit instead of the pre-update row.
+        let (id, key, _) =
+            create_key_via_handler(&state, &headers, "invalidated", vec!["flash".into()], 0).await;
+        insert_usage(
+            &pool,
+            account_id,
+            id,
+            Utc::now().date_naive(),
+            100,
+            20,
+            50,
+            spend_idr,
+        )
+        .await;
+
+        let (status, body) = call_proxy(&app, &key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "the warm-up request must authenticate and be cached: {body}"
+        );
+        assert_eq!(body["error"]["code"], "insufficient_balance");
+
+        let res = update_key(
+            State(state.clone()),
+            Path(id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: None,
+                models: None,
+                spend_limit_idr: Some(spend_idr),
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("lowering the limit to the spend already recorded is a valid update")
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let (status, body) = call_proxy(&app, &key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "the narrowed limit must refuse the next request: {body}"
+        );
+        assert_eq!(
+            body["error"]["code"], "key_limit_exceeded",
+            "update_key must invalidate the cached metadata; an              insufficient_balance here means the PRE-update record (limit 0) is              still being honoured from the cache: {body}"
+        );
+        assert_eq!(
+            body["error"]["details"]["reason"], "spend_limit_idr_reached",
+            "the refusal must name the limit that was just narrowed: {body}"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// DENY BY DEFAULT, after an update. docs/website/06-api-keys-and-limits.md:41:
+    /// "A key with an empty allowlist can call nothing - deny by default." The
+    /// failure mode is the opposite reading - an empty list taken as "every
+    /// model" - which would turn narrowing a key into granting it everything.
+    /// Asserted through the real request path, and against the row.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn an_empty_model_allowlist_after_an_update_denies_every_model() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+        let app = proxy_app(state.clone());
+
+        let (id, key, _) =
+            create_key_via_handler(&state, &headers, "narrowed", vec!["flash".into()], 0).await;
+
+        // The control: BEFORE the update the allowlist admits flash, so the key
+        // gets past step 2 of the enforcement order and fails at the wallet.
+        let (status, body) = call_proxy(&app, &key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "the allowlisted model must reach the wallet check: {body}"
+        );
+        assert_eq!(body["error"]["code"], "insufficient_balance");
+
+        let res = update_key(
+            State(state.clone()),
+            Path(id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: None,
+                models: Some(vec![]),
+                spend_limit_idr: None,
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("an empty allowlist is a valid update")
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let (status, body) = call_proxy(&app, &key, "flash").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a key with an empty allowlist can call nothing: {body}"
+        );
+        assert_eq!(body["error"]["code"], "model_not_allowed");
+
+        // And the row really holds the empty list: the refusal above must come
+        // from the stored value, not from a stray cache entry.
+        let models: Value = sqlx::query_scalar("SELECT models FROM api_keys WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read models");
+        assert_eq!(
+            models,
+            json!([]),
+            "the empty allowlist must be what was persisted"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
     }
 }
