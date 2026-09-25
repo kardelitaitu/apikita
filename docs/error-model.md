@@ -116,7 +116,7 @@ retry_after = min over endpoints of (cooldown_until - now)
 
 With one provider that is its current cooldown: 30s initially, doubling to a cap of
 900s (see `config/apikita.toml` `[circuit_breaker]`). So a 503 may carry
-NaNRetry-After: 900` — correct, and honest that the wait is long.
+`Retry-After: 900` — correct, and honest that the wait is long.
 
 **Floor it at 1 second.** A zero or negative value is a malformed header.
 
