@@ -107,7 +107,7 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 ## Phase 5: Midtrans Payment Integration (Done Last)
 
 - [ ] **Fake Midtrans Webhook Harness**
-  - [ ] Local test runner firing synthetic signed webhooks to `POST /webhooks/midtrans`
+  - [x] Local test runner firing synthetic signed webhooks to `POST /webhooks/midtrans`
   - [ ] Verify signature verification rejection on invalid signatures
   - [ ] Verify idempotency: replayed webhook with same `order_id` credits wallet exactly once
 - [ ] **Midtrans Snap Client**
