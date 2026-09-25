@@ -99,7 +99,7 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [ ] Execute streaming request using `curl` against local Edge Relay on port `8000`
   - [ ] Confirm request routes through Server to Fake Upstream
   - [ ] Confirm balance decrements live on Web UI via SSE without browser refresh
-  - [ ] Verify database reconciliation query: $\sum \text{delta\_idr} \equiv \text{balance\_idr}$
+  - [x] Verify database reconciliation query: $\sum \text{delta\_idr} \equiv \text{balance\_idr}$
   - [ ] Test relay down failover: send requests directly to server port `8080`
 
 ---
@@ -108,8 +108,8 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 
 - [ ] **Fake Midtrans Webhook Harness**
   - [x] Local test runner firing synthetic signed webhooks to `POST /webhooks/midtrans`
-  - [ ] Verify signature verification rejection on invalid signatures
-  - [ ] Verify idempotency: replayed webhook with same `order_id` credits wallet exactly once
+  - [x] Verify signature verification rejection on invalid signatures
+  - [x] Verify idempotency: replayed webhook with same `order_id` credits wallet exactly once
 - [ ] **Midtrans Snap Client**
   - [x] Implement `POST /api/topups` calling Midtrans Snap API (`/snap/v1/transactions`)
   - [x] Enforce deposit limits (50k IDR initial, 10k IDR subsequent)
