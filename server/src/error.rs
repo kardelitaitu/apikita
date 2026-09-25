@@ -5,6 +5,15 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use tracing::error;
+
+/// The fixed, generic `message` returned to clients for the two variants whose
+/// inner value is diagnostic rather than contractual. It deliberately carries
+/// nothing: no SQL, no table or column name, no host, IP, port, provider or
+/// library name (docs/error-model.md:159, rule 1). It stays honest and
+/// non-alarming, and it is not a contract - the `code` is.
+const UNEXPECTED_ERROR_MESSAGE: &str =
+    "An unexpected error occurred. Please try again, and quote the request_id if it persists.";
 
 #[derive(Debug, Serialize)]
 pub struct ApiErrorResponse {
@@ -61,6 +70,9 @@ pub enum AppError {
     #[error("No upstream available")]
     NoUpstreamAvailable,
 
+    // Display keeps the full inner detail on purpose: it is load-bearing for
+    // server-side observability (every `error = %err` log site). The
+    // customer-facing body does NOT use Display - see `client_message`.
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -105,6 +117,18 @@ impl AppError {
         }
     }
 
+    /// The client-facing `message`. This is the non-contract field
+    /// (docs/error-model.md:30) and the one rule 1 constrains: for `Database`
+    /// and `Internal` it is fixed and generic, so no SQL, schema, host, IP,
+    /// port, provider or library name can reach a customer. The underlying
+    /// detail is not dropped - `into_response` logs it at `error!` level.
+    pub fn client_message(&self) -> String {
+        match self {
+            Self::Database(_) | Self::Internal(_) => UNEXPECTED_ERROR_MESSAGE.to_string(),
+            other => other.to_string(),
+        }
+    }
+
     pub fn details(&self) -> Option<Value> {
         match self {
             Self::InsufficientBalance { details } | Self::KeyLimitExceeded { details } => {
@@ -119,9 +143,22 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let code = self.code().to_string();
-        let message = self.to_string();
         let details = self.details();
         let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+
+        // The detail moves to the log, not out of the system. `Display` keeps
+        // the raw sqlx error / formatted failure, so an operator reading the
+        // log still sees it; the customer sees only `client_message`.
+        if matches!(self, Self::Database(_) | Self::Internal(_)) {
+            error!(
+                request_id = %request_id,
+                code = %code,
+                status = status.as_u16(),
+                error = %self,
+                "returning a generic message to the client for an internal failure"
+            );
+        }
+        let message = self.client_message();
 
         let body = ApiErrorResponse {
             error: ApiErrorBody {
@@ -474,6 +511,81 @@ mod tests {
             assert!(
                 !message.contains(leak),
                 "docs/error-model.md rule 1 - internals must not reach the client, leaked {leak} in: {message}"
+            );
+        }
+    }
+
+    /// Regression guard for the fix above: `Display` is load-bearing for
+    /// server-side observability. It is what every `error = %err` log site
+    /// prints, so it MUST keep the raw detail. Only the response body is
+    /// generic. Without this test, gutting `Display` - and silently blinding
+    /// the operator - would pass the whole suite.
+    #[test]
+    fn display_still_carries_the_detail_that_the_response_withholds() {
+        let raw_sql = "SELECT id, balance_idr FROM wallets WHERE account_id = $1";
+        let db = AppError::Database(sqlx::Error::Protocol(raw_sql.to_string()));
+        assert!(
+            db.to_string().contains(raw_sql),
+            "Display must keep the underlying sqlx error for the logs, got: {db}"
+        );
+
+        let infra = "Midtrans Snap request failed: connection refused to 10.0.0.7:443";
+        let internal = AppError::Internal(infra.to_string());
+        assert!(
+            internal.to_string().contains(infra),
+            "Display must keep the formatted failure for the logs, got: {internal}"
+        );
+    }
+
+    /// Rule 1, both directions: the two internal variants must never carry
+    /// observed dangerous substrings into the client-facing body. Asserted on
+    /// absence of the specific leaks rather than on an exact string, so plain
+    /// wording changes to `client_message` do not break the test.
+    #[tokio::test]
+    async fn internal_failures_never_leak_observable_internals_to_the_client() {
+        let cases: Vec<(AppError, Vec<&str>)> = vec![
+            (
+                AppError::Database(sqlx::Error::Protocol(
+                    "encountered unexpected or invalid data: SELECT id, balance_idr FROM wallets WHERE account_id = $1"
+                        .into(),
+                )),
+                vec![
+                    "SELECT",
+                    "wallets",
+                    "balance_idr",
+                    "account_id",
+                    "sqlx",
+                    "Database error:",
+                ],
+            ),
+            (
+                AppError::Internal(
+                    "Midtrans Snap request failed: connection refused to 10.0.0.7:443".into(),
+                ),
+                vec![
+                    "Midtrans",
+                    "10.0.0.7",
+                    "443",
+                    "connection refused",
+                    "Internal server error:",
+                ],
+            ),
+        ];
+
+        for (err, leaks) in cases {
+            let (status, _, body) = respond(err).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            let message = error_object(&body)["message"].as_str().unwrap();
+            for leak in leaks {
+                assert!(
+                    !message.contains(leak),
+                    "docs/error-model.md rule 1 - leaked {leak:?} to the client in: {message}"
+                );
+            }
+            assert!(
+                !message.contains(':')
+                    && !message.chars().any(|c| c.is_ascii_digit()),
+                "the generic message must not carry an interpolated detail, a host, or a port: {message}"
             );
         }
     }
