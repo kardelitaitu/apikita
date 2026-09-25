@@ -1,0 +1,346 @@
+---
+// Wallet top-up island. Interactive surface: ships JavaScript, unlike the
+// marketing pages.
+//
+// Flow and rules are transcribed from docs/website/04-payments.md and
+// docs/server/api-spec.md. The one that matters most: the browser is never
+// trusted to say "I paid". A successful Snap callback creates nothing — only the
+// Midtrans webhook, server-side, credits the wallet.
+//
+// PUBLIC_* values are INLINED INTO BROWSER JAVASCRIPT AND ARE NOT SECRET. The
+// Midtrans server key is server-only and must never appear here.
+
+// Sandbox per MIDTRANS_ENV=sandbox in .env.example. Production is
+// https://app.midtrans.com/snap/snap.js.
+const SNAP_JS_URL = 'https://app.sandbox.midtrans.com/snap/snap.js';
+const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
+---
+
+<div id="topup-island">
+  <form id="topup-form" class="max-w-md space-y-4" novalidate>
+    <div>
+      <label for="topup-amount" class="block text-sm font-medium">Amount (IDR)</label>
+      <input
+        id="topup-amount"
+        name="amount"
+        type="number"
+        inputmode="numeric"
+        step="1000"
+        min="0"
+        required
+        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm tabular-nums"
+        aria-describedby="topup-hint"
+      />
+      <p id="topup-hint" class="mt-1 text-xs text-slate-500">
+        Checking your deposit minimum&hellip;
+      </p>
+      <p id="topup-error" hidden class="mt-1 text-xs text-red-700"></p>
+    </div>
+
+    <button
+      id="topup-submit"
+      type="submit"
+      class="rounded-md bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+    >
+      Top up
+    </button>
+  </form>
+
+  <p id="topup-fee" class="mt-3 max-w-md text-xs text-slate-500">
+    QRIS is the only enabled rail — card payments are deliberately disabled. The
+    amount you enter is gross: you pay it and the full amount is credited to your
+    balance.
+  </p>
+
+  <!--
+    The pending panel. Shown after Snap reports success or a pending payment, and
+    it deliberately shows NO balance change: the money is not real until the
+    webhook confirms it.
+  -->
+  <div
+    id="topup-pending"
+    hidden
+    class="mt-6 max-w-md rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900"
+    aria-live="polite"
+  >
+    <p class="font-medium">Waiting for payment confirmation</p>
+    <p class="mt-2">
+      Your payment has been submitted. Your balance is credited only when Midtrans
+      confirms it to our server — this page is not allowed to do that, so nothing
+      has been added yet.
+    </p>
+    <dl class="mt-3 space-y-1 text-xs">
+      <div class="flex gap-2">
+        <dt class="text-amber-700">Amount</dt>
+        <dd id="topup-pending-amount" class="font-mono"></dd>
+      </div>
+      <div class="flex gap-2">
+        <dt class="text-amber-700">Order</dt>
+        <dd id="topup-pending-order" class="font-mono break-all"></dd>
+      </div>
+    </dl>
+    <p class="mt-3 text-xs text-amber-800">
+      This panel clears by itself when the confirmation arrives and the live
+      balance updates.
+    </p>
+  </div>
+
+  <div id="topup-notice" hidden class="mt-6 max-w-md rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-900" aria-live="polite">
+    <p id="topup-notice-text"></p>
+    <p id="topup-notice-id" class="mt-1 font-mono text-xs text-red-700"></p>
+  </div>
+
+  <section class="mt-10">
+    <h3 class="text-lg font-semibold tracking-tight">Top-up history</h3>
+    <p id="topup-history-empty" hidden class="mt-3 text-sm text-slate-600">
+      No top-ups yet. Your first deposit has a higher minimum than later ones.
+    </p>
+    <table id="topup-history" hidden class="mt-4 w-full border-collapse text-left text-sm">
+      <thead>
+        <tr class="border-b border-slate-300">
+          <th scope="col" class="py-3 pr-4 font-medium">Date</th>
+          <th scope="col" class="py-3 pr-4 font-medium">Order</th>
+          <th scope="col" class="py-3 pr-4 text-right font-medium">Amount</th>
+          <th scope="col" class="py-3 font-medium">Status</th>
+        </tr>
+      </thead>
+      <tbody id="topup-history-rows"></tbody>
+    </table>
+  </section>
+</div>
+
+<script
+  is:inline
+  src={SNAP_JS_URL}
+  data-client-key={SNAP_CLIENT_KEY}
+  defer
+></script>
+
+<script>
+  import { apiFetch } from '../../lib/api';
+  import { describeError } from '../../lib/errors';
+  import { formatIdr } from '../../lib/format';
+  import { getLiveStore } from '../../lib/live';
+
+  // Mirrors the server's own rule in server/src/routes/account.rs create_topup:
+  // the minimum depends on whether the account has ever SETTLED a top-up. A
+  // pending one does not count, on either side.
+  const FIRST_DEPOSIT_MIN_IDR = 50_000;
+  const RETOPUP_MIN_IDR = 10_000;
+
+  interface Topup {
+    id: string;
+    amount_idr: number;
+    order_id: string;
+    status: string;
+    created_at: string;
+    settled_at: string | null;
+  }
+
+  interface CreateTopupResponse {
+    topup_id: string;
+    order_id: string;
+    snap_token: string | null;
+  }
+
+  /** Subset of the Snap.js global that this island uses. */
+  interface SnapGlobal {
+    pay(
+      token: string,
+      options: {
+        onSuccess?: (result: unknown) => void;
+        onPending?: (result: unknown) => void;
+        onError?: (result: unknown) => void;
+        onClose?: () => void;
+      },
+    ): void;
+  }
+
+  const form = document.getElementById('topup-form') as HTMLFormElement;
+  const amountInput = document.getElementById('topup-amount') as HTMLInputElement;
+  const hint = document.getElementById('topup-hint') as HTMLElement;
+  const errorLine = document.getElementById('topup-error') as HTMLElement;
+  const submit = document.getElementById('topup-submit') as HTMLButtonElement;
+  const pending = document.getElementById('topup-pending') as HTMLElement;
+  const pendingAmount = document.getElementById('topup-pending-amount') as HTMLElement;
+  const pendingOrder = document.getElementById('topup-pending-order') as HTMLElement;
+  const notice = document.getElementById('topup-notice') as HTMLElement;
+  const noticeText = document.getElementById('topup-notice-text') as HTMLElement;
+  const noticeId = document.getElementById('topup-notice-id') as HTMLElement;
+  const history = document.getElementById('topup-history') as HTMLElement;
+  const historyRows = document.getElementById('topup-history-rows') as HTMLElement;
+  const historyEmpty = document.getElementById('topup-history-empty') as HTMLElement;
+
+  let minimumIdr = RETOPUP_MIN_IDR;
+  let historyLoaded = false;
+
+  function setError(message: string | null): void {
+    errorLine.textContent = message ?? '';
+    errorLine.hidden = message === null;
+  }
+
+  function showNotice(message: string, requestId: string | null): void {
+    noticeText.textContent = message;
+    noticeId.textContent = requestId ? `request_id: ${requestId}` : '';
+    notice.hidden = false;
+  }
+
+  function clearNotice(): void {
+    notice.hidden = true;
+  }
+
+  /** Pre-validate so the user is never sent into a transaction the server will reject. */
+  function validate(): number | null {
+    const raw = amountInput.value.trim();
+    if (raw === '') {
+      setError('Enter an amount.');
+      return null;
+    }
+    const amount = Number(raw);
+    if (!Number.isFinite(amount) || !Number.isInteger(amount)) {
+      setError('Enter a whole number of rupiah — no decimals.');
+      return null;
+    }
+    if (amount < minimumIdr) {
+      setError(`The minimum is ${formatIdr(minimumIdr)}.`);
+      return null;
+    }
+    setError(null);
+    return amount;
+  }
+
+  function renderHistory(topups: Topup[]): void {
+    historyRows.replaceChildren();
+
+    if (topups.length === 0) {
+      history.hidden = true;
+      historyEmpty.hidden = false;
+      return;
+    }
+    historyEmpty.hidden = true;
+    history.hidden = false;
+
+    for (const topup of topups) {
+      const row = document.createElement('tr');
+      row.className = 'border-b border-slate-200';
+
+      const cells = [
+        new Date(topup.created_at).toLocaleString(),
+        topup.order_id,
+        formatIdr(topup.amount_idr),
+        topup.status,
+      ];
+      cells.forEach((value, index) => {
+        const cell = document.createElement('td');
+        cell.textContent = value;
+        cell.className = index === 2 ? 'py-3 pr-4 text-right font-mono tabular-nums' : 'py-3 pr-4';
+        if (index === 1 || index === 3) cell.classList.add('font-mono');
+        if (index === 3 && topup.status === 'settled') cell.classList.add('text-emerald-700');
+        row.append(cell);
+      });
+
+      historyRows.append(row);
+    }
+  }
+
+  async function loadHistory(): Promise<void> {
+    try {
+      const topups = await apiFetch<Topup[]>('/api/topups?limit=20');
+      historyLoaded = true;
+
+      // The server decides the minimum from the count of SETTLED top-ups.
+      const hasSettled = topups.some((t) => t.status === 'settled');
+      minimumIdr = hasSettled ? RETOPUP_MIN_IDR : FIRST_DEPOSIT_MIN_IDR;
+      amountInput.min = String(minimumIdr);
+      hint.textContent = hasSettled
+        ? `Minimum top-up: ${formatIdr(RETOPUP_MIN_IDR)}.`
+        : `First deposit minimum: ${formatIdr(FIRST_DEPOSIT_MIN_IDR)}. Later top-ups start at ${formatIdr(RETOPUP_MIN_IDR)}.`;
+
+      renderHistory(topups);
+
+      // The webhook settled the order: drop the pending panel. The balance badge
+      // has already been updated by the stream, not by anything here.
+      const settledOrder = pendingOrder.textContent;
+      if (!pending.hidden && settledOrder) {
+        const match = topups.find((t) => t.order_id === settledOrder);
+        if (match && match.status === 'settled') pending.hidden = true;
+      }
+    } catch (err) {
+      const view = describeError(err);
+      if (historyLoaded) showNotice(view.message, view.requestId);
+      else hint.textContent = 'Deposit minimum unavailable — retry by reloading.';
+    }
+  }
+
+  function markPending(orderId: string, amountIdr: number): void {
+    pendingAmount.textContent = formatIdr(amountIdr);
+    pendingOrder.textContent = orderId;
+    pending.hidden = false;
+  }
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    clearNotice();
+
+    const amount = validate();
+    if (amount === null) return;
+
+    submit.disabled = true;
+    void (async () => {
+      try {
+        // Creates the order and returns the Snap token. The server writes a
+        // topups row with status=pending; no money moves here.
+        const created = await apiFetch<CreateTopupResponse>('/api/topups', {
+          method: 'POST',
+          body: JSON.stringify({ amount_idr: amount }),
+        });
+
+        const snap = (window as unknown as { snap?: SnapGlobal }).snap;
+        if (!created.snap_token || !snap) {
+          // The order exists server-side, so it is honest to show it as pending
+          // rather than to pretend the payment started.
+          markPending(created.order_id, amount);
+          showNotice(
+            'Payment could not be opened in this browser, so nothing was charged. The order is recorded as pending and will stay pending until it is paid.',
+            null,
+          );
+          void loadHistory();
+          return;
+        }
+
+        snap.pay(created.snap_token, {
+          // Success here means Snap accepted the payment. It is NOT a credit:
+          // only the server-side webhook creates money.
+          onSuccess: () => markPending(created.order_id, amount),
+          onPending: () => markPending(created.order_id, amount),
+          onError: () => {
+            markPending(created.order_id, amount);
+            showNotice('The payment did not complete. The order is still pending.', null);
+          },
+          onClose: () => {
+            // Closed without paying: the order remains pending server-side.
+            void loadHistory();
+          },
+        });
+      } catch (err) {
+        const view = describeError(err);
+        showNotice(view.message, view.requestId);
+      } finally {
+        submit.disabled = false;
+      }
+    })();
+  });
+
+  amountInput.addEventListener('input', () => setError(null));
+
+  // A settlement pushes a `balance` event, so the history and the pending panel
+  // follow the stream instead of polling for the webhook.
+  let lastBalance: number | null = null;
+  getLiveStore().subscribe((state) => {
+    if (state.balanceIdr === lastBalance) return;
+    lastBalance = state.balanceIdr;
+    if (historyLoaded) void loadHistory();
+  });
+
+  void loadHistory();
+</script>

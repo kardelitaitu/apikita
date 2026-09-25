@@ -1,0 +1,33 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import TopUpForm from '../../islands/wallet/TopUpForm.astro';
+---
+
+<DashboardLayout title="Wallet">
+  <h1 class="text-2xl font-semibold tracking-tight">Wallet</h1>
+  <p class="mt-3 max-w-2xl text-sm text-slate-600">
+    Prepaid balance, topped up by QRIS through Midtrans. Minimums differ: your first
+    deposit is at least 50,000 IDR, later top-ups at least 10,000 IDR. Top-up
+    creation is rate-limited to 5 per hour.
+  </p>
+
+  <div class="mt-8">
+    <TopUpForm />
+  </div>
+
+  <section class="mt-10 max-w-2xl rounded-lg border border-slate-200 p-4 text-sm text-slate-600">
+    <h2 class="font-medium text-slate-900">How crediting works</h2>
+    <p class="mt-2">
+      Midtrans notifies our server directly, the server verifies the notification's
+      signature and matches it against the stored order, and only then does the
+      balance move — in one transaction. The browser is never trusted to say a
+      payment happened, which is why a successful payment shows as
+      <strong>pending</strong> here until the confirmation lands.
+    </p>
+    <p class="mt-2">
+      Balances are prepaid and non-refundable, and do not expire. If a payment is
+      confirmed and the service cannot be delivered, contact support with the order
+      id above.
+    </p>
+  </section>
+</DashboardLayout>
