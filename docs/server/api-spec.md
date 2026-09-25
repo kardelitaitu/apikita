@@ -100,6 +100,13 @@ Daily buckets from `usage_daily`. **Three token classes returned separately** â€
 never summed. Cache-read is priced ~200x below output; a merged total cannot be
 reconciled against an invoice.
 
+Both bounds are ISO `YYYY-MM-DD`; **anything else is a `422`** naming the field in
+`details.field`. **An absent or empty bound is unbounded** â€” it does not constrain the
+window. **Both ends are inclusive**, so `from == to` returns exactly that one day.
+Only when neither parameter is present is the window the last 30 buckets; a bounded
+range that matches nothing returns `[]`, never that default. **No maximum span is
+enforced.**
+
 ### `GET /api/topups?limit=`
 
 Top-up history: amount, status, created, settled. Never exposes Midtrans secrets.
