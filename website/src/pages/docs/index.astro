@@ -1,0 +1,83 @@
+---
+import Base from '../../layouts/Base.astro';
+
+// Route required by docs/website/03-functional-spec.md line 21: "/docs —
+// Integration guide". /docs/quickstart is the guide itself; this page is an
+// index over it, not a second copy. It links to exactly the pages that exist.
+const pages = [
+  {
+    href: '/docs/quickstart',
+    title: 'Quickstart',
+    body: 'The integration guide: exchange a login for a session cookie, create an API key, make a streaming chat completion, and every error code you can get back.',
+  },
+];
+---
+
+<Base
+  title="Documentation — apikita"
+  description="Integration guides for the apikita API: authenticate, create a key, and call the OpenAI-compatible endpoint."
+>
+  <article class="space-y-12">
+    <header>
+      <h1 class="text-3xl font-semibold tracking-tight">Documentation</h1>
+      <p class="mt-4 max-w-2xl text-slate-600">
+        How to integrate with apikita: the OpenAI-compatible endpoint at
+        <code class="font-mono text-sm">POST /v1/chat/completions</code>, the
+        session cookie the dashboard uses, and the API keys that authenticate
+        programmatic calls.
+      </p>
+    </header>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">Guides</h2>
+      <ul class="mt-4 grid gap-4">
+        {pages.map((page) => (
+          <li class="rounded-lg border border-slate-200 p-5">
+            <a href={page.href} class="font-medium underline">{page.title}</a>
+            <p class="mt-2 text-sm leading-relaxed text-slate-600">{page.body}</p>
+          </li>
+        ))}
+      </ul>
+      <p class="mt-4 max-w-2xl text-sm text-slate-500">
+        The quickstart is the only guide published so far. Nothing else is listed
+        here rather than linked to a page that does not exist.
+      </p>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">What the quickstart covers</h2>
+      <ul class="mt-4 max-w-2xl list-disc space-y-2 pl-5 text-slate-600">
+        <li>
+          <strong>Authentication</strong> — exchange a login for an
+          <code class="font-mono text-sm">HttpOnly</code> session cookie with
+          <code class="font-mono text-sm">POST /auth/exchange</code>. The session
+          cookie is for the dashboard only; it is never accepted on
+          <code class="font-mono text-sm">/v1/*</code>.
+        </li>
+        <li>
+          <strong>API keys</strong> — scoped to a model allowlist, with their own
+          spend limit and per-minute rate limit. The plaintext key is returned
+          once; only its SHA-256 hash is stored.
+        </li>
+        <li>
+          <strong>Requests</strong> — streaming over SSE and non-streaming JSON,
+          with the terminal error event that ends a stream that failed mid-answer.
+        </li>
+        <li>
+          <strong>Error codes</strong> — the full table, including which are worth
+          retrying and where <code class="font-mono text-sm">Retry-After</code> is sent.
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">Elsewhere</h2>
+      <p class="mt-3 max-w-2xl text-slate-600">
+        Pricing is on the <a href="/#pricing" class="underline">landing page</a>.
+        If you have not signed up yet,
+        <a href="/signup" class="underline">create an account</a> — you will need
+        one before you can create a key or top up the wallet.
+      </p>
+    </section>
+  </article>
+</Base>
