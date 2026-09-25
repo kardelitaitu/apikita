@@ -1951,4 +1951,142 @@ mod tests {
         // A non-object body is refused before any money moves.
         assert!(force_streaming(json!([1, 2])).is_err());
     }
+
+    // ---------------------------------------------------------------------
+    // The terminal SSE error frame (docs/error-model.md:151-164)
+    //
+    // SSE is a line protocol: `field: value` lines separated by a single
+    // \n, the whole event terminated by a blank line. These tests assert
+    // against that grammar, not against whatever the function currently
+    // returns — a frame that merely looks plausible is what silently drops
+    // the event in an EventSource and hangs the client.
+    // ---------------------------------------------------------------------
+
+    /// The data field's value, with the `data: ` prefix stripped.
+    fn data_field(frame: &str) -> &str {
+        frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or_else(|| panic!("no `data: ` field in {frame:?}"))
+    }
+
+    fn request_id_of(frame: &str) -> String {
+        let parsed: Value = serde_json::from_str(data_field(frame))
+            .unwrap_or_else(|e| panic!("the data field must be JSON: {e}"));
+        parsed["error"]["request_id"]
+            .as_str()
+            .expect("docs/error-model.md:171 - always include request_id")
+            .to_string()
+    }
+
+    #[test]
+    fn the_error_frame_ends_with_a_blank_line() {
+        let frame = error_event("upstream_failed", "boom");
+        // The blank line is what tells a client the event is complete. Without
+        // it the client keeps buffering and the error is never dispatched.
+        assert!(
+            frame.ends_with("\n\n"),
+            "an SSE event is terminated by a blank line, got {frame:?}"
+        );
+        assert_eq!(
+            &frame[frame.len() - 2..],
+            "\n\n",
+            "the LAST TWO CHARACTERS must be the terminator, got {:?}",
+            &frame[frame.len() - 2..]
+        );
+    }
+
+    #[test]
+    fn the_error_frame_is_exactly_one_event_line_then_one_data_line() {
+        let frame = error_event("upstream_failed", "boom");
+
+        // Two field lines plus the blank terminator: split on \n leaves the
+        // empty tail after the terminator.
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(lines.len(), 4, "frame shape is wrong: {lines:?}");
+        assert_eq!(lines[0], "event: error", "the event name must be exactly `error`");
+        assert!(lines[1].starts_with("data: "), "line 2 must be data, got {:?}", lines[1]);
+        assert_eq!(lines[2], "", "the blank line terminates the event");
+        assert_eq!(lines[3], "", "nothing may follow the terminator");
+
+        // Exactly one of each: a stray field line could mis-frame the event.
+        assert_eq!(lines.iter().filter(|l| l.starts_with("event:")).count(), 1);
+        assert_eq!(lines.iter().filter(|l| l.starts_with("data:")).count(), 1);
+
+        // The name is separated from the data by exactly one \n — a blank line
+        // between them would end the event before its payload.
+        assert_eq!(
+            frame.find("\ndata: "),
+            Some("event: error".len()),
+            "exactly one newline must separate the event name from the data"
+        );
+
+        // The spec also allows CR as a line ending; emitting one would be a
+        // second, hidden separator.
+        assert!(!frame.contains('\r'), "no CR in the frame: {frame:?}");
+    }
+
+    #[test]
+    fn the_error_frame_data_parses_back_to_what_was_passed_in() {
+        let frame = error_event("upstream_failed", "The upstream stream failed.");
+        let parsed: Value = serde_json::from_str(data_field(&frame))
+            .unwrap_or_else(|e| panic!("the data field must be machine-parseable JSON: {e}"));
+
+        assert_eq!(parsed["error"]["code"], json!("upstream_failed"));
+        assert_eq!(parsed["error"]["message"], json!("The upstream stream failed."));
+        assert!(
+            parsed["error"]["request_id"].is_string(),
+            "the frame must carry the documented request_id"
+        );
+    }
+
+    #[test]
+    fn a_newline_in_the_code_or_message_cannot_break_out_of_the_data_field() {
+        let frame = error_event("line1\nline2", "line1\nline2");
+
+        // JSON-serialised, so the newline is the two characters \ and n. A
+        // literal one would split the frame and let content inject a field or a
+        // whole event.
+        assert!(
+            !frame.contains("line1\nline2"),
+            "a literal newline escaped the JSON string: {frame:?}"
+        );
+        assert!(
+            frame.contains(r"line1\nline2"),
+            "the newline must be JSON-escaped: {frame:?}"
+        );
+
+        // Only the three framing newlines survive: after `event:`, after
+        // `data:`, and the blank terminator.
+        assert_eq!(frame.matches('\n').count(), 3, "unexpected newline in {frame:?}");
+        assert_eq!(
+            frame.split('\n').filter(|l| l.starts_with("data:")).count(),
+            1,
+            "the payload must stay on one line"
+        );
+
+        // Escaping must not have lost the value.
+        let parsed: Value = serde_json::from_str(data_field(&frame)).unwrap();
+        assert_eq!(parsed["error"]["code"], json!("line1\nline2"));
+        assert_eq!(parsed["error"]["message"], json!("line1\nline2"));
+    }
+
+    #[test]
+    fn every_error_event_carries_a_fresh_documented_request_id() {
+        // Per-event, not per-process: the same inputs must not produce the same
+        // id, or it correlates with nothing (docs/error-model.md:27).
+        let first = request_id_of(&error_event("upstream_failed", "boom"));
+        let second = request_id_of(&error_event("upstream_failed", "boom"));
+        assert_ne!(first, second, "request_id must be generated per event");
+
+        for id in [&first, &second] {
+            assert!(id.starts_with("req_"), "documented form is req_..., got {id}");
+            let hex = &id["req_".len()..];
+            assert_eq!(hex.len(), 32, "the suffix is a bare uuid, got {id}");
+            assert!(
+                hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "the suffix is lowercase hex, got {id}"
+            );
+        }
+    }
 }
