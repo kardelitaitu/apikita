@@ -3018,4 +3018,298 @@ mod tests {
         })
         .await;
     }
+
+    // ---------------------------------------------------------------------
+    // THE DOCUMENTED ENFORCEMENT ORDER, pinned as a REGRESSION.
+    //
+    // docs/website/06-api-keys-and-limits.md:130-146 fixes the per-request
+    // sequence - authenticate, then authorize the model, then throttle, then
+    // check money - and states the consequence explicitly: "Checking the wallet
+    // before the model allowlist leaks that a model exists to a key not
+    // permitted to use it."
+    //
+    // The order is only observable through the error the caller gets back, so
+    // these tests assert the documented `code` (docs/error-model.md:25 - "code
+    // is the contract; message is not") and, for the leak itself, that the
+    // answer is IDENTICAL at a generous balance and at zero.
+    //
+    // The requested model in the leak test is a REAL configured model
+    // (`deepseek-v4-flash`, config/apikita.toml:397), never an unknown name:
+    // an unknown model is refused by the config lookup that sits between the
+    // allowlist and the money, which would mask the very reordering under test.
+    // ---------------------------------------------------------------------
+
+    /// A key carrying an explicit `spend_limit_idr`. The allowlist is passed the
+    /// same way `create_api_key` takes it; only the limit differs.
+    async fn create_api_key_with_spend_limit(
+        pool: &PgPool,
+        account_id: Uuid,
+        plaintext: &str,
+        models: &[&str],
+        spend_limit_idr: i64,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO api_keys (account_id, key_hash, prefix, label, models, spend_limit_idr)
+             VALUES ($1, $2, 'apk_test', 'proxy-live', $3, $4) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(hash_string(plaintext))
+        .bind(serde_json::to_value(models).expect("models as JSON"))
+        .bind(spend_limit_idr)
+        .fetch_one(pool)
+        .await
+        .expect("create api key")
+    }
+
+    /// The wallet the login path creates and nothing else: a real row, zero
+    /// balance, no ledger history. `open_wallet` is the ONLY helper allowed to
+    /// put money in (through `credit_topup_transaction`); this one exists for the
+    /// opposite case, an account that has never topped up.
+    async fn open_empty_wallet(pool: &PgPool, account_id: Uuid) {
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
+            .bind(account_id)
+            .execute(pool)
+            .await
+            .expect("create the zero-balance wallet the login path would create");
+    }
+
+    /// Spend ALREADY recorded against a key, written with the same table, columns
+    /// and day that `db::debit_usage_transaction` writes, so the proxy's own
+    /// `keys::key_spend_used` read sees it. Seeding the row is what makes "this
+    /// key is over its limit" a fixture instead of a whole billed request; the
+    /// read under test is still the production one.
+    async fn seed_key_spend(pool: &PgPool, account_id: Uuid, key_id: Uuid, cost_idr: i64) {
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, cost_idr)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(account_id)
+        .bind(key_id)
+        .bind(chrono::Utc::now().date_naive())
+        .bind(cost_idr)
+        .execute(pool)
+        .await
+        .expect("seed the key's 30-day spend");
+    }
+
+    /// (a) A key whose allowlist EXCLUDES the requested model is refused with the
+    /// MODEL error - and the refusal does not depend on the wallet at all.
+    ///
+    /// Same key shape, same request, two wallets: one generously funded, one at
+    /// zero. A balance-dependent answer IS the documented leak: the caller whose
+    /// wallet happens to be empty would learn about money the funded caller was
+    /// never told. Both must get 403 `model_not_allowed`.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn a_model_outside_the_allowlist_is_refused_identically_at_any_balance() {
+        let pool = live_pool().await;
+        let state = test_state(pool.clone());
+
+        // A REAL configured model the key is NOT allowed: the allowlist is the
+        // only check that can refuse it, so the money steps are genuinely in play.
+        let body = r#"{"model":"deepseek-v4-flash","stream":true}"#;
+
+        let funded_account = create_account(&pool).await;
+        let funded_opening = 50_000;
+        open_wallet(&pool, funded_account, funded_opening).await;
+        let funded_key = format!("apk_live_{}", Uuid::new_v4().simple());
+        create_api_key(&pool, funded_account, &funded_key, &["flash"]).await;
+
+        let broke_account = create_account(&pool).await;
+        open_empty_wallet(&pool, broke_account).await;
+        let broke_key = format!("apk_live_{}", Uuid::new_v4().simple());
+        create_api_key(&pool, broke_account, &broke_key, &["flash"]).await;
+
+        let pool_for_assertions = pool.clone();
+        let assertions = tokio::spawn(async move {
+            let funded = call_chat_completions(&state, &funded_key, body)
+                .await
+                .err()
+                .expect("a model outside the allowlist is always refused");
+            let broke = call_chat_completions(&state, &broke_key, body)
+                .await
+                .err()
+                .expect("a model outside the allowlist is always refused");
+
+            let answer = (funded.status_code(), funded.code());
+            assert_eq!(
+                answer,
+                (StatusCode::FORBIDDEN, "model_not_allowed"),
+                "the model error is the documented contract, got {funded:?}"
+            );
+            assert_eq!(
+                (broke.status_code(), broke.code()),
+                answer,
+                "THE LEAK: a zero-balance wallet must not change the answer, got {broke:?} vs {funded:?}"
+            );
+
+            // The wallet was never consulted on either account: the funded one
+            // still holds exactly its top-up, and its ledger never saw a hold.
+            let deltas = ledger_deltas(&pool_for_assertions, funded_account).await;
+            assert_eq!(
+                deltas.iter().map(|(delta, _)| *delta).collect::<Vec<_>>(),
+                vec![funded_opening],
+                "a model-denied request must not move the ledger at all"
+            );
+            assert!(
+                deltas.iter().all(|(_, reference)| !reference
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("reserve_"))),
+                "no balance may be reserved before the allowlist refuses: {deltas:?}"
+            );
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, funded_account).await,
+                funded_opening,
+                "the balance must be untouched by a model denial"
+            );
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, broke_account).await,
+                0
+            );
+
+            for account in [funded_account, broke_account] {
+                assert_eq!(
+                    drift_rows(&pool_for_assertions, account).await,
+                    0,
+                    "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+                );
+                assert_eq!(
+                    unpaired_hold_rows(&pool_for_assertions, account)
+                        .await
+                        .expect("stranded-hold sweep"),
+                    0,
+                    "INVARIANT (b): a refusal must leave ZERO stranded holds"
+                );
+            }
+        });
+
+        let outcome = assertions.await;
+        delete_fixture_rows(&pool, funded_account).await;
+        delete_fixture_rows(&pool, broke_account).await;
+        outcome.expect("the enforcement-order assertions panicked");
+    }
+
+    /// (b) A key that IS allowed the model but whose wallet cannot cover the worst
+    /// case gets the MONEY error, not the model error.
+    ///
+    /// This is the other half of the same order: once the model is permitted, the
+    /// balance is what refuses - and the refusal names the hold it could not cover.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn an_allowed_model_with_an_uncovered_balance_is_refused_for_money() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        open_empty_wallet(&pool, account_id).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let expected_hold = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        assert!(
+            expected_hold > 0,
+            "the worst case must be a real hold, otherwise this test asserts nothing"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(pool.clone(), account_id, async move {
+            let err = call_chat_completions(&state, &key, body)
+                .await
+                .err()
+                .expect("an empty wallet cannot cover the worst case");
+
+            assert_eq!(
+                err.status_code(),
+                StatusCode::PAYMENT_REQUIRED,
+                "an unaffordable request is a 402, got {err:?}"
+            );
+            assert_eq!(err.code(), "insufficient_balance");
+            assert_ne!(
+                err.code(),
+                "model_not_allowed",
+                "the model IS allowed here - the money is what is missing"
+            );
+            assert_eq!(
+                err.details(),
+                Some(json!({ "balance_idr": 0, "required_idr": expected_hold })),
+                "the 402 must name the hold the wallet could not cover"
+            );
+
+            // A reservation that matched no row writes nothing: no ledger row, no
+            // drift, no stranded hold.
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                0
+            );
+            assert_eq!(
+                ledger_deltas(&pool_for_assertions, account_id).await,
+                Vec::<(i64, Option<String>)>::new(),
+                "a refused reservation must not write a ledger row"
+            );
+            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a refused reservation leaves ZERO stranded holds"
+            );
+        })
+        .await;
+    }
+
+    /// (c) A key over its own 30-day spend limit gets the LIMIT error - and it
+    /// gets it while the wallet could easily pay, which is what pins the limit
+    /// ahead of the money (docs/website/06-api-keys-and-limits.md:137-139).
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn a_key_over_its_spend_limit_is_refused_for_the_limit_not_for_money() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 500_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let spend_limit_idr = 10_000;
+        let key_id =
+            create_api_key_with_spend_limit(&pool, account_id, &key, &["flash"], spend_limit_idr)
+                .await;
+        seed_key_spend(&pool, account_id, key_id, spend_limit_idr).await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        assert!(
+            expected_hold_idr(&state.config, "flash", body.as_bytes(), None) < opening_idr,
+            "the wallet must be able to pay, or the limit is not what stopped the request"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(pool.clone(), account_id, async move {
+            let err = call_chat_completions(&state, &key, body)
+                .await
+                .err()
+                .expect("the key is exactly at its ceiling, which already blocks");
+
+            assert_eq!(
+                err.status_code(),
+                StatusCode::PAYMENT_REQUIRED,
+                "a key limit is a 402, not a 429 (docs/error-model.md:73-86), got {err:?}"
+            );
+            assert_eq!(err.code(), "key_limit_exceeded");
+            assert_eq!(
+                err.details()
+                    .and_then(|details| details["reason"].as_str().map(str::to_string)),
+                Some("spend_limit_idr_reached".to_string()),
+                "the documented limit is the one reported, got {:?}",
+                err.details()
+            );
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr,
+                "the limit refuses before any money moves"
+            );
+            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+        })
+        .await;
+    }
 }
