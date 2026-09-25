@@ -22,6 +22,22 @@ use crate::routes::proxy::AppState;
 fn error_body(code: &str, message: &str) -> Json<serde_json::Value> {
     Json(json!({ "error": code, "message": message }))
 }
+/// Whether a configured secret is usable for signature verification.
+///
+/// `env::var` yields `Ok("")` for a variable that is SET BUT EMPTY, and an
+/// empty key is catastrophic here: the published Midtrans formula
+/// (docs/website/04-payments.md:40) is SHA512(order_id + status_code +
+/// gross_amount + server_key), so with an empty key anyone can compute a
+/// matching signature and forge a `settlement` notification that credits a
+/// wallet. Absent and empty must therefore fail identically.
+///
+/// A key is taken VERBATIM - never trimmed into use. Whitespace is legitimate
+/// key material, so trimming could silently change a valid secret; a
+/// whitespace-only value carries no secret and is refused.
+fn is_usable_server_key(key: &str) -> bool {
+    !key.trim().is_empty()
+}
+
 /// The account that owns a topup order, or None when the order does not exist.
 ///
 /// A read-only lookup for the realtime publish, which happens AFTER the money
@@ -68,7 +84,21 @@ pub async fn handle_midtrans_webhook(
     // the hub, which is why the extractor is AppState rather than PgPool.
     let pool = &state.pool;
     let server_key = match env::var("MIDTRANS_SERVER_KEY") {
-        Ok(k) => k,
+        Ok(k) if is_usable_server_key(&k) => k,
+        Ok(_) => {
+            // Configured but empty or whitespace-only: distinct from ABSENT so
+            // an operator can tell the two misconfigurations apart. Never fall
+            // through to verification - an empty key makes the signature
+            // worthless and a forged notification would credit a wallet.
+            error!(
+                "MIDTRANS_SERVER_KEY is configured but empty or whitespace-only; \
+                 refusing to verify signatures against an empty secret"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "server misconfigured"})),
+            );
+        }
         Err(_) => {
             error!("MIDTRANS_SERVER_KEY environment variable is not configured");
             return (
@@ -79,6 +109,9 @@ pub async fn handle_midtrans_webhook(
     };
 
     // 1. Signature verification
+    // The comparison is byte-wise over the lowercase hex `hex::encode` emits, so
+    // an UPPERCASE-hex signature is rejected. Midtrans documents lowercase, so
+    // this is strict and correct - but it is intentional, not incidental.
     if !verify_midtrans_signature(&payload, &server_key) {
         warn!(
             order_id = %payload.order_id,
@@ -514,6 +547,39 @@ mod tests {
                 "{unchanged:?} changed no balance and must publish nothing"
             );
         }
+    }
+
+    /// The regression this change exists for. `env::var` returns `Ok("")` for a
+    /// variable that is SET BUT EMPTY, and the old `match` accepted that `Ok`.
+    /// Verification then hashed `order_id + status_code + gross_amount` with
+    /// nothing appended - a formula published in docs/website/04-payments.md -
+    /// so anyone could forge a `settlement` notification and credit a wallet.
+    /// The predicate is pure, so this pins the contract without touching (and
+    /// racing on) the process-wide environment.
+    #[test]
+    fn an_empty_or_whitespace_secret_is_never_usable() {
+        assert!(!is_usable_server_key(""), "an empty secret must be refused");
+        assert!(
+            !is_usable_server_key("   "),
+            "a whitespace-only secret must be refused"
+        );
+        assert!(
+            !is_usable_server_key("\t\n "),
+            "a whitespace-only secret must be refused"
+        );
+
+        // A real key must still be accepted, so the cases above are not passing
+        // merely because the predicate rejects everything.
+        assert!(
+            is_usable_server_key("SB-Mid-server-TEST"),
+            "a real key must be usable"
+        );
+        // A padded key is NOT trimmed into use: it is taken verbatim, so it is
+        // usable as-is (only whitespace-ONLY is rejected).
+        assert!(
+            is_usable_server_key("  SB-Mid-server-TEST  "),
+            "a padded key is accepted verbatim, never trimmed"
+        );
     }
 
     /// The refund mirror. The 409 insufficient-balance path is the one that
