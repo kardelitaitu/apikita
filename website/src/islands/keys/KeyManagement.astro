@@ -10,43 +10,43 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
 <div id="key-island" class="mt-6">
   <!-- List ----------------------------------------------------------------- -->
   <div class="flex items-center justify-between">
-    <div id="key-list-status" class="text-sm text-slate-500" aria-live="polite">Loading keys…</div>
+    <div id="key-list-status" class="text-sm text-ink-muted" aria-live="polite">Loading keys…</div>
     <button id="create-key-btn" type="button"
-      class="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">Create key</button>
+      class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Create key</button>
   </div>
 
-  <div id="key-error" hidden class="mt-4 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900"></div>
+  <div id="key-error" hidden class="mt-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
 
-  <ul id="key-list" class="mt-4 divide-y divide-slate-200 rounded-lg border border-slate-200"></ul>
+  <ul id="key-list" class="mt-4 divide-y divide-edge rounded-lg border border-edge"></ul>
 
-  <div id="key-empty" hidden class="mt-4 rounded-lg border border-slate-200 p-6 text-sm text-slate-600">
-    <p class="font-medium text-slate-900">No API keys yet</p>
+  <div id="key-empty" hidden class="mt-4 rounded-lg border border-edge bg-surface-raised p-6 text-sm text-ink-muted">
+    <p class="font-medium text-ink">No API keys yet</p>
     <p class="mt-1">A key is the credential your program sends to
       <code class="font-mono">POST /v1/chat/completions</code>. Create one, then call the API —
       see the <a href="/docs/quickstart" class="underline">quickstart</a>.</p>
     <button id="key-empty-create" type="button"
-      class="mt-4 rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">Create your first key</button>
+      class="mt-4 rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Create your first key</button>
   </div>
 
   <!-- Create-key modal ------------------------------------------------------ -->
-  <div id="key-modal" hidden class="fixed inset-0 z-20 flex items-center justify-center bg-slate-900/40 p-4"
+  <div id="key-modal" hidden class="fixed inset-0 z-20 flex items-center justify-center bg-surface-sunken/80 p-4 backdrop-blur-sm"
     role="dialog" aria-modal="true" aria-labelledby="key-modal-title">
-    <div class="w-full max-w-lg rounded-xl bg-white p-6 shadow-xl">
+    <div class="w-full max-w-lg rounded-xl border border-edge-strong bg-surface-raised p-6 shadow-2xl shadow-black/60">
       <!-- Step 1: the form -->
       <div id="key-form-step">
         <h2 id="key-modal-title" class="text-lg font-semibold tracking-tight">Create API key</h2>
-        <p class="mt-2 text-sm text-slate-600">Only a label is required. Leave limits at 0 for unlimited.</p>
+        <p class="mt-2 text-sm text-ink-muted">Only a label is required. Leave limits at 0 for unlimited.</p>
 
         <form id="key-form" class="mt-4 space-y-4">
           <div>
             <label for="k-label" class="block text-sm font-medium">Label</label>
             <input id="k-label" name="label" type="text" required autocomplete="off" placeholder="e.g. prod"
-              class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" />
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
           </div>
 
           <fieldset>
             <legend class="text-sm font-medium">Models</legend>
-            <p class="text-xs text-slate-500">Omitting models = all currently enabled models.</p>
+            <p class="text-xs text-ink-muted">Omitting models = all currently enabled models.</p>
             <div class="mt-2 flex flex-wrap gap-3">
               {MODELS.map((m) => (
                 <label class="inline-flex items-center gap-2 text-sm">
@@ -61,27 +61,27 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
             <div>
               <label for="k-spend" class="block text-sm font-medium">Spend limit (IDR)</label>
               <input id="k-spend" name="spend_limit_idr" type="number" min="0" value="0"
-                class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" />
+                class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
             </div>
             <div>
               <label for="k-token" class="block text-sm font-medium">Token limit</label>
               <input id="k-token" name="token_limit" type="number" min="0" value="0"
-                class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" />
+                class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
             </div>
             <div>
               <label for="k-rate" class="block text-sm font-medium">Rate (req/min)</label>
               <input id="k-rate" name="rate_limit_rpm" type="number" min="0" value="0"
-                class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" />
+                class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
             </div>
           </div>
 
-          <div id="key-form-error" hidden class="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-900"></div>
+          <div id="key-form-error" hidden class="rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
 
           <div class="flex justify-end gap-3 pt-2">
             <button id="key-cancel" type="button"
-              class="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium hover:border-slate-400">Cancel</button>
+              class="rounded-md border border-edge-strong px-4 py-2 text-sm font-medium hover:border-brand">Cancel</button>
             <button id="key-submit" type="submit"
-              class="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">Create key</button>
+              class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Create key</button>
           </div>
         </form>
       </div>
@@ -89,25 +89,25 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       <!-- Step 2: the plaintext key, shown exactly once -->
       <div id="key-secret-step" hidden>
         <h2 class="text-lg font-semibold tracking-tight">Your new API key</h2>
-        <div class="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+        <div class="mt-3 rounded-md border border-warn-edge bg-warn-surface p-3 text-sm text-warn-ink">
           <strong>You will not see this key again.</strong> Store it somewhere safe now.
           The server keeps only its hash — if you lose it, revoke it and create a new one.
         </div>
 
-        <div id="key-secret-missing" hidden class="mt-3 rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-900">
+        <div id="key-secret-missing" hidden class="mt-3 rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink">
           The server created the key but did not return the plaintext value. This is unexpected —
           the key cannot be retrieved later. Treat it as unusable and revoke it from the list.
         </div>
 
         <div id="key-secret-wrap" class="mt-3 flex items-center gap-2">
-          <code id="key-secret" class="block flex-1 break-all rounded-md border border-slate-300 bg-slate-50 px-3 py-2 font-mono text-sm"></code>
+          <code id="key-secret" class="block flex-1 break-all rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 font-mono text-sm"></code>
           <button id="key-copy" type="button"
-            class="shrink-0 rounded-md border border-slate-300 px-3 py-2 text-sm font-medium hover:border-slate-400">Copy</button>
+            class="shrink-0 rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm font-medium hover:border-brand">Copy</button>
         </div>
 
         <div class="flex justify-end pt-4">
           <button id="key-done" type="button"
-            class="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">I've saved it</button>
+            class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">I've saved it</button>
         </div>
       </div>
     </div>
@@ -199,15 +199,15 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       left.innerHTML =
         '<div class="flex items-center gap-2">' +
           '<span class="font-medium">' + escapeHtml(k.label || '(unlabeled)') + '</span>' +
-          '<span class="rounded-full border border-slate-300 px-2 py-0.5 text-xs text-slate-500">' + statusLabel(k) + '</span>' +
+          '<span class="rounded-full border border-edge-strong px-2 py-0.5 text-xs text-ink-muted ' + (k.revoked_at ? "border-danger-edge text-danger" : "border-ok-edge text-ok") + '">' + statusLabel(k) + '</span>' +
         '</div>' +
-        '<div class="mt-1 font-mono text-sm text-slate-500">' + escapeHtml(k.prefix) + '…</div>' +
-        '<div class="mt-1 text-xs text-slate-500">Models: ' + modelsText(k) + ' · Spend: ' + spendText(k) + ' · Last used: ' + lastUsedText(k) + '</div>';
+        '<div class="mt-1 font-mono text-sm text-ink-muted">' + escapeHtml(k.prefix) + '…</div>' +
+        '<div class="mt-1 text-xs text-ink-muted">Models: ' + modelsText(k) + ' · Spend: ' + spendText(k) + ' · Last used: ' + lastUsedText(k) + '</div>';
       const right = document.createElement('div');
       if (!k.revoked_at) {
         const revoke = document.createElement('button');
         revoke.type = 'button';
-        revoke.className = 'rounded-md border border-red-300 px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50';
+        revoke.className = 'rounded-md border border-danger-edge px-3 py-1.5 text-sm font-medium text-danger hover:bg-danger-surface';
         revoke.textContent = 'Revoke';
         revoke.addEventListener('click', () => confirmAndRevoke(k));
         right.appendChild(revoke);

@@ -1,1 +1,99 @@
 @import "tailwindcss";
+
+/* ============================================================================
+   apikita — dark theme tokens.
+
+   One palette, defined once, in the token layer. Pages consume semantic
+   utilities (bg-surface-raised, text-ink-muted, border-danger-edge) instead of
+   raw hue+shade pairs, so the theme can move without a 200-class
+   find-and-replace — and, more importantly, so ERROR stays red and SUCCESS
+   stays green rather than being repainted into the brand colour.
+
+   LAYERING. Three surfaces, sunken < surface < raised, so cards, tables and
+   the modal read as raised off the page instead of flat-painted onto it.
+
+   ACCENTS (deliberate split — see the change report):
+     GREEN  --color-brand*   PRIMARY. Every action and every piece of
+                             interactive state: buttons, links, focus rings,
+                             active/selected, live indicator, success.
+     ORANGE --color-accent*  SECONDARY and sparse. It marks the money figure
+                             on a surface (balance, today's cost, token rate)
+                             and nothing else. Never an action, never a status,
+                             so the two accents cannot fight.
+
+   SEMANTIC FAMILIES are dark-appropriate variants of the SAME hue. An error
+   that looks like success is a bug:
+     danger (red)     errors, destructive actions, revoke
+     warn   (amber)   pending / not-yet-true / caution
+     ok     (emerald) confirmed success
+   ========================================================================== */
+@theme {
+  /* --- Surfaces: a very dark green, never pure black --------------------- */
+  --color-surface: #0a1a13; /* the page itself */
+  --color-surface-raised: #102a1f; /* cards, panels, tables, the modal */
+  --color-surface-sunken: #061009; /* wells: code blocks, inputs, secrets */
+
+  /* --- Dividers and control outlines ------------------------------------ */
+  --color-edge: #1e3d2e; /* hairline between rows and sections */
+  --color-edge-strong: #457a61; /* outline of a control / table head */
+
+  /* --- Text ------------------------------------------------------------- */
+  --color-ink: #e8f4ee; /* 15.90:1 on surface — body and headings */
+  --color-ink-muted: #a9c0b3; /*  9.30:1 on surface — secondary copy */
+  --color-ink-subtle: #7f978a; /*  5.72:1 on surface — captions, still AA */
+
+  /* --- BRAND: green, the primary accent --------------------------------- */
+  --color-brand: #3fd97f; /*  9.78:1 on surface — links, rings, active */
+  --color-brand-strong: #5ee89a; /* hover on a filled brand control */
+  --color-brand-ink: #04170e; /* text on a brand fill — 10.09:1 */
+  --color-brand-soft: #0d3324; /* brand-tinted well (selected state) */
+
+  /* --- ACCENT: orange, the secondary accent ----------------------------- */
+  --color-accent: #ff8a3c; /*  7.65:1 on surface */
+  --color-accent-strong: #ffa361;
+  --color-accent-ink: #2a1004; /* text on an accent fill — 7.62:1 */
+
+  /* --- DANGER: red. Errors and destructive actions. --------------------- */
+  --color-danger: #ff6b6b; /*  6.47:1 on surface — inline error text */
+  --color-danger-edge: #a84a54; /* panel border — 3.18:1 on its own panel */
+  --color-danger-surface: #2b1013; /* panel background */
+  --color-danger-ink: #ffc4c4; /* 11.76:1 on its own panel */
+
+  /* --- WARN: amber. Pending, unconfirmed, caution. ---------------------- */
+  --color-warn: #f5b544; /*  9.89:1 on surface */
+  --color-warn-edge: #8a6a24; /* 3.21:1 on its own panel */
+  --color-warn-surface: #2a1f08;
+  --color-warn-ink: #ffdca8; /* 12.37:1 on its own panel */
+
+  /* --- OK: emerald. Confirmed success. ---------------------------------- */
+  --color-ok: #10b981; /*  7.08:1 on surface — a deeper green than the
+                                  brand, so "settled" never reads as a link */
+  --color-ok-edge: #2f7a55; /* 3.14:1 on its own panel */
+  --color-ok-surface: #06251a;
+  --color-ok-ink: #8ff0c4; /* 11.99:1 on its own panel */
+}
+
+/* ============================================================================
+   Base
+   ========================================================================== */
+:root {
+  /* Native widgets — number spinners, checkboxes, scrollbars, the caret —
+     follow this instead of rendering a light control on a dark page. */
+  color-scheme: dark;
+  /* Native checkboxes (the model allowlist) pick up the brand green. */
+  accent-color: var(--color-brand);
+}
+
+::selection {
+  background-color: var(--color-brand);
+  color: var(--color-brand-ink);
+}
+
+/* One shared focus guard instead of a per-element class. Deliberately NOT in
+   an @layer: unlayered declarations outrank every Tailwind utility layer, so a
+   component's own `focus:outline-none` cannot silently delete keyboard focus.
+   Every focusable element on every page gets a visible brand ring. */
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}

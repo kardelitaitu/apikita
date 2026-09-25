@@ -10,11 +10,11 @@ const { title } = Astro.props;
 ---
 
 <Base title={`${title} — apikita`} description="apikita dashboard." chrome={false}>
-  <header class="sticky top-0 z-10 border-b border-slate-200 bg-white/95 backdrop-blur">
+  <header class="sticky top-0 z-10 border-b border-edge bg-surface-raised/95 backdrop-blur">
     <div class="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3 px-6 py-3">
       <nav class="flex items-center gap-5 text-sm">
         <a href="/" class="font-semibold tracking-tight">apikita</a>
-        <a href="/dashboard" class="text-slate-600 hover:text-slate-900">Dashboard</a>
+        <a href="/dashboard" class="text-ink-muted hover:text-brand">Dashboard</a>
       </nav>
 
       <div class="flex items-center gap-4">
@@ -24,29 +24,29 @@ const { title } = Astro.props;
           never shown as live (docs/realtime.md).
         -->
         <div class="flex items-center gap-3">
-          <span id="balance-value" class="font-mono text-sm tabular-nums" aria-live="polite">&mdash;</span>
+          <span id="balance-value" class="font-mono text-sm font-medium tabular-nums text-accent" aria-live="polite">&mdash;</span>
           <span
             id="live-badge"
             data-status="connecting"
-            class="inline-flex items-center gap-2 rounded-full border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-500 data-[status=live]:border-emerald-300 data-[status=live]:text-emerald-700 data-[status=stale]:border-amber-400 data-[status=stale]:bg-amber-50 data-[status=stale]:text-amber-800"
+            class="inline-flex items-center gap-2 rounded-full border border-edge-strong px-2.5 py-1 text-xs font-medium text-ink-muted data-[status=live]:border-ok-edge data-[status=live]:text-ok data-[status=stale]:border-warn data-[status=stale]:bg-warn-surface data-[status=stale]:text-warn-ink"
           >
             <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
             <span id="live-badge-label">Connecting&hellip;</span>
           </span>
         </div>
 
-        <form method="post" class="flex items-center gap-3 text-sm text-slate-600">
-          <button id="logout" type="button" class="hover:text-slate-900">Log out</button>
-          <button id="logout-all" type="button" class="hover:text-slate-900">Sign out everywhere</button>
+        <form method="post" class="flex items-center gap-3 text-sm text-ink-muted">
+          <button id="logout" type="button" class="hover:text-brand">Log out</button>
+          <button id="logout-all" type="button" class="hover:text-brand">Sign out everywhere</button>
         </form>
       </div>
     </div>
   </header>
 
-  <div id="banner-error" hidden class="border-b border-red-200 bg-red-50">
-    <div class="mx-auto flex max-w-4xl items-baseline justify-between gap-4 px-6 py-2 text-sm text-red-900">
+  <div id="banner-error" hidden class="border-b border-danger-edge bg-danger-surface">
+    <div class="mx-auto flex max-w-4xl items-baseline justify-between gap-4 px-6 py-2 text-sm text-danger-ink">
       <span id="banner-error-text"></span>
-      <span id="banner-error-id" class="font-mono text-xs text-red-700"></span>
+      <span id="banner-error-id" class="font-mono text-xs text-danger"></span>
     </div>
   </div>
 

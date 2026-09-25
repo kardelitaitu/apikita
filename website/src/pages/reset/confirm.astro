@@ -25,9 +25,9 @@ const lead = 'Choose a new password. Saving it signs out every session on this a
         minlength="8"
         required
         aria-describedby="password-rules"
-        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+        class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm focus:border-brand focus:outline-none"
       />
-      <p id="password-rules" class="mt-1 text-xs text-slate-500">
+      <p id="password-rules" class="mt-1 text-xs text-ink-muted">
         At least 8 characters. Shown before you submit, not after it fails.
       </p>
     </div>
@@ -40,13 +40,13 @@ const lead = 'Choose a new password. Saving it signs out every session on this a
         autocomplete="new-password"
         minlength="8"
         required
-        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+        class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm focus:border-brand focus:outline-none"
       />
     </div>
     <button
       id="reset-confirm-submit"
       type="submit"
-      class="w-full rounded-md bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+      class="w-full rounded-md bg-brand px-4 py-2.5 text-sm font-medium text-brand-ink hover:bg-brand-strong disabled:cursor-not-allowed disabled:cursor-not-allowed disabled:opacity-50"
     >
       Save new password
     </button>

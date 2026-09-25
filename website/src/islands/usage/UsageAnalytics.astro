@@ -11,28 +11,28 @@
 ---
 
 <div id="usage-island" class="mt-6">
-  <div id="usage-error" hidden class="mb-4 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900"></div>
+  <div id="usage-error" hidden class="mb-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
 
   <section aria-labelledby="usage-today-h">
     <h2 id="usage-today-h" class="text-lg font-semibold tracking-tight">Today</h2>
-    <p class="mt-1 text-sm text-slate-500">
+    <p class="mt-1 text-sm text-ink-muted">
       Three separate counters. They are never added together — each class is billed on its own rate.
     </p>
     <div id="usage-today-grid" class="mt-4 grid gap-4 sm:grid-cols-3">
-      <div class="rounded-lg border border-slate-200 p-4">
-        <div class="text-xs uppercase tracking-wide text-slate-500">Input tokens</div>
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <div class="text-xs uppercase tracking-wide text-ink-muted">Input tokens</div>
         <div id="u-in" class="mt-1 font-mono text-lg tabular-nums">—</div>
       </div>
-      <div class="rounded-lg border border-slate-200 p-4">
-        <div class="text-xs uppercase tracking-wide text-slate-500">Cache-read tokens</div>
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <div class="text-xs uppercase tracking-wide text-ink-muted">Cache-read tokens</div>
         <div id="u-cache" class="mt-1 font-mono text-lg tabular-nums">—</div>
       </div>
-      <div class="rounded-lg border border-slate-200 p-4">
-        <div class="text-xs uppercase tracking-wide text-slate-500">Output tokens</div>
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <div class="text-xs uppercase tracking-wide text-ink-muted">Output tokens</div>
         <div id="u-out" class="mt-1 font-mono text-lg tabular-nums">—</div>
       </div>
     </div>
-    <p class="mt-2 text-xs text-slate-500">
+    <p class="mt-2 text-xs text-ink-muted">
       Cost today is shown for reference only; the token counters above are the source of truth for billing.
     </p>
   </section>
@@ -40,11 +40,11 @@
   <section class="mt-10" aria-labelledby="usage-daily-h">
     <div class="flex items-center justify-between">
       <h2 id="usage-daily-h" class="text-lg font-semibold tracking-tight">Daily breakdown</h2>
-      <div class="text-sm text-slate-500" id="usage-daily-status" aria-live="polite">Loading…</div>
+      <div class="text-sm text-ink-muted" id="usage-daily-status" aria-live="polite">Loading…</div>
     </div>
-    <p class="mt-1 text-sm text-slate-500">Token classes are reported per day, separately — never as one summed number.</p>
+    <p class="mt-1 text-sm text-ink-muted">Token classes are reported per day, separately — never as one summed number.</p>
 
-    <div id="usage-empty" hidden class="mt-4 rounded-lg border border-slate-200 p-6 text-sm text-slate-600">
+    <div id="usage-empty" hidden class="mt-4 rounded-lg border border-edge bg-surface-raised p-6 text-sm text-ink-muted">
       No usage recorded in this period yet. Create an API key, then call
       <code class="font-mono">POST /v1/chat/completions</code> — see the
       <a href="/docs/quickstart" class="underline">quickstart</a>.
@@ -53,7 +53,7 @@
     <div class="mt-4 overflow-x-auto">
       <table class="w-full border-collapse text-left text-sm">
         <thead>
-          <tr class="border-b border-slate-300 text-slate-600">
+          <tr class="border-b border-edge-strong text-ink-muted">
             <th scope="col" class="py-2 pr-4 font-medium">Date</th>
             <th scope="col" class="py-2 pr-4 text-right font-medium">Input</th>
             <th scope="col" class="py-2 pr-4 text-right font-medium">Cache-read</th>
@@ -61,7 +61,7 @@
             <th scope="col" class="py-2 text-right font-medium">Cost (IDR)</th>
           </tr>
         </thead>
-        <tbody id="usage-rows" class="divide-y divide-slate-200"></tbody>
+        <tbody id="usage-rows" class="divide-y divide-edge"></tbody>
       </table>
     </div>
   </section>

@@ -28,25 +28,25 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
         step="1000"
         min="0"
         required
-        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm tabular-nums"
+        class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm tabular-nums"
         aria-describedby="topup-hint"
       />
-      <p id="topup-hint" class="mt-1 text-xs text-slate-500">
+      <p id="topup-hint" class="mt-1 text-xs text-ink-muted">
         Checking your deposit minimum&hellip;
       </p>
-      <p id="topup-error" hidden class="mt-1 text-xs text-red-700"></p>
+      <p id="topup-error" hidden class="mt-1 text-xs text-danger"></p>
     </div>
 
     <button
       id="topup-submit"
       type="submit"
-      class="rounded-md bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+      class="rounded-md bg-brand px-4 py-2.5 text-sm font-medium text-brand-ink hover:bg-brand-strong disabled:cursor-not-allowed disabled:cursor-not-allowed disabled:opacity-50"
     >
       Top up
     </button>
   </form>
 
-  <p id="topup-fee" class="mt-3 max-w-md text-xs text-slate-500">
+  <p id="topup-fee" class="mt-3 max-w-md text-xs text-ink-muted">
     QRIS is the only enabled rail — card payments are deliberately disabled. The
     amount you enter is gross: you pay it and the full amount is credited to your
     balance.
@@ -60,7 +60,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
   <div
     id="topup-pending"
     hidden
-    class="mt-6 max-w-md rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900"
+    class="mt-6 max-w-md rounded-lg border border-warn-edge bg-warn-surface p-4 text-sm text-warn-ink"
     aria-live="polite"
   >
     <p class="font-medium">Waiting for payment confirmation</p>
@@ -71,33 +71,33 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
     </p>
     <dl class="mt-3 space-y-1 text-xs">
       <div class="flex gap-2">
-        <dt class="text-amber-700">Amount</dt>
+        <dt class="text-warn">Amount</dt>
         <dd id="topup-pending-amount" class="font-mono"></dd>
       </div>
       <div class="flex gap-2">
-        <dt class="text-amber-700">Order</dt>
+        <dt class="text-warn">Order</dt>
         <dd id="topup-pending-order" class="font-mono break-all"></dd>
       </div>
     </dl>
-    <p class="mt-3 text-xs text-amber-800">
+    <p class="mt-3 text-xs text-warn-ink">
       This panel clears by itself when the confirmation arrives and the live
       balance updates.
     </p>
   </div>
 
-  <div id="topup-notice" hidden class="mt-6 max-w-md rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-900" aria-live="polite">
+  <div id="topup-notice" hidden class="mt-6 max-w-md rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink" aria-live="polite">
     <p id="topup-notice-text"></p>
-    <p id="topup-notice-id" class="mt-1 font-mono text-xs text-red-700"></p>
+    <p id="topup-notice-id" class="mt-1 font-mono text-xs text-danger"></p>
   </div>
 
   <section class="mt-10">
     <h3 class="text-lg font-semibold tracking-tight">Top-up history</h3>
-    <p id="topup-history-empty" hidden class="mt-3 text-sm text-slate-600">
+    <p id="topup-history-empty" hidden class="mt-3 text-sm text-ink-muted">
       No top-ups yet. Your first deposit has a higher minimum than later ones.
     </p>
     <table id="topup-history" hidden class="mt-4 w-full border-collapse text-left text-sm">
       <thead>
-        <tr class="border-b border-slate-300">
+        <tr class="border-b border-edge-strong">
           <th scope="col" class="py-3 pr-4 font-medium">Date</th>
           <th scope="col" class="py-3 pr-4 font-medium">Order</th>
           <th scope="col" class="py-3 pr-4 text-right font-medium">Amount</th>
@@ -226,7 +226,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
 
     for (const topup of topups) {
       const row = document.createElement('tr');
-      row.className = 'border-b border-slate-200';
+      row.className = 'border-b border-edge';
 
       const cells = [
         new Date(topup.created_at).toLocaleString(),
@@ -239,7 +239,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
         cell.textContent = value;
         cell.className = index === 2 ? 'py-3 pr-4 text-right font-mono tabular-nums' : 'py-3 pr-4';
         if (index === 1 || index === 3) cell.classList.add('font-mono');
-        if (index === 3 && topup.status === 'settled') cell.classList.add('text-emerald-700');
+        if (index === 3 && topup.status === 'settled') cell.classList.add('text-ok');
         row.append(cell);
       });
 

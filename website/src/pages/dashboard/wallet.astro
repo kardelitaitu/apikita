@@ -5,7 +5,7 @@ import TopUpForm from '../../islands/wallet/TopUpForm.astro';
 
 <DashboardLayout title="Wallet">
   <h1 class="text-2xl font-semibold tracking-tight">Wallet</h1>
-  <p class="mt-3 max-w-2xl text-sm text-slate-600">
+  <p class="mt-3 max-w-2xl text-sm text-ink-muted">
     Prepaid balance, topped up by QRIS through Midtrans. Minimums differ: your first
     deposit is at least 50,000 IDR, later top-ups at least 10,000 IDR. Top-up
     creation is rate-limited to 5 per hour.
@@ -15,8 +15,8 @@ import TopUpForm from '../../islands/wallet/TopUpForm.astro';
     <TopUpForm />
   </div>
 
-  <section class="mt-10 max-w-2xl rounded-lg border border-slate-200 p-4 text-sm text-slate-600">
-    <h2 class="font-medium text-slate-900">How crediting works</h2>
+  <section class="mt-10 max-w-2xl rounded-lg border border-edge bg-surface-raised p-4 text-sm text-ink-muted">
+    <h2 class="font-medium text-ink">How crediting works</h2>
     <p class="mt-2">
       Midtrans notifies our server directly, the server verifies the notification's
       signature and matches it against the stored order, and only then does the

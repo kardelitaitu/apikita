@@ -18,7 +18,7 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
 
 <DashboardLayout title="Settings">
   <h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
-  <p class="mt-3 max-w-2xl text-sm text-slate-600">
+  <p class="mt-3 max-w-2xl text-sm text-ink-muted">
     Your profile, your password, and the identities linked to this account. The
     account owns the wallet and the API keys; a linked identity is a way in, not a
     second account.
@@ -27,101 +27,101 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
   <!-- One error surface for the page. A failed fetch says so; it never leaves a
        stale value on screen looking current (spec lines 109-118). -->
   <div id="settings-error" hidden role="alert"
-    class="mt-6 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900">
+    class="mt-6 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink">
     <span id="settings-error-text"></span>
-    <span id="settings-error-id" class="ml-1 font-mono text-xs text-red-700"></span>
+    <span id="settings-error-id" class="ml-1 font-mono text-xs text-danger"></span>
   </div>
 
   <!-- Profile ------------------------------------------------------------- -->
-  <section class="mt-8 max-w-2xl rounded-lg border border-slate-200 p-4">
+  <section class="mt-8 max-w-2xl rounded-lg border border-edge bg-surface-raised p-4">
     <h2 class="text-lg font-semibold tracking-tight">Profile</h2>
     <dl class="mt-3 space-y-2 text-sm">
       <div class="flex flex-wrap gap-x-3">
-        <dt class="w-40 shrink-0 text-slate-500">Email</dt>
+        <dt class="w-40 shrink-0 text-ink-muted">Email</dt>
         <dd id="profile-email" class="font-mono">Loading…</dd>
       </div>
       <div class="flex flex-wrap gap-x-3">
-        <dt class="w-40 shrink-0 text-slate-500">Email verified</dt>
+        <dt class="w-40 shrink-0 text-ink-muted">Email verified</dt>
         <dd id="profile-verified" class="font-mono">Loading…</dd>
       </div>
       <div class="flex flex-wrap gap-x-3">
-        <dt class="w-40 shrink-0 text-slate-500">Account id</dt>
+        <dt class="w-40 shrink-0 text-ink-muted">Account id</dt>
         <dd id="profile-account" class="break-all font-mono">Loading…</dd>
       </div>
       <div class="flex flex-wrap gap-x-3">
-        <dt class="w-40 shrink-0 text-slate-500">Account status</dt>
+        <dt class="w-40 shrink-0 text-ink-muted">Account status</dt>
         <dd id="profile-status" class="font-mono">Loading…</dd>
       </div>
     </dl>
-    <p class="mt-3 text-xs text-slate-500">
+    <p class="mt-3 text-xs text-ink-muted">
       An unverified address cannot hold a balance: an unverified email is not proof
       the address belongs to the person, and deposits are non-refundable.
     </p>
   </section>
 
   <!-- Password ------------------------------------------------------------ -->
-  <section class="mt-8 max-w-2xl rounded-lg border border-slate-200 p-4">
+  <section class="mt-8 max-w-2xl rounded-lg border border-edge bg-surface-raised p-4">
     <h2 class="text-lg font-semibold tracking-tight">Password</h2>
-    <p class="mt-2 text-sm text-slate-600">
+    <p class="mt-2 text-sm text-ink-muted">
       Changing your password signs every device out, including this one — that is
       the point of changing it after a suspected compromise. Minimum 8 characters.
     </p>
 
     <div id="password-done" hidden role="status"
-      class="mt-3 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm text-emerald-900"></div>
+      class="mt-3 rounded-lg border border-ok-edge bg-ok-surface p-3 text-sm text-ok-ink"></div>
 
     <form id="password-form" class="mt-4 space-y-4">
       <div>
         <label for="current-password" class="block text-sm font-medium">Current password</label>
         <input id="current-password" name="currentPassword" type="password"
           autocomplete="current-password" required
-          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+          class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand" />
       </div>
       <div>
         <label for="new-password" class="block text-sm font-medium">New password</label>
         <input id="new-password" name="password" type="password"
           autocomplete="new-password" required minlength="8"
-          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+          class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand" />
       </div>
       <div>
         <label for="confirm-password" class="block text-sm font-medium">Confirm new password</label>
         <input id="confirm-password" name="passwordConfirm" type="password"
           autocomplete="new-password" required minlength="8"
-          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300" />
+          class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand" />
       </div>
 
       <div id="password-error" hidden role="alert"
-        class="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-900"></div>
+        class="rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
 
       <button id="password-submit" type="submit"
-        class="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50">
+        class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong disabled:cursor-not-allowed disabled:cursor-not-allowed disabled:opacity-50">
         Change password
       </button>
     </form>
   </section>
 
   <!-- Linked accounts ----------------------------------------------------- -->
-  <section class="mt-8 max-w-2xl rounded-lg border border-slate-200 p-4">
+  <section class="mt-8 max-w-2xl rounded-lg border border-edge bg-surface-raised p-4">
     <h2 class="text-lg font-semibold tracking-tight">Linked accounts</h2>
 
     <dl class="mt-3 space-y-3 text-sm">
       <div class="flex flex-wrap items-baseline gap-x-3">
-        <dt class="w-40 shrink-0 text-slate-500">Google</dt>
+        <dt class="w-40 shrink-0 text-ink-muted">Google</dt>
         <dd id="linked-google" class="font-mono">Checking…</dd>
       </div>
       <div class="flex flex-wrap items-baseline gap-x-3">
-        <dt class="w-40 shrink-0 text-slate-500">Telegram</dt>
+        <dt class="w-40 shrink-0 text-ink-muted">Telegram</dt>
         <dd id="linked-telegram" class="font-mono">Loading…</dd>
       </div>
     </dl>
 
-    <p class="mt-3 text-sm text-slate-600">
+    <p class="mt-3 text-sm text-ink-muted">
       A linked Telegram account is bound with a single-use, five-minute
       <code class="font-mono">/link</code> code issued here and sent to the bot, so
       the code proves control of this account and the chat proves control of the
       Telegram account.
     </p>
-    <p class="mt-2 text-sm text-slate-600">
+    <p class="mt-2 text-sm text-ink-muted">
       Unlinking removes only the link: <strong>the account and its balance remain</strong>,
       and the Telegram account can be relinked later. Linking is not yet available
       from the dashboard — the endpoints are specified but not deployed — so the
@@ -130,8 +130,8 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
   </section>
 
   <!-- Session controls ---------------------------------------------------- -->
-  <section class="mt-8 max-w-2xl rounded-lg border border-slate-200 p-4 text-sm text-slate-600">
-    <h2 class="text-lg font-semibold tracking-tight text-slate-900">Sessions</h2>
+  <section class="mt-8 max-w-2xl rounded-lg border border-edge bg-surface-raised p-4 text-sm text-ink-muted">
+    <h2 class="text-lg font-semibold tracking-tight text-ink">Sessions</h2>
     <p class="mt-2">
       <strong>Log out</strong> (this device only) and <strong>Sign out everywhere</strong>
       (real revocation, every device at once) are both in the dashboard header, on
