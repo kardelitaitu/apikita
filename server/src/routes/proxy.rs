@@ -27,7 +27,7 @@ use crate::routes::events::{publish_balance, publish_usage, todays_usage, Realti
 // The 30-day window and the spend read are shared with the key-management routes
 // on purpose: the limit the proxy enforces and the number the dashboard shows
 // must come from one definition, not two that can drift.
-use crate::routes::keys::{key_spend_used, SPEND_WINDOW_DAYS};
+use crate::routes::keys::{key_spend_used, key_tokens_used, SPEND_WINDOW_DAYS};
 use crate::upstream::{parse_usage_from_sse, UpstreamClient, UpstreamError, UpstreamStream, Usage};
 
 #[derive(Clone)]
@@ -85,16 +85,112 @@ fn is_model_allowed(allowed_models: &[String], model: &str) -> bool {
     allowed_models.iter().any(|m| m == model)
 }
 
-/// Whether a key's rolling 30-day spend has reached its ceiling.
+/// Whether a key's rolling 30-day usage has reached its ceiling.
 ///
-/// 0 (or a negative value, which key management refuses to store) means "no
-/// limit" (docs/website/06-api-keys-and-limits.md), so it never blocks. The
-/// comparison is `>=`, not `>`: the window total is what has already been
-/// spent, so a key sitting exactly on its ceiling is out of budget and the next
-/// request is the one that would exceed it. Pure, so the boundary is tested
-/// without a database or a request.
-fn spend_limit_hit(spend_limit_idr: i64, spend_used_idr: i64) -> bool {
-    spend_limit_idr > 0 && spend_used_idr >= spend_limit_idr
+/// ONE rule for both the spend limit and the token limit: they differ only in
+/// the unit they count, and two copies of the same boundary is how the two
+/// start disagreeing. 0 (or a negative value, which key management refuses to
+/// store) means "no limit" (docs/website/06-api-keys-and-limits.md), so it
+/// never blocks. The comparison is `>=`, not `>`: the window total is what has
+/// already been used, so a key sitting exactly on its ceiling is out of budget
+/// and the next request is the one that would exceed it. Pure, so the boundary
+/// is tested without a database or a request.
+fn limit_reached(limit: i64, used: i64) -> bool {
+    limit > 0 && used >= limit
+}
+
+/// The rate-limit window: one minute, the unit `rate_limit_rpm` is stated in.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// What a rate check decided. A plain value rather than a `Result` so the
+/// boundary is testable without a clock, a key or a database.
+#[derive(Debug, PartialEq, Eq)]
+enum RateDecision {
+    Allow,
+    /// Refused; `retry_after_secs` is how long until the window rolls over.
+    Deny { retry_after_secs: u64 },
+}
+
+/// One key's request counter for the current minute.
+///
+/// FIXED window, not sliding: a counter plus the instant its minute began. A
+/// burst straddling a boundary can therefore pass twice in quick succession —
+/// the documented cost of a fixed window, and much cheaper than retaining one
+/// timestamp per request. Sustained throughput is still bounded at the
+/// configured rate.
+struct RateWindow {
+    started_at: Instant,
+    count: u32,
+}
+
+impl RateWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            count: 0,
+        }
+    }
+
+    /// Count this request against the window.
+    ///
+    /// `limit_rpm` is always > 0 here: the caller skips the whole mechanism for
+    /// a key with no rate limit, so an unlimited key never allocates a window.
+    fn check(&mut self, limit_rpm: u32, now: Instant) -> RateDecision {
+        if now.saturating_duration_since(self.started_at) >= RATE_WINDOW {
+            self.started_at = now;
+            self.count = 0;
+        }
+
+        if self.count >= limit_rpm {
+            let remaining =
+                RATE_WINDOW.saturating_sub(now.saturating_duration_since(self.started_at));
+            // At least 1: a `Retry-After: 0` invites an immediate retry that is
+            // refused again, which reads as a broken limiter.
+            return RateDecision::Deny {
+                retry_after_secs: remaining.as_secs().max(1),
+            };
+        }
+
+        self.count += 1;
+        RateDecision::Allow
+    }
+}
+
+/// Per-key rate windows.
+///
+/// SINGLE-PROCESS, exactly like the key-metadata cache: another instance behind
+/// the load balancer keeps its own counter, so the effective ceiling is
+/// `rate_limit_rpm` PER INSTANCE rather than per key fleet-wide. Closing that
+/// needs shared state (Redis or similar), which this build has no dependency
+/// for. Setting `rate_limit_rpm` to 0 disables the check entirely.
+static RATE_WINDOWS: OnceLock<Mutex<HashMap<Uuid, RateWindow>>> = OnceLock::new();
+
+/// The same backstop as the key cache, for the same reason: only a key that
+/// authenticated can create a window, but a pathological number of live keys
+/// must not pin unbounded memory.
+const RATE_WINDOW_CAPACITY: usize = 4096;
+
+/// Count one request for `key_id` against its minute, returning the decision.
+fn check_rate_limit(key_id: Uuid, limit_rpm: u32, now: Instant) -> RateDecision {
+    let windows = RATE_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut windows = windows.lock().unwrap_or_else(|e| e.into_inner());
+
+    if windows.len() >= RATE_WINDOW_CAPACITY {
+        windows.retain(|_, w| now.saturating_duration_since(w.started_at) < RATE_WINDOW);
+        if windows.len() >= RATE_WINDOW_CAPACITY {
+            // Still full of live windows. Dropping one hands that key a fresh
+            // window — it is allowed through MORE often, never less, which is
+            // the safe direction for a limiter to fail.
+            if let Some(victim) = windows.keys().next().copied() {
+                windows.remove(&victim);
+            }
+        }
+    }
+
+    windows
+        .entry(key_id)
+        .or_insert_with(|| RateWindow::new(now))
+        .check(limit_rpm, now)
 }
 
 /// Maximum cached API-key records.
@@ -121,6 +217,14 @@ struct KeyMetadata {
     /// reads: a cache HIT must decide exactly like a MISS, and a limit that
     /// existed only on the miss path would make the two paths disagree.
     spend_limit_idr: i64,
+    /// The key's rolling 30-day token ceiling, in tokens; 0 means "no limit".
+    /// Same reasoning as `spend_limit_idr`: it is a column of the same row, so
+    /// caching it is what keeps a cache HIT enforcing exactly like a MISS.
+    token_limit: i64,
+    /// The key's requests-per-minute ceiling; 0 means "no limit". Cached for the
+    /// same reason — a narrowed rate limit must not be honoured from a stale
+    /// record any longer than the other fields are.
+    rate_limit_rpm: i32,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -304,7 +408,8 @@ async fn load_key_metadata(
 
     let row = sqlx::query(
         r#"
-        SELECT id, account_id, models, spend_limit_idr, expires_at, revoked_at
+        SELECT id, account_id, models, spend_limit_idr, token_limit, rate_limit_rpm,
+               expires_at, revoked_at
         FROM api_keys
         WHERE key_hash = $1
         "#,
@@ -322,6 +427,8 @@ async fn load_key_metadata(
         account_id: row.get("account_id"),
         models: row.get("models"),
         spend_limit_idr: row.get("spend_limit_idr"),
+        token_limit: row.get("token_limit"),
+        rate_limit_rpm: row.get("rate_limit_rpm"),
         expires_at: row.get("expires_at"),
         revoked_at: row.get("revoked_at"),
     };
@@ -688,6 +795,8 @@ pub async fn chat_completions(
     let account_id = key.account_id;
     let models_val = key.models.clone();
     let spend_limit_idr = key.spend_limit_idr;
+    let token_limit = key.token_limit;
+    let rate_limit_rpm = key.rate_limit_rpm;
     let expires_at = key.expires_at;
     let revoked_at = key.revoked_at;
 
@@ -735,29 +844,49 @@ pub async fn chat_completions(
         .find(|m| m.name == meta.model)
         .ok_or_else(|| AppError::ModelNotAllowed(meta.model.clone()))?;
 
-    // The key's own rolling 30-day spend limit — step 4 of the documented
-    // enforcement order (docs/failover.md:154, docs/server/api-spec.md:334):
-    // authenticate, allowlist, throttle, KEY LIMIT, then wallet. It is checked
-    // here, before the reservation and before the upstream is called, so a key
-    // over its limit costs nothing and reaches no provider.
+    // 3. The key's own requests-per-minute ceiling — step 3 of the documented
+    //    enforcement order (docs/failover.md:154, docs/server/api-spec.md:333):
+    //    authenticate, allowlist, RATE LIMIT, key spend/token limit, wallet.
+    //    Throttling before the money checks is deliberate: a hammering key must
+    //    be refused without touching the wallet at all.
     //
-    // The number is the same one the dashboard shows, because it is literally the
-    // same read: `keys::key_spend_used` sums `usage_daily.cost_idr` over
-    // `keys::SPEND_WINDOW_DAYS` (trailing 30 days, inclusive of today). Reusing
-    // the function rather than re-deriving the window is what keeps the two from
-    // disagreeing: a key the proxy blocks is a key the dashboard shows at or over
-    // its limit, and a key the dashboard shows over its limit is one the proxy
-    // refuses.
+    //    A limit of 0 means "no limit", so an unlimited key never allocates a
+    //    window and the check costs one branch.
+    if rate_limit_rpm > 0 {
+        match check_rate_limit(key_id, rate_limit_rpm as u32, Instant::now()) {
+            RateDecision::Allow => {}
+            RateDecision::Deny { retry_after_secs } => {
+                return Err(AppError::RateLimited { retry_after_secs });
+            }
+        }
+    }
+
+    // 4. The key's own rolling 30-day ceilings — step 4 of the same order:
+    //    the spend limit (IDR) and the token limit. Checked BEFORE the wallet
+    //    and before the upstream is called, so a key over either limit costs
+    //    nothing and reaches no provider.
     //
-    // Only a limited key pays for the query; a limit of 0 means "no limit".
+    // Both numbers are the same ones the dashboard shows, because they are
+    // literally the same reads: `keys::key_spend_used` sums
+    // `usage_daily.cost_idr` and `keys::key_tokens_used` sums the three token
+    // counters of the same rows, both over `keys::SPEND_WINDOW_DAYS` (trailing
+    // 30 days, inclusive of today). Reusing the functions rather than
+    // re-deriving the window is what keeps them from disagreeing: a key the
+    // proxy blocks is a key the dashboard shows at or over its limit, and a key
+    // the dashboard shows over its limit is one the proxy refuses.
+    //
+    // Only a limited key pays for a query. Spend is checked first because the
+    // docs call it the primary limit: the report names the limit that actually
+    // stopped the request, and a key at both ceilings is reported as spend.
     if spend_limit_idr > 0 {
         let spend_used_idr =
             key_spend_used(&state.pool, account_id, key_id, chrono::Utc::now().date_naive())
                 .await?;
-        if spend_limit_hit(spend_limit_idr, spend_used_idr) {
+        if limit_reached(spend_limit_idr, spend_used_idr) {
             return Err(AppError::KeyLimitExceeded {
                 details: Some(json!({
                     "reason": "spend_limit_idr_reached",
+                    "limit": "spend_limit_idr",
                     "spend_limit_idr": spend_limit_idr,
                     "spend_used_idr": spend_used_idr,
                     "window_days": SPEND_WINDOW_DAYS,
@@ -766,7 +895,24 @@ pub async fn chat_completions(
         }
     }
 
-    // 3. Pre-flight worst-case reservation, taken BEFORE routing.
+    if token_limit > 0 {
+        let tokens_used =
+            key_tokens_used(&state.pool, account_id, key_id, chrono::Utc::now().date_naive())
+                .await?;
+        if limit_reached(token_limit, tokens_used) {
+            return Err(AppError::KeyLimitExceeded {
+                details: Some(json!({
+                    "reason": "token_limit_reached",
+                    "limit": "token_limit",
+                    "token_limit": token_limit,
+                    "tokens_used": tokens_used,
+                    "window_days": SPEND_WINDOW_DAYS,
+                })),
+            });
+        }
+    }
+
+    // Pre-flight worst-case reservation, taken BEFORE routing.
     //
     // Input is estimated from the raw body length (~4 bytes per token, floored
     // at 1); the output ceiling is the request's own cap, clamped to the hard
@@ -1167,6 +1313,8 @@ mod tests {
             account_id: Uuid::new_v4(),
             models: json!(["deepseek-flash"]),
             spend_limit_idr: 0,
+            token_limit: 0,
+            rate_limit_rpm: 0,
             expires_at: None,
             revoked_at,
         }
@@ -1374,15 +1522,101 @@ mod tests {
     // the request path. 0 is unlimited, the ceiling itself already blocks, and
     // spending past it keeps blocking.
     #[test]
-    fn a_spend_limit_blocks_at_and_above_the_ceiling() {
-        assert!(!spend_limit_hit(0, 0), "0 means no limit");
-        assert!(!spend_limit_hit(0, 10_000_000), "0 never blocks, whatever was spent");
-        assert!(!spend_limit_hit(50_000, 49_999), "one IDR under the ceiling is fine");
-        assert!(spend_limit_hit(50_000, 50_000), "exactly at the ceiling is out of budget");
-        assert!(spend_limit_hit(50_000, 60_000), "over the ceiling stays blocked");
+    fn a_limit_blocks_at_and_above_the_ceiling() {
+        assert!(!limit_reached(0, 0), "0 means no limit");
+        assert!(!limit_reached(0, 10_000_000), "0 never blocks, whatever was used");
+        assert!(!limit_reached(50_000, 49_999), "one unit under the ceiling is fine");
+        assert!(limit_reached(50_000, 50_000), "exactly at the ceiling is out of budget");
+        assert!(limit_reached(50_000, 60_000), "over the ceiling stays blocked");
         // A negative limit is refused at key-management time, so it can never be
         // stored; it is treated as "no limit" rather than blocking every request.
-        assert!(!spend_limit_hit(-1, 10));
+        assert!(!limit_reached(-1, 10));
+    }
+
+    // The TOKEN limit is the same rule in a different unit, so it inherits the
+    // same boundary — asserted separately because the two are separate columns
+    // and a future divergence would otherwise go unnoticed.
+    #[test]
+    fn a_token_limit_blocks_at_and_above_the_ceiling() {
+        assert!(!limit_reached(0, 1_000_000), "0 tokens means no limit");
+        assert!(!limit_reached(1_000, 999));
+        assert!(limit_reached(1_000, 1_000));
+        assert!(limit_reached(1_000, 1_001));
+    }
+
+    // The rate window: `limit_rpm` requests pass per minute, the next is refused
+    // with a Retry-After pointing at the rollover.
+    #[test]
+    fn the_rate_window_admits_the_limit_then_refuses() {
+        let start = Instant::now();
+        let mut w = RateWindow::new(start);
+
+        for i in 0..3 {
+            assert_eq!(w.check(3, start), RateDecision::Allow, "request {i} is within 3 rpm");
+        }
+        assert_eq!(
+            w.check(3, start),
+            RateDecision::Deny { retry_after_secs: 60 },
+            "the fourth request in the same minute is refused"
+        );
+    }
+
+    #[test]
+    fn the_rate_window_rolls_over_and_forgets_the_previous_minute() {
+        let start = Instant::now();
+        let mut w = RateWindow::new(start);
+        for _ in 0..3 {
+            w.check(3, start);
+        }
+        assert!(matches!(w.check(3, start), RateDecision::Deny { .. }));
+
+        // One second short of the minute is still the same window.
+        assert!(matches!(
+            w.check(3, start + Duration::from_secs(59)),
+            RateDecision::Deny { .. }
+        ));
+
+        // At the boundary the window restarts: the counter is zeroed, not just
+        // aged, so a key at its ceiling gets a full allowance again.
+        assert_eq!(w.check(3, start + Duration::from_secs(60)), RateDecision::Allow);
+        assert_eq!(w.check(3, start + Duration::from_secs(60)), RateDecision::Allow);
+    }
+
+    #[test]
+    fn a_denied_rate_check_reports_a_retry_after_of_at_least_one_second() {
+        let start = Instant::now();
+        let mut w = RateWindow::new(start);
+        w.check(1, start);
+
+        // 59.5s into the window: the honest remainder rounds DOWN to 59s, and the
+        // refusal must never advertise 0, which would invite an immediate retry
+        // that is refused again.
+        let late = start + Duration::from_millis(59_500);
+        assert_eq!(
+            w.check(1, late),
+            RateDecision::Deny { retry_after_secs: 1 },
+            "sub-second remainders floor at 1"
+        );
+    }
+
+    // A separate key gets a separate window: one key at its ceiling must not
+    // throttle another.
+    #[test]
+    fn rate_windows_are_per_key() {
+        let now = Instant::now();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        assert_eq!(check_rate_limit(a, 1, now), RateDecision::Allow);
+        assert!(matches!(
+            check_rate_limit(a, 1, now),
+            RateDecision::Deny { .. }
+        ));
+        assert_eq!(
+            check_rate_limit(b, 1, now),
+            RateDecision::Allow,
+            "a different key has its own counter"
+        );
     }
 
     // DEFECT 2 regression: the invalidation drops the entry, and a lookup that

@@ -133,6 +133,40 @@ pub(crate) async fn key_spend_used(
     Ok(used.unwrap_or(0))
 }
 
+/// 30-day token usage already recorded against one key, in tokens.
+///
+/// Public for the same reason as `key_spend_used`: the proxy enforces
+/// `token_limit` with this exact read, over the same `usage_daily` rows and the
+/// same `spend_window_start` boundary as the spend limit. Two limits, one
+/// window, one source — so they cannot disagree with each other or with the
+/// dashboard.
+///
+/// All three token classes are summed because `token_limit` counts tokens, not
+/// money: cache-read tokens are ~50x cheaper than output tokens but they are
+/// still tokens consumed, and `usage_daily` is the only place the request path
+/// records them.
+pub(crate) async fn key_tokens_used(
+    pool: &PgPool,
+    account_id: Uuid,
+    key_id: Uuid,
+    today: NaiveDate,
+) -> Result<i64, AppError> {
+    let used: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT SUM(input_tokens + cache_read_tokens + output_tokens)::bigint
+        FROM usage_daily
+        WHERE account_id = $1 AND api_key_id = $2 AND day >= $3
+        "#,
+    )
+    .bind(account_id)
+    .bind(key_id)
+    .bind(spend_window_start(today))
+    .fetch_one(pool)
+    .await?;
+
+    Ok(used.unwrap_or(0))
+}
+
 /// Rejects a requested `spend_limit_idr` that cannot be enforced, reporting the
 /// key's current window usage so the operator can see where it stands.
 ///
