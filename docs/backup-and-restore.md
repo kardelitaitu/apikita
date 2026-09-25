@@ -151,7 +151,27 @@ silent failure.** Alert on size, not just exit code.
 ## Open items
 
 - [x] Backup tooling: **managed PITR**, else `pg_dump` + `wal-g` (see `decisions.md`).
+      Implemented as [`tools/backup/backup.sh`](../tools/backup/README.md): `pg_dump -Fc`, verified
+      with `pg_restore --list` before success, encrypted, retention-pruned, with an offsite hook and
+      a documented exit-code contract. **This is the `pg_dump` half only** — it is a daily logical
+      dump, so it does **not** meet the 15-minute RPO; WAL archiving/PITR is still unchosen.
 - [ ] Offsite storage provider and encryption key custody.
+      **A human decision**, deliberately not invented. The tool refuses to run without
+      `BACKUP_ENCRYPTION_KEY` (a silent plaintext downgrade is the failure that matters) and takes
+      an `OFFSITE_CMD` hook so any provider can be plugged in. Encryption is AES-256-CBC via
+      OpenSSL, which is **not authenticated** — pair it with object versioning or a write-only bucket.
 - [x] RTO **4 hours**, RPO **15 minutes** — verify against the drill.
-- [ ] Where the drill log lives.
+      The drill is now executable: [`tools/drill/drill.sh`](../tools/drill/README.md) restores into a
+      scratch database, reuses the reconciliation query as its verdict, spot-checks a balance,
+      measures the restore time and writes a log. Measured on the local dev database:
+      **~1–6 s** to restore a ~126 KB dump — orders of magnitude under the 4-hour RTO, but that is a
+      **dev-sized** database; the production number is unmeasured until the drill runs there.
+- [x] Where the drill log lives.
+      `tools/drill/drill.sh` writes `.agents/drill-logs/drill-<UTC-timestamp>-<target>.log` (that
+      directory is gitignored, since a log names row counts and account ids). Each log carries all
+      five "Record the drill" fields: `date_utc`, `run_by`, `backup_age`, `restore_ms`, `result`,
+      plus the dump sha256/size, TOC count, the row-count table, the spot-check pair and the drift
+      verdict. Override with `--log-dir`/`DRILL_LOG_DIR` when the retention answer moves.
 - [ ] Whether PocketBase gets its own tested restore procedure.
+      **Still open.** Neither tool covers PocketBase: `backup.sh` dumps only the Postgres database and
+      the drill restores only that, so identity data has no tested restore path today.
