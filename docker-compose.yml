@@ -52,8 +52,13 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Edge relay. Proxies to the Rust API running on the HOST (cargo run --bin api),
-  # which is why the upstream is host.docker.internal:8080 and not a service name.
+  # Edge relay. Serves the STATIC SITE and proxies the API, both on :8000, so the
+  # browser sees ONE origin and the session cookie is actually sent. Production
+  # splits them (Cloudflare Pages + Northflank); locally they must not be split or
+  # the dashboard cannot authenticate. See .docker/nginx/relay.conf.
+  #
+  # The API upstream is host.docker.internal:8080 rather than a service name
+  # because the Rust API runs on the HOST (cargo run --bin api), not here.
   # ---------------------------------------------------------------------------
   nginx:
     image: nginx:1.27-alpine
@@ -62,6 +67,14 @@ services:
       - "8000:8000"
     volumes:
       - ./.docker/nginx/relay.conf:/etc/nginx/conf.d/default.conf:ro
+      # The site is the BUILD OUTPUT itself, mounted read-only, never copied
+      # into an image: a baked-in copy silently serves yesterday's JS after a
+      # rebuild, which is the failure this mount exists to prevent. Build it
+      # first (PUBLIC_API_BASE_URL= makes the JS call this same origin):
+      #   cd website && PUBLIC_API_BASE_URL= npm run build
+      # An empty source directory is harmless — nginx serves 404 until the
+      # build exists, which is honest rather than a stale 200.
+      - ./website/dist:/srv/www:ro
     # Linux hosts need the gateway alias for host.docker.internal.
     extra_hosts:
       - "host.docker.internal:host-gateway"

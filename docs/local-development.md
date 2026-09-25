@@ -25,33 +25,85 @@ real money.
 | PostgreSQL | 5432 |
 | PocketBase | 8090 |
 | Nginx edge relay | 8000 |
-| Frontend dev server | 4321 (Astro default) |
+| Frontend dev server | 4321 (Astro default) — **UI work only**, see below |
 
 **Cookie domains are the trap.** Use `localhost` for everything and make the API
 reachable at the same origin the frontend uses, or session cookies will be set for
 a domain the browser will not send them to. This is the local version of the
 production subdomain decision in [`docs/architecture.md`](architecture.md).
 
+### One origin: the relay serves the site *and* the API
+
+`http://localhost:8000` **is** that one origin locally. The relay serves the built
+site from `website/dist` (bind-mounted read-only into the container — see
+`docker-compose.yml`) and proxies the API slice to the Rust server on the host:
+
+| Path | Where it goes |
+| --- | --- |
+| `/events` | backend — SSE, **unbuffered** |
+| `/v1/` | backend — LLM streaming, **unbuffered** |
+| `/auth/`, `/api/`, `/webhooks/`, `= /health` | backend — buffered |
+| `= /healthz` | the relay itself (compose healthcheck) |
+| everything else | the static file under `website/dist`, else **404** |
+
+That last row is deliberate. This build is **multi-page** (`output: 'static'`), so an
+unknown path is a 404 and never a silent `index.html`. A catch-all fallback turns
+every typo and every deleted page into a 200 of the landing page — it hides exactly
+the 404s you need to see while building the dashboard.
+
+Nothing else about the relay changed: same rate-limit zones, same unbuffered
+`/events` and `/v1/`, same `access_log off`. What differs from production is **which
+hostname serves the site**:
+
+| | Site | API | Cookie question |
+| --- | --- | --- | --- |
+| Production | Cloudflare Pages | Northflank | **subdomain** decision — [`architecture.md`](architecture.md) |
+| Local | the relay, `:8000` | the relay, `:8000` | same origin — already settled |
+
+So local development resolves the trap **by construction** and deliberately does
+*not* answer the production subdomain question. One origin locally because it has
+to be, not because production will be.
+
+> PocketBase is **not** proxied by the relay. `PUBLIC_POCKETBASE_URL` stays
+> `http://127.0.0.1:8090`, so the login round-trip is still cross-origin and its
+> CORS must allow the relay origin. Proxying it is a separate change.
+
 ## First run
 
 ```
-# 1. database
-docker run -d --name apk-pg -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=apikita \
-  -p 5432:5432 postgres:16
+# 1. database + identity + relay. The schema is applied automatically on the
+#    FIRST boot of an empty volume (server/migrations is mounted into
+#    /docker-entrypoint-initdb.d — see .docker/postgres/README.md), so there is
+#    no manual psql step.
+docker compose up -d
 
-# 2. schema
-psql postgresql://postgres:dev@localhost:5432/apikita -f server/migrations/20260925000000_initial_schema.sql
-
-# 3. pocketbase (download the binary, then)
-./pocketbase serve --http=127.0.0.1:8090
-
-# 4. api
+# 2. api, on the HOST. The relay reaches it as host.docker.internal:8080, which
+#    is why it is not a compose service.
 cp .env.example .env    # fill in what you need; fakes need nothing
 cargo run --bin apikita-server
 
-# 5. frontend (only for UI work)
-cd website && npm run dev
+# 3. the site, built for ONE ORIGIN
+#    PUBLIC_API_BASE_URL= is not cosmetic: it is a PUBLIC_* variable INLINED
+#    into the JS at build time. Empty makes every call relative, so the bundle
+#    calls whatever origin served it (:8000). Leave it unset and the bundle
+#    hardcodes http://localhost:8080 — a different origin from the relay, and
+#    the session cookie will never be sent. That is the whole trap.
+cd website && PUBLIC_API_BASE_URL= npm run build
+
 ```
+
+Then open **<http://localhost:8000>** — site and API, one origin.
+
+> **Rebuild after every frontend change.** The container serves `website/dist`
+> from the host, so an edit to `website/src` is not visible until you re-run the
+> build above. No `docker compose` command is needed: the directory is mounted,
+> not copied, which is exactly why a rebuild can never be silently forgotten in
+> an image layer — you either see the new files or you see 404.
+
+> **`npm run dev` is not this flow.** It serves the site on :4321 and is useful
+> only for fast UI iteration on a page that touches no API. It is *cross-origin*
+> from both the relay and the API, so nothing cookie-authenticated works in it —
+> never use it to judge whether the dashboard works end to end.
 
 **`schema.sql` is generated from the documents**, not hand-written elsewhere — see
 [`docs/website/02-data-model.md`](website/02-data-model.md). Keep one source.
@@ -126,6 +178,8 @@ the cheapest guard against the most expensive accounting error.
 | `MIDTRANS_SERVER_KEY` | a dev constant the fake signs with |
 | `MIDTRANS_ENV` | `sandbox` |
 | `RUST_LOG` | `debug` |
+| `PUBLIC_API_BASE_URL` | **empty** — set at `npm run build` time, makes the bundle same-origin |
+| `PUBLIC_POCKETBASE_URL` | `http://127.0.0.1:8090` — PocketBase is not proxied |
 
 **`.env` is gitignored and never contains production values.** See
 [`.env.example`](../.env.example).
