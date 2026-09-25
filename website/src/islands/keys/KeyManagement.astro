@@ -231,8 +231,18 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     }
   }
 
+  // The plaintext key is held nowhere but the #key-secret node. Dismissing the
+  // secret step must RELEASE it, not merely hide it: a 52-char credential must not
+  // linger in a hidden DOM node for the lifetime of the page.
+  function clearSecret(): void {
+    ($('key-secret') as HTMLElement).textContent = '';
+    ($('key-copy') as HTMLButtonElement).textContent = 'Copy';
+  }
+
   function openModal(): void {
     clearError();
+    // Reset path — a previous plaintext must never survive into a reopened modal.
+    clearSecret();
     ($('key-form-step') as HTMLElement).hidden = false;
     ($('key-secret-step') as HTMLElement).hidden = true;
     ($('key-secret-missing') as HTMLElement).hidden = true;
@@ -242,6 +252,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   }
   function closeModal(): void {
     (modal as HTMLElement).hidden = true;
+    clearSecret();
     ($('key-form') as HTMLFormElement).reset();
     void loadKeys();
   }
