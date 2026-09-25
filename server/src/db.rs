@@ -559,10 +559,38 @@ mod tests {
         .expect("reconciliation query")
     }
 
+    /// Deletes every row a fixture created, in FK order (`ledger` and `wallets`
+    /// are ON DELETE RESTRICT).
+    ///
+    /// A leftover wallet with no matching ledger row is not merely untidy: it is
+    /// permanent drift in a database other runs share, and it makes the next run
+    /// fail for a reason that has nothing to do with the code under test.
+    async fn delete_fixture_rows(pool: &PgPool, account_id: Uuid) {
+        for statement in [
+            "DELETE FROM usage_daily WHERE account_id = $1",
+            "DELETE FROM ledger WHERE account_id = $1",
+            "DELETE FROM api_keys WHERE account_id = $1",
+            "DELETE FROM topups WHERE account_id = $1",
+            "DELETE FROM wallets WHERE account_id = $1",
+            "DELETE FROM accounts WHERE id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(account_id)
+                .execute(pool)
+                .await
+                .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
+        }
+    }
+
     /// A debit the wallet cannot cover must NOT be discarded: the reported usage
     /// is recorded and the debit is clamped to the balance, so reconciliation
     /// still holds and the shortfall is visible. A debit it CAN cover still
     /// settles in full.
+    ///
+    /// Every reconciliation assertion is scoped to THIS fixture's `account_id`, not
+    /// to the whole database: this schema is shared with other tests and fixtures,
+    /// and a global drift check fails for concurrent writers rather than for the code
+    /// under test.
     ///
     /// This needs a live, migrated Postgres, so it is #[ignore]d rather than
     /// silently skipped or rewritten to assert nothing: run it with
@@ -584,13 +612,57 @@ mod tests {
                 .await
                 .expect("create account");
 
+        // The assertions run in their own task so a panicking one still reaches the
+        // cleanup below. Tokio turns a task panic into a JoinError instead of
+        // unwinding through this frame, which is what makes the teardown
+        // unconditional.
+        let assertions = tokio::spawn(overdraft_settlement_assertions(pool.clone(), account_id));
+        let outcome = assertions.await;
+
+        delete_fixture_rows(&pool, account_id).await;
+
+        outcome.expect("the settlement assertions panicked");
+    }
+
+    /// The body of the live test, minus the fixture it is handed and the teardown
+    /// its caller owns.
+    async fn overdraft_settlement_assertions(pool: PgPool, account_id: Uuid) {
         let opening_balance: i64 = 1_000;
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, $2)")
+
+        // The fixture opens the wallet exactly the way production does, in two steps:
+        // the zero-balance row the login path creates (routes/auth.rs), then a real
+        // top-up. Money only ever enters a wallet through `credit_topup_transaction`,
+        // which writes the matching `+` ledger row in the same transaction. Seeding
+        // `wallets.balance_idr` directly manufactures the very drift this test then
+        // asserts against - a fixture that cannot pass while the code under test is
+        // correct. A zero-balance wallet with no ledger rows is consistent on its own
+        // (0 = SUM of nothing), so this starting point reconciles.
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
             .bind(account_id)
-            .bind(opening_balance)
             .execute(&pool)
             .await
-            .expect("create wallet");
+            .expect("create the zero-balance wallet the login path would create");
+
+        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
+            .bind(account_id)
+            .bind(opening_balance)
+            .bind(&order_id)
+            .execute(&pool)
+            .await
+            .expect("create topup");
+
+        let credited = credit_topup_transaction(&pool, &order_id, opening_balance)
+            .await
+            .expect("credit the opening balance");
+
+        assert_eq!(
+            credited,
+            TopupCreditResult::Settled {
+                new_balance: opening_balance
+            },
+            "the fixture must open the wallet through the real top-up path"
+        );
 
         // usage_daily.api_key_id is part of the primary key, so a real key row is
         // needed before any usage can be recorded.
@@ -640,13 +712,20 @@ mod tests {
 
         // 3. The ledger records only what was taken, and the usage row records the
         //    FULL cost and the real counters.
-        let ledger_delta: i64 =
-            sqlx::query_scalar("SELECT delta_idr FROM ledger WHERE account_id = $1")
-                .bind(account_id)
-                .fetch_one(&pool)
-                .await
-                .expect("the clamped debit must still append a ledger row");
-        assert_eq!(ledger_delta, -opening_balance);
+        //
+        //    Scoped to the 'usage' row: the opening top-up also wrote a ledger row, so
+        //    an unscoped read would find two and `fetch_one` would refuse it.
+        let ledger_delta: i64 = sqlx::query_scalar(
+            "SELECT delta_idr FROM ledger WHERE account_id = $1 AND reason = 'usage'",
+        )
+        .bind(account_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the clamped debit must still append a ledger row");
+        assert_eq!(
+            ledger_delta, -opening_balance,
+            "the ledger must record exactly what was debited, not the full cost"
+        );
 
         let (input, cache_read, output, usage_cost): (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT input_tokens, cache_read_tokens, output_tokens, cost_idr FROM usage_daily WHERE account_id = $1",
@@ -667,21 +746,23 @@ mod tests {
             "balance_idr must still equal SUM(ledger.delta_idr)"
         );
 
-        // 4. A debit the wallet CAN cover still settles in full. Top the wallet up
-        //    again first - the clamp above left it at zero.
-        sqlx::query("UPDATE wallets SET balance_idr = $2 WHERE account_id = $1")
+        // 4. A debit the wallet CAN cover still settles in full. The clamp above left
+        //    the wallet at zero, so refill it through the same real path the opening
+        //    balance used - a second top-up, which writes its own `+` ledger row.
+        //    Never write `balance_idr` alone: that is the drift the fixture must not
+        //    create.
+        let refill_order_id = format!("test_topup_{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
             .bind(account_id)
             .bind(opening_balance)
+            .bind(&refill_order_id)
             .execute(&pool)
             .await
-            .expect("refill wallet");
-        sqlx::query("INSERT INTO ledger (account_id, delta_idr, reason, balance_after) VALUES ($1, $2, 'adjustment', $3)")
-            .bind(account_id)
-            .bind(opening_balance)
-            .bind(opening_balance)
-            .execute(&pool)
+            .expect("create refill topup");
+
+        credit_topup_transaction(&pool, &refill_order_id, opening_balance)
             .await
-            .expect("refill ledger");
+            .expect("refill the wallet");
 
         let settled_cost: i64 = 250;
         let outcome = debit_usage_transaction(
@@ -709,32 +790,8 @@ mod tests {
             "balance_idr must equal SUM(ledger.delta_idr) after a settled debit"
         );
 
-        // Cleanup, in FK order (ledger and wallets are ON DELETE RESTRICT).
-        sqlx::query("DELETE FROM usage_daily WHERE account_id = $1")
-            .bind(account_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup usage");
-        sqlx::query("DELETE FROM ledger WHERE account_id = $1")
-            .bind(account_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup ledger");
-        sqlx::query("DELETE FROM api_keys WHERE account_id = $1")
-            .bind(account_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup api keys");
-        sqlx::query("DELETE FROM wallets WHERE account_id = $1")
-            .bind(account_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup wallet");
-        sqlx::query("DELETE FROM accounts WHERE id = $1")
-            .bind(account_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup account");
+        // Teardown belongs to the caller, which runs it whether these assertions
+        // pass or panic.
     }
 
     /// A refund is only ever applied to a topup that actually settled, and only
