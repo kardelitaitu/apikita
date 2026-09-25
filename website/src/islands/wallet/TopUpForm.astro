@@ -118,7 +118,8 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
 
 <script>
   import { apiFetch } from '../../lib/api';
-  import { describeError } from '../../lib/errors';
+  import { describeError, renderNotice } from '../../lib/errors';
+  import type { Noticeable } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
   import { getLiveStore } from '../../lib/live';
 
@@ -179,9 +180,12 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
     errorLine.hidden = message === null;
   }
 
-  function showNotice(message: string, requestId: string | null): void {
-    noticeText.textContent = message;
-    noticeId.textContent = requestId ? `request_id: ${requestId}` : '';
+  // Takes the whole notice, not a message plus an id: there is no second
+  // argument for a caller to drop, so the request id cannot go missing on an
+  // error path. The two elements here are the layout; the contract lives in
+  // lib/errors.ts and is what the test suite drives.
+  function showNotice(shown: Noticeable): void {
+    renderNotice({ message: noticeText, correlation: noticeId }, shown);
     notice.hidden = false;
   }
 
@@ -267,7 +271,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
       }
     } catch (err) {
       const view = describeError(err);
-      if (historyLoaded) showNotice(view.message, view.requestId);
+      if (historyLoaded) showNotice(view);
       else hint.textContent = 'Deposit minimum unavailable — retry by reloading.';
     }
   }
@@ -300,10 +304,11 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
           // The order exists server-side, so it is honest to show it as pending
           // rather than to pretend the payment started.
           markPending(created.order_id, amount);
-          showNotice(
-            'Payment could not be opened in this browser, so nothing was charged. The order is recorded as pending and will stay pending until it is paid.',
-            null,
-          );
+          showNotice({
+            message:
+              'Payment could not be opened in this browser, so nothing was charged. The order is recorded as pending and will stay pending until it is paid.',
+            requestId: null,
+          });
           void loadHistory();
           return;
         }
@@ -315,7 +320,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
           onPending: () => markPending(created.order_id, amount),
           onError: () => {
             markPending(created.order_id, amount);
-            showNotice('The payment did not complete. The order is still pending.', null);
+            showNotice({ message: 'The payment did not complete. The order is still pending.', requestId: null });
           },
           onClose: () => {
             // Closed without paying: the order remains pending server-side.
@@ -324,7 +329,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
         });
       } catch (err) {
         const view = describeError(err);
-        showNotice(view.message, view.requestId);
+        showNotice(view);
       } finally {
         submit.disabled = false;
       }

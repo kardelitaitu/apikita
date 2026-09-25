@@ -4,12 +4,16 @@
 // docs/server/api-spec.md, docs/error-model.md and
 // docs/website/03-functional-spec.md. Nothing here is guessed.
 
+import { parseRetryAfter } from './retry-wait.ts';
+
 /**
  * Server origin. No production domain is settled yet, so this is a build-time
  * PUBLIC_* variable (see .env.example) defaulting to the documented local API.
+ * Optional-chained: this module is also loaded outside a bundler (the test
+ * suite), where `import.meta.env` does not exist at all.
  */
 export const API_BASE: string =
-  import.meta.env.PUBLIC_API_BASE_URL ?? 'http://localhost:8080';
+  import.meta.env?.PUBLIC_API_BASE_URL ?? 'http://localhost:8080';
 
 /** docs/error-model.md: every error returns this shape. */
 export interface ApiErrorBody {
@@ -25,14 +29,30 @@ export class ApiError extends Error {
   readonly code: string;
   readonly requestId: string | null;
   readonly details: Record<string, unknown> | null;
+  /**
+   * `Retry-After` in seconds, or null when the response carried none.
+   *
+   * docs/error-model.md: on a 429 this is the exact seconds until the caller's
+   * window frees. A fixed "wait a moment" understates an hourly cap by 3600x, so
+   * the UI reads the wait from here instead of inventing one. Null is a real
+   * case — a response that carries no header must fall back to a wait the copy
+   * can honestly state, never to a guess.
+   */
+  readonly retryAfterSeconds: number | null;
 
-  constructor(status: number, body: ApiErrorBody | null, fallback: string) {
+  constructor(
+    status: number,
+    body: ApiErrorBody | null,
+    fallback: string,
+    retryAfterSeconds: number | null = null,
+  ) {
     super(body?.message ?? fallback);
     this.name = 'ApiError';
     this.status = status;
     this.code = body?.code ?? 'internal_error';
     this.requestId = body?.request_id ?? null;
     this.details = body?.details ?? null;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -71,7 +91,12 @@ export async function apiFetch<T>(path: string, init: ApiFetchInit = {}): Promis
       // Non-JSON error body: fall back to the status line.
     }
     if (res.status === 401 && redirectOn401) redirectToLogin();
-    throw new ApiError(res.status, body, res.statusText);
+    throw new ApiError(
+      res.status,
+      body,
+      res.statusText,
+      parseRetryAfter(res.headers.get('retry-after')),
+    );
   }
 
   if (res.status === 204) return undefined as T;

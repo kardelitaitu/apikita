@@ -116,7 +116,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
 
 <script>
   import { apiFetch, ApiError } from '../../lib/api';
-  import { describeError } from '../../lib/errors';
+  import { describeError, inlineNotice } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
 
   const MODELS_ALL = ['flash', 'deepseek-v4-flash'];
@@ -226,7 +226,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
       const view = describeError(err);
-      showError(view.message + (view.requestId ? ' (' + view.requestId + ')' : ''));
+      showError(inlineNotice(view));
       render([]);
     }
   }
@@ -302,7 +302,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       const formErr = $('key-form-error') as HTMLElement;
       if (err instanceof ApiError) {
         const view = describeError(err);
-        formErr.textContent = view.message + (view.requestId ? ' (' + view.requestId + ')' : '');
+        formErr.textContent = inlineNotice(view);
       } else {
         formErr.textContent = err instanceof Error ? err.message : 'Could not create the key.';
       }
@@ -327,7 +327,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
       const view = describeError(err);
-      showError(view.message + (view.requestId ? ' (' + view.requestId + ')' : ''));
+      showError(inlineNotice(view));
     }
   }
 

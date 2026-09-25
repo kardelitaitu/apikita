@@ -60,7 +60,7 @@ const { title } = Astro.props;
   // JavaScript-free.
   import { getLiveStore } from '../lib/live';
   import { apiFetch } from '../lib/api';
-  import { describeError } from '../lib/errors';
+  import { describeError, renderNotice } from '../lib/errors';
   import { formatIdr, formatCount } from '../lib/format';
   import { pb } from '../lib/pocketbase';
 
@@ -70,6 +70,10 @@ const { title } = Astro.props;
   const banner = document.getElementById('banner-error') as HTMLElement;
   const bannerText = document.getElementById('banner-error-text') as HTMLElement;
   const bannerId = document.getElementById('banner-error-id') as HTMLElement;
+  // The banner is the message over the correlation line — the same two facts,
+  // and the same layout, the wallet notice shows. One renderer, tested, rather
+  // than a third hand-rolled copy of the format.
+  const bannerTarget = { message: bannerText, correlation: bannerId };
 
   const BADGE_LABEL: Record<string, string> = {
     connecting: 'Connecting…',
@@ -101,8 +105,7 @@ const { title } = Astro.props;
     }
 
     if (state.error) {
-      bannerText.textContent = state.error;
-      bannerId.textContent = state.requestId ? `request_id: ${state.requestId}` : '';
+      renderNotice(bannerTarget, { message: state.error, requestId: state.requestId });
       banner.hidden = false;
     } else {
       banner.hidden = true;
@@ -112,9 +115,7 @@ const { title } = Astro.props;
   store.start();
 
   function showError(err: unknown): void {
-    const view = describeError(err);
-    bannerText.textContent = view.message;
-    bannerId.textContent = view.requestId ? `request_id: ${view.requestId}` : '';
+    renderNotice(bannerTarget, describeError(err));
     banner.hidden = false;
   }
 

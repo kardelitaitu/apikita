@@ -69,7 +69,7 @@
 
 <script>
   import { apiFetch, ApiError } from '../../lib/api';
-  import { describeError } from '../../lib/errors';
+  import { describeError, inlineNotice } from '../../lib/errors';
   import { formatIdr, formatCount } from '../../lib/format';
 
   interface UsageBucket {
@@ -159,7 +159,7 @@
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
       const view = describeError(err);
-      showError(view.message + (view.requestId ? ' (' + view.requestId + ')' : ''));
+      showError(inlineNotice(view));
       renderToday(null);
       renderRows([]);
       statusEl.textContent = '';
