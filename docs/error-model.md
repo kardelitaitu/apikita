@@ -41,6 +41,7 @@ matching on its text is a bug waiting to happen.
 | 402 | `insufficient_balance` | Wallet cannot cover it | Top up |
 | 402 | `key_limit_exceeded` | Key's own spend/token limit hit | Raise the limit or new key |
 | 403 | `model_not_allowed` | Model absent from the key's allowlist | Use an allowed model |
+| 403 | `forbidden` | Authenticated, but not permitted — e.g. a non-operator calling an `/api/admin/*` route, or an operator acting on their own account | Do not retry; you do not have this permission |
 | 403 | `wrong_credential_type` | **Reserved, never emitted** — a cookie on `/v1/*`, or a key on a cookie endpoint, returns 401 `unauthenticated` | Treat as 401 |
 | 404 | `not_found` | No such resource | Check the id |
 | 409 | `conflict` | Duplicate (e.g. Telegram already linked) | Reconcile state |
