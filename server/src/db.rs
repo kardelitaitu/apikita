@@ -2386,6 +2386,334 @@ mod tests {
             "balance_idr must equal SUM(ledger.delta_idr) after every case"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Exhaustive property sweeps over the two pure money rules.
+    //
+    // The example tests above pin exact figures. What they cannot do is cover
+    // the DOMAIN: `clamp_debit` IS the billing decision (db.rs:266) and
+    // `settlement_ledger_deltas` IS the ledger move (db.rs:288), so a wrong
+    // answer anywhere in the i64 plane is money invented or money vanished.
+    // These sweeps walk every interesting boundary plus a deterministic
+    // pseudo-random sample of the whole range. No new dependency: a fixed-seed
+    // xorshift64* is enough to be reproducible, and a fixed seed keeps a
+    // counterexample in the assert message stable across runs.
+    // ---------------------------------------------------------------------
+
+    /// The boundary grid. `i64::MIN` is in it deliberately: every negation and
+    /// every `.max(0)` in these two rules is at its most dangerous there, and a
+    /// debug build turns an overflow into a panic rather than a wrong number.
+    /// The rest are the shapes money really takes: 0 (nothing), 1 (one rupiah),
+    /// 2, 100 (sub-rupiah noise), and the -1/-2 a defect would produce if a
+    /// balance or a cost ever went below zero.
+    const MONEY_GRID: [i64; 10] = [
+        i64::MIN,
+        i64::MIN + 1,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        100,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+
+    /// Deterministic xorshift64*. The seed is fixed so a failure is
+    /// reproducible and the printed counterexample is stable.
+    struct XorShift64(u64);
+
+    impl XorShift64 {
+        fn new(seed: u64) -> Self {
+            // xorshift is degenerate at zero.
+            Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        /// A raw i64, so the sweep reaches the negative half of the plane too.
+        fn next_i64(&mut self) -> i64 {
+            self.next_u64() as i64
+        }
+    }
+
+    /// Every (a, b) pair the sweeps run over, in one place so both rules see
+    /// the same domain:
+    ///
+    ///   1. the exhaustive 10x10 boundary grid (100 pairs);
+    ///   2. i64::MIN/i64::MAX and their immediate neighbours, crossed with the
+    ///      whole grid on both sides - the off-by-one hiding at the overflow edge;
+    ///   3. 20 000 fixed-seed pairs drawn from the raw i64 plane;
+    ///   4. 20 000 fixed-seed MONEY-SHAPED pairs: small non-negative rupiah
+    ///      amounts, which is the only region production actually walks.
+    fn sweep_pairs() -> Vec<(i64, i64)> {
+        let mut pairs = Vec::new();
+
+        for a in MONEY_GRID {
+            for b in MONEY_GRID {
+                pairs.push((a, b));
+            }
+        }
+
+        for edge in [i64::MIN, i64::MAX] {
+            for delta in [-2_i64, -1, 0, 1, 2] {
+                let near = edge.saturating_add(delta);
+                for other in MONEY_GRID {
+                    pairs.push((near, other));
+                    pairs.push((other, near));
+                }
+            }
+        }
+
+        let mut rng = XorShift64::new(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..20_000 {
+            pairs.push((rng.next_i64(), rng.next_i64()));
+        }
+        for _ in 0..20_000 {
+            pairs.push((
+                (rng.next_u64() % 10_000_000) as i64,
+                (rng.next_u64() % 10_000_000) as i64,
+            ));
+        }
+
+        pairs
+    }
+
+    /// Every invariant the billing model rests on, asserted for ONE
+    /// `(cost_idr, available_idr)` pair. Called by the sweep below for every
+    /// pair in `sweep_pairs()`.
+    fn assert_clamp_debit_invariants(cost_idr: i64, available_idr: i64) {
+        let (debited_idr, lost_idr) = clamp_debit(cost_idr, available_idr);
+        let true_cost = cost_idr.max(0);
+        let held = available_idr.max(0);
+
+        // (2) Never debit more than is there, and never a negative debit.
+        assert!(
+            debited_idr >= 0,
+            "cost {cost_idr} against {available_idr}: a debit is never a credit"
+        );
+        assert!(
+            debited_idr <= held,
+            "cost {cost_idr} against {available_idr}: debited {debited_idr} exceeds the {held} held"
+        );
+        // (3) Never collect more than the true cost.
+        assert!(
+            debited_idr <= true_cost,
+            "cost {cost_idr} against {available_idr}: debited {debited_idr} exceeds the true cost {true_cost}"
+        );
+        // The clamp is exactly the smaller of the two floors - no third rule.
+        assert_eq!(
+            debited_idr,
+            true_cost.min(held),
+            "cost {cost_idr} against {available_idr}: the debit must be the smaller of the two floors"
+        );
+
+        if cost_idr >= 0 {
+            // (1) Conservation: no money invented, none vanishes. This is the
+            // single most important property of the whole money model.
+            assert_eq!(
+                debited_idr + lost_idr,
+                true_cost,
+                "cost {cost_idr} against {available_idr}: {debited_idr} collected + {lost_idr} lost must be the whole charge"
+            );
+            // (4) A shortfall is never negative.
+            assert!(
+                lost_idr >= 0,
+                "cost {cost_idr} against {available_idr}: a shortfall is never negative"
+            );
+            // (5) A FULL settlement loses nothing, and ONLY a full settlement
+            // does. The balance is floored at zero, so "affordable" is
+            // `cost <= available.max(0)`; for available >= 0 - the production
+            // domain, backed by CHECK (balance_idr >= 0) - that is exactly the
+            // documented `cost <= available`.
+            assert_eq!(
+                lost_idr == 0,
+                cost_idr <= held,
+                "cost {cost_idr} against {available_idr}: lost {lost_idr} must be zero exactly when the charge is affordable"
+            );
+        } else {
+            // A negative cost is not a charge, so the debit floors to zero and
+            // never becomes a credit. NOTE: the pair is `(0, cost_idr)`, i.e.
+            // the negative cost passes straight through into the shortfall
+            // slot as a NEGATIVE number, because db.rs:270 computes
+            // `cost_idr - debited_idr` rather than `cost_idr.max(0) - debited_idr`.
+            // Invariants (1) and (4) as literally stated therefore do NOT hold
+            // below zero. That divergence is pinned here, loudly, so a change to
+            // it cannot be silent.
+            assert_eq!(
+                (debited_idr, lost_idr),
+                (0, cost_idr),
+                "cost {cost_idr} against {available_idr}: a negative cost debits nothing and is not inverted"
+            );
+        }
+    }
+
+    /// Every invariant the ledger rule rests on, for ONE
+    /// `(released_idr, cost_idr)` pair.
+    fn assert_settlement_ledger_invariants(released_idr: i64, cost_idr: i64) {
+        let (release_delta, charge_delta) = settlement_ledger_deltas(released_idr, cost_idr);
+        let floored_release = released_idr.max(0);
+        let floored_cost = cost_idr.max(0);
+
+        // (6) A release is never a second hold and a charge is never a credit.
+        assert!(
+            release_delta >= 0,
+            "release {released_idr} cost {cost_idr}: a release is never a second hold"
+        );
+        assert!(
+            charge_delta <= 0,
+            "release {released_idr} cost {cost_idr}: a charge is never a credit"
+        );
+
+        // The two deltas ARE the floored arguments: i64::MIN must floor to 0
+        // and must not overflow on the way, because the negation applies to the
+        // floor and never to the raw value.
+        assert_eq!(
+            release_delta, floored_release,
+            "release {released_idr} cost {cost_idr}: the release delta is the floored release"
+        );
+        assert_eq!(
+            charge_delta,
+            -floored_cost,
+            "release {released_idr} cost {cost_idr}: the charge delta is the negated floored cost"
+        );
+
+        // The pair's net move. `checked_add` on purpose: summing the two must
+        // not overflow either.
+        assert_eq!(
+            release_delta
+                .checked_add(charge_delta)
+                .expect("the two ledger deltas must not overflow when summed"),
+            floored_release - floored_cost,
+            "release {released_idr} cost {cost_idr}: the pair must net to the floored release minus the floored cost"
+        );
+
+        // The pairing requirement the doc comment states: the two never
+        // collapse into one another. An argument at or below zero floors to a
+        // ZERO delta - a zero release is never written as a negative and a
+        // zero charge is never written as a positive - so the release and the
+        // charge stay two auditable facts, never one sign-flipped one.
+        assert_eq!(
+            release_delta == 0,
+            released_idr <= 0,
+            "release {released_idr} cost {cost_idr}: a zero release must be a zero, never a negative"
+        );
+        assert_eq!(
+            charge_delta == 0,
+            cost_idr <= 0,
+            "release {released_idr} cost {cost_idr}: a zero charge must be a zero, never a positive"
+        );
+    }
+
+    /// (1)-(5) and (7): `clamp_debit` over the whole grid + fixed-seed sample.
+    #[test]
+    fn clamp_debit_holds_every_money_invariant_over_the_whole_domain() {
+        let pairs = sweep_pairs();
+        assert!(
+            pairs.len() > 40_000,
+            "the sweep must cover the boundaries AND a real sample, got {} pairs",
+            pairs.len()
+        );
+
+        for (cost_idr, available_idr) in pairs {
+            assert_clamp_debit_invariants(cost_idr, available_idr);
+        }
+    }
+
+    /// (6) and (7): `settlement_ledger_deltas` over the same domain.
+    #[test]
+    fn settlement_ledger_deltas_hold_every_invariant_over_the_whole_domain() {
+        for (released_idr, cost_idr) in sweep_pairs() {
+            assert_settlement_ledger_invariants(released_idr, cost_idr);
+        }
+    }
+
+    /// The identity that ties the two rules together, derived from the code:
+    ///
+    ///   * `reserve_balance_transaction` already wrote `-held` when the
+    ///     request started (db.rs:276-284).
+    ///   * `debit_usage_transaction` releases the hold IN FULL - `released_idr`
+    ///     is the whole hold, or 0 when nothing was held (db.rs:326-343) - and
+    ///     charges what the clamp allows: `charged_idr` is
+    ///     `clamp_debit(cost, available).0` (db.rs:694-735 on the partial path;
+    ///     db.rs:390-402 passes the full cost on the settled path, where the
+    ///     guard already proved it affordable, so the clamp returns it whole).
+    ///   * `record_usage` writes `settlement_ledger_deltas(released, charged)`
+    ///     (db.rs:441).
+    ///
+    /// So the whole request's net ledger move is
+    ///
+    ///   -held + release_delta + charge_delta == -clamp_debit(cost, available).0
+    ///
+    /// in BOTH paths: a full settlement nets `-cost`, exactly the doc comment's
+    /// `-reserved + release + charge = -cost`; a partial one nets only the
+    /// clamped debit, which is strictly MORE money than `-cost` because the
+    /// uncollected `cost - clamped` shortfall never reaches the ledger at all.
+    /// That last fact is why `record_usage` takes `usage_cost_idr` and
+    /// `charged_idr` as two separate arguments.
+    #[test]
+    fn a_requests_net_ledger_move_is_the_negative_clamped_debit() {
+        for (held_idr, cost_idr) in sweep_pairs() {
+            // A hold is non-negative by construction: release_reservation_transaction
+            // refuses `reserved_idr <= 0` (db.rs:656) and the reserve path only
+            // ever holds a positive amount.
+            if held_idr < 0 {
+                continue;
+            }
+
+            let available_idr = held_idr;
+            let (debited_idr, lost_idr) = clamp_debit(cost_idr, available_idr);
+            let (release_delta, charge_delta) = settlement_ledger_deltas(held_idr, debited_idr);
+            let net_ledger_move = -held_idr + release_delta + charge_delta;
+
+            assert_eq!(
+                net_ledger_move, -debited_idr,
+                "held {held_idr} cost {cost_idr}: the request must net to the clamped debit"
+            );
+            // The ledger can never move more money than the wallet held.
+            assert_eq!(
+                -net_ledger_move,
+                debited_idr,
+                "held {held_idr} cost {cost_idr}: the money out is exactly what was debited"
+            );
+            assert!(
+                debited_idr <= available_idr.max(0),
+                "held {held_idr} cost {cost_idr}: the ledger must never overdraw the wallet"
+            );
+
+            if cost_idr >= 0 && cost_idr <= available_idr.max(0) {
+                // Full settlement: the hold comes back and the true cost lands.
+                assert_eq!(
+                    (debited_idr, lost_idr, net_ledger_move),
+                    (cost_idr, 0, -cost_idr),
+                    "held {held_idr} cost {cost_idr}: a full settlement nets exactly -cost"
+                );
+            } else if cost_idr > available_idr.max(0) {
+                // Partial settlement: only the clamped debit lands, and the
+                // shortfall stays out of the ledger.
+                assert_eq!(
+                    (debited_idr, lost_idr, net_ledger_move),
+                    (
+                        available_idr.max(0),
+                        cost_idr - available_idr.max(0),
+                        -available_idr.max(0)
+                    ),
+                    "held {held_idr} cost {cost_idr}: a partial settlement nets only the clamped debit"
+                );
+                assert!(
+                    net_ledger_move > -cost_idr,
+                    "held {held_idr} cost {cost_idr}: a partial settlement must move less than the true cost"
+                );
+            }
+        }
+    }
 }
 
 /// Verification query: confirms that wallet balance equals sum of ledger entries.
