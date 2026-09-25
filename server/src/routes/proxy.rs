@@ -13,11 +13,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
-use crate::db::debit_usage_transaction;
+use crate::db::{debit_usage_transaction, UsageSettlement};
 use crate::error::AppError;
 use crate::money::{calculate_preflight_reservation_idr, calculate_token_cost_idr};
 use crate::routes::events::{publish_balance, publish_usage, todays_usage, RealtimeHub};
@@ -655,7 +655,7 @@ async fn settle_after_stream(
     )
     .await
     {
-        Ok(new_balance) => {
+        Ok(UsageSettlement::Settled { new_balance }) => {
             info!(
                 account_id = %account_id,
                 cost_idr,
@@ -686,6 +686,48 @@ async fn settle_after_stream(
                 ),
             }
         }
+        // The balance ran out mid-request. The answer was already streamed and
+        // the usage WAS reported, so it is on the books: the debit was clamped,
+        // the real counters were recorded, and the difference is money consumed
+        // and not collected. An error, not a warning - an undercharge nobody
+        // sees is the same class of defect as a refund nobody sees.
+        //
+        // The money layer (db.rs) already logged the shortfall with the amounts;
+        // this line adds the request context an operator needs to place it.
+        Ok(UsageSettlement::Partial {
+            new_balance,
+            debited_idr,
+            shortfall_idr,
+        }) => {
+            error!(
+                account_id = %account_id,
+                key_id = %key_id,
+                model = %model,
+                cost_idr,
+                debited_idr,
+                shortfall_idr,
+                new_balance,
+                input_tokens = usage.input_tokens,
+                cache_read_tokens = usage.cache_read_tokens,
+                output_tokens = usage.output_tokens,
+                "Proxy request UNDERCHARGED: balance could not cover the reported usage"
+            );
+
+            // The clamped debit did commit, so the balance the dashboard shows is
+            // real, and so are the usage totals that back the 30-day spend.
+            publish_balance(&events, account_id, new_balance);
+            match todays_usage(&pool, account_id).await {
+                Ok(totals) => publish_usage(&events, account_id, totals),
+                Err(err) => warn!(
+                    account_id = %account_id,
+                    error = %err,
+                    "Usage event skipped: totals unavailable"
+                ),
+            }
+        }
+        // Only a real failure reaches here now: the wallet being short is a
+        // recorded outcome, not an error. What is left is the database being
+        // unreachable, or a clamped debit that still did not apply.
         Err(err) => warn!(
             account_id = %account_id,
             cost_idr,
