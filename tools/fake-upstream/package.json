@@ -1,0 +1,10 @@
+{
+  "name": "fake-upstream",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible SSE mock upstream with failure injection for local ApiKita testing",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
