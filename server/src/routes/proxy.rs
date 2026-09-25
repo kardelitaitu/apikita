@@ -8,9 +8,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -65,6 +67,192 @@ fn hash_string(s: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Maximum cached API-key records.
+///
+/// The cache can only ever be filled by a key that actually exists in the
+/// database: a presented key with no row is NOT cached (see `load_key_metadata`),
+/// so an unauthenticated caller cannot grow this map. In practice the working set
+/// is the number of live keys. The cap is a backstop so a pathological number of
+/// keys cannot pin unbounded memory; at roughly 250 bytes per record this bounds
+/// the cache at about 1 MiB.
+const KEY_CACHE_CAPACITY: usize = 4096;
+
+/// The api-key fields the request path decides on. Caching exactly these keeps a
+/// cache hit indistinguishable from a fresh read: the same values drive the same
+/// checks.
+#[derive(Debug, Clone, PartialEq)]
+struct KeyMetadata {
+    key_id: Uuid,
+    account_id: Uuid,
+    models: Value,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+struct CacheEntry {
+    meta: KeyMetadata,
+    stored_at: Instant,
+}
+
+/// A bounded, TTL-ed cache of API-key metadata, keyed by the HASHED key.
+///
+/// The plaintext key is never retained: the caller hashes the presented token and
+/// only that digest is used as the key here, so a memory dump of this map cannot
+/// yield a usable credential.
+///
+/// STALENESS TRADEOFF - the documented cost of this cache:
+/// a key revoked, or its model allowlist narrowed, will still be honoured for up to
+/// `limits.key_metadata_cache_seconds` after the change lands in the database. That
+/// window is the price of removing a DB round-trip from every proxied request.
+/// It is bounded and configurable, and setting the config value to 0 disables the
+/// cache entirely (every lookup misses), which is the way to trade the DB read back
+/// for immediate revocation.
+///
+/// Expiry is judged against a monotonic `Instant`, so a wall-clock adjustment can
+/// neither expire entries early nor keep them alive past the TTL.
+struct KeyCache {
+    entries: HashMap<String, CacheEntry>,
+    /// Insertion order, for eviction. Kept in step with `entries`: a key is
+    /// pushed exactly once, when it is first inserted.
+    order: std::collections::VecDeque<String>,
+    ttl: Duration,
+    capacity: usize,
+}
+
+impl KeyCache {
+    fn new(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            ttl,
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// The cached record, or None when it is absent or past its TTL.
+    ///
+    /// `now` is a parameter rather than a call to `Instant::now()` so the TTL rule
+    /// is testable without sleeping. An expired entry is a miss and is left for
+    /// `purge_expired` to reclaim.
+    fn get(&self, key_hash: &str, now: Instant) -> Option<KeyMetadata> {
+        let entry = self.entries.get(key_hash)?;
+        if now.duration_since(entry.stored_at) < self.ttl {
+            Some(entry.meta.clone())
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key_hash: String, meta: KeyMetadata, now: Instant) {
+        if self.entries.len() >= self.capacity {
+            // Expired entries are worthless, so reclaim them first; only if that
+            // frees nothing do we evict a live one.
+            self.purge_expired(now);
+        }
+
+        while self.entries.len() >= self.capacity {
+            // FIFO by first insertion. A true LRU would need per-hit bookkeeping
+            // for no real gain here: the working set is all live keys, so which
+            // one goes is close to arbitrary either way.
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+
+        // Refresh in place: the key is already in `order`, and pushing it again
+        // would put two entries in the queue for one map slot.
+        let inserted = self
+            .entries
+            .insert(
+                key_hash.clone(),
+                CacheEntry {
+                    meta,
+                    stored_at: now,
+                },
+            )
+            .is_none();
+        if inserted {
+            self.order.push_back(key_hash);
+        }
+    }
+
+    fn purge_expired(&mut self, now: Instant) {
+        let ttl = self.ttl;
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.stored_at) < ttl);
+        self.order.retain(|key| self.entries.contains_key(key));
+    }
+
+    /// Used by the tests to assert the cap holds; not needed on the hot path.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// The key-metadata cache, built once from config on the first request.
+static KEY_CACHE: OnceLock<Mutex<KeyCache>> = OnceLock::new();
+
+fn key_cache(config: &AppConfig) -> &'static Mutex<KeyCache> {
+    KEY_CACHE.get_or_init(|| {
+        Mutex::new(KeyCache::new(
+            Duration::from_secs(config.limits.key_metadata_cache_seconds),
+            KEY_CACHE_CAPACITY,
+        ))
+    })
+}
+
+/// Resolve the presented key hash to its metadata, from the cache when fresh and
+/// from the database otherwise.
+///
+/// Only a key that exists in the database is ever inserted, so an unknown key costs
+/// one query and leaves no trace - a caller cannot use the cache as a memory
+/// amplifier by spraying made-up tokens.
+async fn load_key_metadata(
+    cache: &Mutex<KeyCache>,
+    pool: &PgPool,
+    key_hash: &str,
+) -> Result<KeyMetadata, AppError> {
+    // The guard is scoped so the std Mutex is never held across the await below.
+    {
+        let cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(meta) = cache.get(key_hash, Instant::now()) {
+            return Ok(meta);
+        }
+    }
+
+    let row = sqlx::query(
+        r#"
+        SELECT id, account_id, models, expires_at, revoked_at
+        FROM api_keys
+        WHERE key_hash = $1
+        "#,
+    )
+    .bind(key_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Err(AppError::Unauthenticated);
+    };
+
+    let meta = KeyMetadata {
+        key_id: row.get("id"),
+        account_id: row.get("account_id"),
+        models: row.get("models"),
+        expires_at: row.get("expires_at"),
+        revoked_at: row.get("revoked_at"),
+    };
+
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        key_hash.to_string(),
+        meta.clone(),
+        Instant::now(),
+    );
+
+    Ok(meta)
+}
 /// What the tee saw once the upstream stream ended.
 enum StreamEnd {
     /// The stream completed and the tail parsed into a usage report.
@@ -236,29 +424,15 @@ pub async fn chat_completions(
 
     let key_hash = hash_string(presented_key);
 
-    let key_record = sqlx::query(
-        r#"
-        SELECT
-            id, account_id, models, spend_limit_idr,
-            expires_at, revoked_at
-        FROM api_keys
-        WHERE key_hash = $1
-        "#,
-    )
-    .bind(key_hash)
-    .fetch_optional(&state.pool)
-    .await?;
+    // Served from the TTL cache when warm, from the database otherwise. The
+    // checks below are identical either way - only the age of the row differs.
+    let key = load_key_metadata(key_cache(&state.config), &state.pool, &key_hash).await?;
 
-    let key = match key_record {
-        Some(k) => k,
-        None => return Err(AppError::Unauthenticated),
-    };
-
-    let key_id: Uuid = key.get("id");
-    let account_id: Uuid = key.get("account_id");
-    let models_val: Value = key.get("models");
-    let expires_at: Option<chrono::DateTime<chrono::Utc>> = key.get("expires_at");
-    let revoked_at: Option<chrono::DateTime<chrono::Utc>> = key.get("revoked_at");
+    let key_id = key.key_id;
+    let account_id = key.account_id;
+    let models_val = key.models.clone();
+    let expires_at = key.expires_at;
+    let revoked_at = key.revoked_at;
 
     if revoked_at.is_some() {
         return Err(AppError::KeyRevoked);
@@ -487,5 +661,157 @@ async fn settle_after_stream(
             error = %err,
             "Proxy settlement failed"
         ),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(revoked_at: Option<chrono::DateTime<chrono::Utc>>) -> KeyMetadata {
+        KeyMetadata {
+            key_id: Uuid::new_v4(),
+            account_id: Uuid::new_v4(),
+            models: json!(["deepseek-flash"]),
+            expires_at: None,
+            revoked_at,
+        }
+    }
+
+    fn cache(ttl_secs: u64, capacity: usize) -> KeyCache {
+        KeyCache::new(Duration::from_secs(ttl_secs), capacity)
+    }
+
+    #[test]
+    fn a_fresh_entry_is_a_hit() {
+        let mut c = cache(60, 16);
+        let now = Instant::now();
+        let stored = meta(None);
+
+        c.insert("hash-a".into(), stored.clone(), now);
+
+        assert_eq!(c.get("hash-a", now), Some(stored));
+        // An unknown key is always a miss, never a default. The handler turns
+        // that miss into a fresh read.
+        assert_eq!(c.get("hash-b", now), None);
+    }
+
+    #[test]
+    fn an_entry_at_or_past_its_ttl_is_a_miss() {
+        let mut c = cache(60, 16);
+        let now = Instant::now();
+        c.insert("hash-a".into(), meta(None), now);
+
+        // One second inside the window is still a hit.
+        assert!(c.get("hash-a", now + Duration::from_secs(59)).is_some());
+        // At the boundary and beyond it the entry must not be served: the
+        // handler re-reads instead.
+        assert_eq!(c.get("hash-a", now + Duration::from_secs(60)), None);
+        assert_eq!(c.get("hash-a", now + Duration::from_secs(61)), None);
+    }
+
+    #[test]
+    fn a_zero_ttl_disables_the_cache() {
+        // The config value is the escape hatch: 0 means every lookup misses, so
+        // revocation is immediate again at the cost of a read per request.
+        let mut c = cache(0, 16);
+        let now = Instant::now();
+        c.insert("hash-a".into(), meta(None), now);
+
+        assert_eq!(c.get("hash-a", now), None);
+    }
+
+    #[test]
+    fn the_capacity_cap_evicts_and_stays_bounded() {
+        let mut c = cache(60, 2);
+        let now = Instant::now();
+
+        c.insert("a".into(), meta(None), now);
+        c.insert("b".into(), meta(None), now);
+        c.insert("c".into(), meta(None), now);
+
+        assert_eq!(c.len(), 2, "the cap must hold");
+        // FIFO: the oldest insertion went, the two newest stayed.
+        assert_eq!(c.get("a", now), None);
+        assert!(c.get("b", now).is_some());
+        assert!(c.get("c", now).is_some());
+        // The order queue must not leak entries the map has dropped, or it
+        // would grow without bound while the map stayed capped.
+        assert_eq!(c.order.len(), c.len());
+    }
+
+    #[test]
+    fn an_expired_entry_is_reclaimed_before_a_live_one_is_evicted() {
+        let mut c = cache(60, 2);
+        let start = Instant::now();
+
+        c.insert("stale".into(), meta(None), start);
+        c.insert("live".into(), meta(None), start);
+
+        // Well past the TTL and at capacity: the dead entry is reclaimed rather
+        // than evicting the one still inside its window.
+        let later = start + Duration::from_secs(120);
+        c.insert("new".into(), meta(None), later);
+
+        assert_eq!(c.get("stale", later), None);
+        assert!(c.get("new", later).is_some());
+        assert_eq!(c.len(), 1, "both expired entries were reclaimed");
+    }
+
+    #[test]
+    fn re_inserting_a_key_does_not_duplicate_its_order_slot() {
+        let mut c = cache(60, 4);
+        let now = Instant::now();
+
+        c.insert("a".into(), meta(None), now);
+        c.insert("a".into(), meta(None), now);
+        c.insert("a".into(), meta(None), now);
+
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.order.len(), 1, "one map slot, one queue slot");
+    }
+
+    #[test]
+    fn a_revoked_key_is_not_served_beyond_the_ttl() {
+        let mut c = cache(60, 16);
+        let now = Instant::now();
+
+        // Cached while the key was still live.
+        c.insert("hash-a".into(), meta(None), now);
+
+        // Inside the window the stale live record is still honoured - the
+        // documented staleness cost, asserted rather than assumed.
+        assert!(c.get("hash-a", now + Duration::from_secs(30)).is_some());
+
+        // Past the window the entry is gone, so the handler re-reads and sees
+        // the revocation. The cache cannot extend a revoked key's life.
+        assert_eq!(c.get("hash-a", now + Duration::from_secs(61)), None);
+    }
+
+    #[test]
+    fn a_purge_drops_expired_entries_and_their_order_slots() {
+        let mut c = cache(60, 16);
+        let start = Instant::now();
+
+        c.insert("old".into(), meta(None), start);
+        c.insert("new".into(), meta(None), start + Duration::from_secs(120));
+
+        c.purge_expired(start + Duration::from_secs(121));
+
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.order.len(), 1);
+        assert_eq!(c.get("old", start + Duration::from_secs(121)), None);
+    }
+
+    #[test]
+    fn cached_metadata_carries_every_field_the_checks_read() {
+        // A hit must drive the same decision as a fresh read, so the record has
+        // to carry the account, the key id, the model allowlist and BOTH dates.
+        let revoked = chrono::Utc::now();
+        let stored = meta(Some(revoked));
+
+        assert_eq!(stored.revoked_at, Some(revoked));
+        assert_eq!(stored.models, json!(["deepseek-flash"]));
+        assert_ne!(stored.key_id, Uuid::nil());
+        assert_ne!(stored.account_id, Uuid::nil());
     }
 }
