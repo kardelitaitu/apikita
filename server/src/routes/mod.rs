@@ -564,4 +564,337 @@ mod tests {
             .await
             .is_err());
     }
+
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+
+    // ---------------------------------------------------------------------
+    // The route TABLE itself.
+    //
+    // `create_router` above is the product's entire HTTP surface, and nothing
+    // asserted the table AS a table: keys.rs drove one request through
+    // /v1/chat/completions, so a route that was deleted, renamed, moved to the
+    // wrong method, or mounted without `with_state` would leave the whole suite
+    // green while the endpoint was gone.
+    //
+    // The discriminating signal is decided by the ROUTER, before any handler
+    // runs, which is what makes the table testable with no database at all:
+    //
+    //   404 NOT_FOUND          - no route matches the path; the handler never runs;
+    //   405 METHOD_NOT_ALLOWED - the path is mounted, this method is not; the
+    //                            handler never runs and no query is issued;
+    //   anything else          - the request reached the handler, so the path AND
+    //                            the method are mounted. WHICH non-404/405 status
+    //                            it is (401 without a credential, 415/400 for the
+    //                            body, 503 when the database is unreachable) is
+    //                            the handler's business, not the router's, so it
+    //                            is deliberately not pinned here.
+    //
+    // The negative controls are what give the positive half meaning: without them
+    // the positive half would also pass on a router that mounted nothing.
+
+    /// A pool that never dials. `connect_lazy` opens no connection and issues no
+    /// query until a handler asks for one, and every request below stops at the
+    /// router or at the first credential check - so none of these tests needs
+    /// DATABASE_URL and all of them run in the default (non-ignored) suite. That
+    /// is the point: a route-table regression is caught without a database.
+    fn lazy_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            // The default acquire timeout is 30s, which would make the one test
+            // that lets the health handler dial (to prove it used THIS state's
+            // pool) take half a minute. The port is closed, so the connection is
+            // refused almost immediately; this only bounds the pathological case.
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_lazy("postgres://apikita_route_table:unused@127.0.0.1:1/apikita_absent")
+            .expect("the route-table DSN is a valid postgres url")
+    }
+
+    /// The real application state, built the way main.rs builds it.
+    fn table_state() -> AppState {
+        let config = Arc::new(
+            crate::config::AppConfig::load_from_file("../config/apikita.toml")
+                .expect("the shipped config parses"),
+        );
+        let events = Arc::new(crate::routes::events::RealtimeHub::new(&config.realtime));
+        let trusted_proxies: Arc<[crate::ip_tracking::IpCidr]> = Arc::from(
+            crate::ip_tracking::parse_cidrs(&config.network.trusted_proxy_cidrs)
+                .expect("the shipped config CIDRs parse")
+                .into_boxed_slice(),
+        );
+        AppState {
+            pool: lazy_pool(),
+            config,
+            http_client: reqwest::Client::new(),
+            events,
+            ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
+            trusted_proxies,
+        }
+    }
+
+    /// The whole router as a tower service, reached the way a caller reaches it.
+    ///
+    /// MockConnectInfo supplies the peer address that proxy::chat_completions
+    /// extracts: without a ConnectInfo layer that extractor fails with 500, which
+    /// would tell us nothing about whether the route matched.
+    fn table_app() -> Router {
+        use axum::extract::connect_info::MockConnectInfo;
+        use std::net::SocketAddr;
+
+        create_router(table_state()).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+    }
+
+    /// Sends one credential-free request through the real router and returns the
+    /// status. The body is supplied where a handler parses one BEFORE checking a
+    /// credential (auth::exchange_token validates pb_token first): a 400 there
+    /// still proves the route matched, which is all this asserts.
+    async fn route_status(app: &Router, method: &str, uri: &str, body: &str) -> StatusCode {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut req = Request::builder().method(method).uri(uri);
+        if !body.is_empty() {
+            req = req.header(header::CONTENT_TYPE, "application/json");
+        }
+        let req = req
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build the request");
+
+        app.clone()
+            .oneshot(req)
+            .await
+            .expect("the router must respond")
+            .status()
+    }
+
+    /// A concrete path parameter, used to prove {id} is a PARAMETER.
+    const SOME_KEY_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+    /// Every route `create_router` mounts: (method, path, body). One row per
+    /// route CALL, so /api/topups and /api/keys - each a SINGLE `.route()` with
+    /// two methods chained - appear once per method. 13 route calls, 16 rows.
+    const MOUNTED: &[(&str, &str, &str)] = &[
+        ("GET", "/health", ""),
+        ("POST", "/auth/exchange", r#"{"pb_token":"probe"}"#),
+        ("POST", "/auth/logout", ""),
+        ("POST", "/auth/logout-all", ""),
+        ("GET", "/api/me", ""),
+        ("GET", "/api/usage", ""),
+        ("GET", "/api/topups", ""),
+        ("POST", "/api/topups", "{}"),
+        ("GET", "/api/keys", ""),
+        ("POST", "/api/keys", "{}"),
+        ("PATCH", "/api/keys/00000000-0000-0000-0000-000000000000", "{}"),
+        ("POST", "/api/keys/00000000-0000-0000-0000-000000000000/revoke", ""),
+        ("GET", "/events", ""),
+        ("POST", "/webhooks/midtrans", "{}"),
+        ("POST", "/v1/chat/completions", ""),
+    ];
+
+    /// Near misses that MUST be 405: the PATH is mounted, the method is not.
+    const WRONG_METHOD: &[(&str, &str)] = &[
+        ("GET", "/auth/exchange"),
+        ("POST", "/health"),
+        ("GET", "/auth/logout"),
+        ("GET", "/auth/logout-all"),
+        ("DELETE", "/api/keys/00000000-0000-0000-0000-000000000000"),
+        // A {id} path IS mounted (as PATCH), so a GET on it is 405 - which is
+        // also the evidence that the parameter route exists for the METHOD as
+        // well as the path.
+        ("GET", "/api/keys/00000000-0000-0000-0000-000000000000"),
+        ("GET", "/api/keys/00000000-0000-0000-0000-000000000000/revoke"),
+        ("GET", "/webhooks/midtrans"),
+        ("GET", "/v1/chat/completions"),
+    ];
+
+    /// Near misses that MUST be 404: no route matches the path at all. Includes
+    /// paths one segment away from a real one, a real path with an extra segment
+    /// appended, and the trailing-slash spellings that axum does NOT treat as the
+    /// same path.
+    ///
+    /// Deliberately NOT in this list: `GET /api/keys/{a-uuid}`. That path IS
+    /// mounted (as PATCH), so axum answers 405, not 404 - measured, not assumed.
+    /// It belongs with the wrong-method controls below.
+    const ABSENT_PATH: &[(&str, &str)] = &[
+        ("GET", "/api/nope"),
+        ("GET", "/api/mex"),
+        ("POST", "/auth/exchanges"),
+        ("GET", "/healt"),
+        ("GET", "/api/me/"),
+        ("GET", "/api/ME"),
+        ("GET", "/health/"),
+        ("POST", "/api/keys/00000000-0000-0000-0000-000000000000/revoked"),
+        ("POST", "/api/topups/extra"),
+        ("GET", "/v1/chat/completion"),
+    ];
+
+    /// THE TABLE. Every mounted route must be dispatched by the router, and every
+    /// near miss must be refused BY THE ROUTER - 405 for a real path with the
+    /// wrong method, 404 for a path that is not mounted. Delete a route, rename a
+    /// path, or move a handler to another method and this fails naming the exact
+    /// pair.
+    #[tokio::test]
+    async fn every_mounted_route_dispatches_and_every_near_miss_is_refused() {
+        let app = table_app();
+
+        for (method, path, body) in MOUNTED {
+            let status = route_status(&app, method, path, body).await;
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} {path} is mounted by create_router but the router did not match it \
+                 (404): the route was deleted or the path renamed"
+            );
+            assert_ne!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path} is mounted by create_router but the router refused the method \
+                 (405): the handler was moved to a different method"
+            );
+        }
+
+        for (method, path) in WRONG_METHOD {
+            assert_eq!(
+                route_status(&app, method, path, "").await,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path} is NOT mounted, but the router did not answer 405 - either the \
+                 path stopped being mounted, or a method the table does not declare was accepted"
+            );
+        }
+
+        for (method, path) in ABSENT_PATH {
+            assert_eq!(
+                route_status(&app, method, path, "").await,
+                StatusCode::NOT_FOUND,
+                "{method} {path} is NOT mounted, but the router did not answer 404 - a route the \
+                 table does not declare is being matched (prefix matching, or an extra route)"
+            );
+        }
+    }
+
+    /// The dual-method routes: /api/topups and /api/keys are ONE `.route()` call
+    /// each with `get(..).post(..)` chained, so both methods must be mounted and
+    /// a THIRD method must still be 405. That last assertion is what makes this
+    /// more than a duplicate of the table test: it pins that the route carries
+    /// exactly the two methods the table declares.
+    #[tokio::test]
+    async fn the_dual_method_routes_accept_both_methods_and_only_those() {
+        let app = table_app();
+
+        for path in ["/api/topups", "/api/keys"] {
+            for method in ["GET", "POST"] {
+                let status = route_status(&app, method, path, "{}").await;
+                assert_ne!(
+                    status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path} is declared on one route call with the other method, but the \
+                     router does not accept it (405)"
+                );
+                assert_ne!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "{method} {path} is mounted by create_router but not matched (404)"
+                );
+            }
+
+            // A method the table does NOT declare on these paths stays refused,
+            // so the dual-method route cannot silently widen.
+            for method in ["PUT", "DELETE"] {
+                assert_eq!(
+                    route_status(&app, method, path, "").await,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path} is not declared by the table and must be 405"
+                );
+            }
+        }
+    }
+
+    /// `/api/keys/{id}` is a PATH PARAMETER, not the literal string "{id}".
+    ///
+    /// Two different ids are both routed - a literal route could only ever match
+    /// one spelling - and a non-UUID segment is answered by the `Path<Uuid>`
+    /// extractor (400) rather than by the router (404), which is only possible if
+    /// the segment was matched as a parameter and then handed to the extractor.
+    #[tokio::test]
+    async fn the_key_id_route_matches_a_parameter_not_a_literal() {
+        let app = table_app();
+
+        for id in [
+            SOME_KEY_ID,
+            "11111111-2222-3333-4444-555555555555",
+        ] {
+            let uri = format!("/api/keys/{id}");
+            let status = route_status(&app, "PATCH", &uri, "{}").await;
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "PATCH {uri} must be routed: /api/keys/{{id}} is a parameter route (404)"
+            );
+            assert_ne!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "PATCH {uri} must be routed: the table declares patch() on /api/keys/{{id}} (405)"
+            );
+        }
+
+        // Matched as a parameter, then rejected by Path<Uuid>: a 400 proves the
+        // router dispatched the request, a 404 would prove it did not.
+        let status = route_status(&app, "PATCH", "/api/keys/not-a-uuid", "{}").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-UUID id must reach the Path<Uuid> extractor and fail THERE (400); a 404 would \
+             mean the router never matched the parameter route"
+        );
+    }
+
+    /// `with_state` is part of the table: the state handed to `create_router` is
+    /// the state the handlers actually run on.
+    ///
+    /// What this pins, and why it is DB-free: `GET /health` is 503 ONLY if the
+    /// handler ran and read the pool out of the state it was given - that state's
+    /// pool is lazy and points at a closed port, so the 503 is produced by the
+    /// handler dialling THIS state's pool. A router whose handlers did not receive
+    /// the state could not produce it.
+    ///
+    /// The second half is the negative control for a table that is only served for
+    /// one particular state INSTANCE: two routers built from two independently
+    /// constructed states must both serve every route. (Dropping `.with_state`
+    /// outright is a compile error, not a runtime one, so this test cannot and
+    /// does not claim to cover that - see the module note above.)
+    #[tokio::test]
+    async fn the_state_handed_to_the_router_is_the_state_its_handlers_run_on() {
+        let first = table_app();
+        let second = table_app();
+
+        for app in [&first, &second] {
+            let status = route_status(app, "GET", "/health", "").await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "GET /health must run the handler against THIS state's (unreachable) pool and \
+                 report degraded; any other status means the handler did not use the state the \
+                 router was given"
+            );
+        }
+
+        for (method, path, body) in MOUNTED {
+            for app in [&first, &second] {
+                let status = route_status(app, method, path, body).await;
+                assert_ne!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "{method} {path} is mounted but one of two independently built states did not \
+                     serve it (404): the table is not served per-Router from the given state"
+                );
+                assert_ne!(
+                    status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path} is mounted but one of two independently built states refused \
+                     the method (405)"
+                );
+            }
+        }
+    }
 }
