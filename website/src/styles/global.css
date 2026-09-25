@@ -28,48 +28,51 @@
      ok     (emerald) confirmed success
    ========================================================================== */
 @theme {
-  /* --- Surfaces: a very dark green, never pure black --------------------- */
-  --color-surface: #0a1a13; /* the page itself */
-  --color-surface-raised: #102a1f; /* cards, panels, tables, the modal */
-  --color-surface-sunken: #061009; /* wells: code blocks, inputs, secrets */
+  /* --- Surfaces: an almost-black green, never pure black ----------------- */
+  --color-surface: #040d09; /* the page itself */
+  --color-surface-raised: #0a1f16; /* cards, panels, tables, the modal */
+  --color-surface-sunken: #020806; /* wells: code blocks, inputs, secrets */
 
   /* --- Dividers and control outlines ------------------------------------ */
-  --color-edge: #1e3d2e; /* hairline between rows and sections */
-  --color-edge-strong: #457a61; /* outline of a control / table head */
+  --color-edge: #16301f; /* hairline between rows and sections — 1.38:1 on
+                                   surface: visible as a rule, not a line */
+  --color-edge-strong: #3d6d55; /* outline of a control / table head —
+                                  3.30:1 on surface, clears WCAG 3:1 UI */
 
   /* --- Text ------------------------------------------------------------- */
-  --color-ink: #e8f4ee; /* 15.90:1 on surface — body and headings */
-  --color-ink-muted: #a9c0b3; /*  9.30:1 on surface — secondary copy */
-  --color-ink-subtle: #7f978a; /*  5.72:1 on surface — captions, still AA */
+  --color-ink: #e8f4ee; /* 17.44:1 on surface — body and headings */
+  --color-ink-muted: #a9c0b3; /* 10.20:1 on surface — secondary copy */
+  --color-ink-subtle: #7f978a; /*  6.28:1 on surface — captions, still AA */
 
   /* --- BRAND: green, the primary accent --------------------------------- */
-  --color-brand: #3fd97f; /*  9.78:1 on surface — links, rings, active */
+  --color-brand: #3fd97f; /* 10.73:1 on surface — links, rings, active */
   --color-brand-strong: #5ee89a; /* hover on a filled brand control */
   --color-brand-ink: #04170e; /* text on a brand fill — 10.09:1 */
   --color-brand-soft: #0d3324; /* brand-tinted well (selected state) */
 
   /* --- ACCENT: orange, the secondary accent ----------------------------- */
-  --color-accent: #ff8a3c; /*  7.65:1 on surface */
+  --color-accent: #ff8a3c; /*  8.39:1 on surface */
   --color-accent-strong: #ffa361;
   --color-accent-ink: #2a1004; /* text on an accent fill — 7.62:1 */
 
   /* --- DANGER: red. Errors and destructive actions. --------------------- */
-  --color-danger: #ff6b6b; /*  6.47:1 on surface — inline error text */
+  --color-danger: #ff6b6b; /*  7.09:1 on surface — inline error text */
   --color-danger-edge: #a84a54; /* panel border — 3.18:1 on its own panel */
-  --color-danger-surface: #2b1013; /* panel background */
+  --color-danger-surface: #2b1013; /* panel background — reads darker than
+                                      the raised card, so it stays a panel */
   --color-danger-ink: #ffc4c4; /* 11.76:1 on its own panel */
 
   /* --- WARN: amber. Pending, unconfirmed, caution. ---------------------- */
-  --color-warn: #f5b544; /*  9.89:1 on surface */
+  --color-warn: #f5b544; /* 10.85:1 on surface */
   --color-warn-edge: #8a6a24; /* 3.21:1 on its own panel */
-  --color-warn-surface: #2a1f08;
+  --color-warn-surface: #2a1f08; /* panel background — as above */
   --color-warn-ink: #ffdca8; /* 12.37:1 on its own panel */
 
   /* --- OK: emerald. Confirmed success. ---------------------------------- */
-  --color-ok: #10b981; /*  7.08:1 on surface — a deeper green than the
+  --color-ok: #10b981; /*  7.76:1 on surface — a deeper green than the
                                   brand, so "settled" never reads as a link */
   --color-ok-edge: #2f7a55; /* 3.14:1 on its own panel */
-  --color-ok-surface: #06251a;
+  --color-ok-surface: #06251a; /* panel background — as above */
   --color-ok-ink: #8ff0c4; /* 11.99:1 on its own panel */
 }
 
