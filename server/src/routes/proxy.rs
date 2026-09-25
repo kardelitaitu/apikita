@@ -26,7 +26,11 @@ use crate::error::AppError;
 use crate::ip_tracking::{
     ip_hash, record_key_ip, resolve_client_ip, today_utc, DailySalt, IpCidr,
 };
-use crate::money::{calculate_preflight_reservation_idr, calculate_token_cost_idr};
+use crate::money::calculate_token_cost_idr;
+// Only the tests re-derive the reservation: the handler calls the ONE shared
+// rule on ModelConfig, so a second copy of the arithmetic cannot drift from it.
+#[cfg(test)]
+use crate::money::calculate_preflight_reservation_idr;
 use crate::routes::events::{publish_balance, publish_usage, todays_usage, RealtimeHub};
 // The 30-day window and the spend read are shared with the key-management routes
 // on purpose: the limit the proxy enforces and the number the dashboard shows
@@ -1098,23 +1102,18 @@ pub async fn chat_completions(
         .max(model_cfg.max_output_tokens)
         .min(state.config.streaming.hard_max_output_tokens);
 
-    // One reservation per endpoint, and the dearest wins. The rates live on
-    // the model today, so the endpoints tie and this is a no-op - but it is
-    // the rule that must hold once per-endpoint rates exist. The max(1) keeps
-    // a model with no endpoints registered reserving at the model rate,
-    // exactly as UpstreamClient::worst_case_reservation_idr does.
-    let reservation = (0..model_cfg.endpoints.len().max(1))
-        .map(|_| {
-            calculate_preflight_reservation_idr(
-                model_cfg.price,
-                estimated_input,
-                model_cfg.rates.input_peak,
-                max_output,
-                model_cfg.rates.output_peak,
-            )
-        })
-        .max()
-        .unwrap_or(0);
+    // One reservation per endpoint, and the DEAREST wins: the hold is taken
+    // before routing and may be served by any endpoint in the pool, so it must
+    // cover the dearest one or a failover to a dearer provider overdraws the
+    // balance (docs/failover.md:162-165). An endpoint may override the model's
+    // peak rates, so each is priced at its OWN rates.
+    //
+    // The rule itself lives on ModelConfig, in ONE place: the upstream client
+    // used to carry a second copy that read only model-level rates, which made
+    // the endpoints tie and the dearest-endpoint rule a no-op - a mutation
+    // swapping max() for min() was therefore undetectable. Sharing the one
+    // definition is what makes the rule real and testable.
+    let reservation = model_cfg.worst_case_reservation_idr(estimated_input, max_output);
 
     // 5. The inbound body with `stream: true` guaranteed. Parsed BEFORE the hold so
     //    a malformed body can never take money: validation precedes the debit.
@@ -2133,7 +2132,16 @@ mod tests {
     /// handler runs against the same config and the same process-wide key cache
     /// the serving process uses.
     fn test_state(pool: PgPool) -> AppState {
-        let config = live_config();
+        test_state_with(pool, live_config())
+    }
+
+    /// The real application state over an EXPLICIT config.
+    ///
+    /// Needed because the dearest-endpoint rule is only observable when the
+    /// endpoints of one model carry genuinely different rates: the shipped
+    /// config has them all tied, so a test of that rule must build the
+    /// heterogeneous pool itself rather than edit the shared config file.
+    fn test_state_with(pool: PgPool, config: Arc<AppConfig>) -> AppState {
         let events = Arc::new(RealtimeHub::new(&config.realtime));
         let trusted_proxies: Arc<[IpCidr]> = Arc::from(
             parse_cidrs(&config.network.trusted_proxy_cidrs)
@@ -2303,6 +2311,31 @@ mod tests {
         body: &[u8],
         max_tokens: Option<u64>,
     ) -> i64 {
+        // Re-derived by per_endpoint_holds_idr, which prices each endpoint from
+        // the RAW config rather than by calling the production rule: an oracle
+        // that calls the code under test moves with it, and a mutation of that
+        // code would then be invisible (the whole reason this helper exists).
+        per_endpoint_holds_idr(config, model, body, max_tokens)
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The hold the handler MUST take for EACH endpoint of the pool, recomputed
+    /// independently from the config: one entry per endpoint, each priced at its
+    /// own peak-rate override (else the model rate). The DEAREST entry is the hold.
+    ///
+    /// Returned as a vector, not just the maximum, so a test can assert the pool
+    /// is genuinely heterogeneous. On a flat pool every entry is equal, max and
+    /// min coincide, and any assertion about "the dearest endpoint" is vacuous -
+    /// which is exactly how the max->min mutation survived before per-endpoint
+    /// rates existed.
+    fn per_endpoint_holds_idr(
+        config: &AppConfig,
+        model: &str,
+        body: &[u8],
+        max_tokens: Option<u64>,
+    ) -> Vec<i64> {
         let model_cfg = config
             .models
             .iter()
@@ -2313,18 +2346,33 @@ mod tests {
             .unwrap_or(0)
             .max(model_cfg.max_output_tokens)
             .min(config.streaming.hard_max_output_tokens);
-        (0..model_cfg.endpoints.len().max(1))
-            .map(|_| {
-                calculate_preflight_reservation_idr(
-                    model_cfg.price,
-                    estimated_input,
-                    model_cfg.rates.input_peak,
-                    max_output,
-                    model_cfg.rates.output_peak,
+
+        let at = |input_peak: f64, output_peak: f64| {
+            calculate_preflight_reservation_idr(
+                model_cfg.price,
+                estimated_input,
+                input_peak,
+                max_output,
+                output_peak,
+            )
+        };
+
+        let holds: Vec<i64> = model_cfg
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                at(
+                    endpoint.input_peak.unwrap_or(model_cfg.rates.input_peak),
+                    endpoint.output_peak.unwrap_or(model_cfg.rates.output_peak),
                 )
             })
-            .max()
-            .unwrap_or(0)
+            .collect();
+
+        if holds.is_empty() {
+            vec![at(model_cfg.rates.input_peak, model_cfg.rates.output_peak)]
+        } else {
+            holds
+        }
     }
 
     /// POST /v1/chat/completions reached through the REAL handler, with the peer
@@ -2844,6 +2892,128 @@ mod tests {
                 drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): a clamped debit must not break balance_idr = SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
+    // ---------------------------------------------------------------------
+    // THE DEAREST-ENDPOINT RULE, made observable.
+    //
+    // docs/failover.md:162-165: the hold is taken BEFORE routing and applies
+    // whichever endpoint serves the request, so it must cover the DEAREST
+    // endpoint in the pool. Until per-endpoint rates existed, every endpoint of
+    // a model tied (rates lived only on the model), so max() and min() over the
+    // pool were the SAME value: swapping .max() for .min() was program
+    // equivalence, and a mutation doing exactly that survived the whole suite.
+    //
+    // This test builds a pool whose endpoints carry GENUINELY different rates
+    // and drives the real handler, so the dearest figure is the only correct
+    // hold and the mutation now fails.
+    // ---------------------------------------------------------------------
+
+    /// A clone of the live config whose `flash` pool holds endpoints with
+    /// genuinely different peak rates, cheapest first. Returns the config and
+    /// the per-endpoint holds the handler must choose between.
+    fn heterogeneous_flash_config() -> Arc<AppConfig> {
+        let mut config = (*live_config()).clone();
+        let flash = config
+            .models
+            .iter_mut()
+            .find(|m| m.name == "flash")
+            .expect("flash is configured");
+        assert!(
+            flash.endpoints.len() >= 2,
+            "the fixture needs at least two endpoints to have a dearest one"
+        );
+
+        let (input_peak, output_peak) = (flash.rates.input_peak, flash.rates.output_peak);
+        for (index, endpoint) in flash.endpoints.iter_mut().enumerate() {
+            // 1x, 3x, 9x ...: strictly increasing, so the last endpoint is
+            // unambiguously the dearest and the first unambiguously the cheapest.
+            let factor = 3f64.powi(index as i32);
+            endpoint.input_peak = Some(input_peak * factor);
+            endpoint.output_peak = Some(output_peak * factor);
+        }
+
+        Arc::new(config)
+    }
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn the_hold_covers_the_dearest_endpoint_not_the_cheapest() {
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let config = heterogeneous_flash_config();
+        let state = test_state_with(pool.clone(), config.clone());
+        let opening_idr = 500_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let per_endpoint = per_endpoint_holds_idr(&config, "flash", body.as_bytes(), None);
+        let cheapest = *per_endpoint.iter().min().expect("at least one endpoint");
+        let dearest = *per_endpoint.iter().max().expect("at least one endpoint");
+
+        // POSITIVE CONTROL on the fixture itself. If the pool is flat, max and
+        // min coincide and every assertion below is vacuous - the exact
+        // condition that let the mutation survive. This test is worthless
+        // unless the pool genuinely differs.
+        assert!(
+            dearest > cheapest,
+            "the fixture must hold endpoints with genuinely different rates, got {per_endpoint:?}"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(pool.clone(), account_id, async move {
+            // The REAL handler. With no provider key in the environment the
+            // upstream is unreachable, so the request takes the hold, fails to
+            // route, and gives the whole hold back - which is exactly the
+            // money step under test, with no upstream faked.
+            let err = call_chat_completions(&state, &key, body)
+                .await
+                .err()
+                .expect("with no provider key in the environment the upstream is unreachable");
+            assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let holds: Vec<i64> = ledger_deltas(&pool_for_assertions, account_id)
+                .await
+                .into_iter()
+                .filter(|(delta, reference)| {
+                    *delta < 0
+                        && reference
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with("reserve_"))
+                })
+                .map(|(delta, _)| -delta)
+                .collect();
+
+            assert_eq!(
+                holds,
+                vec![dearest],
+                "the hold must be the DEAREST endpoint worst case ({dearest}), not the cheapest ({cheapest}); pool holds were {per_endpoint:?}"
+            );
+            assert_ne!(
+                holds,
+                vec![cheapest],
+                "reserving at the CHEAPEST endpoint would under-reserve and overdraw on a failover"
+            );
+
+            // The whole hold came back, so the account is untouched...
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr,
+                "a refused request must cost the customer nothing"
+            );
+            // ...and the ledger still reconciles (INVARIANT (a)).
+            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): no stranded holds"
             );
         })
         .await;

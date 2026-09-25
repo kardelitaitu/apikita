@@ -151,6 +151,12 @@ struct EndpointEntry {
     pool: KeyPool,
     breaker: CircuitBreaker,
     supports_stream_options: bool,
+    /// This endpoint's peak rates, already resolved against the model's — an
+    /// endpoint may be dearer than the model's nominal rate because the reseller
+    /// charges more, and the reservation must be sized from the dearest one
+    /// (docs/failover.md:162-165).
+    input_peak: f64,
+    output_peak: f64,
 }
 
 /// One configured model with its endpoints.
@@ -170,26 +176,31 @@ impl ModelEntry {
     /// The reservation is taken BEFORE routing and applies whichever endpoint
     /// serves the request, so it must cover the dearest endpoint in the pool —
     /// otherwise a failover to a dearer provider can overdraw the balance
-    /// (docs/failover.md). Upstream cost is configured per model today, so the
-    /// endpoints of one model currently tie; the maximum is taken regardless so
-    /// per-endpoint rates need no change here. The input side is reserved at
-    /// the model's full context window, which is the only upper bound this
-    /// layer can see.
+    /// (docs/failover.md). An endpoint MAY override the model's peak rates
+    /// (`ModelEndpoint::input_peak` / `output_peak`), so each one is priced at
+    /// its OWN rates here — a closure over the model's rates would make the
+    /// endpoints tie and the dearest-endpoint rule unobservable. The input side
+    /// is reserved at the model's full context window, which is the only upper
+    /// bound this layer can see.
+    ///
+    /// A model with no endpoints registered reserves at the model rate, so an
+    /// empty pool is not a zero hold.
     fn worst_case_reservation_idr(&self, max_output_tokens: u64) -> i64 {
-        let per_endpoint = || {
+        let at = |input_peak: f64, output_peak: f64| {
             calculate_preflight_reservation_idr(
                 self.price,
                 self.max_context_tokens,
-                self.input_peak,
+                input_peak,
                 max_output_tokens,
-                self.output_peak,
+                output_peak,
             )
         };
+
         self.endpoints
             .iter()
-            .map(|_| per_endpoint())
+            .map(|endpoint| at(endpoint.input_peak, endpoint.output_peak))
             .max()
-            .unwrap_or_else(per_endpoint)
+            .unwrap_or_else(|| at(self.input_peak, self.output_peak))
     }
 }
 
@@ -310,6 +321,11 @@ impl UpstreamClient {
                         ),
                         breaker: CircuitBreaker::new(config.circuit_breaker.clone()),
                     supports_stream_options: endpoint.supports_stream_options,
+                    // Resolved through the config's own accessors so the
+                    // upstream client and the pre-flight reservation can never
+                    // disagree about what an endpoint costs.
+                    input_peak: endpoint.effective_input_peak(model),
+                    output_peak: endpoint.effective_output_peak(model),
                     })
                     .collect(),
             })
@@ -571,6 +587,18 @@ mod tests {
     }
 
     fn endpoint(name: &str, weight: f64) -> ModelEndpoint {
+        endpoint_at(name, weight, None, None)
+    }
+
+    /// An endpoint that OVERRIDES the model's peak rates, so a pool can hold
+    /// genuinely dearer and cheaper providers. Without this every endpoint of a
+    /// model ties and the dearest-endpoint rule is unobservable.
+    fn endpoint_at(
+        name: &str,
+        weight: f64,
+        input_peak: Option<f64>,
+        output_peak: Option<f64>,
+    ) -> ModelEndpoint {
         ModelEndpoint {
             name: name.to_string(),
             url: format!("https://{name}.example.com/v1"),
@@ -579,6 +607,8 @@ mod tests {
             concurrency_per_key: 0,
             weight,
             supports_stream_options: true,
+            input_peak,
+            output_peak,
         }
     }
 
@@ -792,6 +822,56 @@ mod tests {
         // A bigger output budget reserves more; an unknown model reserves none.
         assert!(client.worst_case_reservation_idr("flash", 8192).unwrap() > reserved);
         assert_eq!(client.worst_case_reservation_idr("ghost", 4096), None);
+    }
+
+    /// THE DEAREST-ENDPOINT RULE, with a pool that genuinely differs.
+    ///
+    /// The test above uses two endpoints that TIE (both inherit the model's
+    /// rates), so max and min over that pool coincide and swapping .max() for
+    /// .min() in `ModelEntry::worst_case_reservation_idr` is program
+    /// equivalence - the mutation survives. An endpoint may override the peak
+    /// rates, so this pool holds a 1x, a 3x and a 9x provider and the dearest
+    /// figure is the only correct answer.
+    #[test]
+    fn the_dearest_endpoint_wins_when_the_pool_holds_different_rates() {
+        let cheap = endpoint_at("cheap", 1.0, Some(1000.0), Some(4000.0));
+        let mid = endpoint_at("mid", 1.0, Some(3000.0), Some(12_000.0));
+        let dear = endpoint_at("dear", 1.0, Some(9000.0), Some(36_000.0));
+        let upstream = client(vec![model("flash", vec![cheap, mid, dear])]);
+
+        let reserved = upstream
+            .worst_case_reservation_idr("flash", 4096)
+            .expect("configured model");
+
+        // in  1e6/1e6 * 9000   = 9000
+        // out 4096/1e6 * 36000 = 147.456
+        // (9000 + 147.456) * 1.5 = 13721.184 -> ceil 13722
+        assert_eq!(reserved, 13_722, "the DEAREST endpoint must set the hold");
+        assert_eq!(
+            reserved,
+            calculate_preflight_reservation_idr(1.5, 1_000_000, 9000.0, 4096, 36_000.0)
+        );
+
+        // POSITIVE CONTROL on the fixture: the pool must genuinely differ, or
+        // the assertion above is vacuous and the mutation is undetectable.
+        let cheapest = calculate_preflight_reservation_idr(1.5, 1_000_000, 1000.0, 4096, 4000.0);
+        assert!(
+            reserved > cheapest,
+            "the fixture must hold a dearer and a cheaper endpoint ({reserved} vs {cheapest})"
+        );
+        assert_ne!(reserved, cheapest, "reserving at the CHEAPEST endpoint would under-reserve");
+
+        // An endpoint that overrides NOTHING still falls back to the model rate,
+        // so an override-free pool keeps the old behaviour exactly.
+        let flat = client(vec![model(
+            "flash",
+            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
+        )]);
+        assert_eq!(
+            flat.worst_case_reservation_idr("flash", 4096),
+            Some(4081),
+            "with no overrides the hold is unchanged from the model-rate behaviour"
+        );
     }
 
     // ---------------------------------------------------------------------

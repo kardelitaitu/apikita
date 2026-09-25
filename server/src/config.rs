@@ -129,6 +129,77 @@ pub struct ModelEndpoint {
     pub weight: f64,
     #[serde(default)]
     pub supports_stream_options: bool,
+    /// Peak input rate for THIS endpoint, IDR per 1M tokens. `None` means the
+    /// model's rate.
+    ///
+    /// Upstream cost is a property of the PROVIDER, not of the product: two
+    /// endpoints of one model are the same thing sold at the same price, bought
+    /// from resellers who charge differently. The pre-flight reservation is taken
+    /// before routing and may be served by any endpoint in the pool, so it must
+    /// cover the DEAREST one (docs/failover.md:162-165); without a per-endpoint
+    /// rate there is nothing for that rule to compare.
+    #[serde(default)]
+    pub input_peak: Option<f64>,
+    /// Peak output rate for THIS endpoint, IDR per 1M tokens. See `input_peak`.
+    #[serde(default)]
+    pub output_peak: Option<f64>,
+}
+
+impl ModelEndpoint {
+    /// This endpoint's peak input rate: its own when it overrides, else the
+    /// model's. One definition, because the reservation and the flattened
+    /// upstream client must resolve an override the same way or they drift.
+    pub fn effective_input_peak(&self, model: &ModelConfig) -> f64 {
+        self.input_peak.unwrap_or(model.rates.input_peak)
+    }
+
+    /// This endpoint's peak output rate: its own when it overrides, else the
+    /// model's. See `effective_input_peak`.
+    pub fn effective_output_peak(&self, model: &ModelConfig) -> f64 {
+        self.output_peak.unwrap_or(model.rates.output_peak)
+    }
+}
+
+impl ModelConfig {
+    /// THE PRE-FLIGHT RESERVATION RULE, in ONE place.
+    ///
+    /// The hold is taken BEFORE routing and applies whichever endpoint serves the
+    /// request, so it must cover the DEAREST endpoint in the pool — a failover to
+    /// a dearer provider would otherwise overdraw the balance
+    /// (docs/failover.md:162-165). Each endpoint is priced at its own peak rates
+    /// when it overrides them, else the model's; a model with no endpoints
+    /// registered reserves at the model rate, exactly as
+    /// `UpstreamClient::worst_case_reservation_idr` does.
+    ///
+    /// This lives here rather than inline in the handler because the handler and
+    /// the upstream client previously each carried their own copy, and a rule
+    /// written twice is a rule that can disagree with itself.
+    pub fn worst_case_reservation_idr(
+        &self,
+        estimated_input_tokens: u64,
+        max_output_tokens: u64,
+    ) -> i64 {
+        let at = |input_peak: f64, output_peak: f64| {
+            crate::money::calculate_preflight_reservation_idr(
+                self.price,
+                estimated_input_tokens,
+                input_peak,
+                max_output_tokens,
+                output_peak,
+            )
+        };
+
+        self.endpoints
+            .iter()
+            .map(|endpoint| {
+                at(
+                    endpoint.effective_input_peak(self),
+                    endpoint.effective_output_peak(self),
+                )
+            })
+            .max()
+            .unwrap_or_else(|| at(self.rates.input_peak, self.rates.output_peak))
+    }
 }
 
 impl AppConfig {
@@ -155,6 +226,20 @@ impl AppConfig {
             }
             if model.rates.input_peak <= 0.0 || model.rates.output_peak <= 0.0 {
                 return Err(format!("Model {} is missing peak rates", model.name).into());
+            }
+            // An override is what the reservation is sized from, so a 0 or
+            // negative one would under-reserve silently. A MISSING override
+            // falls back to the model's rate, so only a present value is checked.
+            for endpoint in &model.endpoints {
+                if endpoint.input_peak.is_some_and(|rate| rate <= 0.0)
+                    || endpoint.output_peak.is_some_and(|rate| rate <= 0.0)
+                {
+                    return Err(format!(
+                        "Model {} endpoint {} has a non-positive peak rate override",
+                        model.name, endpoint.name
+                    )
+                    .into());
+                }
             }
         }
         Ok(())
@@ -218,6 +303,115 @@ fn validate_trusted_proxy_width(cidrs: &[String]) -> Result<(), Box<dyn std::err
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::money::calculate_preflight_reservation_idr;
+
+    /// A config with NO per-endpoint rate overrides must load and validate
+    /// EXACTLY as before: the override fields are additive and optional, so
+    /// every existing config — the shipped one and every operator's — keeps
+    /// working with no edit. This is the regression the feature must not cause.
+    #[test]
+    fn a_config_without_per_endpoint_rates_still_loads_and_prices_at_the_model_rate() {
+        let toml = r#"
+            [pricing]
+            currency = "IDR"
+            [wallet]
+            min_topup = 10000
+            min_first_deposit = 50000
+            min_monthly_tokens = 0
+            dormancy_days = 0
+            reserve_settlement_cycles = 1
+            low_balance_threshold_idr = 10000
+            low_balance_max_per_day = 1
+            [sessions]
+            absolute_days = 30
+            idle_days = 7
+            [limits]
+            topup_per_hour = 5
+            wallet_mutations_per_minute = 10
+            key_creation_per_day = 10
+            review_per_hour = 3
+            key_metadata_cache_seconds = 60
+            [realtime]
+            replay_buffer_events = 100
+            max_connections_per_account = 5
+            max_stream_seconds = 1800
+            [key_pool]
+            rate_limit_status = [429]
+            key_cooldown_seconds = 5
+            max_key_attempts = 3
+            on_pool_exhausted = "reject_503"
+            [circuit_breaker]
+            failure_threshold = 3
+            cooldown_seconds = 30
+            cooldown_max_seconds = 900
+            cooldown_multiplier = 2.0
+            request_timeout_seconds = 120
+            health_check_interval_seconds = 30
+            health_check_failures = 2
+            [streaming]
+            mid_stream_cutoff = false
+            hard_max_output_tokens = 384000
+            max_context_tokens = 1000000
+            [network]
+            trusted_proxy_cidrs = ["127.0.0.1/32"]
+            [[models]]
+            name = "flash"
+            description = "d"
+            price = 1.5
+            max_context_tokens = 1000000
+            max_output_tokens = 384000
+            supports_vision = true
+            supports_thinking = true
+            billing_basis = "peak"
+            [models.rates]
+            cache_read_offpeak = 26.77
+            cache_read_peak = 53.54
+            input_offpeak = 1338.39
+            input_peak = 2676.78
+            output_offpeak = 5353.56
+            output_peak = 10707.12
+            [[models.endpoints]]
+            name = "primary"
+            url = "https://a.example.com/v1"
+            upstream_model = "deepseek-flash"
+            [[models.endpoints]]
+            name = "secondary"
+            url = "https://b.example.com/v1"
+            upstream_model = "deepseek-flash"
+        "#;
+
+        let config: AppConfig = toml::from_str(toml).expect("a legacy config must still parse");
+        config.validate().expect("a legacy config must still validate");
+
+        let flash = &config.models[0];
+        // Absent overrides are None, and the effective rate is the model's.
+        for endpoint in &flash.endpoints {
+            assert_eq!(endpoint.input_peak, None);
+            assert_eq!(endpoint.output_peak, None);
+            assert_eq!(endpoint.effective_input_peak(flash), flash.rates.input_peak);
+            assert_eq!(endpoint.effective_output_peak(flash), flash.rates.output_peak);
+        }
+
+        // With no overrides the endpoints TIE, and the reservation is exactly
+        // the old model-rate figure - the feature is behaviour-preserving.
+        let tied = calculate_preflight_reservation_idr(1.5, 1_000_000, 2676.78, 4096, 10707.12);
+        assert_eq!(flash.worst_case_reservation_idr(1_000_000, 4096), tied);
+    }
+
+    /// A non-positive override would size the hold from a rate that reserves
+    /// nothing, so it is refused at load like a non-positive model rate.
+    #[test]
+    fn a_non_positive_per_endpoint_rate_is_refused_at_load() {
+        let mut config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        config.models[0].endpoints[0].input_peak = Some(0.0);
+        let err = config
+            .validate()
+            .expect_err("a zero per-endpoint rate must be refused")
+            .to_string();
+        assert!(err.contains("non-positive peak rate override"), "got {err}");
+    }
 
     #[test]
     fn test_load_apikita_toml() {
