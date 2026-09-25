@@ -12,13 +12,19 @@
 //! The retry loop is owned by the caller, bounded by
 //! KeyPoolConfig.max_key_attempts (exposed as KeyPool::max_attempts):
 //!
-//!     for _ in 0..pool.max_attempts() {
-//!         let Some(lease) = pool.acquire() else { break }; // pool exhausted
-//!         match send(lease.key()).await {
-//!             Ok(resp) => { lease.report_status(resp.status().as_u16()); return resp }
-//!             Err(_) => { lease.report_status(0); } // network error: free the slot
-//!         }
+//! ```text
+//! for _ in 0..pool.max_attempts() {
+//!     let Some(lease) = pool.acquire() else { break }; // pool exhausted
+//!     match send(lease.key()).await {
+//!         Ok(resp) => { lease.report_status(resp.status().as_u16()); return resp }
+//!         Err(_) => { lease.report_status(0); } // network error: free the slot
 //!     }
+//! }
+//! ```
+//!
+//! Marked `text` rather than left as an indented block on purpose: this is
+//! illustrative, `send` and `resp` are the caller's, and as a Rust doctest it does
+//! not compile — which made a bare `cargo test` red for a comment.
 //!
 //! A rate-limited key is already cooling when the loop comes back around, so the
 //! next iteration naturally lands on a different key.
