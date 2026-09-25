@@ -16,7 +16,19 @@ pub struct MidtransNotification {
 pub enum PaymentAction {
     Credit { amount_idr: i64 },
     DebitRefund { amount_idr: i64 },
-    TerminalNoAction,
+    /// The payment will never settle. Carries the `topups.status` value to
+    /// persist, so the mapping lives here with the vocabulary it maps and the
+    /// handler has no unreachable branch to forget about.
+    TerminalNoAction { status: &'static str },
+    /// Midtrans sent a `transaction_status` this server does not recognise.
+    ///
+    /// This variant exists so an unknown value can never be silently absorbed.
+    /// Before it, anything outside the lists below fell through to `Pending`:
+    /// a new, misspelled, or differently-cased status left the topup `pending`
+    /// forever while the handler answered 200 and logged nothing.
+    ///
+    /// An unrecognised status is NOT evidence that a payment is in progress.
+    Unrecognised,
     Pending,
 }
 
@@ -50,18 +62,65 @@ pub fn verify_midtrans_signature(
     expected.as_bytes().ct_eq(notification.signature_key.as_bytes()).into()
 }
 
-/// Evaluates payment status transition based on Midtrans transaction_status
-pub fn evaluate_payment_status(status: &str, stored_amount_idr: i64) -> PaymentAction {
-    match status {
-        "capture" | "settlement" => PaymentAction::Credit {
-            amount_idr: stored_amount_idr,
-        },
-        "refund" | "partial_refund" => PaymentAction::DebitRefund {
-            amount_idr: stored_amount_idr,
-        },
-        "deny" | "cancel" | "expire" => PaymentAction::TerminalNoAction,
-        _ => PaymentAction::Pending,
+/// Midtrans' documented `transaction_status` values, enumerated so the set is
+/// auditable rather than implied by a catch-all arm.
+///
+/// Adding a status is a deliberate edit here. Anything not in one of these four
+/// sets is `Unrecognised` and must be surfaced, never assumed to be in progress.
+/// Money arrives.
+const CREDIT_STATUSES: [&str; 2] = ["capture", "settlement"];
+/// Money goes back. `partial_refund` included: an unhandled status corrupts the
+/// ledger (docs/server/api-spec.md:285-288).
+const REFUND_STATUSES: [&str; 2] = ["refund", "partial_refund"];
+/// Legitimate in-progress states: nothing to do yet, and 200 is the right answer.
+/// `pending` is what Midtrans sends while the customer has not paid; `authorize`
+/// precedes a card capture. These must keep behaving as before.
+const IN_PROGRESS_STATUSES: [&str; 2] = ["pending", "authorize"];
+
+/// The `topups.status` value for a Midtrans terminal status, or None.
+///
+/// Midtrans says `deny` and `expire`; the schema's CHECK constraint allows
+/// `denied` and `expired` (migration 20260925000000_initial_schema.sql:78).
+/// Passing Midtrans' vocabulary straight through violated the constraint, and
+/// the error was swallowed - a real `deny` webhook returned 200 while the row
+/// stayed `pending`.
+///
+/// `cancel` maps to `denied`: there is no `cancelled` in the schema, and the
+/// distinction between a payment the customer abandoned and one the issuer
+/// refused is not one the money model acts on - neither will ever settle.
+pub fn terminal_status(midtrans_status: &str) -> Option<&'static str> {
+    match midtrans_status {
+        "deny" | "cancel" => Some("denied"),
+        "expire" => Some("expired"),
+        _ => None,
     }
+}
+
+/// Evaluates payment status transition based on Midtrans transaction_status
+///
+/// The four sets above are checked explicitly and everything else is
+/// `Unrecognised`. There is deliberately NO catch-all that maps an unknown
+/// status onto `Pending`.
+pub fn evaluate_payment_status(status: &str, stored_amount_idr: i64) -> PaymentAction {
+    if CREDIT_STATUSES.contains(&status) {
+        return PaymentAction::Credit {
+            amount_idr: stored_amount_idr,
+        };
+    }
+    if REFUND_STATUSES.contains(&status) {
+        return PaymentAction::DebitRefund {
+            amount_idr: stored_amount_idr,
+        };
+    }
+    if let Some(schema_status) = terminal_status(status) {
+        return PaymentAction::TerminalNoAction {
+            status: schema_status,
+        };
+    }
+    if IN_PROGRESS_STATUSES.contains(&status) {
+        return PaymentAction::Pending;
+    }
+    PaymentAction::Unrecognised
 }
 
 /// Calculates token cost in integer IDR using uniform markup multiplier M
@@ -150,7 +209,15 @@ mod tests {
         );
         assert_eq!(
             evaluate_payment_status("cancel", 50000),
-            PaymentAction::TerminalNoAction
+            PaymentAction::TerminalNoAction { status: "denied" }
+        );
+        assert_eq!(
+            evaluate_payment_status("deny", 50000),
+            PaymentAction::TerminalNoAction { status: "denied" }
+        );
+        assert_eq!(
+            evaluate_payment_status("expire", 50000),
+            PaymentAction::TerminalNoAction { status: "expired" }
         );
         assert_eq!(
             evaluate_payment_status("pending", 50000),

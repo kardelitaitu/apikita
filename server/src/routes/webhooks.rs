@@ -12,32 +12,9 @@ use crate::db::{
     credit_topup_transaction, refund_topup_transaction, RefundResult, TopupCreditResult,
 };
 use crate::money::{
-    evaluate_payment_status, verify_midtrans_signature, MidtransNotification, PaymentAction,
+    evaluate_payment_status, terminal_status, verify_midtrans_signature, MidtransNotification,
+    PaymentAction,
 };
-
-/// The `topups.status` value for a Midtrans terminal status.
-///
-/// Midtrans says `deny` and `expire`; the schema's CHECK constraint allows
-/// `denied` and `expired` (migration 20260925000000_initial_schema.sql:78).
-/// Passing Midtrans' vocabulary straight through violated the constraint, and
-/// the error was swallowed - a real `deny` webhook returned 200 while the row
-/// stayed `pending` (Bug B).
-///
-/// `cancel` maps to `denied`: there is no `cancelled` in the schema, and the
-/// distinction between a payment the customer abandoned and one the issuer
-/// refused is not one the money model needs - both mean the topup will never
-/// settle. `denied` is the closer of the two available values, and it keeps the
-/// status set closed rather than inventing a migration for a synonym.
-fn terminal_status(midtrans_status: &str) -> Option<&'static str> {
-    match midtrans_status {
-        "deny" | "cancel" => Some("denied"),
-        "expire" => Some("expired"),
-        // Not a terminal status this handler knows. `None` is a refusal to
-        // guess: the caller reports it instead of writing a value the CHECK
-        // constraint would reject.
-        _ => None,
-    }
-}
 
 /// The JSON body for a refusal that leaves no money movement ambiguous.
 fn error_body(code: &str, message: &str) -> Json<serde_json::Value> {
@@ -214,22 +191,10 @@ pub async fn handle_midtrans_webhook(
                 }
             }
         }
-        PaymentAction::TerminalNoAction => {
-            // Translate Midtrans' vocabulary into the schema's before binding it:
-            // writing `deny` straight through violated topups_status_check, and
-            // the swallowed error returned 200 while the row stayed `pending`.
-            let Some(status) = terminal_status(&payload.transaction_status) else {
-                error!(
-                    order_id = %payload.order_id,
-                    status = %payload.transaction_status,
-                    "Unmappable terminal status: refusing to write a value the schema rejects"
-                );
-                return (
-                    StatusCode::BAD_REQUEST,
-                    error_body("unknown_terminal_status", "unrecognised terminal status"),
-                );
-            };
-
+        // The schema value travels with the action: `evaluate_payment_status`
+        // only produces this variant for a status `terminal_status` mapped, so
+        // there is no unmappable case left to forget.
+        PaymentAction::TerminalNoAction { status } => {
             info!(
                 order_id = %payload.order_id,
                 midtrans_status = %payload.transaction_status,
@@ -278,7 +243,28 @@ pub async fn handle_midtrans_webhook(
                 }
             }
         }
-        PaymentAction::Pending => (StatusCode::OK, Json(json!({"status": "pending"}))),
+        // A status Midtrans sent that this server does not know. Before this arm
+        // existed, such a value fell through to `Pending`: the topup stayed
+        // `pending` forever, the handler answered 200, and nothing was logged.
+        PaymentAction::Unrecognised => {
+            // WARN, not info: an unknown status is an operational signal, and the
+            // raw value is included so the set can be extended deliberately.
+            warn!(
+                order_id = %payload.order_id,
+                status = %payload.transaction_status,
+                "Unrecognised Midtrans transaction_status: not classified as pending"
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "unrecognised_status",
+                    "detail": "transaction_status is not one this server recognises; no state changed",
+                })),
+            )
+        }
+        // A legitimate in-progress status (`pending`, `authorize`). 200 is the
+        // correct answer and Midtrans should not retry.
+        PaymentAction::Pending => (StatusCode::OK, Json(json!({ "status": "pending" }))),
     }
 }
 #[cfg(test)]
@@ -319,10 +305,104 @@ mod tests {
         assert_eq!(terminal_status("DENY"), None, "matching is exact");
     }
 
-    /// `deny` and `cancel` collapse to one value on purpose: the schema has no
-    /// `cancelled`, and neither status will ever settle.
+    /// The regression this change exists for. Every value the live tester swept
+    /// against the endpoint must NOT be classified as Pending - before this,
+    /// all nine of the unrecognised ones were, so the topup stayed pending
+    /// forever while the handler answered 200 and logged nothing.
     #[test]
-    fn cancel_and_deny_collapse_to_denied() {
-        assert_eq!(terminal_status("cancel"), terminal_status("deny"));
+    fn an_unrecognised_status_is_never_classified_as_pending() {
+        // The exact sweep that refuted the previous fix.
+        for status in [
+            "foobar",
+            "unknown",
+            "expired",
+            "denied",
+            "DENY",
+            "settlement",
+            "",
+            "cancel_pending",
+            "refund_pending",
+        ] {
+            // `settlement` is a credit, not unrecognised - it is in the sweep
+            // because it must not be Pending either.
+            let action = evaluate_payment_status(status, 50000);
+            assert_ne!(
+                action,
+                PaymentAction::Pending,
+                "{status:?} must not be silently absorbed as Pending"
+            );
+        }
+
+        // The genuinely unknown ones are explicitly Unrecognised, not merely
+        // 'something other than Pending'.
+        for status in [
+            "foobar",
+            "unknown",
+            "expired",
+            "denied",
+            "DENY",
+            "",
+            "cancel_pending",
+            "refund_pending",
+        ] {
+            assert_eq!(
+                evaluate_payment_status(status, 50000),
+                PaymentAction::Unrecognised,
+                "{status:?} should be reported as unrecognised"
+            );
+        }
+    }
+
+    /// Legitimate in-progress statuses must keep behaving exactly as before:
+    /// `pending` is what Midtrans sends while the customer has not paid, and
+    /// `authorize` precedes a card capture. Neither may become Unrecognised.
+    #[test]
+    fn legitimate_in_progress_statuses_still_classify_as_pending() {
+        assert_eq!(
+            evaluate_payment_status("pending", 50000),
+            PaymentAction::Pending
+        );
+        assert_eq!(
+            evaluate_payment_status("authorize", 50000),
+            PaymentAction::Pending
+        );
+    }
+
+    /// The money-moving statuses are unaffected by the new arm.
+    #[test]
+    fn money_statuses_still_classify_correctly() {
+        assert_eq!(
+            evaluate_payment_status("settlement", 50000),
+            PaymentAction::Credit { amount_idr: 50000 }
+        );
+        assert_eq!(
+            evaluate_payment_status("capture", 50000),
+            PaymentAction::Credit { amount_idr: 50000 }
+        );
+        assert_eq!(
+            evaluate_payment_status("refund", 50000),
+            PaymentAction::DebitRefund { amount_idr: 50000 }
+        );
+        assert_eq!(
+            evaluate_payment_status("partial_refund", 50000),
+            PaymentAction::DebitRefund { amount_idr: 50000 }
+        );
+    }
+
+    /// The terminal arm now carries its schema value, so a terminal status can
+    /// never reach the handler without a value the CHECK constraint accepts.
+    #[test]
+    fn terminal_actions_carry_a_schema_valid_status() {
+        const ALLOWED: [&str; 5] = ["pending", "settled", "denied", "expired", "refunded"];
+
+        for status in ["deny", "cancel", "expire"] {
+            match evaluate_payment_status(status, 50000) {
+                PaymentAction::TerminalNoAction { status } => assert!(
+                    ALLOWED.contains(&status),
+                    "{status} is not permitted by topups_status_check"
+                ),
+                other => panic!("{status} should be terminal, got {other:?}"),
+            }
+        }
     }
 }
