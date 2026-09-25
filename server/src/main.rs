@@ -1,8 +1,4 @@
-mod config;
-mod db;
-mod error;
-mod money;
-mod routes;
+use apikita_server::{config, db, routes};
 
 use std::env;
 use std::net::SocketAddr;
