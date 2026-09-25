@@ -214,13 +214,45 @@ Counted against the tree, not estimated. This is the actual work list.
 | `ON CONFLICT … DO UPDATE` | **2** | `db.rs:466`, `ip_tracking.rs:201` | → **keep**; measured working, including the table-qualified form |
 | `ON CONFLICT … DO NOTHING` | **2** | `ip_tracking.rs:196`, `auth.rs:233` | → `auth.rs` goes with PocketBase; `ip_tracking.rs` is blocked by the CTE below |
 | **Data-modifying CTE** | **1** | `ip_tracking.rs:190-205` | → **no SQLite equivalent; must be rewritten** ([§4.7](#47-the-data-modifying-cte--one-function-must-be-rewritten)) |
-| `interval '2 hours'` | **1** | `abuse.rs:309` | → `datetime('now','-2 hours')` (test helper) |
+| `interval '2 hours'` | **1** | `abuse.rs:309` | → **bind from Rust**; `datetime('now','-2 hours')` is wrong — see correction 2 below |
+| Columns that relied on a Postgres `DEFAULT` | **5 sites** | `auth.rs` 3, `keys.rs` 1, `account.rs` 1 | → bind `id` from `Uuid::new_v4()` and every timestamp from Rust. **Absent from this inventory as first written** — see correction 1 below |
 | `SELECT now() - interval …` | 0 | — | not used in production SQL |
 | `= ANY($1)` array bind | **0** | — | the 3 `ANY(` hits are Rust `.iter().any()` |
 | `GREATEST` / `LEAST` | **0** | — | the 12 `LEAST` hits are prose ("at least") |
 | `jsonb` / `->>` operators | **0** | — | `models` is bound as a `serde_json::Value`, not queried as JSON |
 | `CREATE EXTENSION` | 1 | migration | → delete |
 | `gen_random_uuid()` | — | schema defaults | → `Uuid::new_v4()` in Rust |
+
+**Two corrections to this inventory, found while executing Phase 4.**
+
+**Correction 1 — the inventory counted `now()` call sites but not the columns that
+relied on a Postgres default.** Removing `DEFAULT gen_random_uuid()` and every
+`DEFAULT now()` (§4.6, rule 2) is correct, but it silently invalidates every INSERT
+that omitted those columns. Five production statements did:
+
+| Site | Table | Columns now required |
+| --- | --- | --- |
+| `routes/auth.rs` account upsert | `accounts` | `id`, `created_at`, `updated_at` |
+| `routes/auth.rs` wallet upsert | `wallets` | `updated_at` |
+| `routes/auth.rs` session insert | `sessions` | `id`, `created_at`, `last_seen_at` |
+| `routes/keys.rs` key creation | `api_keys` | `id`, `created_at` |
+| `routes/account.rs` topup creation | `topups` | `created_at` |
+
+Measured, not inferred: with the schema as shipped and the fixtures as they stood,
+the ignored integration tests fail at the first fixture insert with
+`NOT NULL constraint failed: accounts.id`. That is the rule-2 design working as
+intended — a forgotten bind is a loud error rather than silent drift — but the
+inventory should have listed these sites, because "17 `now()` sites" understated the
+work by five statements and §5.2's warning 1 named only `sessions`.
+
+**Correction 2 — `datetime('now','-2 hours')` cannot be the translation.** The row
+above prescribed it, and it contradicts §4.6 rule 3. Measured: `datetime()` emits
+`2026-09-25 05:09:19`, the space format, and the `created_at` GLOB CHECK refuses it
+(`CHECK constraint failed: updated_at GLOB '????-??-??T??:??:??*+00:00'`). The
+`strftime('%Y-%m-%dT%H:%M:%f','now') || '+00:00'` form §4.6 already documents IS
+accepted. Since this is a test helper, the simpler and more honest fix is to bind
+`Utc::now() - Duration::hours(2)` from Rust and keep "never write time in SQL"
+absolute.
 
 **Two pieces of good news that shrink the port:**
 
@@ -289,6 +321,22 @@ supposed to make a hard delete of a funded account *impossible* stops working. T
 is the single most dangerous omission in the port: it fails silently and it removes a
 money backstop.
 
+*Precision added while executing:* this is **raw** SQLite's default. sqlx already
+overrides it — `SqliteConnectOptions::default()` sets `foreign_keys` to `ON` — so a
+pool built from `SqliteConnectOptions` is not exposed to the trap by accident. The
+option is still passed explicitly in both `db::init_pool` and `bin/migrate.rs`, because
+a money backstop that depends on a dependency's default is one dependency bump away
+from being gone. Measured with the options as written: a dangling reference is refused
+with `FOREIGN KEY constraint failed` (code 787).
+
+The same care applies to the other two options. Measured defaults in sqlx 0.8.6:
+`busy_timeout` is already 5s and `journal_mode` is deliberately left **unset** (with a
+source comment explaining that WAL is permanent and entering it needs an exclusive lock
+`sqlite3_busy_timeout()` cannot wait on), so neither is a default to lean on — WAL is
+set by `bin/migrate.rs` and re-asserted by `init_pool`, and `synchronous(Normal)` is a
+real change from SQLite's `FULL`. Measured with the options as written:
+`journal_mode=wal`, `foreign_keys=1`, `synchronous=1`, `busy_timeout=5000`.
+
 **Trap 2 — deferred transactions that read then write can fail unrecoverably.**
 SQLite's default `BEGIN` is deferred. A transaction that `SELECT`s and later `UPDATE`s
 can get `SQLITE_BUSY_SNAPSHOT` on upgrade, and that error **cannot be resolved by
@@ -297,6 +345,32 @@ are exactly this shape: `credit_topup_transaction` and `refund_topup_transaction
 Both must use `BEGIN IMMEDIATE` (measured: accepted). sqlx's `pool.begin()` issues a
 deferred `BEGIN`, so add a helper that acquires a connection and issues
 `BEGIN IMMEDIATE` explicitly, and route both call sites through it.
+
+**Executed, with one refinement.** `pool.begin_with("BEGIN IMMEDIATE")` exists in
+sqlx 0.8.6 and is what the helper uses — it needs no manual connection handling, and
+it *verifies* the statement opened a transaction, failing with `BeginFailed` otherwise
+(measured: `begin_with("SELECT 1")` is refused, so a typo is loud). The helper is
+`db::begin_immediate`.
+
+The refinement: moving each guard **into** the `UPDATE` (§4.5) means both named
+functions now begin with a write, so the read-then-write shape this trap describes no
+longer exists in either of them — nor in the other four transactions in the module,
+which all open with a write too. `BEGIN IMMEDIATE` is still used for all six, because
+it makes the lock acquisition explicit rather than a consequence of statement
+ordering, so a later edit that adds a read to the top of one of them cannot
+reintroduce the trap.
+
+**Measured: what contention actually does.** With `max_connections(8)` and two
+connections contending, the second `BEGIN IMMEDIATE` waits the full `busy_timeout`
+(measured 5.53s) and then **fails with `database is locked` (code 5)**; once the first
+releases, the identical statement succeeds. So `busy_timeout` does replace `FOR UPDATE`
+waiting, but it is a bounded wait, not an indefinite one — every write in the process
+serializes behind a single writer, and a writer that cannot get in within 5s errors
+rather than blocking. The transactions here are a handful of statements, so this is
+headroom rather than a live risk, but it is the shape of the ceiling: SQLite gives one
+writer at a time for the whole database, and `record_key_ip` sits on the proxy hot
+path. Worth knowing before raising `max_connections` in the belief it buys write
+throughput.
 
 **Trap 3 — `NULL` in a composite primary key duplicates rows.** In Postgres a PK
 column is implicitly `NOT NULL`; **SQLite does not enforce this.** Measured: a `NULL`
@@ -384,9 +458,39 @@ WHERE order_id = ? AND status = 'pending' AND amount_idr = ?;
 (`settled_at` is bound from Rust — [§4.6](#46-timestamps--the-hazard-that-would-have-shipped).)
 
 If `rows_affected() == 0`, one disambiguating `SELECT` decides between
-`AlreadySettled`, `NotFound` and `AmountMismatch` — the same three outcomes
-`TopupCreditResult` already models. This removes the lock instead of emulating it,
-and keeps the existing tests meaningful.
+`AlreadySettled`, `NotFound` and `AmountMismatch`. This removes the lock instead of
+emulating it, and keeps the existing tests meaningful.
+
+**Correction, found while executing Phase 4: there is a fourth outcome, and the
+stricter predicate is not merely a port.** The claim above that these are "the same
+three outcomes `TopupCreditResult` already models" is incomplete, because
+`status = 'pending'` is stricter than the Rust check it replaces. That check was
+
+```rust
+if status == "settled" { return AlreadySettled; }
+if amount_idr != webhook_amount_idr { return AmountMismatch; }
+// otherwise: settle it
+```
+
+— it short-circuited only on `'settled'`, so a row in **any other** state fell
+through to settlement. Two consequences:
+
+1. **A money-duplication defect, now closed.** Sequence: settle (wallet `+N`,
+   status `settled`) → refund (wallet `-N`, status `refunded`) → the original
+   *settlement* webhook is replayed. The old check saw `'refunded'`, which is not
+   `'settled'`, so it settled again: the wallet gained `N` back and the row returned
+   to `settled`. The refund was silently undone and the money existed twice. The
+   `status = 'pending'` predicate refuses this, and does so in the same shape
+   `refund_decision` already uses, where every non-`settled` status is refused.
+2. **A fourth outcome the enum could not express.** A row that exists, whose amount
+   agrees, but whose status is `denied`, `expired` or `refunded` is neither a
+   mismatch nor a replay of a *settlement*. Reporting it as `AlreadySettled` would
+   describe a refunded order as settled. `TopupCreditResult` therefore gains
+   `NotSettleable { status }`, mirroring `RefundResult::NotSettled { status }`. The
+   webhook answers **200** with a distinct body rather than the refund path's 409: a
+   non-2xx would make Midtrans retry a webhook that can never succeed, and unlike the
+   insufficient-balance case there is no operator action that would change the
+   outcome.
 
 ### 4.6 Timestamps — the hazard that would have shipped
 
@@ -489,6 +593,35 @@ preserve that property. Two candidate shapes, to be settled in the phase:
 **Either way it is one function, not a pattern.** Worth noting explicitly because
 `ip_tracking.rs` is 782 lines and only this one statement is affected — the rest of the
 file is ordinary SQL.
+
+**Executed: the first approach, as preferred.** `record_key_ip` is now two statements
+inside one `BEGIN IMMEDIATE`, with `rows_affected()` on the `key_ip_seen` insert
+supplying the 1-or-0. Measured: `rows_affected()` is 1 for a new `(key, day, ip_hash)`
+and **0** when `ON CONFLICT DO NOTHING` fires, and the sequence h1, h1, h2 yields
+`distinct_ips` 1, 1, 2 against `request_count` 1, 2, 3. Measured confirmation that the
+rewrite was necessary: the original statement is refused with
+`near "INSERT": syntax error`.
+
+The conflict target is spelled out rather than left bare — `ON CONFLICT (api_key_id,
+day, ip_hash)` matches `key_ip_seen`'s primary key, all three columns `NOT NULL` — so a
+future second unique index cannot silently capture the insert.
+
+**The same rewrite exposed an error in §4.3's wording about `usage_daily`.** That
+section says the upsert must "target **that index**", and the schema comment says
+"target it by name". SQLite has no `ON CONFLICT ON CONSTRAINT <name>` form: an index
+cannot be named, only restated. Measured against the real index
+(`usage_daily_scope_uniq (account_id, day, COALESCE(api_key_id, ''))`):
+
+| Conflict target | Result |
+| --- | --- |
+| `ON CONFLICT (account_id, api_key_id, day)` — the Postgres shape, and what the port first carried | **refused**: `ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint` |
+| `ON CONFLICT (account_id, day, COALESCE(api_key_id, ''))` | accepted; a NULL key and a real key accumulate into two separate rows |
+| `ON CONFLICT` (target omitted) | also accepted, and equivalent here since the table has one unique index |
+
+The expression form is used: it states which index is meant, where omitting the target
+would depend on the table never gaining a second one. Note the contrast with
+`key_ip_daily`, whose key is a real composite primary key and which therefore *can* use
+the plain column-list form — the two upserts in the same file legitimately differ.
 
 ### 4.8 Suspension and soft delete — already the design, with one correction
 
@@ -679,6 +812,12 @@ and in the deploy pipeline **before** the server starts
 
 ### 5.4 Phase 4 — Query port
 
+**Executed 2026-09-25 on branch `sqlite-port`.** The mechanical rules were applied
+across all 14 files, then the semantic work was done by blast radius. Final state:
+`cargo check --all-targets` clean, `cargo build --release` clean, and **no SQL-side
+`now()`, no `FOR UPDATE`, no `$N` placeholder and no `::bigint` cast** left anywhere in
+`server/src`.
+
 14 files carry SQL. Port order is by blast radius, smallest first:
 
 | Order | File | `$N` sites | Why this order |
@@ -697,6 +836,43 @@ and in the deploy pipeline **before** the server starts
 
 **Do not port `db.rs` first.** It is the file with the invariants; port it once the
 mechanical rules are already validated on cheap files.
+
+**Four things the port needed that §4.1's inventory did not name.** Each is recorded in
+full where it belongs; listed here so the phase's real size is visible:
+
+1. **Five INSERTs that relied on a removed Postgres default** — `accounts`, `wallets`,
+   `sessions`, `api_keys`, `topups` ([§4.1](#41-the-measured-port-inventory),
+   correction 1). These are the sites where "the compiler cannot see it" is literal.
+2. **A fourth `TopupCreditResult` outcome**, because the prescribed
+   `status = 'pending'` guard is stricter than the Rust check it replaces — and closing
+   that gap also closed a money-duplication defect ([§4.5](#45-the-two-for-update-sites)).
+3. **An expression conflict target for `usage_daily`**, since SQLite cannot name an
+   index in `ON CONFLICT` ([§4.7](#47-the-data-modifying-cte--one-function-must-be-rewritten)).
+4. **`db::init_pool` needed the full [§4.3](#43-connection-setup--four-traps-all-measured)
+   option set**, which §5.2's warning 2 assigns to this phase: WAL, `synchronous(Normal)`,
+   `busy_timeout(5s)`, `foreign_keys(on)`. Separately, `main.rs` still defaulted
+   `DATABASE_URL` to `postgres://postgres:postgres@localhost:5432/apikita`; that is fixed
+   to the SQLite path `.env.example` documents.
+
+**Verified by execution, not by compilation.** The ignored unit tests cannot reach this
+code — their fixtures fail first on `NOT NULL constraint failed: accounts.id`, which is
+itself the confirmation of item 1. So the ported statements were exercised directly,
+against a database produced by the real `bin/migrate`, through a harness that calls the
+real `db::*` and `ip_tracking::*` functions. **33 checks, 0 failed**, including:
+
+- `record_key_ip` on h1, h1, h2 → `distinct_ips` 1, 1, 2 against `request_count` 1, 2, 3.
+- settle → replay → refund → **replayed settlement**. The last is refused as
+  `NotSettleable`, the wallet stays at 0, and the ledger still reconciles. Under the
+  pre-port check this same sequence re-credited the wallet and undid the refund.
+- `usage_daily` accumulates a NULL-keyed and a keyed row into two separate rows with the
+  right totals; the pre-port conflict target was refused outright.
+- `balance_idr = SUM(ledger.delta_idr)` after every money step — settle, refund, hold,
+  four charges, release, and a clamped shortfall.
+- An expired session is not accepted, and the space timestamp format is refused by the
+  schema's own CHECK.
+
+The harness is a scratch instrument under `.agents/` and is deliberately not committed;
+Phase 5 is where these become real tests.
 
 ### 5.5 Phase 5 — Tests become real tests
 
@@ -990,16 +1166,16 @@ proposals.
 | 1 | Foreign keys actually on | `PRAGMA foreign_keys` → `1`; and a bad FK insert must **fail** | **probe: PASS** |
 | 2 | `NULL` `api_key_id` upsert | Two calls with `api_key_id = NULL` must yield **one** row | **probe: reproduces the bug, and the `COALESCE` index fix** |
 | 3 | Timestamp format uniformity | Every column rejects the space format; mixed-format expiry comparison must not return "still valid" | **probe: reproduces the 7.5-hour session overrun** |
-| 4 | Read-then-write under contention | Concurrent `refund_topup_transaction` calls must not raise `SQLITE_BUSY_SNAPSHOT` | new test |
-| 5 | Ledger invariant | `SELECT COUNT(*) FROM (SELECT w.account_id FROM wallets w LEFT JOIN ledger l ON l.account_id=w.account_id GROUP BY w.account_id, w.balance_idr HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr),0))` → **0**. This is Launch Gate 2 | existing query |
+| 4 | Read-then-write under contention | Concurrent `refund_topup_transaction` calls must not raise `SQLITE_BUSY_SNAPSHOT` | **shape removed by construction** — every transaction now opens with its write, under `BEGIN IMMEDIATE`. Measured: a contended `BEGIN IMMEDIATE` waits the full `busy_timeout` (5.53s) then fails `database is locked` (code 5), which is a *bounded wait*, not the unrecoverable upgrade. Phase 5 still owes a real concurrency test |
+| 5 | Ledger invariant | `SELECT COUNT(*) FROM (SELECT w.account_id FROM wallets w LEFT JOIN ledger l ON l.account_id=w.account_id GROUP BY w.account_id, w.balance_idr HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr),0))` → **0**. This is Launch Gate 2 | **harness: PASS** — asserted after settle, refund, hold, four charges, release and a clamped shortfall |
 | 6 | Stranded holds | `unpaired_hold_rows` → **0** for every account (`db.rs:1692`) | existing |
 | 7 | WAL is actually on and persists | `PRAGMA journal_mode` → `wal`, and still `wal` on a fresh connection | **probe: PASS** |
-| 8 | `::bigint` removal is safe | `typeof(SUM(col))` → `integer` for every money and token column | **probe: PASS** |
+| 8 | `::bigint` removal is safe | `typeof(SUM(col))` → `integer` for every money and token column | **PASS against the migrated schema** — 9/9 columns return `integer`, and a `REAL` column returns `real`, which is the trap the casts existed for |
 | 9 | Overdraw proof | `cargo test --lib` — the concurrency test now runs **without** `--ignored` | existing test, newly unblocked |
 | 10 | Volume permissions | The container user can create, write and reopen the DB file **on the real volume** | new, deploy-time |
 | 11 | Memory | Re-measure RSS, including the Litestream sidecar | re-run `docs/benchmark.md` |
 | 12 | Write throughput ceiling | Single-writer serialisation is the new bottleneck. Record the write rate, not just token throughput | re-run `bin/benchmark.rs` |
-| 13 | Build | `cargo check && cargo build --release` | — |
+| 13 | Build | `cargo check && cargo build --release` | **PASS** — both clean |
 | 14 | Restore drill | Restore from Litestream/backup into a clean volume and run check 5 against the restored file | Launch Gate 1 |
 
 **Run the probes first, before writing any Rust.** They take seconds and they confirm
