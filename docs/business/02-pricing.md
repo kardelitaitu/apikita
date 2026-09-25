@@ -1,9 +1,9 @@
 # 02 — Pricing & Unit Economics
 
-> **Operative margin: M = 2.00, set per model.** This document analyses both 1.50
-> and 2.00 for comparison; the decision is recorded in
-> [`docs/decisions.md`](../decisions.md). At 1.50 a 20M-token/month customer is
-> contribution-negative, which is why 2.00 is the operating value.
+> **Operative margin: M = 1.50, set per model.** The decision is recorded in
+> [`docs/decisions.md`](../decisions.md). At zero fixed infrastructure cost (free tiers),
+> M = 1.50 provides highly competitive IDR retail pricing (¥1.50 input / ¥6.00 output)
+> while remaining profitable from Customer #1.
 
 > **Correction notice (v2).** An earlier version of this document claimed that a
 > cache-heavy workload realizes ~33% margin instead of 50%, and that revenue mix
@@ -72,8 +72,7 @@ the cheap 79% — the tradeoff is recorded in `decisions.md`.
 | Output | 10,707.12 | 16,061 | 21,414 |
 | Cache read | 53.54 | 80 | 107 |
 
-**M = 2.00 is the operating value** (see `decisions.md`). At 1.50 a 20M-token/month
-customer is contribution-negative against the assumed support cost.
+**M = 1.50 is the operating value** (see `decisions.md`). It delivers attractive retail pricing in IDR while maintaining positive gross margin.
 
 ### Why the old figures were wrong, and what it changed
 

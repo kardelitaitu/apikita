@@ -42,7 +42,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Decision | Value | Rationale |
 | --- | --- | --- |
 | Margin basis | **Uniform multiplier on all token classes** | Uniform markup yields a uniform margin rate |
-| **Margin value** | **2.0 per model — no global default** | At 2.00 a chat-shaped 20M-token/month customer contributes ~55k IDR; at 1.50 only chat usage is viable and mixed is negative |
+| **Margin value** | **1.5 per model — no global default** | With zero fixed server overhead (Cloudflare & Northflank free tiers), M = 1.50 delivers competitive pricing in IDR while maintaining positive contribution |
 | Margin location | **Per model, never global** | Pro-tier output costs ~3.4x flash; one global rate cannot fit both |
 | Missing model price | **Startup error, not a default** | A silent default would bill at the wrong margin |
 | Billing periods | **Peak + off-peak, billed at peak** | Off-peak is exactly half price; pricing at peak never loses |

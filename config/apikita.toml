@@ -41,12 +41,9 @@
 # There is deliberately NO global default. Every model MUST declare its price,
 # so a missing value is a startup error rather than a silent wrong margin.
 #
-# RATIONALE FOR 2.0: at M=1.50 a 20M-token/month customer is contribution-
-# negative against the assumed support cost; M=2.00 roughly halves the volume
-# needed to break even. See docs/business/03-financial-model.md.
-#
-# OPEN: revisit downward once real support cost is measured. This is the single
-# most sensitive commercial input in the model.
+# OPERATIVE MARGIN: M = 1.50 (50% markup over wholesale cost).
+# At zero fixed server cost (Cloudflare & Northflank developer tiers), M = 1.50
+# delivers competitive pricing in IDR while remaining profitable from Customer #1.
 
 currency = "IDR"
 
@@ -268,7 +265,7 @@ max_context_tokens = 1000000
 [[models]]
 name = "flash"
 description = "Fast, low-cost general model. 1M context, vision capable."
-price = 2.0                    # markup over wholesale
+price = 1.5                    # 50% markup over wholesale (M = 1.50)
 
 max_context_tokens = 1000000
 max_output_tokens = 384000
@@ -357,7 +354,7 @@ weight = 0.0
 [[models]]
 name = "deepseek-v4-flash"
 description = "Legacy alias of flash. Identical pricing."
-price = 2.0
+price = 1.5
 
 max_context_tokens = 1000000
 max_output_tokens = 384000
@@ -387,11 +384,11 @@ concurrency_per_key = 0
 weight = 1.0
 
 # ===========================================================================
-# What a customer pays (rate x price), IDR per 1M, at the PEAK basis
+# What a customer pays (rate x price), IDR per 1M, at the PEAK basis (M = 1.50)
 # ===========================================================================
 #
-#   deepseek-flash      in 5,354    out 21,414    cache 107
-#   deepseek-v4-flash   in 5,354    out 21,414    cache 107
+#   deepseek-flash      in 4,015    out 16,061    cache 80
+#   deepseek-v4-flash   in 4,015    out 16,061    cache 80
 #
 # Both models cost the same upstream and are priced the same. The only
 # difference is the version behind the name (V4.1-Flash-0910 vs
