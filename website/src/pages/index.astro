@@ -1,9 +1,13 @@
 ---
+// CUSTOMER-FACING COPY RULE: this page states the price the customer pays and
+// the terms attached to it, and never where that price comes from — our cost
+// basis, the fixed multiplier applied to it, or that we buy capacity at a
+// discount. See docs/decisions.md.
 import Base from '../layouts/Base.astro';
 
 // Figures are transcribed from config/apikita.toml (the single source of
-// truth), at the operative margin M = 1.50, peak billing basis, IDR per 1M
-// tokens. Nothing here is estimated.
+// truth) as the rates the customer is billed, IDR per 1M tokens. Nothing here
+// is estimated.
 const rates = [
   { label: 'Input tokens', price: '4,015', note: 'Prompt tokens billed at the standard input rate.' },
   { label: 'Cache-read tokens', price: '80', note: 'Cheapest class. Reported separately, never merged with input.' },
@@ -37,11 +41,11 @@ const steps = [
 const faq = [
   {
     q: 'How is usage billed?',
-    a: 'Per token, in IDR, priced at a fixed margin of 1.50x over wholesale cost — a 50% markup. Input, cache-read and output tokens are three separate classes with three separate rates, shown above. They are never summed into one number, because cache-read is priced roughly 200x below output and a merged total could not be reconciled against an invoice.',
+    a: 'Per token, in IDR, at the rates shown above. Input, cache-read and output tokens are three separate classes with three separate rates. They are never summed into one number, because cache-read is priced roughly 200x below output and a merged total could not be reconciled against an invoice.',
   },
   {
-    q: 'Which rate applies, peak or off-peak?',
-    a: 'Requests are reserved and billed at the peak rate, so a request can never cost more than was reserved against your balance. Off-peak is exactly half of peak upstream.',
+    q: 'Does the price depend on when I call?',
+    a: 'No. Every request is reserved and billed at the rates shown above, at any hour, so a request can never cost more than was reserved against your balance.',
   },
   {
     q: 'What happens when my balance runs out?',
@@ -64,17 +68,16 @@ const faq = [
 
 <Base
   title="apikita — prepaid LLM API gateway"
-  description="One OpenAI-compatible endpoint in front of wholesale LLM capacity. Prepaid in IDR, priced at a fixed 1.50x margin over wholesale cost."
+  description="One OpenAI-compatible endpoint, prepaid in IDR. Per-token rates with no subscription, no minimum spend and no per-request fee."
 >
   <section>
     <h1 class="text-4xl font-semibold tracking-tight sm:text-5xl">
-      One OpenAI-compatible endpoint in front of wholesale LLM capacity.
+      One OpenAI-compatible endpoint, prepaid in IDR.
     </h1>
     <p class="mt-6 max-w-2xl text-lg text-ink-muted">
       apikita is a prepaid gateway. You fund a wallet in IDR, issue a key, and call
-      a single OpenAI-compatible endpoint. Pricing is a fixed 1.50x over our
-      wholesale cost — a 50% markup, applied uniformly, with no plan tiers and no
-      monthly fee.
+      a single OpenAI-compatible endpoint. You pay per token at the rates below —
+      no plan tiers, no subscription and no monthly fee.
     </p>
     <div class="mt-8 flex flex-wrap gap-4">
       <a
@@ -108,9 +111,8 @@ const faq = [
   <section id="pricing" class="mt-20 scroll-mt-8">
     <h2 class="text-2xl font-semibold tracking-tight">Pricing</h2>
     <p class="mt-3 max-w-2xl text-ink-muted">
-      IDR per 1,000,000 tokens, at the peak billing basis and the operative margin
-      M = 1.50 (a 50% markup over wholesale cost). No subscription, no minimum
-      monthly spend, no per-request fee.
+      IDR per 1,000,000 tokens, billed at the rates below. No subscription, no
+      minimum monthly spend, no per-request fee.
     </p>
 
     <table class="mt-6 w-full border-collapse text-left text-sm">
@@ -133,9 +135,8 @@ const faq = [
     </table>
 
     <p class="mt-4 text-sm text-ink-muted">
-      Available models: {models.join(', ')} — priced identically. Billing reserves
-      at the peak rate; off-peak upstream pricing is exactly half, so requests made
-      off-peak are never billed above the reservation.
+      Available models: {models.join(', ')} — priced identically. Every request is
+      reserved and billed at the rates above.
     </p>
 
     <dl class="mt-8 grid gap-4 text-sm sm:grid-cols-3">
