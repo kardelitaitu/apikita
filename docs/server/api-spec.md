@@ -32,6 +32,10 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 Keeping them distinct prevents a browser session from being usable as an API
 credential, which would let a leaked cookie spend money.
 
+**Presenting the wrong one is a bad credential, not an authorization failure:** a
+cookie on `/v1/*`, or a Bearer key on a cookie endpoint, returns 401
+`unauthenticated`. See [`docs/error-model.md`](../error-model.md).
+
 ---
 
 ## Auth

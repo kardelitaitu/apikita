@@ -41,7 +41,7 @@ matching on its text is a bug waiting to happen.
 | 402 | `insufficient_balance` | Wallet cannot cover it | Top up |
 | 402 | `key_limit_exceeded` | Key's own spend/token limit hit | Raise the limit or new key |
 | 403 | `model_not_allowed` | Model absent from the key's allowlist | Use an allowed model |
-| 403 | `wrong_credential_type` | Cookie where a key is required (or vice versa) | Use the right credential |
+| 403 | `wrong_credential_type` | **Reserved, never emitted** — a cookie on `/v1/*`, or a key on a cookie endpoint, returns 401 `unauthenticated` | Treat as 401 |
 | 404 | `not_found` | No such resource | Check the id |
 | 409 | `conflict` | Duplicate (e.g. Telegram already linked) | Reconcile state |
 | 422 | `validation_failed` | Well-formed but invalid (rating out of range) | Fix the value |
@@ -55,11 +55,20 @@ matching on its text is a bug waiting to happen.
 | --- | --- | --- |
 | No credential | 401 | Who are you? |
 | Bad credential | 401 | We cannot identify you |
+| Wrong credential type — a cookie on `/v1/*`, or a key on a cookie endpoint | 401 | Same: it is not a credential we can use |
 | Valid credential, model denied | **403** | We know you; you may not do this |
 
 **Do not return 403 for a bad key.** A valid-but-unauthorized request and an
 unauthenticated one are different, and clients handle them differently (re-login vs
 change the request).
+
+**A wrong credential type on the two API auth schemes is a bad credential, and
+returns 401.** A cookie sent to `/v1/*`, or a key sent to a cookie endpoint, fails as
+`unauthenticated`. `wrong_credential_type` stays defined and reserved, but nothing
+emits it: a 403 here would confirm to the caller — including one holding a stolen
+cookie or key — that the credential is genuine and merely misapplied, while the
+caller's next step is the same either way. One 401 for every credential failure costs
+nothing operationally and tells an attacker nothing.
 
 ## 402 vs 429 for limit exhaustion
 
