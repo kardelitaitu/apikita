@@ -11,9 +11,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use tracing::info;
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::config::{AppConfig, WalletConfig};
 use crate::error::AppError;
@@ -59,7 +60,7 @@ fn hash_string(s: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, AppError> {
+async fn resolve_account_from_cookie(pool: &SqlitePool, headers: &HeaderMap) -> Result<Uuid, AppError> {
     let cookie_hdr = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -70,14 +71,14 @@ async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Resu
         if let Some(token) = piece.strip_prefix("session=") {
             let token_hash = hash_string(token);
             let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()",
             )
             .bind(token_hash)
             .fetch_optional(pool)
             .await?;
 
             if let Some(s) = session {
-                return Ok(s.try_get("account_id")?);
+                return Ok(s.try_get::<Hyphenated, _>("account_id")?.into_uuid());
             }
         }
     }
@@ -86,20 +87,20 @@ async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Resu
 }
 
 pub async fn get_me(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
 
-    let account = sqlx::query("SELECT status FROM accounts WHERE id = $1")
-        .bind(account_id)
+    let account = sqlx::query("SELECT status FROM accounts WHERE id = ?")
+        .bind(account_id.hyphenated())
         .fetch_one(&pool)
         .await?;
 
     let status: String = account.try_get("status")?;
 
-    let wallet = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = $1")
-        .bind(account_id)
+    let wallet = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = ?")
+        .bind(account_id.hyphenated())
         .fetch_optional(&pool)
         .await?;
 
@@ -112,21 +113,21 @@ pub async fn get_me(
     let usage_today = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
-            COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
-            COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
-            COALESCE(SUM(cost_idr), 0)::bigint AS cost_idr
+            COALESCE(SUM(input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(cost_idr), 0) AS cost_idr
         FROM usage_daily
-        WHERE account_id = $1 AND day = $2
+        WHERE account_id = ? AND day = ?
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(today)
     .fetch_one(&pool)
     .await?;
 
-    let tg_link = sqlx::query("SELECT telegram_id FROM telegram_links WHERE account_id = $1")
-        .bind(account_id)
+    let tg_link = sqlx::query("SELECT telegram_id FROM telegram_links WHERE account_id = ?")
+        .bind(account_id.hyphenated())
         .fetch_optional(&pool)
         .await?;
 
@@ -145,7 +146,7 @@ pub async fn get_me(
 }
 
 pub async fn get_usage(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
@@ -154,18 +155,18 @@ pub async fn get_usage(
         r#"
         SELECT
             day,
-            SUM(input_tokens)::bigint AS input_tokens,
-            SUM(cache_read_tokens)::bigint AS cache_read_tokens,
-            SUM(output_tokens)::bigint AS output_tokens,
-            SUM(cost_idr)::bigint AS cost_idr
+            SUM(input_tokens) AS input_tokens,
+            SUM(cache_read_tokens) AS cache_read_tokens,
+            SUM(output_tokens) AS output_tokens,
+            SUM(cost_idr) AS cost_idr
         FROM usage_daily
-        WHERE account_id = $1
+        WHERE account_id = ?
         GROUP BY day
         ORDER BY day DESC
         LIMIT 30
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .fetch_all(&pool)
     .await?;
 
@@ -191,7 +192,7 @@ pub async fn get_usage(
 }
 
 pub async fn get_topups(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
     Query(query): Query<LimitQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -202,12 +203,12 @@ pub async fn get_topups(
         r#"
         SELECT id, amount_idr, order_id, status, created_at, settled_at
         FROM topups
-        WHERE account_id = $1
+        WHERE account_id = ?
         ORDER BY created_at DESC
-        LIMIT $2
+        LIMIT ?
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(limit)
     .fetch_all(&pool)
     .await?;
@@ -215,7 +216,7 @@ pub async fn get_topups(
     let result: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| -> Result<serde_json::Value, AppError> {
-            let id: Uuid = r.try_get("id")?;
+            let id: Uuid = r.try_get::<Hyphenated, _>("id")?.into_uuid();
             let amount_idr: i64 = r.try_get("amount_idr")?;
             let order_id: String = r.try_get("order_id")?;
             let status: String = r.try_get("status")?;
@@ -249,7 +250,7 @@ const SNAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 static WALLET_CONFIG: OnceLock<WalletConfig> = OnceLock::new();
 
-/// WalletConfig is not part of the router state (State<PgPool>), so the config
+/// WalletConfig is not part of the router state (State<SqlitePool>), so the config
 /// file is read once per process and cached. Same resolution order as
 /// auth::sessions_config and main.rs: APIKITA_CONFIG_PATH, then config/, then
 /// ../config/.
@@ -442,9 +443,9 @@ pub async fn create_topup(
     let wallet = wallet_config()?;
 
     let past_settled = sqlx::query(
-        "SELECT count(*) AS count FROM topups WHERE account_id = $1 AND status = 'settled'",
+        "SELECT count(*) AS count FROM topups WHERE account_id = ? AND status = 'settled'",
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .fetch_one(&state.pool)
     .await?;
 
@@ -460,8 +461,8 @@ pub async fn create_topup(
     let order_id = format!("topup_{}", topup_id);
 
     // accounts stores only the PocketBase record id; the email lives in PocketBase.
-    let pb_user_id: String = sqlx::query("SELECT pb_user_id FROM accounts WHERE id = $1")
-        .bind(account_id)
+    let pb_user_id: String = sqlx::query("SELECT pb_user_id FROM accounts WHERE id = ?")
+        .bind(account_id.hyphenated())
         .fetch_one(&state.pool)
         .await?
         .try_get("pb_user_id")?;
@@ -483,10 +484,10 @@ pub async fn create_topup(
         create_snap_transaction(&snap_http, &server_key, endpoint, &snap_payload).await?;
 
     sqlx::query(
-        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token) VALUES ($1, $2, $3, $4, 'pending', $5)",
+        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token) VALUES (?, ?, ?, ?, 'pending', ?)",
     )
-    .bind(topup_id)
-    .bind(account_id)
+    .bind(topup_id.hyphenated())
+    .bind(account_id.hyphenated())
     .bind(payload.amount_idr)
     .bind(&order_id)
     .bind(&snap_token)

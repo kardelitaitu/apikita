@@ -9,8 +9,9 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::config::{AppConfig, SessionsConfig};
 use crate::error::AppError;
@@ -20,7 +21,7 @@ use crate::error::AppError;
 const SESSION_COOKIE: &str = "session";
 
 /// PocketBase collection whose auth tokens are accepted. Identity lives in
-/// PocketBase; Postgres holds only the pb_user_id reference
+/// PocketBase; Sqlite holds only the pb_user_id reference
 /// (docs/architecture/identity.md).
 const PB_USERS_COLLECTION: &str = "users";
 
@@ -140,7 +141,7 @@ async fn verify_pb_token(token: &str) -> Result<String, AppError> {
 
 static SESSIONS_CONFIG: OnceLock<SessionsConfig> = OnceLock::new();
 
-/// SessionsConfig is not part of the router state (State<PgPool>), so the config
+/// SessionsConfig is not part of the router state (State<SqlitePool>), so the config
 /// file is read once per process and cached. Same resolution order as main.rs:
 /// APIKITA_CONFIG_PATH, then config/, then ../config/.
 fn sessions_config() -> Result<&'static SessionsConfig, AppError> {
@@ -192,7 +193,7 @@ fn session_token_from_cookie_header(cookie_header: &str) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 pub async fn exchange_token(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
     Json(payload): Json<AuthExchangeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -210,7 +211,7 @@ pub async fn exchange_token(
     let account = sqlx::query(
         r#"
         INSERT INTO accounts (pb_user_id)
-        VALUES ($1)
+        VALUES (?)
         ON CONFLICT (pb_user_id) DO UPDATE SET updated_at = now()
         RETURNING id, status
         "#,
@@ -219,7 +220,7 @@ pub async fn exchange_token(
     .fetch_one(&mut *tx)
     .await?;
 
-    let account_id: Uuid = account.get("id");
+    let account_id: Uuid = account.get::<Hyphenated, _>("id").into_uuid();
     let account_status: String = account.get("status");
 
     if account_status != "active" {
@@ -229,20 +230,20 @@ pub async fn exchange_token(
     let wallet = sqlx::query(
         r#"
         INSERT INTO wallets (account_id, balance_idr)
-        VALUES ($1, 0)
+        VALUES (?, 0)
         ON CONFLICT (account_id) DO NOTHING
         RETURNING balance_idr
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .fetch_optional(&mut *tx)
     .await?;
 
     let balance_idr = match wallet {
         Some(w) => w.get("balance_idr"),
         None => {
-            let existing = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            let existing = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&mut *tx)
                 .await?;
             existing.get("balance_idr")
@@ -261,9 +262,9 @@ pub async fn exchange_token(
         .map(|s| s.to_string());
 
     sqlx::query(
-        "INSERT INTO sessions (account_id, token_hash, expires_at, user_agent) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO sessions (account_id, token_hash, expires_at, user_agent) VALUES (?, ?, ?, ?)",
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(token_hash)
     .bind(expires_at)
     .bind(user_agent)
@@ -287,7 +288,7 @@ pub async fn exchange_token(
 /// Revoke the current session row. A failed revoke is reported rather than
 /// swallowed: the cookie is only cleared once the row is actually dead.
 pub async fn logout(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     if let Some(token) = headers
@@ -296,7 +297,7 @@ pub async fn logout(
         .and_then(session_token_from_cookie_header)
     {
         sqlx::query(
-            "UPDATE sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
+            "UPDATE sessions SET revoked_at = now() WHERE token_hash = ? AND revoked_at IS NULL",
         )
         .bind(hash_token(token))
         .execute(&pool)
@@ -309,7 +310,7 @@ pub async fn logout(
 /// Revoke every live session for the account - other devices are logged out
 /// immediately (docs/server/api-spec.md, auth).
 pub async fn logout_all(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     if let Some(token) = headers
@@ -318,18 +319,18 @@ pub async fn logout_all(
         .and_then(session_token_from_cookie_header)
     {
         let session = sqlx::query(
-            "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+            "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()",
         )
         .bind(hash_token(token))
         .fetch_optional(&pool)
         .await?;
 
         if let Some(s) = session {
-            let account_id: Uuid = s.get("account_id");
+            let account_id: Uuid = s.get::<Hyphenated, _>("account_id").into_uuid();
             sqlx::query(
-                "UPDATE sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
+                "UPDATE sessions SET revoked_at = now() WHERE account_id = ? AND revoked_at IS NULL",
             )
-            .bind(account_id)
+            .bind(account_id.hyphenated())
             .execute(&pool)
             .await?;
         }
@@ -424,7 +425,7 @@ mod tests {
 
     #[test]
     fn session_hash_is_sha256_hex_and_never_the_token() {
-        // Only the hash reaches Postgres; the cookie value never does.
+        // Only the hash reaches Sqlite; the cookie value never does.
         assert_eq!(
             hash_token("apk_sess_abc"),
             "c943c9214781fe698239bd2827dda2ed0fd7c0c746cd3ab44785da20083a1a9e"

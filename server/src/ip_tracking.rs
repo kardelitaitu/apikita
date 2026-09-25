@@ -34,7 +34,7 @@ use chrono::{NaiveDate, Utc};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use std::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -181,7 +181,7 @@ pub fn ip_hash(salt: &[u8], ip: &std::net::IpAddr) -> String {
 ///
 /// Returns the counts as they stand AFTER this request.
 pub async fn record_key_ip(
-    pool: &PgPool,
+    pool: &SqlitePool,
     key_id: Uuid,
     day: NaiveDate,
     ip_hash: &str,
@@ -204,7 +204,7 @@ pub async fn record_key_ip(
                                  + (SELECT COUNT(*) FROM inserted)::integer
          RETURNING distinct_ips, request_count",
     )
-    .bind(key_id)
+    .bind(key_id.hyphenated())
     .bind(day)
     .bind(ip_hash)
     .fetch_one(pool)
@@ -254,17 +254,17 @@ pub struct PurgedRows {
 /// Run nightly. Nothing calls this per-request — deleting on the hot path
 /// would add a second write to every proxied request to do work that has to
 /// happen once a day.
-pub async fn purge_expired(pool: &PgPool, today: NaiveDate) -> Result<PurgedRows, AppError> {
+pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<PurgedRows, AppError> {
     let seen_cutoff = today - chrono::Duration::days(SEEN_RETENTION_DAYS);
     let daily_cutoff = today - chrono::Duration::days(DAILY_RETENTION_DAYS);
 
-    let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day < $1")
+    let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day < ?")
         .bind(seen_cutoff)
         .execute(pool)
         .await?
         .rows_affected();
 
-    let daily = sqlx::query("DELETE FROM key_ip_daily WHERE day < $1")
+    let daily = sqlx::query("DELETE FROM key_ip_daily WHERE day < ?")
         .bind(daily_cutoff)
         .execute(pool)
         .await?
@@ -642,32 +642,32 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Live Postgres. Ignored rather than silently skipped: a test that asserts
+    // Live Sqlite. Ignored rather than silently skipped: a test that asserts
     // nothing is worse than no test.
     //
     //   DATABASE_URL=... cargo test --lib ip_tracking:: -- --ignored
     // -----------------------------------------------------------------------
 
-    async fn test_pool() -> PgPool {
+    async fn test_pool() -> SqlitePool {
         let database_url =
-            std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated Postgres instance");
-        crate::db::init_pool(&database_url).await.expect("connect to Postgres")
+            std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated Sqlite instance");
+        crate::db::init_pool(&database_url).await.expect("connect to Sqlite")
     }
 
     /// A key needs an account. Returns (account_id, key_id).
-    async fn create_key(pool: &PgPool) -> (Uuid, Uuid) {
+    async fn create_key(pool: &SqlitePool) -> (Uuid, Uuid) {
         let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
         let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES (?) RETURNING id")
                 .bind(&pb_user_id)
                 .fetch_one(pool)
                 .await
                 .expect("create account");
 
         let key_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES ($1, $2, 'apk_test') RETURNING id",
+            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES (?, ?, 'apk_test') RETURNING id",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
         .fetch_one(pool)
         .await
@@ -676,24 +676,24 @@ mod tests {
         (account_id, key_id)
     }
 
-    async fn delete_fixture(pool: &PgPool, account_id: Uuid) {
+    async fn delete_fixture(pool: &SqlitePool, account_id: Uuid) {
         // Children first: both IP tables reference api_keys, which references
         // accounts, and api_keys is ON DELETE CASCADE from accounts.
         for statement in [
-            "DELETE FROM key_ip_seen WHERE api_key_id IN (SELECT id FROM api_keys WHERE account_id = $1)",
-            "DELETE FROM key_ip_daily WHERE api_key_id IN (SELECT id FROM api_keys WHERE account_id = $1)",
-            "DELETE FROM api_keys WHERE account_id = $1",
-            "DELETE FROM accounts WHERE id = $1",
+            "DELETE FROM key_ip_seen WHERE api_key_id IN (SELECT id FROM api_keys WHERE account_id = ?)",
+            "DELETE FROM key_ip_daily WHERE api_key_id IN (SELECT id FROM api_keys WHERE account_id = ?)",
+            "DELETE FROM api_keys WHERE account_id = ?",
+            "DELETE FROM accounts WHERE id = ?",
         ] {
             sqlx::query(statement)
-                .bind(account_id)
+                .bind(account_id.hyphenated())
                 .execute(pool)
                 .await
                 .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
         }
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_repeat_ip_counts_once_and_a_new_ip_counts_twice() {
         let pool = test_pool().await;
@@ -731,7 +731,7 @@ mod tests {
         delete_fixture(&pool, account_id).await;
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_purge_keeps_the_window_and_removes_what_is_past_it() {
         let pool = test_pool().await;
@@ -767,8 +767,8 @@ mod tests {
         assert!(purged.daily >= 1, "the row past 90 days must go");
 
         let remaining_seen: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM key_ip_seen WHERE api_key_id = $1")
-                .bind(key_id)
+            sqlx::query_scalar("SELECT COUNT(*) FROM key_ip_seen WHERE api_key_id = ?")
+                .bind(key_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count remaining hashes");

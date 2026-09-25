@@ -22,7 +22,7 @@
 //! this module holds no state and no second view of the configuration.
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -102,7 +102,7 @@ fn cap_outcome(
 /// `created_at` columns; it is never request-derived, which is what makes the
 /// interpolation below safe. `limit` comes from the caller's config.
 pub async fn enforce_creation_cap(
-    pool: &PgPool,
+    pool: &SqlitePool,
     table: &'static str,
     window: Duration,
     limit: u32,
@@ -110,12 +110,12 @@ pub async fn enforce_creation_cap(
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     let sql = format!(
-        "SELECT COUNT(*)::bigint AS used, MIN(created_at) AS oldest \
-         FROM {table} WHERE account_id = $1 AND created_at >= $2"
+        "SELECT COUNT(*) AS used, MIN(created_at) AS oldest \
+         FROM {table} WHERE account_id = ? AND created_at >= ?"
     );
 
     let row = sqlx::query(&sql)
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .bind(now - window)
         .fetch_one(pool)
         .await?;
@@ -206,7 +206,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Live Postgres. Ignored rather than silently skipped, exactly like the
+    // Live Sqlite. Ignored rather than silently skipped, exactly like the
     // settlement tests in `db.rs`: a test that asserts nothing is worse than no
     // test.
     //
@@ -226,17 +226,17 @@ mod tests {
         panic!("could not find apikita.toml for testing");
     }
 
-    async fn test_pool() -> PgPool {
+    async fn test_pool() -> SqlitePool {
         let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
+            .expect("set DATABASE_URL to a migrated Sqlite instance");
         crate::db::init_pool(&database_url)
             .await
-            .expect("connect to Postgres")
+            .expect("connect to Sqlite")
     }
 
-    async fn create_account(pool: &PgPool) -> Uuid {
+    async fn create_account(pool: &SqlitePool) -> Uuid {
         let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES (?) RETURNING id")
             .bind(&pb_user_id)
             .fetch_one(pool)
             .await
@@ -245,30 +245,30 @@ mod tests {
 
     /// Deletes every row the fixture created, in FK order: `topups` references
     /// `accounts` ON DELETE RESTRICT, so the children go first.
-    async fn delete_fixture(pool: &PgPool, account_id: Uuid) {
+    async fn delete_fixture(pool: &SqlitePool, account_id: Uuid) {
         for statement in [
-            "DELETE FROM topups WHERE account_id = $1",
-            "DELETE FROM api_keys WHERE account_id = $1",
-            "DELETE FROM accounts WHERE id = $1",
+            "DELETE FROM topups WHERE account_id = ?",
+            "DELETE FROM api_keys WHERE account_id = ?",
+            "DELETE FROM accounts WHERE id = ?",
         ] {
             sqlx::query(statement)
-                .bind(account_id)
+                .bind(account_id.hyphenated())
                 .execute(pool)
                 .await
                 .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
         }
     }
 
-    async fn insert_topup(pool: &PgPool, account_id: Uuid) {
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, 10000, $2)")
-            .bind(account_id)
+    async fn insert_topup(pool: &SqlitePool, account_id: Uuid) {
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES (?, 10000, ?)")
+            .bind(account_id.hyphenated())
             .bind(format!("test_cap_{}", Uuid::new_v4().simple()))
             .execute(pool)
             .await
             .expect("insert topup");
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_topup_cap_lets_the_limit_through_and_refuses_the_next() {
         let pool = test_pool().await;
@@ -306,9 +306,9 @@ mod tests {
 
         // A row older than the window no longer counts, so the cap frees.
         sqlx::query(
-            "UPDATE topups SET created_at = now() - interval '2 hours' WHERE account_id = $1",
+            "UPDATE topups SET created_at = now() - interval '2 hours' WHERE account_id = ?",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .execute(&pool)
         .await
         .expect("age the rows out of the window");
@@ -330,7 +330,7 @@ mod tests {
         delete_fixture(&pool, account_id).await;
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[ignore = "requires live Sqlite: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_key_creation_cap_refuses_past_the_configured_daily_limit() {
         let pool = test_pool().await;
@@ -341,9 +341,9 @@ mod tests {
         let now = Utc::now();
         for _ in 0..limit {
             sqlx::query(
-                "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES ($1, $2, 'apk_test')",
+                "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES (?, ?, 'apk_test')",
             )
-            .bind(account_id)
+            .bind(account_id.hyphenated())
             .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
             .execute(&pool)
             .await

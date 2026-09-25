@@ -5,7 +5,7 @@ use axum::{
 };
 use futures_util::{stream, Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
@@ -17,6 +17,7 @@ use std::{
 };
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::config::RealtimeConfig;
 use crate::error::AppError;
@@ -328,19 +329,19 @@ pub fn publish_key_update(
 /// The stream carries totals rather than deltas (docs/realtime.md:93), so a
 /// lost event self-heals: the next one carries the whole value regardless of
 /// what was missed.
-pub async fn todays_usage(pool: &PgPool, account_id: Uuid) -> Result<UsageDelta, AppError> {
+pub async fn todays_usage(pool: &SqlitePool, account_id: Uuid) -> Result<UsageDelta, AppError> {
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
-            COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
-            COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
-            COALESCE(SUM(cost_idr), 0)::bigint AS cost_idr
+            COALESCE(SUM(input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(cost_idr), 0) AS cost_idr
         FROM usage_daily
-        WHERE account_id = $1 AND day = $2
+        WHERE account_id = ? AND day = ?
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(chrono::Utc::now().date_naive())
     .fetch_one(pool)
     .await?;
@@ -359,7 +360,7 @@ fn hash_string(s: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, AppError> {
+async fn resolve_account_from_cookie(pool: &SqlitePool, headers: &HeaderMap) -> Result<Uuid, AppError> {
     let cookie_hdr = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -370,14 +371,14 @@ async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Resu
         if let Some(token) = piece.strip_prefix("session=") {
             let token_hash = hash_string(token);
             let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()",
             )
             .bind(token_hash)
             .fetch_optional(pool)
             .await?;
 
             if let Some(s) = session {
-                return Ok(s.try_get("account_id")?);
+                return Ok(s.try_get::<Hyphenated, _>("account_id")?.into_uuid());
             }
         }
     }
@@ -441,8 +442,8 @@ pub async fn sse_events_handler(
     let snapshot = todays_usage(&state.pool, account_id).await?;
 
     let balance_idr: i64 =
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-            .bind(account_id)
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_optional(&state.pool)
             .await?
             .unwrap_or(0);

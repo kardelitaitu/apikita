@@ -7,6 +7,7 @@ use serde_json::json;
 use std::env;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::db::{
     credit_topup_transaction, refund_topup_transaction, RefundResult, TopupCreditResult,
@@ -29,13 +30,15 @@ fn error_body(code: &str, message: &str) -> Json<serde_json::Value> {
 /// per-account subscriber filter in events.rs (DEFECT 1) silently drops it.
 /// This cannot fail the webhook: the money is already settled, and a missing
 /// account_id only means the dashboard waits for its next snapshot.
-async fn topup_account_id(pool: &sqlx::PgPool, order_id: &str) -> Option<Uuid> {
-    sqlx::query_scalar::<_, Uuid>("SELECT account_id FROM topups WHERE order_id = $1")
+async fn topup_account_id(pool: &sqlx::SqlitePool, order_id: &str) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Hyphenated>("SELECT account_id FROM topups WHERE order_id = ?")
         .bind(order_id)
         .fetch_optional(pool)
         .await
         .ok()
         .flatten()
+        // `Hyphenated` is how a TEXT uuid column comes back; the callers want a Uuid.
+        .map(|h| h.into_uuid())
 }
 
 /// The balance to announce for a topup credit outcome, or None when nothing
@@ -65,7 +68,7 @@ pub async fn handle_midtrans_webhook(
     Json(payload): Json<MidtransNotification>,
 ) -> impl IntoResponse {
     // The handler works on the pool throughout; only the realtime publish needs
-    // the hub, which is why the extractor is AppState rather than PgPool.
+    // the hub, which is why the extractor is AppState rather than SqlitePool.
     let pool = &state.pool;
     let server_key = match env::var("MIDTRANS_SERVER_KEY") {
         Ok(k) => k,
@@ -284,7 +287,7 @@ pub async fn handle_midtrans_webhook(
 
             // The write is NOT swallowed: a failed persist must not answer 200.
             match sqlx::query(
-                "UPDATE topups SET status = $1 WHERE order_id = $2 AND status = 'pending'",
+                "UPDATE topups SET status = ? WHERE order_id = ? AND status = 'pending'",
             )
             .bind(status)
             .bind(&payload.order_id)

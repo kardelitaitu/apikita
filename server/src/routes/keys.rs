@@ -8,9 +8,10 @@ use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use std::collections::HashMap;
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::error::AppError;
 use crate::routes::proxy::{invalidate_key_cache, AppState};
@@ -112,20 +113,20 @@ fn fold_spend_in_window(rows: &[(Uuid, NaiveDate, i64)], today: NaiveDate) -> Ha
 /// disagreeing, and a key showing "limit reached" that still gets served is
 /// precisely the defect this closes.
 pub(crate) async fn key_spend_used(
-    pool: &PgPool,
+    pool: &SqlitePool,
     account_id: Uuid,
     key_id: Uuid,
     today: NaiveDate,
 ) -> Result<i64, AppError> {
     let used: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT SUM(cost_idr)::bigint
+        SELECT SUM(cost_idr)
         FROM usage_daily
-        WHERE account_id = $1 AND api_key_id = $2 AND day >= $3
+        WHERE account_id = ? AND api_key_id = ? AND day >= ?
         "#,
     )
-    .bind(account_id)
-    .bind(key_id)
+    .bind(account_id.hyphenated())
+    .bind(key_id.hyphenated())
     .bind(spend_window_start(today))
     .fetch_one(pool)
     .await?;
@@ -146,20 +147,20 @@ pub(crate) async fn key_spend_used(
 /// still tokens consumed, and `usage_daily` is the only place the request path
 /// records them.
 pub(crate) async fn key_tokens_used(
-    pool: &PgPool,
+    pool: &SqlitePool,
     account_id: Uuid,
     key_id: Uuid,
     today: NaiveDate,
 ) -> Result<i64, AppError> {
     let used: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT SUM(input_tokens + cache_read_tokens + output_tokens)::bigint
+        SELECT SUM(input_tokens + cache_read_tokens + output_tokens)
         FROM usage_daily
-        WHERE account_id = $1 AND api_key_id = $2 AND day >= $3
+        WHERE account_id = ? AND api_key_id = ? AND day >= ?
         "#,
     )
-    .bind(account_id)
-    .bind(key_id)
+    .bind(account_id.hyphenated())
+    .bind(key_id.hyphenated())
     .bind(spend_window_start(today))
     .fetch_one(pool)
     .await?;
@@ -187,7 +188,7 @@ fn check_spend_limit(requested_idr: i64, spend_used_idr: i64) -> Result<(), AppE
     Ok(())
 }
 
-async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, AppError> {
+async fn resolve_account_from_cookie(pool: &SqlitePool, headers: &HeaderMap) -> Result<Uuid, AppError> {
     let cookie_hdr = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -198,14 +199,14 @@ async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Resu
         if let Some(token) = piece.strip_prefix("session=") {
             let token_hash = hash_string(token);
             let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()",
             )
             .bind(token_hash)
             .fetch_optional(pool)
             .await?;
 
             if let Some(s) = session {
-                return Ok(s.get("account_id"));
+                return Ok(s.get::<Hyphenated, _>("account_id").into_uuid());
             }
         }
     }
@@ -214,7 +215,7 @@ async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Resu
 }
 
 pub async fn list_keys(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
@@ -225,11 +226,11 @@ pub async fn list_keys(
             id, prefix, label, models, spend_limit_idr, rate_limit_rpm,
             expires_at, last_used_at, revoked_at
         FROM api_keys
-        WHERE account_id = $1
+        WHERE account_id = ?
         ORDER BY created_at DESC
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .fetch_all(&pool)
     .await?;
 
@@ -240,10 +241,10 @@ pub async fn list_keys(
         r#"
         SELECT api_key_id, day, cost_idr
         FROM usage_daily
-        WHERE account_id = $1 AND api_key_id IS NOT NULL AND day >= $2
+        WHERE account_id = ? AND api_key_id IS NOT NULL AND day >= ?
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(spend_window_start(today))
     .fetch_all(&pool)
     .await?;
@@ -251,7 +252,7 @@ pub async fn list_keys(
     let usage: Vec<(Uuid, NaiveDate, i64)> = usage_rows
         .into_iter()
         .map(|r| {
-            let key_id: Uuid = r.get("api_key_id");
+            let key_id: Uuid = r.get::<Hyphenated, _>("api_key_id").into_uuid();
             let day: NaiveDate = r.get("day");
             let cost_idr: i64 = r.get("cost_idr");
             (key_id, day, cost_idr)
@@ -262,7 +263,7 @@ pub async fn list_keys(
     let response: Vec<ApiKeyDto> = keys
         .into_iter()
         .map(|k| {
-            let id: Uuid = k.get("id");
+            let id: Uuid = k.get::<Hyphenated, _>("id").into_uuid();
             ApiKeyDto {
                 id,
                 prefix: k.get("prefix"),
@@ -326,11 +327,11 @@ pub async fn create_key(
             account_id, key_hash, prefix, label, models,
             spend_limit_idr, token_limit, rate_limit_rpm, expires_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(key_hash)
     .bind(&prefix)
     .bind(payload.label)
@@ -342,7 +343,7 @@ pub async fn create_key(
     .fetch_one(&state.pool)
     .await?;
 
-    let id: Uuid = key_record.get("id");
+    let id: Uuid = key_record.get::<Hyphenated, _>("id").into_uuid();
 
     Ok((
         StatusCode::CREATED,
@@ -379,13 +380,13 @@ pub async fn update_key(
         r#"
         UPDATE api_keys
         SET
-            label = COALESCE($1, label),
-            models = COALESCE($2, models),
-            spend_limit_idr = COALESCE($3, spend_limit_idr),
-            token_limit = COALESCE($4, token_limit),
-            rate_limit_rpm = COALESCE($5, rate_limit_rpm),
-            expires_at = COALESCE($6, expires_at)
-        WHERE id = $7 AND account_id = $8 AND revoked_at IS NULL
+            label = COALESCE(?, label),
+            models = COALESCE(?, models),
+            spend_limit_idr = COALESCE(?, spend_limit_idr),
+            token_limit = COALESCE(?, token_limit),
+            rate_limit_rpm = COALESCE(?, rate_limit_rpm),
+            expires_at = COALESCE(?, expires_at)
+        WHERE id = ? AND account_id = ? AND revoked_at IS NULL
         RETURNING key_hash
         "#,
     )
@@ -395,8 +396,8 @@ pub async fn update_key(
     .bind(payload.token_limit)
     .bind(payload.rate_limit_rpm)
     .bind(payload.expires_at)
-    .bind(id)
-    .bind(account_id)
+    .bind(id.hyphenated())
+    .bind(account_id.hyphenated())
     .fetch_optional(&state.pool)
     .await?;
 
@@ -430,12 +431,12 @@ pub async fn revoke_key(
     let revoked_hash: Option<String> = sqlx::query_scalar(
         r#"
         UPDATE api_keys SET revoked_at = now()
-        WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
+        WHERE id = ? AND account_id = ? AND revoked_at IS NULL
         RETURNING key_hash
         "#,
     )
-    .bind(id)
-    .bind(account_id)
+    .bind(id.hyphenated())
+    .bind(account_id.hyphenated())
     .fetch_optional(&state.pool)
     .await?;
 

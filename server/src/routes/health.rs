@@ -4,9 +4,9 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::SqlitePool;
 
-pub async fn health_check(State(pool): State<PgPool>) -> impl IntoResponse {
+pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
     match sqlx::query("SELECT 1").execute(&pool).await {
         Ok(_) => (
             StatusCode::OK,

@@ -7,7 +7,7 @@ use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -16,6 +16,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::config::AppConfig;
 use crate::db::{
@@ -36,7 +37,7 @@ use crate::upstream::{parse_usage_from_sse, UpstreamClient, UpstreamError, Upstr
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: PgPool,
+    pub pool: SqlitePool,
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
     /// The realtime fan-out behind `GET /events`.
@@ -77,7 +78,7 @@ fn record_request_source(state: &AppState, key_id: Uuid, peer: SocketAddr, heade
     });
 }
 
-impl axum::extract::FromRef<AppState> for PgPool {
+impl axum::extract::FromRef<AppState> for SqlitePool {
     fn from_ref(state: &AppState) -> Self {
         state.pool.clone()
     }
@@ -100,7 +101,7 @@ impl axum::extract::FromRef<AppState> for PgPool {
 /// `defuse` once the debit has committed - the exact moment the money is already
 /// back in the wallet.
 struct ReservationGuard {
-    pool: PgPool,
+    pool: SqlitePool,
     account_id: Uuid,
     reserved_idr: i64,
     reservation_ref: String,
@@ -110,7 +111,7 @@ struct ReservationGuard {
 
 impl ReservationGuard {
     fn new(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         reserved_idr: i64,
         reservation_ref: &str,
@@ -502,7 +503,7 @@ fn key_cache(config: &AppConfig) -> &'static Mutex<KeyCache> {
 /// amplifier by spraying made-up tokens.
 async fn load_key_metadata(
     cache: &Mutex<KeyCache>,
-    pool: &PgPool,
+    pool: &SqlitePool,
     key_hash: &str,
 ) -> Result<KeyMetadata, AppError> {
     // The guard is scoped so the std Mutex is never held across the await below.
@@ -519,7 +520,7 @@ async fn load_key_metadata(
         SELECT id, account_id, models, spend_limit_idr, token_limit, rate_limit_rpm,
                expires_at, revoked_at
         FROM api_keys
-        WHERE key_hash = $1
+        WHERE key_hash = ?
         "#,
     )
     .bind(key_hash)
@@ -531,8 +532,8 @@ async fn load_key_metadata(
     };
 
     let meta = KeyMetadata {
-        key_id: row.get("id"),
-        account_id: row.get("account_id"),
+        key_id: row.get::<Hyphenated, _>("id").into_uuid(),
+        account_id: row.get::<Hyphenated, _>("account_id").into_uuid(),
         models: row.get("models"),
         spend_limit_idr: row.get("spend_limit_idr"),
         token_limit: row.get("token_limit"),
@@ -1224,7 +1225,7 @@ fn settlement_plan(usage: Option<Usage>) -> SettlementPlan {
 #[allow(clippy::too_many_arguments)]
 async fn settle_after_stream(
     end: tokio::sync::oneshot::Receiver<StreamEnd>,
-    pool: PgPool,
+    pool: SqlitePool,
     config: Arc<AppConfig>,
     events: Arc<RealtimeHub>,
     account_id: Uuid,
@@ -1379,7 +1380,7 @@ async fn settle_after_stream(
                 Ok(totals) => publish_usage(&events, account_id, totals),
                 // A decode/aggregate failure here is not cosmetic: it silently
                 // drops the usage event subscribers rely on, and a type mismatch
-                // (Postgres returns NUMERIC for SUM(bigint) while the row is
+                // (Sqlite returns NUMERIC for SUM(bigint) while the row is
                 // decoded into i64) is exactly how that went unnoticed. Loud, with
                 // the account and the model, so it is diagnosable from the log.
                 Err(err) => error!(
@@ -1428,7 +1429,7 @@ async fn settle_after_stream(
                 Ok(totals) => publish_usage(&events, account_id, totals),
                 // A decode/aggregate failure here is not cosmetic: it silently
                 // drops the usage event subscribers rely on, and a type mismatch
-                // (Postgres returns NUMERIC for SUM(bigint) while the row is
+                // (Sqlite returns NUMERIC for SUM(bigint) while the row is
                 // decoded into i64) is exactly how that went unnoticed. Loud, with
                 // the account and the model, so it is diagnosable from the log.
                 Err(err) => error!(
@@ -1464,7 +1465,7 @@ async fn settle_after_stream(
 /// request that was never billed — the mirror image of the defect this fix closes
 /// — so a failure is loud even though the client is long gone.
 async fn release_quietly(
-    pool: &PgPool,
+    pool: &SqlitePool,
     account_id: Uuid,
     reserved_idr: i64,
     reservation_ref: &str,
