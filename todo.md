@@ -2,9 +2,11 @@
 
 The living development roadmap for the ApiKita high-throughput LLM arbitrage proxy gateway.
 
+> **Execution Directive:** Everything is developed and tested **locally first** (Web + Server + Edge Relay + Database + Fakes). **Midtrans payments are implemented last.**
+
 ---
 
-## Phase 0: Groundwork & Specification
+## Phase 0: Groundwork & Specification (Complete)
 
 - [x] **Documentation & Architecture**
   - [x] Settle core decisions register ([`docs/decisions.md`](docs/decisions.md))
@@ -29,7 +31,23 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 
 ---
 
-## Phase 1: Real Upstream Proxy Streaming Engine (`server/`)
+## Phase 1: Local Stack & Testing Fakes Setup
+
+- [ ] **Docker Compose Local Environment (`docker-compose.yml`)**
+  - [ ] PostgreSQL 16 container on port `5432` with automatic migration runner
+  - [ ] PocketBase container on port `8090` (identity only)
+  - [ ] Nginx Edge Relay container on port `8000` (proxying to server `8080`, with `proxy_buffering off` on `/events` and `/v1/*`)
+- [ ] **Fake Upstream Provider Service**
+  - [ ] Local mock server speaking OpenAI `/v1/chat/completions` SSE streaming format
+  - [ ] Configurable test triggers via headers:
+    - [ ] Happy path streaming (canned tokens at 30 tok/sec)
+    - [ ] HTTP 429 rate limit injection (to test key cooldown)
+    - [ ] Mid-stream abrupt disconnection (to test unbilled wastage handling)
+    - [ ] HTTP 500 error (to test circuit breaker trip)
+
+---
+
+## Phase 2: Rust Server Core & Streaming Pipeline (`server/`)
 
 - [ ] **100-Key Pool Router & Load Balancer**
   - [ ] Implement atomic least-loaded key selection (`min_by_key(|k| k.in_flight)`)
@@ -48,43 +66,17 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [ ] Parse usage summary from final SSE chunk
   - [ ] Execute atomic usage settlement (`debit_usage_transaction`) on stream completion
   - [ ] Ensure mid-stream errors do not retry silently
-
----
-
-## Phase 2: Session Auth & Realtime SSE
-
-- [ ] **PocketBase Auth Integration**
-  - [ ] Wire `POST /auth/exchange` to verify PocketBase JWTs via internal REST call
-  - [ ] Upsert `accounts(pb_user_id)` and initialize default wallet
-  - [ ] Issue opaque session cookie (`session=<token>; HttpOnly; Secure; SameSite=Lax`)
+- [ ] **Session Auth & Realtime Event Stream**
+  - [ ] Wire `POST /auth/exchange` to verify PocketBase JWTs and issue cookie
   - [ ] Implement session revocation on `POST /auth/logout` and `POST /auth/logout-all`
-- [ ] **Realtime Event Bus (`GET /events`)**
-  - [ ] Create `tokio::sync::broadcast` channel for account updates
-  - [ ] Emit absolute `balance` events on webhook credit and proxy usage settlement
-  - [ ] Emit heartbeat `: heartbeat` every 20 seconds to prevent Cloudflare drops
-  - [ ] Replay buffer for reconnecting clients (`Last-Event-ID`)
+  - [ ] Realtime SSE stream (`GET /events`) with heartbeat and live balance broadcast
 
 ---
 
-## Phase 3: Payments & Midtrans Sandbox
+## Phase 3: Web Dashboard (`website/` Astro + Islands)
 
-- [ ] **Midtrans Snap Client**
-  - [ ] Implement `POST /api/topups` calling Midtrans Snap API (`/snap/v1/transactions`)
-  - [ ] Enforce deposit limits (50k IDR initial, 10k IDR subsequent)
-  - [ ] Generate unique `order_id = "topup_<uuid>"`
-- [ ] **Webhook Handler (`POST /webhooks/midtrans`)**
-  - [ ] Verify SHA-512 constant-time signature
-  - [ ] Validate amount against stored `topups` row
-  - [ ] Row-level lock (`SELECT ... FOR UPDATE`) for idempotency
-  - [ ] Handle `settlement`/`capture` (credit) and `refund`/`partial_refund` (debit)
-  - [ ] Integration test suite for webhook replay protection
-
----
-
-## Phase 4: Astro Dashboard & Frontend (`website/`)
-
-- [ ] **Static Shell (Astro + Tailwind CSS)**
-  - [ ] Landing page with pricing table and transparent wholesale margin disclosure
+- [ ] **Static Marketing Shell (Astro + Tailwind CSS)**
+  - [ ] Landing page with pricing table ($M = 1.50$ rates)
   - [ ] Quick-start developer guide & cURL examples
   - [ ] Zero JavaScript payload on marketing pages
 - [ ] **Interactive Client Islands**
@@ -94,33 +86,41 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [ ] API Key Management island:
     - [ ] Create key modal with show-once plaintext key and copy button
     - [ ] Key list with prefix, labels, 30-day spend limits, and revoke actions
-  - [ ] Wallet island:
-    - [ ] Top-up amount selector (preset buttons 50k, 100k, 250k, 500k)
-    - [ ] Midtrans Snap.js popup checkout integration
-    - [ ] Recent transactions and deposit history table
   - [ ] Usage Analytics island:
     - [ ] 3-counter daily breakdown (Standard Input, Cache Read, Output tokens)
 
 ---
 
-## Phase 5: Telegram Bot & Community (`telegram/`)
+## Phase 4: Local End-to-End Integration Validation
 
-- [ ] **Account Linking**
-  - [ ] Website: `POST /api/telegram/link-code` (6-digit, 5-minute TTL)
-  - [ ] Bot: `/link <code>` redeeming via internal `POST /api/bot/link` with bot token
-  - [ ] Atomic re-attribution of pre-link reviews on account binding
-- [ ] **Customer Commands & Notifications**
-  - [ ] `/balance` and `/usage` commands
-  - [ ] Automated low-balance DM (<10,000 IDR, max 1/day)
-  - [ ] Anonymous top-up channel feed (`POST /api/bot/notify-topup` with masked emails)
-- [ ] **Review Flow**
-  - [ ] Interactive bot review conversation (rating 1–5, optional body $\le 1000$ chars)
-  - [ ] Edit history tracking in `review_history`
-  - [ ] Public aggregate rating endpoint `GET /api/reviews`
+- [ ] **Full Local Stack Test (Web $\rightarrow$ Relay $\rightarrow$ Server $\rightarrow$ Fake Upstream)**
+  - [ ] Log in through local Web UI via PocketBase
+  - [ ] Generate an API key through Web UI
+  - [ ] Execute streaming request using `curl` against local Edge Relay on port `8000`
+  - [ ] Confirm request routes through Server to Fake Upstream
+  - [ ] Confirm balance decrements live on Web UI via SSE without browser refresh
+  - [ ] Verify database reconciliation query: $\sum \text{delta\_idr} \equiv \text{balance\_idr}$
+  - [ ] Test relay down failover: send requests directly to server port `8080`
 
 ---
 
-## Phase 6: Deployment & Production Launch Gates
+## Phase 5: Midtrans Payment Integration (Done Last)
+
+- [ ] **Fake Midtrans Webhook Harness**
+  - [ ] Local test runner firing synthetic signed webhooks to `POST /webhooks/midtrans`
+  - [ ] Verify signature verification rejection on invalid signatures
+  - [ ] Verify idempotency: replayed webhook with same `order_id` credits wallet exactly once
+- [ ] **Midtrans Snap Client**
+  - [ ] Implement `POST /api/topups` calling Midtrans Snap API (`/snap/v1/transactions`)
+  - [ ] Enforce deposit limits (50k IDR initial, 10k IDR subsequent)
+  - [ ] Integrate Midtrans Snap.js popup modal in Web wallet island
+- [ ] **Midtrans Sandbox Verification**
+  - [ ] Run live end-to-end sandbox top-up with test QRIS code
+  - [ ] Confirm webhook receipt, signature check, wallet credit, and realtime UI update
+
+---
+
+## Phase 6: Production Deployment & Launch Readiness
 
 - [ ] **Infrastructure Setup**
   - [ ] Deploy Astro frontend to **Cloudflare Pages**
