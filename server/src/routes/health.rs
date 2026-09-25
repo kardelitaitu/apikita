@@ -159,4 +159,120 @@ mod tests {
             "the healthy contract must not drift - the deploy gate parses this body"
         );
     }
+
+    /// The LIVE half of the healthy contract: the first test that drives the
+    /// handler against a REAL Postgres through a pool that has not dialled yet, so
+    /// the 200 can only come from SELECT 1 actually executing.
+    ///
+    /// connect_lazy starts with zero connections, which makes the handler own query
+    /// the thing that opens them: asserting pool.size() > 0 afterwards proves the
+    /// handler reached the server rather than short-circuiting. That is the part no
+    /// pure test can cover, and the reason this one is #[ignore]d.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_probe_executes_select_1_against_real_postgres_and_is_200_healthy() {
+        let dsn = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+
+        // Lazy on purpose: nothing has been dialled yet, so any connection that
+        // exists after the probe was opened BY the probe.
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy(&dsn)
+            .expect("DATABASE_URL is a valid postgres url");
+        assert_eq!(
+            pool.size(),
+            0,
+            "the pool must start empty, or this test cannot tell who dialled"
+        );
+
+        let (status, body) = probe(pool.clone()).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "docs/server/api-spec.md:366 - 200 only when the process AND the database are reachable"
+        );
+        assert_eq!(
+            body,
+            json!({ "status": "healthy", "database": "connected" }),
+            "the healthy contract must not drift - the deploy gate parses this body"
+        );
+        assert!(
+            pool.size() > 0,
+            "the handler must have executed its probe against real Postgres; an empty pool here means the 200 came from somewhere other than SELECT 1"
+        );
+    }
+
+    /// The LIVE unavailable branch: a pool that was REALLY connected to Postgres
+    /// and then REALLY torn down, so the handler failure is the driver own
+    /// PoolClosed, not a hand-built error.
+    ///
+    /// The no-leak assertion compares the body against the driver error text this
+    /// process ACTUALLY received, so it cannot go stale the way a hand-written
+    /// fragment list does.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_probe_on_a_closed_pool_reports_the_constant_and_no_driver_error_fragment() {
+        let dsn = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+
+        let pool = crate::db::init_pool(&dsn)
+            .await
+            .expect("connect to Postgres");
+
+        // Establish a real connection first, so closing the pool is a real teardown
+        // of a real connection rather than a never-dialled no-op.
+        let warmed: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("the pool is reachable before it is closed");
+        assert_eq!(warmed, 1, "the fixture must start from a working database");
+
+        pool.close().await;
+        assert!(pool.is_closed(), "close() must leave the pool unusable");
+
+        // Capture the REAL driver error the handler is about to hit, from the same
+        // pool and the same statement. If a closed pool ever starts serving queries
+        // again, the unavailable branch is unreachable and this test is meaningless,
+        // so that is a failure rather than a skip.
+        let driver_error = match sqlx::query("SELECT 1").execute(&pool).await {
+            Ok(_) => panic!(
+                "a closed pool must not serve queries; the unavailable branch would never be reached"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !driver_error.is_empty() && driver_error != DATABASE_UNAVAILABLE,
+            "the captured failure must carry real detail, or the leak assertion below is vacuous: {driver_error:?}"
+        );
+
+        let (status, body) = probe(pool).await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "docs/server/api-spec.md:366 - 200 only when the process AND the database are reachable"
+        );
+        assert_eq!(
+            body["status"], "degraded",
+            "monitoring parses status; it must not be renamed or dropped"
+        );
+        assert_eq!(
+            body["database"], DATABASE_UNAVAILABLE,
+            "docs/error-model.md:168 - the caller gets the fixed constant, never the driver error"
+        );
+        assert_eq!(
+            body,
+            json!({ "status": "degraded", "database": DATABASE_UNAVAILABLE }),
+            "the degraded body is exactly the documented pair and nothing else"
+        );
+
+        let raw = serde_json::to_string(&body).expect("the body is JSON");
+        assert!(
+            !raw.contains(&driver_error),
+            "docs/error-model.md rule 1 - the driver error {driver_error:?} reached an unauthenticated caller in: {raw}"
+        );
+    }
 }
