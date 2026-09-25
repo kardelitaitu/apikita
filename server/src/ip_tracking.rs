@@ -29,6 +29,33 @@
 //! a suspicion threshold is "flagged for a human to look at", a hard cap
 //! (`config/apikita.toml [limits]`) "refuses the request". Nothing here refuses
 //! anything — crossing a threshold logs, and a human decides.
+//!
+//! SINGLE-INSTANCE PRECONDITION. This design assumes ONE server process, and
+//! every counter below depends on it. The daily salt is drawn from this
+//! process's OS RNG and is never shared or persisted, so two instances hold two
+//! independent salts and the same caller hashes to two different values.
+//! `distinct_ips` is therefore per instance, not per key per day: the rows are
+//! keyed `(api_key_id, day)` and a second instance upserts into the SAME row with
+//! its own independent count, so the stored figure is the SUM of the instances'
+//! counts rather than the true distinct set.
+//!
+//! What degrades when more than one instance runs is the abuse SIGNAL, not the
+//! privacy promise. The hashes stay salted and unlinkable; but a shared account
+//! is counted separately by each instance, so counts can exceed the real
+//! distinct set and the `SHARING_SUSPICION_IPS` warning can fire in more than
+//! one process for the same key on the same day — a split signal and duplicate
+//! alerts. That is the safe direction to be wrong in (a human investigates a
+//! false positive, rather than nobody investigating), but it is wrong all the
+//! same. This matches the deployment [`docs/cost-and-sizing.md`](../../docs/cost-and-sizing.md)
+//! describes — "two instances, two deploys, no benefit at this scale" — and it
+//! is stated here because it was previously implied everywhere and asserted
+//! nowhere in this module.
+//!
+//! Making the counter correct under more than one instance would mean moving the
+//! distinct set into the database and sharing the salt. That is a larger design
+//! change than this module's remit and it is deliberately NOT done here; the
+//! assumption is recorded so it is a known constraint rather than a latent
+//! surprise.
 
 use chrono::{NaiveDate, Utc};
 use hmac::{Hmac, Mac};
@@ -251,20 +278,35 @@ pub struct PurgedRows {
 /// aggregate survives the hashes because a count with no salt behind it is a
 /// trend, not a history.
 ///
+/// THE CUTOFF IS INCLUSIVE, AND THE WINDOW IS "TODAY PLUS THE PRECEDING SIX".
+/// The doc promises 7 days of `key_ip_seen` and 90 of `key_ip_daily`; those
+/// are the numbers of days RETAINED, so the days kept are
+/// `today - (N - 1) ..= today` and every day at or before `today - N` is deleted.
+/// The comparison is therefore `<=`, not `<`: with `<` the cutoff day itself
+/// survived, which quietly retained N+1 days — 8 days of hashes and 91 daily
+/// rows — against a privacy statement that says 7 and 90. A retention window
+/// longer than the documented one is a broken promise, not a rounding detail.
+///
+/// The constants are the contract and stay as documented. A boundary that looks
+/// wrong is fixed HERE, in the comparison, never by nudging the constant to
+/// compensate — that would make the code agree with the docs by making both
+/// wrong.
+///
 /// Run nightly. Nothing calls this per-request — deleting on the hot path
 /// would add a second write to every proxied request to do work that has to
 /// happen once a day.
 pub async fn purge_expired(pool: &PgPool, today: NaiveDate) -> Result<PurgedRows, AppError> {
+    // Inclusive cutoffs: the boundary day is deleted, `today - N + 1` is kept.
     let seen_cutoff = today - chrono::Duration::days(SEEN_RETENTION_DAYS);
     let daily_cutoff = today - chrono::Duration::days(DAILY_RETENTION_DAYS);
 
-    let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day < $1")
+    let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day <= $1")
         .bind(seen_cutoff)
         .execute(pool)
         .await?
         .rows_affected();
 
-    let daily = sqlx::query("DELETE FROM key_ip_daily WHERE day < $1")
+    let daily = sqlx::query("DELETE FROM key_ip_daily WHERE day <= $1")
         .bind(daily_cutoff)
         .execute(pool)
         .await?
@@ -654,6 +696,15 @@ mod tests {
         crate::db::init_pool(&database_url).await.expect("connect to Postgres")
     }
 
+    /// Serializes the purge tests. `purge_expired` deletes globally rather than
+    /// per key, so two purge tests running concurrently in the same test process
+    /// can delete each other's out-of-window fixtures before the other has
+    /// asserted on them.
+    fn purge_guard() -> &'static tokio::sync::Mutex<()> {
+        static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     /// A key needs an account. Returns (account_id, key_id).
     async fn create_key(pool: &PgPool) -> (Uuid, Uuid) {
         let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
@@ -734,6 +785,7 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_purge_keeps_the_window_and_removes_what_is_past_it() {
+        let _purge = purge_guard().lock().await;
         let pool = test_pool().await;
         let (account_id, key_id) = create_key(&pool).await;
         let today = today_utc();
@@ -775,6 +827,80 @@ mod tests {
         assert_eq!(
             remaining_seen, 1,
             "only the in-window hash survives: the aggregate outlives the hash"
+        );
+
+        delete_fixture(&pool, account_id).await;
+    }
+
+    /// THE BOUNDARY, PINNED EXACTLY — the off-by-one this test exists for.
+    ///
+    /// A test that only asserts "old rows go" passes with BOTH `<` and `<=`,
+    /// which is exactly how the window quietly became N+1 days against a
+    /// statement that says N. So both directions are asserted: the row ON the
+    /// cutoff day is DELETED, and the row one day INSIDE the window is KEPT.
+    ///
+    /// Its own account, so no other test's rows can inflate the result.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn the_retention_cutoff_day_is_deleted_and_the_day_inside_the_window_is_kept() {
+        let _purge = purge_guard().lock().await;
+        let pool = test_pool().await;
+        let (account_id, key_id) = create_key(&pool).await;
+        let today = today_utc();
+        let salt = [6u8; 32];
+
+        // On the cutoff day: must be deleted. This is the day the exclusive
+        // comparison used to keep, retaining 8 days of hashes and 91 daily rows.
+        let seen_cutoff = today - chrono::Duration::days(SEEN_RETENTION_DAYS);
+        let daily_cutoff = today - chrono::Duration::days(DAILY_RETENTION_DAYS);
+        // One day inside each window: must survive.
+        let seen_kept = today - chrono::Duration::days(SEEN_RETENTION_DAYS - 1);
+        let daily_kept = today - chrono::Duration::days(DAILY_RETENTION_DAYS - 1);
+
+        for (day, address) in [
+            (seen_cutoff, "203.0.113.11"),
+            (seen_kept, "203.0.113.12"),
+            (daily_cutoff, "203.0.113.13"),
+            (daily_kept, "203.0.113.14"),
+        ] {
+            record_key_ip(&pool, key_id, day, &ip_hash(&salt, &ip(address)))
+                .await
+                .expect("seed row");
+        }
+
+        purge_expired(&pool, today).await.expect("purge");
+
+        let surviving_seen: Vec<NaiveDate> = sqlx::query_scalar(
+            "SELECT day FROM key_ip_seen WHERE api_key_id = $1 ORDER BY day",
+        )
+        .bind(key_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read surviving hashes");
+        assert_eq!(
+            surviving_seen,
+            vec![seen_kept],
+            "the day AT the 7-day cutoff ({seen_cutoff}) must be deleted and              {seen_kept}, one day inside the window, must be kept"
+        );
+
+        let surviving_daily: Vec<NaiveDate> = sqlx::query_scalar(
+            "SELECT day FROM key_ip_daily WHERE api_key_id = $1 ORDER BY day",
+        )
+        .bind(key_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read surviving counts");
+        // Containment, not an exact vector: `record_key_ip` writes a daily row
+        // for every day it sees, so the two days seeded for the hash window are
+        // legitimately INSIDE the 90-day aggregate window and survive. The
+        // boundary is what this pins: the cutoff day gone, the day inside kept.
+        assert!(
+            !surviving_daily.contains(&daily_cutoff),
+            "the day AT the 90-day cutoff ({daily_cutoff}) must be deleted, got {surviving_daily:?}"
+        );
+        assert!(
+            surviving_daily.contains(&daily_kept),
+            "the day one inside the 90-day window ({daily_kept}) must be kept, got {surviving_daily:?}"
         );
 
         delete_fixture(&pool, account_id).await;
