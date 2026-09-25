@@ -781,8 +781,13 @@ mod tests {
 
     use crate::db::credit_topup_transaction;
     use crate::routes::events::RealtimeHub;
+    use crate::routes::test_env::{EnvGuard, EnvLock};
     use axum::body::to_bytes;
     use std::sync::Arc;
+
+    /// The key both Snap-failure tests install: deliberately invalid, so the
+    /// outcome cannot depend on whatever the developer shell exports.
+    const INVALID_SERVER_KEY: &str = "SB-Mid-server-INVALID-LIVE-TEST-KEY";
 
     /// A SMALL pool per test, deliberately.
     ///
@@ -1657,6 +1662,12 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_create_topup_persists_nothing_when_snap_cannot_be_reached() {
+        // Held for the WHOLE test body. The assertions below run in a spawned
+        // task and write MIDTRANS_SERVER_KEY, and this lock is the half that
+        // stops that write from interleaving with another test's - in this
+        // module or in routes::webhooks, which installs its own key.
+        let _env = EnvLock::acquire();
+
         let pool = live_pool().await;
         let primary = live_account(&pool).await;
 
@@ -1678,8 +1689,10 @@ mod tests {
         // An explicitly INVALID server key, so the outcome cannot depend on
         // whatever the developer shell exports. Snap answers 401 to it, and an
         // unreachable network fails the same way - either is a failure to
-        // obtain a token, and neither may leave a row behind.
-        std::env::set_var("MIDTRANS_SERVER_KEY", "SB-Mid-server-INVALID-LIVE-TEST-KEY");
+        // obtain a token, and neither may leave a row behind. The guard puts the
+        // PREVIOUS key back when it drops (panic included), instead of leaking
+        // this one into every later test in the process.
+        let _server_key = EnvGuard::set("MIDTRANS_SERVER_KEY", INVALID_SERVER_KEY);
 
         let state = live_app_state(pool.clone());
         let (status, body) = respond(create_topup(
@@ -1745,6 +1758,10 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_deposit_limits_follow_the_real_settled_history() {
+        // Same reason as the Snap-failure test above: this one also reaches Snap
+        // with an invalid key, so its write is serialised and restored.
+        let _env = EnvLock::acquire();
+
         let pool = live_pool().await;
         let primary = live_account(&pool).await;
 
@@ -1772,7 +1789,9 @@ mod tests {
             "config/apikita.toml [wallet] min_topup"
         );
 
-        std::env::set_var("MIDTRANS_SERVER_KEY", "SB-Mid-server-INVALID-LIVE-TEST-KEY");
+        // The key is restored when this function returns, and the caller holds
+        // the env lock across it, so nothing else can see it in between.
+        let _server_key = EnvGuard::set("MIDTRANS_SERVER_KEY", INVALID_SERVER_KEY);
 
         // --- No settled history: the FIRST-deposit minimum applies. ---
         let history: i64 = sqlx::query_scalar(
@@ -2101,6 +2120,11 @@ mod tests {
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_create_topup_success_persists_a_pending_row_and_returns_201() {
+        // Held for the WHOLE test body: the assertions below point
+        // MIDTRANS_SNAP_URL at this test's loopback stub, and that value must
+        // never be visible to the sibling test that asserts Snap FAILS.
+        let _env = EnvLock::acquire();
+
         let pool = live_pool().await;
         let primary = live_account(&pool).await;
 
@@ -2133,11 +2157,13 @@ mod tests {
         // this a developer shell exporting MIDTRANS_ENV=production would send
         // this test's request to the REAL Midtrans host. That must be impossible,
         // not merely unlikely.
-        let previous_env = std::env::var_os("MIDTRANS_ENV");
-        let previous_endpoint = std::env::var_os("MIDTRANS_SNAP_URL");
-        std::env::set_var("MIDTRANS_ENV", "sandbox");
-        std::env::set_var("MIDTRANS_SNAP_URL", &endpoint);
-        std::env::set_var("MIDTRANS_SERVER_KEY", "SB-Mid-server-LIVE-TEST-SUCCESS");
+        // Saved and restored by the guard, which also holds the process-wide
+        // env lock: save/restore alone is NOT enough here, because these tests
+        // run on parallel threads in one process and a sibling could interleave
+        // between the save and the restore.
+        let mut env_vars = EnvGuard::set("MIDTRANS_ENV", "sandbox");
+        env_vars.also("MIDTRANS_SNAP_URL", &endpoint);
+        env_vars.also("MIDTRANS_SERVER_KEY", "SB-Mid-server-LIVE-TEST-SUCCESS");
 
         // Prove the seam is live before the handler runs, so a silently-ignored
         // override fails HERE (clearly) rather than as a 15s timeout against
@@ -2178,15 +2204,9 @@ mod tests {
         .await;
 
         // Restore the host BEFORE asserting, so a failure here cannot leak the
-        // loopback endpoint into whatever test runs next.
-        match previous_endpoint {
-            Some(value) => std::env::set_var("MIDTRANS_SNAP_URL", value),
-            None => std::env::remove_var("MIDTRANS_SNAP_URL"),
-        }
-        match previous_env {
-            Some(value) => std::env::set_var("MIDTRANS_ENV", value),
-            None => std::env::remove_var("MIDTRANS_ENV"),
-        }
+        // loopback endpoint into whatever test runs next. Dropping the guard does
+        // exactly that - and does it on the panic path too.
+        drop(env_vars);
 
         assert_eq!(
             status,

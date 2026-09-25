@@ -107,6 +107,205 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Process-wide serialisation of environment-variable mutation in tests.
+///
+/// std::env is PROCESS-GLOBAL and Rust runs the tests of one binary in parallel
+/// threads inside a single process, so a variable one test sets is visible to
+/// every other test - and a save/restore pair is NOT enough on its own: two
+/// tests can interleave between the save and the restore, each seeing the
+/// other's value. Both halves are therefore required, and this module owns both
+/// so that every test in the crate that touches these variables shares ONE lock:
+///
+/// - ENV_LOCK is that one lock. EnvGuard::set takes it and holds it until the
+///   guard drops, so two guarded tests cannot overlap - including across modules
+///   (routes::account and routes::webhooks both write MIDTRANS_SERVER_KEY, and
+///   two private mutexes would not exclude each other);
+/// - EnvGuard captures the PREVIOUS value with var_os and puts it back on Drop:
+///   on the success path, on an assertion panic and on an early return alike. A
+///   variable that was UNSET before is REMOVED again rather than left holding
+///   the test's value.
+///
+/// The guard is deliberately not Send (it holds a MutexGuard): acquire it in the
+/// test body and keep it there, outside any tokio::spawn, which is where the
+/// assertions run.
+#[cfg(test)]
+pub mod test_env {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The ONE process-wide lock over environment mutation in tests.
+    ///
+    /// Acquire it at the start of every test that reads or writes a shared
+    /// environment variable and keep it alive for the whole test: it is the half
+    /// that stops two tests from INTERLEAVING their writes. It is deliberately
+    /// not Send (it holds a MutexGuard), so it belongs in the test body and must
+    /// not cross a tokio::spawn - a spawned assertion task may write a variable
+    /// with EnvGuard instead, which is safe precisely because this lock is held
+    /// by the test that spawned it.
+    pub struct EnvLock {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvLock {
+        pub fn acquire() -> Self {
+            // A panicking test must not poison the lock for every later test:
+            // the state a panic leaves behind is exactly what EnvGuard restores.
+            Self {
+                _lock: ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner()),
+            }
+        }
+    }
+
+    /// Sets environment variables and puts the PREVIOUS values back on Drop - on
+    /// the success path, on an assertion panic and on an early return alike. A
+    /// variable that was UNSET before is REMOVED again rather than left holding
+    /// the test value.
+    ///
+    /// Takes no lock (so it is Send and may be used inside a spawned task):
+    /// it is only safe while the test's EnvLock is alive.
+    pub struct EnvGuard {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        pub fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let mut guard = Self {
+                previous: Vec::new(),
+            };
+            guard.also(key, value);
+            guard
+        }
+
+        /// Sets another variable under the same guard.
+        pub fn also(&mut self, key: &'static str, value: impl AsRef<OsStr>) {
+            self.previous.push((key, std::env::var_os(key)));
+            std::env::set_var(key, value);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Reverse order, so a variable written twice ends at its original.
+            for (key, previous) in self.previous.drain(..).rev() {
+                match previous {
+                    Some(previous) => std::env::set_var(key, previous),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{EnvGuard, EnvLock};
+        use std::panic::AssertUnwindSafe;
+
+        // Probe names no other test in the crate touches, so these assertions
+        // read the process environment without racing a sibling.
+        const RESTORED: &str = "APK_TEST_ENV_GUARD_PROBE_RESTORED";
+        const REMOVED: &str = "APK_TEST_ENV_GUARD_PROBE_REMOVED";
+        const PANICKED: &str = "APK_TEST_ENV_GUARD_PROBE_PANICKED";
+        const SERIALISED: &str = "APK_TEST_ENV_GUARD_PROBE_SERIALISED";
+
+        #[test]
+        fn drop_restores_the_previous_value() {
+            std::env::set_var(RESTORED, "the-original-value");
+            {
+                let _guard = EnvGuard::set(RESTORED, "the-test-value");
+                assert_eq!(
+                    std::env::var(RESTORED).as_deref(),
+                    Ok("the-test-value"),
+                    "the guard must install the value it was given"
+                );
+            }
+            assert_eq!(
+                std::env::var(RESTORED).as_deref(),
+                Ok("the-original-value"),
+                "the guard must put the PREVIOUS value back when it drops"
+            );
+            std::env::remove_var(RESTORED);
+        }
+
+        #[test]
+        fn drop_removes_a_variable_that_was_unset() {
+            std::env::remove_var(REMOVED);
+            assert!(std::env::var_os(REMOVED).is_none());
+
+            {
+                let _guard = EnvGuard::set(REMOVED, "leaked-if-not-removed");
+                assert_eq!(std::env::var(REMOVED).as_deref(), Ok("leaked-if-not-removed"));
+            }
+
+            assert!(
+                std::env::var_os(REMOVED).is_none(),
+                "a variable that was UNSET before the guard must be unset again, not left holding the test value: {:?}",
+                std::env::var_os(REMOVED)
+            );
+        }
+
+        /// The classic bug this type exists to prevent: a guard that restores on
+        /// the success path only, leaving the value installed when an assertion
+        /// unwinds through it.
+        #[test]
+        fn drop_restores_on_the_panic_path_too() {
+            std::env::set_var(PANICKED, "the-original-value");
+
+            let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _guard = EnvGuard::set(PANICKED, "the-test-value");
+                panic!("unwind straight through the guard");
+            }));
+
+            assert!(unwound.is_err(), "the probe closure must actually have panicked");
+            assert_eq!(
+                std::env::var(PANICKED).as_deref(),
+                Ok("the-original-value"),
+                "Drop must run on the unwinding path, not only on success"
+            );
+            std::env::remove_var(PANICKED);
+        }
+
+        /// The OTHER half: a guard that restores but does not exclude would
+        /// still let two tests interleave their writes.
+        #[test]
+        fn a_second_lock_cannot_enter_while_the_first_is_alive() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            use std::time::Duration;
+
+            std::env::remove_var(SERIALISED);
+            let entered = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&entered);
+
+            let held = EnvLock::acquire();
+            let contender = std::thread::spawn(move || {
+                let _lock = EnvLock::acquire();
+                let _guard = EnvGuard::set(SERIALISED, "held-by-the-other-thread");
+                flag.store(true, Ordering::SeqCst);
+            });
+
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !entered.load(Ordering::SeqCst),
+                "a second test must NOT get in while the first holds the env lock - that mutual exclusion is what stops two tests interleaving writes to a process-global variable"
+            );
+
+            drop(held);
+            contender.join().expect("the contender thread must not panic");
+            assert!(
+                entered.load(Ordering::SeqCst),
+                "the contender must proceed once the first lock has dropped"
+            );
+
+            // The contender restored what IT saw - the value the first lock-holder
+            // had written - so the probe is cleaned up explicitly. It is a name
+            // nothing else in the crate reads.
+            std::env::remove_var(SERIALISED);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

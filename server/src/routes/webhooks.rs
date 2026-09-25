@@ -630,33 +630,30 @@ mod tests {
     //   DATABASE_URL=postgres://postgres:dev@localhost:5432/apikita \
     //     cargo test --lib -- --ignored
     //
-    // ENVIRONMENT SERIALISATION, chosen deliberately. The handler reads
-    // MIDTRANS_SERVER_KEY through `env::var`, and that variable is
-    // PROCESS-WIDE: a value one test sets is visible to every other test
-    // thread in this binary. BOTH halves are used together:
+    // ENVIRONMENT SERIALISATION. The handler reads MIDTRANS_SERVER_KEY through
+    // `env::var`, and that variable is PROCESS-WIDE: a value one test sets is
+    // visible to every other test thread in this binary. BOTH halves live in
+    // `crate::routes::test_env`, SHARED with routes::account so that ONE lock
+    // covers every writer in the crate (two private mutexes would exclude
+    // nothing):
     //
-    //   (a) SERVER_KEY_LOCK - a process-wide mutex that every live test here
-    //       holds for its whole body, so these tests cannot race EACH OTHER; and
-    //   (b) ServerKeyGuard - RAII that restores the PREVIOUS value on drop, on
-    //       the success path and the panic path alike, so no test leaks a key
-    //       into a later test or a later `cargo test` in the same process.
+    //   (a) EnvLock - the single process-wide mutex, held for the whole body of
+    //       every test that touches these variables, so no two of them can
+    //       interleave their writes; and
+    //   (b) EnvGuard - RAII that restores the PREVIOUS value on drop, on the
+    //       success path and the panic path alike, so no test leaks a key into a
+    //       later test or a later `cargo test` in the same process.
     //
     // (b) is the half that matters: a leaked key is worse than no test.
-    //
-    // Residual, documented risk: account.rs's live create_topup test sets the
-    // same variable to an invalid key and never restores it. That writer is
-    // outside this fence and takes no lock, so it is the one remaining source
-    // of interference; `assert_test_key_installed` fails LOUDLY and names it
-    // rather than letting a clobbered key surface as a mysterious 401.
     // =====================================================================
 
     use crate::config::AppConfig;
     use crate::money::compute_midtrans_signature;
     use crate::routes::events::RealtimeHub;
+    use crate::routes::test_env::{EnvGuard, EnvLock};
     use axum::body::to_bytes;
     use sqlx::PgPool;
-    use std::ffi::OsString;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// The key every live test here installs. Deliberately NOT the
@@ -664,39 +661,6 @@ mod tests {
     /// impossible to mistake for one that did.
     const LIVE_TEST_SERVER_KEY: &str = "SB-Mid-server-WEBHOOK-LIVE-TEST";
 
-    /// Held for the whole body of every live test here - see the module note.
-    static SERVER_KEY_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Installs the test server key and puts the PREVIOUS value back on drop,
-    /// including when an assertion panics - which is exactly when a leaked key
-    /// would otherwise poison every later test in the process.
-    struct ServerKeyGuard {
-        previous: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl ServerKeyGuard {
-        fn install() -> Self {
-            let lock = SERVER_KEY_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-            let previous = std::env::var_os("MIDTRANS_SERVER_KEY");
-            std::env::set_var("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
-            Self {
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for ServerKeyGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => std::env::set_var("MIDTRANS_SERVER_KEY", previous),
-                // Absent before this test: absent again afterwards, so the next
-                // test's precondition is the one this test started from.
-                None => std::env::remove_var("MIDTRANS_SERVER_KEY"),
-            }
-        }
-    }
 
     async fn live_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -728,21 +692,24 @@ mod tests {
         }
     }
 
-    /// Installs the server key, builds the fixture, runs the assertions in
-    /// their own task, then tears the fixture down in FK order whether they
-    /// passed or panicked - and only then restores the environment.
+    /// Takes the process-wide env lock, installs the server key, builds the
+    /// fixture, runs the assertions in their own task, then tears the fixture
+    /// down in FK order whether they passed or panicked - and only then releases
+    /// the lock and restores the environment.
     ///
     /// The assertions are spawned so a panicking one arrives as a JoinError
     /// instead of unwinding through the teardown. That is what makes the
-    /// cleanup unconditional, and it is why the key guard is held HERE rather
-    /// than inside the task (a MutexGuard is not Send).
+    /// cleanup unconditional, and it is why the LOCK is held HERE rather than
+    /// inside the task (a MutexGuard is not Send). Holding it here is also what
+    /// excludes routes::account's Snap tests, which take the same lock.
     async fn run_live<F, Fut>(assertions: F)
     where
         F: FnOnce(PgPool, Uuid, AppState) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        let _env = EnvLock::acquire();
         let pool = live_pool().await;
-        let key_guard = ServerKeyGuard::install();
+        let key_guard = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
 
         let account_id = fixture_account(&pool).await;
         let state = live_app_state(pool.clone());
@@ -842,25 +809,15 @@ mod tests {
 
     /// Drives the handler exactly the way the router does and reads its body.
     ///
-    /// The key is RE-INSTALLED here, immediately before the call, and that is
-    /// deliberate rather than belt-and-braces. The handler reads
-    /// `MIDTRANS_SERVER_KEY` in its first statement - before any await - and the
-    /// variable is process-wide, so another test thread can clobber it between
-    /// this test's guard being installed and the handler reading it.
-    /// account.rs's live create_topup test does exactly that: it writes the
-    /// variable to an invalid key and never restores it. Measured here:
-    /// un-repaired, the full `--ignored` suite failed my refund test roughly
-    /// half the time with "invalid signature" on a signature this test had just
-    /// computed correctly. Repairing at the last possible instant removes that
-    /// interference WITHOUT weakening any assertion - no expectation is
-    /// relaxed, and no money assertion is skipped.
-    ///
-    /// The reverse direction is NOT repaired and does not need to be: that test
-    /// asserts Snap must FAIL, which it does for any fake key, so this key
-    /// cannot make it pass or fail spuriously. The RAII guard still owns
-    /// restoring the previous value afterwards.
+    /// The key this reads was installed by `run_live` under the shared env lock,
+    /// and that lock is held for this whole test - so nothing can clobber
+    /// `MIDTRANS_SERVER_KEY` between the install and the handler reading it, and
+    /// this function needs no re-install of its own. It used to re-set the
+    /// variable immediately before the call, to defend against account.rs's
+    /// Snap tests writing an invalid key with no restore and no lock; those
+    /// tests now take the same lock and restore through the same guard, which
+    /// removes the race at its source instead of repairing its symptom here.
     async fn post(state: &AppState, payload: MidtransNotification) -> (StatusCode, serde_json::Value) {
-        std::env::set_var("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
         let res = handle_midtrans_webhook(State(state.clone()), Json(payload))
             .await
             .into_response();
