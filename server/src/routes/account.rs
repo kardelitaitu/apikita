@@ -76,7 +76,7 @@ async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Resu
             .await?;
 
             if let Some(s) = session {
-                return Ok(s.get("account_id"));
+                return Ok(s.try_get("account_id")?);
             }
         }
     }
@@ -95,23 +95,26 @@ pub async fn get_me(
         .fetch_one(&pool)
         .await?;
 
-    let status: String = account.get("status");
+    let status: String = account.try_get("status")?;
 
     let wallet = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = $1")
         .bind(account_id)
         .fetch_optional(&pool)
         .await?;
 
-    let balance_idr: i64 = wallet.map(|w| w.get("balance_idr")).unwrap_or(0);
+    let balance_idr: i64 = wallet
+        .map(|w| w.try_get::<i64, _>("balance_idr"))
+        .transpose()?
+        .unwrap_or(0);
 
     let today = Utc::now().date_naive();
     let usage_today = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(input_tokens), 0) AS input_tokens,
-            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-            COALESCE(SUM(output_tokens), 0) AS output_tokens,
-            COALESCE(SUM(cost_idr), 0) AS cost_idr
+            COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+            COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
+            COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+            COALESCE(SUM(cost_idr), 0)::bigint AS cost_idr
         FROM usage_daily
         WHERE account_id = $1 AND day = $2
         "#,
@@ -130,10 +133,10 @@ pub async fn get_me(
         account_id,
         balance_idr,
         usage_today: UsageTodayDto {
-            input_tokens: usage_today.get("input_tokens"),
-            cache_read_tokens: usage_today.get("cache_read_tokens"),
-            output_tokens: usage_today.get("output_tokens"),
-            cost_idr: usage_today.get("cost_idr"),
+            input_tokens: usage_today.try_get("input_tokens")?,
+            cache_read_tokens: usage_today.try_get("cache_read_tokens")?,
+            output_tokens: usage_today.try_get("output_tokens")?,
+            cost_idr: usage_today.try_get("cost_idr")?,
         },
         telegram_linked: tg_link.is_some(),
         status,
@@ -150,10 +153,10 @@ pub async fn get_usage(
         r#"
         SELECT
             day,
-            SUM(input_tokens) AS input_tokens,
-            SUM(cache_read_tokens) AS cache_read_tokens,
-            SUM(output_tokens) AS output_tokens,
-            SUM(cost_idr) AS cost_idr
+            SUM(input_tokens)::bigint AS input_tokens,
+            SUM(cache_read_tokens)::bigint AS cache_read_tokens,
+            SUM(output_tokens)::bigint AS output_tokens,
+            SUM(cost_idr)::bigint AS cost_idr
         FROM usage_daily
         WHERE account_id = $1
         GROUP BY day
@@ -165,23 +168,23 @@ pub async fn get_usage(
     .fetch_all(&pool)
     .await?;
 
-    let result: Vec<_> = rows
+    let result: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|r| {
-            let day: chrono::NaiveDate = r.get("day");
-            let in_tok: Option<i64> = r.get("input_tokens");
-            let cache_tok: Option<i64> = r.get("cache_read_tokens");
-            let out_tok: Option<i64> = r.get("output_tokens");
-            let cost: Option<i64> = r.get("cost_idr");
-            json!({
+        .map(|r| -> Result<serde_json::Value, AppError> {
+            let day: chrono::NaiveDate = r.try_get("day")?;
+            let in_tok: Option<i64> = r.try_get("input_tokens")?;
+            let cache_tok: Option<i64> = r.try_get("cache_read_tokens")?;
+            let out_tok: Option<i64> = r.try_get("output_tokens")?;
+            let cost: Option<i64> = r.try_get("cost_idr")?;
+            Ok(json!({
                 "day": day,
                 "input_tokens": in_tok.unwrap_or(0),
                 "cache_read_tokens": cache_tok.unwrap_or(0),
                 "output_tokens": out_tok.unwrap_or(0),
                 "cost_idr": cost.unwrap_or(0),
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(result))
 }
@@ -208,25 +211,25 @@ pub async fn get_topups(
     .fetch_all(&pool)
     .await?;
 
-    let result: Vec<_> = rows
+    let result: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|r| {
-            let id: Uuid = r.get("id");
-            let amount_idr: i64 = r.get("amount_idr");
-            let order_id: String = r.get("order_id");
-            let status: String = r.get("status");
-            let created_at: chrono::DateTime<Utc> = r.get("created_at");
-            let settled_at: Option<chrono::DateTime<Utc>> = r.get("settled_at");
-            json!({
+        .map(|r| -> Result<serde_json::Value, AppError> {
+            let id: Uuid = r.try_get("id")?;
+            let amount_idr: i64 = r.try_get("amount_idr")?;
+            let order_id: String = r.try_get("order_id")?;
+            let status: String = r.try_get("status")?;
+            let created_at: chrono::DateTime<Utc> = r.try_get("created_at")?;
+            let settled_at: Option<chrono::DateTime<Utc>> = r.try_get("settled_at")?;
+            Ok(json!({
                 "id": id,
                 "amount_idr": amount_idr,
                 "order_id": order_id,
                 "status": status,
                 "created_at": created_at,
                 "settled_at": settled_at,
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(result))
 }
@@ -429,7 +432,7 @@ pub async fn create_topup(
     .fetch_one(&pool)
     .await?;
 
-    let settled_count: i64 = past_settled.get("count");
+    let settled_count: i64 = past_settled.try_get("count")?;
     check_deposit_limit(payload.amount_idr, settled_count, wallet)?;
 
     let server_key = env::var("MIDTRANS_SERVER_KEY").map_err(|_| {
@@ -445,7 +448,7 @@ pub async fn create_topup(
         .bind(account_id)
         .fetch_one(&pool)
         .await?
-        .get("pb_user_id");
+        .try_get("pb_user_id")?;
 
     // Built per request: this path is one call per customer action, far too cold
     // to justify a process-wide pool, and SNAP_REQUEST_TIMEOUT is this call's

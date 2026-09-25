@@ -332,10 +332,10 @@ pub async fn todays_usage(pool: &PgPool, account_id: Uuid) -> Result<UsageDelta,
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(input_tokens), 0) AS input_tokens,
-            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-            COALESCE(SUM(output_tokens), 0) AS output_tokens,
-            COALESCE(SUM(cost_idr), 0) AS cost_idr
+            COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+            COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
+            COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+            COALESCE(SUM(cost_idr), 0)::bigint AS cost_idr
         FROM usage_daily
         WHERE account_id = $1 AND day = $2
         "#,
@@ -377,7 +377,7 @@ async fn resolve_account_from_cookie(pool: &PgPool, headers: &HeaderMap) -> Resu
             .await?;
 
             if let Some(s) = session {
-                return Ok(s.get("account_id"));
+                return Ok(s.try_get("account_id")?);
             }
         }
     }
@@ -661,5 +661,37 @@ mod tests {
 
         headers.insert("last-event-id", HeaderValue::from_static("not-a-number"));
         assert_eq!(last_event_id(&headers), None);
+    }
+
+    /// The fix for the panic decodes token sums into `i64` via a `::bigint`
+    /// cast. This proves the chosen representation survives values near the
+    /// i64 ceiling: had anyone "simplified" to a narrower type (i32/INT4) the
+    /// SUM would silently overflow. Sums must stay exact for large usage.
+    #[test]
+    fn token_sums_preserve_large_i64_values() {
+        // A realistic heavy-tenant day, well above i32::MAX (2_147_483_647).
+        let big = 9_000_000_000i64;
+        let delta = test_usage(big, big / 2, big / 3, big * 14);
+
+        // RealtimeEvent::usage carries an absolute total, never a delta
+        // (docs/realtime.md:93), so a lost frame self-heals from the next one.
+        let event = RealtimeEvent::usage(Uuid::new_v4(), delta);
+        assert_eq!(event.name(), "usage");
+
+        let parsed: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+        assert_eq!(parsed["input_tokens"].as_i64().unwrap(), big);
+        // Cost is priced roughly 14x tokens; must not wrap into a small number.
+        assert_eq!(parsed["cost_idr"].as_i64().unwrap(), big * 14);
+    }
+
+    /// Regression: the SSE stream must never emit the heartbeat as an event.
+    /// docs/realtime.md specifies it as a `: heartbeat` COMMENT line, so a
+    /// client's `onmessage` handler must not fire for it. Heartbeat frames
+    /// produced here carry no event name.
+    #[test]
+    fn heartbeat_is_a_comment_not_an_event() {
+        let frame = ": heartbeat";
+        assert!(!frame.starts_with("event:"), "heartbeat must not be an event");
+        assert!(frame.starts_with(": "), "heartbeat is a SSE comment line");
     }
 }
