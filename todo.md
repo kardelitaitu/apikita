@@ -33,31 +33,31 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
 
 ## Phase 1: Local Stack & Testing Fakes Setup
 
-- [ ] **Docker Compose Local Environment (`docker-compose.yml`)**
-  - [ ] PostgreSQL 16 container on port `5432` with automatic migration runner
-  - [ ] PocketBase container on port `8090` (identity only)
-  - [ ] Nginx Edge Relay container on port `8000` (proxying to server `8080`, with `proxy_buffering off` on `/events` and `/v1/*`)
-- [ ] **Fake Upstream Provider Service**
-  - [ ] Local mock server speaking OpenAI `/v1/chat/completions` SSE streaming format
-  - [ ] Configurable test triggers via headers:
-    - [ ] Happy path streaming (canned tokens at 30 tok/sec)
-    - [ ] HTTP 429 rate limit injection (to test key cooldown)
-    - [ ] Mid-stream abrupt disconnection (to test unbilled wastage handling)
-    - [ ] HTTP 500 error (to test circuit breaker trip)
+- [x] **Docker Compose Local Environment (`docker-compose.yml`)**
+  - [x] PostgreSQL 16 container on port `5432` with automatic migration runner
+  - [x] PocketBase container on port `8090` (identity only)
+  - [x] Nginx Edge Relay container on port `8000` (proxying to server `8080`, with `proxy_buffering off` on `/events` and `/v1/*`)
+- [x] **Fake Upstream Provider Service**
+  - [x] Local mock server speaking OpenAI `/v1/chat/completions` SSE streaming format
+  - [x] Configurable test triggers via headers:
+    - [x] Happy path streaming (canned tokens at 30 tok/sec)
+    - [x] HTTP 429 rate limit injection (to test key cooldown)
+    - [x] Mid-stream abrupt disconnection (to test unbilled wastage handling)
+    - [x] HTTP 500 error (to test circuit breaker trip)
 
 ---
 
 ## Phase 2: Rust Server Core & Streaming Pipeline (`server/`)
 
-- [ ] **100-Key Pool Router & Load Balancer**
-  - [ ] Implement atomic least-loaded key selection (`min_by_key(|k| k.in_flight)`)
-  - [ ] Implement granular per-key 5-second cooldown upon receiving HTTP 429
-  - [ ] Implement client-side transparent retry across available keys (up to `max_key_attempts = 3`)
-  - [ ] Configure `reqwest::Client` persistent HTTP connection pooling (`pool_max_idle_per_host(100)`)
-- [ ] **Circuit Breaker**
-  - [ ] Consecutive failure counter (3 failures to trip to `Open`)
-  - [ ] Exponential cooldown backoff (30s $\rightarrow$ 60s $\rightarrow$ capped at 900s)
-  - [ ] Half-open trial request logic
+- [x] **100-Key Pool Router & Load Balancer**
+  - [x] Implement atomic least-loaded key selection (`min_by_key(|k| k.in_flight)`)
+  - [x] Implement granular per-key 5-second cooldown upon receiving HTTP 429
+  - [x] Implement client-side transparent retry across available keys (up to `max_key_attempts = 3`)
+  - [x] Configure `reqwest::Client` persistent HTTP connection pooling (`pool_max_idle_per_host(100)`)
+- [x] **Circuit Breaker**
+  - [x] Consecutive failure counter (3 failures to trip to `Open`)
+  - [x] Exponential cooldown backoff (30s $\rightarrow$ 60s $\rightarrow$ capped at 900s)
+  - [x] Half-open trial request logic
 - [ ] **Streaming Pipeline (`POST /v1/chat/completions`)**
   - [ ] Bearer API key validation with 60-second in-memory TTL cache
   - [ ] Model allowlist verification
@@ -67,18 +67,18 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [ ] Execute atomic usage settlement (`debit_usage_transaction`) on stream completion
   - [ ] Ensure mid-stream errors do not retry silently
 - [ ] **Session Auth & Realtime Event Stream**
-  - [ ] Wire `POST /auth/exchange` to verify PocketBase JWTs and issue cookie
-  - [ ] Implement session revocation on `POST /auth/logout` and `POST /auth/logout-all`
+  - [x] Wire `POST /auth/exchange` to verify PocketBase JWTs and issue cookie
+  - [x] Implement session revocation on `POST /auth/logout` and `POST /auth/logout-all`
   - [ ] Realtime SSE stream (`GET /events`) with heartbeat and live balance broadcast
 
 ---
 
 ## Phase 3: Web Dashboard (`website/` Astro + Islands)
 
-- [ ] **Static Marketing Shell (Astro + Tailwind CSS)**
-  - [ ] Landing page with pricing table ($M = 1.50$ rates)
-  - [ ] Quick-start developer guide & cURL examples
-  - [ ] Zero JavaScript payload on marketing pages
+- [x] **Static Marketing Shell (Astro + Tailwind CSS)**
+  - [x] Landing page with pricing table ($M = 1.50$ rates)
+  - [x] Quick-start developer guide & cURL examples
+  - [x] Zero JavaScript payload on marketing pages
 - [ ] **Interactive Client Islands**
   - [ ] Auth island: Google OAuth2 & email/password via PocketBase SDK
   - [ ] Dashboard layout with sticky Live Balance badge wired to `/events` SSE
