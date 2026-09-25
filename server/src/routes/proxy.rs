@@ -17,7 +17,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
-use crate::db::{debit_usage_transaction, UsageSettlement};
+use crate::db::{
+    debit_usage_transaction, release_reservation_transaction, reserve_balance_transaction,
+    ReservationResult, UsageSettlement,
+};
 use crate::error::AppError;
 use crate::money::{calculate_preflight_reservation_idr, calculate_token_cost_idr};
 use crate::routes::events::{publish_balance, publish_usage, todays_usage, RealtimeHub};
@@ -271,6 +274,11 @@ enum StreamEnd {
     /// The stream completed but reported no usage — truncated, or killed
     /// mid-way. Nothing may be billed from this.
     NoUsage,
+    /// The client hung up before the stream ended. The upstream body comes with
+    /// it, unread: the upstream has already generated the partial answer and
+    /// still reports usage for it, so the settlement task drains the body itself
+    /// instead of letting it be dropped unread.
+    Hangup(Option<UpstreamStream>),
 }
 
 /// Forwards every upstream chunk the moment it arrives while retaining only the
@@ -279,9 +287,11 @@ enum StreamEnd {
 ///
 /// It owns the upstream stream rather than borrowing it, so it is `'static` and
 /// can be handed straight to `Body::from_stream`. Dropping it — a client that
-/// hangs up mid-answer — drops the upstream stream, which releases its key lease
-/// and leaves the settlement receiver empty-handed: nothing is billed for an
-/// answer the customer never finished receiving.
+/// hangs up mid-answer — HANDS the unread upstream body to the settlement task
+/// rather than dropping it: the upstream generated that answer and will report
+/// usage for it, so abandoning the body would bill nothing while the provider
+/// charges us. The settlement task drains it and settles what the upstream
+/// reported (docs/failover.md:138-144).
 struct MeteredStream {
     inner: Option<UpstreamStream>,
     tail: Vec<u8>,
@@ -341,6 +351,40 @@ impl MeteredStream {
     }
 }
 
+/// The client is gone, so the stream is being abandoned rather than polled.
+///
+/// The upstream body is HANDED OVER, not finished: it goes down the settlement
+/// channel so the usage the upstream still reports for the partial answer is read
+/// and billed instead of evaporating. The key lease travels with the body and is
+/// reported by whoever consumes it (a transport-level cut, status 0: a client
+/// hangup says nothing about the upstream, so the key is freed without a cooldown).
+/// Finishing the lease HERE would drop the body unread — exactly the defect this
+/// is fixing.
+impl Drop for MeteredStream {
+    fn drop(&mut self) {
+        if self.done {
+            // The stream ended on its own; `finish` already took the lease and
+            // sent the outcome. A second send would be lost anyway.
+            return;
+        }
+        self.done = true;
+
+        match self.settle.take() {
+            Some(settle) => {
+                // The settlement task owns the body now and reports the lease.
+                let _ = settle.send(StreamEnd::Hangup(self.inner.take()));
+            }
+            None => {
+                // Nobody is listening for the outcome, so the lease must still be
+                // freed here rather than leaked out of the key pool.
+                if let Some(inner) = self.inner.take() {
+                    inner.finish_status(0);
+                }
+            }
+        }
+    }
+}
+
 impl Stream for MeteredStream {
     type Item = Result<Bytes, std::io::Error>;
 
@@ -392,6 +436,78 @@ impl Stream for MeteredStream {
             }
         }
     }
+}
+
+/// Maps a failed upstream call to the error the client may see.
+///
+/// A transport error's Display embeds the provider URL, so it is logged and
+/// withheld: the client gets the generic upstream-unavailable error instead
+/// (DEFECT 3, docs/error-model.md:159). The other variants carry no provider URL
+/// or hostname.
+fn upstream_error(err: UpstreamError, model: &str, account_id: Uuid) -> AppError {
+    match err {
+        UpstreamError::NoModel(_) => AppError::ModelNotAllowed(model.to_string()),
+        UpstreamError::NoHealthyUpstream(_) => AppError::NoUpstreamAvailable,
+        UpstreamError::Transport(detail) => {
+            warn!(
+                account_id = %account_id,
+                model = %model,
+                error = %detail,
+                "upstream transport error; detail withheld from client"
+            );
+            AppError::NoUpstreamAvailable
+        }
+        other => AppError::Internal(other.to_string()),
+    }
+}
+
+/// Reads an abandoned upstream stream to its end, keeping the usage tail, so the
+/// tokens the upstream generated for a customer who hung up can be settled.
+///
+/// This is the only thing that can be done with the body once the client is gone:
+/// dropping it unread is what made a client abort free. Nothing is forwarded
+/// anywhere — there is no client left — and no chunk is retained except the tail.
+///
+/// `None` means the upstream reported no usage. That is the documented washed case
+/// (docs/failover.md:138-144) and settles nothing: token counts are never invented.
+async fn drain_for_usage(stream: Option<UpstreamStream>) -> Option<Usage> {
+    let mut stream = stream?;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut transport_ok = true;
+
+    {
+        let bytes = stream.bytes();
+        futures_util::pin_mut!(bytes);
+        while let Some(chunk) = bytes.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    tail.extend_from_slice(&chunk);
+                    if tail.len() > USAGE_TAIL_CAP {
+                        let excess = tail.len() - USAGE_TAIL_CAP;
+                        tail.drain(..excess);
+                    }
+                }
+                // The upstream died mid-answer. Whatever it reported before
+                // dying is all the evidence there is; a transport cut says
+                // nothing about the key, so it is not a rate-limit status.
+                Err(err) => {
+                    transport_ok = false;
+                    warn!(error = %err, "Upstream stream failed while draining an aborted request");
+                    break;
+                }
+            }
+        }
+    }
+
+    let usage = parse_usage_from_sse(&tail);
+
+    if transport_ok && usage.is_some() {
+        stream.finish_ok();
+    } else {
+        stream.finish_status(0);
+    }
+
+    usage
 }
 
 /// A terminal SSE error event, then the stream closes cleanly.
@@ -480,21 +596,7 @@ pub async fn chat_completions(
         .find(|m| m.name == meta.model)
         .ok_or_else(|| AppError::ModelNotAllowed(meta.model.clone()))?;
 
-    // 3. Pre-flight wallet balance check
-    let wallet = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = $1")
-        .bind(account_id)
-        .fetch_optional(&state.pool)
-        .await?;
-
-    let current_balance: i64 = wallet.map(|w| w.get("balance_idr")).unwrap_or(0);
-
-    if current_balance <= 0 {
-        return Err(AppError::InsufficientBalance {
-            details: Some(json!({ "balance_idr": current_balance, "required_idr": 1 })),
-        });
-    }
-
-    // 4. Pre-flight worst-case reservation, taken BEFORE routing.
+    // 3. Pre-flight worst-case reservation, taken BEFORE routing.
     //
     // Input is estimated from the raw body length (~4 bytes per token, floored
     // at 1); the output ceiling is the request's own cap, clamped to the hard
@@ -525,42 +627,65 @@ pub async fn chat_completions(
         .max()
         .unwrap_or(0);
 
-    if reservation > current_balance && !state.config.streaming.allow_negative_balance_overdraft {
-        return Err(AppError::InsufficientBalance {
-            details: Some(json!({
-                "balance_idr": current_balance,
-                "required_idr": reservation
-            })),
-        });
-    }
-
-    // 5. Route and stream. The raw inbound body goes up with `stream: true`
-    // ensured; the client rewrites `model` to the endpoint's upstream_model.
+    // 5. The inbound body with `stream: true` guaranteed. Parsed BEFORE the hold so
+    //    a malformed body can never take money: validation precedes the debit.
     let upstream_body = ensure_streaming(&body)?;
 
-    let stream = upstream
-        .stream_chat(&meta.model, upstream_body)
-        .await
-        .map_err(|err| match err {
-            UpstreamError::NoModel(_) => AppError::ModelNotAllowed(meta.model.clone()),
-            UpstreamError::NoHealthyUpstream(_) => AppError::NoUpstreamAvailable,
-            // A transport error is a network-level failure: reqwest's Display
-            // embeds the provider URL, so the raw error MUST NOT reach the client
-            // (DEFECT 3, docs/error-model.md:159). Log it server-side at warn
-            // level and return a generic upstream-unavailable error instead.
-            UpstreamError::Transport(_) => {
-                warn!(
-                    account_id = %account_id,
-                    model = %meta.model,
-                    error = %err,
-                    "upstream transport error; detail withheld from client"
-                );
-                AppError::NoUpstreamAvailable
-            }
-            // None of the remaining variants carry a provider URL or hostname, so
-            // the generic internal error is safe to surface.
-            other => AppError::Internal(other.to_string()),
-        })?;
+    // 6. HOLD the reservation. This is the money step: the wallet is debited by
+    //    the worst case in a guarded, committed transaction BEFORE the upstream is
+    //    called, and the release happens at settlement.
+    //
+    // The guard is `balance_idr >= $amount` inside the UPDATE, not a read: two
+    // concurrent requests from the same account are serialized by the row lock, so
+    // only as many as the balance can actually cover are admitted. The previous
+    // code read the balance here and debited nothing, which let an account holding
+    // 1 IDR run unbounded concurrent expensive requests — and with
+    // `allow_negative_balance_overdraft = true` the 402 branch below was dead, so
+    // nothing refused them at all.
+    //
+    // `allow_negative_balance_overdraft` is deliberately NOT consulted here: a hold
+    // is not a balance rule, it is the mechanism that makes the balance rule real.
+    // The balance can never go negative (docs/decisions.md D3) — the CHECK
+    // constraint is never bypassed and no unaffordable request is admitted.
+    let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+    let held = reserve_balance_transaction(
+        &state.pool,
+        account_id,
+        reservation,
+        Some(&reservation_ref),
+    )
+    .await?;
+
+    let reserved_idr = match held {
+        ReservationResult::Held { reserved_idr, .. } => reserved_idr,
+        // Nothing held: the wallet cannot cover the worst case. 402, and no request
+        // was made — a customer is never charged for a request that was refused.
+        ReservationResult::Insufficient { balance_idr } => {
+            return Err(AppError::InsufficientBalance {
+                details: Some(json!({
+                    "balance_idr": balance_idr,
+                    "required_idr": reservation
+                })),
+            });
+        }
+        // A zero-token worst case is not a refusal; there is simply nothing to hold.
+        ReservationResult::Zero => 0,
+    };
+
+    // 7. Route and stream. The raw inbound body goes up with `stream: true`
+    // ensured; the client rewrites `model` to the endpoint's upstream_model.
+    //
+    // The hold is out of the wallet from here on, so every exit must give it back.
+    // The upstream was never reached, so there is nothing to bill: releasing the
+    // whole hold is exactly the net-zero the ledger needs.
+    let stream = match upstream.stream_chat(&meta.model, upstream_body).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            release_quietly(&state.pool, account_id, reserved_idr, &reservation_ref, &meta.model)
+                .await;
+            return Err(upstream_error(err, &meta.model, account_id));
+        }
+    };
 
     let endpoint = stream.endpoint_name().to_string();
 
@@ -571,9 +696,11 @@ pub async fn chat_completions(
         "Proxy streaming from upstream"
     );
 
-    // 6. Settlement runs detached: the client is served first, and a billing
+    // 8. Settlement runs detached: the client is served first, and a billing
     // failure must not turn a completed answer into an error the customer never
-    // saw. The tee reports back through this channel when the stream ends.
+    // saw. The tee reports back through this channel when the stream ends —
+    // including when the client hangs up, in which case it hands the unread
+    // upstream body over so the usage the upstream still reports is settled.
     let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
 
     tokio::spawn(settle_after_stream(
@@ -584,6 +711,8 @@ pub async fn chat_completions(
         account_id,
         key_id,
         meta.model.clone(),
+        reservation,
+        reservation_ref,
     ));
 
     Response::builder()
@@ -595,7 +724,40 @@ pub async fn chat_completions(
         .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-/// Bills the request once the upstream stream has ended.
+/// What a settlement should do with a finished request, from the upstream's own
+/// evidence alone.
+#[derive(Debug, PartialEq, Eq)]
+enum SettlementPlan {
+    /// The upstream reported usage: bill exactly those tokens, releasing the hold
+    /// inside the same settlement transaction.
+    Bill(Usage),
+    /// No usage was reported — a truncated stream, a client hangup whose upstream
+    /// said nothing, or a lost settlement channel. Settle NOTHING and give the whole
+    /// hold back. This is the documented washed case (docs/failover.md:138-144);
+    /// token counts are never invented to fill the gap.
+    Wash,
+}
+
+/// The billing decision, pure so it is testable without a database or a stream.
+///
+/// The single rule: bill what the upstream reported, and nothing when it reported
+/// nothing. A partial answer is billed by exactly the tokens the upstream says it
+/// generated — the client receiving less of the answer than it asked for does not
+/// change what the provider charged us.
+fn settlement_plan(usage: Option<Usage>) -> SettlementPlan {
+    match usage {
+        Some(usage) => SettlementPlan::Bill(usage),
+        None => SettlementPlan::Wash,
+    }
+}
+
+/// Bills the request once the upstream stream has ended, and gives back whatever
+/// of the reservation the real cost did not use.
+///
+/// Every exit from here releases the hold: `reserved_idr` is out of the wallet for
+/// the whole upstream call, and the settlement transaction credits it back before
+/// charging the true cost, so the ledger nets to exactly `-cost_idr`.
+#[allow(clippy::too_many_arguments)]
 async fn settle_after_stream(
     end: tokio::sync::oneshot::Receiver<StreamEnd>,
     pool: PgPool,
@@ -604,17 +766,15 @@ async fn settle_after_stream(
     account_id: Uuid,
     key_id: Uuid,
     model: String,
+    reserved_idr: i64,
+    reservation_ref: String,
 ) {
-    let end = match end.await {
-        Ok(end) => end,
-        // The response was dropped before the stream ended: the client hung up.
-        // The tee dropped the upstream stream with it; nothing to settle.
-        Err(_) => return,
-    };
-
-    let usage = match end {
-        StreamEnd::Settled(usage) => usage,
-        StreamEnd::NoUsage => {
+    // Each arm reports only what the upstream actually said; the single rule below
+    // then decides bill-or-wash, so there is exactly one place a hold can be
+    // released and exactly one place a charge can be made.
+    let reported = match end.await {
+        Ok(StreamEnd::Settled(usage)) => Some(usage),
+        Ok(StreamEnd::NoUsage) => {
             // docs/failover.md: a stream that ends without a usage block was
             // truncated. Settle nothing rather than inventing token counts.
             warn!(
@@ -622,11 +782,64 @@ async fn settle_after_stream(
                 model = %model,
                 "Upstream stream ended without usage; nothing settled"
             );
-            return;
+            None
+        }
+        Ok(StreamEnd::Hangup(stream)) => {
+            // The client hung up mid-answer. The upstream keeps generating and still
+            // reports usage for what it produced, so the abandoned body is drained to
+            // its end rather than dropped: the tokens were consumed upstream and must
+            // be billed. There is no client left to send the answer to, so this is
+            // logged quietly rather than treated as a delivery failure.
+            let drained = drain_for_usage(stream).await;
+            match drained {
+                Some(usage) => info!(
+                    account_id = %account_id,
+                    model = %model,
+                    input_tokens = usage.input_tokens,
+                    cache_read_tokens = usage.cache_read_tokens,
+                    output_tokens = usage.output_tokens,
+                    "Client hung up; settling the usage the upstream still reported"
+                ),
+                None => info!(
+                    account_id = %account_id,
+                    model = %model,
+                    "Client hung up; upstream reported no usage, nothing settled"
+                ),
+            }
+            drained
+        }
+        Err(_) => {
+            // The settlement channel closed with no outcome at all. The tee sends on
+            // drop, so this is a task-level loss rather than a client hangup; the hold
+            // must not be left stranded either way.
+            warn!(
+                account_id = %account_id,
+                model = %model,
+                reserved_idr,
+                "Settlement channel closed without an outcome; releasing the reservation"
+            );
+            None
         }
     };
 
+    // Bill exactly what the upstream reported, and give the whole hold back when it
+    // reported nothing. No usage means no charge — never an invented one.
+    let SettlementPlan::Bill(usage) = settlement_plan(reported) else {
+        release_quietly(&pool, account_id, reserved_idr, &reservation_ref, &model).await;
+        return;
+    };
+
     let Some(model_cfg) = config.models.iter().find(|m| m.name == model) else {
+        // The model was routed moments ago, so this cannot happen without a config
+        // reload mid-request. The hold must still come back: a stranded reservation
+        // is money the customer cannot spend.
+        warn!(
+            account_id = %account_id,
+            model = %model,
+            reserved_idr,
+            "Settled model is no longer configured; releasing the reservation"
+        );
+        release_quietly(&pool, account_id, reserved_idr, &reservation_ref, &model).await;
         return;
     };
 
@@ -652,6 +865,7 @@ async fn settle_after_stream(
         usage.output_tokens,
         cost_idr,
         None,
+        reserved_idr,
     )
     .await
     {
@@ -679,10 +893,16 @@ async fn settle_after_stream(
             // usage figures, so this is logged, not fatal.
             match todays_usage(&pool, account_id).await {
                 Ok(totals) => publish_usage(&events, account_id, totals),
-                Err(err) => warn!(
+                // A decode/aggregate failure here is not cosmetic: it silently
+                // drops the usage event subscribers rely on, and a type mismatch
+                // (Postgres returns NUMERIC for SUM(bigint) while the row is
+                // decoded into i64) is exactly how that went unnoticed. Loud, with
+                // the account and the model, so it is diagnosable from the log.
+                Err(err) => error!(
                     account_id = %account_id,
+                    model = %model,
                     error = %err,
-                    "Usage event skipped: totals unavailable"
+                    "Usage event skipped: today's totals could not be read"
                 ),
             }
         }
@@ -718,10 +938,16 @@ async fn settle_after_stream(
             publish_balance(&events, account_id, new_balance);
             match todays_usage(&pool, account_id).await {
                 Ok(totals) => publish_usage(&events, account_id, totals),
-                Err(err) => warn!(
+                // A decode/aggregate failure here is not cosmetic: it silently
+                // drops the usage event subscribers rely on, and a type mismatch
+                // (Postgres returns NUMERIC for SUM(bigint) while the row is
+                // decoded into i64) is exactly how that went unnoticed. Loud, with
+                // the account and the model, so it is diagnosable from the log.
+                Err(err) => error!(
                     account_id = %account_id,
+                    model = %model,
                     error = %err,
-                    "Usage event skipped: totals unavailable"
+                    "Usage event skipped: today's totals could not be read"
                 ),
             }
         }
@@ -736,6 +962,31 @@ async fn settle_after_stream(
         ),
     }
 }
+/// Gives a reservation back, logging a failure instead of discarding it.
+///
+/// A release that does not land leaves the customer's money debited against a
+/// request that was never billed — the mirror image of the defect this fix closes
+/// — so a failure is loud even though the client is long gone.
+async fn release_quietly(
+    pool: &PgPool,
+    account_id: Uuid,
+    reserved_idr: i64,
+    reservation_ref: &str,
+    model: &str,
+) {
+    match release_reservation_transaction(pool, account_id, reserved_idr, Some(reservation_ref)).await
+    {
+        Ok(_) => {}
+        Err(err) => error!(
+            account_id = %account_id,
+            model = %model,
+            reserved_idr,
+            error = %err,
+            "Failed to release the reservation; the hold is stranded"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,6 +1137,41 @@ mod tests {
         assert_eq!(stored.models, json!(["deepseek-flash"]));
         assert_ne!(stored.key_id, Uuid::nil());
         assert_ne!(stored.account_id, Uuid::nil());
+    }
+
+    /// A completed stream that reported usage is billed by exactly what the
+    /// upstream said, and a stream that reported nothing is washed — never billed
+    /// against invented counts (docs/failover.md:138-144).
+    #[test]
+    fn a_reported_usage_is_billed_and_a_missing_one_is_washed() {
+        let full = Usage {
+            input_tokens: 11,
+            cache_read_tokens: 5,
+            output_tokens: 40,
+        };
+        assert_eq!(settlement_plan(Some(full)), SettlementPlan::Bill(full));
+
+        // The documented washed case: the upstream never reported usage.
+        assert_eq!(settlement_plan(None), SettlementPlan::Wash);
+    }
+
+    /// A partial answer is still billed by the tokens the upstream generated —
+    /// the client receiving less than it asked for does not change what the
+    /// provider charged us. Only "no usage at all" is washed.
+    #[test]
+    fn a_partial_answer_is_billed_while_no_report_is_washed() {
+        let partial = Usage {
+            input_tokens: 3,
+            cache_read_tokens: 0,
+            output_tokens: 1,
+        };
+        assert_eq!(settlement_plan(Some(partial)), SettlementPlan::Bill(partial));
+
+        // Zero-valued but PRESENT usage is a report, not an absence: the upstream
+        // spoke, so it is billed rather than washed.
+        let zero = Usage::default();
+        assert_eq!(settlement_plan(Some(zero)), SettlementPlan::Bill(zero));
+        assert_ne!(settlement_plan(Some(zero)), SettlementPlan::Wash);
     }
 
     // DEFECT 2 regression: an empty allowlist denies everything. A key created

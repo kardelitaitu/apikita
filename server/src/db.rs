@@ -270,7 +270,27 @@ pub fn clamp_debit(cost_idr: i64, available_idr: i64) -> (i64, i64) {
     (debited_idr, cost_idr - debited_idr)
 }
 
-/// Atomically settles usage: debits wallet, inserts ledger row, and upserts daily usage.
+/// The two ledger deltas a settlement writes, as a pure function of what was held
+/// and what the request truly cost.
+///
+/// `reserve_balance_transaction` already wrote `-reserved_idr` when the request
+/// started. Adding the two deltas here gives the whole request's net ledger move:
+///
+///   -reserved_idr + release_delta + charge_delta = -cost_idr
+///
+/// which is what `balance_idr = SUM(ledger.delta_idr)` requires at the commit
+/// point. The release is written as its OWN row rather than folded into the charge
+/// so the hold's reversal stays visible in an append-only log: `-reserved`,
+/// `+reserved`, `-cost` is three auditable facts; `-cost` alone is one.
+///
+/// A negative argument is floored: a charge is never a credit and a release is
+/// never a second hold.
+pub fn settlement_ledger_deltas(released_idr: i64, cost_idr: i64) -> (i64, i64) {
+    (released_idr.max(0), -cost_idr.max(0))
+}
+
+/// Atomically settles usage: releases the reservation, debits wallet, appends the
+/// ledger rows, and upserts daily usage.
 ///
 /// The balance check is a predicate on the UPDATE itself, so it cannot race a
 /// concurrent request, and `CHECK (balance_idr >= 0)` is never the thing that
@@ -279,6 +299,13 @@ pub fn clamp_debit(cost_idr: i64, available_idr: i64) -> (i64, i64) {
 /// An unaffordable debit is NOT dropped: the reported usage is still recorded and
 /// the debit is clamped to the balance (`UsageSettlement::Partial`). See
 /// `clamp_debit` for why the debit is clamped rather than the balance forced.
+///
+/// `reserved_idr` is the hold `reserve_balance_transaction` took before the
+/// request went upstream. Releasing it and charging the real cost happen in THIS
+/// transaction, in that order, so no commit point ever shows a balance that the
+/// ledger cannot explain: the hold is out of the wallet for the whole upstream
+/// call, and the release row is written before the charge row.
+#[allow(clippy::too_many_arguments)]
 pub async fn debit_usage_transaction(
     pool: &PgPool,
     account_id: Uuid,
@@ -288,8 +315,32 @@ pub async fn debit_usage_transaction(
     output_tokens: i64,
     cost_idr: i64,
     ref_batch: Option<&str>,
+    reserved_idr: i64,
 ) -> Result<UsageSettlement, AppError> {
     let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+
+    // 0. Release the hold first. The guard is the same one the take used: the
+    //    wallet can never have spent more than its own balance, so the release
+    //    always matches when a hold was actually taken, and a zero reservation
+    //    (nothing held) skips the statement entirely.
+    let released_idr = if reserved_idr > 0 {
+        match try_credit(&mut tx, account_id, reserved_idr).await? {
+            Some(_) => reserved_idr,
+            None => {
+                // No wallet row: nothing was ever held, so there is nothing to
+                // give back. Recording a release anyway would credit money the
+                // ledger never took.
+                error!(
+                    account_id = %account_id,
+                    reserved_idr,
+                    "Reservation release matched no wallet; nothing released"
+                );
+                0
+            }
+        }
+    } else {
+        0
+    };
 
     // 1. Debit wallet.
     //
@@ -325,13 +376,17 @@ pub async fn debit_usage_transaction(
                 output_tokens,
                 cost_idr,
                 ref_batch,
+                released_idr,
                 current_balance,
             )
             .await;
         }
     };
 
-    // 2. Append the ledger debit and the usage row, then commit.
+    // 2. Release the hold, append the ledger debit and the usage row, then commit.
+    //    `released_idr` is what step 0 credited back; passing it here is what
+    //    writes the matching `+hold` ledger row. Omitting it credits the wallet
+    //    without a ledger row, which is exactly the drift this invariant catches.
     record_usage(
         tx,
         account_id,
@@ -341,7 +396,8 @@ pub async fn debit_usage_transaction(
         output_tokens,
         cost_idr,
         ref_batch,
-        -cost_idr,
+        released_idr,
+        cost_idr,
         new_balance,
     )
     .await?;
@@ -357,8 +413,15 @@ pub async fn debit_usage_transaction(
 /// `balance_after` invariant cannot drift apart between them.
 ///
 /// `usage_cost_idr` is what the request cost, and is what the dashboard and the
-/// 30-day spend reporting read; `delta_idr` is what the ledger records. The two
+/// 30-day spend reporting read; `charged_idr` is what the ledger records. The two
 /// differ only when the wallet could not cover the cost in full.
+///
+/// `released_idr` is a reservation being handed back, and it is written as its
+/// own row BEFORE the charge. The hold was appended when the reservation was
+/// taken, so reversing it here is what keeps the ledger invariant
+/// (`balance_idr = SUM(ledger.delta_idr)`) true at the commit point: across the
+/// whole request the ledger moves `-reserved + released - charged`, which is
+/// exactly `-charged` because the whole hold comes back.
 #[allow(clippy::too_many_arguments)]
 async fn record_usage(
     mut tx: Transaction<'_, Postgres>,
@@ -369,18 +432,27 @@ async fn record_usage(
     output_tokens: i64,
     usage_cost_idr: i64,
     ref_batch: Option<&str>,
-    delta_idr: i64,
+    released_idr: i64,
+    charged_idr: i64,
     new_balance: i64,
 ) -> Result<(), AppError> {
-    sqlx::query(
-        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES ($1, $2, 'usage', $3, $4, now())",
-    )
-    .bind(account_id)
-    .bind(delta_idr)
-    .bind(ref_batch)
-    .bind(new_balance)
-    .execute(&mut *tx)
-    .await?;
+    // The release and the charge, from one pure rule so the ledger cannot drift:
+    // `-reserved + release_delta + charge_delta` is exactly `-cost`.
+    let (release_delta, charge_delta) = settlement_ledger_deltas(released_idr, charged_idr);
+
+    if release_delta != 0 {
+        // The balance the release left: the charge below has not been taken yet.
+        insert_ledger_row(
+            &mut tx,
+            account_id,
+            release_delta,
+            ref_batch,
+            new_balance - charge_delta,
+        )
+        .await?;
+    }
+
+    insert_ledger_row(&mut tx, account_id, charge_delta, ref_batch, new_balance).await?;
 
     // Upsert usage_daily
     let today = Utc::now().date_naive();
@@ -450,6 +522,157 @@ async fn try_debit(
     Ok(wallet.map(|w| w.get("balance_idr")))
 }
 
+/// Appends one append-only ledger row. `balance_after` is the wallet balance the
+/// row leaves behind, which is what makes the ledger self-explaining after a
+/// crash: the running balance can be replayed without the wallet row.
+async fn insert_ledger_row(
+    tx: &mut Transaction<'_, Postgres>,
+    account_id: Uuid,
+    delta_idr: i64,
+    ref_batch: Option<&str>,
+    balance_after: i64,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES ($1, $2, 'usage', $3, $4, now())",
+    )
+    .bind(account_id)
+    .bind(delta_idr)
+    .bind(ref_batch)
+    .bind(balance_after)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Credits `amount` to the wallet, returning the balance after it.
+///
+/// Unconditional on purpose: this is only ever a RESERVATION being handed back,
+/// never money arriving from outside. A hold the wallet took itself can always be
+/// returned, so there is nothing to guard against — unlike `try_debit`, which
+/// must never let the balance go negative.
+async fn try_credit(
+    tx: &mut Transaction<'_, Postgres>,
+    account_id: Uuid,
+    amount: i64,
+) -> Result<Option<i64>, AppError> {
+    let wallet = sqlx::query(
+        "UPDATE wallets SET balance_idr = balance_idr + $1, updated_at = now() WHERE account_id = $2 RETURNING balance_idr",
+    )
+    .bind(amount)
+    .bind(account_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    Ok(wallet.map(|w| w.get("balance_idr")))
+}
+
+/// What taking a reservation did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReservationResult {
+    /// The wallet is debited by `reserved_idr` and the ledger holds the matching
+    /// negative row. The money is out of the balance for the whole request, which
+    /// is the point: a concurrent request sees it gone.
+    Held { reserved_idr: i64, new_balance: i64 },
+    /// Nothing was held: the wallet cannot cover `reserved_idr` right now, or the
+    /// account has no wallet at all.
+    Insufficient { balance_idr: i64 },
+    /// Nothing to hold. A zero-amount reservation must not write a ledger row — a
+    /// zero delta is noise in an append-only money log.
+    Zero,
+}
+
+/// Takes the worst-case reservation BEFORE the request goes upstream, and returns
+/// whether it was held.
+///
+/// This is the fix for the overdraw defect. The old check read `balance_idr` in
+/// one statement and debited nothing, so N concurrent requests from one account
+/// all passed the same point-in-time value and an account holding 1 IDR could run
+/// unbounded expensive requests. Here the check IS the debit:
+/// `balance_idr >= $amount` is a predicate on the UPDATE, and Postgres re-evaluates
+/// it against the latest row version under the row lock, so exactly as many
+/// concurrent requests as the balance can pay for are admitted and the rest match
+/// no row. Concurrency is serialized by the database, not by a read.
+///
+/// The hold is a real, guarded debit with its own ledger row, taken in one
+/// transaction and committed before the upstream is called. `balance_idr` and
+/// `SUM(ledger.delta_idr)` therefore move together, and a crash between the hold
+/// and the settlement leaves the money debited and the row written — a visible
+/// held reservation, never a balance the ledger cannot explain.
+///
+/// This is NOT `allow_negative_balance_overdraft`: the CHECK constraint is never
+/// bypassed and the balance never goes negative (docs/decisions.md D3).
+pub async fn reserve_balance_transaction(
+    pool: &PgPool,
+    account_id: Uuid,
+    reserved_idr: i64,
+    ref_batch: Option<&str>,
+) -> Result<ReservationResult, AppError> {
+    if reserved_idr <= 0 {
+        return Ok(ReservationResult::Zero);
+    }
+
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+
+    // The guard lives inside the statement, never in a preceding read.
+    match try_debit(&mut tx, account_id, reserved_idr).await? {
+        Some(new_balance) => {
+            insert_ledger_row(&mut tx, account_id, -reserved_idr, ref_batch, new_balance).await?;
+            tx.commit().await?;
+
+            Ok(ReservationResult::Held {
+                reserved_idr,
+                new_balance,
+            })
+        }
+        None => {
+            // No row matched: the decision is already made. This read only fills in
+            // the detail the caller shows the customer, and failing it must not turn
+            // a visible refusal into an opaque 500. Nothing was written, so there is
+            // nothing to roll back beyond the empty transaction.
+            let balance_idr = read_balance(&mut tx, account_id).await.unwrap_or(0);
+            tx.rollback().await?;
+
+            Ok(ReservationResult::Insufficient { balance_idr })
+        }
+    }
+}
+
+/// Gives a held reservation back IN FULL, in its own transaction.
+///
+/// Used on the paths where no billable usage exists: the upstream was never
+/// reached, the stream ended without a usage report (the documented washed case,
+/// docs/failover.md:138-144), or the settlement channel closed with no outcome.
+/// The credit is the exact inverse of the guarded debit that took the hold, so the
+/// ledger nets to zero and no money is created.
+///
+/// `Ok(None)` means nothing was released — a zero reservation, or no wallet row.
+pub async fn release_reservation_transaction(
+    pool: &PgPool,
+    account_id: Uuid,
+    reserved_idr: i64,
+    ref_batch: Option<&str>,
+) -> Result<Option<i64>, AppError> {
+    if reserved_idr <= 0 {
+        return Ok(None);
+    }
+
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+
+    let Some(new_balance) = try_credit(&mut tx, account_id, reserved_idr).await? else {
+        // No wallet row: nothing was ever held, so nothing is released and no
+        // ledger row is written. A credit the ledger cannot back is the one thing
+        // this function must never do.
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    insert_ledger_row(&mut tx, account_id, reserved_idr, ref_batch, new_balance).await?;
+    tx.commit().await?;
+
+    Ok(Some(new_balance))
+}
+
 /// Records usage the wallet could not cover in full, and returns what was lost.
 ///
 /// Runs on the transaction `debit_usage_transaction` already opened: the guarded
@@ -465,6 +688,7 @@ async fn settle_partial_usage(
     output_tokens: i64,
     cost_idr: i64,
     ref_batch: Option<&str>,
+    released_idr: i64,
     available_idr: i64,
 ) -> Result<UsageSettlement, AppError> {
     let (debited_idr, _) = clamp_debit(cost_idr, available_idr);
@@ -504,7 +728,8 @@ async fn settle_partial_usage(
         output_tokens,
         cost_idr,
         ref_batch,
-        -debited_idr,
+        released_idr,
+        debited_idr,
         new_balance,
     )
     .await?;
@@ -557,6 +782,36 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
+    }
+
+    /// Everything an operator needs to see when reconciliation fails: the wallet
+    /// balance, the ledger sum, and every ledger row that produced it. A bare
+    /// "drift" count says money is wrong but not which row is missing.
+    async fn drift_report(pool: &PgPool, account_id: Uuid) -> String {
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(pool)
+                .await
+                .expect("read balance");
+
+        let ledger_sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(delta_idr), 0)::bigint FROM ledger WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
+        .expect("sum ledger");
+
+        let rows: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT delta_idr, reason, balance_after, ref FROM ledger WHERE account_id = $1 ORDER BY id",
+        )
+        .bind(account_id)
+        .fetch_all(pool)
+        .await
+        .expect("read ledger rows");
+
+        format!("balance_idr={balance} ledger_sum={ledger_sum} rows={rows:?}")
     }
 
     /// Deletes every row a fixture created, in FK order (`ledger` and `wallets`
@@ -687,6 +942,7 @@ mod tests {
             150,
             cost_idr,
             Some("test_overdraft"),
+            0,
         )
         .await
         .expect("a partial settlement is a recorded outcome, not an error");
@@ -774,6 +1030,7 @@ mod tests {
             150,
             settled_cost,
             Some("test_covered"),
+            0,
         )
         .await
         .expect("an affordable debit must succeed");
@@ -792,6 +1049,225 @@ mod tests {
 
         // Teardown belongs to the caller, which runs it whether these assertions
         // pass or panic.
+    }
+
+    /// REAL CONCURRENCY PROOF for the overdraw defect, plus the per-settlement
+    /// reconciliation invariant.
+    ///
+    /// The account is funded for EXACTLY ONE request, through the real top-up path
+    /// — never by writing `balance_idr`, which would manufacture the very drift this
+    /// test then asserts against. Five reservations are taken concurrently. The
+    /// guarded UPDATE serializes them on the wallet row, so exactly one matches and
+    /// the rest are refused. Before the fix all five passed a point-in-time read.
+    ///
+    /// Then the winner settles: the hold is released and the true cost charged in
+    /// one transaction. `ledger_drift_rows` is asserted ZERO after every single
+    /// settlement, sequential and concurrent, because a missing release row is
+    /// exactly the money leak this invariant exists to catch.
+    ///
+    /// Needs a live, migrated Postgres, so it is #[ignore]d:
+    /// `DATABASE_URL=... cargo test --lib -- --ignored`.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn concurrent_requests_cannot_overdraw_a_one_request_balance() {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+        let pool = init_pool(&database_url).await.expect("connect to Postgres");
+
+        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
+        let account_id: Uuid =
+            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
+                .bind(&pb_user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("create account");
+
+        let assertions = tokio::spawn(overdraw_concurrency_assertions(pool.clone(), account_id));
+        let outcome = assertions.await;
+        delete_fixture_rows(&pool, account_id).await;
+        outcome.expect("the concurrency assertions panicked");
+    }
+
+    /// The body of the live concurrency test, minus the fixture and teardown its
+    /// caller owns.
+    async fn overdraw_concurrency_assertions(pool: PgPool, account_id: Uuid) {
+        const RESERVATION: i64 = 10_000;
+        const CONCURRENCY: usize = 5;
+
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
+            .bind(account_id)
+            .execute(&pool)
+            .await
+            .expect("create the zero-balance wallet the login path would create");
+
+        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
+            .bind(account_id)
+            .bind(RESERVATION)
+            .bind(&order_id)
+            .execute(&pool)
+            .await
+            .expect("create topup");
+
+        assert_eq!(
+            credit_topup_transaction(&pool, &order_id, RESERVATION)
+                .await
+                .expect("fund the wallet"),
+            TopupCreditResult::Settled {
+                new_balance: RESERVATION
+            },
+            "the fixture must fund the wallet through the real top-up path"
+        );
+
+        // Five at once, each asking for the whole balance: at most one can be held.
+        let mut tasks = Vec::with_capacity(CONCURRENCY);
+        for i in 0..CONCURRENCY {
+            let pool = pool.clone();
+            let reference = format!("test_reserve_{i}");
+            tasks.push(tokio::spawn(async move {
+                reserve_balance_transaction(&pool, account_id, RESERVATION, Some(&reference)).await
+            }));
+        }
+
+        let mut held = 0;
+        let mut refused = 0;
+        for task in tasks {
+            match task
+                .await
+                .expect("a reservation task panicked")
+                .expect("reserve")
+            {
+                ReservationResult::Held { reserved_idr, .. } => {
+                    assert_eq!(reserved_idr, RESERVATION);
+                    held += 1;
+                }
+                ReservationResult::Insufficient { .. } => refused += 1,
+                ReservationResult::Zero => panic!("a non-zero reservation was reported as zero"),
+            }
+        }
+
+        assert_eq!(held, 1, "exactly one request may be funded by a one-request balance");
+        assert_eq!(refused, CONCURRENCY - 1, "the rest must be refused");
+
+        let balance: i64 = sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read balance");
+        assert_eq!(balance, 0, "the single hold consumed the whole balance");
+
+        let held_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = $1 AND delta_idr < 0")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count holds");
+        assert_eq!(held_rows, 1, "a refused reservation must write no ledger row");
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must equal SUM(ledger.delta_idr) after concurrent holds"
+        );
+
+        // usage_daily.api_key_id is part of the primary key, so a real key row is
+        // needed before any usage can be recorded.
+        let key_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES ($1, $2, 'apk_test') RETURNING id",
+        )
+        .bind(account_id)
+        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
+        .fetch_one(&pool)
+        .await
+        .expect("create api key");
+
+        // The winner settles: the hold comes back and the true cost is charged, in
+        // ONE transaction. Drift must be zero immediately afterwards — a release
+        // that credits the wallet without a ledger row is the leak being guarded.
+        let cost_idr = 250;
+        let settled = debit_usage_transaction(
+            &pool,
+            account_id,
+            Some(key_id),
+            200,
+            0,
+            150,
+            cost_idr,
+            Some("test_reserve"),
+            RESERVATION,
+        )
+        .await
+        .expect("settle the winner");
+        assert_eq!(
+            settled,
+            UsageSettlement::Settled {
+                new_balance: RESERVATION - cost_idr
+            }
+        );
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "the release and the charge must net to the true cost: {}",
+            drift_report(&pool, account_id).await
+        );
+
+        // The release row must be ON THE BOOKS, not merely reflected in the balance:
+        // the whole hold back out, and exactly the cost in.
+        let release_row: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(delta_idr), 0)::bigint FROM ledger WHERE account_id = $1 AND delta_idr > 0 AND reason = 'usage'",
+        )
+        .bind(account_id)
+        .fetch_one(&pool)
+        .await
+        .expect("sum release rows");
+        assert_eq!(release_row, RESERVATION, "the release must write a +hold ledger row");
+
+        // Now the same path repeatedly, asserting the invariant after EVERY
+        // settlement rather than only at the end. A drift that appears mid-run and
+        // is later masked is the failure mode this catches.
+        for round in 0..5 {
+            let refill = format!("test_topup_refill_{round}");
+            sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
+                .bind(account_id)
+                .bind(RESERVATION)
+                .bind(&refill)
+                .execute(&pool)
+                .await
+                .expect("create refill topup");
+            credit_topup_transaction(&pool, &refill, RESERVATION)
+                .await
+                .expect("refill through the real top-up path");
+
+            let reference = format!("test_round_reserve_{round}");
+            let reservation =
+                reserve_balance_transaction(&pool, account_id, RESERVATION, Some(&reference))
+                    .await
+                    .expect("reserve");
+            assert!(matches!(reservation, ReservationResult::Held { .. }));
+            assert_eq!(
+                ledger_drift_rows(&pool, account_id).await,
+                0,
+                "drift after the hold of round {round}"
+            );
+
+            debit_usage_transaction(
+                &pool,
+                account_id,
+                Some(key_id),
+                10,
+                0,
+                5,
+                66,
+                Some(&reference),
+                RESERVATION,
+            )
+            .await
+            .expect("settle");
+            assert_eq!(
+                ledger_drift_rows(&pool, account_id).await,
+                0,
+                "drift after settlement {round}"
+            );
+        }
     }
 
     /// A refund is only ever applied to a topup that actually settled, and only
@@ -907,6 +1383,62 @@ mod tests {
                 );
                 assert!(debited >= 0, "a debit is never a credit");
             }
+        }
+    }
+
+    /// The reservation arithmetic, as a pure rule: the two deltas a settlement
+    /// writes must undo the hold and leave exactly the true cost behind.
+    ///
+    /// `reserve_balance_transaction` already wrote `-reserved` when the request
+    /// started, so the whole request's net ledger move is
+    /// `-reserved + release_delta + charge_delta`, and it must be `-cost` for
+    /// `balance_idr = SUM(ledger.delta_idr)` to hold at the commit point.
+    #[test]
+    fn a_reservation_and_its_release_net_to_the_true_cost() {
+        for reserved in [0_i64, 1, 66, 1_000, 250_000] {
+            for cost in [0_i64, 1, 66, 999, 1_000, 250_000] {
+                let (release_delta, charge_delta) = settlement_ledger_deltas(reserved, cost);
+
+                assert_eq!(
+                    -reserved + release_delta + charge_delta,
+                    -cost,
+                    "reserved {reserved}, cost {cost}: the ledger must net to the true cost"
+                );
+                assert!(release_delta >= 0, "a release is never a second hold");
+                assert!(charge_delta <= 0, "a charge is never a credit");
+            }
+        }
+    }
+
+    /// Nothing is held when there is nothing to hold, so nothing is released: a
+    /// zero-delta ledger row is noise in an append-only money log.
+    #[test]
+    fn a_zero_reservation_writes_no_release_row() {
+        assert_eq!(settlement_ledger_deltas(0, 0), (0, 0));
+        assert_eq!(settlement_ledger_deltas(0, 500), (0, -500));
+    }
+
+    /// A negative argument must never become money: a negative cost is not a
+    /// charge and a negative release is not a hold being returned.
+    #[test]
+    fn a_negative_delta_is_floored_not_inverted() {
+        assert_eq!(settlement_ledger_deltas(-100, -100), (0, 0));
+        assert_eq!(settlement_ledger_deltas(-1, 0), (0, 0));
+    }
+
+    /// A reservation is either held or refused, and the refusal carries the
+    /// balance the customer actually has, so the 402 detail is not a guess.
+    #[test]
+    fn a_refused_reservation_is_not_mistakable_for_a_held_one() {
+        assert_ne!(
+            ReservationResult::Held { reserved_idr: 0, new_balance: 0 },
+            ReservationResult::Insufficient { balance_idr: 0 }
+        );
+        assert_ne!(ReservationResult::Zero, ReservationResult::Insufficient { balance_idr: 0 });
+
+        match (ReservationResult::Insufficient { balance_idr: 1 }) {
+            ReservationResult::Insufficient { balance_idr } => assert_eq!(balance_idr, 1),
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
