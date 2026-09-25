@@ -871,20 +871,64 @@ real `db::*` and `ip_tracking::*` functions. **33 checks, 0 failed**, including:
 - An expired session is not accepted, and the space timestamp format is refused by the
   schema's own CHECK.
 
-The harness is a scratch instrument under `.agents/` and is deliberately not committed;
-Phase 5 is where these become real tests.
+The harness was a scratch instrument under `.agents/` and was deliberately not
+committed. [§5.5](#55-phase-5--tests-become-real-tests) is where they became real
+tests: every check above now runs in `cargo test --lib` against a temp database.
 
 ### 5.5 Phase 5 — Tests become real tests
 
-A genuine benefit worth stating: every money test in `db.rs` is currently
-`#[ignore = "requires live Postgres"]`. With SQLite they need only a temp file, so
-they can **run in CI by default**, including
-`concurrent_requests_cannot_overdraw_a_one_request_balance` — the real-concurrency
-proof that is currently never executed automatically.
+**Executed.** The benefit stated below was real and it is now taken: every money test
+in `db.rs` was `#[ignore = "requires live Postgres"]`, including
+`concurrent_requests_cannot_overdraw_a_one_request_balance`. With SQLite they need
+only a temp file, so they **run in CI by default**. Measured after the phase:
+**134 passed, 0 failed, 0 ignored** — without the `--ignored` flag, and with
+`DATABASE_URL` set to nothing.
 
-Re-point them at `tempfile::TempDir` (dev-dependency), drop the `#[ignore]`, and add
-the two new regression tests [§4.3](#43-connection-setup--four-traps-all-measured) demands
-(the `NULL`-`api_key_id` upsert, and the `BEGIN IMMEDIATE` read-then-write path).
+What changed:
+
+- `tempfile` is a dev-dependency, and `server/src/test_support.rs` (gated
+  `#[cfg(test)]`) builds one migrated database per test. It creates the file and
+  applies the real `sqlx::migrate!("./migrations")` on a single connection exactly as
+  `bin/migrate.rs` does, then hands the result to `db::init_pool` — so the pragmas
+  under test are the **production** ones, not a test-only approximation a passing
+  suite could hide behind.
+- The three modules that read `DATABASE_URL` (`db.rs`, `abuse.rs`, `ip_tracking.rs`)
+  now call `TestDb::new()`. Not one `#[ignore]` remains in `src/`.
+- The fixtures that omitted `id`, `created_at` and `updated_at` are replaced by named
+  helpers. This is the defect class the compiler cannot see: the old
+  `INSERT INTO accounts (pb_user_id) VALUES (?)` still type-checked and failed at
+  runtime with `NOT NULL constraint failed: accounts.id`.
+- Per-test databases made the teardown **unnecessary**. `delete_fixture_rows` and
+  `delete_fixture` deleted rows by name in FK order; there is nothing left to clean
+  up, and two tests that used to race through one shared database now cannot see each
+  other's rows.
+
+**Correction to [§4.1](#41-the-measured-port-inventory): its "5 sites" understate this.**
+Those five are production code. The test fixtures are a *separate* five
+(`db.rs` 3, `abuse.rs` 1, `ip_tracking.rs` 1) plus the wallet and topup inserts inside
+the assertion helpers. That last group is where one insert survived a first pass — its
+`.expect()` message differed by three words from the other two, so a whole-file
+replacement missed it and only running the tests found it
+(`NOT NULL constraint failed: wallets.updated_at`).
+
+New tests, each of which fails against a naive mechanical port:
+
+| Test | What it guards |
+| --- | --- |
+| `two_null_key_settlements_accumulate_into_one_usage_row` | [§4.3](#43-connection-setup--four-traps-all-measured) trap 3 — two `NULL`-keyed upserts must land on **one** row, and a keyed row must stay a separate scope |
+| `a_settlement_replayed_after_a_refund_is_refused_and_credits_nothing` | [§4.5](#45-the-two-for-update-sites) — the money-duplication defect; the wallet must stay at 0 and the row must stay `refunded` |
+| `concurrent_refunds_serialize_without_losing_the_write_lock` | [§9](#9-verification) check 4, the real concurrency test this section owed. Five concurrent refunds: one refunds, four see it already refunded, **none errors** |
+| `an_expired_session_is_refused_and_a_live_one_is_accepted` | [§4.6](#46-timestamps--the-hazard-that-would-have-shipped) — the session-lifetime hazard, exercised through the real cookie path |
+| `the_schema_refuses_a_timestamp_sqlite_would_have_written` | [§4.6](#46-timestamps--the-hazard-that-would-have-shipped) — the GLOB CHECK actually fires on the space-separated format |
+
+**Measured, and the convenient assumption is wrong:** while a pooled SQLite connection
+is open, `remove_dir_all` on its directory is **refused** on Windows — SQLite's win32
+VFS does not request `FILE_SHARE_DELETE` for the main database or its `-wal`/`-shm`
+sidecars. So `TestDb::close` *awaits* `pool.close()` instead of relying on drop order
+(dropping a pool only signals the close), and a test that **panics** never reaches
+`close` and leaves one small directory in the system temp. That is the accepted cost
+of per-test isolation: bounded, and far cheaper than the single shared database these
+tests used to race through.
 
 ### 5.6 Phase 6 — Identity
 
@@ -1164,18 +1208,18 @@ proposals.
 | # | Check | Command / method | Status |
 | --- | --- | --- | --- |
 | 1 | Foreign keys actually on | `PRAGMA foreign_keys` → `1`; and a bad FK insert must **fail** | **probe: PASS** |
-| 2 | `NULL` `api_key_id` upsert | Two calls with `api_key_id = NULL` must yield **one** row | **probe: reproduces the bug, and the `COALESCE` index fix** |
-| 3 | Timestamp format uniformity | Every column rejects the space format; mixed-format expiry comparison must not return "still valid" | **probe: reproduces the 7.5-hour session overrun** |
-| 4 | Read-then-write under contention | Concurrent `refund_topup_transaction` calls must not raise `SQLITE_BUSY_SNAPSHOT` | **shape removed by construction** — every transaction now opens with its write, under `BEGIN IMMEDIATE`. Measured: a contended `BEGIN IMMEDIATE` waits the full `busy_timeout` (5.53s) then fails `database is locked` (code 5), which is a *bounded wait*, not the unrecoverable upgrade. Phase 5 still owes a real concurrency test |
-| 5 | Ledger invariant | `SELECT COUNT(*) FROM (SELECT w.account_id FROM wallets w LEFT JOIN ledger l ON l.account_id=w.account_id GROUP BY w.account_id, w.balance_idr HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr),0))` → **0**. This is Launch Gate 2 | **harness: PASS** — asserted after settle, refund, hold, four charges, release and a clamped shortfall |
+| 2 | `NULL` `api_key_id` upsert | Two calls with `api_key_id = NULL` must yield **one** row | **test: PASS** — `two_null_key_settlements_accumulate_into_one_usage_row`. The probe first **reproduced the bug and the `COALESCE` index fix** |
+| 3 | Timestamp format uniformity | Every column rejects the space format; mixed-format expiry comparison must not return "still valid" | **test: PASS** — `the_schema_refuses_a_timestamp_sqlite_would_have_written` and `an_expired_session_is_refused_and_a_live_one_is_accepted`. The probe first **reproduced the 7.5-hour session overrun** |
+| 4 | Read-then-write under contention | Concurrent `refund_topup_transaction` calls must not raise `SQLITE_BUSY_SNAPSHOT` | **test: PASS** — `concurrent_refunds_serialize_without_losing_the_write_lock`: five concurrent refunds, exactly one refunds, four see `AlreadyRefunded`, **none errors**. Shape also still removed by construction — every transaction opens with its write under `BEGIN IMMEDIATE`. Measured: a deliberately held `BEGIN IMMEDIATE` makes a contender wait the full `busy_timeout` (5.53s) then fail `database is locked` (code 5) — a *bounded* wait, not the unrecoverable upgrade |
+| 5 | Ledger invariant | `SELECT COUNT(*) FROM (SELECT w.account_id FROM wallets w LEFT JOIN ledger l ON l.account_id=w.account_id GROUP BY w.account_id, w.balance_idr HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr),0))` → **0**. This is Launch Gate 2 | **test: PASS** — asserted after settle, refund, hold, four charges, release and a clamped shortfall, and now **by default** rather than behind `--ignored` |
 | 6 | Stranded holds | `unpaired_hold_rows` → **0** for every account (`db.rs:1692`) | existing |
 | 7 | WAL is actually on and persists | `PRAGMA journal_mode` → `wal`, and still `wal` on a fresh connection | **probe: PASS** |
 | 8 | `::bigint` removal is safe | `typeof(SUM(col))` → `integer` for every money and token column | **PASS against the migrated schema** — 9/9 columns return `integer`, and a `REAL` column returns `real`, which is the trap the casts existed for |
-| 9 | Overdraw proof | `cargo test --lib` — the concurrency test now runs **without** `--ignored` | existing test, newly unblocked |
+| 9 | Overdraw proof | `cargo test --lib` — the concurrency test now runs **without** `--ignored` | **test: PASS** — measured **134 passed / 0 failed / 0 ignored**. The two concurrency tests re-run 15× with no flakes (0.30–0.44 s each) |
 | 10 | Volume permissions | The container user can create, write and reopen the DB file **on the real volume** | new, deploy-time |
 | 11 | Memory | Re-measure RSS, including the Litestream sidecar | re-run `docs/benchmark.md` |
 | 12 | Write throughput ceiling | Single-writer serialisation is the new bottleneck. Record the write rate, not just token throughput | re-run `bin/benchmark.rs` |
-| 13 | Build | `cargo check && cargo build --release` | **PASS** — both clean |
+| 13 | Build | `cargo check --all-targets`, `cargo build --release`, `cargo test` | **PASS** — check clean, release built in 18.85s, and `cargo test` runs **134 passed / 0 failed / 0 ignored**. One pre-existing failure was fixed on the way: an illustrative indented block in `upstream/key_pool.rs` was collected as a Rust doctest and did not compile, so a bare `cargo test` was red for a comment. Marked `text` |
 | 14 | Restore drill | Restore from Litestream/backup into a clean volume and run check 5 against the restored file | Launch Gate 1 |
 
 **Run the probes first, before writing any Rust.** They take seconds and they confirm

@@ -160,7 +160,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 The entries this changes — Money store, SQL driver, Identity store, Account key,
 Money type, Backup tooling, and the Operations additions — are **decided**.
 
-As of Phases 0–4 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
+As of Phases 0–5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
 
 - **`server/` no longer builds against Postgres.** The dependency, the config, the
   compose file, the schema, the migration binary and every SQL statement in `src/`
@@ -169,9 +169,14 @@ As of Phases 0–4 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
   is still present and `NOT NULL`. Identity is Phase 6, and the column survives
   deliberately: `auth.rs` creates accounts through it, so dropping it earlier would
   break login while claiming the intermediate phases shipped intact.
-- **The test suite does not run yet.** The `#[cfg(test)]` fixtures still rely on
-  Postgres column defaults that the schema removed, so they fail at
-  `NOT NULL constraint failed: accounts.id`. Rewriting them is Phase 5.
+- **The test suite runs, and it runs by default.** Phase 5 gave every database test
+  its own migrated SQLite file in a temp directory, so no test needs
+  `DATABASE_URL` and not one `#[ignore]` remains: measured
+  **134 passed / 0 failed / 0 ignored**. The money tests — including the real
+  concurrency proof of the overdraw fix,
+  `concurrent_requests_cannot_overdraw_a_one_request_balance` — had been
+  `#[ignore = "requires live Postgres"]` and were therefore never executed
+  automatically. They now are.
 - **`sessions.last_seen_at` is seeded but the 7-day idle bound is not enforced.**
   The column exists so the register's *"30 days absolute, 7 days idle"* becomes
   representable; enforcing the idle half needs a write on the request path, which is
