@@ -4,26 +4,70 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde_json::json;
-use sqlx::PgPool;
 use std::env;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::db::{
     credit_topup_transaction, refund_topup_transaction, RefundResult, TopupCreditResult,
 };
+use crate::error::AppError;
 use crate::money::{
     evaluate_payment_status, terminal_status, verify_midtrans_signature, MidtransNotification,
     PaymentAction,
 };
+use crate::routes::events::publish_balance;
+use crate::routes::proxy::AppState;
 
 /// The JSON body for a refusal that leaves no money movement ambiguous.
 fn error_body(code: &str, message: &str) -> Json<serde_json::Value> {
     Json(json!({ "error": code, "message": message }))
 }
+/// The account that owns a topup order, or None when the order does not exist.
+///
+/// A read-only lookup for the realtime publish, which happens AFTER the money
+/// transaction committed. The event must be scoped to the owning account or the
+/// per-account subscriber filter in events.rs (DEFECT 1) silently drops it.
+/// This cannot fail the webhook: the money is already settled, and a missing
+/// account_id only means the dashboard waits for its next snapshot.
+async fn topup_account_id(pool: &sqlx::PgPool, order_id: &str) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>("SELECT account_id FROM topups WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The balance to announce for a topup credit outcome, or None when nothing
+/// changed. Only a fresh settle moves the wallet: a replayed webhook
+/// (`AlreadySettled`), an amount mismatch and a missing order all wrote
+/// nothing and must publish nothing (docs/realtime.md:146-157).
+fn credit_balance_to_publish(result: &Result<TopupCreditResult, AppError>) -> Option<i64> {
+    match result {
+        Ok(TopupCreditResult::Settled { new_balance }) => Some(*new_balance),
+        _ => None,
+    }
+}
+
+/// The balance to announce for a refund outcome, or None when nothing changed.
+/// A replayed refund (`AlreadyRefunded`) and a refund the wallet cannot cover
+/// (`InsufficientBalance` - the 409 path) wrote nothing, so neither may
+/// announce a balance that did not move.
+fn refund_balance_to_publish(result: &Result<RefundResult, AppError>) -> Option<i64> {
+    match result {
+        Ok(RefundResult::Refunded { new_balance }) => Some(*new_balance),
+        _ => None,
+    }
+}
+
 pub async fn handle_midtrans_webhook(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Json(payload): Json<MidtransNotification>,
 ) -> impl IntoResponse {
+    // The handler works on the pool throughout; only the realtime publish needs
+    // the hub, which is why the extractor is AppState rather than PgPool.
+    let pool = &state.pool;
     let server_key = match env::var("MIDTRANS_SERVER_KEY") {
         Ok(k) => k,
         Err(_) => {
@@ -48,7 +92,13 @@ pub async fn handle_midtrans_webhook(
     }
 
     // 2. Evaluate status
-    let gross_idr: i64 = match payload.gross_amount.split('.').next().unwrap_or("0").parse() {
+    let gross_idr: i64 = match payload
+        .gross_amount
+        .split('.')
+        .next()
+        .unwrap_or("0")
+        .parse()
+    {
         Ok(v) => v,
         Err(_) => {
             return (
@@ -61,13 +111,28 @@ pub async fn handle_midtrans_webhook(
     let action = evaluate_payment_status(&payload.transaction_status, gross_idr);
     match action {
         PaymentAction::Credit { amount_idr } => {
-            match credit_topup_transaction(&pool, &payload.order_id, amount_idr).await {
+            let result = credit_topup_transaction(pool, &payload.order_id, amount_idr).await;
+
+            // Only a fresh settle moves the wallet, so only a fresh settle is
+            // announced. The value is the POST-credit balance the transaction
+            // returned, never a stale pre-write read; it is absolute, not a
+            // delta (docs/realtime.md:93,146-157); and it is scoped to the
+            // owning account, without which the per-account subscriber filter
+            // in events.rs (DEFECT 1) would silently drop it.
+            if let Some(new_balance) = credit_balance_to_publish(&result) {
+                if let Some(account_id) = topup_account_id(pool, &payload.order_id).await {
+                    publish_balance(&state.events, account_id, new_balance);
+                }
+            }
+
+            match result {
                 Ok(TopupCreditResult::Settled { new_balance }) => {
                     info!(
                         order_id = %payload.order_id,
                         new_balance,
                         "Successfully credited topup"
                     );
+
                     (StatusCode::OK, Json(json!({"status": "settled"})))
                 }
                 Ok(TopupCreditResult::AlreadySettled) => {
@@ -82,7 +147,10 @@ pub async fn handle_midtrans_webhook(
                         order_id = %payload.order_id,
                         "Webhook rejected: order not found"
                     );
-                    (StatusCode::NOT_FOUND, Json(json!({"error": "order not found"})))
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": "order not found"})),
+                    )
                 }
                 Ok(TopupCreditResult::AmountMismatch) => {
                     error!(
@@ -114,7 +182,19 @@ pub async fn handle_midtrans_webhook(
                 "Received refund status from Midtrans webhook"
             );
 
-            match refund_topup_transaction(&pool, &payload.order_id, amount_idr).await {
+            let result = refund_topup_transaction(pool, &payload.order_id, amount_idr).await;
+
+            // Only a committed debit moves the wallet: a replayed refund
+            // (AlreadyRefunded) and the 409 insufficient-balance path wrote
+            // nothing, so they publish nothing. Absolute value, scoped to the
+            // owning account (docs/realtime.md:93,146-157; DEFECT 1).
+            if let Some(new_balance) = refund_balance_to_publish(&result) {
+                if let Some(account_id) = topup_account_id(pool, &payload.order_id).await {
+                    publish_balance(&state.events, account_id, new_balance);
+                }
+            }
+
+            match result {
                 Ok(RefundResult::Refunded { new_balance }) => {
                     info!(
                         order_id = %payload.order_id,
@@ -122,6 +202,7 @@ pub async fn handle_midtrans_webhook(
                         new_balance,
                         "Refund debited the wallet and appended a ledger row"
                     );
+
                     (StatusCode::OK, Json(json!({ "status": "refunded" })))
                 }
                 Ok(RefundResult::AlreadyRefunded) => {
@@ -208,7 +289,7 @@ pub async fn handle_midtrans_webhook(
             )
             .bind(status)
             .bind(&payload.order_id)
-            .execute(&pool)
+            .execute(pool)
             .await
             {
                 Ok(result) if result.rows_affected() > 0 => (
@@ -403,6 +484,65 @@ mod tests {
                 ),
                 other => panic!("{status} should be terminal, got {other:?}"),
             }
+        }
+    }
+
+    /// The regression this change exists for: a successful top-up credit must
+    /// announce the balance the transaction returned, and nothing else may.
+    /// `AlreadySettled` is a replayed webhook - no money moved - so publishing
+    /// there would show a balance that did not change.
+    #[test]
+    fn only_a_fresh_settle_announces_a_balance() {
+        assert_eq!(
+            credit_balance_to_publish(&Ok(TopupCreditResult::Settled {
+                new_balance: 75_000
+            })),
+            Some(75_000)
+        );
+
+        for unchanged in [
+            Ok(TopupCreditResult::AlreadySettled),
+            Ok(TopupCreditResult::NotFound),
+            Ok(TopupCreditResult::AmountMismatch),
+            Err(AppError::NotFound("no such order".into())),
+        ] {
+            assert_eq!(
+                credit_balance_to_publish(&unchanged),
+                None,
+                "{unchanged:?} changed no balance and must publish nothing"
+            );
+        }
+    }
+
+    /// The refund mirror. The 409 insufficient-balance path is the one that
+    /// matters: it is a CONFLICT, not a success, and NOTHING was written - so
+    /// announcing a balance there would invent money movement.
+    #[test]
+    fn a_refund_announces_a_balance_only_when_it_debited() {
+        assert_eq!(
+            refund_balance_to_publish(&Ok(RefundResult::Refunded {
+                new_balance: 12_000
+            })),
+            Some(12_000)
+        );
+
+        for unchanged in [
+            Ok(RefundResult::AlreadyRefunded),
+            Ok(RefundResult::NotFound),
+            Ok(RefundResult::NotSettled {
+                status: "pending".into(),
+            }),
+            Ok(RefundResult::InsufficientBalance {
+                balance_idr: 1_000,
+                required_idr: 50_000,
+            }),
+            Err(AppError::NotFound("no such order".into())),
+        ] {
+            assert_eq!(
+                refund_balance_to_publish(&unchanged),
+                None,
+                "{unchanged:?} changed no balance and must publish nothing"
+            );
         }
     }
 }
