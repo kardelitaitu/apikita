@@ -45,20 +45,30 @@ pub struct RealtimeEvent {
     id: u64,
     name: &'static str,
     data: String,
+    /// The account that owns this event. Every balance, usage and key event is
+    /// scoped to exactly one account so the fan-out can be filtered per
+    /// subscriber (DEFECT 1: a process-wide broadcast must not leak account A's
+    /// wallet into account B's dashboard).
+    account_id: Uuid,
 }
 
 impl RealtimeEvent {
     /// A wallet balance, as an absolute value — never a change.
-    pub fn balance(balance_idr: i64) -> Self {
+    ///
+    /// `owner` is the account this balance belongs to: the live stream filters
+    /// on it (DEFECT 1) so a subscriber only ever receives its own account's
+    /// events.
+    pub fn balance(account_id: Uuid, balance_idr: i64) -> Self {
         Self {
             id: 0,
             name: "balance",
             data: serde_json::json!({ "balance_idr": balance_idr }).to_string(),
+            account_id,
         }
     }
 
     /// Today's cumulative usage, as absolute totals — never a change.
-    pub fn usage(totals: UsageDelta) -> Self {
+    pub fn usage(account_id: Uuid, totals: UsageDelta) -> Self {
         Self {
             id: 0,
             name: "usage",
@@ -69,15 +79,21 @@ impl RealtimeEvent {
                 "cost_idr": totals.cost_idr,
             })
             .to_string(),
+            account_id,
         }
     }
 
     /// A key was created, edited or revoked. A null `revoked_at` means live.
-    pub fn key(key_id: Uuid, revoked_at: Option<chrono::DateTime<chrono::Utc>>) -> Self {
+    pub fn key(
+        account_id: Uuid,
+        key_id: Uuid,
+        revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
         Self {
             id: 0,
             name: "key",
             data: serde_json::json!({ "key_id": key_id, "revoked_at": revoked_at }).to_string(),
+            account_id,
         }
     }
 
@@ -213,12 +229,23 @@ impl RealtimeHub {
     }
 
     /// The mandatory snapshot: a client may be a fresh page load, and an
-    /// unknown Last-Event-ID cannot be replayed (docs/realtime.md:110).
-    fn snapshot_events(&self, balance_idr: i64, totals: UsageDelta) -> Vec<Event> {
+    /// unknown Last-Event-ID cannot be replayed (docs/realtime.md:110). The
+    /// snapshot is scoped to `account_id`, matching the filtered live stream so a
+    /// subscriber can never see another account's opening balances (DEFECT 1).
+    fn snapshot_events(
+        &self,
+        account_id: Uuid,
+        balance_idr: i64,
+        totals: UsageDelta,
+    ) -> Vec<Event> {
         let id = self.current_id();
         vec![
-            RealtimeEvent::balance(balance_idr).with_id(id).into_event(),
-            RealtimeEvent::usage(totals).with_id(id).into_event(),
+            RealtimeEvent::balance(account_id, balance_idr)
+                .with_id(id)
+                .into_event(),
+            RealtimeEvent::usage(account_id, totals)
+                .with_id(id)
+                .into_event(),
         ]
     }
 
@@ -274,24 +301,26 @@ impl Drop for ConnectionGuard {
 
 /// Publish a new balance. Call only AFTER the wallet transaction committed:
 /// announcing a balance that then rolls back shows the customer money appearing
-/// and vanishing (docs/realtime.md:146-157).
-pub fn publish_balance(hub: &RealtimeHub, balance_idr: i64) {
-    hub.publish(RealtimeEvent::balance(balance_idr));
+/// and vanishing (docs/realtime.md:146-157). The event is scoped to `account_id`
+/// so only that account's dashboard receives it (DEFECT 1).
+pub fn publish_balance(hub: &RealtimeHub, account_id: Uuid, balance_idr: i64) {
+    hub.publish(RealtimeEvent::balance(account_id, balance_idr));
 }
 
-/// Publish today's cumulative usage totals.
-pub fn publish_usage(hub: &RealtimeHub, totals: UsageDelta) {
-    hub.publish(RealtimeEvent::usage(totals));
+/// Publish today's cumulative usage totals, scoped to `account_id` (DEFECT 1).
+pub fn publish_usage(hub: &RealtimeHub, account_id: Uuid, totals: UsageDelta) {
+    hub.publish(RealtimeEvent::usage(account_id, totals));
 }
 
 /// Publish a key change, for keys.rs to call on create, edit or revoke
-/// (docs/realtime.md:65-74).
+/// (docs/realtime.md:65-74). Scoped to `account_id` (DEFECT 1).
 pub fn publish_key_update(
     hub: &RealtimeHub,
+    account_id: Uuid,
     key_id: Uuid,
     revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 ) {
-    hub.publish(RealtimeEvent::key(key_id, revoked_at));
+    hub.publish(RealtimeEvent::key(account_id, key_id, revoked_at));
 }
 
 /// Today's cumulative usage for one account, summed across all of its keys.
@@ -380,21 +409,34 @@ pub async fn sse_events_handler(
     // snapshot is being read must not fall into a gap and be lost. It reaches
     // the client after the snapshot, and because every event is absolute, the
     // newer value simply corrects the older one.
-    let live = stream::unfold(state.events.subscribe(), |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => return Some((Ok(event.into_event()), rx)),
-                // Lagged: this client could not keep up and missed events.
-                // Keep the subscription rather than ending the stream — every
-                // event carries absolute values, so the next one it receives
-                // corrects the state on its own (docs/realtime.md:93).
-                Err(RecvError::Lagged(_)) => continue,
-                // Every sender is gone. The hub lives in AppState for the
-                // process lifetime, so this is shutdown.
-                Err(RecvError::Closed) => return None,
+    //
+    // FILTER (DEFECT 1): the broadcast is process-wide, so a subscriber must
+    // discard every event that does not belong to its own account. Without this
+    // an account would observe another account's wallet balance and token
+    // totals. We also swallow `Lagged` (absolute values self-heal) and only end
+    // on `Closed`.
+    let live = stream::unfold(
+        (state.events.subscribe(), account_id),
+        |(mut rx, owner)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) if event.account_id == owner => {
+                        return Some((Ok(event.into_event()), (rx, owner)));
+                    }
+                    // Belongs to another account: never forward it.
+                    Ok(_) => continue,
+                    // Lagged: this client could not keep up and missed events.
+                    // Keep the subscription rather than ending the stream — every
+                    // event carries absolute values, so the next one it receives
+                    // corrects the state on its own (docs/realtime.md:93).
+                    Err(RecvError::Lagged(_)) => continue,
+                    // Every sender is gone. The hub lives in AppState for the
+                    // process lifetime, so this is shutdown.
+                    Err(RecvError::Closed) => return None,
+                }
             }
-        }
-    });
+        },
+    );
 
     let snapshot = todays_usage(&state.pool, account_id).await?;
 
@@ -406,10 +448,15 @@ pub async fn sse_events_handler(
             .unwrap_or(0);
 
     let opening: Vec<Result<Event, Infallible>> = match state.events.resume(last_event_id) {
-        Resume::Replay(events) => events.into_iter().map(|e| Ok(e.into_event())).collect(),
+        Resume::Replay(events) => events
+            .into_iter()
+            // DEFECT 1: only this account's replayed events escape to the wire.
+            .filter(|e| e.account_id == account_id)
+            .map(|e| Ok(e.into_event()))
+            .collect(),
         Resume::Snapshot => state
             .events
-            .snapshot_events(balance_idr, snapshot)
+            .snapshot_events(account_id, balance_idr, snapshot)
             .into_iter()
             .map(Ok)
             .collect(),
@@ -476,7 +523,7 @@ mod tests {
 
     #[test]
     fn usage_event_keeps_the_three_token_classes_separate() {
-        let event = RealtimeEvent::usage(test_usage(1200, 8000, 400, 812));
+        let event = RealtimeEvent::usage(Uuid::new_v4(), test_usage(1200, 8000, 400, 812));
         assert_eq!(event.name(), "usage");
 
         let parsed: serde_json::Value = serde_json::from_str(&event.data).unwrap();
@@ -511,8 +558,9 @@ mod tests {
     #[test]
     fn resume_replays_only_events_after_the_client_id() {
         let hub = RealtimeHub::new(&hub_config(10, 5));
+        let owner = Uuid::new_v4();
         for i in 1..=4i64 {
-            hub.publish(RealtimeEvent::balance(i));
+            hub.publish(RealtimeEvent::balance(owner, i));
         }
 
         match hub.resume(Some(2)) {
@@ -531,8 +579,9 @@ mod tests {
     #[test]
     fn resume_snapshots_when_the_buffer_was_evicted_past_the_client() {
         let hub = RealtimeHub::new(&hub_config(2, 5));
+        let owner = Uuid::new_v4();
         for i in 1..=5i64 {
-            hub.publish(RealtimeEvent::balance(i));
+            hub.publish(RealtimeEvent::balance(owner, i));
         }
 
         // Only ids 4 and 5 remain. A client at id 1 missed 2 and 3, and a
@@ -550,14 +599,56 @@ mod tests {
     #[test]
     fn event_ids_are_monotonic_and_snapshots_carry_the_latest() {
         let hub = RealtimeHub::new(&hub_config(10, 5));
+        let owner = Uuid::new_v4();
         assert_eq!(hub.current_id(), 0);
 
-        hub.publish(RealtimeEvent::balance(1));
-        hub.publish(RealtimeEvent::balance(2));
+        hub.publish(RealtimeEvent::balance(owner, 1));
+        hub.publish(RealtimeEvent::balance(owner, 2));
         assert_eq!(hub.current_id(), 2);
 
-        let snapshot = hub.snapshot_events(100, test_usage(1, 2, 3, 4));
+        let snapshot = hub.snapshot_events(owner, 100, test_usage(1, 2, 3, 4));
         assert_eq!(snapshot.len(), 2, "balance and usage, always both");
+    }
+
+    /// DEFECT 1 regression: a subscriber whose account is X must never observe an
+    /// event published for account Y, even though the broadcast channel is shared
+    /// process-wide. This mirrors the `live` unfold filter in `sse_events_handler`.
+    #[test]
+    fn a_subscriber_only_sees_its_own_account_events() {
+        let hub = Arc::new(RealtimeHub::new(&hub_config(64, 5)));
+        let account_x = Uuid::new_v4();
+        let account_y = Uuid::new_v4();
+
+        // Both accounts open their live streams BEFORE any activity, so they each
+        // receive everything the hub publishes from here on.
+        let mut rx_x = hub.subscribe();
+        let mut rx_y = hub.subscribe();
+
+        // Account Y does a bunch of activity: balance, usage and a key change.
+        publish_balance(&hub, account_y, 99_000);
+        publish_usage(&hub, account_y, test_usage(10, 20, 30, 40));
+        publish_key_update(&hub, account_y, Uuid::new_v4(), None);
+
+        // Account X applies exactly the filter the handler applies — only events
+        // owned by account_x reach the wire. None of Y's events may leak through.
+        let observed: Vec<&'static str> = std::iter::repeat(())
+            .map_while(|_| rx_x.try_recv().ok())
+            .filter(|event| event.account_id == account_x)
+            .map(|event| event.name())
+            .collect();
+
+        assert!(
+            observed.is_empty(),
+            "account X saw account Y's events: {observed:?}"
+        );
+
+        // And the other direction holds: Y sees exactly its own three events.
+        let seen_by_y: Vec<&'static str> = std::iter::repeat(())
+            .map_while(|_| rx_y.try_recv().ok())
+            .filter(|event| event.account_id == account_y)
+            .map(|event| event.name())
+            .collect();
+        assert_eq!(seen_by_y, vec!["balance", "usage", "key"]);
     }
 
     #[test]

@@ -67,6 +67,17 @@ fn hash_string(s: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Whether `model` is permitted for a key whose stored allowlist is
+/// `allowed_models`.
+///
+/// DENY BY DEFAULT (DEFECT 2): an empty allowlist permits NO model — a key made
+/// without an explicit model list cannot call the dearest configured model. Only
+/// a model that appears in the list is allowed. The list is matched against the
+/// model name exactly as the client requested it (before any upstream rewrite).
+fn is_model_allowed(allowed_models: &[String], model: &str) -> bool {
+    allowed_models.iter().any(|m| m == model)
+}
+
 /// Maximum cached API-key records.
 ///
 /// The cache can only ever be filled by a key that actually exists in the
@@ -452,9 +463,13 @@ pub async fn chat_completions(
     let meta: RequestMeta = serde_json::from_slice(&body)
         .map_err(|err| AppError::InvalidRequest(format!("malformed request body: {err}")))?;
 
-    // 2. Authorize model
+    // 2. Authorize model. DENY BY DEFAULT: an empty allowlist permits nothing.
+    // docs/website/06-api-keys-and-limits.md:41 states the contract explicitly —
+    // a key with an empty allowlist can call nothing, so a key created without
+    // an explicit model list is refused (DEFECT 2). Only a model that is present
+    // in the list is permitted.
     let allowed_models: Vec<String> = serde_json::from_value(models_val).unwrap_or_default();
-    if !allowed_models.is_empty() && !allowed_models.contains(&meta.model) {
+    if !is_model_allowed(&allowed_models, &meta.model) {
         return Err(AppError::ModelNotAllowed(meta.model.clone()));
     }
 
@@ -529,7 +544,22 @@ pub async fn chat_completions(
         .map_err(|err| match err {
             UpstreamError::NoModel(_) => AppError::ModelNotAllowed(meta.model.clone()),
             UpstreamError::NoHealthyUpstream(_) => AppError::NoUpstreamAvailable,
-            _ => AppError::Internal(err.to_string()),
+            // A transport error is a network-level failure: reqwest's Display
+            // embeds the provider URL, so the raw error MUST NOT reach the client
+            // (DEFECT 3, docs/error-model.md:159). Log it server-side at warn
+            // level and return a generic upstream-unavailable error instead.
+            UpstreamError::Transport(_) => {
+                warn!(
+                    account_id = %account_id,
+                    model = %meta.model,
+                    error = %err,
+                    "upstream transport error; detail withheld from client"
+                );
+                AppError::NoUpstreamAvailable
+            }
+            // None of the remaining variants carry a provider URL or hostname, so
+            // the generic internal error is safe to surface.
+            other => AppError::Internal(other.to_string()),
         })?;
 
     let endpoint = stream.endpoint_name().to_string();
@@ -638,8 +668,9 @@ async fn settle_after_stream(
 
             // Only now that the debit has committed. Emitting before commit
             // could announce a balance that then rolls back
-            // (docs/realtime.md:146-157).
-            publish_balance(&events, new_balance);
+            // (docs/realtime.md:146-157). Scoped to account_id so only this
+            // account's dashboard receives it (DEFECT 1).
+            publish_balance(&events, account_id, new_balance);
 
             // The event carries today's CUMULATIVE totals, not this request's
             // delta: absolute values make a lost event self-healing
@@ -647,7 +678,7 @@ async fn settle_after_stream(
             // already gone out and the next settlement will correct the
             // usage figures, so this is logged, not fatal.
             match todays_usage(&pool, account_id).await {
-                Ok(totals) => publish_usage(&events, totals),
+                Ok(totals) => publish_usage(&events, account_id, totals),
                 Err(err) => warn!(
                     account_id = %account_id,
                     error = %err,
@@ -813,5 +844,30 @@ mod tests {
         assert_eq!(stored.models, json!(["deepseek-flash"]));
         assert_ne!(stored.key_id, Uuid::nil());
         assert_ne!(stored.account_id, Uuid::nil());
+    }
+
+    // DEFECT 2 regression: an empty allowlist denies everything. A key created
+    // without an explicit model list must not be able to call any model, least
+    // of all the dearest one in the pool.
+    #[test]
+    fn empty_allowlist_denies_every_model() {
+        assert!(!is_model_allowed(&[], "deepseek-flash"));
+        assert!(!is_model_allowed(&[], "gpt-4o"));
+        assert!(!is_model_allowed(&[], ""));
+    }
+
+    #[test]
+    fn listed_model_is_allowed() {
+        let allowed = vec!["deepseek-flash".to_string(), "gpt-4o-mini".to_string()];
+        assert!(is_model_allowed(&allowed, "deepseek-flash"));
+        assert!(is_model_allowed(&allowed, "gpt-4o-mini"));
+    }
+
+    #[test]
+    fn unlisted_model_is_denied() {
+        let allowed = vec!["deepseek-flash".to_string()];
+        assert!(!is_model_allowed(&allowed, "gpt-4o"));
+        // A non-empty list does not fall back to allowing anything else.
+        assert!(!is_model_allowed(&allowed, "deepseek-flash-v2"));
     }
 }
