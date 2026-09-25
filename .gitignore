@@ -53,3 +53,5 @@ venv/
 # ignored except tracked skills, so a scratch script cannot be committed.
 .agents/*
 !.agents/skills/
+# Local tool artifact
+.freebuff/
