@@ -1,0 +1,123 @@
+# CI: the checks between a commit and a deploy.
+#
+# These are exactly the pull-request stages docs/ci-cd.md lists — format check,
+# lint, build, unit tests, integration tests on a real Postgres, schema check,
+# secret scan, plus the website toolchain. There is deliberately no deploy job:
+# the on-merge sequence (snapshot -> migrate -> deploy server -> health check ->
+# deploy frontend) belongs to docs/deployment.md and needs provider secrets this
+# repository does not hold.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    services:
+      # docs/ci-cd.md: a real Postgres, same major version as production (16),
+      # never SQLite — `FOR UPDATE` locking and partial unique indexes are what
+      # the idempotency tests actually exercise.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: apikita
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:dev@localhost:5432/apikita
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Format check
+        working-directory: server
+        run: cargo fmt --check
+
+      - name: Lint
+        working-directory: server
+        run: cargo clippy -- -D warnings
+
+      - name: Build
+        working-directory: server
+        run: cargo build
+
+      - name: Unit tests
+        working-directory: server
+        run: cargo test
+
+      # Schema check: every migration must apply, in order, to an empty database.
+      - name: Apply migrations to an empty database
+        run: |
+          for migration in server/migrations/*.sql; do
+            echo "applying $migration"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
+          done
+
+      # The database now holds the migrated schema. 73 of the 75 #[ignore]d tests
+      # need only DATABASE_URL; the other two also need a *configured* PocketBase
+      # (collections, not just a running container), which this workflow does not
+      # provide. They are named here and skipped explicitly, so they are excluded
+      # rather than silently dropped:
+      #   - a_new_login_after_suspend_is_still_refused
+      #   - live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
+      - name: Integration tests (real Postgres)
+        working-directory: server
+        run: >-
+          cargo test -- --ignored
+          --skip a_new_login_after_suspend_is_still_refused
+          --skip live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
+
+      - name: Install website dependencies
+        working-directory: website
+        run: npm ci
+
+      # The project ships no `typescript` on disk; the pinned npx form is what
+      # the typecheck gate already uses locally.
+      - name: Typecheck (website)
+        working-directory: website
+        run: npx --yes -p typescript@5.6 tsc --noEmit -p tsconfig.json
+
+      - name: Website contract tests
+        working-directory: website
+        run: node --test 'tests/**/*.test.ts'
+
+      - name: Build website
+        working-directory: website
+        run: npm run build
+
+      # A floor, not a full scanner: enough to catch the two mistakes that reach
+      # history most often. docs/ci-cd.md leaves the tool open.
+      - name: Secret scan
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked; it must stay out of git"
+            exit 1
+          fi
+          if git grep -nE -e '-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+            echo "::error::a private key is committed"
+            exit 1
+          fi
