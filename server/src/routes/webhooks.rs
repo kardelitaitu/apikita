@@ -126,7 +126,12 @@ pub async fn handle_midtrans_webhook(
     // an UPPERCASE-hex signature is rejected. Midtrans documents lowercase, so
     // this is strict and correct - but it is intentional, not incidental.
     if !verify_midtrans_signature(&payload, &server_key) {
+        // `topup.rejected` is the event name docs/observability.md:39 defines
+        // and the alert registry (docs/observability.md:99, tools/alert/probe.sh)
+        // fires on: "any `topup.rejected`" line in the captured stdout. A
+        // rejection logged under any other name is an alert that never fires.
         warn!(
+            event = "topup.rejected",
             order_id = %payload.order_id,
             "Midtrans webhook rejected: invalid signature"
         );
@@ -198,7 +203,10 @@ pub async fn handle_midtrans_webhook(
                     )
                 }
                 Ok(TopupCreditResult::AmountMismatch) => {
+                    // Same event-name contract as the signature refusal above:
+                    // the registry fires on "any `topup.rejected`".
                     error!(
+                        event = "topup.rejected",
                         order_id = %payload.order_id,
                         "Webhook rejected: amount mismatch with stored record"
                     );
@@ -1400,5 +1408,114 @@ mod tests {
             assert_reconciled(&pool, _account_id, "after malformed bodies").await;
         })
         .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // THE REJECTION EVENT LOG. docs/observability.md:39 names the event
+    // `topup.rejected` (warn) — "Webhook verification failure - investigate" —
+    // and the alert registry (docs/observability.md:99, tools/alert) fires on
+    // "any `topup.rejected`" line in the server's captured stdout. A rejection
+    // that is logged under a DIFFERENT name is an alert that can never fire.
+    // -----------------------------------------------------------------------
+
+    /// An `io::Write` sink that captures the log lines the process would emit,
+    /// so the assertion reads what an operator's probe would read.
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log sink lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Installs a capturing subscriber for the current thread and returns the
+    /// captured buffer. The guard must be held while the code under test runs.
+    fn capture_logs() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_sink = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || LogSink(writer_sink.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (guard, sink)
+    }
+
+    fn captured_lines(sink: &std::sync::Mutex<Vec<u8>>) -> String {
+        String::from_utf8(sink.lock().expect("log sink lock").clone()).expect("log lines are utf-8")
+    }
+
+    #[tokio::test]
+    async fn a_webhook_rejection_is_logged_under_the_documented_topup_rejected_event() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        // (a) A bad signature: the registry's verification-failure case.
+        let bad_signature = notification("order_x", "200", "50000.00", "settlement", "wrong-key");
+        {
+            let (_guard, sink) = capture_logs();
+            let _ = handle_midtrans_webhook(State(state.clone()), Ok(Json(bad_signature))).await;
+            let logged = captured_lines(&sink);
+            assert!(
+                logged.contains("topup.rejected"),
+                "a rejected signature must be logged under the documented event name \
+                 'topup.rejected' (docs/observability.md:39); the probe and the alert registry \
+                 key on it. Logged instead:\n{logged}"
+            );
+        }
+
+        // (b) An amount mismatch: a VALID signature over a wrong amount.
+        let order_id = pending_topup(&db.pool, account_id, 50_000).await;
+        let inflated = notification(
+            &order_id,
+            "200",
+            "99999.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+        {
+            let (_guard, sink) = capture_logs();
+            let _ = handle_midtrans_webhook(State(state.clone()), Ok(Json(inflated))).await;
+            let logged = captured_lines(&sink);
+            assert!(
+                logged.contains("topup.rejected"),
+                "an amount mismatch must be logged under the documented event name \
+                 'topup.rejected' (docs/observability.md:39). Logged instead:\n{logged}"
+            );
+        }
+
+        // (c) Control: a legitimate settlement is NOT a rejection and must not
+        //     raise the event - an alert that fires on every payment is as
+        //     broken as one that never fires.
+        let order_id = pending_topup(&db.pool, account_id, 10_000).await;
+        let settled = notification(
+            &order_id,
+            "200",
+            "10000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+        {
+            let (_guard, sink) = capture_logs();
+            let _ = handle_midtrans_webhook(State(state.clone()), Ok(Json(settled))).await;
+            let logged = captured_lines(&sink);
+            assert!(
+                !logged.contains("topup.rejected"),
+                "a settled payment must not be logged as a rejection. Logged:\n{logged}"
+            );
+        }
+
+        assert_reconciled(&db.pool, account_id, "after the rejection logging").await;
+        db.close().await;
     }
 }
