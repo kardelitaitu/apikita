@@ -47,6 +47,16 @@ pub struct CreateTopupResponse {
     pub topup_id: Uuid,
     pub order_id: String,
     pub snap_token: Option<String>,
+    /// Which Midtrans environment this session was created against: exactly
+    /// "sandbox" or "production".
+    ///
+    /// Sent so the browser can cross-check its own PUBLIC_MIDTRANS_ENV against
+    /// the server's MIDTRANS_ENV instead of guessing from the client key's
+    /// prefix - a rule Midtrans does not document, and the client key is not
+    /// the value that decides the host anyway. Derived from the same decision
+    /// that picks the Snap endpoint (see `midtrans_environment`), never from a
+    /// second read of the variable, so the two cannot drift.
+    pub environment: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +324,21 @@ fn snap_endpoint(midtrans_env: Option<&str>) -> &'static str {
     }
 }
 
+/// Which Midtrans environment a top-up session is created against, as it goes
+/// on the wire: exactly "sandbox" or "production".
+///
+/// Deliberately the SAME predicate that picks the Snap host (`snap_endpoint`
+/// above), not a second read of MIDTRANS_ENV: the response field and the host
+/// the request is actually sent to are two views of one decision, so they
+/// cannot drift into disagreeing with each other.
+fn midtrans_environment(midtrans_env: Option<&str>) -> &'static str {
+    if is_production(midtrans_env) {
+        "production"
+    } else {
+        "sandbox"
+    }
+}
+
 /// The Snap host this process will actually POST to.
 ///
 /// `override_url` (from MIDTRANS_SNAP_URL) lets a live test point the handler at
@@ -529,10 +554,14 @@ pub async fn create_topup(
     // MIDTRANS_SNAP_URL is a test seam and is ignored in production (see
     // resolve_snap_endpoint); it is read here, at the call site, so the decision
     // function itself stays pure.
+    // Read ONCE: both the Snap host and the environment reported to the browser
+    // are derived from this same value, so the two can never disagree.
+    let midtrans_env = env::var("MIDTRANS_ENV").ok();
     let endpoint = resolve_snap_endpoint(
-        env::var("MIDTRANS_ENV").ok().as_deref(),
+        midtrans_env.as_deref(),
         env::var("MIDTRANS_SNAP_URL").ok().as_deref(),
     );
+    let environment = midtrans_environment(midtrans_env.as_deref());
 
     let topup_id = Uuid::new_v4();
     let order_id = format!("topup_{}", topup_id);
@@ -585,6 +614,7 @@ pub async fn create_topup(
             topup_id,
             order_id,
             snap_token: Some(snap_token),
+            environment: environment.to_string(),
         }),
     ))
 }
@@ -655,6 +685,71 @@ mod tests {
         // A typo must never reach the live host.
         assert_eq!(snap_endpoint(Some("prod")), SNAP_SANDBOX_URL);
         assert_eq!(snap_endpoint(Some("")), SNAP_SANDBOX_URL);
+    }
+
+    /// The environment on the wire is the SAME decision that picks the Snap host.
+    ///
+    /// Not "both happen to agree today": the assertion is that the two move
+    /// together across every input the endpoint test above pins, including the
+    /// typos. A second, independent read of MIDTRANS_ENV is what this forbids.
+    #[test]
+    fn reported_environment_tracks_the_endpoint_that_was_chosen() {
+        for raw in [
+            None,
+            Some("production"),
+            Some(" production "),
+            Some("Production"),
+            Some("sandbox"),
+            Some("prod"),
+            Some(""),
+        ] {
+            let environment = midtrans_environment(raw);
+            assert!(
+                environment == "sandbox" || environment == "production",
+                "{raw:?} produced {environment:?}; the field is exactly one of the \
+                 two documented values"
+            );
+
+            let host_is_live = snap_endpoint(raw) == SNAP_PRODUCTION_URL;
+            assert_eq!(
+                environment == "production",
+                host_is_live,
+                "{raw:?} reported {environment:?} while the Snap host was \
+                 {} - the browser would be told the wrong environment",
+                snap_endpoint(raw)
+            );
+        }
+    }
+
+    /// The response SHAPE, serialized the way axum writes it.
+    ///
+    /// A response struct, so this is the whole contract: the three existing keys
+    /// keep their names and types and `environment` is a string. Nothing else is
+    /// asserted, because adding a field must not disturb the keys a deployed
+    /// website already reads.
+    #[test]
+    fn create_topup_response_carries_the_environment_as_a_string() {
+        let body = serde_json::to_value(CreateTopupResponse {
+            topup_id: Uuid::nil(),
+            order_id: "topup_x".to_string(),
+            snap_token: Some("snap-token".to_string()),
+            environment: midtrans_environment(Some("production")).to_string(),
+        })
+        .expect("the response must serialize");
+
+        assert_eq!(
+            body,
+            json!({
+                "topup_id": Uuid::nil(),
+                "order_id": "topup_x",
+                "snap_token": "snap-token",
+                "environment": "production",
+            })
+        );
+        assert!(
+            body["environment"].is_string(),
+            "environment must be a JSON string, not a bool or a null: {body}"
+        );
     }
 
     /// The MIDTRANS_SNAP_URL gate, pure: both inputs are arguments, so this needs
@@ -2225,6 +2320,16 @@ mod tests {
             body["snap_token"],
             json!("snap-token-from-midtrans"),
             "the response carries the token Snap returned, verbatim: {body}"
+        );
+
+        // The server's own environment rides on the 201, so the browser can
+        // cross-check instead of guessing from the client key's prefix. This test
+        // forced MIDTRANS_ENV=sandbox above, so this reads the real wire field
+        // against the real variable - the pure test pins the production side.
+        assert_eq!(
+            body["environment"],
+            json!("sandbox"),
+            "the 201 must name the environment the Snap call actually used: {body}"
         );
 
         // The row the success INSERT wrote, read back column by column.
