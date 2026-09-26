@@ -19,13 +19,13 @@ const stored = [
   { what: 'Email', where: 'PocketBase', sensitivity: 'Personal' },
   { what: 'Password hash', where: 'PocketBase', sensitivity: 'Sensitive, but not usable if leaked (hashed)' },
   { what: 'Google account link', where: 'PocketBase', sensitivity: 'Personal' },
-  { what: 'Telegram ID', where: 'Postgres', sensitivity: 'Personal, pseudonymous' },
-  { what: 'Wallet balance + ledger', where: 'Postgres', sensitivity: 'Financial' },
-  { what: 'Top-up history (amounts, dates)', where: 'Postgres', sensitivity: 'Financial' },
-  { what: 'Token usage per day', where: 'Postgres', sensitivity: 'Behavioural' },
-  { what: 'API keys', where: 'Postgres', sensitivity: 'Credentials (hashed) — the plaintext is never stored' },
-  { what: 'Reviews + edit history', where: 'Postgres', sensitivity: 'Opinion, published aggregate only' },
-  { what: 'Sessions', where: 'Postgres', sensitivity: 'Contains IP hash and user agent' },
+  { what: 'Telegram ID', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal, pseudonymous' },
+  { what: 'Wallet balance + ledger', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
+  { what: 'Top-up history (amounts, dates)', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
+  { what: 'Token usage per day', where: 'Embedded SQLite (the database file)', sensitivity: 'Behavioural' },
+  { what: 'API keys', where: 'Embedded SQLite (the database file)', sensitivity: 'Credentials (hashed) — the plaintext is never stored' },
+  { what: 'Reviews + edit history', where: 'Embedded SQLite (the database file)', sensitivity: 'Opinion, published aggregate only' },
+  { what: 'Sessions', where: 'Embedded SQLite (the database file)', sensitivity: 'Contains IP hash and user agent' },
 ];
 
 // docs/data-retention.md, "What is NOT stored".
