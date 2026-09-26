@@ -107,7 +107,7 @@ What exists today:
 | Surface | State |
 | --- | --- |
 | [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → 200 passed / 75 ignored; the live database suite passes against real Postgres. |
-| [`website/`](website/README.md) | Astro site. `npm run build` → 14 pages; `npm test` → 27 passed. |
+| [`website/`](website/README.md) | Astro site. `npm run build` → 15 pages; `npm test` → 52 passed. |
 | [`tools/`](tools/) | `reconcile`, `backup`, `drill`, `alert`, `fake-upstream`, `fake-midtrans` — each with a documented exit-code contract. |
 | [`telegram/`](telegram/README.md) | Design only — no code yet. |
 
