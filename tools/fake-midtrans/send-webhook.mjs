@@ -38,7 +38,9 @@ SCENARIOS:
   wrong-amount    Valid signature but gross_amount that does not match the stored
                   order (expect 400 amount mismatch).
   replay          Re-sends an already-settled order_id (expect 200 already_settled).
-  refund          Valid signature, transaction_status=refund (expect 200 refund_recorded).
+  refund          Valid signature, transaction_status=refund. The platform does NOT
+                  refund: the notification is acknowledged with
+                  200 {"status":"refund_not_supported"} and changes nothing.
 
 ENVIRONMENT:
   MIDTRANS_TARGET      POST target URL.
@@ -109,6 +111,10 @@ function buildNotification(scenario, opts) {
       transactionStatus = 'settlement';
       break;
     case 'refund':
+      // The platform does not refund. The server acknowledges this with
+      // 200 {"status":"refund_not_supported"}, logs it at error!, and changes
+      // nothing: the topup stays settled, no ledger row is written, and the
+      // wallet cannot move. (docs/decisions.md: "Non-refundable".)
       transactionStatus = 'refund';
       break;
     default:

@@ -44,7 +44,7 @@ the signature with `verify_midtrans_signature`, then evaluates
 | `transaction_status`          | Action (from `money.rs`)        |
 | ------------------------------ | --------------------------------- |
 | `capture`, `settlement`       | Credit `amount_idr`               |
-| `refund`, `partial_refund`    | DebitRefund `amount_idr`          |
+| `refund`, `partial_refund`    | Refused — `200 {"status":"refund_not_supported"}` |
 | `deny`, `cancel`, `expire`   | TerminalNoAction                   |
 | anything else                  | Pending                            |
 
@@ -63,7 +63,7 @@ node tools/fake-midtrans/send-webhook.mjs --help
 | `bad-signature`| Signature computed with a **wrong** server key                           | `401 {"error":"invalid signature"}`                         |
 | `wrong-amount` | Valid signature but `gross_amount` that does not match stored order     | `400 {"error":"amount mismatch"}`                           |
 | `replay`       | Re-sends an already-settled `order_id` (use `--order-id`)              | `200 {"status":"already_settled"}`                         |
-| `refund`       | Valid signature, `transaction_status=refund`                            | `200 {"status":"refund_recorded"}`                         |
+| `refund`       | Valid signature, `transaction_status=refund`                            | `200 {"status":"refund_not_supported"}`                    |
 
 *Expected responses are read off `server/src/routes/webhooks.rs`. They are
 **unverified against a running server** — see the status note below.
