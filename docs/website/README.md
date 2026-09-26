@@ -170,8 +170,11 @@ document used to list as open is settled there, or has been overtaken:
   [`../architecture/identity.md`](../architecture/identity.md) §Reconciliation is still
   the outstanding work.
 
-Nothing in this document is still open. Genuinely open items are in the register's
-§"Genuinely open"; build tasks are in [`launch-checklist.md`](../launch-checklist.md).
+Nothing this document used to list as open is still undecided. The one live item above
+— identity/PocketBase reconciliation — is not a decision to make here: it is a
+consequence of migration Phase 6 not having landed. Genuinely open items are in the
+register's §"Genuinely open"; build tasks are in
+[`launch-checklist.md`](../launch-checklist.md).
 
 ### Verified
 
