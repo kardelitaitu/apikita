@@ -297,7 +297,7 @@ The only source of wallet credits.
 **Non-negotiable:**
 
 - The amount comes from **our stored row**, never the payload.
-- `order_id` is unique in Postgres — the database enforces idempotency.
+- `order_id` is unique in SQLite — the database enforces idempotency.
 - Handle `settlement`/`capture` as credit; `deny`/`cancel`/`expire` as terminal;
   **`refund`/`partial_refund` as debit** even though the policy is
   non-refundable — disputes arrive uninvited, and an unhandled status corrupts the
@@ -324,7 +324,7 @@ data: {"input_tokens": 1200, "cache_read_tokens": 8000, "output_tokens": 400, "c
 : heartbeat        (every 20-30s, keeps proxies from closing it)
 ```
 
-- PocketBase's realtime is useless here — our data is in Postgres. This is ours.
+- PocketBase's realtime is useless here — our data is in SQLite. This is ours.
 - Emit on: webhook settlement, usage settlement, key changes.
 - **Heartbeat is required.** Cloudflare and intermediaries close idle streams, and
   a silently dropped stream looks like "the balance stopped updating".

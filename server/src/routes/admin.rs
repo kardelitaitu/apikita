@@ -12,8 +12,9 @@
 //! - the actor is identified by resolve_account_from_cookie (routes/mod.rs:61),
 //!   the one session-cookie parser and resolver - never a query parameter, never
 //!   a header, never a separate admin credential (docs/server/api-spec.md:421);
-//! - revocation reuses the exact statement logout_all uses for sessions
-//!   (auth.rs:309) and revoke_key's revoked_at = now() for keys;
+//! - revocation reuses the same predicate logout_all uses for sessions
+//!   (auth.rs:309) - `revoked_at IS NULL` - and stamps the keys the way
+//!   revoke_key does;
 //! - a revoked key is evicted from the proxy's process-wide metadata cache with
 //!   proxy::invalidate_key_cache, exactly as revoke_key does - without it a
 //!   revoked key stays usable for up to limits.key_metadata_cache_seconds, which
@@ -144,8 +145,8 @@ async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Uuid,
     let actor = resolve_account_from_cookie(&state.pool, headers).await?;
 
     let is_operator: Option<bool> =
-        sqlx::query_scalar("SELECT is_operator FROM accounts WHERE id = $1")
-            .bind(actor)
+        sqlx::query_scalar("SELECT is_operator FROM accounts WHERE id = ?")
+            .bind(actor.hyphenated())
             .fetch_optional(&state.pool)
             .await?;
 
@@ -230,17 +231,21 @@ pub async fn get_account(
             a.created_at,
             COALESCE(w.balance_idr, 0) AS balance_idr,
             (SELECT COUNT(*) FROM sessions s
-              WHERE s.account_id = a.id AND s.revoked_at IS NULL AND s.expires_at > now())
+              WHERE s.account_id = a.id AND s.revoked_at IS NULL AND s.expires_at > ?)
                 AS live_sessions,
             (SELECT COUNT(*) FROM api_keys k
               WHERE k.account_id = a.id AND k.revoked_at IS NULL)
                 AS live_keys
         FROM accounts a
         LEFT JOIN wallets w ON w.account_id = a.id
-        WHERE a.id = $1
+        WHERE a.id = ?
         "#,
     )
-    .bind(id)
+    // The expiry bound is BOUND FROM RUST, never SQLite's now(): its
+    // space-separated output sorts before the RFC3339 values every timestamp
+    // column holds, so a SQL now() here would count expired sessions as live.
+    .bind(Utc::now())
+    .bind(id.hyphenated())
     .fetch_optional(&state.pool)
     .await?;
 
@@ -269,9 +274,11 @@ pub async fn get_account(
 /// 2. revoke EVERY live session for the account;
 /// 3. revoke EVERY live API key for the account.
 ///
-/// The target row is locked FOR UPDATE first, so two concurrent suspends of the
-/// same account serialise and the second sees 'suspended' and refuses, instead
-/// of both reporting a successful revocation.
+/// The transaction takes SQLite's write lock UP FRONT (BEGIN IMMEDIATE), so two
+/// concurrent suspends of the same account serialise and the second sees
+/// 'suspended' and refuses, instead of both reporting a successful revocation.
+/// The Postgres original relied on `SELECT ... FOR UPDATE` here; SQLite has no row
+/// locks and rejects that clause as a syntax error.
 ///
 /// Only an 'active' account can be suspended. Anything else (already suspended,
 /// or closed) is a 409 and writes NO audit row: there is nothing to do, and a
@@ -292,10 +299,15 @@ pub async fn suspend_account(
     let operator_id = require_operator(&state, &headers).await?;
     refuse_self_action(operator_id, id)?;
 
-    let mut tx = state.pool.begin().await?;
+    // BEGIN IMMEDIATE, not a deferred BEGIN. SQLite has no row locks and
+    // rejects FOR UPDATE as a syntax error (measured), so the write lock taken up
+    // front is what serialises two concurrent suspends of one account: the second
+    // then sees 'suspended' and refuses, instead of both reporting a successful
+    // revocation. See db.rs::begin_immediate for the full reasoning.
+    let mut tx = crate::db::begin_immediate(&state.pool).await?;
 
-    let target = sqlx::query("SELECT status FROM accounts WHERE id = $1 FOR UPDATE")
-        .bind(id)
+    let target = sqlx::query("SELECT status FROM accounts WHERE id = ?")
+        .bind(id.hyphenated())
         .fetch_optional(&mut *tx)
         .await?;
     let Some(target) = target else {
@@ -309,8 +321,9 @@ pub async fn suspend_account(
         .into());
     }
 
-    sqlx::query("UPDATE accounts SET status = 'suspended', updated_at = now() WHERE id = $1")
-        .bind(id)
+    sqlx::query("UPDATE accounts SET status = 'suspended', updated_at = ? WHERE id = ?")
+        .bind(Utc::now())
+        .bind(id.hyphenated())
         .execute(&mut *tx)
         .await?;
 
@@ -319,9 +332,10 @@ pub async fn suspend_account(
     // predicate: an already-revoked row is not touched, which is what makes the
     // count an honest count of what this call revoked.
     let sessions_revoked = sqlx::query(
-        "UPDATE sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
+        "UPDATE sessions SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL",
     )
-    .bind(id)
+    .bind(Utc::now())
+    .bind(id.hyphenated())
     .execute(&mut *tx)
     .await?
     .rows_affected() as i64;
@@ -330,10 +344,11 @@ pub async fn suspend_account(
     // key exists nowhere (it was shown once, at creation), so the hash is the
     // only handle the process-wide cache can be addressed by.
     let revoked_key_hashes: Vec<String> = sqlx::query_scalar(
-        "UPDATE api_keys SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL \
+        "UPDATE api_keys SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL \
          RETURNING key_hash",
     )
-    .bind(id)
+    .bind(Utc::now())
+    .bind(id.hyphenated())
     .fetch_all(&mut *tx)
     .await?;
     let keys_revoked = revoked_key_hashes.len() as i64;
@@ -345,15 +360,21 @@ pub async fn suspend_account(
         "status_to": "suspended",
     });
 
+    // created_at is bound from Rust: the SQLite schema has no DEFAULT for it
+    // (plan section 4.1, correction 1 - the Postgres now() default was
+    // deliberately removed), so omitting it fails the NOT NULL constraint at
+    // runtime. This is the defect a compiler cannot see.
     sqlx::query(
-        "INSERT INTO admin_audit (operator_id, action, target_type, target_id, detail)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO admin_audit
+             (operator_id, action, target_type, target_id, detail, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
-    .bind(operator_id)
+    .bind(operator_id.hyphenated())
     .bind(ACTION_SUSPEND)
     .bind(TARGET_TYPE_ACCOUNT)
     .bind(id.to_string())
     .bind(&detail)
+    .bind(Utc::now())
     .execute(&mut *tx)
     .await?;
 
@@ -401,10 +422,10 @@ pub async fn resume_account(
     let operator_id = require_operator(&state, &headers).await?;
     refuse_self_action(operator_id, id)?;
 
-    let mut tx = state.pool.begin().await?;
+    let mut tx = crate::db::begin_immediate(&state.pool).await?;
 
-    let target = sqlx::query("SELECT status FROM accounts WHERE id = $1 FOR UPDATE")
-        .bind(id)
+    let target = sqlx::query("SELECT status FROM accounts WHERE id = ?")
+        .bind(id.hyphenated())
         .fetch_optional(&mut *tx)
         .await?;
     let Some(target) = target else {
@@ -418,8 +439,9 @@ pub async fn resume_account(
         .into());
     }
 
-    sqlx::query("UPDATE accounts SET status = 'active', updated_at = now() WHERE id = $1")
-        .bind(id)
+    sqlx::query("UPDATE accounts SET status = 'active', updated_at = ? WHERE id = ?")
+        .bind(Utc::now())
+        .bind(id.hyphenated())
         .execute(&mut *tx)
         .await?;
 
@@ -430,15 +452,19 @@ pub async fn resume_account(
         "keys_revoked": 0,
     });
 
+    // created_at is bound from Rust for the same reason as the suspend path
+    // above: the SQLite schema gives the column no DEFAULT.
     sqlx::query(
-        "INSERT INTO admin_audit (operator_id, action, target_type, target_id, detail)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO admin_audit
+             (operator_id, action, target_type, target_id, detail, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
-    .bind(operator_id)
+    .bind(operator_id.hyphenated())
     .bind(ACTION_RESUME)
     .bind(TARGET_TYPE_ACCOUNT)
     .bind(id.to_string())
     .bind(&detail)
+    .bind(Utc::now())
     .execute(&mut *tx)
     .await?;
 
@@ -471,25 +497,21 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::AppConfig;
-    use crate::db::{credit_topup_transaction, init_pool, TopupCreditResult};
     use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
     use crate::routes::auth::{exchange_token, AuthExchangeRequest};
     use crate::routes::events::RealtimeHub;
     use crate::routes::hash_token;
     use crate::routes::keys::{create_key, CreateKeyRequest};
+    use crate::test_support::{self, TestDb};
     use serde_json::Value;
-    use sqlx::PgPool;
+    use sqlx::SqlitePool;
 
     // -----------------------------------------------------------------------
-    // Fixtures. Same style as keys.rs/account.rs: a real, migrated Postgres, the
+    // Fixtures. Same style as keys.rs/account.rs: a real, migrated database, the
     // real handlers, and the real money path - never a hand-written balance.
+    // Each test builds its OWN SQLite database in a temp directory (TestDb), so
+    // the suite runs with no live server and no row-by-row teardown.
     // -----------------------------------------------------------------------
-
-    async fn live_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        init_pool(&database_url).await.expect("connect to Postgres")
-    }
 
     fn live_config() -> Arc<AppConfig> {
         for path in ["../config/apikita.toml", "config/apikita.toml"] {
@@ -502,7 +524,7 @@ mod tests {
 
     /// The real application state, built the way main.rs builds it, so the
     /// handler evicts from the same process-wide key cache the proxy reads.
-    fn test_state(pool: PgPool) -> AppState {
+    fn test_state(pool: SqlitePool) -> AppState {
         let config = live_config();
         let events = Arc::new(RealtimeHub::new(&config.realtime));
         let trusted_proxies: Arc<[IpCidr]> = Arc::from(
@@ -528,36 +550,51 @@ mod tests {
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
     }
 
-    async fn create_account(pool: &PgPool) -> Uuid {
-        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-            .bind(format!("test_{}", Uuid::new_v4().simple()))
-            .fetch_one(pool)
-            .await
-            .expect("create account")
+    /// An account row. The SQLite schema has no DEFAULT for id, created_at or
+    /// updated_at (plan section 4.1, correction 1), so the Postgres
+    /// RETURNING id shape would fail at runtime rather than here.
+    async fn create_account(pool: &SqlitePool) -> Uuid {
+        test_support::account(pool).await
     }
 
     /// An account with the operator flag. The flag is a column, not a table
     /// (docs/decisions.md:92), so this is the whole fixture.
-    async fn create_operator(pool: &PgPool) -> Uuid {
-        sqlx::query_scalar(
-            "INSERT INTO accounts (pb_user_id, is_operator) VALUES ($1, true) RETURNING id",
+    async fn create_operator(pool: &SqlitePool) -> Uuid {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO accounts (id, pb_user_id, is_operator, created_at, updated_at)
+             VALUES (?, ?, 1, ?, ?)",
         )
-        .bind(format!("test_op_{}", Uuid::new_v4().simple()))
-        .fetch_one(pool)
+        .bind(id.hyphenated())
+        .bind(format!("test_op_{}", id.simple()))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
         .await
-        .expect("create operator account")
+        .expect("create operator account");
+        id
     }
 
     /// A real sessions row, plus the token whose cookie resolves to it, so every
     /// handler below is reached through the production authentication path.
-    async fn issue_session(pool: &PgPool, account_id: Uuid) -> String {
+    async fn issue_session(pool: &SqlitePool, account_id: Uuid) -> String {
         let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        // Every NOT NULL column is bound from Rust: the SQLite schema has no
+        // DEFAULT for id, last_seen_at or created_at, and now() + interval has no
+        // SQLite spelling that keeps the RFC3339-offset form the timestamp GLOB
+        // CHECK requires.
+        let now = Utc::now();
         sqlx::query(
-            "INSERT INTO sessions (account_id, token_hash, expires_at)
-             VALUES ($1, $2, now() + interval '30 days')",
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(account_id)
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
         .bind(hash_token(&token))
+        .bind(now + chrono::Duration::days(30))
+        .bind(now)
+        .bind(now)
         .execute(pool)
         .await
         .expect("create session");
@@ -577,31 +614,9 @@ mod tests {
     /// the matching ledger row in the same transaction. Writing
     /// wallets.balance_idr directly manufactures exactly the drift the
     /// reconciliation assertion at the end of every test looks for.
-    async fn open_wallet(pool: &PgPool, account_id: Uuid, opening_idr: i64) {
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(account_id)
-            .execute(pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
-
-        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
-            .bind(account_id)
-            .bind(opening_idr)
-            .bind(&order_id)
-            .execute(pool)
-            .await
-            .expect("create topup");
-
-        assert_eq!(
-            credit_topup_transaction(pool, &order_id, opening_idr)
-                .await
-                .expect("credit the opening balance"),
-            TopupCreditResult::Settled {
-                new_balance: opening_idr
-            },
-            "the fixture must open the wallet through the real top-up path"
-        );
+    async fn open_wallet(pool: &SqlitePool, account_id: Uuid, opening_idr: i64) {
+        test_support::wallet(pool, account_id).await;
+        test_support::fund(pool, account_id, opening_idr).await;
     }
 
     /// A key created through the REAL handler, returning (id, plaintext). The
@@ -643,30 +658,34 @@ mod tests {
 
     /// Live = usable right now. Both bounds matter for a session: an
     /// expired-but-unrevoked row is not a credential.
-    async fn live_sessions(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn live_sessions(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        // The expiry bound is bound from Rust, not SQLite's now(): the
+        // space-separated form it emits sorts before every RFC3339 value the
+        // column holds, so a SQL now() would count expired sessions as live.
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM sessions
-              WHERE account_id = $1 AND revoked_at IS NULL AND expires_at > now()",
+              WHERE account_id = ? AND revoked_at IS NULL AND expires_at > ?",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
+        .bind(Utc::now())
         .fetch_one(pool)
         .await
         .expect("count live sessions")
     }
 
-    async fn live_keys(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn live_keys(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM api_keys WHERE account_id = $1 AND revoked_at IS NULL",
+            "SELECT COUNT(*) FROM api_keys WHERE account_id = ? AND revoked_at IS NULL",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(pool)
         .await
         .expect("count live keys")
     }
 
-    async fn account_status(pool: &PgPool, account_id: Uuid) -> String {
-        sqlx::query_scalar("SELECT status FROM accounts WHERE id = $1")
-            .bind(account_id)
+    async fn account_status(pool: &SqlitePool, account_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
+            .bind(account_id.hyphenated())
             .fetch_one(pool)
             .await
             .expect("read status")
@@ -675,12 +694,12 @@ mod tests {
     /// Every audit row aimed at one target, as (operator_id, action, target_type,
     /// detail). Read straight from the table: a response is not evidence.
     async fn audit_rows(
-        pool: &PgPool,
+        pool: &SqlitePool,
         target_id: Uuid,
     ) -> Vec<(Uuid, String, String, Option<Value>)> {
         let rows = sqlx::query(
             "SELECT operator_id, action, target_type, detail FROM admin_audit
-              WHERE target_id = $1 ORDER BY id",
+              WHERE target_id = ? ORDER BY id",
         )
         .bind(target_id.to_string())
         .fetch_all(pool)
@@ -690,7 +709,9 @@ mod tests {
         rows.iter()
             .map(|row| {
                 (
-                    row.try_get("operator_id").expect("operator_id"),
+                    row.try_get::<uuid::fmt::Hyphenated, _>("operator_id")
+                        .expect("operator_id")
+                        .into_uuid(),
                     row.try_get("action").expect("action"),
                     row.try_get("target_type").expect("target_type"),
                     row.try_get("detail").expect("detail"),
@@ -701,65 +722,33 @@ mod tests {
 
     /// docs/observability.md's reconciliation, scoped to THIS fixture's account:
     /// wallets.balance_idr must equal SUM(ledger.delta_idr). Must return 0.
-    async fn drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
                 SELECT w.account_id
                 FROM wallets w
                 LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = $1
+                WHERE w.account_id = ?
                 GROUP BY w.account_id, w.balance_idr
                 HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
     }
 
     /// Every branch of every test ends here: the fixture must not have drifted.
-    async fn assert_no_drift(pool: &PgPool, account_ids: &[Uuid]) {
+    async fn assert_no_drift(pool: &SqlitePool, account_ids: &[Uuid]) {
         for account_id in account_ids {
             assert_eq!(
                 drift_rows(pool, *account_id).await,
                 0,
                 "wallets.balance_idr must equal SUM(ledger.delta_idr) for {account_id}"
             );
-        }
-    }
-
-    /// Deletes every row a fixture created, in FK order. admin_audit FIRST: its
-    /// operator_id is ON DELETE RESTRICT, so an account with an audit row cannot
-    /// be deleted until the trail is removed. Unconditional, so a panicking
-    /// assertion does not leave permanent residue.
-    async fn delete_fixture_rows(pool: &PgPool, account_ids: &[Uuid]) {
-        for account_id in account_ids {
-            let target_id = account_id.to_string();
-            sqlx::query("DELETE FROM admin_audit WHERE operator_id = $1 OR target_id = $2")
-                .bind(account_id)
-                .bind(&target_id)
-                .execute(pool)
-                .await
-                .expect("cleanup admin_audit");
-
-            for statement in [
-                "DELETE FROM usage_daily WHERE account_id = $1",
-                "DELETE FROM api_keys WHERE account_id = $1",
-                "DELETE FROM ledger WHERE account_id = $1",
-                "DELETE FROM topups WHERE account_id = $1",
-                "DELETE FROM wallets WHERE account_id = $1",
-                "DELETE FROM sessions WHERE account_id = $1",
-                "DELETE FROM accounts WHERE id = $1",
-            ] {
-                sqlx::query(statement)
-                    .bind(account_id)
-                    .execute(pool)
-                    .await
-                    .unwrap_or_else(|err| panic!("cleanup failed on {statement}: {err}"));
-            }
         }
     }
 
@@ -850,10 +839,11 @@ mod tests {
     // (a) + (d) + (i): suspend revokes EVERY live session and EVERY live key,
     // counted from the tables, and writes exactly ONE audit row.
     // -----------------------------------------------------------------------
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+
     #[tokio::test]
     async fn suspend_revokes_every_live_session_and_every_live_key() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
@@ -868,12 +858,20 @@ mod tests {
         // row is revoked too, and the LIVE count is what must reach zero.
         let victim_headers = cookie_headers(&issue_session(&pool, victim).await);
         issue_session(&pool, victim).await;
+        // The expired row carries every NOT NULL column from Rust, and its
+        // expiry is computed in Rust: now() - interval has no SQLite spelling
+        // that keeps the RFC3339-offset form the GLOB CHECK requires.
+        let expired_now = Utc::now();
         sqlx::query(
-            "INSERT INTO sessions (account_id, token_hash, expires_at)
-             VALUES ($1, $2, now() - interval '1 day')",
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(victim)
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(victim.hyphenated())
         .bind(hash_token(&format!("apk_sess_{}", Uuid::new_v4().simple())))
+        .bind(expired_now - chrono::Duration::days(1))
+        .bind(expired_now)
+        .bind(expired_now)
         .execute(&pool)
         .await
         .expect("create an expired session row");
@@ -885,8 +883,9 @@ mod tests {
         let (_, _) = create_key_via_handler(&state, &victim_headers, "warm2", vec![]).await;
         let (dead_key_id, _) =
             create_key_via_handler(&state, &victim_headers, "dead", vec![]).await;
-        sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE id = $1")
-            .bind(dead_key_id)
+        sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE id = ?")
+            .bind(Utc::now())
+            .bind(dead_key_id.hyphenated())
             .execute(&pool)
             .await
             .expect("pre-revoke one key");
@@ -934,9 +933,9 @@ mod tests {
 
         // Not one unrevoked session row is left, expired ones included.
         let unrevoked: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sessions WHERE account_id = $1 AND revoked_at IS NULL",
+            "SELECT COUNT(*) FROM sessions WHERE account_id = ? AND revoked_at IS NULL",
         )
-        .bind(victim)
+        .bind(victim.hyphenated())
         .fetch_one(&pool)
         .await
         .expect("count unrevoked sessions");
@@ -956,8 +955,8 @@ mod tests {
 
         // The already-revoked key stays revoked (it is not re-stamped).
         let dead_revoked_at: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
-                .bind(dead_key_id)
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = ?")
+                .bind(dead_key_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read the pre-revoked key");
@@ -984,26 +983,27 @@ mod tests {
         assert_eq!(detail["status_from"], json!("active"), "detail: {detail}");
 
         assert_no_drift(&pool, &[operator, victim]).await;
-        delete_fixture_rows(&pool, &[operator, victim]).await;
+        db.close().await;
     }
     /// (d), second half: a FAILED suspend writes no audit row - and changes
     /// nothing else either.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+
     #[tokio::test]
     async fn a_failed_suspend_writes_no_audit_row() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
         let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
 
-        let (status, _) = render(suspend_account(
+        let (status, body) = render(suspend_account(
             State(state.clone()),
             Path(victim),
             operator_headers.clone(),
         ))
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(audit_rows(&pool, victim).await.len(), 1);
 
         // Suspending an account that is not 'active' is refused...
@@ -1029,15 +1029,16 @@ mod tests {
         );
 
         assert_no_drift(&pool, &[operator, victim]).await;
-        delete_fixture_rows(&pool, &[operator, victim]).await;
+        db.close().await;
     }
 
     /// (b) A session revoked by the suspend can no longer resolve - driven
     /// through the REAL request path, not by reading revoked_at.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+
     #[tokio::test]
     async fn a_session_revoked_by_suspend_can_no_longer_resolve() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
@@ -1073,16 +1074,17 @@ mod tests {
         assert_eq!(body["error"]["code"], json!("unauthenticated"));
 
         assert_no_drift(&pool, &[operator, victim]).await;
-        delete_fixture_rows(&pool, &[operator, victim]).await;
+        db.close().await;
     }
 
     /// (c) A key revoked by the suspend is refused by the real proxy path - and
     /// refused even when the proxy's metadata cache was already warm, which is
     /// the half a status-flag-only suspend would miss.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+
     #[tokio::test]
     async fn a_key_revoked_by_suspend_is_refused_by_the_proxy_path() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
@@ -1126,8 +1128,8 @@ mod tests {
         assert_eq!(body["error"]["code"], json!("key_revoked"));
 
         let revoked_at: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
-                .bind(key_id)
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = ?")
+                .bind(key_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read revoked_at");
@@ -1137,13 +1139,14 @@ mod tests {
         );
 
         assert_no_drift(&pool, &[operator, victim]).await;
-        delete_fixture_rows(&pool, &[operator, victim]).await;
+        db.close().await;
     }
     /// (e) A non-operator is refused, and NOTHING happens to the target.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+
     #[tokio::test]
     async fn a_non_operator_is_refused_and_the_target_is_unchanged() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let nobody = create_account(&pool).await;
         let victim = create_account(&pool).await;
@@ -1206,15 +1209,16 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         assert_no_drift(&pool, &[nobody, victim]).await;
-        delete_fixture_rows(&pool, &[nobody, victim]).await;
+        db.close().await;
     }
 
     /// (f) An operator cannot act on themselves - and their own credentials are
     /// untouched.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+
     #[tokio::test]
     async fn an_operator_cannot_act_on_themselves() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let self_headers = cookie_headers(&issue_session(&pool, operator).await);
@@ -1282,13 +1286,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         assert_no_drift(&pool, &[operator, victim]).await;
-        delete_fixture_rows(&pool, &[operator, victim]).await;
+        db.close().await;
     }
     /// (g) Resume sets the status back to active, revokes nothing, and audits.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+
     #[tokio::test]
     async fn resume_sets_status_active_and_revokes_nothing() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
@@ -1300,8 +1305,8 @@ mod tests {
 
         // Suspended by hand: the point of this test is what RESUME does, and a
         // live session + live key is exactly the state resume must leave alone.
-        sqlx::query("UPDATE accounts SET status = 'suspended' WHERE id = $1")
-            .bind(victim)
+        sqlx::query("UPDATE accounts SET status = 'suspended' WHERE id = ?")
+            .bind(victim.hyphenated())
             .execute(&pool)
             .await
             .expect("suspend the fixture out of band");
@@ -1330,8 +1335,8 @@ mod tests {
             "resume must NOT revoke keys"
         );
         let key_revoked: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
-                .bind(key_id)
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = ?")
+                .bind(key_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read revoked_at");
@@ -1380,14 +1385,15 @@ mod tests {
         );
 
         assert_no_drift(&pool, &[operator, victim]).await;
-        delete_fixture_rows(&pool, &[operator, victim]).await;
+        db.close().await;
     }
 
     /// The read-only lookup answers with counts and NEVER a credential hash.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+
     #[tokio::test]
     async fn the_read_only_lookup_exposes_no_credential_hash() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
@@ -1415,14 +1421,14 @@ mod tests {
 
         // Neither hash of anything real appears in the response.
         let key_hash: String =
-            sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE account_id = $1")
-                .bind(victim)
+            sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE account_id = ?")
+                .bind(victim.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read key_hash");
         let session_hash: String =
-            sqlx::query_scalar("SELECT token_hash FROM sessions WHERE account_id = $1")
-                .bind(victim)
+            sqlx::query_scalar("SELECT token_hash FROM sessions WHERE account_id = ?")
+                .bind(victim.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read token_hash");
@@ -1450,7 +1456,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         assert_no_drift(&pool, &[operator, victim]).await;
-        delete_fixture_rows(&pool, &[operator, victim]).await;
+        db.close().await;
     }
     /// (h) The login path still refuses a suspended account - the behaviour
     /// auth.rs:204 already had, now asserted next to the suspension that makes it
@@ -1460,10 +1466,16 @@ mod tests {
     /// fake and mocking the network would test the mock. The identity is a real
     /// PocketBase record; the account row is created here with that record's id
     /// as its pb_user_id, exactly as the first login would.
-    #[ignore = "requires live Postgres AND the local PocketBase: DATABASE_URL + POCKETBASE_URL"]
+    // The database half of this fixture is now a per-test SQLite file, but the
+    // LOGIN half is not portable: exchange_token verifies its token against a
+    // real PocketBase over the network, and faking that would test the fake. So
+    // this is the one test here that still needs a live external service
+    // (POCKETBASE_URL); nothing about it needs Postgres.
+    #[ignore = "requires the local PocketBase: POCKETBASE_URL"]
     #[tokio::test]
     async fn a_new_login_after_suspend_is_still_refused() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
@@ -1472,12 +1484,20 @@ mod tests {
         let tag = Uuid::new_v4().simple().to_string();
         let (record_id, pb_token) = pocketbase_identity(&client, &tag).await;
 
-        let victim: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-                .bind(&record_id)
-                .fetch_one(&pool)
-                .await
-                .expect("create the account the login would have created");
+        // Every NOT NULL column is bound from Rust: the SQLite schema has no
+        // DEFAULT for id, created_at or updated_at.
+        let victim = Uuid::new_v4();
+        let victim_now = Utc::now();
+        sqlx::query(
+            "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(victim.hyphenated())
+        .bind(&record_id)
+        .bind(victim_now)
+        .bind(victim_now)
+        .execute(&pool)
+        .await
+        .expect("create the account the login would have created");
 
         let (status, _) = render(suspend_account(
             State(state.clone()),
@@ -1507,8 +1527,8 @@ mod tests {
 
         // And it minted nothing on the way out.
         let sessions: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = $1")
-                .bind(victim)
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
+                .bind(victim.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count sessions");
@@ -1518,7 +1538,7 @@ mod tests {
         );
 
         assert_no_drift(&pool, &[operator, victim]).await;
-        delete_fixture_rows(&pool, &[operator, victim]).await;
+        db.close().await;
         delete_pocketbase_identity(&client, &record_id, &pb_token).await;
     }
 

@@ -4,7 +4,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::SqlitePool;
 use tracing::error;
 
 /// The fixed, generic `database` indicator for the failed probe.
@@ -18,7 +18,7 @@ use tracing::error;
 /// logged below at `error!` level.
 const DATABASE_UNAVAILABLE: &str = "database unavailable";
 
-pub async fn health_check(State(pool): State<PgPool>) -> impl IntoResponse {
+pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
     match sqlx::query("SELECT 1").execute(&pool).await {
         Ok(_) => (
             StatusCode::OK,
@@ -49,12 +49,14 @@ pub async fn health_check(State(pool): State<PgPool>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use crate::test_support::TestDb;
     use serde_json::{json, Value};
-    use sqlx::postgres::PgPoolOptions;
+    use std::str::FromStr;
     use std::time::Duration;
+    use uuid::Uuid;
 
     /// Drives the handler exactly the way the router does and reads its body.
-    async fn probe(pool: PgPool) -> (StatusCode, Value) {
+    async fn probe(pool: SqlitePool) -> (StatusCode, Value) {
         let res = health_check(State(pool)).await.into_response();
         let status = res.status();
         let bytes = to_bytes(res.into_body(), usize::MAX)
@@ -66,14 +68,28 @@ mod tests {
     }
 
     /// A pool pointed at a database that is genuinely unreachable, so the probe
-    /// fails for real instead of being simulated. connect_lazy does not dial
-    /// until the first query, which is exactly the moment the handler dials.
-    fn unreachable_pool() -> PgPool {
-        PgPoolOptions::new()
+    /// fails for real instead of being simulated. Lazy: it does not dial until the
+    /// first query, which is exactly the moment the handler dials.
+    ///
+    /// Ported from the Postgres original, whose DSN named a closed TCP port. There
+    /// is no host to be unreachable under SQLite, so the equivalent is a FILENAME
+    /// that does not exist: `init_pool` deliberately does not set
+    /// `create_if_missing`, so the first query fails with `unable to open database
+    /// file` - the same honest "the database is not there", for the same reason.
+    /// The path is under the system temp directory and is never created.
+    fn unreachable_pool() -> SqlitePool {
+        let absent = std::env::temp_dir().join(format!(
+            "apikita_probe_absent_{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(absent)
+            .busy_timeout(Duration::from_secs(5));
+
+        sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(5))
-            .connect_lazy("postgres://apikita_probe:secret@127.0.0.1:1/apikita_absent")
-            .expect("the probe DSN is a valid postgres url")
+            .connect_lazy_with(options)
     }
 
     /// docs/error-model.md:168 (rule 1) - never leak internals. The health
@@ -87,7 +103,11 @@ mod tests {
     /// break the test - only a leak does.
     #[tokio::test]
     async fn a_database_failure_reports_degraded_without_leaking_the_driver_error() {
-        let dsn = "postgres://apikita_probe:secret@127.0.0.1:1/apikita_absent";
+        // The leak list is the Postgres original's, kept verbatim: the point is that
+        // NO driver text reaches the caller, and the SQLite driver's own vocabulary
+        // ("unable to open database file", "sqlite", the path) is what the handler
+        // must not echo. "postgres" stays in the list deliberately - if the constant
+        // ever regressed to naming an engine, the test still catches it.
         let (status, body) = probe(unreachable_pool()).await;
 
         // The shape monitoring parses stays stable (docs/deployment.md:134 gates
@@ -105,8 +125,10 @@ mod tests {
         let raw = serde_json::to_string(&body).expect("the body is JSON");
         let lower = raw.to_lowercase();
         for leak in [
-            dsn,
             "apikita_probe",
+            "sqlite",
+            "unable to open",
+            "database file",
             "secret",
             "127.0.0.1",
             "postgres",
@@ -136,15 +158,11 @@ mod tests {
     /// the deploy gate, so the status code AND the whole body are pinned.
     #[tokio::test]
     async fn a_reachable_database_is_200_healthy_and_connected() {
-        // Read-only (SELECT 1), so unlike the settlement fixtures in db.rs this
-        // is safe to run against the shared local schema.
-        let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            // The documented local stack default (.env.example, docker-compose.yml).
-            "postgres://postgres:dev@localhost:5432/apikita".to_string()
-        });
-        let pool = crate::db::init_pool(&dsn)
-            .await
-            .expect("set DATABASE_URL to a reachable Postgres instance");
+        // Ported: the Postgres original read DATABASE_URL and dialled a shared
+        // server. `TestDb` builds and migrates its own file, so this runs by
+        // default and no other test's rows can perturb it.
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
 
         let (status, body) = probe(pool).await;
 
@@ -158,29 +176,37 @@ mod tests {
             json!({ "status": "healthy", "database": "connected" }),
             "the healthy contract must not drift - the deploy gate parses this body"
         );
+
+        db.close().await;
     }
 
     /// The LIVE half of the healthy contract: the first test that drives the
     /// handler against a REAL Postgres through a pool that has not dialled yet, so
     /// the 200 can only come from SELECT 1 actually executing.
     ///
-    /// connect_lazy starts with zero connections, which makes the handler own query
+    /// A lazy pool starts with zero connections, which makes the handler own query
     /// the thing that opens them: asserting pool.size() > 0 afterwards proves the
-    /// handler reached the server rather than short-circuiting. That is the part no
-    /// pure test can cover, and the reason this one is #[ignore]d.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    /// handler reached the database rather than short-circuiting. That is the part
+    /// no pure test can cover.
+    ///
+    /// Ported: the Postgres original read DATABASE_URL and was `#[ignore]`d because
+    /// it needed a migrated server. `TestDb` builds and migrates one per test, so
+    /// the ignore is gone - which is the whole point of the port (plan section 5.5).
     #[tokio::test]
-    async fn live_probe_executes_select_1_against_real_postgres_and_is_200_healthy() {
-        let dsn = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
+    async fn live_probe_executes_select_1_against_the_real_database_and_is_200_healthy() {
+        let db = TestDb::new().await;
 
-        // Lazy on purpose: nothing has been dialled yet, so any connection that
-        // exists after the probe was opened BY the probe.
-        let pool = PgPoolOptions::new()
+        // A SECOND, lazy pool onto the same migrated file: nothing has been dialled
+        // yet, so any connection that exists after the probe was opened BY the probe.
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&format!(
+            "sqlite://{}",
+            db.dir_path().join("test.db").display()
+        ))
+        .expect("parse the migrated file as a sqlite url");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(2)
             .acquire_timeout(Duration::from_secs(5))
-            .connect_lazy(&dsn)
-            .expect("DATABASE_URL is a valid postgres url");
+            .connect_lazy_with(options);
         assert_eq!(
             pool.size(),
             0,
@@ -201,26 +227,27 @@ mod tests {
         );
         assert!(
             pool.size() > 0,
-            "the handler must have executed its probe against real Postgres; an empty pool here means the 200 came from somewhere other than SELECT 1"
+            "the handler must have executed its probe against the real database; an empty pool here means the 200 came from somewhere other than SELECT 1"
         );
+
+        pool.close().await;
+        db.close().await;
     }
 
-    /// The LIVE unavailable branch: a pool that was REALLY connected to Postgres
-    /// and then REALLY torn down, so the handler failure is the driver own
-    /// PoolClosed, not a hand-built error.
+    /// The LIVE unavailable branch: a pool that was REALLY connected to the
+    /// database and then REALLY torn down, so the handler failure is the driver's
+    /// own PoolClosed, not a hand-built error.
     ///
     /// The no-leak assertion compares the body against the driver error text this
     /// process ACTUALLY received, so it cannot go stale the way a hand-written
     /// fragment list does.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    ///
+    /// Ported: `TestDb` supplies the migrated database the Postgres original took
+    /// from DATABASE_URL, so the ignore is gone.
     #[tokio::test]
     async fn live_probe_on_a_closed_pool_reports_the_constant_and_no_driver_error_fragment() {
-        let dsn = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-
-        let pool = crate::db::init_pool(&dsn)
-            .await
-            .expect("connect to Postgres");
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
 
         // Establish a real connection first, so closing the pool is a real teardown
         // of a real connection rather than a never-dialled no-op.
@@ -274,5 +301,7 @@ mod tests {
             !raw.contains(&driver_error),
             "docs/error-model.md rule 1 - the driver error {driver_error:?} reached an unauthenticated caller in: {raw}"
         );
+
+        db.close().await;
     }
 }

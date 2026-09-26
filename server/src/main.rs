@@ -48,9 +48,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Configuration validated successfully"
     );
 
-    // Database connection
-    let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/apikita".into());
+    // Database connection.
+    //
+    // The default is the same local SQLite file `.env.example` documents. It must
+    // not be a Postgres URL: this deployment has no Postgres, so a missing
+    // DATABASE_URL would otherwise fail inside the driver with a parse error about
+    // a scheme rather than an honest "the database is not there".
+    let database_url =
+        env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/server.db".into());
 
     let pool = match db::init_pool(&database_url).await {
         Ok(p) => {

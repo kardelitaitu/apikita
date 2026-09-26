@@ -28,9 +28,9 @@
 
 SELECT COALESCE(w.account_id, l.account_id) AS account_id,
        CASE WHEN w.account_id IS NULL THEN 'NO WALLET ROW'
-            ELSE w.balance_idr::text
+            ELSE CAST(w.balance_idr AS TEXT)
        END AS balance_idr,
-       COALESCE(SUM(l.delta_idr), 0)::text AS ledger_sum
+       CAST(COALESCE(SUM(l.delta_idr), 0) AS TEXT) AS ledger_sum
 FROM wallets w
 FULL OUTER JOIN ledger l ON l.account_id = w.account_id
 GROUP BY w.account_id, l.account_id, w.balance_idr

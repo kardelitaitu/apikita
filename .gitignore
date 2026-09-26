@@ -27,6 +27,12 @@ tmp/
 # Rust
 target/
 
+# Local SQLite database. DATABASE_URL points here by default
+# (sqlite://data/server.db). Local scratch data in development, and on the
+# persistent volume in production. The -wal and -shm sidecars sit beside the
+# database file, inside this directory.
+data/
+
 # Node
 node_modules/
 dist/

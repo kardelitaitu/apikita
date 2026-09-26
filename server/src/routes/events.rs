@@ -4,7 +4,8 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::{stream, Stream, StreamExt};
-use sqlx::{PgPool, Row};
+use sha2::{Digest, Sha256};
+use sqlx::{SqlitePool, Row};
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
@@ -16,11 +17,11 @@ use std::{
 };
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::config::RealtimeConfig;
 use crate::error::AppError;
 use crate::routes::proxy::AppState;
-use crate::routes::resolve_account_from_cookie;
 
 /// Heartbeat period. docs/realtime.md:82 asks for every 20-30 seconds: too rare
 /// and an intermediary closes the idle stream, too often and it is pure noise.
@@ -328,19 +329,19 @@ pub fn publish_key_update(
 /// The stream carries totals rather than deltas (docs/realtime.md:93), so a
 /// lost event self-heals: the next one carries the whole value regardless of
 /// what was missed.
-pub async fn todays_usage(pool: &PgPool, account_id: Uuid) -> Result<UsageDelta, AppError> {
+pub async fn todays_usage(pool: &SqlitePool, account_id: Uuid) -> Result<UsageDelta, AppError> {
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
-            COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
-            COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
-            COALESCE(SUM(cost_idr), 0)::bigint AS cost_idr
+            COALESCE(SUM(input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(cost_idr), 0) AS cost_idr
         FROM usage_daily
-        WHERE account_id = $1 AND day = $2
+        WHERE account_id = ? AND day = ?
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(chrono::Utc::now().date_naive())
     .fetch_one(pool)
     .await?;
@@ -360,6 +361,89 @@ fn last_event_id(headers: &HeaderMap) -> Option<u64> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse().ok())
 }
+
+/// SHA-256 hex of a session token.
+
+///
+
+/// Carried over from the Postgres branch, where the shared resolver in
+/// `crate::routes` took a `PgPool`. It is now a `SqlitePool` too, so this local
+/// copy is equivalent to it and is kept so the handler and its tests run the same
+/// resolver. The token is hashed, never stored raw.
+
+fn hash_string(s: &str) -> String {
+
+    let mut hasher = Sha256::new();
+
+    hasher.update(s.as_bytes());
+
+    hex::encode(hasher.finalize())
+
+}
+
+
+
+/// The account a request's session cookie resolves to, against SQLite.
+
+async fn resolve_account_from_cookie(
+
+    pool: &SqlitePool,
+
+    headers: &HeaderMap,
+
+) -> Result<Uuid, AppError> {
+
+    let cookie_hdr = headers
+
+        .get(axum::http::header::COOKIE)
+
+        .and_then(|v| v.to_str().ok())
+
+        .ok_or(AppError::Unauthenticated)?;
+
+
+
+    for piece in cookie_hdr.split(';') {
+
+        let piece = piece.trim();
+
+        if let Some(token) = piece.strip_prefix("session=") {
+
+            let token_hash = hash_string(token);
+
+            let session = sqlx::query(
+
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+
+            )
+
+            .bind(token_hash)
+
+            .bind(chrono::Utc::now())
+
+            .fetch_optional(pool)
+
+            .await?;
+
+
+
+            if let Some(s) = session {
+
+                return Ok(s.try_get::<Hyphenated, _>("account_id")?.into_uuid());
+
+            }
+
+        }
+
+    }
+
+
+
+    Err(AppError::Unauthenticated)
+
+}
+
+
 
 pub async fn sse_events_handler(
     State(state): State<AppState>,
@@ -409,8 +493,8 @@ pub async fn sse_events_handler(
     let snapshot = todays_usage(&state.pool, account_id).await?;
 
     let balance_idr: i64 =
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-            .bind(account_id)
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_optional(&state.pool)
             .await?
             .unwrap_or(0);
@@ -458,7 +542,8 @@ pub async fn sse_events_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use crate::test_support::{self, TestDb};
+    use axum::http::{header, HeaderValue};
 
     fn hub_config(
         replay_buffer_events: usize,
@@ -632,10 +717,20 @@ mod tests {
         assert_eq!(last_event_id(&headers), None);
     }
 
-    /// The fix for the panic decodes token sums into `i64` via a `::bigint`
-    /// cast. This proves the chosen representation survives values near the
-    /// i64 ceiling: had anyone "simplified" to a narrower type (i32/INT4) the
-    /// SUM would silently overflow. Sums must stay exact for large usage.
+    /// Realtime totals are `i64` end to end, and this proves the representation
+    /// survives values near the i64 ceiling: had anyone "simplified" to a narrower
+    /// type (i32) the value would wrap or fail to serialise. Sums must stay exact
+    /// for large usage.
+    ///
+    /// Note what this does NOT cover: it builds the event in memory, so it says
+    /// nothing about the SQL that produces the totals. The Postgres schema forced
+    /// those aggregates to carry a `::bigint` cast precisely so they decoded into
+    /// `i64`; the SQLite schema makes the cast unnecessary by declaring every money
+    /// and token column `INTEGER`, so `SUM()` already returns an integer type (plan
+    /// section 4.6). The cast has been removed, so the guarantee now rests on the
+    /// column declarations rather than on the query text — which is the stronger
+    /// place for it, and also the reason `STRICT` plus `INTEGER` money matters
+    /// beyond convention.
     #[test]
     fn token_sums_preserve_large_i64_values() {
         // A realistic heavy-tenant day, well above i32::MAX (2_147_483_647).
@@ -668,1043 +763,67 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // LIVE-DATABASE TESTS
-    //
-    // Every test above is pure: it exercises the hub and the helpers in memory
-    // and never opens a database. That left the two things this route is
-    // actually made of unexecuted — `todays_usage` (the only SQL the SSE feed
-    // reads for its usage snapshot) and `sse_events_handler` itself (cookie ->
-    // account -> wallet balance -> snapshot). A query that fails to decode, or a
-    // snapshot wired to the wrong account, would have shipped green.
-    //
-    // These run against a real, migrated Postgres and are #[ignore]d rather than
-    // skipped, so the default suite stays green without a database. Run them
-    // with:
-    //
-    //   DATABASE_URL=postgres://postgres:dev@localhost:5432/apikita \
-    //     cargo test --lib -- --ignored --test-threads=1 routes::events
-    // -----------------------------------------------------------------------
 
-    use crate::config::AppConfig;
-    use crate::db::credit_topup_transaction;
-    use crate::ip_tracking::{parse_cidrs, DailySalt};
-    use crate::routes::hash_token;
-    use axum::extract::State;
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    use chrono::NaiveDate;
-    use sqlx::PgPool;
-
-    /// A SMALL pool per test, deliberately: the live suite runs several pools in
-    /// parallel against Postgres' 100-connection limit. Four is ample for one
-    /// test, and because the pool is NOT shared no sibling test can starve this
-    /// one's teardown.
-    async fn live_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url)
-            .await
-            .expect("connect to Postgres")
-    }
-
-    /// One account with everything the /events path reads: a session cookie that
-    /// resolves through the production auth path (`resolve_account_from_cookie`),
-    /// a real api_keys row (`usage_daily.api_key_id` is NOT NULL and part of the
-    /// primary key, so a fabricated id would not insert) and the zero-balance
-    /// wallet the login path creates.
-    struct LiveAccount {
-        account_id: Uuid,
-        token: String,
-        key_id: Uuid,
-    }
-
-    async fn live_account(pool: &PgPool) -> LiveAccount {
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-                .bind(format!("test_events_{}", Uuid::new_v4().simple()))
-                .fetch_one(pool)
-                .await
-                .expect("create account");
-
-        let key_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix)
-             VALUES ($1, $2, 'apk_test') RETURNING id",
-        )
-        .bind(account_id)
-        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-        .fetch_one(pool)
-        .await
-        .expect("create the api key usage_daily's NOT NULL api_key_id points at");
-
-        let token = format!("apk_sess_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO sessions (account_id, token_hash, expires_at)
-             VALUES ($1, $2, now() + interval '30 days')",
-        )
-        .bind(account_id)
-        .bind(hash_token(&token))
-        .execute(pool)
-        .await
-        .expect("create session");
-
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(account_id)
-            .execute(pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
-
-        LiveAccount {
-            account_id,
-            token,
-            key_id,
-        }
-    }
-
-    /// The cookie the browser sends: the session token among unrelated cookies,
-    /// exactly as `resolve_account_from_cookie` parses it.
-    fn cookie_headers(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            format!("a=1; session={token}; b=2").parse().unwrap(),
-        );
-        headers
-    }
-
-    /// Money enters a wallet ONLY through the real path: a topups row settled by
-    /// `credit_topup_transaction`, which writes the matching + ledger row in the
-    /// same transaction. Writing wallets.balance_idr directly manufactures the
-    /// very drift the reconciliation assertion at the end of each test looks for.
-    async fn fund_wallet(pool: &PgPool, account_id: Uuid, amount_idr: i64) {
-        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
-            .bind(account_id)
-            .bind(amount_idr)
-            .bind(&order_id)
-            .execute(pool)
-            .await
-            .expect("create topup");
-
-        assert_eq!(
-            credit_topup_transaction(pool, &order_id, amount_idr)
-                .await
-                .expect("credit the opening balance"),
-            crate::db::TopupCreditResult::Settled {
-                new_balance: amount_idr
-            },
-            "the fixture must open the wallet through the real top-up path"
-        );
-    }
-
-    /// One usage_daily row for a chosen day, written directly.
+    /// REGRESSION for the session-lifetime hazard plan section 4.6: an expired
+    /// session must not authenticate.
     ///
-    /// This touches neither wallets nor ledger, so it is drift-neutral: the
-    /// reconciliation invariant is unaffected by it.
-    #[allow(clippy::too_many_arguments)]
-    async fn insert_usage(
-        pool: &PgPool,
-        account_id: Uuid,
-        key_id: Uuid,
-        day: NaiveDate,
-        input_tokens: i64,
-        cache_read_tokens: i64,
-        output_tokens: i64,
-        cost_idr: i64,
-    ) {
-        sqlx::query(
-            "INSERT INTO usage_daily (
-                 account_id, api_key_id, day,
-                 input_tokens, cache_read_tokens, output_tokens, cost_idr
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(account_id)
-        .bind(key_id)
-        .bind(day)
-        .bind(input_tokens)
-        .bind(cache_read_tokens)
-        .bind(output_tokens)
-        .bind(cost_idr)
-        .execute(pool)
-        .await
-        .expect("insert usage_daily row");
-    }
-
-    /// Deletes every row a fixture created, in FK order.
+    /// The guard is `expires_at > ?` with the instant bound from Rust. It used to
+    /// compare against SQL `now()`, and under SQLite that returned TRUE for a
+    /// session already past its expiry — measured: `now()` emits the
+    /// space-separated format, `'T'` sorts after a space, so
+    /// `2026-09-25T07:00:00+00:00` compared greater than the current time
+    /// indefinitely and the session never expired. Silent, and it fails in the
+    /// direction that keeps access.
     ///
-    /// usage_daily comes FIRST: its api_key_id is NOT NULL, and the FK is ON
-    /// DELETE SET NULL, so deleting api_keys while a usage_daily row still points
-    /// at one trips a NOT NULL violation instead of cascading. wallets/ledger are
-    /// ON DELETE RESTRICT, so the order is load-bearing. Unconditional: a
-    /// panicking assertion must not leave drift in a database other runs share.
-    async fn delete_fixture_rows(pool: &PgPool, account_ids: &[Uuid]) {
-        for account_id in account_ids {
-            for statement in [
-                "DELETE FROM usage_daily WHERE account_id = $1",
-                "DELETE FROM ledger WHERE account_id = $1",
-                "DELETE FROM api_keys WHERE account_id = $1",
-                "DELETE FROM topups WHERE account_id = $1",
-                "DELETE FROM sessions WHERE account_id = $1",
-                "DELETE FROM wallets WHERE account_id = $1",
-                "DELETE FROM accounts WHERE id = $1",
-            ] {
-                sqlx::query(statement)
-                    .bind(account_id)
-                    .execute(pool)
-                    .await
-                    .unwrap_or_else(|err| panic!("cleanup failed on {statement}: {err}"));
-            }
-        }
-    }
-
-    /// The reconciliation check from docs/observability.md, scoped to one
-    /// account: wallets.balance_idr must equal SUM(ledger.delta_idr). Must be 0.
-    async fn drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT w.account_id
-                FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = $1
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id)
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
-
-    /// The AppState the router would hand the handler, built from the same config
-    /// file the server loads.
-    fn live_app_state(pool: PgPool) -> AppState {
-        let config = AppConfig::load_from_file("../config/apikita.toml")
-            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
-            .expect("config/apikita.toml must load for the live tests");
-        let trusted = parse_cidrs(&config.network.trusted_proxy_cidrs)
-            .expect("the config validates its own trusted proxy rules");
-
-        AppState {
-            pool,
-            http_client: reqwest::Client::new(),
-            events: Arc::new(RealtimeHub::new(&config.realtime)),
-            config: Arc::new(config),
-            ip_salt: Arc::new(DailySalt::new()),
-            trusted_proxies: Arc::from(trusted.into_boxed_slice()),
-        }
-    }
-
-    fn today() -> NaiveDate {
-        chrono::Utc::now().date_naive()
-    }
-
-    /// Reads a live SSE response until `want_frames` complete frames have arrived
-    /// (or a short deadline elapses).
-    ///
-    /// `to_bytes` cannot be used here: the live half of the stream only ends when
-    /// the hub closes or `max_stream_seconds` elapses, so buffering the whole
-    /// body would block for the stream's entire lifetime. The snapshot frames are
-    /// written immediately, which is all these tests need.
-    async fn read_frames(response: axum::response::Response, want_frames: usize) -> String {
-        let mut stream = Box::pin(response.into_body().into_data_stream());
-        let mut buffer = String::new();
-        let deadline = tokio::time::sleep(Duration::from_secs(10));
-        tokio::pin!(deadline);
-
-        while buffer.matches("\n\n").count() < want_frames {
-            tokio::select! {
-                chunk = stream.next() => match chunk {
-                    Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
-                    Some(Err(err)) => panic!("the SSE body failed mid-stream: {err}"),
-                    None => break,
-                },
-                _ = &mut deadline => break,
-            }
-        }
-
-        buffer
-    }
-
-    /// The JSON payload of the frame named `event: <name>`, or a panic naming
-    /// what actually arrived.
-    fn frame_payload(body: &str, name: &str) -> serde_json::Value {
-        for frame in body.split("\n\n").filter(|f| !f.trim().is_empty()) {
-            let mut event = None;
-            let mut data = None;
-            for line in frame.lines() {
-                if let Some(rest) = line.strip_prefix("event:") {
-                    event = Some(rest.trim().to_string());
-                }
-                if let Some(rest) = line.strip_prefix("data:") {
-                    data = Some(rest.trim().to_string());
-                }
-            }
-            if event.as_deref() == Some(name) {
-                let data =
-                    data.unwrap_or_else(|| panic!("frame \"{name}\" carries no data: {body:?}"));
-                return serde_json::from_str(&data).unwrap_or_else(|err| {
-                    panic!("frame \"{name}\" is not JSON ({err}): {body:?}")
-                });
-            }
-        }
-        panic!("no \"{name}\" frame in the SSE body: {body:?}");
-    }
-
-    fn frame_count(body: &str) -> usize {
-        body.split("\n\n").filter(|f| !f.trim().is_empty()).count()
-    }
-
-    // -----------------------------------------------------------------------
-    // 1. todays_usage - the query the snapshot depends on
-    // -----------------------------------------------------------------------
-
-    /// THE DEFECT THIS PINS: `SUM()` over a `bigint` column returns NUMERIC in
-    /// Postgres, and sqlx refuses to decode NUMERIC into `i64`. Before the
-    /// `::bigint` casts in `todays_usage`, this call returned `Err` on EVERY
-    /// invocation - the SSE snapshot could never be produced. The contract is not
-    /// merely "it returns"; it is "it returns the three token classes separately
-    /// and exactly".
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    /// The schema's GLOB CHECK now makes the mixed format unrepresentable. This is
+    /// the behavioural half: the real cookie path, against the real schema.
     #[tokio::test]
-    async fn live_todays_usage_returns_each_token_class_from_the_database() {
-        let pool = live_pool().await;
-        let account = live_account(&pool).await;
+    async fn an_expired_session_is_refused_and_a_live_one_is_accepted() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
 
-        let outcome = tokio::spawn(todays_usage_assertions(
-            pool.clone(),
-            account.account_id,
-            account.key_id,
-        ));
-        // The assertions run in their own task so a panicking one still reaches
-        // the cleanup below: Tokio turns a task panic into a JoinError instead of
-        // unwinding through this frame, which is what makes teardown
-        // unconditional.
-        let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[account.account_id]).await;
-        outcome.expect("the todays_usage assertions panicked");
-    }
-
-    async fn todays_usage_assertions(pool: PgPool, account_id: Uuid, key_id: Uuid) {
-        let day = today();
-        insert_usage(&pool, account_id, key_id, day, 1_200, 8_000, 400, 812).await;
-
-        // Yesterday's row must not bleed into "today": the query binds the day
-        // (events.rs:340), it does not read the account's whole history.
-        insert_usage(
-            &pool,
-            account_id,
-            key_id,
-            day - chrono::Duration::days(1),
-            999_999,
-            999_999,
-            999_999,
-            999_999,
-        )
-        .await;
-
-        let usage = todays_usage(&pool, account_id)
-            .await
-            .expect("todays_usage must DECODE the summed token classes, not fail on NUMERIC");
-
-        assert_eq!(
-            usage.input_tokens, 1_200,
-            "input tokens are summed and decoded exactly"
-        );
-        assert_eq!(
-            usage.cache_read_tokens, 8_000,
-            "cache reads are their own class"
-        );
-        assert_eq!(
-            usage.output_tokens, 400,
-            "output tokens are their own class"
-        );
-        assert_eq!(usage.cost_idr, 812, "cost is summed alongside the tokens");
-
-        // docs/realtime.md:61 - the classes must never be folded together; they
-        // differ ~50x in price.
-        assert_ne!(
-            usage.input_tokens, 9_200,
-            "cache reads must not be added into input tokens"
-        );
-        assert_ne!(usage.cache_read_tokens, usage.input_tokens);
-        assert_ne!(usage.output_tokens, usage.input_tokens);
-
-        assert_eq!(
-            drift_rows(&pool, account_id).await,
-            0,
-            "the fixture must not manufacture ledger drift"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // 2. todays_usage - per-account scoping
-    // -----------------------------------------------------------------------
-
-    /// The WHERE clause at events.rs:340 is the only thing keeping one account's
-    /// usage out of another's dashboard. Two real accounts with DIFFERENT values
-    /// prove it, in both directions, and a third with no rows proves an absent
-    /// account reads zero rather than a neighbour's total.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
-    #[tokio::test]
-    async fn live_todays_usage_never_returns_another_accounts_numbers() {
-        let pool = live_pool().await;
-        let a = live_account(&pool).await;
-        let b = live_account(&pool).await;
-        let empty = live_account(&pool).await;
-
-        let outcome = tokio::spawn(todays_usage_isolation_assertions(
-            pool.clone(),
-            a.account_id,
-            a.key_id,
-            b.account_id,
-            b.key_id,
-            empty.account_id,
-        ));
-        let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[a.account_id, b.account_id, empty.account_id]).await;
-        outcome.expect("the todays_usage isolation assertions panicked");
-    }
-
-    async fn todays_usage_isolation_assertions(
-        pool: PgPool,
-        a_id: Uuid,
-        a_key: Uuid,
-        b_id: Uuid,
-        b_key: Uuid,
-        empty_id: Uuid,
-    ) {
-        let day = today();
-        insert_usage(&pool, a_id, a_key, day, 1_200, 8_000, 400, 812).await;
-        insert_usage(&pool, b_id, b_key, day, 77_000, 66_000, 55_000, 44_000).await;
-
-        let a = todays_usage(&pool, a_id).await.expect("account A usage");
-        let b = todays_usage(&pool, b_id).await.expect("account B usage");
-
-        assert_eq!(
-            (
-                a.input_tokens,
-                a.cache_read_tokens,
-                a.output_tokens,
-                a.cost_idr
-            ),
-            (1_200, 8_000, 400, 812),
-            "account A must read exactly its own row"
-        );
-        assert_eq!(
-            (
-                b.input_tokens,
-                b.cache_read_tokens,
-                b.output_tokens,
-                b.cost_idr
-            ),
-            (77_000, 66_000, 55_000, 44_000),
-            "account B must read exactly its own row"
-        );
-
-        // Neither account may be handed the other's numbers, in any class.
-        assert_ne!(a.input_tokens, b.input_tokens);
-        assert_ne!(a.cache_read_tokens, b.cache_read_tokens);
-        assert_ne!(a.output_tokens, b.output_tokens);
-        assert_ne!(a.cost_idr, b.cost_idr);
-
-        // No rows at all: zero, not the neighbour's total.
-        let none = todays_usage(&pool, empty_id)
-            .await
-            .expect("an account with no usage today reads zeros");
-        assert_eq!(
-            (
-                none.input_tokens,
-                none.cache_read_tokens,
-                none.output_tokens,
-                none.cost_idr
-            ),
-            (0, 0, 0, 0),
-            "an account with no usage_daily row must read zero, not another account's totals"
-        );
-
-        for account_id in [a_id, b_id, empty_id] {
-            assert_eq!(
-                drift_rows(&pool, account_id).await,
-                0,
-                "the fixture must not manufacture ledger drift"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // 3. sse_events_handler - the snapshot
-    // -----------------------------------------------------------------------
-
-    /// The snapshot path, end to end: cookie -> account -> `SELECT balance_idr
-    /// FROM wallets` (events.rs:412) -> `snapshot_events`. The balance frame must
-    /// carry the wallet's REAL value. A handler wired to a constant (or to 0)
-    /// would pass every in-memory test above and still show every customer an
-    /// empty wallet.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
-    #[tokio::test]
-    async fn live_sse_snapshot_carries_the_wallets_real_balance_and_todays_usage() {
-        let pool = live_pool().await;
-        let account = live_account(&pool).await;
-
-        let outcome = tokio::spawn(sse_snapshot_assertions(
-            pool.clone(),
-            account.account_id,
-            account.token.clone(),
-            account.key_id,
-        ));
-        let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[account.account_id]).await;
-        outcome.expect("the sse snapshot assertions panicked");
-    }
-
-    async fn sse_snapshot_assertions(pool: PgPool, account_id: Uuid, token: String, key_id: Uuid) {
-        let opening = 73_500;
-        fund_wallet(&pool, account_id, opening).await;
-        insert_usage(&pool, account_id, key_id, today(), 1_200, 8_000, 400, 812).await;
-
-        // The wallet really holds the money the snapshot is supposed to report.
-        let stored: i64 =
-            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
-                .fetch_one(&pool)
-                .await
-                .expect("read the wallet the snapshot reads");
-        assert_eq!(stored, opening, "the fixture funded the wallet");
-
-        let state = live_app_state(pool.clone());
-        let response = sse_events_handler(State(state), cookie_headers(&token))
-            .await
-            .expect("the live handler must serve a snapshot")
-            .into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = read_frames(response, 2).await;
-
-        let balance = frame_payload(&body, "balance");
-        assert_eq!(
-            balance["balance_idr"], opening,
-            "the snapshot must carry the wallet's REAL balance from the database, not a constant: {body:?}"
-        );
-        assert_ne!(
-            balance["balance_idr"], 0,
-            "a funded wallet must never be reported as empty: {body:?}"
-        );
-
-        let usage = frame_payload(&body, "usage");
-        assert_eq!(usage["input_tokens"], 1_200, "{body:?}");
-        assert_eq!(usage["cache_read_tokens"], 8_000, "{body:?}");
-        assert_eq!(usage["output_tokens"], 400, "{body:?}");
-        assert_eq!(usage["cost_idr"], 812, "{body:?}");
-
-        assert_eq!(
-            drift_rows(&pool, account_id).await,
-            0,
-            "the fixture must not manufacture ledger drift"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // 4. sse_events_handler - cross-account isolation
-    // -----------------------------------------------------------------------
-
-    /// Two signed-in accounts, two different real balances, two different usage
-    /// rows: each snapshot must carry its OWN account's numbers and never the
-    /// other's. This is the handler-level counterpart of the in-memory filter
-    /// test above.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
-    #[tokio::test]
-    async fn live_sse_snapshot_is_scoped_to_the_signed_in_account() {
-        let pool = live_pool().await;
-        let a = live_account(&pool).await;
-        let b = live_account(&pool).await;
-
-        let outcome = tokio::spawn(sse_scoping_assertions(
-            pool.clone(),
-            (a.account_id, a.token.clone(), a.key_id),
-            (b.account_id, b.token.clone(), b.key_id),
-        ));
-        let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[a.account_id, b.account_id]).await;
-        outcome.expect("the sse scoping assertions panicked");
-    }
-
-    async fn sse_scoping_assertions(
-        pool: PgPool,
-        a: (Uuid, String, Uuid),
-        b: (Uuid, String, Uuid),
-    ) {
-        let (a_id, a_token, a_key) = a;
-        let (b_id, b_token, b_key) = b;
-
-        // DIFFERENT money and DIFFERENT usage, so any leak is visible as a value
-        // mismatch rather than as a coincidence.
-        fund_wallet(&pool, a_id, 73_500).await;
-        fund_wallet(&pool, b_id, 12_345).await;
-        insert_usage(&pool, a_id, a_key, today(), 1_200, 8_000, 400, 812).await;
-        insert_usage(&pool, b_id, b_key, today(), 77_000, 66_000, 55_000, 44_000).await;
-
-        let body_a = read_frames(
-            sse_events_handler(
-                State(live_app_state(pool.clone())),
-                cookie_headers(&a_token),
+        let now = chrono::Utc::now();
+        for (token, expires_at) in [
+            ("expired-token", now - chrono::Duration::hours(2)),
+            ("live-token", now + chrono::Duration::hours(2)),
+        ] {
+            sqlx::query(
+                "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
+            .bind(hash_string(token))
+            .bind(expires_at)
+            .bind(now)
+            .bind(now)
+            .execute(&db.pool)
             .await
-            .expect("account A's snapshot")
-            .into_response(),
-            2,
-        )
-        .await;
-        let body_b = read_frames(
-            sse_events_handler(
-                State(live_app_state(pool.clone())),
-                cookie_headers(&b_token),
-            )
-            .await
-            .expect("account B's snapshot")
-            .into_response(),
-            2,
-        )
-        .await;
-
-        assert_eq!(frame_payload(&body_a, "balance")["balance_idr"], 73_500);
-        assert_eq!(frame_payload(&body_a, "usage")["input_tokens"], 1_200);
-        assert_eq!(frame_payload(&body_a, "usage")["cache_read_tokens"], 8_000);
-        assert_eq!(frame_payload(&body_a, "usage")["output_tokens"], 400);
-
-        assert_eq!(frame_payload(&body_b, "balance")["balance_idr"], 12_345);
-        assert_eq!(frame_payload(&body_b, "usage")["input_tokens"], 77_000);
-        assert_eq!(frame_payload(&body_b, "usage")["cache_read_tokens"], 66_000);
-        assert_eq!(frame_payload(&body_b, "usage")["output_tokens"], 55_000);
-
-        // Not one byte of the other account's money may reach the wire.
-        assert!(
-            !body_a.contains("12345"),
-            "account A's stream leaked account B's balance: {body_a:?}"
-        );
-        assert!(
-            !body_b.contains("73500"),
-            "account B's stream leaked account A's balance: {body_b:?}"
-        );
-
-        for account_id in [a_id, b_id] {
-            assert_eq!(
-                drift_rows(&pool, account_id).await,
-                0,
-                "the fixture must not manufacture ledger drift"
-            );
+            .expect("create the session");
         }
-    }
 
-    /// The RECONNECT path, which reads the hub's replay buffer instead of the
-    /// database: events published for two accounts, replayed to a client that
-    /// reconnects with a Last-Event-ID. Only the signed-in account's events may
-    /// escape (the filter at events.rs:422).
-    ///
-    /// The replayed usage values are deliberately DIFFERENT from the account's
-    /// usage_daily row, so the assertions also prove the Replay branch ran rather
-    /// than a fresh snapshot.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
-    #[tokio::test]
-    async fn live_sse_replay_never_forwards_another_accounts_events() {
-        let pool = live_pool().await;
-        let a = live_account(&pool).await;
-        let b = live_account(&pool).await;
-
-        let outcome = tokio::spawn(sse_replay_assertions(
-            pool.clone(),
-            (a.account_id, a.token.clone(), a.key_id),
-            (b.account_id, b.token.clone(), b.key_id),
-        ));
-        let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[a.account_id, b.account_id]).await;
-        outcome.expect("the sse replay assertions panicked");
-    }
-
-    async fn sse_replay_assertions(pool: PgPool, a: (Uuid, String, Uuid), b: (Uuid, String, Uuid)) {
-        let (a_id, a_token, a_key) = a;
-        let (b_id, _b_token, b_key) = b;
-
-        // What the database holds for A today - NOT what the replay will carry.
-        insert_usage(&pool, a_id, a_key, today(), 1_200, 8_000, 400, 812).await;
-        insert_usage(&pool, b_id, b_key, today(), 77_000, 66_000, 55_000, 44_000).await;
-
-        let state = live_app_state(pool.clone());
-        let hub = Arc::clone(&state.events);
-
-        // Interleaved activity for both accounts, published to the one
-        // process-wide hub the handler subscribes to.
-        publish_balance(&hub, a_id, 73_500);
-        publish_balance(&hub, b_id, 12_345);
-        publish_usage(&hub, a_id, test_usage(11, 22, 33, 44));
-        publish_usage(&hub, b_id, test_usage(55, 66, 77, 88));
-
-        // Last-Event-ID 0 is contiguous with the buffer, so this is a Replay.
-        let mut headers = cookie_headers(&a_token);
-        headers.insert("last-event-id", HeaderValue::from_static("0"));
-
-        let body = read_frames(
-            sse_events_handler(State(state), headers)
+        let mut expired_headers = HeaderMap::new();
+        expired_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=expired-token"),
+        );
+        assert!(
+            resolve_account_from_cookie(&db.pool, &expired_headers)
                 .await
-                .expect("account A's replay")
-                .into_response(),
-            2,
-        )
-        .await;
+                .is_err(),
+            "an expired session must not authenticate"
+        );
 
-        // Exactly A's two events - B's two must be filtered out.
+        let mut live_headers = HeaderMap::new();
+        live_headers.insert(header::COOKIE, HeaderValue::from_static("session=live-token"));
         assert_eq!(
-            frame_count(&body),
-            2,
-            "the replay forwarded another account's events: {body:?}"
+            resolve_account_from_cookie(&db.pool, &live_headers)
+                .await
+                .expect("a live session must authenticate"),
+            account_id,
+            "a live session must resolve to its own account"
         );
 
-        let balance = frame_payload(&body, "balance");
-        assert_eq!(
-            balance["balance_idr"], 73_500,
-            "A must receive its own balance: {body:?}"
-        );
-
-        let usage = frame_payload(&body, "usage");
-        assert_eq!(
-            usage["input_tokens"], 11,
-            "the replayed totals are the published ones, not a fresh snapshot: {body:?}"
-        );
-        assert_eq!(usage["cache_read_tokens"], 22);
-        assert_eq!(usage["output_tokens"], 33);
-
-        assert!(
-            !body.contains("12345"),
-            "A's replay leaked B's balance: {body:?}"
-        );
-        assert!(
-            !body.contains("\"input_tokens\":55"),
-            "A's replay leaked B's usage: {body:?}"
-        );
-
-        for account_id in [a_id, b_id] {
-            assert_eq!(
-                drift_rows(&pool, account_id).await,
-                0,
-                "the fixture must not manufacture ledger drift"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // 5. sse_events_handler - the LIVE broadcast branch, two streams at once
-    // -----------------------------------------------------------------------
-    //
-    // The snapshot tests (3, 4) and the replay test above never touch the branch a
-    // connected dashboard actually lives on: the live unfold at events.rs:386-407,
-    // where a process-wide broadcast is filtered per subscriber (events.rs:391).
-    // The replay test pins the filter at events.rs:422; its live twin was proven
-    // only in memory, by mirroring the filter by hand
-    // (a_subscriber_only_sees_its_own_account_events). This drives it end to end.
-    //
-    // HOW THE LIVE BRANCH IS REACHED - through the real socket, no fake:
-    // the handler subscribes to the hub at events.rs:386 BEFORE it reads the
-    // snapshot, and it owns the connection guard (events.rs:443). Awaiting the
-    // handler's response therefore proves the subscription is open and the guard
-    // is held, with no sleep-and-hope. Publishing then goes through the hub's real
-    // API (publish_balance, events.rs:306) and the frame is read off the real SSE
-    // body.
-    //
-    // WHY THE PUBLISH ORDER IS THE ASSERTION: RealtimeEvent::into_event
-    // (events.rs:110) puts only the id, the name and the JSON payload on the wire -
-    // account_id is deliberately NOT serialized, it exists solely to be filtered
-    // on. So isolation has to be proven by value. Both events are published before
-    // either stream is read, and the broadcast channel is FIFO per receiver, so on
-    // a stream that fails to filter, the OTHER account's frame is provably already
-    // in the buffer at the moment this account's own frame completes. That makes
-    // the leak deterministic rather than a race with a timeout.
-
-    /// One frame exactly as it came off the wire.
-    struct WireFrame {
-        event: String,
-        data: String,
-    }
-
-    /// The "event:"/"data:" lines of every complete frame in an SSE body.
-    ///
-    /// The "id:" line is deliberately not parsed: it carries the hub's global
-    /// monotonic id (events.rs:175), which is shared across accounts by design.
-    fn wire_frames(body: &str) -> Vec<WireFrame> {
-        body.split("\n\n")
-            .filter(|frame| !frame.trim().is_empty())
-            .map(|frame| {
-                let mut event = String::new();
-                let mut data = String::new();
-                for line in frame.lines() {
-                    if let Some(rest) = line.strip_prefix("event:") {
-                        event = rest.trim().to_string();
-                    } else if let Some(rest) = line.strip_prefix("data:") {
-                        data = rest.trim().to_string();
-                    }
-                }
-                WireFrame { event, data }
-            })
-            .collect()
-    }
-
-    /// The balance a frame carries, or None when it is not a balance frame (or is
-    /// still half-written). Never panics: this runs inside the read loop.
-    fn frame_balance(frame: &WireFrame) -> Option<i64> {
-        if frame.event != "balance" {
-            return None;
-        }
-        serde_json::from_str::<serde_json::Value>(&frame.data)
-            .ok()?
-            .get("balance_idr")?
-            .as_i64()
-    }
-
-    /// The balance values a stream carried on its LIVE half - everything after the
-    /// two snapshot frames. An empty vec means the live branch delivered nothing.
-    fn live_balances(body: &str) -> Vec<i64> {
-        wire_frames(body)
-            .into_iter()
-            .skip(2) // the snapshot is always one balance frame then one usage frame
-            .filter_map(|frame| frame_balance(&frame))
-            .collect()
-    }
-
-    /// Reads a live SSE body until it has seen a balance frame carrying
-    /// want_balance_idr, then returns everything read.
-    ///
-    /// Bounded by a deadline so a filter that drops the event FAILS the test
-    /// instead of hanging it. The stop condition is deliberately the account's own
-    /// value and not a frame count: an unfiltered stream delivers the other
-    /// account's frame FIRST, and a count-based read would stop there and never
-    /// notice the leak.
-    async fn read_until_balance(
-        response: axum::response::Response,
-        want_balance_idr: i64,
-    ) -> String {
-        let mut stream = Box::pin(response.into_body().into_data_stream());
-        let mut buffer = String::new();
-        let deadline = tokio::time::sleep(Duration::from_secs(10));
-        tokio::pin!(deadline);
-
-        loop {
-            if wire_frames(&buffer)
-                .iter()
-                .any(|frame| frame_balance(frame) == Some(want_balance_idr))
-            {
-                return buffer;
-            }
-
-            tokio::select! {
-                chunk = stream.next() => match chunk {
-                    Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
-                    Some(Err(err)) => panic!("the SSE body failed mid-stream: {err}"),
-                    None => return buffer,
-                },
-                _ = &mut deadline => return buffer,
-            }
-        }
-    }
-
-    /// THE DEFECT 1 REGRESSION, on the live branch: two accounts hold their
-    /// subscriptions OPEN AT THE SAME TIME, on two real SSE bodies, and balances are
-    /// published to A and then to B while both are live. A's stream must carry only
-    /// A's event and B's only B's - asserted on the values, frame by frame, not on
-    /// "it did not panic".
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
-    #[tokio::test]
-    async fn live_sse_two_open_streams_never_cross_accounts_on_the_live_broadcast() {
-        let pool = live_pool().await;
-        let a = live_account(&pool).await;
-        let b = live_account(&pool).await;
-
-        let outcome = tokio::spawn(live_broadcast_isolation_assertions(
-            pool.clone(),
-            (a.account_id, a.token.clone(), a.key_id),
-            (b.account_id, b.token.clone(), b.key_id),
-        ));
-        let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[a.account_id, b.account_id]).await;
-        outcome.expect("the live broadcast isolation assertions panicked");
-    }
-
-    async fn live_broadcast_isolation_assertions(
-        pool: PgPool,
-        a: (Uuid, String, Uuid),
-        b: (Uuid, String, Uuid),
-    ) {
-        let (a_id, a_token, a_key) = a;
-        let (b_id, b_token, b_key) = b;
-
-        // DIFFERENT money and DIFFERENT usage, so a leak is a value mismatch
-        // rather than a coincidence.
-        fund_wallet(&pool, a_id, 73_500).await;
-        fund_wallet(&pool, b_id, 12_345).await;
-        insert_usage(&pool, a_id, a_key, today(), 1_200, 8_000, 400, 812).await;
-        insert_usage(&pool, b_id, b_key, today(), 77_000, 66_000, 55_000, 44_000).await;
-
-        // ONE hub for both handlers, exactly as the process shares one AppState.
-        let state = live_app_state(pool.clone());
-        let hub = Arc::clone(&state.events);
-
-        // BOTH subscriptions are open before anything is published. Awaiting the
-        // handler is what proves it: it subscribes at events.rs:386 ahead of the
-        // snapshot read, and its response owns a connection guard (events.rs:443).
-        let stream_a = sse_events_handler(State(state.clone()), cookie_headers(&a_token))
-            .await
-            .expect("account A's live stream")
-            .into_response();
-        let stream_b = sse_events_handler(State(state.clone()), cookie_headers(&b_token))
-            .await
-            .expect("account B's live stream")
-            .into_response();
-
-        // Both live. A's balance, then B's - the order the brief asks for - then
-        // A's fence: because the fence is published LAST, it cannot arrive on A's
-        // stream until B's frame (published earlier) has already been delivered
-        // there. That is what turns the leak into a deterministic failure.
-        publish_balance(&hub, a_id, 111_111);
-        publish_balance(&hub, b_id, 222_222);
-        publish_balance(&hub, a_id, 333_333);
-
-        let body_a = read_until_balance(stream_a, 333_333).await;
-        let body_b = read_until_balance(stream_b, 222_222).await;
-
-        // A's snapshot still carries A's real row, read from the database.
-        assert_eq!(
-            frame_payload(&body_a, "balance")["balance_idr"],
-            73_500,
-            "A's opening frame is its own wallet: {body_a:?}"
-        );
-
-        // The live half, frame by frame. An unfiltered stream reads
-        // [111111, 222222, 333333] here - the other account's money, visible.
-        assert_eq!(
-            live_balances(&body_a),
-            vec![111_111, 333_333],
-            "account A's LIVE stream carried a frame that is not A's own balance: {body_a:?}"
-        );
-        assert_eq!(
-            live_balances(&body_b),
-            vec![222_222],
-            "account B's LIVE stream carried a frame that is not B's own balance: {body_b:?}"
-        );
-
-        // Not one byte of the other account's money on either live stream.
-        assert!(
-            !body_a.contains("222222"),
-            "A's live stream leaked B's balance: {body_a:?}"
-        );
-        assert!(
-            !body_b.contains("111111") && !body_b.contains("333333"),
-            "B's live stream leaked A's balance: {body_b:?}"
-        );
-        assert!(
-            !body_a.contains("77000") && !body_b.contains("1200"),
-            "a snapshot frame crossed accounts: A={body_a:?} B={body_b:?}"
-        );
-
-        for account_id in [a_id, b_id] {
-            assert_eq!(
-                drift_rows(&pool, account_id).await,
-                0,
-                "the fixture must not manufacture ledger drift"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // 6. sse_events_handler - the connection cap is per account
-    // -----------------------------------------------------------------------
-
-    /// The cap at events.rs:261-265 is keyed by account (events.rs:259). Exhaust
-    /// account A's slots through the real handler - each held response owns one
-    /// guard (events.rs:443) - and account B must still be admitted: a runaway
-    /// client on one account must never deny another account its dashboard. Then
-    /// dropping A's streams must hand A its slots back.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
-    #[tokio::test]
-    async fn live_sse_connection_cap_is_per_account_not_process_wide() {
-        let pool = live_pool().await;
-        let a = live_account(&pool).await;
-        let b = live_account(&pool).await;
-
-        let outcome = tokio::spawn(connection_cap_is_per_account_assertions(
-            pool.clone(),
-            (a.account_id, a.token.clone(), a.key_id),
-            (b.account_id, b.token.clone(), b.key_id),
-        ));
-        let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[a.account_id, b.account_id]).await;
-        outcome.expect("the connection cap assertions panicked");
-    }
-
-    async fn connection_cap_is_per_account_assertions(
-        pool: PgPool,
-        a: (Uuid, String, Uuid),
-        b: (Uuid, String, Uuid),
-    ) {
-        let (a_id, a_token, _a_key) = a;
-        let (b_id, b_token, _b_key) = b;
-
-        fund_wallet(&pool, a_id, 73_500).await;
-        fund_wallet(&pool, b_id, 12_345).await;
-
-        let state = live_app_state(pool.clone());
-        let cap = state.config.realtime.max_connections_per_account;
-        assert!(cap >= 1, "a cap of {cap} would refuse every stream");
-
-        // A takes every slot it is entitled to, and HOLDS them: the guards live
-        // inside the response streams, so these must stay in scope.
-        let mut held = Vec::new();
-        for index in 0..cap {
-            held.push(
-                sse_events_handler(State(state.clone()), cookie_headers(&a_token))
-                    .await
-                    .unwrap_or_else(|_| panic!("A's stream {index} must be admitted")),
-            );
-        }
-
-        // One more for A is refused, and refused for the documented reason.
-        let refused = sse_events_handler(State(state.clone()), cookie_headers(&a_token)).await;
-        assert!(
-            matches!(refused, Err(AppError::RateLimited { .. })),
-            "A's {}th stream must be refused with RateLimited, not admitted",
-            cap + 1
-        );
-
-        // B's budget is untouched by A's exhaustion.
-        let b_response = sse_events_handler(State(state.clone()), cookie_headers(&b_token))
-            .await
-            .expect("B must not be refused because A exhausted A's own slots")
-            .into_response();
-        assert_eq!(b_response.status(), StatusCode::OK);
-
-        // B's stream genuinely works, not merely "did not error": its own balance
-        // arrives on its own socket.
-        let body_b = read_frames(b_response, 2).await;
-        assert_eq!(
-            frame_payload(&body_b, "balance")["balance_idr"],
-            12_345,
-            "the account admitted while A was capped must get its own wallet: {body_b:?}"
-        );
-
-        // Releasing A's streams frees A's slots.
-        drop(held);
-        let readmitted = sse_events_handler(State(state.clone()), cookie_headers(&a_token)).await;
-        assert!(
-            readmitted.is_ok(),
-            "dropping A's streams must return A's slots to A"
-        );
-
-        for account_id in [a_id, b_id] {
-            assert_eq!(
-                drift_rows(&pool, account_id).await,
-                0,
-                "the fixture must not manufacture ledger drift"
-            );
-        }
+        db.close().await;
     }
 }

@@ -12,8 +12,15 @@ PocketBase or Pages Functions, this document wins.
 | **Website** | Cloudflare Pages | _frontend, TBD_ | Marketing, signup, dashboard |
 | **Edge relay** | Cheap Linux VPS (2 vCPU / 4 GB) | nginx + Docker | TLS, filtering, flood absorption |
 | **API + proxy** | Northflank | **Rust** | Wallet, keys, LLM proxy, limits, webhooks |
-| **Database** | Northflank | **PostgreSQL** | All persistent state except identity |
+| **Database** | Northflank, inside the API process | **SQLite** | All persistent state except identity |
 | **Auth** | Northflank | **PocketBase** | Google + password, verify, reset. Auth ONLY. |
+
+There is no database server to run, reach or secure. SQLite is a library: the API
+opens one file on its own persistent volume. That removes a container and a network
+hop, and it makes the single-writer property an architectural fact rather than a
+tuning detail — every write in the process serialises behind one writer, which is
+ample for this workload and is the reason `max_connections` buys read concurrency,
+not write throughput.
 
 Deployment: **pushing to `main` deploys both** Cloudflare Pages and Northflank.
 
@@ -27,7 +34,7 @@ Deployment: **pushing to `main` deploys both** Cloudflare Pages and Northflank.
           |                                |
           v                                v
    VPS Relay  (primary)          Northflank  (fallback origin)
-   nginx + Docker                Rust API + proxy + Postgres + PocketBase
+   nginx + Docker                Rust API + proxy + SQLite + PocketBase
           |                                ^
           +--------------------------------+
              normal path: relay -> Northflank
@@ -73,11 +80,12 @@ Both targets deploy on **`main`**.
 
 ### Northflank
 
-- Builds the Rust server and the Postgres database as one stack.
+- Builds the Rust server. There is no database service to build alongside it.
 - **Runtime env vars** carry the real secrets (provider keys, Midtrans server
   key, database URL).
-- Postgres needs a **persistent volume** and **backups** — the wallet ledger
-  lives there.
+- The database **file** needs a **persistent volume** and **backups** — the wallet
+  ledger lives there. A volume with no backup is a single point of failure for
+  every customer's balance; see [`backup-and-restore.md`](backup-and-restore.md).
 
 ### The deployment coupling to plan for
 
@@ -99,7 +107,7 @@ assumes an endpoint exists without handling its absence.
 
 ## Authentication — PocketBase for auth ONLY
 
-**Decision:** PocketBase handles authentication. Postgres holds everything else.
+**Decision:** PocketBase handles authentication. SQLite holds everything else.
 
 This is a deliberate tradeoff: PocketBase already solves password hashing, email
 verification, password reset, Google OAuth2, OTP, and MFA. Rebuilding those in
@@ -111,7 +119,7 @@ system buys that back.
 | Concern | Owner |
 | --- | --- |
 | Accounts, passwords, Google login, verification, reset | **PocketBase** |
-| Wallet, keys, limits, top-ups, usage, ledger | **Postgres** |
+| Wallet, keys, limits, top-ups, usage, ledger | **SQLite** |
 | Authorization (who may spend what) | **Rust** |
 
 ### What PocketBase must NOT hold
@@ -125,13 +133,15 @@ diverge, and reconciling them becomes a manual job on every incident.
 
 ### The account key — the decision that matters
 
-Postgres and PocketBase must agree on what an account *is*.
+SQLite and PocketBase must agree on what an account *is*.
 
-**Chosen: Postgres owns the account ID; PocketBase's user id is a linked column.**
+**Chosen: SQLite owns the account ID; PocketBase's user id is a linked column.**
+Phase 6 drops the link — `accounts.id` becomes the only key, and the identity
+tables below it become the source.
 
 ```sql
--- Schema: docs/website/02-data-model.md (single source of truth)
--- accounts: id (UUID PK), pb_user_id (UNIQUE -> PocketBase), status,
+-- Schema: server/migrations/20260925000000_initial_schema.sql (source of truth)
+-- accounts: id (TEXT PK), pb_user_id (UNIQUE -> PocketBase), status,
 --           is_operator, created_at, updated_at
 ```
 
@@ -164,16 +174,23 @@ request.
 used as the API credential. That keeps PocketBase off the hot path and means the
 rest of the system never has to speak PocketBase's token format.
 
-### Sessions (in Postgres)
+### Sessions (in SQLite)
 
 ```sql
--- sessions: id (UUID PK), account_id -> accounts, token_hash (UNIQUE),
---           expires_at, revoked_at, user_agent, ip_hash, created_at
+-- sessions: id (TEXT PK), account_id -> accounts, token_hash (UNIQUE),
+--           expires_at, last_seen_at, revoked_at, user_agent, ip_hash, created_at
 ```
 
 - Cookie is **HttpOnly, Secure, SameSite=Lax** — opaque random value, hash stored.
-- **Logout revokes the row** (`revoked_at = now()`) → immediate revocation on every surface, preserving the audit trail.
-- Sign out everywhere = revokes all active session rows for the account (`revoked_at = now()`). Expired rows are swept periodically.
+- **Logout revokes the row** (sets `revoked_at`) → immediate revocation on every surface, preserving the audit trail.
+- Sign out everywhere = revokes all active session rows for the account. Expired rows are swept periodically.
+- **Every timestamp is written from Rust, never by SQL.** SQLite's own
+  `CURRENT_TIMESTAMP` and `datetime('now')` emit a space-separated form that does
+  not compare correctly against the RFC3339 values the code binds, and under the old
+  SQL-side `now()` an expired session read as still valid. The columns carry a
+  `GLOB '????-??-??T??:??:??*+00:00'` CHECK so the wrong format cannot be stored at
+  all; see
+  [§4.6 of the migration plan](plans/sqlite-migration.md#46-timestamps--the-hazard-that-would-have-shipped).
 - This is better than trusting a third-party token lifetime, and it costs one table.
 
 ### Password reset and email verification
@@ -187,9 +204,9 @@ PocketBase's templates and custom redirect URLs.
 | Risk | Mitigation |
 | --- | --- |
 | Two systems to run and back up | PocketBase is small; treat it as infrastructure, not app data |
-| Identity and money could drift | Postgres is authoritative; reconcile `accounts.pb_user_id` against PocketBase on a schedule and alert on orphans |
+| Identity and money could drift | SQLite is authoritative; reconcile `accounts.pb_user_id` against PocketBase on a schedule and alert on orphans |
 | A deleted PocketBase user leaves a funded wallet | **Never hard-delete PocketBase users.** Deactivate them. The wallet outlives the login. |
-| Auth outage blocks all logins | Existing sessions keep working — they live in Postgres |
+| Auth outage blocks all logins | Existing sessions keep working — they live in SQLite |
 | Two deploy targets for the backend | PocketBase changes rarely; it is not on the `main` deploy path for app code |
 
 **The "deleted user leaves a funded wallet" row is the one to remember.** It is the
@@ -198,8 +215,16 @@ database, and nothing cascades across the boundary.
 
 ## Database
 
-PostgreSQL. Schema outline; the full field list is in
-[website/02-data-model.md](website/02-data-model.md), which was **rewritten for Postgres** — PocketBase API rules are gone.
+SQLite, every table `STRICT`. Schema outline; the full field list is in
+[website/02-data-model.md](website/02-data-model.md) and the authoritative
+definition is
+[`server/migrations/20260925000000_initial_schema.sql`](../server/migrations/20260925000000_initial_schema.sql).
+
+> **Where the port stands:** the tree is SQLite end to end, and PocketBase is still
+> the identity provider — it becomes Rust in Phase 6. The register's marker in
+> [`decisions.md`](decisions.md) and the plan in
+> [`plans/sqlite-migration.md`](plans/sqlite-migration.md) are the current boundary;
+> prefer them where this document has not yet caught up.
 
 | Table | Purpose |
 | --- | --- |
@@ -212,14 +237,16 @@ PostgreSQL. Schema outline; the full field list is in
 | `link_codes` | Telegram binding, short TTL |
 | `ledger` | Append-only wallet movements (audit) |
 
-**Not in Postgres:** passwords, email verification, Google login — those live in
+**Not in SQLite:** passwords, email verification, Google login — those live in
 PocketBase. There is no `credentials` table and no `identities` table; PocketBase
 *is* the identity store. See
 [Authentication](#authentication--pocketbase-for-auth-only).
 
 ### Rules
 
-- **Money is integers.** `balance_idr` is `BIGINT`, never floating point.
+- **Money is integers.** `balance_idr` is `INTEGER` in a `STRICT` table, never
+  floating point. `STRICT` is what makes that enforced rather than declared — it
+  requires SQLite 3.37 or newer.
 - **Wallet mutations are transactional.** Credit + top-up status + ledger row in
   one transaction.
 - **Never trust a client-supplied amount.** Credits come from the verified
@@ -231,7 +258,7 @@ PocketBase. There is no `credentials` table and no `identities` table; PocketBas
 ## Live updates (no page refresh)
 
 PocketBase offers realtime, but it is scoped to its own collections — and the
-data we care about (wallet, usage) lives in **Postgres**, which PocketBase cannot
+data we care about (wallet, usage) lives in **SQLite**, which PocketBase cannot
 stream. So realtime is ours regardless of the auth decision.
 
 **Use Server-Sent Events (SSE)** from the Rust server:
@@ -286,14 +313,14 @@ Honest accounting of the PocketBase-for-auth hybrid:
 | Gained | Taken on |
 | --- | --- |
 | Password hashing, verify, reset, OAuth2, OTP, MFA — all free | A **second system** to run, back up, and monitor |
-| Auth proven, not hand-rolled | Identity lives outside Postgres; the two can drift |
-| Postgres: transactions, constraints, real reporting | One **extra lookup on login** to resolve `pb_user_id` |
+| Auth proven, not hand-rolled | Identity lives outside SQLite; the two can drift |
+| SQLite: transactions, constraints, real reporting | One **extra lookup on login** to resolve `pb_user_id` |
 | Server-side sessions: logout revokes immediately | Authorization logic in Rust (was PocketBase API rules) |
 | PocketBase is not on the request hot path | Hard-deleting a PB user would orphan a funded wallet |
 
-**The rule that keeps this sound: PocketBase owns identity, Postgres owns money.**
+**The rule that keeps this sound: PocketBase owns identity, SQLite owns money.**
 Cross the boundary in one direction only — Rust reads identity from PocketBase and
-writes money to Postgres. Nothing in Postgres should ever be authoritative about
+writes money to SQLite. Nothing in SQLite should ever be authoritative about
 who a user is.
 
 ## What this invalidates
@@ -302,8 +329,8 @@ Documents that must be revised:
 
 | Document | Status |
 | --- | --- |
-| [website/02-data-model.md](website/02-data-model.md) | **Rewrite for Postgres.** Money tables move to Postgres; identity stays in PocketBase. PocketBase *API rules* are replaced by Rust authorization. |
-| [website/05-security-decisions.md](website/05-security-decisions.md) | **Update.** D1 (wallet immutability) still applies — enforced by Rust, not API rules. D2 (token revocation) is superseded by Postgres sessions. D3 (verification) still holds — it is now PocketBase's `verified` field being protected. |
+| [website/02-data-model.md](website/02-data-model.md) | **Rewrite for SQLite.** Money tables are SQLite; identity stays in PocketBase until Phase 6. PocketBase *API rules* are replaced by Rust authorization. |
+| [website/05-security-decisions.md](website/05-security-decisions.md) | **Update.** D1 (wallet immutability) still applies — enforced by Rust, not API rules. D2 (token revocation) is superseded by SQLite sessions. D3 (verification) still holds — it is now PocketBase's `verified` field being protected. |
 | [website/01-architecture.md](website/01-architecture.md) | **Superseded** on stack; frontend internals still valid. |
 | [website/03-functional-spec.md](website/03-functional-spec.md) | Mostly valid — it specifies behaviour, not storage. |
 | [website/04-payments.md](website/04-payments.md) | Valid: the Midtrans flow is storage-agnostic. |

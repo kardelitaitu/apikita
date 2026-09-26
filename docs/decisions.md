@@ -155,18 +155,38 @@ open. Do not re-open a settled decision in a document — change it here instead
 | RPO | **15 minutes** | The ledger is the business |
 | RTO | **4 hours** | Achievable by restoring to a new host |
 
-### Migration in flight — decided, not yet in the code
+### Migration in flight — the direction is chosen, and the tree has partly moved
 
 The entries this changes — Money store, SQL driver, Identity store, Account key,
-Money type, Backup tooling, and the Operations additions — are **decided**. The code
-has not moved yet. Until Phase 5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md)
-lands, `server/` still builds against Postgres and still calls PocketBase for
-`auth-refresh`.
+Money type, Backup tooling, and the Operations additions — are **decided**.
 
-This marker exists so the register does not lie in the other direction. Here,
+As of Phases 0–5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
+
+- **`server/` no longer builds against Postgres.** The dependency, the config, the
+  compose file, the schema, the migration binary and every SQL statement in `src/`
+  are SQLite. `cargo check --all-targets` is clean.
+- **`server/` still calls PocketBase** for `auth-refresh`, and `accounts.pb_user_id`
+  is still present and `NOT NULL`. Identity is Phase 6, and the column survives
+  deliberately: `auth.rs` creates accounts through it, so dropping it earlier would
+  break login while claiming the intermediate phases shipped intact.
+- **The test suite runs, and it runs by default.** Phase 5 gave every database test
+  its own migrated SQLite file in a temp directory, so no test needs
+  `DATABASE_URL` and not one `#[ignore]` remains: measured
+  **134 passed / 0 failed / 0 ignored**. The money tests — including the real
+  concurrency proof of the overdraw fix,
+  `concurrent_requests_cannot_overdraw_a_one_request_balance` — had been
+  `#[ignore = "requires live Postgres"]` and were therefore never executed
+  automatically. They now are.
+- **`sessions.last_seen_at` is seeded but the 7-day idle bound is not enforced.**
+  The column exists so the register's *"30 days absolute, 7 days idle"* becomes
+  representable; enforcing the idle half needs a write on the request path, which is
+  a design decision rather than a port.
+
+This marker exists so the register does not lie in either direction. Here,
 **settled means the direction is chosen, not that the tree matches it** — the register
 is read by agents working in parallel with the port, and a value flipped ahead of the
-code is the same failure as a value left behind it.
+code is the same failure as a value left behind it. The list above is the current
+boundary between the two.
 
 ## Genuinely open
 

@@ -1,10 +1,10 @@
 # CI: the checks between a commit and a deploy.
 #
 # These are exactly the pull-request stages docs/ci-cd.md lists — format check,
-# lint, build, unit tests, integration tests on a real Postgres, schema check,
-# secret scan, plus the website toolchain. There is deliberately no deploy job:
-# the on-merge sequence (snapshot -> migrate -> deploy server -> health check ->
-# deploy frontend) belongs to docs/deployment.md and needs provider secrets this
+# lint, build, unit tests, the database suite and schema check, secret scan, plus
+# the website toolchain. There is deliberately no deploy job: the on-merge
+# sequence (snapshot -> migrate -> deploy server -> health check -> deploy
+# frontend) belongs to docs/deployment.md and needs provider secrets this
 # repository does not hold.
 name: CI
 
@@ -19,26 +19,9 @@ jobs:
   checks:
     runs-on: ubuntu-latest
 
-    services:
-      # docs/ci-cd.md: a real Postgres, same major version as production (16),
-      # never SQLite — `FOR UPDATE` locking and partial unique indexes are what
-      # the idempotency tests actually exercise.
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: dev
-          POSTGRES_DB: apikita
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      DATABASE_URL: postgres://postgres:dev@localhost:5432/apikita
+    # No service container and no DATABASE_URL: SQLite is bundled, so the database
+    # is a file. Nothing here needs a second process, and the test suite needs no
+    # environment at all — see the integration step below.
 
     steps:
       - uses: actions/checkout@v4
@@ -70,25 +53,37 @@ jobs:
         run: cargo test
 
       # Schema check: every migration must apply, in order, to an empty database.
+      # `bin/migrate` is the mechanism the register names (`sqlx migrate`,
+      # forward-only, never on application boot): it creates the file, applies the
+      # whole `./migrations` set through `sqlx::migrate!("./migrations")`, and
+      # exits non-zero unless `journal_mode` is `wal` and `foreign_keys` is on.
+      # The database is deleted first so "empty" is literal, not assumed.
       - name: Apply migrations to an empty database
+        working-directory: server
+        env:
+          DATABASE_URL: sqlite://ci-schema-check.db
         run: |
-          for migration in server/migrations/*.sql; do
-            echo "applying $migration"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
-          done
+          rm -f ci-schema-check.db ci-schema-check.db-wal ci-schema-check.db-shm
+          cargo run --bin migrate
 
-      # The database now holds the migrated schema. 73 of the 75 #[ignore]d tests
-      # need only DATABASE_URL; the other two also need a *configured* PocketBase
-      # (collections, not just a running container), which this workflow does not
-      # provide. They are named here and skipped explicitly, so they are excluded
-      # rather than silently dropped:
+      # There is no second, `#[ignore]`d database tier any more. The database is a
+      # file, so `server/src/test_support.rs` gives every database test its own
+      # migrated temp database and the money suite runs in the plain `cargo test`
+      # above — with no service container and no DATABASE_URL. Measured on
+      # `sqlite-port`: 134 passed / 0 failed / 0 ignored, without the old flag.
+      #
+      # This step runs the library suite explicitly — the invocation the port's own
+      # plan names — with the only two tests CI still cannot run named and skipped.
+      # They need a *configured* PocketBase (collections, not just a running
+      # container), which this workflow does not provide. Naming them keeps the
+      # exclusion explicit rather than leaving it to a bare `#[ignore]`:
       #   - a_new_login_after_suspend_is_still_refused
       #   - live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
-      - name: Integration tests (real Postgres)
+      - name: Integration tests (bundled SQLite)
         working-directory: server
         run: >-
-          cargo test -- --ignored
-          --skip a_new_login_after_suspend_is_still_refused
+          cargo test --lib
+          -- --skip a_new_login_after_suspend_is_still_refused
           --skip live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
 
       - name: Install website dependencies

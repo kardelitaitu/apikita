@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -60,7 +60,7 @@ pub fn session_token_from_cookie_header(cookie_header: &str) -> Option<&str> {
 /// token, or an unreadable row - is `AppError::Unauthenticated`: a caller
 /// cannot tell "no session" from "dead session", and neither can an attacker.
 pub async fn resolve_account_from_cookie(
-    pool: &PgPool,
+    pool: &SqlitePool,
     headers: &HeaderMap,
 ) -> Result<Uuid, AppError> {
     let cookie_hdr = headers
@@ -70,15 +70,23 @@ pub async fn resolve_account_from_cookie(
 
     let token = session_token_from_cookie_header(cookie_hdr).ok_or(AppError::Unauthenticated)?;
 
+    // Two dialect changes from the Postgres original, both required and neither
+    // cosmetic. The placeholder is `?` (sqlx-sqlite), and the expiry bound is
+    // BOUND FROM RUST rather than compared against SQL `now()`: SQLite's `now()`
+    // emits the space-separated format, and `'T'` sorts after a space, so
+    // `...T07:00:00+00:00` compares greater than the current time indefinitely and
+    // an expired session would never expire - a silent failure in the direction
+    // that keeps access. The same hazard is recorded in db.rs and ip_tracking.rs.
     let session = sqlx::query(
-        "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+        "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
     )
     .bind(hash_token(token))
+    .bind(chrono::Utc::now())
     .fetch_optional(pool)
     .await?;
 
     match session {
-        Some(s) => Ok(s.try_get("account_id")?),
+        Some(s) => Ok(s.try_get::<uuid::fmt::Hyphenated, _>("account_id")?.into_uuid()),
         None => Err(AppError::Unauthenticated),
     }
 }
@@ -338,6 +346,7 @@ pub mod test_env {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{self, TestDb};
 
     /// The whole contract of the one session-cookie parser. Every endpoint that
     /// accepts a session credential goes through it, so these cases are the
@@ -443,42 +452,52 @@ mod tests {
         }
     }
 
-    /// A fixture account whose session row is known to this test, deleted in FK
-    /// order afterwards.
+    /// A fixture account, with one session row this test chose the state of, in
+    /// its OWN migrated SQLite database.
+    ///
+    /// Ported from the Postgres original, which read `DATABASE_URL`, inserted an
+    /// account and a session, and then deleted the account in a fire-and-forget
+    /// task so its `ON DELETE CASCADE` cleaned the session up even when the
+    /// assertions panicked. SQLite makes all of that unnecessary: the database is
+    /// a file, so `TestDb` builds one per fixture and `close()` removes it - there
+    /// is no shared state to delete rows out of and therefore no teardown that has
+    /// to be panic-safe. What the original `Drop` was protecting is preserved by
+    /// `close()` being awaited rather than trusted to drop order.
+    ///
+    /// The INSERT carries every NOT NULL column: the SQLite schema has no DEFAULT
+    /// for `id`, `created_at` or `last_seen_at` (plan section 4.1, correction 1),
+    /// so the Postgres `INSERT INTO sessions (account_id, ...)` shape would fail at
+    /// runtime with a NOT NULL constraint error.
     struct SessionFixture {
-        pool: PgPool,
+        db: TestDb,
         account_id: Uuid,
         token: String,
     }
 
     impl SessionFixture {
         async fn new(
-            pool: &PgPool,
             token: &str,
             revoked: bool,
             expires_at: chrono::DateTime<chrono::Utc>,
         ) -> Self {
-            let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-            let account_id: Uuid =
-                sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-                    .bind(&pb_user_id)
-                    .fetch_one(pool)
-                    .await
-                    .expect("create account");
+            let db = TestDb::new().await;
+            let account_id = test_support::account(&db.pool).await;
+            let now = chrono::Utc::now();
 
-            sqlx::query(
-                "INSERT INTO sessions (account_id, token_hash, expires_at, revoked_at) VALUES ($1, $2, $3, $4)",
-            )
-            .bind(account_id)
-            .bind(hash_token(token))
-            .bind(expires_at)
-            .bind(revoked.then(chrono::Utc::now))
-            .execute(pool)
-            .await
-            .expect("create session");
+            sqlx::query(SESSION_INSERT)
+                .bind(Uuid::new_v4().hyphenated())
+                .bind(account_id.hyphenated())
+                .bind(hash_token(token))
+                .bind(expires_at)
+                .bind(now)
+                .bind(revoked.then(chrono::Utc::now))
+                .bind(now)
+                .execute(&db.pool)
+                .await
+                .expect("create session");
 
             Self {
-                pool: pool.clone(),
+                db,
                 account_id,
                 token: token.to_string(),
             }
@@ -492,45 +511,27 @@ mod tests {
             );
             headers
         }
-    }
 
-    impl Drop for SessionFixture {
-        fn drop(&mut self) {
-            // Deleting the account cascades to its sessions (schema: ON DELETE
-            // CASCADE), so the fixture leaves nothing behind even if the
-            // assertions panicked.
-            let pool = self.pool.clone();
-            let account_id = self.account_id;
-            tokio::spawn(async move {
-                let _ = sqlx::query("DELETE FROM accounts WHERE id = $1")
-                    .bind(account_id)
-                    .execute(&pool)
-                    .await;
-            });
+        async fn close(self) {
+            self.db.close().await;
         }
     }
 
-    async fn live_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        crate::db::init_pool(&database_url)
-            .await
-            .expect("connect to Postgres")
-    }
+    /// Every NOT NULL sessions column, so the fixture cannot silently depend on a
+    /// column default the strict schema does not have.
+    const SESSION_INSERT: &str = "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
 
     /// The lookup half: a live token resolves to its account, and every other
     /// shape is unauthenticated - never a different account.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_session_lookup_resolves_the_account_or_refuses() {
-        let pool = live_pool().await;
         let live = SessionFixture::new(
-            &pool,
             &format!("apk_sess_{}", Uuid::new_v4().simple()),
             false,
             chrono::Utc::now() + chrono::Duration::days(30),
         )
         .await;
+        let pool = live.db.pool.clone();
 
         // A valid session resolves to its own account.
         assert_eq!(
@@ -566,36 +567,35 @@ mod tests {
                 .unwrap(),
         );
         assert!(resolve_account_from_cookie(&pool, &unknown).await.is_err());
+
+        live.close().await;
     }
 
     /// A revoked or expired session is refused even though the row exists: this
     /// is what logout relies on.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_revoked_and_expired_sessions_are_refused() {
-        let pool = live_pool().await;
-
         let revoked = SessionFixture::new(
-            &pool,
             &format!("apk_sess_{}", Uuid::new_v4().simple()),
             true,
             chrono::Utc::now() + chrono::Duration::days(30),
         )
         .await;
-        assert!(resolve_account_from_cookie(&pool, &revoked.cookie_header())
+        assert!(resolve_account_from_cookie(&revoked.db.pool, &revoked.cookie_header())
             .await
             .is_err());
+        revoked.close().await;
 
         let expired = SessionFixture::new(
-            &pool,
             &format!("apk_sess_{}", Uuid::new_v4().simple()),
             false,
             chrono::Utc::now() - chrono::Duration::days(1),
         )
         .await;
-        assert!(resolve_account_from_cookie(&pool, &expired.cookie_header())
+        assert!(resolve_account_from_cookie(&expired.db.pool, &expired.cookie_header())
             .await
             .is_err());
+        expired.close().await;
     }
 
     use std::sync::Arc;
@@ -627,21 +627,35 @@ mod tests {
     // The negative controls are what give the positive half meaning: without them
     // the positive half would also pass on a router that mounted nothing.
 
-    /// A pool that never dials. `connect_lazy` opens no connection and issues no
+    /// A pool that never dials. A lazy pool opens no connection and issues no
     /// query until a handler asks for one, and every request below stops at the
-    /// router or at the first credential check - so none of these tests needs
-    /// DATABASE_URL and all of them run in the default (non-ignored) suite. That
-    /// is the point: a route-table regression is caught without a database.
-    fn lazy_pool() -> PgPool {
-        sqlx::postgres::PgPoolOptions::new()
+    /// router or at the first credential check - so none of these tests needs a
+    /// database and all of them run in the default (non-ignored) suite. That is
+    /// the point: a route-table regression is caught without a database.
+    ///
+    /// Ported from the Postgres original, whose lazy DSN pointed at a closed TCP
+    /// port. There is no host to be unreachable under SQLite, so the equivalent is
+    /// a filename that does not exist: `init_pool` deliberately does not set
+    /// `create_if_missing`, so the first query fails with `unable to open database
+    /// file` - the same "the database is not there" answer, for the same reason.
+    /// The file is under the system temp directory and is never created.
+    fn lazy_pool() -> SqlitePool {
+        let absent = std::env::temp_dir().join(format!(
+            "apikita_route_table_absent_{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(absent)
+            .busy_timeout(std::time::Duration::from_millis(500));
+
+        sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             // The default acquire timeout is 30s, which would make the one test
             // that lets the health handler dial (to prove it used THIS state's
-            // pool) take half a minute. The port is closed, so the connection is
-            // refused almost immediately; this only bounds the pathological case.
+            // pool) take half a minute. The file is absent, so the attempt fails
+            // immediately; this only bounds the pathological case.
             .acquire_timeout(std::time::Duration::from_millis(500))
-            .connect_lazy("postgres://apikita_route_table:unused@127.0.0.1:1/apikita_absent")
-            .expect("the route-table DSN is a valid postgres url")
+            .connect_lazy_with(options)
     }
 
     /// The real application state, built the way main.rs builds it.

@@ -7,6 +7,7 @@ use serde_json::json;
 use std::env;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::db::{
     credit_topup_transaction, refund_topup_transaction, RefundResult, TopupCreditResult,
@@ -45,13 +46,15 @@ fn is_usable_server_key(key: &str) -> bool {
 /// per-account subscriber filter in events.rs (DEFECT 1) silently drops it.
 /// This cannot fail the webhook: the money is already settled, and a missing
 /// account_id only means the dashboard waits for its next snapshot.
-async fn topup_account_id(pool: &sqlx::PgPool, order_id: &str) -> Option<Uuid> {
-    sqlx::query_scalar::<_, Uuid>("SELECT account_id FROM topups WHERE order_id = $1")
+async fn topup_account_id(pool: &sqlx::SqlitePool, order_id: &str) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Hyphenated>("SELECT account_id FROM topups WHERE order_id = ?")
         .bind(order_id)
         .fetch_optional(pool)
         .await
         .ok()
         .flatten()
+        // `Hyphenated` is how a TEXT uuid column comes back; the callers want a Uuid.
+        .map(|h| h.into_uuid())
 }
 
 /// The balance to announce for a topup credit outcome, or None when nothing
@@ -82,7 +85,7 @@ pub async fn handle_midtrans_webhook(
     Json(payload): Json<MidtransNotification>,
 ) -> impl IntoResponse {
     // The handler works on the pool throughout; only the realtime publish needs
-    // the hub, which is why the extractor is AppState rather than PgPool.
+    // the hub, which is why the extractor is AppState rather than SqlitePool.
     let pool = &state.pool;
     let server_key = match env::var("MIDTRANS_SERVER_KEY") {
         Ok(k) if is_usable_server_key(&k) => k,
@@ -193,6 +196,29 @@ pub async fn handle_midtrans_webhook(
                     (
                         StatusCode::BAD_REQUEST,
                         Json(json!({"error": "amount mismatch"})),
+                    )
+                }
+                Ok(TopupCreditResult::NotSettleable { status }) => {
+                    // A settlement webhook arrived for a row that is not
+                    // `pending` - the order was denied, expired, or refunded and
+                    // then settled again. NO money moved: the guard in
+                    // `credit_topup_transaction` refused the transition, which is
+                    // what stops a replayed settlement webhook from re-crediting a
+                    // refunded order.
+                    //
+                    // Logged at error level because the delivery is contradictory
+                    // and worth seeing, but answered 200: a non-2xx would make
+                    // Midtrans retry a webhook that can never succeed. The refund
+                    // path's 409 is a different situation - there an operator has
+                    // money to resolve by hand.
+                    error!(
+                        order_id = %payload.order_id,
+                        status = %status,
+                        "Webhook ignored: order is not settleable"
+                    );
+                    (
+                        StatusCode::OK,
+                        Json(json!({"status": "not_settleable", "order_status": status})),
                     )
                 }
                 Err(err) => {
@@ -335,7 +361,7 @@ pub async fn handle_midtrans_webhook(
 
             // The write is NOT swallowed: a failed persist must not answer 200.
             match sqlx::query(
-                "UPDATE topups SET status = $1 WHERE order_id = $2 AND status = 'pending'",
+                "UPDATE topups SET status = ? WHERE order_id = ? AND status = 'pending'",
             )
             .bind(status)
             .bind(&payload.order_id)
@@ -557,6 +583,9 @@ mod tests {
             Ok(TopupCreditResult::AlreadySettled),
             Ok(TopupCreditResult::NotFound),
             Ok(TopupCreditResult::AmountMismatch),
+            Ok(TopupCreditResult::NotSettleable {
+                status: "refunded".into(),
+            }),
             Err(AppError::NotFound("no such order".into())),
         ] {
             assert_eq!(
@@ -681,8 +710,9 @@ mod tests {
     use crate::money::compute_midtrans_signature;
     use crate::routes::events::RealtimeHub;
     use crate::routes::test_env::{EnvGuard, EnvLock};
+    use crate::test_support::{self, TestDb};
     use axum::body::to_bytes;
-    use sqlx::PgPool;
+    use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -691,17 +721,9 @@ mod tests {
     /// impossible to mistake for one that did.
     const LIVE_TEST_SERVER_KEY: &str = "SB-Mid-server-WEBHOOK-LIVE-TEST";
 
-    async fn live_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        crate::db::init_pool(&database_url)
-            .await
-            .expect("connect to Postgres")
-    }
-
     /// The AppState the router would hand the handler, built from the same
     /// config file the server loads.
-    fn live_app_state(pool: PgPool) -> AppState {
+    fn live_app_state(pool: SqlitePool) -> AppState {
         let config = AppConfig::load_from_file("../config/apikita.toml")
             .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
             .expect("config/apikita.toml must load for the live tests");
@@ -722,30 +744,35 @@ mod tests {
     }
 
     /// Takes the process-wide env lock, installs the server key, builds the
-    /// fixture, runs the assertions in their own task, then tears the fixture
-    /// down in FK order whether they passed or panicked - and only then releases
-    /// the lock and restores the environment.
+    /// fixture in its OWN migrated SQLite database, runs the assertions in their
+    /// own task, then closes the database whether they passed or panicked - and
+    /// only then releases the lock and restores the environment.
     ///
     /// The assertions are spawned so a panicking one arrives as a JoinError
-    /// instead of unwinding through the teardown. That is what makes the
-    /// cleanup unconditional, and it is why the LOCK is held HERE rather than
-    /// inside the task (a MutexGuard is not Send). Holding it here is also what
-    /// excludes routes::account's Snap tests, which take the same lock.
+    /// instead of unwinding through the teardown. That is what makes the cleanup
+    /// unconditional, and it is why the LOCK is held HERE rather than inside the
+    /// task (a MutexGuard is not Send). Holding it here is also what excludes
+    /// routes::account's Snap tests, which take the same lock.
+    ///
+    /// The Postgres original deleted its rows by name in FK order here. SQLite
+    /// makes that unnecessary: the database is a file, so TestDb builds one per
+    /// fixture and close() removes it - there is no shared state to delete rows
+    /// out of, and therefore no teardown order to get wrong.
     async fn run_live<F, Fut>(assertions: F)
     where
-        F: FnOnce(PgPool, Uuid, AppState) -> Fut + Send + 'static,
+        F: FnOnce(SqlitePool, Uuid, AppState) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let _env = EnvLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
         let key_guard = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
 
-        let account_id = fixture_account(&pool).await;
-        let state = live_app_state(pool.clone());
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
 
-        let outcome = tokio::spawn(assertions(pool.clone(), account_id, state)).await;
+        let outcome = tokio::spawn(assertions(db.pool.clone(), account_id, state)).await;
 
-        delete_fixture_rows(&pool, &[account_id]).await;
+        db.close().await;
 
         outcome.expect("the live webhook assertions panicked");
         drop(key_guard);
@@ -754,59 +781,20 @@ mod tests {
     /// An account with the zero-balance wallet the login path creates. A wallet
     /// with no ledger rows is consistent on its own (0 = SUM of nothing), so
     /// this starting point reconciles.
-    async fn fixture_account(pool: &PgPool) -> Uuid {
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-                .bind(&pb_user_id)
-                .fetch_one(pool)
-                .await
-                .expect("create account");
-
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(account_id)
-            .execute(pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
-
-        account_id
+    ///
+    /// test_support::account_with_wallet is the same fixture the db.rs and
+    /// abuse.rs suites use. The SQLite schema has no DEFAULT for id, created_at
+    /// or updated_at, so the Postgres RETURNING id shape would fail at runtime
+    /// with a NOT NULL constraint error rather than here.
+    async fn fixture_account(pool: &SqlitePool) -> Uuid {
+        test_support::account_with_wallet(pool).await
     }
 
     /// A `pending` topup, written the way routes/account.rs::create_topup writes
     /// it (minus the Snap token, which needs a live Midtrans). Returns its
     /// `order_id`, the key Midtrans notifies on.
-    async fn pending_topup(pool: &PgPool, account_id: Uuid, amount_idr: i64) -> String {
-        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
-            .bind(account_id)
-            .bind(amount_idr)
-            .bind(&order_id)
-            .execute(pool)
-            .await
-            .expect("create topup");
-        order_id
-    }
-
-    /// Deletes every row a fixture created, in FK order (ledger, topups and
-    /// wallets are ON DELETE RESTRICT, so the order is load-bearing).
-    async fn delete_fixture_rows(pool: &PgPool, account_ids: &[Uuid]) {
-        for account_id in account_ids {
-            for statement in [
-                "DELETE FROM usage_daily WHERE account_id = $1",
-                "DELETE FROM ledger WHERE account_id = $1",
-                "DELETE FROM api_keys WHERE account_id = $1",
-                "DELETE FROM topups WHERE account_id = $1",
-                "DELETE FROM sessions WHERE account_id = $1",
-                "DELETE FROM wallets WHERE account_id = $1",
-                "DELETE FROM accounts WHERE id = $1",
-            ] {
-                sqlx::query(statement)
-                    .bind(account_id)
-                    .execute(pool)
-                    .await
-                    .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
-            }
-        }
+    async fn pending_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) -> String {
+        test_support::pending_topup(pool, account_id, amount_idr).await
     }
 
     /// A Midtrans notification whose signature is computed by the REAL
@@ -862,25 +850,25 @@ mod tests {
         (status, body)
     }
 
-    async fn balance_of(pool: &PgPool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-            .bind(account_id)
+    async fn balance_of(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_one(pool)
             .await
             .expect("read balance")
     }
 
-    async fn topup_status_of(pool: &PgPool, order_id: &str) -> String {
-        sqlx::query_scalar("SELECT status FROM topups WHERE order_id = $1")
+    async fn topup_status_of(pool: &SqlitePool, order_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM topups WHERE order_id = ?")
             .bind(order_id)
             .fetch_one(pool)
             .await
             .expect("read topup status")
     }
 
-    async fn ledger_count(pool: &PgPool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = $1")
-            .bind(account_id)
+    async fn ledger_count(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_one(pool)
             .await
             .expect("count ledger rows")
@@ -889,14 +877,14 @@ mod tests {
     /// Every ledger row for the account with that reason, oldest first, as
     /// (delta_idr, ref).
     async fn ledger_rows_of(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         reason: &str,
     ) -> Vec<(i64, Option<String>)> {
         sqlx::query_as(
-            "SELECT delta_idr, ref FROM ledger WHERE account_id = $1 AND reason = $2 ORDER BY id",
+            "SELECT delta_idr, ref FROM ledger WHERE account_id = ? AND reason = ? ORDER BY id",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .bind(reason)
         .fetch_all(pool)
         .await
@@ -906,20 +894,20 @@ mod tests {
     /// The reconciliation check from docs/observability.md: wallets.balance_idr
     /// must equal SUM(ledger.delta_idr). Scoped to THIS fixture's account, so a
     /// concurrent writer cannot fail it for a reason unrelated to the handler.
-    async fn drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
                 SELECT w.account_id
                 FROM wallets w
                 LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = $1
+                WHERE w.account_id = ?
                 GROUP BY w.account_id, w.balance_idr
                 HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
@@ -928,7 +916,7 @@ mod tests {
     /// THE INVARIANT, asserted after EVERY branch of every test below. A write
     /// that lands on one side only - a credit with no ledger row, a debit with
     /// no ledger row - cannot pass this, whatever the HTTP status said.
-    async fn assert_reconciled(pool: &PgPool, account_id: Uuid, context: &str) {
+    async fn assert_reconciled(pool: &SqlitePool, account_id: Uuid, context: &str) {
         assert_eq!(
             drift_rows(pool, account_id).await,
             0,
@@ -940,13 +928,12 @@ mod tests {
     // 1. A BAD SIGNATURE is rejected and NOTHING changes.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_webhook_rejects_a_bad_signature_and_writes_nothing() {
         run_live(bad_signature_assertions).await;
     }
 
-    async fn bad_signature_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+    async fn bad_signature_assertions(pool: SqlitePool, account_id: Uuid, state: AppState) {
         const AMOUNT: i64 = 50_000;
         let order_id = pending_topup(&pool, account_id, AMOUNT).await;
 
@@ -994,13 +981,12 @@ mod tests {
     // 2. A WRONG AMOUNT with a VALID signature is rejected, nothing changes.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_webhook_rejects_a_wrong_amount_with_a_valid_signature() {
         run_live(wrong_amount_assertions).await;
     }
 
-    async fn wrong_amount_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+    async fn wrong_amount_assertions(pool: SqlitePool, account_id: Uuid, state: AppState) {
         const STORED: i64 = 50_000;
         let order_id = pending_topup(&pool, account_id, STORED).await;
 
@@ -1042,13 +1028,12 @@ mod tests {
     // 3. SETTLEMENT credits EXACTLY ONCE; a REPLAY does not credit again.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_webhook_settlement_credits_exactly_once_and_a_replay_does_not() {
         run_live(settlement_then_replay_assertions).await;
     }
 
-    async fn settlement_then_replay_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+    async fn settlement_then_replay_assertions(pool: SqlitePool, account_id: Uuid, state: AppState) {
         const AMOUNT: i64 = 50_000;
         let order_id = pending_topup(&pool, account_id, AMOUNT).await;
 
@@ -1114,13 +1099,12 @@ mod tests {
     // 4. DENY / EXPIRE / CANCEL persist the SCHEMA vocabulary.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_webhook_terminal_statuses_persist_the_schema_vocabulary() {
         run_live(terminal_status_assertions).await;
     }
 
-    async fn terminal_status_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+    async fn terminal_status_assertions(pool: SqlitePool, account_id: Uuid, state: AppState) {
         const AMOUNT: i64 = 50_000;
 
         // Midtrans' word -> the word the topups_status_check constraint accepts
@@ -1164,13 +1148,12 @@ mod tests {
     // 5. AN UNRECOGNISED status performs NO write and claims no credit.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_webhook_an_unrecognised_status_writes_nothing() {
         run_live(unrecognised_status_assertions).await;
     }
 
-    async fn unrecognised_status_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+    async fn unrecognised_status_assertions(pool: SqlitePool, account_id: Uuid, state: AppState) {
         const AMOUNT: i64 = 50_000;
         let order_id = pending_topup(&pool, account_id, AMOUNT).await;
 
@@ -1220,13 +1203,12 @@ mod tests {
     // 6. REFUND debits once; a replayed refund does not debit twice.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_webhook_refund_debits_once_and_a_replay_does_not() {
         run_live(refund_then_replay_assertions).await;
     }
 
-    async fn refund_then_replay_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+    async fn refund_then_replay_assertions(pool: SqlitePool, account_id: Uuid, state: AppState) {
         const AMOUNT: i64 = 50_000;
 
         // Fund the wallet through the REAL path - a topups row, then
@@ -1299,7 +1281,6 @@ mod tests {
     // 6. A REFUND whose amount is NOT the stored one is rejected, nothing changes.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_webhook_refund_rejects_an_amount_that_is_not_the_stored_one() {
         run_live(refund_wrong_amount_assertions).await;
@@ -1316,13 +1297,13 @@ mod tests {
     /// docs/server/api-spec.md:284 mandates comparing the amount against the
     /// STORED row; :295 says "the amount comes from our stored row, never the
     /// payload". The credit branch honours that; this one must too.
-    async fn refund_wrong_amount_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+    async fn refund_wrong_amount_assertions(pool: SqlitePool, account_id: Uuid, state: AppState) {
         const STORED: i64 = 50_000;
         const INFLATED: i64 = 100_000;
 
         // TWO settled top-ups, so the wallet holds 100_000 and an inflated refund
         // of the FIRST one is AFFORDABLE. The guarded UPDATE
-        // (`balance_idr >= $1`) cannot save us here, which is exactly the
+        // (the `balance_idr >= ?` CHECK) cannot save us here, which is exactly the
         // reported consequence: a single notification drains the whole wallet.
         let first = pending_topup(&pool, account_id, STORED).await;
         assert_eq!(

@@ -4,7 +4,7 @@ How code reaches production, and how the database schema changes without breakin
 a running system.
 
 > **Stack:** Cloudflare Pages (frontend) + **edge relay VPS** + Rust on Northflank
-> (API) + PostgreSQL. Relay: [`edge-relay.md`](edge-relay.md).
+> (API, with SQLite embedded). Relay: [`edge-relay.md`](edge-relay.md).
 > See [`architecture.md`](architecture.md).
 
 ## The core problem
@@ -223,7 +223,7 @@ The wallet ledger is the business.
 | `MIDTRANS_ENV` ≠ `PUBLIC_MIDTRANS_ENV` | Payment sheet never opens; no credit, silently. No top-up row at all when the server is sandbox; a row stuck `pending` when the server is production | Set both in one deploy, rebuild Pages. The browser names an inconsistent Pages build, but nothing detects the server/Pages disagreement — the operator must keep the values in step |
 | Relay config changed | Not automatic — it is not part of the app deploy | SSH or a config repo; test `nginx -t` first |
 | **Relay down** | **Total outage**; the backend is unreachable | It is a single point of failure — see [\`edge-relay.md\`](edge-relay.md) |
-| Postgres volume lost | **Total loss of funds data** | Restore; this is why backups are tested |
+| Database volume lost | **Total loss of funds data** | Restore; this is why backups are tested |
 
 ## Open items
 

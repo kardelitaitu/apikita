@@ -22,7 +22,7 @@
 //! this module holds no state and no second view of the configuration.
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -102,7 +102,7 @@ fn cap_outcome(
 /// `created_at` columns; it is never request-derived, which is what makes the
 /// interpolation below safe. `limit` comes from the caller's config.
 pub async fn enforce_creation_cap(
-    pool: &PgPool,
+    pool: &SqlitePool,
     table: &'static str,
     window: Duration,
     limit: u32,
@@ -110,12 +110,12 @@ pub async fn enforce_creation_cap(
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     let sql = format!(
-        "SELECT COUNT(*)::bigint AS used, MIN(created_at) AS oldest \
-         FROM {table} WHERE account_id = $1 AND created_at >= $2"
+        "SELECT COUNT(*) AS used, MIN(created_at) AS oldest \
+         FROM {table} WHERE account_id = ? AND created_at >= ?"
     );
 
     let row = sqlx::query(&sql)
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .bind(now - window)
         .fetch_one(pool)
         .await?;
@@ -132,6 +132,7 @@ pub async fn enforce_creation_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{self, TestDb};
 
     #[test]
     fn a_zero_limit_turns_the_cap_off() {
@@ -206,11 +207,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Live Postgres. Ignored rather than silently skipped, exactly like the
-    // settlement tests in `db.rs`: a test that asserts nothing is worse than no
-    // test.
-    //
-    //   DATABASE_URL=... cargo test --lib abuse:: -- --ignored
+    // Database tests. Each gets its own migrated database in a temp directory,
+    // so they run by default and cannot see each other's rows.
     // -----------------------------------------------------------------------
 
     /// The configured caps, read the way the application reads them.
@@ -226,70 +224,32 @@ mod tests {
         panic!("could not find apikita.toml for testing");
     }
 
-    async fn test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        crate::db::init_pool(&database_url)
-            .await
-            .expect("connect to Postgres")
+    /// One top-up at the configured amount, as the create path writes one.
+    async fn insert_topup(pool: &SqlitePool, account_id: Uuid) {
+        test_support::pending_topup(pool, account_id, 10_000).await;
     }
 
-    async fn create_account(pool: &PgPool) -> Uuid {
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-            .bind(&pb_user_id)
-            .fetch_one(pool)
-            .await
-            .expect("create account")
-    }
-
-    /// Deletes every row the fixture created, in FK order: `topups` references
-    /// `accounts` ON DELETE RESTRICT, so the children go first.
-    async fn delete_fixture(pool: &PgPool, account_id: Uuid) {
-        for statement in [
-            "DELETE FROM topups WHERE account_id = $1",
-            "DELETE FROM api_keys WHERE account_id = $1",
-            "DELETE FROM accounts WHERE id = $1",
-        ] {
-            sqlx::query(statement)
-                .bind(account_id)
-                .execute(pool)
-                .await
-                .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
-        }
-    }
-
-    async fn insert_topup(pool: &PgPool, account_id: Uuid) {
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, 10000, $2)")
-            .bind(account_id)
-            .bind(format!("test_cap_{}", Uuid::new_v4().simple()))
-            .execute(pool)
-            .await
-            .expect("insert topup");
-    }
-
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_topup_cap_lets_the_limit_through_and_refuses_the_next() {
-        let pool = test_pool().await;
-        let account_id = create_account(&pool).await;
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
         let limit = configured_limits().topup_per_hour;
         assert!(limit > 0, "the fixture assumes a configured hourly cap");
 
         let now = Utc::now();
         for _ in 0..limit - 1 {
-            insert_topup(&pool, account_id).await;
+            insert_topup(&db.pool, account_id).await;
         }
 
         assert!(
-            enforce_creation_cap(&pool, "topups", topup_window(), limit, account_id, now)
+            enforce_creation_cap(&db.pool, "topups", topup_window(), limit, account_id, now)
                 .await
                 .is_ok(),
             "one under the cap must be allowed"
         );
 
-        insert_topup(&pool, account_id).await;
-        let err = enforce_creation_cap(&pool, "topups", topup_window(), limit, account_id, now)
+        insert_topup(&db.pool, account_id).await;
+        let err = enforce_creation_cap(&db.pool, "topups", topup_window(), limit, account_id, now)
             .await
             .expect_err("a top-up at the cap must be refused");
 
@@ -305,17 +265,22 @@ mod tests {
         }
 
         // A row older than the window no longer counts, so the cap frees.
-        sqlx::query(
-            "UPDATE topups SET created_at = now() - interval '2 hours' WHERE account_id = $1",
-        )
-        .bind(account_id)
-        .execute(&pool)
-        .await
-        .expect("age the rows out of the window");
+        //
+        // Bound from Rust, not `datetime('now','-2 hours')`: the SQLite function
+        // emits the space-separated format, which the `created_at` GLOB CHECK
+        // refuses (plan section 4.6, rule 3). The Postgres `now() - interval`
+        // form has no equivalent that both computes the offset and keeps the
+        // RFC3339-offset representation.
+        sqlx::query("UPDATE topups SET created_at = ? WHERE account_id = ?")
+            .bind(Utc::now() - Duration::hours(2))
+            .bind(account_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("age the rows out of the window");
 
         assert!(
             enforce_creation_cap(
-                &pool,
+                &db.pool,
                 "topups",
                 topup_window(),
                 limit,
@@ -327,31 +292,23 @@ mod tests {
             "rows outside the window must not count against the cap"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_key_creation_cap_refuses_past_the_configured_daily_limit() {
-        let pool = test_pool().await;
-        let account_id = create_account(&pool).await;
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
         let limit = configured_limits().key_creation_per_day;
         assert!(limit > 0, "the fixture assumes a configured daily cap");
 
         let now = Utc::now();
         for _ in 0..limit {
-            sqlx::query(
-                "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES ($1, $2, 'apk_test')",
-            )
-            .bind(account_id)
-            .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-            .execute(&pool)
-            .await
-            .expect("insert api key");
+            test_support::api_key(&db.pool, account_id).await;
         }
 
         let err = enforce_creation_cap(
-            &pool,
+            &db.pool,
             "api_keys",
             key_creation_window(),
             limit,
@@ -372,7 +329,7 @@ mod tests {
             other => panic!("expected RateLimited, got {other:?}"),
         }
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
     // -----------------------------------------------------------------------
@@ -406,7 +363,7 @@ mod tests {
 
     /// The AppState the router would hand `create_key`, built from the same
     /// config file the server loads.
-    fn live_app_state(pool: PgPool) -> AppState {
+    fn live_app_state(pool: SqlitePool) -> AppState {
         let config = AppConfig::load_from_file("../config/apikita.toml")
             .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
             .expect("config/apikita.toml must load for the live tests");
@@ -426,14 +383,23 @@ mod tests {
     /// A real `sessions` row and the cookie that resolves to it, so the handler
     /// is reached through the production authentication path
     /// (`resolve_account_from_cookie`) rather than a hand-passed account id.
-    async fn session_cookie(pool: &PgPool, account_id: Uuid) -> HeaderMap {
+    async fn session_cookie(pool: &SqlitePool, account_id: Uuid) -> HeaderMap {
         let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        // Every NOT NULL column is bound from Rust: the SQLite schema has no
+        // DEFAULT for id, last_seen_at or created_at (plan section 4.1,
+        // correction 1), and now() + interval has no SQLite spelling that also
+        // keeps the RFC3339-offset form the timestamp GLOB CHECK requires.
+        let now = Utc::now();
         sqlx::query(
-            "INSERT INTO sessions (account_id, token_hash, expires_at)
-             VALUES ($1, $2, now() + interval '30 days')",
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(account_id)
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
         .bind(crate::routes::hash_token(&token))
+        .bind(now + Duration::days(30))
+        .bind(now)
+        .bind(now)
         .execute(pool)
         .await
         .expect("create session");
@@ -452,17 +418,18 @@ mod tests {
     /// below is where a row sits relative to a window boundary, and the code
     /// under test must not manufacture its own inputs.
     async fn insert_topups_at(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         created_at: DateTime<Utc>,
         count: u32,
     ) {
         for _ in 0..count {
             sqlx::query(
-                "INSERT INTO topups (account_id, amount_idr, order_id, created_at)
-                 VALUES ($1, 10000, $2, $3)",
+                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
+                 VALUES (?, ?, 10000, ?, 'pending', ?)",
             )
-            .bind(account_id)
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
             .bind(format!("test_cap_{}", Uuid::new_v4().simple()))
             .bind(created_at)
             .execute(pool)
@@ -474,17 +441,18 @@ mod tests {
     /// `count` api_keys rows stamped with an EXPLICIT `created_at`, for the
     /// same reason: the boundary is the subject.
     async fn insert_api_keys_at(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         created_at: DateTime<Utc>,
         count: u32,
     ) {
         for _ in 0..count {
             sqlx::query(
-                "INSERT INTO api_keys (account_id, key_hash, prefix, created_at)
-                 VALUES ($1, $2, 'apk_test', $3)",
+                "INSERT INTO api_keys (id, account_id, key_hash, prefix, created_at)
+                 VALUES (?, ?, ?, 'apk_test', ?)",
             )
-            .bind(account_id)
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
             .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
             .bind(created_at)
             .execute(pool)
@@ -495,10 +463,10 @@ mod tests {
 
     /// Moves an existing fixture's rows to a new instant, so one account can
     /// exercise several boundary positions without a second fixture.
-    async fn repin_api_keys(pool: &PgPool, account_id: Uuid, created_at: DateTime<Utc>) {
-        sqlx::query("UPDATE api_keys SET created_at = $2 WHERE account_id = $1")
-            .bind(account_id)
+    async fn repin_api_keys(pool: &SqlitePool, account_id: Uuid, created_at: DateTime<Utc>) {
+        sqlx::query("UPDATE api_keys SET created_at = ? WHERE account_id = ?")
             .bind(created_at)
+            .bind(account_id.hyphenated())
             .execute(pool)
             .await
             .expect("re-pin the fixture's api_keys rows");
@@ -553,9 +521,9 @@ mod tests {
         .await
     }
 
-    async fn count_api_keys(pool: &PgPool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT count(*) FROM api_keys WHERE account_id = $1")
-            .bind(account_id)
+    async fn count_api_keys(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM api_keys WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_one(pool)
             .await
             .expect("count api keys")
@@ -563,11 +531,11 @@ mod tests {
 
     /// (a) The HANDLER refuses with 429, and the Retry-After it names is the
     /// time until the OLDEST row ages out - not the newest, and not the window.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_create_key_refuses_with_429_and_the_retry_after_of_the_oldest_row() {
-        let pool = test_pool().await;
-        let account_id = create_account(&pool).await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = test_support::account(&pool).await;
         let headers = session_cookie(&pool, account_id).await;
         let state = live_app_state(pool.clone());
 
@@ -611,17 +579,17 @@ mod tests {
             "a refused request must not create a row"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
     /// (b) Against REAL rows, the refusal rounds UP and is never zero. The unit
     /// test at abuse.rs:179 pins the arithmetic; this pins the same property
     /// when the number is driven by an actual timestamp on an actual row.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_the_handler_refusal_rounds_up_and_is_never_zero() {
-        let pool = test_pool().await;
-        let account_id = create_account(&pool).await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = test_support::account(&pool).await;
         let headers = session_cookie(&pool, account_id).await;
         let state = live_app_state(pool.clone());
 
@@ -655,17 +623,17 @@ mod tests {
             "2.9s of window must round UP to 3"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
     /// (c) The two windows are genuinely different, measured against the SAME
     /// real rows: an age that is outside the 1-hour topup window is inside the
     /// 24-hour key window. Duration constants alone cannot show this.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_the_two_windows_differ_measured_against_real_rows() {
-        let pool = test_pool().await;
-        let account_id = create_account(&pool).await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = test_support::account(&pool).await;
         let headers = session_cookie(&pool, account_id).await;
         let state = live_app_state(pool.clone());
 
@@ -719,16 +687,16 @@ mod tests {
             "create_key counts a 24-hour window: two-hour-old rows must refuse. body: {body}"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
     /// (d) A limit of 0 turns the cap OFF, live, through the handler: the same
     /// rows that refuse above are let through and the key is actually minted.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_a_zero_limit_turns_the_key_cap_off_at_the_handler() {
-        let pool = test_pool().await;
-        let account_id = create_account(&pool).await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = test_support::account(&pool).await;
         let headers = session_cookie(&pool, account_id).await;
 
         // The operator's "off" switch is the config value, so the config is what
@@ -768,6 +736,6 @@ mod tests {
             "the handler must have proceeded to mint the key"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 }

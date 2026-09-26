@@ -60,7 +60,7 @@ use std::env;
 
 use apikita_server::db;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{Row, SqlitePool};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -148,7 +148,7 @@ fn parse_args() -> Result<Options, String> {
 /// `reserve_%` ref whose negative rows have NO positive row under the same ref.
 /// A different predicate here would make the binary and the library disagree
 /// about what "stranded" means, which is how a detector stops being trusted.
-async fn stranded_holds(pool: &PgPool) -> Result<Vec<StrandedHold>, sqlx::Error> {
+async fn stranded_holds(pool: &SqlitePool) -> Result<Vec<StrandedHold>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
         SELECT
@@ -156,9 +156,12 @@ async fn stranded_holds(pool: &PgPool) -> Result<Vec<StrandedHold>, sqlx::Error>
             a.pb_user_id,
             l.ref AS reservation_ref,
             -- SUM over BIGINT is NUMERIC; cast back so it decodes as i64.
-            SUM(l.delta_idr)::bigint AS amount_idr,
+            CAST(SUM(l.delta_idr) AS INTEGER) AS amount_idr,
             MIN(l.created_at) AS held_at,
-            EXTRACT(EPOCH FROM (now() - MIN(l.created_at)))::bigint AS age_seconds,
+            -- SQLite has no now()/EXTRACT: the schema stores RFC3339 TEXT, so the
+            -- age is strftime seconds between the oldest hold and the bound instant
+            -- the caller binds. See db.rs for the timestamp contract.
+            CAST(strftime('%s', ?) - strftime('%s', MIN(l.created_at)) AS INTEGER) AS age_seconds,
             COUNT(*) AS row_count
         FROM ledger l
         JOIN accounts a ON a.id = l.account_id
@@ -174,6 +177,7 @@ async fn stranded_holds(pool: &PgPool) -> Result<Vec<StrandedHold>, sqlx::Error>
         ORDER BY held_at ASC
         "#,
     )
+    .bind(Utc::now().to_rfc3339())
     .fetch_all(pool)
     .await?;
 
@@ -198,30 +202,35 @@ async fn stranded_holds(pool: &PgPool) -> Result<Vec<StrandedHold>, sqlx::Error>
 /// `adjustment` row under the SAME ref rather than touching the negative one.
 /// The ref is passed through verbatim so the pairing is exact - rewriting it
 /// would hide the very trace an operator needs afterwards.
-async fn release_hold(pool: &PgPool, hold: &StrandedHold) -> Result<i64, sqlx::Error> {
+async fn release_hold(pool: &SqlitePool, hold: &StrandedHold) -> Result<i64, sqlx::Error> {
     let amount = hold.amount_idr.abs();
+    // The schema stores RFC3339 TEXT and refuses SQLite's own now() form, so every
+    // instant is computed in Rust and bound. See db.rs for the timestamp contract.
+    let now = Utc::now().to_rfc3339();
 
     // Same shape as reserve_balance_transaction: lock the wallet row, credit it,
     // and read back the resulting balance in one transaction so balance_after is
     // the true post-credit balance rather than a snapshot taken outside the lock.
     let mut tx = pool.begin().await?;
     let new_balance: i64 = sqlx::query_scalar(
-        "UPDATE wallets SET balance_idr = balance_idr + $2, updated_at = now() \
-         WHERE account_id = $1 RETURNING balance_idr",
+        "UPDATE wallets SET balance_idr = balance_idr + ?, updated_at = ? \
+         WHERE account_id = ? RETURNING balance_idr",
     )
-    .bind(hold.account_id)
     .bind(amount)
+    .bind(&now)
+    .bind(hold.account_id)
     .fetch_one(&mut *tx)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after) \
-         VALUES ($1, $2, 'adjustment', $3, $4)",
+        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) \
+         VALUES (?, ?, 'adjustment', ?, ?, ?)",
     )
     .bind(hold.account_id)
     .bind(amount)
     .bind(&hold.reservation_ref)
     .bind(new_balance)
+    .bind(&now)
     .execute(&mut *tx)
     .await?;
 

@@ -5,20 +5,21 @@ use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sqlx::{PgPool, Row};
+use sha2::{Digest, Sha256};
+use sqlx::{SqlitePool, Row};
 use tracing::info;
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::config::{AppConfig, WalletConfig};
 use crate::error::AppError;
 use crate::routes::proxy::AppState;
-use crate::routes::resolve_account_from_cookie;
 
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
@@ -75,21 +76,63 @@ pub struct UsageQuery {
     pub to: Option<String>,
 }
 
+/// SHA-256 hex of a session token.
+///
+/// Carried over from the Postgres branch, where the shared
+/// `crate::routes::resolve_account_from_cookie` in mod.rs took a `PgPool`. That
+/// resolver is now a `SqlitePool` too, so this local copy is equivalent to it:
+/// this module keeps its own so the handler and its tests exercise the same
+/// resolver. Two copies of the hash-then-compare rule, so a divergence fails a
+/// test rather than passing silently
+/// into mod.rs. Same rule either way: the token is hashed, never stored raw.
+fn hash_string(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+async fn resolve_account_from_cookie(pool: &SqlitePool, headers: &HeaderMap) -> Result<Uuid, AppError> {
+    let cookie_hdr = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthenticated)?;
+
+    for piece in cookie_hdr.split(';') {
+        let piece = piece.trim();
+        if let Some(token) = piece.strip_prefix("session=") {
+            let token_hash = hash_string(token);
+            let session = sqlx::query(
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+            )
+            .bind(token_hash)
+            .bind(Utc::now())
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some(s) = session {
+                return Ok(s.try_get::<Hyphenated, _>("account_id")?.into_uuid());
+            }
+        }
+    }
+
+    Err(AppError::Unauthenticated)
+}
+
 pub async fn get_me(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
 
-    let account = sqlx::query("SELECT status FROM accounts WHERE id = $1")
-        .bind(account_id)
+    let account = sqlx::query("SELECT status FROM accounts WHERE id = ?")
+        .bind(account_id.hyphenated())
         .fetch_one(&pool)
         .await?;
 
     let status: String = account.try_get("status")?;
 
-    let wallet = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = $1")
-        .bind(account_id)
+    let wallet = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = ?")
+        .bind(account_id.hyphenated())
         .fetch_optional(&pool)
         .await?;
 
@@ -102,21 +145,21 @@ pub async fn get_me(
     let usage_today = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
-            COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
-            COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
-            COALESCE(SUM(cost_idr), 0)::bigint AS cost_idr
+            COALESCE(SUM(input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(cost_idr), 0) AS cost_idr
         FROM usage_daily
-        WHERE account_id = $1 AND day = $2
+        WHERE account_id = ? AND day = ?
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(today)
     .fetch_one(&pool)
     .await?;
 
-    let tg_link = sqlx::query("SELECT telegram_id FROM telegram_links WHERE account_id = $1")
-        .bind(account_id)
+    let tg_link = sqlx::query("SELECT telegram_id FROM telegram_links WHERE account_id = ?")
+        .bind(account_id.hyphenated())
         .fetch_optional(&pool)
         .await?;
 
@@ -163,7 +206,7 @@ fn parse_usage_day(
 const USAGE_DEFAULT_LIMIT: i64 = 30;
 
 pub async fn get_usage(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
     Query(query): Query<UsageQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -188,21 +231,29 @@ pub async fn get_usage(
         r#"
         SELECT
             day,
-            SUM(input_tokens)::bigint AS input_tokens,
-            SUM(cache_read_tokens)::bigint AS cache_read_tokens,
-            SUM(output_tokens)::bigint AS output_tokens,
-            SUM(cost_idr)::bigint AS cost_idr
+            SUM(input_tokens) AS input_tokens,
+            SUM(cache_read_tokens) AS cache_read_tokens,
+            SUM(output_tokens) AS output_tokens,
+            SUM(cost_idr) AS cost_idr
         FROM usage_daily
-        WHERE account_id = $1
-          AND ($2::date IS NULL OR day >= $2::date)
-          AND ($3::date IS NULL OR day <= $3::date)
+        WHERE account_id = ?
+          AND (? IS NULL OR day >= ?)
+          AND (? IS NULL OR day <= ?)
         GROUP BY day
         ORDER BY day DESC
-        LIMIT $4
+        LIMIT ?
         "#,
     )
-    .bind(account_id)
+    // Ported: the Postgres original compared with `?::date`/`?::date` casts.
+    // SQLite has no `::date` and its `day` column is TEXT in `YYYY-MM-DD` form,
+    // which compares correctly against the same `YYYY-MM-DD` string chrono
+    // encodes a `NaiveDate` to — so the bound value is what needs repeating, not
+    // the cast. Each bound day is passed twice, once as the null test and once as
+    // the comparison.
+    .bind(account_id.hyphenated())
     .bind(from)
+    .bind(from)
+    .bind(to)
     .bind(to)
     .bind(limit)
     .fetch_all(&pool)
@@ -230,7 +281,7 @@ pub async fn get_usage(
 }
 
 pub async fn get_topups(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
     Query(query): Query<LimitQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -241,12 +292,12 @@ pub async fn get_topups(
         r#"
         SELECT id, amount_idr, order_id, status, created_at, settled_at
         FROM topups
-        WHERE account_id = $1
+        WHERE account_id = ?
         ORDER BY created_at DESC
-        LIMIT $2
+        LIMIT ?
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(limit)
     .fetch_all(&pool)
     .await?;
@@ -254,7 +305,7 @@ pub async fn get_topups(
     let result: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| -> Result<serde_json::Value, AppError> {
-            let id: Uuid = r.try_get("id")?;
+            let id: Uuid = r.try_get::<Hyphenated, _>("id")?.into_uuid();
             let amount_idr: i64 = r.try_get("amount_idr")?;
             let order_id: String = r.try_get("order_id")?;
             let status: String = r.try_get("status")?;
@@ -288,7 +339,7 @@ const SNAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 static WALLET_CONFIG: OnceLock<WalletConfig> = OnceLock::new();
 
-/// WalletConfig is not part of the router state (State<PgPool>), so the config
+/// WalletConfig is not part of the router state (State<SqlitePool>), so the config
 /// file is read once per process and cached. Same resolution order as
 /// auth::sessions_config and main.rs: APIKITA_CONFIG_PATH, then config/, then
 /// ../config/.
@@ -539,9 +590,9 @@ pub async fn create_topup(
     let wallet = wallet_config()?;
 
     let past_settled = sqlx::query(
-        "SELECT count(*) AS count FROM topups WHERE account_id = $1 AND status = 'settled'",
+        "SELECT count(*) AS count FROM topups WHERE account_id = ? AND status = 'settled'",
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .fetch_one(&state.pool)
     .await?;
 
@@ -567,8 +618,8 @@ pub async fn create_topup(
     let order_id = format!("topup_{}", topup_id);
 
     // accounts stores only the PocketBase record id; the email lives in PocketBase.
-    let pb_user_id: String = sqlx::query("SELECT pb_user_id FROM accounts WHERE id = $1")
-        .bind(account_id)
+    let pb_user_id: String = sqlx::query("SELECT pb_user_id FROM accounts WHERE id = ?")
+        .bind(account_id.hyphenated())
         .fetch_one(&state.pool)
         .await?
         .try_get("pb_user_id")?;
@@ -589,14 +640,18 @@ pub async fn create_topup(
     let (snap_token, redirect_url) =
         create_snap_transaction(&snap_http, &server_key, &endpoint, &snap_payload).await?;
 
+    // `created_at` has no default: the Postgres schema defaulted it to `now()`,
+    // and that default was removed so that no SQL-side time can ever be written
+    // in the other format (plan section 4.6, rule 2).
     sqlx::query(
-        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token) VALUES ($1, $2, $3, $4, 'pending', $5)",
+        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
     )
-    .bind(topup_id)
-    .bind(account_id)
+    .bind(topup_id.hyphenated())
+    .bind(account_id.hyphenated())
     .bind(payload.amount_idr)
     .bind(&order_id)
     .bind(&snap_token)
+    .bind(Utc::now())
     .execute(&state.pool)
     .await?;
 
@@ -876,6 +931,7 @@ mod tests {
 
     use crate::db::credit_topup_transaction;
     use crate::routes::events::RealtimeHub;
+    use crate::test_support::{self, TestDb};
     use crate::routes::test_env::{EnvGuard, EnvLock};
     use axum::body::to_bytes;
     use std::sync::Arc;
@@ -884,62 +940,22 @@ mod tests {
     /// outcome cannot depend on whatever the developer shell exports.
     const INVALID_SERVER_KEY: &str = "SB-Mid-server-INVALID-LIVE-TEST-KEY";
 
-    /// A SMALL pool per test, deliberately.
-    ///
-    /// `crate::db::init_pool` opens up to 20 connections per call, and the live
-    /// suite already runs several such pools in parallel. Five more of those
-    /// exhausted Postgres' 100-connection limit and made an unrelated db.rs test
-    /// fail with `PoolTimedOut` - a connection-budget failure, not a code
-    /// failure. Four is ample for one test, and because the pool is NOT shared,
-    /// no sibling test can starve this one's teardown.
-    async fn live_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url)
-            .await
-            .expect("connect to Postgres")
-    }
-
-    /// Deletes every row a fixture created, in FK order. wallets, ledger and
-    /// topups are ON DELETE RESTRICT, so the order is load-bearing.
-    async fn delete_fixture_rows(pool: &PgPool, account_ids: &[Uuid]) {
-        for account_id in account_ids {
-            for statement in [
-                "DELETE FROM usage_daily WHERE account_id = $1",
-                "DELETE FROM ledger WHERE account_id = $1",
-                "DELETE FROM api_keys WHERE account_id = $1",
-                "DELETE FROM topups WHERE account_id = $1",
-                "DELETE FROM sessions WHERE account_id = $1",
-                "DELETE FROM wallets WHERE account_id = $1",
-                "DELETE FROM accounts WHERE id = $1",
-            ] {
-                sqlx::query(statement)
-                    .bind(account_id)
-                    .execute(pool)
-                    .await
-                    .unwrap_or_else(|err| panic!("cleanup failed on {statement}: {err}"));
-            }
-        }
-    }
-
     /// The reconciliation check from docs/observability.md, scoped to one
     /// account: wallets.balance_idr must equal SUM(ledger.delta_idr).
-    async fn ledger_drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
                 SELECT w.account_id
                 FROM wallets w
                 LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = $1
+                WHERE w.account_id = ?
                 GROUP BY w.account_id, w.balance_idr
                 HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
@@ -953,33 +969,30 @@ mod tests {
         token: String,
     }
 
-    async fn live_account(pool: &PgPool) -> LiveAccount {
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-                .bind(&pb_user_id)
-                .fetch_one(pool)
-                .await
-                .expect("create account");
+    async fn live_account(pool: &SqlitePool) -> LiveAccount {
+        // Ported from the Postgres original, which leaned on column DEFAULTS for
+        // `accounts.id`, `accounts.created_at` and `wallets.updated_at`. The strict
+        // SQLite schema has none of them (plan section 4.1, correction 1), so every
+        // NOT NULL column is bound from Rust - the defect the compiler cannot see,
+        // because the INSERT still type-checks and only fails at runtime.
+        let account_id = test_support::account(pool).await;
+        test_support::wallet(pool, account_id).await;
 
         let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        let now = Utc::now();
         sqlx::query(
-            "INSERT INTO sessions (account_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(account_id)
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
         .bind(crate::routes::hash_token(&token))
-        .bind(Utc::now() + chrono::Duration::days(30))
+        .bind(now + chrono::Duration::days(30))
+        .bind(now)
+        .bind(now)
         .execute(pool)
         .await
         .expect("create session");
-
-        // A zero-balance wallet with no ledger rows is consistent on its own
-        // (0 = SUM of nothing), so this starting point reconciles.
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(account_id)
-            .execute(pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
 
         LiveAccount { account_id, token }
     }
@@ -998,15 +1011,23 @@ mod tests {
     /// ledger row in the same transaction. Writing wallets.balance_idr directly
     /// would manufacture the very drift the drift assertion then reports - a
     /// fixture that cannot pass while the code under test is correct.
-    async fn settle_topup(pool: &PgPool, account_id: Uuid, amount_idr: i64) -> Uuid {
+    async fn settle_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) -> Uuid {
         let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        let topup_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3) RETURNING id",
+        // Ported: `topups.id` is TEXT, so RETURNING decodes through `Hyphenated`
+        // rather than a bare 16-byte `Uuid` (the failure is
+        // `ParseByteLength { len: 36 }` - the hyphenated string arriving where a raw
+        // uuid was expected).
+        let topup_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
+             VALUES (?, ?, ?, ?, 'pending', ?)",
         )
-        .bind(account_id)
+        .bind(topup_id.hyphenated())
+        .bind(account_id.hyphenated())
         .bind(amount_idr)
         .bind(&order_id)
-        .fetch_one(pool)
+        .bind(Utc::now())
+        .execute(pool)
         .await
         .expect("create topup");
 
@@ -1042,7 +1063,7 @@ mod tests {
 
     /// The AppState the router would hand create_topup, built from the same
     /// config file the server loads.
-    fn live_app_state(pool: PgPool) -> AppState {
+    fn live_app_state(pool: SqlitePool) -> AppState {
         let config = AppConfig::load_from_file("../config/apikita.toml")
             .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
             .expect("config/apikita.toml must load for the live tests");
@@ -1073,10 +1094,10 @@ mod tests {
     // 1. get_me
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_get_me_returns_the_real_balance_and_the_documented_fields() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
         let other = live_account(&pool).await;
 
@@ -1093,12 +1114,12 @@ mod tests {
         // unconditional. Awaiting BEFORE the deletes also stops the fixture
         // from racing its own cleanup.
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id, other.account_id]).await;
+        db.close().await;
         outcome.expect("the get_me assertions panicked");
     }
 
     async fn get_me_assertions(
-        pool: PgPool,
+        pool: SqlitePool,
         account_id: Uuid,
         token: String,
         other_account_id: Uuid,
@@ -1117,8 +1138,8 @@ mod tests {
         // Cross-checked against a direct SELECT, so the test cannot pass on a
         // stale or hardcoded value.
         let stored: i64 =
-            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read the wallet");
@@ -1191,10 +1212,10 @@ mod tests {
     // 2. get_usage - the most important one
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_get_usage_keeps_the_three_token_classes_separate() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
         let other = live_account(&pool).await;
 
@@ -1206,23 +1227,30 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id, other.account_id]).await;
+        db.close().await;
         outcome.expect("the get_usage assertions panicked");
     }
 
-    async fn create_api_key(pool: &PgPool, account_id: Uuid) -> Uuid {
-        sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES ($1, $2, 'apk_test') RETURNING id",
+    async fn create_api_key(pool: &SqlitePool, account_id: Uuid) -> Uuid {
+        // Ported: `api_keys.id` is TEXT, so it decodes through `Hyphenated`.
+        let key_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO api_keys (id, account_id, key_hash, prefix, created_at)
+             VALUES (?, ?, ?, 'apk_test', ?)",
         )
-        .bind(account_id)
+        .bind(key_id.hyphenated())
+        .bind(account_id.hyphenated())
         .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-        .fetch_one(pool)
+        .bind(Utc::now())
+        .execute(pool)
         .await
-        .expect("create api key")
+        .expect("create api key");
+
+        key_id
     }
 
     async fn insert_usage(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         key_id: Uuid,
         day: chrono::NaiveDate,
@@ -1233,11 +1261,11 @@ mod tests {
             INSERT INTO usage_daily (
                 account_id, api_key_id, day,
                 input_tokens, cache_read_tokens, output_tokens, cost_idr
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(account_id)
-        .bind(key_id)
+        .bind(account_id.hyphenated())
+        .bind(key_id.hyphenated())
         .bind(day)
         .bind(tokens.0)
         .bind(tokens.1)
@@ -1249,7 +1277,7 @@ mod tests {
     }
 
     async fn get_usage_assertions(
-        pool: PgPool,
+        pool: SqlitePool,
         account_id: Uuid,
         token: String,
         other_account_id: Uuid,
@@ -1416,10 +1444,10 @@ mod tests {
     // that asked a bounded question got a plausible answer to a different one.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_get_usage_honours_the_documented_from_to_range() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
         let other = live_account(&pool).await;
 
@@ -1431,12 +1459,12 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id, other.account_id]).await;
+        db.close().await;
         outcome.expect("the usage range assertions panicked");
     }
 
     async fn usage_range_assertions(
-        pool: PgPool,
+        pool: SqlitePool,
         account_id: Uuid,
         token: String,
         other_account_id: Uuid,
@@ -1593,10 +1621,10 @@ mod tests {
 
     /// A malformed date must be REJECTED, naming the field - not silently
     /// ignored, which is exactly how the original bug behaved.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_get_usage_rejects_a_malformed_date_naming_the_field() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
 
         let outcome = tokio::spawn(usage_validation_assertions(
@@ -1606,11 +1634,11 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        db.close().await;
         outcome.expect("the usage validation assertions panicked");
     }
 
-    async fn usage_validation_assertions(pool: PgPool, account_id: Uuid, token: String) {
+    async fn usage_validation_assertions(pool: SqlitePool, account_id: Uuid, token: String) {
         let key = create_api_key(&pool, account_id).await;
         insert_usage(
             &pool,
@@ -1662,10 +1690,10 @@ mod tests {
     // 3. get_topups
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_get_topups_returns_only_this_accounts_topups() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
         let other = live_account(&pool).await;
 
@@ -1677,12 +1705,12 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id, other.account_id]).await;
+        db.close().await;
         outcome.expect("the get_topups assertions panicked");
     }
 
     async fn get_topups_assertions(
-        pool: PgPool,
+        pool: SqlitePool,
         account_id: Uuid,
         token: String,
         other_account_id: Uuid,
@@ -1692,22 +1720,34 @@ mod tests {
         let settled_id = settle_topup(&pool, account_id, 50_000).await;
 
         let pending_order = format!("test_pending_{}", Uuid::new_v4().simple());
-        let pending_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO topups (account_id, amount_idr, order_id, created_at) \
-             VALUES ($1, $2, $3, now() - interval '1 minute') RETURNING id",
+        // Ported: SQLite has no `interval` arithmetic and its `now()` emits the
+        // space-separated form the schema GLOB CHECK refuses, so the earlier instant
+        // is computed in Rust. `id` and `created_at` are bound because the strict
+        // schema has no DEFAULT for either.
+        let pending_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
+             VALUES (?, ?, ?, ?, 'pending', ?)",
         )
-        .bind(account_id)
+        .bind(pending_id.hyphenated())
+        .bind(account_id.hyphenated())
         .bind(25_000)
         .bind(&pending_order)
-        .fetch_one(&pool)
+        .bind(Utc::now() - chrono::Duration::minutes(1))
+        .execute(&pool)
         .await
         .expect("create a pending topup");
 
         let other_order = format!("test_other_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
-            .bind(other_account_id)
+        sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
+             VALUES (?, ?, ?, ?, 'pending', ?)",
+        )
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(other_account_id.hyphenated())
             .bind(1_234_567)
             .bind(&other_order)
+            .bind(Utc::now())
             .execute(&pool)
             .await
             .expect("create the other account topup");
@@ -1814,7 +1854,6 @@ mod tests {
     // reached, and the client never fabricates a token.
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_create_topup_persists_nothing_when_snap_cannot_be_reached() {
         // Held for the WHOLE test body. The assertions below run in a spawned
@@ -1823,7 +1862,8 @@ mod tests {
         // module or in routes::webhooks, which installs its own key.
         let _env = EnvLock::acquire();
 
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
 
         let outcome = tokio::spawn(create_topup_failure_assertions(
@@ -1833,11 +1873,11 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        db.close().await;
         outcome.expect("the create_topup assertions panicked");
     }
 
-    async fn create_topup_failure_assertions(pool: PgPool, account_id: Uuid, token: String) {
+    async fn create_topup_failure_assertions(pool: SqlitePool, account_id: Uuid, token: String) {
         let wallet = configured_wallet();
         let amount = wallet.min_first_deposit as i64;
 
@@ -1872,8 +1912,8 @@ mod tests {
         // The load-bearing assertion: Midtrans first, row second. A rejected or
         // unreachable Snap call must leave NO row - so there is nothing pending
         // to settle later and no fabricated token persisted.
-        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = $1")
-            .bind(account_id)
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_one(&pool)
             .await
             .expect("count topups");
@@ -1883,17 +1923,17 @@ mod tests {
         );
 
         let settled: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM topups WHERE account_id = $1 AND status = 'settled'",
+            "SELECT count(*) FROM topups WHERE account_id = ? AND status = 'settled'",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(&pool)
         .await
         .expect("count settled");
         assert_eq!(settled, 0, "nothing may be settled or paid");
 
         let balance: i64 =
-            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read balance");
@@ -1910,14 +1950,14 @@ mod tests {
     // 5 + 6. Deposit limits against REAL settled history
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_deposit_limits_follow_the_real_settled_history() {
         // Same reason as the Snap-failure test above: this one also reaches Snap
         // with an invalid key, so its write is serialised and restored.
         let _env = EnvLock::acquire();
 
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
 
         let outcome = tokio::spawn(deposit_limit_assertions(
@@ -1927,11 +1967,11 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        db.close().await;
         outcome.expect("the deposit limit assertions panicked");
     }
 
-    async fn deposit_limit_assertions(pool: PgPool, account_id: Uuid, token: String) {
+    async fn deposit_limit_assertions(pool: SqlitePool, account_id: Uuid, token: String) {
         let wallet = configured_wallet();
         // Pinned against the real config file, so this test cannot drift into
         // asserting numbers the server does not actually use.
@@ -1950,9 +1990,9 @@ mod tests {
 
         // --- No settled history: the FIRST-deposit minimum applies. ---
         let history: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM topups WHERE account_id = $1 AND status = 'settled'",
+            "SELECT count(*) FROM topups WHERE account_id = ? AND status = 'settled'",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(&pool)
         .await
         .expect("count settled history");
@@ -1988,8 +2028,8 @@ mod tests {
 
         // The refused attempt created nothing.
         let after_refusal: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count topups");
@@ -1999,9 +2039,9 @@ mod tests {
         settle_topup(&pool, account_id, wallet.min_first_deposit as i64).await;
 
         let history: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM topups WHERE account_id = $1 AND status = 'settled'",
+            "SELECT count(*) FROM topups WHERE account_id = ? AND status = 'settled'",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(&pool)
         .await
         .expect("count settled history");
@@ -2039,8 +2079,8 @@ mod tests {
         // Still exactly one row: the deposit check passed, but the Snap failure
         // persisted nothing.
         let final_rows: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count topups");
@@ -2182,15 +2222,16 @@ mod tests {
     /// handler's decision on EXISTING history, and manufacturing that history
     /// with the very code path under test would be circular. `created_at` is
     /// pinned 90s back so the rows sit unambiguously inside the rolling window.
-    async fn seed_topups_inside_the_cap_window(pool: &PgPool, account_id: Uuid, count: i64) {
+    async fn seed_topups_inside_the_cap_window(pool: &SqlitePool, account_id: Uuid, count: i64) {
         let created_at = Utc::now() - chrono::Duration::seconds(90);
         for _ in 0..count {
             let order_id = format!("test_cap_{}", Uuid::new_v4().simple());
             sqlx::query(
-                "INSERT INTO topups (account_id, amount_idr, order_id, status, created_at) \
-                 VALUES ($1, $2, $3, 'pending', $4)",
+                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
+                 VALUES (?, ?, ?, ?, 'pending', ?)",
             )
-            .bind(account_id)
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
             .bind(1_000_000_i64)
             .bind(&order_id)
             .bind(created_at)
@@ -2200,10 +2241,10 @@ mod tests {
         }
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_create_topup_refuses_with_429_once_the_handler_cap_is_hit() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
 
         let outcome = tokio::spawn(create_topup_cap_assertions(
@@ -2213,11 +2254,11 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        db.close().await;
         outcome.expect("the create_topup cap assertions panicked");
     }
 
-    async fn create_topup_cap_assertions(pool: PgPool, account_id: Uuid, token: String) {
+    async fn create_topup_cap_assertions(pool: SqlitePool, account_id: Uuid, token: String) {
         let state = live_app_state(pool.clone());
         let cap = state.config.limits.topup_per_hour as i64;
         assert!(
@@ -2250,8 +2291,8 @@ mod tests {
 
         // The refusal wrote nothing. The cap counts rows, so a refused request
         // that still inserted one would refill its own budget.
-        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = $1")
-            .bind(account_id)
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM topups WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_one(&pool)
             .await
             .expect("count topups");
@@ -2262,8 +2303,8 @@ mod tests {
 
         // And no money moved on the way to the refusal.
         let balance: i64 =
-            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read balance");
@@ -2275,7 +2316,6 @@ mod tests {
         );
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_create_topup_success_persists_a_pending_row_and_returns_201() {
         // Held for the WHOLE test body: the assertions below point
@@ -2283,7 +2323,8 @@ mod tests {
         // never be visible to the sibling test that asserts Snap FAILS.
         let _env = EnvLock::acquire();
 
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
 
         let outcome = tokio::spawn(create_topup_success_assertions(
@@ -2293,11 +2334,11 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        db.close().await;
         outcome.expect("the create_topup success assertions panicked");
     }
 
-    async fn create_topup_success_assertions(pool: PgPool, account_id: Uuid, token: String) {
+    async fn create_topup_success_assertions(pool: SqlitePool, account_id: Uuid, token: String) {
         let wallet = configured_wallet();
         let amount = wallet.min_first_deposit as i64;
 
@@ -2398,15 +2439,24 @@ mod tests {
         // The row the success INSERT wrote, read back column by column.
         let row = sqlx::query(
             "SELECT id, account_id, amount_idr, order_id, status, snap_token, settled_at \
-             FROM topups WHERE order_id = $1",
+             FROM topups WHERE order_id = ?",
         )
         .bind(order_id)
         .fetch_one(&pool)
         .await
         .expect("the success path must have inserted the topups row");
 
-        assert_eq!(row.get::<Uuid, _>("id"), Uuid::parse_str(topup_id).unwrap());
-        assert_eq!(row.get::<Uuid, _>("account_id"), account_id);
+        // Ported: `topups.id` and `topups.account_id` are TEXT, so both decode
+        // through `Hyphenated` rather than a bare `Uuid` (the failure is
+        // `ParseByteLength { len: 36 }`).
+        assert_eq!(
+            row.get::<Hyphenated, _>("id").into_uuid(),
+            Uuid::parse_str(topup_id).unwrap()
+        );
+        assert_eq!(
+            row.get::<Hyphenated, _>("account_id").into_uuid(),
+            account_id
+        );
         assert_eq!(row.get::<i64, _>("amount_idr"), amount);
         assert_eq!(row.get::<String, _>("order_id"), order_id);
         assert_eq!(
@@ -2463,7 +2513,7 @@ mod tests {
             "the 201's row must settle to exactly its amount"
         );
 
-        let settled = sqlx::query("SELECT status, settled_at FROM topups WHERE order_id = $1")
+        let settled = sqlx::query("SELECT status, settled_at FROM topups WHERE order_id = ?")
             .bind(order_id)
             .fetch_one(&pool)
             .await
@@ -2476,8 +2526,8 @@ mod tests {
             "a settled top-up carries its settled_at"
         );
 
-        let ledger = sqlx::query("SELECT delta_idr, reason, ref FROM ledger WHERE account_id = $1")
-            .bind(account_id)
+        let ledger = sqlx::query("SELECT delta_idr, reason, ref FROM ledger WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_all(&pool)
             .await
             .expect("read the ledger");
@@ -2487,8 +2537,8 @@ mod tests {
         assert_eq!(ledger[0].get::<String, _>("ref"), topup_id);
 
         let balance: i64 =
-            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read balance");
@@ -2503,8 +2553,8 @@ mod tests {
             "a replayed settlement must be idempotent"
         );
         let after_replay: i64 =
-            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read balance");
@@ -2524,10 +2574,10 @@ mod tests {
     /// the migrated schema, and that the documented status vocabulary is the one
     /// the CHECK constraint enforces - so a schema change that would break the
     /// success path fails here instead of in production.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_topups_row_accepts_exactly_what_create_topups_insert_writes() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let primary = live_account(&pool).await;
 
         let outcome = tokio::spawn(topups_row_contract_assertions(
@@ -2536,30 +2586,32 @@ mod tests {
         ));
 
         let outcome = outcome.await;
-        delete_fixture_rows(&pool, &[primary.account_id]).await;
+        db.close().await;
         outcome.expect("the topups row contract assertions panicked");
     }
 
-    async fn topups_row_contract_assertions(pool: PgPool, account_id: Uuid) {
+    async fn topups_row_contract_assertions(pool: SqlitePool, account_id: Uuid) {
         // Column list transcribed from create_topup's INSERT (account.rs:516),
         // status literal included.
         let topup_id = Uuid::new_v4();
         let order_id = format!("topup_{topup_id}");
         sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token) \
-             VALUES ($1, $2, $3, $4, 'pending', $5)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, created_at) \
+             VALUES (?, ?, ?, ?, 'pending', ?, ?)",
         )
-        .bind(topup_id)
-        .bind(account_id)
+        .bind(topup_id.hyphenated())
+        .bind(account_id.hyphenated())
         .bind(50_000_i64)
         .bind(&order_id)
         .bind("snap-token-from-midtrans")
+        .bind(Utc::now())
+        .bind(Utc::now())
         .execute(&pool)
         .await
         .expect("the schema must accept the tuple create_topup writes");
 
-        let row = sqlx::query("SELECT status, snap_token, settled_at FROM topups WHERE id = $1")
-            .bind(topup_id)
+        let row = sqlx::query("SELECT status, snap_token, settled_at FROM topups WHERE id = ?")
+            .bind(topup_id.hyphenated())
             .fetch_one(&pool)
             .await
             .expect("read back the row");
@@ -2576,13 +2628,15 @@ mod tests {
         for status in ["pending", "settled", "denied", "expired", "refunded"] {
             let order_id = format!("test_status_{}", Uuid::new_v4().simple());
             sqlx::query(
-                "INSERT INTO topups (account_id, amount_idr, order_id, status) \
-                 VALUES ($1, $2, $3, $4)",
+                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
-            .bind(account_id)
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
             .bind(1_000_i64)
             .bind(&order_id)
             .bind(status)
+            .bind(Utc::now())
             .execute(&pool)
             .await
             .unwrap_or_else(|e| panic!("{status} must be a documented status: {e}"));
@@ -2591,19 +2645,21 @@ mod tests {
         // ...and anything outside it is refused, not silently stored.
         let bad_order = format!("test_status_bad_{}", Uuid::new_v4().simple());
         let refused = sqlx::query(
-            "INSERT INTO topups (account_id, amount_idr, order_id, status) \
-             VALUES ($1, $2, $3, 'partially_paid')",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
+             VALUES (?, ?, ?, ?, 'partially_paid', ?)",
         )
-        .bind(account_id)
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
         .bind(1_000_i64)
         .bind(&bad_order)
+        .bind(Utc::now())
         .execute(&pool)
         .await;
         assert!(
             refused.is_err(),
             "an undocumented status must be refused by the CHECK constraint"
         );
-        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM topups WHERE order_id = $1")
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM topups WHERE order_id = ?")
             .bind(&bad_order)
             .fetch_one(&pool)
             .await

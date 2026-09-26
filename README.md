@@ -20,7 +20,7 @@ surface, priced at a fixed margin over wholesale cost.
 | [`docs/architecture.md`](docs/architecture.md) | The system end to end — the authoritative stack |
 | [`docs/topology.md`](docs/topology.md) | The triangle: Cloudflare, relay, Northflank, failover |
 | [`docs/server/api-spec.md`](docs/server/api-spec.md) | Every endpoint, auth scheme, enforcement order |
-| [`docs/website/02-data-model.md`](docs/website/02-data-model.md) | PostgreSQL schema (parser-validated) |
+| [`docs/website/02-data-model.md`](docs/website/02-data-model.md) | SQLite schema (parser-validated) |
 | [`docs/business/README.md`](docs/business/README.md) | Does the business work — pricing, model, risks |
 
 ### Building it
@@ -75,8 +75,8 @@ these disagree, `docs/architecture.md` and the business docs win.
 | Frontend | Cloudflare Pages | **Astro** + islands |
 | Edge relay | Linux VPS (2 vCPU / 4 GB) | nginx + Docker |
 | API + proxy | Northflank | Rust |
-| Money | Northflank | PostgreSQL |
-| Identity | Northflank | PocketBase |
+| Money | Northflank | SQLite (embedded — no separate service) |
+| Identity | Northflank | PocketBase, until Phase 6 replaces it in Rust |
 
 Push to `main` deploys. Reasoning and consequences:
 [`docs/architecture.md`](docs/architecture.md).
@@ -97,7 +97,7 @@ Push to `main` deploys. Reasoning and consequences:
 **Built locally; nothing deployed.** The server and the website both exist and
 pass their test suites — but no environment is live and no customer has been served.
 
-Settled (41 documents): the stack and topology, the identity model, the PostgreSQL
+Settled (41 documents): the stack and topology, the identity model, the SQLite
 schema (validated with a SQL parser), the full HTTP API, payments, API keys and
 limits, realtime, failover, the relay, deployment, cost, observability, backup,
 abuse handling, data retention, and the Terms of Service outline.

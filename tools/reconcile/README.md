@@ -1,7 +1,7 @@
 # Ledger reconciliation gate (launch Gate 2)
 
 This directory holds the wallet/ledger reconciliation check required by
-[Gate 2 - Money correctness](../docs/launch-checklist.md). Gate 2 requires that
+[Gate 2 - Money correctness](../../docs/launch-checklist.md). Gate 2 requires that
 **"The reconciliation query returns zero rows on production data"** - it is the
 single best guard against silently wrong money.
 
@@ -101,24 +101,26 @@ so it is reported but does not fail the gate; an older one does.
   form; this file is the corrected one), using the real column names from
   `server/migrations/20260925000000_initial_schema.sql`. Returns the drifting
   accounts and ledger-only accounts, with both figures.
-- `reconcile.sh` - a POSIX shell runner. Applies both checks against
-  `$DATABASE_URL` via `psql`, prints the results, and exits non-zero when either
-  check fails, so it can gate CI.
+- `reconcile.sh` - a POSIX shell runner. Applies both checks against the SQLite
+  file `$DATABASE_URL` names, via the `sqlite3` CLI, prints the results, and
+  exits non-zero when either check fails, so it can gate CI.
 
 ## How to run
 
 ```sh
-export DATABASE_URL='postgres://user:pass@host:5432/db'
+export DATABASE_URL='sqlite://data/server.db'
 sh tools/reconcile/reconcile.sh
 ```
 
 In CI (e.g. a launch Gate 2 job), a non-zero exit fails the build.
 
-Rows are counted from psql **stdout** only. psql **stderr** is diagnostics - a
-`NOTICE` or `WARNING` on an otherwise healthy database is surfaced as
-diagnostic output and never counted as drift, so a chatty Postgres cannot make
-the gate red for the wrong reason. A genuinely failed psql run is exit 4, not a
-warning.
+`sqlite3` must be on `PATH`. It is not a dependency of the Rust build, so a CI
+image needs it installed explicitly — a missing `sqlite3` is exit `3`, not a
+silent pass.
+
+Rows are counted from sqlite3 **stdout** only. sqlite3 **stderr** is diagnostics -
+surfaced as diagnostic output and never counted as drift. A genuinely failed
+sqlite3 run is exit 4, not a warning.
 
 ## Exit codes
 
@@ -126,24 +128,71 @@ warning.
 | ---- | ------- |
 | `0`  | Passed - zero drifting accounts and zero holds over the bound. |
 | `1`  | **Drift detected** - at least one account where `balance_idr <> SUM(ledger.delta_idr)`, or ledger money with no `wallets` row. Investigate before the customer notices. |
-| `2`  | `DATABASE_URL` is not set - unset, empty, or whitespace only. |
-| `3`  | `psql` is not installed / not on PATH. |
-| `4`  | `psql` ran but failed (connection, permissions, or SQL error). |
+| `2`  | `DATABASE_URL` is not set (unset, empty, or whitespace only), is not a SQLite URL, or names an in-memory database. |
+| `3`  | `sqlite3` is not installed / not on `PATH`. |
+| `4`  | `sqlite3` ran but failed (unreadable file, or a SQL error). |
 | `5`  | **Stranded hold** - at least one reservation hold unpaired for more than `HOLD_MAX_AGE_SECONDS` (default 900s): money left a wallet and came back nowhere. Run `hold-sweep`. |
+| `6`  | The database file `DATABASE_URL` names does not exist. |
 
-Codes `0`-`4` keep their original meanings; `5` is additive, so an existing
-consumer that only knows `0`-`4` still treats it as a failure.
+Codes `0`-`4` and `5` keep their original meanings. `6` is the single addition the
+SQLite port forced: the port had wanted `5` for a missing database file, but `5`
+was already the stranded hold in this line, and one code meaning two things is
+worse than a new one. `6` is additive — every non-zero code is a failure, so an
+existing consumer that only knows `0`-`5` still fails the gate on a missing file,
+it just cannot name it. The compose scheduler and any CI caller that branches on
+the code should be taught `6`.
+
+## Two things the runner does on purpose
+
+**It opens the database `-readonly`.** Reconciliation must never write, so a stray
+`UPDATE` in `reconcile.sql` fails rather than silently moving money. On a WAL
+database this needs the `-shm` file to be creatable; where the volume forbids
+that, run the gate against a backup copy instead (`docs/backup-and-restore.md`).
+
+**It refuses a non-SQLite `DATABASE_URL` loudly.** The prefix is matched with a
+`case`, not stripped blindly, because a leftover `postgres://…` URL would
+otherwise be rewritten into a relative path that happens to be a plausible
+filename — and the gate would quietly check nothing.
 
 ## Verification status
 
-Verified against a live PostgreSQL (the local stack database) with every exit
-code exercised for real - no fabricated output. Because this host has no `psql`,
-the checks ran through a shim that execs the **real** `psql` inside the
-`apikita-postgres` container, so exit codes and error text are psql's own.
-Covered: clean DB (0, stderr empty), corrupted wallet balance (1, naming the
-account and both figures), ledger row with no wallet row (1, where the previous
-`LEFT JOIN` version exited 0), a NOTICE on stderr with zero rows (0, not 1),
-unset / empty / whitespace-only `DATABASE_URL` (2), absent `psql` (3),
-unreachable host and nonexistent database (4), and a seeded stranded hold
-(reported on a pass; exit 5 once it exceeds the bound). The fixtures were removed
-in FK order and the drift query returned to zero rows afterwards.
+`reconcile.sh` is verified by execution. `reconcile.sql` is **not** — read the
+next section before trusting a green run.
+
+The runner, against scratch SQLite databases (fixtures in `.agents/reconcile-verify/`):
+
+- `sh -n` clean.
+- `sh reconcile.sh` with no `DATABASE_URL` → exit `2`.
+- A leftover `postgres://…` URL → exit `2`, refused by name.
+- `sqlite3` off `PATH` → exit `3`.
+- `DATABASE_URL` naming a missing file → exit `6`.
+- Clean database (wallet 1000 = ledger sum 1000) → exit `0`.
+- Drift injected (wallet 1009 vs ledger 1000) → exit `1`, printing
+  `acc1|1009|1000`. A check that cannot fail is not a check, so the detection
+  path is proven, not just the clean path.
+- Ledger money with **no** `wallets` row → exit `1`, printing
+  `acc9|NO WALLET ROW|250000`.
+- A seeded stranded hold 26h old, wallet otherwise balanced → exit `5`, printing
+  the hold with its `age_seconds`. A hold under the bound does not fail the gate.
+
+### `reconcile.sql` is still Postgres SQL — the runner cannot pass today
+
+**This is a real, currently-failing gap, not a caveat.** `reconcile.sql` in this
+directory still uses Postgres `::text` casts. `sqlite3` rejects them:
+
+```
+Parse error near line 29: unrecognized token: ":"
+  HEN 'NO WALLET ROW'             ELSE w.balance_idr::text        END AS balance
+                                      error here ---^
+```
+
+Check 1 therefore exits `4` on every run, and because check 1 runs first the
+hold check never reports. The exit codes above were reproduced with a
+`CAST(… AS TEXT)` copy of the query in `.agents/reconcile-verify/probe/`; the
+committed `reconcile.sql` still needs the two-line fix:
+
+- `w.balance_idr::text` → `CAST(w.balance_idr AS TEXT)`
+- `COALESCE(SUM(l.delta_idr), 0)::text` → `CAST(COALESCE(SUM(l.delta_idr), 0) AS TEXT)`
+
+`reconcile.sql` was outside the file fence this README was resolved under, so it
+was left untouched and the gap is reported here instead of fixed silently.

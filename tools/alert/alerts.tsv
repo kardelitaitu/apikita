@@ -1,9 +1,9 @@
 id	title	condition	threshold	action	coverage	source
-webhook_rejection	Webhook rejection	any `topup.rejected`	any (>=1 in the window)	Investigate immediately - either an attack or a config error breaking payments	needs-metrics	docs/observability.md:99
+webhook_rejection	Webhook rejection	any `topup.rejected`	any (>=1 in the window)	Investigate immediately - either an attack or a config error breaking payments	covered	docs/observability.md:99
 ledger_drift	Ledger drift	`ledger_balance_drift_idr != 0`	0 (must equal 0)	Money is wrong. Freeze changes, investigate	covered	docs/observability.md:100
-api_down	API down	`/health` failing 2 min	120s of failed /health checks	Restart/investigate; auth is down	needs-metrics	docs/observability.md:101
+api_down	API down	`/health` failing 2 min	120s of failed /health checks	Restart/investigate; auth is down	covered	docs/observability.md:101
 relay_5xx	Relay 5xx	relay returns 502/504	any 502/504 in the window	The relay is up but the backend is not	needs-metrics	docs/observability.md:102
-relay_down	Relay down	external check fails	1 failed external check	Total outage - single point of failure	needs-metrics	docs/observability.md:103
+relay_down	Relay down	external check fails	1 failed external check	Total outage - single point of failure	covered	docs/observability.md:103
 all_providers_unhealthy	All providers unhealthy	circuit open on every endpoint	every endpoint open	Requests failing; check upstream	needs-metrics	docs/observability.md:104
 balance_negative	Balance negative	`balance_idr < 0`	0 (must equal 0)	Should be impossible (CHECK constraint). A bug	covered	docs/observability.md:105
 db_disk	DB disk >80%	volume usage	80%	Usage rows growing; check retention	needs-metrics	docs/observability.md:106

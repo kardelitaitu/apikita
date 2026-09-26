@@ -28,6 +28,10 @@ is real, and gets it in front of a human with the action attached.
   cooldown. Refuses to run with no channel.
 - `check-alerts.sh` - runs the checks the doc's table allows with `psql` alone, and
   prints the ones it cannot run. Fires `alert.sh` on a breach.
+- `probe.sh` - the three checks that need **no database at all** (`api_down`,
+  `relay_down`, `webhook_rejection`). Opens no database connection by design, so it
+  keeps working across the PostgreSQL -> SQLite migration. Fires `alert.sh` on a
+  breach, through the same transport and cooldown as everything else.
 
 ## How to run
 
@@ -38,6 +42,13 @@ WEBHOOK_URL='https://hooks.example/apikita' sh tools/alert/alert.sh \
 
 # the psql-only checks (drift, balance-negative, stranded holds)
 WEBHOOK_URL='https://hooks.example/apikita' sh tools/alert/check-alerts.sh
+
+# the database-free checks (api_down, relay_down, webhook_rejection)
+WEBHOOK_URL='https://hooks.example/apikita' sh tools/alert/probe.sh
+
+# one of them, and what probe.sh can and cannot check
+sh tools/alert/probe.sh --check api_down
+sh tools/alert/probe.sh --list
 
 # every definition and its coverage
 sh tools/alert/alert.sh --list
@@ -152,6 +163,29 @@ told) beats everything; then `2`/`3`/`4`/`6` (a check that could not run); then 
 (fired and delivered).** "Something is wrong" is only good news if you heard about
 it, and a check that did not run is not a check that passed.
 
+### `probe.sh`
+
+**The same table, deliberately - no new numbering was invented.** `0`-`4` keep
+`reconcile.sh`'s meanings, `5` and `6` are the same additive codes
+`check-alerts.sh` already uses, and the precedence rule is identical.
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | **CLEAN** - every selected check ran (or was **visibly skipped**) and no threshold was breached. |
+| `1`  | **FIRED** - at least one alert fired and was delivered (or throttled). |
+| `2`  | **CONFIG** - a knob is unusable: a non-integer `PROBE_*` window/interval/timeout, an unknown check id, or an unknown argument. |
+| `3`  | **MISSING** - no usable `curl`, or `alert.sh` is not next to this script. |
+| `4`  | **FAILED** - a check ran and could not reach a verdict (the log file is not readable). |
+| `5`  | **UNDELIVERED** - an alert fired and could **not** be delivered. Not a pass. |
+| `6`  | **UNKNOWN** - a configured source is absent, so the check cannot run (`PROBE_LOG_FILE` points at a file that does not exist). Unknown is not clean. |
+
+Note the split between **SKIPPED** and **UNKNOWN**, because conflating them is how a
+silent pass creeps back in: a check that is *not configured* is exit 0 with the skip
+printed (there is nothing to run, and the operator is told); a check that *is
+configured but unusable* is exit 6 (the operator believed it was running). A
+skipped check that nobody can see is the exact defect this directory exists to
+remove, so `--list` reports it too, as **skipped**.
+
 ## What `check-alerts.sh` actually checks
 
 Three checks, no metrics backend needed.
@@ -185,10 +219,67 @@ line**, not a counter:
 
 There is **no column anywhere in the schema that records a rejected webhook**, so
 `any topup.rejected` (the doc's condition, line 99) is **not answerable from SQL**.
-This is stated on every `check-alerts.sh` run rather than silently skipped. It is
-alertable the moment a metrics backend counts those log lines, or the moment a
-`topups.status` / audit row is written for a rejection - **both are changes outside
-this fence** (`server/**`), so they are reported here, not made here.
+`check-alerts.sh` states this on every run rather than silently skipping it - a
+database check cannot answer it, and pretending otherwise would be the defect. It
+is answered a different way by `probe.sh`: the same log lines, counted from the
+server's **captured stdout** (`PROBE_LOG_FILE`), which is exactly the "log counter"
+this section used to say was needed. No `server/**` change was required for that,
+and none was made.
+
+The remaining gap is honesty about the source: with no `PROBE_LOG_FILE` configured,
+`probe.sh` prints **SKIPPED - no log source configured** and says the alert is NOT
+being checked. A skipped check is stated, never counted as a pass.
+
+## What `probe.sh` actually checks
+
+Three checks, and **not one line of SQL**. This is deliberate, not incidental: the
+stack is mid-migration from PostgreSQL to SQLite (a concurrent change under
+`server/`), and a checker that reads the database goes blind during exactly the
+window when the migration is most likely to break something. `probe.sh` reads only
+HTTP and a log file, so it keeps working whichever engine is behind the API.
+
+| # | Check | How | Threshold |
+| - | ----- | --- | --------- |
+| 1 | **API down** | Polls `GET $PROBE_API_URL/health` and measures the **span** of consecutive non-200/failed checks | The registry's `120s of failed /health checks` |
+| 2 | **Relay down** | ONE `GET` of the relay's own origin (`$PROBE_RELAY_URL`) | `1 failed external check` - any HTTP answer at all is "up" |
+| 3 | **Webhook rejection** | Counts `topup.rejected` lines in the **server's captured stdout** (`$PROBE_LOG_FILE`), from the line offset of the last scan | `any (>=1 in the window)` |
+
+Three things about check 1 that are choices, not accidents:
+
+- **The window is a real window.** One failed sample is not 120s of failure. The
+  poll loop only returns once either `/health` answers (the failure run is broken -
+  consecutive means consecutive) or the failures span the window. It therefore
+  blocks only while the API is actually down, which is precisely when waiting out
+  the window before paging is the right call.
+- **A 502/504 is NOT `relay_down`.** Any HTTP answer means the relay is up; a bad
+  status is `relay_5xx`'s alert, which is still unchecked. Filing "the backend is
+  down" as "the edge is down" would be a wrong action attached to a real event.
+- **The webhook scan advances only on delivery.** The line offset is recorded when
+  somebody was actually told (delivered *or* throttled). A failed delivery does not
+  advance it, so the event is not lost - the same rule `alert.sh` applies to its
+  cooldown.
+
+### Environment
+
+Everything is overridable so the checks can be proven without waiting two minutes -
+which is how the verification below was done.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PROBE_API_URL` | `http://127.0.0.1:8080` | API origin; `/health` is appended. |
+| `PROBE_API_WINDOW_SECONDS` | `120` | The failure span that triggers `api_down` (the registry's documented window). |
+| `PROBE_API_INTERVAL_SECONDS` | `10` | Poll interval while the API is failing. Floored at `1`. |
+| `PROBE_RELAY_URL` | `http://127.0.0.1:8000` | The relay's own origin, checked externally. |
+| `PROBE_LOG_FILE` | - | The server's captured stdout. **Unset = `webhook_rejection` is SKIPPED, visibly.** |
+| `PROBE_STATE_DIR` | `${TMPDIR:-/tmp}/apikita-probe` | Where the webhook line offset lives. Must persist across runs, or the same lines are re-scanned. |
+| `PROBE_HTTP_TIMEOUT` | `5` | Connect/read timeout in seconds for both external checks. |
+| `ALERT_SINK_FILE` / `WEBHOOK_URL` / Telegram vars | - | **Not probe.sh's** - they belong to `alert.sh`, which does the delivering. See its table above. |
+| `ALERT_COOLDOWN_SECONDS` | `900` | **Not probe.sh's** either. It applies to every firing, because every firing goes through `alert.sh`. |
+
+`--check <id>` runs one check (repeatable); `--list` shows the three and marks
+`webhook_rejection` as **skipped** when `PROBE_LOG_FILE` is unset. The script
+honours the registry thresholds but never re-states them: the numbers in an alert's
+message come from `alerts.tsv` via `alert.sh`.
 
 ## Coverage: what this can deliver today
 
@@ -198,20 +289,31 @@ investigate, then credit**").
 
 | # | Doc alert (line) | Delivered today? | Why not, if not |
 | - | ---------------- | ---------------- | --------------- |
-| 1 | **Webhook rejection** (99) | **No** | The event exists only as a log line in `server/src/routes/webhooks.rs` (see above). Needs a metrics backend or a log counter. |
+| 1 | **Webhook rejection** (99) | **Yes** | `probe.sh` counts `topup.rejected` in the server's captured stdout (`PROBE_LOG_FILE`). **Skipped, not passed, when no log source is configured.** |
 | 2 | **Ledger drift** (100) | **Yes** | `check-alerts.sh` -> `reconcile.sh` -> `alert.sh`. |
-| 3 | **API down** (101) | **No** | An external `GET /health` probe on a 2-minute window. Not a database fact, and no prober exists in this repo. |
+| 3 | **API down** (101) | **Yes** | `probe.sh` -> external `GET /health`, alerting once the failure span covers the window. Not a database fact, so it needs no database. |
 | 4 | **Relay 5xx** (102) | **No** | nginx status counts. Needs a metrics backend (or an access-log counter). |
-| 5 | **Relay down** (103) | **No** | External check against the relay. |
+| 5 | **Relay down** (103) | **Yes** | `probe.sh` -> one external `GET` of the relay's origin. |
 | 6 | **All providers unhealthy** (104) | **No** | Circuit-breaker state is in-process (`server/src/upstream/circuit_breaker.rs`); it is not exposed anywhere a shell script can read. |
 | 7 | **Balance negative** (105) | **Yes** | One `SELECT COUNT(*)`, threshold 0. |
 | 8 | **DB disk >80%** (106) | **No** | Volume usage - not visible in SQL. |
 | 9 | **Error rate >5%** (107) | **No** | HTTP counters over a 5-minute window. Needs a metrics backend. |
 | + | **Stranded holds** (141-175) | **Yes** | Via `reconcile.sh`'s copy of the `hold-sweep` predicate. |
 
-**Covered: 3 of 10. Not covered: 7 of 10, and the reasons are in the table.** The
-four the task named as genuinely metrics-dependent - error rate, relay 5xx, DB
-disk, all-providers-unhealthy - are four of the seven.
+**Covered: 6 of 10. Not covered: 4 of 10, and the reasons are in the table.** Those
+four are the ones that genuinely need a surface nothing here can reach:
+
+- `error_rate` and `relay_5xx` both need nginx **access logs**, which are
+  deliberately disabled for privacy (`docs/edge-relay.md`, `docs/data-retention.md`) -
+  enabling them to satisfy an alert would trade a privacy decision for an
+  operational one, and that is not this script's trade to make.
+- `all_providers_unhealthy` needs the upstream **circuit-breaker state**, which is
+  in-process in `server/src/upstream/circuit_breaker.rs` and not exposed anywhere a
+  shell script can read.
+- `db_disk` needs **volume usage**, which no client of any engine can see.
+
+Wiring any of those is a call to `alert.sh --alert <id>` once the surface exists -
+no change to the transport, and no change to `probe.sh`.
 
 The delivery **mechanism**, though, is complete for all ten: `alerts.tsv` carries
 every doc alert's threshold and action, so wiring a metrics backend means calling
@@ -234,7 +336,7 @@ alert the doc did not ask for; `alerts.tsv` contains exactly the doc's 9 rows pl
 | **Bot token custody** | Where `TELEGRAM_BOT_TOKEN` lives (secret manager, host environment, compose secret) and how it is rotated if it leaks. |
 | **Scheduling** | **Nothing runs `check-alerts.sh` yet** - no cron, no compose service, no CI job. `tools/reconcile/` and `tools/backup/` have the same gap. |
 | **Cooldown length** | 900s matches `reconcile.sh`'s hold bound and is a starting point, not a measured value. What "one page per incident" means for your traffic is a judgement call. |
-| **A metrics backend** | The doc's other open item (line 199). Seven of ten alerts need it; self-hosted Prometheus vs a hosted service is a cost decision, not a technical one. |
+| **A metrics backend** | The doc's other open item (line 199). **Four** of ten alerts still need it (down from seven - `probe.sh` removed three without one). Self-hosted Prometheus vs a hosted service is a cost decision, not a technical one. |
 | **A public status page** | The doc's open item at line 202. Separate from alerting; nothing here addresses it. |
 
 **`docs/observability.md` was NOT edited.** Its open item at line 201 - "Alert
@@ -284,6 +386,34 @@ re-run with **no** shim on `PATH`, so exit codes and error text are psql's own.
 | m | Clean database, sink channel | **exit 0** CLEAN |
 | n | The whole matrix re-run with **no** `psql` shim on `PATH` | identical results: `0` CLEAN, `1` delivered, `1` throttled (1 payload), `2`, `3`, `4`, `5`, `6` |
 
+### `probe.sh` - verified 2026-09-26, with no database at all
+
+Every row below was produced for real on this host with `ALERT_SINK_FILE` as the
+channel (no credential needed) and `ALERT_COOLDOWN_SECONDS=0` **or** a fresh
+`ALERT_STATE_DIR` per firing - because the live cooldown is 900s and would otherwise
+suppress a repeat test firing. Row `x` shows that suppression working, not bypassed.
+The API and relay checks were pointed at local servers via `PROBE_*_URL`, so no
+component was stopped to run them.
+
+| # | Scenario | Result |
+| - | -------- | ------ |
+| p1 | `--check api_down`, healthy `/health` (200) | **exit 0**, `OK  api_down: ... returned 200`, **0 payloads** |
+| p2 | `--check api_down`, API **dead** (`PROBE_API_URL` at a port with nothing listening), window 3s | **exit 1**, `ALERT api_down: ... failing for 3s of the 3s window (1 consecutive failed check(s))`, **1 payload** with the registry's `Threshold: 120s of failed /health checks` |
+| p3 | `--check api_down` again, API healthy | **exit 0**, **0 payloads** - silent again |
+| p4 | `--check relay_down`, relay answering | **exit 0**, `OK  relay_down: ... answered (HTTP 200)`, **0 payloads** |
+| p5 | `--check relay_down`, relay **unreachable** | **exit 1**, `ALERT relay_down: ... did not answer a single external check`, **1 payload**, `Threshold: 1 failed external check` |
+| p6 | `--check relay_down` again, relay answering | **exit 0**, **0 payloads** |
+| p7 | `--check webhook_rejection`, log with **no** rejection line | **exit 0**, `0 'topup.rejected' in 3 new line(s)`, **0 payloads** |
+| p8 | append **one** line containing `topup.rejected` | **exit 1**, `ALERT webhook_rejection: 1 'topup.rejected' line(s) in 1 new line(s)`, **1 payload** |
+| p9 | run again, no new lines | **exit 0**, `0 in 0 new line(s) ... (4 total; scanned from line 5)` - the offset advanced, so the same event does not re-page |
+| p9b | append one more rejection | **exit 1** again - one page per rejection, not one per run |
+| p10 | `PROBE_LOG_FILE` **unset** | **exit 0** and `SKIPPED webhook_rejection - no log source configured ... This alert is NOT being checked`; `--list` marks it `skipped`. A skip stated out loud, never a pass |
+| p11 | `PROBE_LOG_FILE` set to a **missing** file | **exit 6** UNKNOWN - `'no rejections' cannot be claimed. Unknown is not clean.` |
+| p12 | log **rotated** (shrank below the offset) | rescans from the start and still fires - the offset never hides an event |
+| x | second firing inside the live 900s cooldown | `alert: THROTTLED ... cooldown 900s; nothing sent`, **still 1 payload** - the cooldown is genuinely in force |
+| y | `--list` | the three checks with their `covered`/`skipped` state and the four still-unchecked ids |
+| z | unknown argument / unknown check id | **exit 2** |
+
 ### Mutation-checked
 
 Each guard was removed and the bad behaviour reproduced, to prove the guard - not
@@ -294,6 +424,13 @@ and after (`6619a438...d341b31`), so "restored" is verified, not claimed.
 | -------- | --------- | ------- |
 | The no-channel refusal returns `exit 0` instead of `exit 2` | exit 2, refusal printed, nothing sent | **exit 0 with no channel and nothing sent** - a silently dropped alert reported as success |
 | The cooldown is hard-coded to `0` (`ALERT_COOLDOWN_SECONDS` ignored) | 2 runs -> 1 payload | **3 runs -> 3 payloads** - the alert fatigue the doc warns about |
+| `probe.sh`: the `api_down` window comparison `[ "$SPAN" -ge "$API_WINDOW" ]` is made unsatisfiable | API dead -> **exit 1**, 1 payload | **exit 0 CLEAN with the API still dead and nothing fired** - the outage reported as healthy |
+| `probe.sh`: the `topup.rejected` pattern is changed to match nothing | rejection in the log -> **exit 1**, 1 payload | **exit 0 CLEAN with the rejection still in the log and nothing fired** |
+
+Both mutants were run as **copies under `.agents/`**, with a copy of `alert.sh` beside
+them (`probe.sh` resolves it from its own directory) - the shipped file was never
+edited. `probe.sh`'s sha256 was `c429a642...454b1f0` before **and** after the
+mutation run, and `alert.sh`'s was unchanged (`c140495d...39f69`) throughout.
 
 ### Not verified
 
@@ -304,8 +441,15 @@ and after (`6619a438...d341b31`), so "restored" is verified, not claimed.
 - **A webhook receiver under load, or with retries.** The sink accepts one POST at a
   time and returns 200. No retry, backoff, or ordering behaviour is implemented or
   tested - `alert.sh` fires once and reports.
-- **The seven metrics-dependent alerts.** By construction: no metrics backend exists
-  (the doc's own open item).
+- **The four alerts that still need a surface.** By construction: no metrics backend,
+  no access logs, no server-side breaker or volume surface exists (the doc's own open
+  item). The three `probe.sh` covers are no longer in this list.
+- **`probe.sh` against the real API and relay.** The checks were verified against
+  local HTTP servers via `PROBE_API_URL` / `PROBE_RELAY_URL`; the `120s` window was
+  exercised at 3s for the same reason the knobs exist. On this host the real API
+  (`127.0.0.1:8080`) was **not listening**, and the relay (`127.0.0.1:8000`) answered -
+  the dead-API path was therefore proved against a dead port, which is the same
+  observable behaviour.
 - **A schedule.** Nothing invokes `check-alerts.sh` automatically.
 - **`ALERT_STATE_DIR` on a durable path.** Verified under `.agents/`, i.e. a
   writable local filesystem. A read-only or per-process `${TMPDIR:-/tmp}` is handled

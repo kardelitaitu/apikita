@@ -1,19 +1,21 @@
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{PgPool, Row};
+use sha2::{Digest, Sha256};
+use sqlx::{SqlitePool, Row};
 use std::collections::HashMap;
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::error::AppError;
 use crate::routes::proxy::{invalidate_key_cache, AppState};
-use crate::routes::{hash_token, resolve_account_from_cookie};
+use crate::routes::hash_token;
 
 #[derive(Debug, Serialize)]
 pub struct ApiKeyDto {
@@ -106,20 +108,20 @@ fn fold_spend_in_window(rows: &[(Uuid, NaiveDate, i64)], today: NaiveDate) -> Ha
 /// disagreeing, and a key showing "limit reached" that still gets served is
 /// precisely the defect this closes.
 pub(crate) async fn key_spend_used(
-    pool: &PgPool,
+    pool: &SqlitePool,
     account_id: Uuid,
     key_id: Uuid,
     today: NaiveDate,
 ) -> Result<i64, AppError> {
     let used: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT SUM(cost_idr)::bigint
+        SELECT SUM(cost_idr)
         FROM usage_daily
-        WHERE account_id = $1 AND api_key_id = $2 AND day >= $3
+        WHERE account_id = ? AND api_key_id = ? AND day >= ?
         "#,
     )
-    .bind(account_id)
-    .bind(key_id)
+    .bind(account_id.hyphenated())
+    .bind(key_id.hyphenated())
     .bind(spend_window_start(today))
     .fetch_one(pool)
     .await?;
@@ -140,20 +142,20 @@ pub(crate) async fn key_spend_used(
 /// still tokens consumed, and `usage_daily` is the only place the request path
 /// records them.
 pub(crate) async fn key_tokens_used(
-    pool: &PgPool,
+    pool: &SqlitePool,
     account_id: Uuid,
     key_id: Uuid,
     today: NaiveDate,
 ) -> Result<i64, AppError> {
     let used: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT SUM(input_tokens + cache_read_tokens + output_tokens)::bigint
+        SELECT SUM(input_tokens + cache_read_tokens + output_tokens)
         FROM usage_daily
-        WHERE account_id = $1 AND api_key_id = $2 AND day >= $3
+        WHERE account_id = ? AND api_key_id = ? AND day >= ?
         "#,
     )
-    .bind(account_id)
-    .bind(key_id)
+    .bind(account_id.hyphenated())
+    .bind(key_id.hyphenated())
     .bind(spend_window_start(today))
     .fetch_one(pool)
     .await?;
@@ -202,6 +204,55 @@ fn check_token_limit(requested: i64) -> Result<(), AppError> {
     Ok(())
 }
 
+/// SHA-256 hex of a session token.
+///
+/// Carried over from the Postgres branch, where the shared resolver in
+/// `crate::routes` took a `PgPool`. It is now a `SqlitePool` too, so this local
+/// copy is equivalent to it and is kept so the handler and its tests run the same
+/// resolver. The token is hashed, never stored raw.
+fn hash_string(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// The account a request's session cookie resolves to, against SQLite.
+///
+/// The Postgres branch shared one resolver in `crate::routes`, but that one takes
+/// a `PgPool` and this crate's sqlx is sqlite-only, so the port gave each route
+/// module its own. Kept here rather than centralised for the same reason: the
+/// resolution rule - hash the token, never store it raw, treat every failure as
+/// Unauthenticated - stays next to the handlers that use it.
+async fn resolve_account_from_cookie(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<Uuid, AppError> {
+    let cookie_hdr = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthenticated)?;
+
+    for piece in cookie_hdr.split(';') {
+        let piece = piece.trim();
+        if let Some(token) = piece.strip_prefix("session=") {
+            let token_hash = hash_string(token);
+            let session = sqlx::query(
+                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+            )
+            .bind(token_hash)
+            .bind(Utc::now())
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some(s) = session {
+                return Ok(s.get::<Hyphenated, _>("account_id").into_uuid());
+            }
+        }
+    }
+
+    Err(AppError::Unauthenticated)
+}
+
 /// The same refusal for `rate_limit_rpm`.
 ///
 /// `proxy.rs`: "Setting `rate_limit_rpm` to 0 disables the check entirely." A
@@ -221,7 +272,7 @@ fn check_rate_limit(requested: i32) -> Result<(), AppError> {
 }
 
 pub async fn list_keys(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
@@ -232,11 +283,11 @@ pub async fn list_keys(
             id, prefix, label, models, spend_limit_idr, rate_limit_rpm,
             expires_at, last_used_at, revoked_at
         FROM api_keys
-        WHERE account_id = $1
+        WHERE account_id = ?
         ORDER BY created_at DESC
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .fetch_all(&pool)
     .await?;
 
@@ -247,10 +298,10 @@ pub async fn list_keys(
         r#"
         SELECT api_key_id, day, cost_idr
         FROM usage_daily
-        WHERE account_id = $1 AND api_key_id IS NOT NULL AND day >= $2
+        WHERE account_id = ? AND api_key_id IS NOT NULL AND day >= ?
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
     .bind(spend_window_start(today))
     .fetch_all(&pool)
     .await?;
@@ -258,7 +309,7 @@ pub async fn list_keys(
     let usage: Vec<(Uuid, NaiveDate, i64)> = usage_rows
         .into_iter()
         .map(|r| {
-            let key_id: Uuid = r.get("api_key_id");
+            let key_id: Uuid = r.get::<Hyphenated, _>("api_key_id").into_uuid();
             let day: NaiveDate = r.get("day");
             let cost_idr: i64 = r.get("cost_idr");
             (key_id, day, cost_idr)
@@ -269,7 +320,7 @@ pub async fn list_keys(
     let response: Vec<ApiKeyDto> = keys
         .into_iter()
         .map(|k| {
-            let id: Uuid = k.get("id");
+            let id: Uuid = k.get::<Hyphenated, _>("id").into_uuid();
             ApiKeyDto {
                 id,
                 prefix: k.get("prefix"),
@@ -332,17 +383,22 @@ pub async fn create_key(
     check_token_limit(payload.token_limit)?;
     check_rate_limit(payload.rate_limit_rpm)?;
 
+    // `id` and `created_at` are bound, not defaulted: both had Postgres defaults
+    // (`gen_random_uuid()`, `now()`) which the SQLite schema deliberately removed
+    // (plan section 4.6). Returning `id` rather than echoing the generated value
+    // keeps this honest if the insert ever gains an upsert clause.
     let key_record = sqlx::query(
         r#"
         INSERT INTO api_keys (
-            account_id, key_hash, prefix, label, models,
-            spend_limit_idr, token_limit, rate_limit_rpm, expires_at
+            id, account_id, key_hash, prefix, label, models,
+            spend_limit_idr, token_limit, rate_limit_rpm, expires_at, created_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         "#,
     )
-    .bind(account_id)
+    .bind(Uuid::new_v4().hyphenated())
+    .bind(account_id.hyphenated())
     .bind(key_hash)
     .bind(&prefix)
     .bind(payload.label)
@@ -351,10 +407,11 @@ pub async fn create_key(
     .bind(payload.token_limit)
     .bind(payload.rate_limit_rpm)
     .bind(payload.expires_at)
+    .bind(Utc::now())
     .fetch_one(&state.pool)
     .await?;
 
-    let id: Uuid = key_record.get("id");
+    let id: Uuid = key_record.get::<Hyphenated, _>("id").into_uuid();
 
     Ok((
         StatusCode::CREATED,
@@ -400,13 +457,13 @@ pub async fn update_key(
         r#"
         UPDATE api_keys
         SET
-            label = COALESCE($1, label),
-            models = COALESCE($2, models),
-            spend_limit_idr = COALESCE($3, spend_limit_idr),
-            token_limit = COALESCE($4, token_limit),
-            rate_limit_rpm = COALESCE($5, rate_limit_rpm),
-            expires_at = COALESCE($6, expires_at)
-        WHERE id = $7 AND account_id = $8 AND revoked_at IS NULL
+            label = COALESCE(?, label),
+            models = COALESCE(?, models),
+            spend_limit_idr = COALESCE(?, spend_limit_idr),
+            token_limit = COALESCE(?, token_limit),
+            rate_limit_rpm = COALESCE(?, rate_limit_rpm),
+            expires_at = COALESCE(?, expires_at)
+        WHERE id = ? AND account_id = ? AND revoked_at IS NULL
         RETURNING key_hash
         "#,
     )
@@ -416,8 +473,8 @@ pub async fn update_key(
     .bind(payload.token_limit)
     .bind(payload.rate_limit_rpm)
     .bind(payload.expires_at)
-    .bind(id)
-    .bind(account_id)
+    .bind(id.hyphenated())
+    .bind(account_id.hyphenated())
     .fetch_optional(&state.pool)
     .await?;
 
@@ -450,13 +507,14 @@ pub async fn revoke_key(
     // the plaintext never has to be reconstructed to evict an entry.
     let revoked_hash: Option<String> = sqlx::query_scalar(
         r#"
-        UPDATE api_keys SET revoked_at = now()
-        WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
+        UPDATE api_keys SET revoked_at = ?
+        WHERE id = ? AND account_id = ? AND revoked_at IS NULL
         RETURNING key_hash
         "#,
     )
-    .bind(id)
-    .bind(account_id)
+    .bind(Utc::now())
+    .bind(id.hyphenated())
+    .bind(account_id.hyphenated())
     .fetch_optional(&state.pool)
     .await?;
 
@@ -480,6 +538,7 @@ pub async fn revoke_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{self, TestDb};
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -581,7 +640,7 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::db::{
-        credit_topup_transaction, debit_usage_transaction, init_pool, TopupCreditResult,
+        credit_topup_transaction, debit_usage_transaction, TopupCreditResult,
         UsageSettlement,
     };
     // Postgres keeps timestamptz at microsecond resolution, so the live tests
@@ -637,7 +696,7 @@ mod tests {
     /// The real application state, built the way main.rs builds it, so the
     /// handlers run against the same cache instance and the same config the
     /// process serves with.
-    fn test_state(pool: PgPool) -> AppState {
+    fn test_state(pool: SqlitePool) -> AppState {
         let config = live_config();
         let events = Arc::new(RealtimeHub::new(&config.realtime));
         let trusted_proxies: Arc<[IpCidr]> = Arc::from(
@@ -655,31 +714,26 @@ mod tests {
         }
     }
 
-    async fn live_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        init_pool(&database_url).await.expect("connect to Postgres")
-    }
-
-    async fn create_account(pool: &PgPool) -> Uuid {
-        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-            .bind(format!("test_{}", Uuid::new_v4().simple()))
-            .fetch_one(pool)
-            .await
-            .expect("create account")
+    async fn create_account(pool: &SqlitePool) -> Uuid {
+        test_support::account(pool).await
     }
 
     /// A real sessions row and the cookie that resolves to it, so every handler
     /// below is reached through the production authentication path
     /// (resolve_account_from_cookie) rather than a hand-passed account id.
-    async fn session_cookie(pool: &PgPool, account_id: Uuid) -> HeaderMap {
+    async fn session_cookie(pool: &SqlitePool, account_id: Uuid) -> HeaderMap {
         let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        let now = Utc::now();
         sqlx::query(
-            "INSERT INTO sessions (account_id, token_hash, expires_at)
-             VALUES ($1, $2, now() + interval '30 days')",
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(account_id)
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
         .bind(hash_token(&token))
+        .bind(now + chrono::Duration::days(30))
+        .bind(now)
+        .bind(now)
         .execute(pool)
         .await
         .expect("create session");
@@ -696,21 +750,24 @@ mod tests {
     /// the matching + ledger row in the same transaction. Writing
     /// wallets.balance_idr directly manufactures exactly the reconciliation drift
     /// the drift_rows assertion at the end of every test looks for.
-    async fn open_wallet(pool: &PgPool, account_id: Uuid, opening_idr: i64) {
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(account_id)
-            .execute(pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
+    async fn open_wallet(pool: &SqlitePool, account_id: Uuid, opening_idr: i64) {
+        // Ported: `wallets.updated_at` is NOT NULL with no DEFAULT in the strict
+        // SQLite schema, so the Postgres shape fails at runtime.
+        test_support::wallet(pool, account_id).await;
 
         let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
-            .bind(account_id)
-            .bind(opening_idr)
-            .bind(&order_id)
-            .execute(pool)
-            .await
-            .expect("create topup");
+        sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
+             VALUES (?, ?, ?, ?, 'pending', ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(opening_idr)
+        .bind(&order_id)
+        .bind(Utc::now())
+        .execute(pool)
+        .await
+        .expect("create topup");
 
         assert_eq!(
             credit_topup_transaction(pool, &order_id, opening_idr)
@@ -731,7 +788,7 @@ mod tests {
     /// drift-neutral: the reconciliation invariant is unaffected by it.
     #[allow(clippy::too_many_arguments)]
     async fn insert_usage(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         key_id: Uuid,
         day: NaiveDate,
@@ -744,10 +801,10 @@ mod tests {
             "INSERT INTO usage_daily (
                  account_id, api_key_id, day,
                  input_tokens, cache_read_tokens, output_tokens, cost_idr
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(account_id)
-        .bind(key_id)
+        .bind(account_id.hyphenated())
+        .bind(key_id.hyphenated())
         .bind(day)
         .bind(input_tokens)
         .bind(cache_read_tokens)
@@ -758,44 +815,23 @@ mod tests {
         .expect("insert usage_daily row");
     }
 
-    /// Deletes every row a fixture created, in FK order (ledger and wallets are
-    /// ON DELETE RESTRICT). Unconditional: a panicking assertion must not leave
-    /// permanent drift in a database other runs share.
-    async fn delete_fixture_rows(pool: &PgPool, account_id: Uuid) {
-        for statement in [
-            "DELETE FROM usage_daily WHERE account_id = $1",
-            "DELETE FROM ledger WHERE account_id = $1",
-            "DELETE FROM api_keys WHERE account_id = $1",
-            "DELETE FROM topups WHERE account_id = $1",
-            "DELETE FROM sessions WHERE account_id = $1",
-            "DELETE FROM wallets WHERE account_id = $1",
-            "DELETE FROM accounts WHERE id = $1",
-        ] {
-            sqlx::query(statement)
-                .bind(account_id)
-                .execute(pool)
-                .await
-                .unwrap_or_else(|err| panic!("cleanup failed on {statement}: {err}"));
-        }
-    }
-
     /// The reconciliation check from docs/observability.md, scoped to THIS
     /// fixture's account: wallets.balance_idr must equal SUM(ledger.delta_idr).
     /// It must return 0 rows.
-    async fn drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
                 SELECT w.account_id
                 FROM wallets w
                 LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = $1
+                WHERE w.account_id = ?
                 GROUP BY w.account_id, w.balance_idr
                 HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
@@ -898,10 +934,10 @@ mod tests {
     /// full key, and the plaintext is shown exactly once. That is the property
     /// that makes a database leak survivable, so it is asserted against the row
     /// itself, not against the response.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn creating_a_key_stores_only_a_sha256_digest_never_the_plaintext() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -923,8 +959,8 @@ mod tests {
         assert_eq!(prefix.len(), 13);
 
         // The stored form is the SHA-256 digest, hex - never the key itself.
-        let stored: String = sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE id = $1")
-            .bind(key_id)
+        let stored: String = sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE id = ?")
+            .bind(key_id.hyphenated())
             .fetch_one(&pool)
             .await
             .expect("read key_hash");
@@ -946,9 +982,19 @@ mod tests {
         );
 
         // And nowhere in the row: a dump must not yield a usable credential.
-        let row_text: String =
-            sqlx::query_scalar("SELECT row_to_json(k)::text FROM api_keys k WHERE id = $1")
-                .bind(key_id)
+        // Ported: `row_to_json` is Postgres-only. The subject is the WHOLE row, so
+        // the SQLite equivalent concatenates every column explicitly - spelling them
+        // out is what makes a column added later fail this test loudly instead of
+        // being silently skipped by a `SELECT *`.
+        let row_text: String = sqlx::query_scalar(
+            "SELECT id || '|' || account_id || '|' || key_hash || '|' || prefix || '|' || \
+             COALESCE(label, '') || '|' || COALESCE(models, '') || '|' || \
+             spend_limit_idr || '|' || token_limit || '|' || rate_limit_rpm || '|' || \
+             COALESCE(expires_at, '') || '|' || COALESCE(last_used_at, '') || '|' || \
+             COALESCE(revoked_at, '') || '|' || created_at
+             FROM api_keys WHERE id = ?",
+        )
+                .bind(key_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read the whole row");
@@ -984,17 +1030,17 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// REVOCATION ACTUALLY REVOKES: after revoke_key, resolving that key through
     /// the REAL lookup path must refuse it. A key that still works after
     /// revocation is the failure this test exists to prevent.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn revoking_a_key_makes_the_real_lookup_path_refuse_it() {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1032,8 +1078,8 @@ mod tests {
 
         // Durable, not merely a cache miss: the row itself says so.
         let revoked_at: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
-                .bind(revoked_id)
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = ?")
+                .bind(revoked_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read revoked_at");
@@ -1054,7 +1100,7 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// CACHE INVALIDATION: the proxy caches key metadata for a TTL, so a
@@ -1062,12 +1108,12 @@ mod tests {
     /// limits.key_metadata_cache_seconds. The revoke path is supposed to call
     /// invalidate_key_cache; this proves the effect through the request path
     /// rather than by poking at proxy.rs internals, which keys.rs cannot reach.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn revoking_a_key_invalidates_the_proxy_cache_instead_of_leaving_it_honoured_for_the_ttl()
     {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1093,8 +1139,12 @@ mod tests {
         );
         assert_eq!(body["error"]["code"], "model_not_allowed");
 
-        sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE id = $1")
-            .bind(stale_id)
+        // Ported: SQLite has no `now()`. The instant is bound, which is also what
+        // the schema's GLOB CHECK requires - SQLite's own `now()` emits the
+        // space-separated form that the CHECK refuses outright.
+        sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE id = ?")
+            .bind(Utc::now())
+            .bind(stale_id.hyphenated())
             .execute(&pool)
             .await
             .expect("revoke out of band, deliberately bypassing invalidate_key_cache");
@@ -1135,15 +1185,15 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// LIST REPORTS REAL SPEND: list_keys returns spend_used_idr from
     /// usage_daily, not a hardcoded 0.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn list_keys_reports_real_spend_from_usage_daily_not_a_hardcoded_zero() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1202,17 +1252,17 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// THE 30-DAY WINDOW IS REAL: the window is the trailing 30 days inclusive,
     /// so a row exactly at its first day counts and one a single day earlier does
     /// not. Asserted as an exact total, so any widening OR narrowing of the
     /// window fails this test rather than passing it.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_thirty_day_window_is_real_and_only_in_window_usage_contributes() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1270,17 +1320,17 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// THE LIMIT ACTUALLY BLOCKS. The pure check_spend_limit test above only
     /// exercises the argument validation; the integration - real usage rows, read
     /// by the real enforcement path, refusing the request - is what it cannot see.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn real_usage_at_the_spend_limit_makes_the_proxy_refuse_the_request() {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1372,17 +1422,17 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// CROSS-ACCOUNT ISOLATION: a key of account A must never appear in B's
     /// list_keys, and B must not be able to revoke or update A's key. A tenancy
     /// property a pure test cannot see.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_key_of_one_account_is_invisible_and_unrevokable_to_another() {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_a = create_account(&pool).await;
         let account_b = create_account(&pool).await;
         let state = test_state(pool.clone());
@@ -1443,8 +1493,8 @@ mod tests {
 
         // ...and A's key is untouched.
         let revoked_at: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
-                .bind(a_key_id)
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = ?")
+                .bind(a_key_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read revoked_at");
@@ -1476,8 +1526,8 @@ mod tests {
         };
         assert_eq!(err.status_code(), StatusCode::NOT_FOUND);
 
-        let label: Option<String> = sqlx::query_scalar("SELECT label FROM api_keys WHERE id = $1")
-            .bind(a_key_id)
+        let label: Option<String> = sqlx::query_scalar("SELECT label FROM api_keys WHERE id = ?")
+            .bind(a_key_id.hyphenated())
             .fetch_one(&pool)
             .await
             .expect("read label");
@@ -1489,8 +1539,8 @@ mod tests {
 
         // ...and B's payload did not widen A's key into an empty allowlist: the
         // no-op is complete, not partial.
-        let a_models: Value = sqlx::query_scalar("SELECT models FROM api_keys WHERE id = $1")
-            .bind(a_key_id)
+        let a_models: Value = sqlx::query_scalar("SELECT models FROM api_keys WHERE id = ?")
+            .bind(a_key_id.hyphenated())
             .fetch_one(&pool)
             .await
             .expect("read models");
@@ -1510,8 +1560,7 @@ mod tests {
             0,
             "fixture B must not drift"
         );
-        delete_fixture_rows(&pool, account_a).await;
-        delete_fixture_rows(&pool, account_b).await;
+        db.close().await;
     }
 
     /// A SUCCESSFUL UPDATE PERSISTS. The 200 is not the property - the ROW is.
@@ -1519,11 +1568,11 @@ mod tests {
     /// answered 200 without writing (or wrote only some of the columns) leaves
     /// the key enforcing its OLD limits while the operator believes otherwise,
     /// which is a silent security hole, not a cosmetic bug.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn updating_a_key_persists_every_patched_column_to_the_row() {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1560,9 +1609,9 @@ mod tests {
 
         let row = sqlx::query(
             "SELECT label, models, spend_limit_idr, token_limit, rate_limit_rpm, expires_at
-             FROM api_keys WHERE id = $1",
+             FROM api_keys WHERE id = ?",
         )
-        .bind(key_id)
+        .bind(key_id.hyphenated())
         .fetch_one(&pool)
         .await
         .expect("read the updated row back");
@@ -1590,7 +1639,7 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// UPDATE INVALIDATES THE PROXY CACHE. The proxy caches key metadata for a
@@ -1603,12 +1652,12 @@ mod tests {
     /// Two parts, exactly like the revocation test above: Part A shows the cache
     /// is genuinely warm and that a change bypassing the handler is not seen, so
     /// Part B cannot pass merely because the entry was never cached.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn updating_a_key_invalidates_the_proxy_cache_instead_of_leaving_the_old_limit_honoured_for_the_ttl(
     ) {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1654,7 +1703,7 @@ mod tests {
             "an UNLIMITED key must get past the spend check and reach the wallet check: {body}"
         );
 
-        sqlx::query("UPDATE api_keys SET spend_limit_idr = $2 WHERE id = $1")
+        sqlx::query("UPDATE api_keys SET spend_limit_idr = ? WHERE id = ?")
             .bind(stale_id)
             .bind(spend_idr)
             .execute(&pool)
@@ -1730,7 +1779,7 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// DENY BY DEFAULT, after an update. docs/website/06-api-keys-and-limits.md:41:
@@ -1738,11 +1787,11 @@ mod tests {
     /// failure mode is the opposite reading - an empty list taken as "every
     /// model" - which would turn narrowing a key into granting it everything.
     /// Asserted through the real request path, and against the row.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn an_empty_model_allowlist_after_an_update_denies_every_model() {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1789,8 +1838,8 @@ mod tests {
 
         // And the row really holds the empty list: the refusal above must come
         // from the stored value, not from a stray cache entry.
-        let models: Value = sqlx::query_scalar("SELECT models FROM api_keys WHERE id = $1")
-            .bind(id)
+        let models: Value = sqlx::query_scalar("SELECT models FROM api_keys WHERE id = ?")
+            .bind(id.hyphenated())
             .fetch_one(&pool)
             .await
             .expect("read models");
@@ -1805,7 +1854,7 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// A NEGATIVE CEILING IS REFUSED, AND NOTHING IS WRITTEN.
@@ -1818,11 +1867,11 @@ mod tests {
     /// count is asserted too: a handler that refuses with an error but has
     /// already INSERTed (or one that stores the value and errors afterwards)
     /// would leave exactly the key this defect is about behind.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn creating_a_key_with_a_negative_limit_is_refused_and_writes_no_row() {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1869,8 +1918,8 @@ mod tests {
 
         // Only the control key exists. A refused create must write NOTHING.
         let rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM api_keys WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count the account's keys");
@@ -1880,10 +1929,10 @@ mod tests {
         );
 
         let negative_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM api_keys
-             WHERE account_id = $1 AND (token_limit < 0 OR rate_limit_rpm < 0)",
+            "SELECT COUNT(*) FROM api_keys
+             WHERE account_id = ? AND (token_limit < 0 OR rate_limit_rpm < 0)",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(&pool)
         .await
         .expect("count negative limits");
@@ -1894,18 +1943,18 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 
     /// The same rule on the UPDATE path, where it matters most: the row already
     /// exists and is enforcing. A negative PATCH that lands replaces a working
     /// ceiling with "unlimited", so the assertion is not just the 402 - it is
     /// that the stored value is UNCHANGED.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn updating_a_key_with_a_negative_limit_is_refused_and_leaves_the_row_alone() {
         let _cache = CacheLock::acquire();
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
@@ -1961,8 +2010,8 @@ mod tests {
         }
 
         let (token_limit, rate_limit_rpm): (i64, i32) =
-            sqlx::query_as("SELECT token_limit, rate_limit_rpm FROM api_keys WHERE id = $1")
-                .bind(key_id)
+            sqlx::query_as("SELECT token_limit, rate_limit_rpm FROM api_keys WHERE id = ?")
+                .bind(key_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read the row back");
@@ -1977,6 +2026,6 @@ mod tests {
             0,
             "fixture must not drift"
         );
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
     }
 }

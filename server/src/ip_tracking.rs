@@ -61,7 +61,7 @@ use chrono::{NaiveDate, Utc};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use std::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -204,42 +204,71 @@ pub fn ip_hash(salt: &[u8], ip: &std::net::IpAddr) -> String {
 
 /// Records one request from `ip` against `key_id` for `day`.
 ///
-/// ONE STATEMENT, so the two tables cannot disagree: the `key_ip_seen` insert
-/// reports whether this hash is new for the day, and that single fact drives
-/// whether `distinct_ips` moves. Upserting `distinct_ips` from a separate
-/// `COUNT(*)` read would race — two first-seen IPs in flight at once could both
-/// read the pre-insert count and settle on the same value.
+/// The Postgres original did this in ONE statement with a data-modifying CTE.
+/// SQLite has no such construct — its `WITH` clause accepts only `SELECT` in a
+/// CTE, and the original is rejected with `near "INSERT": syntax error`
+/// (measured) — so it becomes two statements inside one `BEGIN IMMEDIATE`.
+///
+/// The property that must survive is the reason the CTE existed: the insert into
+/// `key_ip_seen` reports whether this hash is new for the day, and that ONE fact
+/// drives whether `distinct_ips` moves. Deriving it from a separate `COUNT(*)`
+/// read would race — two first-seen IPs in flight at once could both read the
+/// pre-insert count and settle on the same value. Here the fact comes from
+/// `rows_affected()` on the insert itself (measured: 1 for a new pair, 0 when
+/// `ON CONFLICT DO NOTHING` fires), read inside the same transaction that holds
+/// the write lock, so the two tables still cannot disagree. Measured on the
+/// sequence h1, h1, h2: `distinct_ips` goes 1, 1, 2 while `request_count` goes
+/// 1, 2, 3.
 ///
 /// Returns the counts as they stand AFTER this request.
 pub async fn record_key_ip(
-    pool: &PgPool,
+    pool: &SqlitePool,
     key_id: Uuid,
     day: NaiveDate,
     ip_hash: &str,
 ) -> Result<KeyIpCounts, AppError> {
-    let row = sqlx::query(
-        // `inserted` yields one row when this hash is new for the day and none
-        // when it was already present; `COUNT(*)` over it is the 1 or 0 that
-        // decides whether the distinct counter moves.
-        "WITH inserted AS (
-             INSERT INTO key_ip_seen (api_key_id, day, ip_hash)
-             VALUES ($1, $2, $3)
-             ON CONFLICT DO NOTHING
-             RETURNING 1
-         )
-         INSERT INTO key_ip_daily (api_key_id, day, distinct_ips, request_count)
-         VALUES ($1, $2, (SELECT COUNT(*) FROM inserted)::integer, 1)
-         ON CONFLICT (api_key_id, day) DO UPDATE
-             SET request_count = key_ip_daily.request_count + 1,
-                 distinct_ips  = key_ip_daily.distinct_ips
-                                 + (SELECT COUNT(*) FROM inserted)::integer
-         RETURNING distinct_ips, request_count",
+    let mut tx = crate::db::begin_immediate(pool).await?;
+
+    // 1. Was this (key, day, ip_hash) already seen today? `ON CONFLICT DO
+    //    NOTHING` makes the insert itself answer, and `rows_affected()` is the
+    //    1 or 0. The conflict target is `key_ip_seen`'s primary key, all three
+    //    columns NOT NULL; it is spelled out rather than left bare so a future
+    //    second unique index cannot silently capture this insert.
+    let inserted = sqlx::query(
+        "INSERT INTO key_ip_seen (api_key_id, day, ip_hash)
+         VALUES (?, ?, ?)
+         ON CONFLICT (api_key_id, day, ip_hash) DO NOTHING",
     )
-    .bind(key_id)
+    .bind(key_id.hyphenated())
     .bind(day)
     .bind(ip_hash)
-    .fetch_one(pool)
+    .execute(&mut *tx)
     .await?;
+
+    let new_ip = inserted.rows_affected() as i64;
+
+    // 2. Always move `request_count`; move `distinct_ips` only when step 1
+    //    actually inserted. `key_ip_daily`'s key is the composite primary key
+    //    (api_key_id, day), both NOT NULL, so the plain column-list conflict
+    //    target is correct here — unlike `usage_daily`, whose key is an
+    //    expression index and cannot be named by columns (plan section 4.3,
+    //    trap 3). The fourth `?` is the one inside the `DO UPDATE` clause.
+    let row = sqlx::query(
+        "INSERT INTO key_ip_daily (api_key_id, day, distinct_ips, request_count)
+         VALUES (?, ?, ?, 1)
+         ON CONFLICT (api_key_id, day) DO UPDATE
+             SET request_count = key_ip_daily.request_count + 1,
+                 distinct_ips  = key_ip_daily.distinct_ips + ?
+         RETURNING distinct_ips, request_count",
+    )
+    .bind(key_id.hyphenated())
+    .bind(day)
+    .bind(new_ip)
+    .bind(new_ip)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
 
     let counts = KeyIpCounts {
         distinct_ips: row.get("distinct_ips"),
@@ -299,18 +328,18 @@ pub struct PurgedRows {
 /// Run nightly. Nothing calls this per-request — deleting on the hot path
 /// would add a second write to every proxied request to do work that has to
 /// happen once a day.
-pub async fn purge_expired(pool: &PgPool, today: NaiveDate) -> Result<PurgedRows, AppError> {
+pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<PurgedRows, AppError> {
     // Inclusive cutoffs: the boundary day is deleted, `today - N + 1` is kept.
     let seen_cutoff = today - chrono::Duration::days(SEEN_RETENTION_DAYS);
     let daily_cutoff = today - chrono::Duration::days(DAILY_RETENTION_DAYS);
 
-    let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day <= $1")
+    let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day <= ?")
         .bind(seen_cutoff)
         .execute(pool)
         .await?
         .rows_affected();
 
-    let daily = sqlx::query("DELETE FROM key_ip_daily WHERE day <= $1")
+    let daily = sqlx::query("DELETE FROM key_ip_daily WHERE day <= ?")
         .bind(daily_cutoff)
         .execute(pool)
         .await?
@@ -474,6 +503,7 @@ pub fn resolve_client_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{self, TestDb};
     use axum::http::HeaderMap;
     use std::net::IpAddr;
 
@@ -767,79 +797,35 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Live Postgres. Ignored rather than silently skipped: a test that asserts
-    // nothing is worse than no test.
-    //
-    //   DATABASE_URL=... cargo test --lib ip_tracking:: -- --ignored
+    // Database tests. Each builds its own migrated database in a temp
+    // directory, so they run by default and share no rows with each other.
     // -----------------------------------------------------------------------
 
-    async fn test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        crate::db::init_pool(&database_url)
-            .await
-            .expect("connect to Postgres")
-    }
-
-    /// Serializes the purge tests. `purge_expired` deletes globally rather than
-    /// per key, so two purge tests running concurrently in the same test process
-    /// can delete each other's out-of-window fixtures before the other has
-    /// asserted on them.
-    fn purge_guard() -> &'static tokio::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
-    /// A key needs an account. Returns (account_id, key_id).
-    async fn create_key(pool: &PgPool) -> (Uuid, Uuid) {
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-                .bind(&pb_user_id)
-                .fetch_one(pool)
-                .await
-                .expect("create account");
-
-        let key_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix) VALUES ($1, $2, 'apk_test') RETURNING id",
-        )
-        .bind(account_id)
-        .bind(format!("test_hash_{}", Uuid::new_v4().simple()))
-        .fetch_one(pool)
-        .await
-        .expect("create api key");
-
+    /// A key needs an account, so the fixture creates one and returns both.
+    ///
+    /// Ported: the Postgres original read DATABASE_URL and `DELETE`d its fixture
+    /// rows in FK order afterwards, serialized by a process-wide `purge_guard`
+    /// because `purge_expired` deletes globally and two purge tests sharing one
+    /// database could delete each other's out-of-window rows. Each test now owns
+    /// its own migrated database (`TestDb`), so neither the DSN, the teardown, nor
+    /// the guard is needed: the guard would only be serializing tests that already
+    /// cannot see each other.
+    async fn create_key(pool: &SqlitePool) -> (Uuid, Uuid) {
+        let account_id = test_support::account(pool).await;
+        let key_id = test_support::api_key(pool, account_id).await;
         (account_id, key_id)
     }
 
-    async fn delete_fixture(pool: &PgPool, account_id: Uuid) {
-        // Children first: both IP tables reference api_keys, which references
-        // accounts, and api_keys is ON DELETE CASCADE from accounts.
-        for statement in [
-            "DELETE FROM key_ip_seen WHERE api_key_id IN (SELECT id FROM api_keys WHERE account_id = $1)",
-            "DELETE FROM key_ip_daily WHERE api_key_id IN (SELECT id FROM api_keys WHERE account_id = $1)",
-            "DELETE FROM api_keys WHERE account_id = $1",
-            "DELETE FROM accounts WHERE id = $1",
-        ] {
-            sqlx::query(statement)
-                .bind(account_id)
-                .execute(pool)
-                .await
-                .unwrap_or_else(|err| panic!("cleanup failed on `{statement}`: {err}"));
-        }
-    }
-
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_repeat_ip_counts_once_and_a_new_ip_counts_twice() {
-        let pool = test_pool().await;
-        let (account_id, key_id) = create_key(&pool).await;
+        let db = TestDb::new().await;
+        let (_, key_id) = create_key(&db.pool).await;
         let day = today_utc();
         let salt = [3u8; 32];
 
         let first = ip_hash(&salt, &ip("203.0.113.9"));
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &first)
+            record_key_ip(&db.pool, key_id, day, &first)
                 .await
                 .expect("first request"),
             KeyIpCounts {
@@ -850,7 +836,7 @@ mod tests {
 
         // Same address again: the request counts, the distinct count does not.
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &first)
+            record_key_ip(&db.pool, key_id, day, &first)
                 .await
                 .expect("repeat request"),
             KeyIpCounts {
@@ -861,7 +847,7 @@ mod tests {
 
         let second = ip_hash(&salt, &ip("203.0.113.10"));
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &second)
+            record_key_ip(&db.pool, key_id, day, &second)
                 .await
                 .expect("new ip"),
             KeyIpCounts {
@@ -875,7 +861,7 @@ mod tests {
         let tomorrow = day.succ_opt().expect("next day");
         let fresh = ip_hash(&[4u8; 32], &ip("203.0.113.9"));
         assert_eq!(
-            record_key_ip(&pool, key_id, tomorrow, &fresh)
+            record_key_ip(&db.pool, key_id, tomorrow, &fresh)
                 .await
                 .expect("next day"),
             KeyIpCounts {
@@ -884,38 +870,36 @@ mod tests {
             }
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_purge_keeps_the_window_and_removes_what_is_past_it() {
-        let _purge = purge_guard().lock().await;
-        let pool = test_pool().await;
-        let (account_id, key_id) = create_key(&pool).await;
+        let db = TestDb::new().await;
+        let (_, key_id) = create_key(&db.pool).await;
         let today = today_utc();
         let salt = [5u8; 32];
 
         // Inside both windows.
         let recent = today - chrono::Duration::days(SEEN_RETENTION_DAYS - 1);
-        record_key_ip(&pool, key_id, recent, &ip_hash(&salt, &ip("203.0.113.1")))
+        record_key_ip(&db.pool, key_id, recent, &ip_hash(&salt, &ip("203.0.113.1")))
             .await
             .expect("recent row");
 
         // Past the hash window but inside the aggregate window: the hash goes,
         // the count stays. That asymmetry is the privacy design.
         let older = today - chrono::Duration::days(SEEN_RETENTION_DAYS + 1);
-        record_key_ip(&pool, key_id, older, &ip_hash(&salt, &ip("203.0.113.2")))
+        record_key_ip(&db.pool, key_id, older, &ip_hash(&salt, &ip("203.0.113.2")))
             .await
             .expect("older row");
 
         // Past both.
         let ancient = today - chrono::Duration::days(DAILY_RETENTION_DAYS + 1);
-        record_key_ip(&pool, key_id, ancient, &ip_hash(&salt, &ip("203.0.113.3")))
+        record_key_ip(&db.pool, key_id, ancient, &ip_hash(&salt, &ip("203.0.113.3")))
             .await
             .expect("ancient row");
 
-        let purged = purge_expired(&pool, today).await.expect("purge");
+        let purged = purge_expired(&db.pool, today).await.expect("purge");
         assert!(
             purged.seen >= 2,
             "both rows past the hash window must go, got {}",
@@ -924,9 +908,9 @@ mod tests {
         assert!(purged.daily >= 1, "the row past 90 days must go");
 
         let remaining_seen: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM key_ip_seen WHERE api_key_id = $1")
-                .bind(key_id)
-                .fetch_one(&pool)
+            sqlx::query_scalar("SELECT COUNT(*) FROM key_ip_seen WHERE api_key_id = ?")
+                .bind(key_id.hyphenated())
+                .fetch_one(&db.pool)
                 .await
                 .expect("count remaining hashes");
         assert_eq!(
@@ -934,7 +918,7 @@ mod tests {
             "only the in-window hash survives: the aggregate outlives the hash"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 
     /// THE BOUNDARY, PINNED EXACTLY — the off-by-one this test exists for.
@@ -944,13 +928,15 @@ mod tests {
     /// statement that says N. So both directions are asserted: the row ON the
     /// cutoff day is DELETED, and the row one day INSIDE the window is KEPT.
     ///
-    /// Its own account, so no other test's rows can inflate the result.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    /// Its own account AND its own database, so no other test's rows can inflate
+    /// the result. The Postgres original needed both a `DATABASE_URL` and a
+    /// process-wide `purge_guard` for this; `TestDb` gives it per test instead,
+    /// which is why the `#[ignore]` that made this boundary assertion never run
+    /// is gone.
     #[tokio::test]
     async fn the_retention_cutoff_day_is_deleted_and_the_day_inside_the_window_is_kept() {
-        let _purge = purge_guard().lock().await;
-        let pool = test_pool().await;
-        let (account_id, key_id) = create_key(&pool).await;
+        let db = TestDb::new().await;
+        let (_, key_id) = create_key(&db.pool).await;
         let today = today_utc();
         let salt = [6u8; 32];
 
@@ -968,17 +954,17 @@ mod tests {
             (daily_cutoff, "203.0.113.13"),
             (daily_kept, "203.0.113.14"),
         ] {
-            record_key_ip(&pool, key_id, day, &ip_hash(&salt, &ip(address)))
+            record_key_ip(&db.pool, key_id, day, &ip_hash(&salt, &ip(address)))
                 .await
                 .expect("seed row");
         }
 
-        purge_expired(&pool, today).await.expect("purge");
+        purge_expired(&db.pool, today).await.expect("purge");
 
         let surviving_seen: Vec<NaiveDate> =
-            sqlx::query_scalar("SELECT day FROM key_ip_seen WHERE api_key_id = $1 ORDER BY day")
-                .bind(key_id)
-                .fetch_all(&pool)
+            sqlx::query_scalar("SELECT day FROM key_ip_seen WHERE api_key_id = ? ORDER BY day")
+                .bind(key_id.hyphenated())
+                .fetch_all(&db.pool)
                 .await
                 .expect("read surviving hashes");
         assert_eq!(
@@ -988,9 +974,9 @@ mod tests {
         );
 
         let surviving_daily: Vec<NaiveDate> =
-            sqlx::query_scalar("SELECT day FROM key_ip_daily WHERE api_key_id = $1 ORDER BY day")
-                .bind(key_id)
-                .fetch_all(&pool)
+            sqlx::query_scalar("SELECT day FROM key_ip_daily WHERE api_key_id = ? ORDER BY day")
+                .bind(key_id.hyphenated())
+                .fetch_all(&db.pool)
                 .await
                 .expect("read surviving counts");
         // Containment, not an exact vector: `record_key_ip` writes a daily row
@@ -1006,6 +992,6 @@ mod tests {
             "the day one inside the 90-day window ({daily_kept}) must be kept, got {surviving_daily:?}"
         );
 
-        delete_fixture(&pool, account_id).await;
+        db.close().await;
     }
 }

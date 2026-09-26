@@ -7,7 +7,7 @@ use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{SqlitePool, Row};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -16,6 +16,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::config::AppConfig;
 use crate::db::{
@@ -38,7 +39,7 @@ use crate::upstream::{parse_usage_from_sse, UpstreamClient, UpstreamError, Upstr
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: PgPool,
+    pub pool: SqlitePool,
     pub config: Arc<AppConfig>,
     pub http_client: reqwest::Client,
     /// The realtime fan-out behind `GET /events`.
@@ -79,7 +80,7 @@ fn record_request_source(state: &AppState, key_id: Uuid, peer: SocketAddr, heade
     });
 }
 
-impl axum::extract::FromRef<AppState> for PgPool {
+impl axum::extract::FromRef<AppState> for SqlitePool {
     fn from_ref(state: &AppState) -> Self {
         state.pool.clone()
     }
@@ -102,7 +103,7 @@ impl axum::extract::FromRef<AppState> for PgPool {
 /// `defuse` once the debit has committed - the exact moment the money is already
 /// back in the wallet.
 struct ReservationGuard {
-    pool: PgPool,
+    pool: SqlitePool,
     account_id: Uuid,
     reserved_idr: i64,
     reservation_ref: String,
@@ -112,7 +113,7 @@ struct ReservationGuard {
 
 impl ReservationGuard {
     fn new(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         reserved_idr: i64,
         reservation_ref: &str,
@@ -536,7 +537,7 @@ fn key_cache(config: &AppConfig) -> &'static Mutex<KeyCache> {
 /// amplifier by spraying made-up tokens.
 async fn load_key_metadata(
     cache: &Mutex<KeyCache>,
-    pool: &PgPool,
+    pool: &SqlitePool,
     key_hash: &str,
 ) -> Result<KeyMetadata, AppError> {
     // The guard is scoped so the std Mutex is never held across the await below.
@@ -553,7 +554,7 @@ async fn load_key_metadata(
         SELECT id, account_id, models, spend_limit_idr, token_limit, rate_limit_rpm,
                expires_at, revoked_at
         FROM api_keys
-        WHERE key_hash = $1
+        WHERE key_hash = ?
         "#,
     )
     .bind(key_hash)
@@ -565,8 +566,8 @@ async fn load_key_metadata(
     };
 
     let meta = KeyMetadata {
-        key_id: row.get("id"),
-        account_id: row.get("account_id"),
+        key_id: row.get::<Hyphenated, _>("id").into_uuid(),
+        account_id: row.get::<Hyphenated, _>("account_id").into_uuid(),
         models: row.get("models"),
         spend_limit_idr: row.get("spend_limit_idr"),
         token_limit: row.get("token_limit"),
@@ -1209,9 +1210,10 @@ pub async fn chat_completions(
     //    the worst case in a guarded, committed transaction BEFORE the upstream is
     //    called, and the release happens at settlement.
     //
-    // The guard is `balance_idr >= $amount` inside the UPDATE, not a read: two
-    // concurrent requests from the same account are serialized by the row lock, so
-    // only as many as the balance can actually cover are admitted. The previous
+    // The guard is `balance_idr >= ?1` inside the UPDATE, not a read: SQLite
+    // admits one writer at a time, so two concurrent requests from the same
+    // account cannot both pass against one stale balance, and only as many as the
+    // balance can cover are admitted. The previous
     // code read the balance here and debited nothing, which let an account holding
     // 1 IDR run unbounded concurrent expensive requests — and with
     // `allow_negative_balance_overdraft = true` the 402 branch below was dead, so
@@ -1363,7 +1365,7 @@ fn settlement_plan(usage: Option<Usage>) -> SettlementPlan {
 #[allow(clippy::too_many_arguments)]
 async fn settle_after_stream(
     end: tokio::sync::oneshot::Receiver<StreamEnd>,
-    pool: PgPool,
+    pool: SqlitePool,
     config: Arc<AppConfig>,
     events: Arc<RealtimeHub>,
     account_id: Uuid,
@@ -1532,7 +1534,7 @@ async fn settle_after_stream(
                 Ok(totals) => publish_usage(&events, account_id, totals),
                 // A decode/aggregate failure here is not cosmetic: it silently
                 // drops the usage event subscribers rely on, and a type mismatch
-                // (Postgres returns NUMERIC for SUM(bigint) while the row is
+                // (Sqlite returns NUMERIC for SUM(bigint) while the row is
                 // decoded into i64) is exactly how that went unnoticed. Loud, with
                 // the account and the model, so it is diagnosable from the log.
                 Err(err) => error!(
@@ -1581,7 +1583,7 @@ async fn settle_after_stream(
                 Ok(totals) => publish_usage(&events, account_id, totals),
                 // A decode/aggregate failure here is not cosmetic: it silently
                 // drops the usage event subscribers rely on, and a type mismatch
-                // (Postgres returns NUMERIC for SUM(bigint) while the row is
+                // (Sqlite returns NUMERIC for SUM(bigint) while the row is
                 // decoded into i64) is exactly how that went unnoticed. Loud, with
                 // the account and the model, so it is diagnosable from the log.
                 Err(err) => error!(
@@ -1624,7 +1626,7 @@ async fn settle_after_stream(
 /// request that was never billed — the mirror image of the defect this fix closes
 /// — so a failure is loud even though the client is long gone.
 async fn release_quietly(
-    pool: &PgPool,
+    pool: &SqlitePool,
     account_id: Uuid,
     reserved_idr: i64,
     reservation_ref: &str,
@@ -2509,9 +2511,10 @@ mod tests {
     // ---------------------------------------------------------------------
 
     use crate::config::AppConfig;
-    use crate::db::{credit_topup_transaction, init_pool, unpaired_hold_rows, TopupCreditResult};
+    use crate::db::unpaired_hold_rows;
     use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
     use crate::routes::events::RealtimeHub;
+    use crate::test_support::{self, TestDb};
 
     fn live_config() -> Arc<AppConfig> {
         for path in ["../config/apikita.toml", "config/apikita.toml"] {
@@ -2525,7 +2528,7 @@ mod tests {
     /// The real application state, built the way main.rs builds it, so the
     /// handler runs against the same config and the same process-wide key cache
     /// the serving process uses.
-    fn test_state(pool: PgPool) -> AppState {
+    fn test_state(pool: SqlitePool) -> AppState {
         test_state_with(pool, live_config())
     }
 
@@ -2535,7 +2538,7 @@ mod tests {
     /// endpoints of one model carry genuinely different rates: the shipped
     /// config has them all tied, so a test of that rule must build the
     /// heterogeneous pool itself rather than edit the shared config file.
-    fn test_state_with(pool: PgPool, config: Arc<AppConfig>) -> AppState {
+    fn test_state_with(pool: SqlitePool, config: Arc<AppConfig>) -> AppState {
         let events = Arc::new(RealtimeHub::new(&config.realtime));
         let trusted_proxies: Arc<[IpCidr]> = Arc::from(
             parse_cidrs(&config.network.trusted_proxy_cidrs)
@@ -2552,130 +2555,83 @@ mod tests {
         }
     }
 
-    async fn live_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        init_pool(&database_url).await.expect("connect to Postgres")
-    }
-
-    async fn create_account(pool: &PgPool) -> Uuid {
-        sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-            .bind(format!("test_proxy_{}", Uuid::new_v4().simple()))
-            .fetch_one(pool)
-            .await
-            .expect("create account")
+    /// An account row. The SQLite schema has no DEFAULT for id, created_at or
+    /// updated_at (plan section 4.1, correction 1), so the Postgres
+    /// RETURNING id shape would fail at runtime rather than here.
+    async fn create_account(pool: &SqlitePool) -> Uuid {
+        test_support::account(pool).await
     }
 
     /// Money enters a wallet ONLY through credit_topup_transaction, which writes
     /// the matching +ledger row in the same transaction. Writing
     /// wallets.balance_idr directly manufactures exactly the drift the
     /// reconciliation assertion at the end of every test looks for.
-    async fn open_wallet(pool: &PgPool, account_id: Uuid, opening_idr: i64) {
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(account_id)
-            .execute(pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
-
-        let order_id = format!("test_proxy_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
-            .bind(account_id)
-            .bind(opening_idr)
-            .bind(&order_id)
-            .execute(pool)
-            .await
-            .expect("create topup");
-
-        assert_eq!(
-            credit_topup_transaction(pool, &order_id, opening_idr)
-                .await
-                .expect("credit the opening balance"),
-            TopupCreditResult::Settled {
-                new_balance: opening_idr
-            },
-            "the fixture must open the wallet through the real top-up path"
-        );
+    ///
+    /// test_support::fund does exactly this - the wallet row, the topups row and
+    /// the real credit - so the fixture cannot drift from the money-in path.
+    async fn open_wallet(pool: &SqlitePool, account_id: Uuid, opening_idr: i64) {
+        test_support::wallet(pool, account_id).await;
+        test_support::fund(pool, account_id, opening_idr).await;
     }
 
     /// An api_keys row whose key_hash is the SAME hash chat_completions derives
     /// from the bearer token, so the lookup under test is the production one and
     /// not a bypass around it.
     async fn create_api_key(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         plaintext: &str,
         models: &[&str],
     ) -> Uuid {
-        sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix, label, models)
-             VALUES ($1, $2, 'apk_test', 'proxy-live', $3) RETURNING id",
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO api_keys (id, account_id, key_hash, prefix, label, models, created_at)
+             VALUES (?, ?, ?, 'apk_test', 'proxy-live', ?, ?)",
         )
-        .bind(account_id)
+        .bind(id.hyphenated())
+        .bind(account_id.hyphenated())
         .bind(hash_string(plaintext))
         .bind(serde_json::to_value(models).expect("models as JSON"))
-        .fetch_one(pool)
+        .bind(chrono::Utc::now())
+        .execute(pool)
         .await
-        .expect("create api key")
-    }
-
-    /// Deletes every row the fixture created, in FK order (ledger, wallets and
-    /// topups are ON DELETE RESTRICT).
-    ///
-    /// usage_daily BEFORE api_keys, always: usage_daily.api_key_id is NOT NULL
-    /// and part of the primary key, so the ON DELETE SET NULL on that column is
-    /// unreachable - deleting the key first would violate the NOT NULL instead of
-    /// nulling the column.
-    async fn delete_fixture_rows(pool: &PgPool, account_id: Uuid) {
-        for statement in [
-            "DELETE FROM usage_daily WHERE account_id = $1",
-            "DELETE FROM api_keys WHERE account_id = $1",
-            "DELETE FROM ledger WHERE account_id = $1",
-            "DELETE FROM topups WHERE account_id = $1",
-            "DELETE FROM wallets WHERE account_id = $1",
-            "DELETE FROM sessions WHERE account_id = $1",
-            "DELETE FROM accounts WHERE id = $1",
-        ] {
-            sqlx::query(statement)
-                .bind(account_id)
-                .execute(pool)
-                .await
-                .unwrap_or_else(|err| panic!("cleanup failed on {statement}: {err}"));
-        }
+        .expect("create api key");
+        id
     }
 
     /// INVARIANT (a), scoped to THIS fixture's account: wallets.balance_idr must
     /// equal SUM(ledger.delta_idr). It must return 0 rows.
-    async fn drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
                 SELECT w.account_id
                 FROM wallets w
                 LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = $1
+                WHERE w.account_id = ?
                 GROUP BY w.account_id, w.balance_idr
                 HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
     }
 
     /// Every ledger move of the fixture, in order: (delta_idr, ref).
-    async fn ledger_deltas(pool: &PgPool, account_id: Uuid) -> Vec<(i64, Option<String>)> {
-        sqlx::query_as("SELECT delta_idr, ref FROM ledger WHERE account_id = $1 ORDER BY id")
-            .bind(account_id)
+    async fn ledger_deltas(pool: &SqlitePool, account_id: Uuid) -> Vec<(i64, Option<String>)> {
+        sqlx::query_as("SELECT delta_idr, ref FROM ledger WHERE account_id = ? ORDER BY id")
+            .bind(account_id.hyphenated())
             .fetch_all(pool)
             .await
             .expect("read ledger")
     }
 
-    async fn wallet_balance(pool: &PgPool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-            .bind(account_id)
+    async fn wallet_balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_one(pool)
             .await
             .expect("read balance")
@@ -2683,12 +2639,12 @@ mod tests {
 
     /// Today's usage row for the account: the three token classes SEPARATELY
     /// plus the cost. None means nothing was ever billed.
-    async fn usage_today(pool: &PgPool, account_id: Uuid) -> Option<(i64, i64, i64, i64)> {
+    async fn usage_today(pool: &SqlitePool, account_id: Uuid) -> Option<(i64, i64, i64, i64)> {
         sqlx::query_as(
             "SELECT input_tokens, cache_read_tokens, output_tokens, cost_idr
-             FROM usage_daily WHERE account_id = $1",
+             FROM usage_daily WHERE account_id = ?",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_optional(pool)
         .await
         .expect("read usage_daily")
@@ -2794,15 +2750,21 @@ mod tests {
         .await
     }
 
-    /// Runs the money assertions, then deletes the fixture whether they passed or
-    /// panicked, so a failing run cannot leave rows in a database other runs
-    /// share (the db.rs pattern).
-    async fn with_fixture<F>(pool: PgPool, account_id: Uuid, assertions: F)
+    /// Runs the money assertions, then closes the fixture's database whether they
+    /// passed or panicked.
+    ///
+    /// The Postgres original deleted its rows by name here, so a failing run could
+    /// not leave residue in a database other runs shared. SQLite makes that
+    /// unnecessary: TestDb owns a private temp database and close() removes it.
+    /// close() is awaited rather than trusted to drop order, for the reason
+    /// documented in test_support - dropping the pool only signals the close, so
+    /// the removal would race it.
+    async fn with_fixture<F>(db: TestDb, assertions: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let outcome = tokio::spawn(assertions).await;
-        delete_fixture_rows(&pool, account_id).await;
+        db.close().await;
         outcome.expect("the money-path assertions panicked");
     }
 
@@ -2813,10 +2775,10 @@ mod tests {
     /// the hold is out of the wallet for the whole upstream call, so an exit that
     /// forgets to give it back is money debited against a request that was never
     /// billed. INVARIANT (b): unpaired_hold_rows must be 0.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_failed_upstream_releases_the_whole_hold_and_never_strands_it() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
@@ -2832,7 +2794,7 @@ mod tests {
         );
 
         let pool_for_assertions = pool.clone();
-        with_fixture(pool.clone(), account_id, async move {
+        with_fixture(db, async move {
             let err = call_chat_completions(&state, &key, body)
                 .await
                 .expect_err("with no provider key in the environment the upstream is unreachable");
@@ -2915,10 +2877,10 @@ mod tests {
     /// and (c): the wallet ends exactly -cost_idr from the opening balance, the
     /// ledger's whole move for the request is exactly -cost_idr, and the three
     /// token classes are recorded SEPARATELY - never summed.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn settlement_debits_the_real_usage_and_releases_the_rest_of_the_hold() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
@@ -2960,7 +2922,7 @@ mod tests {
         );
 
         let pool_for_assertions = pool.clone();
-        with_fixture(pool.clone(), account_id, async move {
+        with_fixture(db, async move {
             // Step 6 of the handler: the HOLD, before the upstream call.
             let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
             let held = reserve_balance_transaction(
@@ -3067,10 +3029,10 @@ mod tests {
     /// THE WASHED CASE. A stream that ended without a usage report is billed
     /// NOTHING and gives the whole hold back (docs/failover.md:138-144). Token
     /// counts are never invented to fill the gap.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_stream_without_usage_is_washed_and_the_whole_hold_returns() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
@@ -3091,7 +3053,7 @@ mod tests {
         );
 
         let pool_for_assertions = pool.clone();
-        with_fixture(pool.clone(), account_id, async move {
+        with_fixture(db, async move {
             let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
             assert!(matches!(
                 reserve_balance_transaction(
@@ -3182,10 +3144,10 @@ mod tests {
     /// balance, usage_daily still carries the FULL cost, and reconciliation still
     /// holds because the ledger records only what was actually taken. The balance
     /// never goes negative (docs/decisions.md D3).
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_clamped_debit_still_records_the_full_usage_and_stays_reconciled() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let opening_idr = 1_000;
         open_wallet(&pool, account_id, opening_idr).await;
@@ -3198,7 +3160,7 @@ mod tests {
         .await;
 
         let pool_for_assertions = pool.clone();
-        with_fixture(pool.clone(), account_id, async move {
+        with_fixture(db, async move {
             // The whole balance is held, so the settlement has nothing left to
             // collect from once the hold is released.
             let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
@@ -3333,10 +3295,10 @@ mod tests {
         Arc::new(config)
     }
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn the_hold_covers_the_dearest_endpoint_not_the_cheapest() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let config = heterogeneous_flash_config();
         let state = test_state_with(pool.clone(), config.clone());
@@ -3360,7 +3322,7 @@ mod tests {
         );
 
         let pool_for_assertions = pool.clone();
-        with_fixture(pool.clone(), account_id, async move {
+        with_fixture(db, async move {
             // The REAL handler. With no provider key in the environment the
             // upstream is unreachable, so the request takes the hold, fails to
             // route, and gives the whole hold back - which is exactly the
@@ -3435,35 +3397,36 @@ mod tests {
     /// A key carrying an explicit `spend_limit_idr`. The allowlist is passed the
     /// same way `create_api_key` takes it; only the limit differs.
     async fn create_api_key_with_spend_limit(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         plaintext: &str,
         models: &[&str],
         spend_limit_idr: i64,
     ) -> Uuid {
-        sqlx::query_scalar(
-            "INSERT INTO api_keys (account_id, key_hash, prefix, label, models, spend_limit_idr)
-             VALUES ($1, $2, 'apk_test', 'proxy-live', $3, $4) RETURNING id",
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO api_keys
+                 (id, account_id, key_hash, prefix, label, models, spend_limit_idr, created_at)
+             VALUES (?, ?, ?, 'apk_test', 'proxy-live', ?, ?, ?)",
         )
-        .bind(account_id)
+        .bind(id.hyphenated())
+        .bind(account_id.hyphenated())
         .bind(hash_string(plaintext))
         .bind(serde_json::to_value(models).expect("models as JSON"))
         .bind(spend_limit_idr)
-        .fetch_one(pool)
+        .bind(chrono::Utc::now())
+        .execute(pool)
         .await
-        .expect("create api key")
+        .expect("create api key");
+        id
     }
 
     /// The wallet the login path creates and nothing else: a real row, zero
     /// balance, no ledger history. `open_wallet` is the ONLY helper allowed to
     /// put money in (through `credit_topup_transaction`); this one exists for the
     /// opposite case, an account that has never topped up.
-    async fn open_empty_wallet(pool: &PgPool, account_id: Uuid) {
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(account_id)
-            .execute(pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
+    async fn open_empty_wallet(pool: &SqlitePool, account_id: Uuid) {
+        test_support::wallet(pool, account_id).await;
     }
 
     /// Spend ALREADY recorded against a key, written with the same table, columns
@@ -3471,13 +3434,13 @@ mod tests {
     /// `keys::key_spend_used` read sees it. Seeding the row is what makes "this
     /// key is over its limit" a fixture instead of a whole billed request; the
     /// read under test is still the production one.
-    async fn seed_key_spend(pool: &PgPool, account_id: Uuid, key_id: Uuid, cost_idr: i64) {
+    async fn seed_key_spend(pool: &SqlitePool, account_id: Uuid, key_id: Uuid, cost_idr: i64) {
         sqlx::query(
             "INSERT INTO usage_daily (account_id, api_key_id, day, cost_idr)
-             VALUES ($1, $2, $3, $4)",
+             VALUES (?, ?, ?, ?)",
         )
-        .bind(account_id)
-        .bind(key_id)
+        .bind(account_id.hyphenated())
+        .bind(key_id.hyphenated())
         .bind(chrono::Utc::now().date_naive())
         .bind(cost_idr)
         .execute(pool)
@@ -3492,10 +3455,10 @@ mod tests {
     /// zero. A balance-dependent answer IS the documented leak: the caller whose
     /// wallet happens to be empty would learn about money the funded caller was
     /// never told. Both must get 403 `model_not_allowed`.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_model_outside_the_allowlist_is_refused_identically_at_any_balance() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let state = test_state(pool.clone());
 
         // A REAL configured model the key is NOT allowed: the allowlist is the
@@ -3572,8 +3535,9 @@ mod tests {
         });
 
         let outcome = assertions.await;
-        delete_fixture_rows(&pool, funded_account).await;
-        delete_fixture_rows(&pool, broke_account).await;
+        // Both accounts live in this test's own temp database, so closing it is
+        // the whole teardown: there is no shared table to delete rows out of.
+        db.close().await;
         outcome.expect("the enforcement-order assertions panicked");
     }
 
@@ -3582,10 +3546,10 @@ mod tests {
     ///
     /// This is the other half of the same order: once the model is permitted, the
     /// balance is what refuses - and the refusal names the hold it could not cover.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn an_allowed_model_with_an_uncovered_balance_is_refused_for_money() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         open_empty_wallet(&pool, account_id).await;
@@ -3600,7 +3564,7 @@ mod tests {
         );
 
         let pool_for_assertions = pool.clone();
-        with_fixture(pool.clone(), account_id, async move {
+        with_fixture(db, async move {
             let err = call_chat_completions(&state, &key, body)
                 .await
                 .expect_err("an empty wallet cannot cover the worst case");
@@ -3645,10 +3609,10 @@ mod tests {
     /// (c) A key over its own 30-day spend limit gets the LIMIT error - and it
     /// gets it while the wallet could easily pay, which is what pins the limit
     /// ahead of the money (docs/website/06-api-keys-and-limits.md:137-139).
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn a_key_over_its_spend_limit_is_refused_for_the_limit_not_for_money() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 500_000;
@@ -3668,7 +3632,7 @@ mod tests {
         );
 
         let pool_for_assertions = pool.clone();
-        with_fixture(pool.clone(), account_id, async move {
+        with_fixture(db, async move {
             let err = call_chat_completions(&state, &key, body)
                 .await
                 .expect_err("the key is exactly at its ceiling, which already blocks");

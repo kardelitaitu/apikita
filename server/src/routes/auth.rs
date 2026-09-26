@@ -8,15 +8,57 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sha2::{Digest, Sha256};
+use sqlx::{SqlitePool, Row};
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::config::{AppConfig, SessionsConfig};
 use crate::error::AppError;
-use crate::routes::{hash_token, session_token_from_cookie_header, SESSION_COOKIE};
+use crate::routes::{session_token_from_cookie_header, SESSION_COOKIE};
+
+/// SHA-256 hex of a session token, the value the sessions row stores.
+/// The account a request's session cookie resolves to, against SQLite.
+///
+/// The shared resolver in `crate::routes` takes a `SqlitePool` and works for the
+/// handlers; this test-side copy exists because the auth tests below drive the
+/// handler AND the resolver against the same pool, and the production one is the
+/// only other place that knows the hash-then-compare rule. Both are the same
+/// three lines, so a divergence would fail a test rather than pass silently.
+#[cfg(test)]
+async fn resolve_account_from_cookie(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<Uuid, AppError> {
+    let cookie_hdr = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthenticated)?;
+
+    let token = session_token_from_cookie_header(cookie_hdr).ok_or(AppError::Unauthenticated)?;
+
+    let session = sqlx::query(
+        "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+    )
+    .bind(hash_token(token))
+    .bind(chrono::Utc::now())
+    .fetch_optional(pool)
+    .await?;
+
+    match session {
+        Some(s) => Ok(s.get::<Hyphenated, _>("account_id").into_uuid()),
+        None => Err(AppError::Unauthenticated),
+    }
+}
+
+fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 /// PocketBase collection whose auth tokens are accepted. Identity lives in
-/// PocketBase; Postgres holds only the pb_user_id reference
+/// PocketBase; Sqlite holds only the pb_user_id reference
 /// (docs/architecture/identity.md).
 const PB_USERS_COLLECTION: &str = "users";
 
@@ -131,7 +173,7 @@ async fn verify_pb_token(token: &str) -> Result<String, AppError> {
 
 static SESSIONS_CONFIG: OnceLock<SessionsConfig> = OnceLock::new();
 
-/// SessionsConfig is not part of the router state (State<PgPool>), so the config
+/// SessionsConfig is not part of the router state (State<SqlitePool>), so the config
 /// file is read once per process and cached. Same resolution order as main.rs:
 /// APIKITA_CONFIG_PATH, then config/, then ../config/.
 fn sessions_config() -> Result<&'static SessionsConfig, AppError> {
@@ -173,7 +215,7 @@ pub(crate) fn session_cookie(value: String, max_age_days: i64) -> HeaderMap {
 // ---------------------------------------------------------------------------
 
 pub async fn exchange_token(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
     Json(payload): Json<AuthExchangeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -186,44 +228,59 @@ pub async fn exchange_token(
 
     let sessions = sessions_config()?;
 
-    let mut tx = pool.begin().await?;
+    // `BEGIN IMMEDIATE`, not sqlx's default deferred `BEGIN`: this transaction
+    // writes, and taking the write lock up front means no lock upgrade can fail
+    // with SQLITE_BUSY_SNAPSHOT (plan section 4.3, trap 2).
+    let mut tx = crate::db::begin_immediate(&pool).await?;
 
+    // `id`, `created_at` and `updated_at` are all bound. The Postgres schema
+    // defaulted them to `gen_random_uuid()` and `now()`; both defaults were
+    // deliberately removed so no SQL-side time can be written (plan section 4.6).
+    // On conflict the freshly generated `id` is discarded and only `updated_at`
+    // moves — the same semantics the Postgres `DO UPDATE SET updated_at = now()`
+    // had, expressed through `excluded` so one instant serves the whole insert.
+    let now = Utc::now();
     let account = sqlx::query(
         r#"
-        INSERT INTO accounts (pb_user_id)
-        VALUES ($1)
-        ON CONFLICT (pb_user_id) DO UPDATE SET updated_at = now()
+        INSERT INTO accounts (id, pb_user_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (pb_user_id) DO UPDATE SET updated_at = excluded.updated_at
         RETURNING id, status
         "#,
     )
+    .bind(Uuid::new_v4().hyphenated())
     .bind(&pb_user_id)
+    .bind(now)
+    .bind(now)
     .fetch_one(&mut *tx)
     .await?;
 
-    let account_id: Uuid = account.get("id");
+    let account_id: Uuid = account.get::<Hyphenated, _>("id").into_uuid();
     let account_status: String = account.get("status");
 
     if account_status != "active" {
         return Err(AppError::Unauthenticated);
     }
 
+    // `updated_at` had a Postgres `now()` default and is now bound.
     let wallet = sqlx::query(
         r#"
-        INSERT INTO wallets (account_id, balance_idr)
-        VALUES ($1, 0)
+        INSERT INTO wallets (account_id, balance_idr, updated_at)
+        VALUES (?, 0, ?)
         ON CONFLICT (account_id) DO NOTHING
         RETURNING balance_idr
         "#,
     )
-    .bind(account_id)
+    .bind(account_id.hyphenated())
+    .bind(now)
     .fetch_optional(&mut *tx)
     .await?;
 
     let balance_idr = match wallet {
         Some(w) => w.get("balance_idr"),
         None => {
-            let existing = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            let existing = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&mut *tx)
                 .await?;
             existing.get("balance_idr")
@@ -232,22 +289,29 @@ pub async fn exchange_token(
 
     let session_token = format!("apk_sess_{}", Uuid::new_v4().simple());
     let token_hash = hash_token(&session_token);
-    // Absolute lifetime from config. The idle bound needs a last-seen column the
-    // schema does not have yet (docs/website/02-data-model.md, sessions).
-    let expires_at = Utc::now() + Duration::days(sessions.absolute_days as i64);
+    // Absolute lifetime from config. The idle bound (7d) is measured from
+    // `last_seen_at`, which the schema now carries and this insert seeds. The
+    // expiry is derived from the same instant as the row's other timestamps.
+    let expires_at = now + Duration::days(sessions.absolute_days as i64);
 
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // `id` had a Postgres `gen_random_uuid()` default; `last_seen_at` and
+    // `created_at` had `now()`. All three are bound now. Seeding `last_seen_at`
+    // with the login instant means an unused session dies on the idle bound.
     sqlx::query(
-        "INSERT INTO sessions (account_id, token_hash, expires_at, user_agent) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, user_agent, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(account_id)
+    .bind(Uuid::new_v4().hyphenated())
+    .bind(account_id.hyphenated())
     .bind(token_hash)
     .bind(expires_at)
+    .bind(now)
     .bind(user_agent)
+    .bind(now)
     .execute(&mut *tx)
     .await?;
 
@@ -268,7 +332,7 @@ pub async fn exchange_token(
 /// Revoke the current session row. A failed revoke is reported rather than
 /// swallowed: the cookie is only cleared once the row is actually dead.
 pub async fn logout(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     if let Some(token) = headers
@@ -277,8 +341,9 @@ pub async fn logout(
         .and_then(session_token_from_cookie_header)
     {
         sqlx::query(
-            "UPDATE sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
+            "UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
         )
+        .bind(Utc::now())
         .bind(hash_token(token))
         .execute(&pool)
         .await?;
@@ -290,7 +355,7 @@ pub async fn logout(
 /// Revoke every live session for the account - other devices are logged out
 /// immediately (docs/server/api-spec.md, auth).
 pub async fn logout_all(
-    State(pool): State<PgPool>,
+    State(pool): State<SqlitePool>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     if let Some(token) = headers
@@ -299,18 +364,20 @@ pub async fn logout_all(
         .and_then(session_token_from_cookie_header)
     {
         let session = sqlx::query(
-            "SELECT account_id FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+            "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
         )
         .bind(hash_token(token))
+        .bind(Utc::now())
         .fetch_optional(&pool)
         .await?;
 
         if let Some(s) = session {
-            let account_id: Uuid = s.get("account_id");
+            let account_id: Uuid = s.get::<Hyphenated, _>("account_id").into_uuid();
             sqlx::query(
-                "UPDATE sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",
+                "UPDATE sessions SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL",
             )
-            .bind(account_id)
+            .bind(Utc::now())
+            .bind(account_id.hyphenated())
             .execute(&pool)
             .await?;
         }
@@ -406,60 +473,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::db::{credit_topup_transaction, TopupCreditResult};
-    use crate::routes::resolve_account_from_cookie;
+    use crate::test_support::{self, TestDb};
     use axum::body::to_bytes;
     use chrono::DateTime;
     use serde_json::{json, Value};
 
-    /// A SMALL pool per test, for the reason account.rs documents: the live
-    /// suite already runs several pools and Postgres' connection limit is 100.
-    async fn live_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to a migrated Postgres instance");
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url)
-            .await
-            .expect("connect to Postgres")
-    }
-
-    /// Deletes every row a fixture created, in FK order: sessions -> wallets ->
-    /// accounts, plus the ledger and topups rows the money fixture appends
-    /// (both are ON DELETE RESTRICT, so the order is load-bearing).
-    async fn delete_fixture_rows(pool: &PgPool, account_ids: &[Uuid]) {
-        for account_id in account_ids {
-            for statement in [
-                "DELETE FROM ledger WHERE account_id = $1",
-                "DELETE FROM topups WHERE account_id = $1",
-                "DELETE FROM sessions WHERE account_id = $1",
-                "DELETE FROM wallets WHERE account_id = $1",
-                "DELETE FROM accounts WHERE id = $1",
-            ] {
-                sqlx::query(statement)
-                    .bind(account_id)
-                    .execute(pool)
-                    .await
-                    .unwrap_or_else(|err| panic!("cleanup failed on {statement}: {err}"));
-            }
-        }
-    }
-
     /// docs/observability.md's reconciliation, scoped to one account:
     /// wallets.balance_idr must equal SUM(ledger.delta_idr).
-    async fn ledger_drift_rows(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
                 SELECT w.account_id
                 FROM wallets w
                 LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = $1
+                WHERE w.account_id = ?
                 GROUP BY w.account_id, w.balance_idr
                 HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
@@ -469,13 +503,18 @@ mod tests {
     /// credit_topup_transaction, which settles it and appends the matching +
     /// ledger row in the same transaction. Writing wallets.balance_idr directly
     /// would manufacture the very drift the drift assertion then reports.
-    async fn settle_topup(pool: &PgPool, account_id: Uuid, amount_idr: i64) {
+    async fn settle_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) {
         let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO topups (account_id, amount_idr, order_id) VALUES ($1, $2, $3)")
-            .bind(account_id)
-            .bind(amount_idr)
-            .bind(&order_id)
-            .execute(pool)
+        sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
+             VALUES (?, ?, ?, ?, 'pending', ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(amount_idr)
+        .bind(&order_id)
+        .bind(Utc::now())
+        .execute(pool)
             .await
             .expect("create topup");
 
@@ -491,11 +530,15 @@ mod tests {
     /// Sessions that are actually usable: unrevoked AND unexpired. Both bounds
     /// matter - an expired-but-unrevoked row is not a credential, and counting
     /// it as "live" would make an expired cookie look like a valid session.
-    async fn live_sessions(pool: &PgPool, account_id: Uuid) -> i64 {
+    async fn live_sessions(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        // Both bounds are bound: an earlier port bound only the account, leaving the
+        // expiry comparison against NULL - which is never TRUE, so every count came
+        // back 0 and the assertions below read as "logout deleted rows".
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sessions WHERE account_id = $1 AND revoked_at IS NULL AND expires_at > now()",
+            "SELECT COUNT(*) FROM sessions WHERE account_id = ? AND revoked_at IS NULL AND expires_at > ?",
         )
-        .bind(account_id)
+        .bind(account_id.hyphenated())
+        .bind(Utc::now())
         .fetch_one(pool)
         .await
         .expect("count live sessions")
@@ -504,17 +547,22 @@ mod tests {
     /// A live session for an existing account, created the way exchange_token
     /// creates one: the row holds only the SHA-256 of the token.
     async fn add_live_session(
-        pool: &PgPool,
+        pool: &SqlitePool,
         account_id: Uuid,
         expires_at: DateTime<Utc>,
     ) -> String {
         let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        let now = Utc::now();
         sqlx::query(
-            "INSERT INTO sessions (account_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(account_id)
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
         .bind(hash_token(&token))
         .bind(expires_at)
+        .bind(now)
+        .bind(now)
         .execute(pool)
         .await
         .expect("create session");
@@ -528,22 +576,12 @@ mod tests {
         token: String,
     }
 
-    async fn live_account(pool: &PgPool) -> LiveAccount {
-        let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
-        let account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-                .bind(&pb_user_id)
-                .fetch_one(pool)
-                .await
-                .expect("create account");
-
-        // A zero-balance wallet with no ledger rows is consistent on its own
-        // (0 = SUM of nothing), so this starting point reconciles.
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(account_id)
-            .execute(pool)
-            .await
-            .expect("create the zero-balance wallet the login path would create");
+    async fn live_account(pool: &SqlitePool) -> LiveAccount {
+        // Ported: the Postgres original leaned on column DEFAULTS for `accounts.id`,
+        // `accounts.created_at` and `wallets.updated_at`; the strict SQLite schema has
+        // none, so the shared fixture binds them (plan section 4.1, correction 1).
+        let account_id = test_support::account(pool).await;
+        test_support::wallet(pool, account_id).await;
 
         let token = add_live_session(pool, account_id, Utc::now() + Duration::days(30)).await;
 
@@ -702,8 +740,8 @@ mod tests {
     }
 
     /// The account a PocketBase identity resolved to, if any.
-    async fn account_for_pb_user(pool: &PgPool, pb_user_id: &str) -> Option<Uuid> {
-        sqlx::query_scalar("SELECT id FROM accounts WHERE pb_user_id = $1")
+    async fn account_for_pb_user(pool: &SqlitePool, pb_user_id: &str) -> Option<Uuid> {
+        sqlx::query_scalar("SELECT id FROM accounts WHERE pb_user_id = ?")
             .bind(pb_user_id)
             .fetch_optional(pool)
             .await
@@ -714,10 +752,16 @@ mod tests {
     // 1. exchange_token
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres AND the local PocketBase: DATABASE_URL + POCKETBASE_URL"]
+    // The ONLY remaining exception in this module, and it is not about the database:
+    // `verify_pb_token` has no seam to fake, so this test drives a real local
+    // PocketBase (POCKETBASE_URL) end to end. Its database half is now the same
+    // per-test migrated SQLite file every other test uses, so what is missing is
+    // the identity provider, not Postgres.
+    #[ignore = "requires a live local PocketBase at POCKETBASE_URL: this test drives a real auth exchange and has no seam to fake"]
     #[tokio::test]
     async fn live_exchange_token_returns_the_real_balance_and_stores_only_the_hash() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let client = reqwest::Client::new();
 
         let tag = Uuid::new_v4().simple().to_string();
@@ -728,17 +772,19 @@ mod tests {
         // through the only sanctioned path, so the exchange has to read the
         // wallet rather than assume a new account.
         let seeded_pb_user_id = seeded.record_id.clone();
-        let seeded_account_id: Uuid =
-            sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
-                .bind(&seeded_pb_user_id)
-                .fetch_one(&pool)
-                .await
-                .expect("create the pre-existing account");
-        sqlx::query("INSERT INTO wallets (account_id, balance_idr) VALUES ($1, 0)")
-            .bind(seeded_account_id)
-            .execute(&pool)
-            .await
-            .expect("create the pre-existing wallet");
+        // Ported: `accounts.id`, `created_at`, `updated_at` and `wallets.updated_at`
+        // have no DEFAULT in the strict SQLite schema, so the Postgres shape (which
+        // relied on one) fails at runtime rather than at compile time.
+        let seeded_account_id = test_support::account(&pool).await;
+        sqlx::query(
+            "UPDATE accounts SET pb_user_id = ? WHERE id = ?",
+        )
+        .bind(&seeded_pb_user_id)
+        .bind(seeded_account_id.hyphenated())
+        .execute(&pool)
+        .await
+        .expect("link the pre-existing account to its PocketBase identity");
+        test_support::wallet(&pool, seeded_account_id).await;
         settle_topup(&pool, seeded_account_id, 73_500).await;
 
         assert!(
@@ -764,14 +810,14 @@ mod tests {
                 created.push(account_id);
             }
         }
-        delete_fixture_rows(&pool, &created).await;
+        db.close().await;
         delete_pb_identity(&client, &fresh).await;
         delete_pb_identity(&client, &seeded).await;
         outcome.expect("the exchange_token assertions panicked");
     }
 
     async fn exchange_token_assertions(
-        pool: PgPool,
+        pool: SqlitePool,
         fresh_pb_user_id: String,
         fresh_token: String,
         rejected_token: String,
@@ -819,8 +865,8 @@ mod tests {
 
         // The wallet the balance came from.
         let balance: i64 =
-            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("the exchange must have created the wallet");
@@ -839,8 +885,8 @@ mod tests {
         );
 
         let rows: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT token_hash, user_agent FROM sessions WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_as("SELECT token_hash, user_agent FROM sessions WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_all(&pool)
                 .await
                 .expect("read the session rows");
@@ -862,8 +908,8 @@ mod tests {
 
         // The session lifetime comes from config, not from a constant.
         let expires_at: DateTime<Utc> =
-            sqlx::query_scalar("SELECT expires_at FROM sessions WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT expires_at FROM sessions WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("read expires_at");
@@ -903,15 +949,15 @@ mod tests {
             "accounts.pb_user_id is UNIQUE, so a second login must resolve the same account: {again_body}"
         );
         let wallet_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count wallets");
         assert_eq!(wallet_rows, 1, "the wallet must not be duplicated");
         let session_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = $1")
-                .bind(account_id)
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
+                .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count sessions");
@@ -994,10 +1040,10 @@ mod tests {
     // 2. logout
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_logout_revokes_exactly_this_session_and_clears_the_cookie() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let victim = live_account(&pool).await;
         let sibling = live_account(&pool).await;
 
@@ -1010,12 +1056,12 @@ mod tests {
         ));
         let outcome = outcome.await;
 
-        delete_fixture_rows(&pool, &[victim.account_id, sibling.account_id]).await;
+        db.close().await;
         outcome.expect("the logout assertions panicked");
     }
 
     async fn logout_assertions(
-        pool: PgPool,
+        pool: SqlitePool,
         victim_id: Uuid,
         victim_token: String,
         sibling_id: Uuid,
@@ -1042,9 +1088,9 @@ mod tests {
         );
 
         let live_before: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sessions WHERE account_id = $1 AND revoked_at IS NULL",
+            "SELECT COUNT(*) FROM sessions WHERE account_id = ? AND revoked_at IS NULL",
         )
-        .bind(victim_id)
+        .bind(victim_id.hyphenated())
         .fetch_one(&pool)
         .await
         .expect("count live sessions");
@@ -1066,7 +1112,7 @@ mod tests {
 
         // The row is REVOKED, not deleted: the audit trail survives.
         let revoked_at: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = $1")
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
                 .bind(hash_token(&victim_token))
                 .fetch_one(&pool)
                 .await
@@ -1094,9 +1140,9 @@ mod tests {
             sibling_id
         );
         let sibling_live: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sessions WHERE account_id = $1 AND revoked_at IS NULL",
+            "SELECT COUNT(*) FROM sessions WHERE account_id = ? AND revoked_at IS NULL",
         )
-        .bind(sibling_id)
+        .bind(sibling_id.hyphenated())
         .fetch_one(&pool)
         .await
         .expect("count the sibling's live sessions");
@@ -1107,7 +1153,7 @@ mod tests {
         let second = call(logout(State(pool.clone()), cookie_header(&victim_token))).await;
         assert_eq!(second.status, StatusCode::NO_CONTENT);
         let revoked_again: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = $1")
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
                 .bind(hash_token(&victim_token))
                 .fetch_one(&pool)
                 .await
@@ -1119,8 +1165,8 @@ mod tests {
 
         // The victim account is otherwise intact.
         let sessions_left: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = $1")
-                .bind(victim_id)
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
+                .bind(victim_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count the victim's sessions");
@@ -1136,10 +1182,10 @@ mod tests {
     // 3. logout_all
     // -----------------------------------------------------------------------
 
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_logout_all_revokes_every_session_for_the_account_only() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let device_a = live_account(&pool).await;
         // device_b is a SECOND session on the SAME account, which is the whole
         // point of "sign out everywhere": two accounts prove nothing.
@@ -1157,12 +1203,12 @@ mod tests {
         ));
         let outcome = outcome.await;
 
-        delete_fixture_rows(&pool, &[device_a.account_id, other.account_id]).await;
+        db.close().await;
         outcome.expect("the logout_all assertions panicked");
     }
 
     async fn logout_all_assertions(
-        pool: PgPool,
+        pool: SqlitePool,
         account_id: Uuid,
         token_a: String,
         token_b: String,
@@ -1200,8 +1246,8 @@ mod tests {
         );
 
         // Revoked, not deleted: all three rows are still there.
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = $1")
-            .bind(account_id)
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
+            .bind(account_id.hyphenated())
             .fetch_one(&pool)
             .await
             .expect("count all sessions");
@@ -1244,13 +1290,13 @@ mod tests {
         );
     }
 
-    /// The "expires_at > now()" clause in logout_all's SELECT. Without it, an
+    /// The "expires_at > ?" clause in logout_all's SELECT. Without it, an
     /// expired-but-unrevoked cookie would be a credential that can sign every
     /// other device out - the one thing a dead session must not be able to do.
-    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
     #[tokio::test]
     async fn live_logout_all_ignores_a_session_that_is_not_live() {
-        let pool = live_pool().await;
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
         let account = live_account(&pool).await;
         let expired_token =
             add_live_session(&pool, account.account_id, Utc::now() - Duration::days(1)).await;
@@ -1263,12 +1309,12 @@ mod tests {
         ));
         let outcome = outcome.await;
 
-        delete_fixture_rows(&pool, &[account.account_id]).await;
+        db.close().await;
         outcome.expect("the logout_all dead-session assertions panicked");
     }
 
     async fn logout_all_ignores_dead_sessions(
-        pool: PgPool,
+        pool: SqlitePool,
         account_id: Uuid,
         live_token: String,
         expired_token: String,

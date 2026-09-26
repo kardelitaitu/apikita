@@ -73,8 +73,7 @@ trailing 30 days) unless a calendar period is explicitly needed:
 
 ## Data model
 
-The `api_keys` table lives in PostgreSQL (see
-[02-data-model.md](02-data-model.md)):
+The `api_keys` table lives in SQLite (see [02-data-model.md](02-data-model.md)):
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -147,8 +146,11 @@ model exists to a key not permitted to use it.
 
 ### Caching
 
-The proxy must **not** query PostgreSQL on every request — that would make the
-database the bottleneck and add latency to every token.
+The proxy must **not** query the database on every request — that would put the
+database on every token's hot path. SQLite made the query itself far cheaper
+(there is no network hop), but it did not remove the reason: **SQLite has one
+writer at a time for the whole database**, so a read on every token is still
+serialising against the write lock.
 
 - Cache key metadata (limits, model list, revoked state) with a **short TTL**
   (e.g. 30–60 seconds).

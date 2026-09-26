@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = match db::init_pool(&database_url).await {
         Ok(pool) => pool,
         Err(err) => {
-            error!("Could not connect to Postgres: {err}");
+            error!("Could not connect to Sqlite: {err}");
             // Non-zero, so a scheduler notices a sweep that did not run.
             // Silence here is how a privacy promise quietly stops being kept.
             std::process::exit(1);

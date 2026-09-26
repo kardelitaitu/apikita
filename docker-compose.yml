@@ -2,55 +2,24 @@
 #
 #   cp .env.example .env && docker compose up -d
 #
-# Postgres is money, PocketBase is identity, nginx is the edge relay.
+# nginx is the edge relay; it proxies to the Rust API running on the HOST.
 # Ports and the fake-provider strategy: docs/local-development.md.
-# Relay behaviour: docs/edge-relay.md. Migrations: .docker/postgres/README.md.
+# Relay behaviour: docs/edge-relay.md.
+#
+# There is no database container. The API uses embedded SQLite at the path in
+# DATABASE_URL (default sqlite://data/server.db) — a file on this host, not a
+# service. Postgres and the PocketBase container were removed by the SQLite
+# migration (docs/plans/sqlite-migration.md); PocketBase returns as a Rust
+# implementation in Phase 6, and it will not be a container either.
+#
+# Resetting the local database is a file operation, not a volume one, and the
+# instructions live with the rest of the dev loop in docs/local-development.md —
+# `docker compose down -v` no longer touches any data, so there is nothing here to
+# reset.
 #
 # No top-level `version:` key — obsolete in Compose v2+.
 
 services:
-  # ---------------------------------------------------------------------------
-  # Money. Schema lives in server/migrations and is applied automatically on the
-  # FIRST boot of an empty volume (see .docker/postgres/README.md).
-  # ---------------------------------------------------------------------------
-  postgres:
-    image: postgres:16
-    container_name: apikita-postgres
-    environment:
-      POSTGRES_DB: apikita
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev}
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      # /docker-entrypoint-initdb.d runs *.sql once, on first boot only.
-      - ./server/migrations:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d apikita"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-
-  # ---------------------------------------------------------------------------
-  # Identity only. Holds no money: balances and ledger are in Postgres.
-  # ---------------------------------------------------------------------------
-  pocketbase:
-    image: ghcr.io/muchobien/pocketbase:latest
-    container_name: apikita-pocketbase
-    command: ["serve", "--http=0.0.0.0:8090"]
-    ports:
-      - "8090:8090"
-    volumes:
-      - pbdata:/pb_data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/api/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   # ---------------------------------------------------------------------------
   # Edge relay. Serves the STATIC SITE and proxies the API, both on :8000, so the
   # browser sees ONE origin and the session cookie is actually sent. Production
@@ -58,7 +27,7 @@ services:
   # the dashboard cannot authenticate. See .docker/nginx/relay.conf.
   #
   # The API upstream is host.docker.internal:8080 rather than a service name
-  # because the Rust API runs on the HOST (cargo run --bin api), not here.
+  # because the Rust API runs on the HOST (cargo run --bin apikita-server), not here.
   # ---------------------------------------------------------------------------
   nginx:
     image: nginx:1.27-alpine
@@ -78,10 +47,8 @@ services:
     # Linux hosts need the gateway alias for host.docker.internal.
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # Wait for a migrated database before accepting traffic.
-    depends_on:
-      postgres:
-        condition: service_healthy
+    # No depends_on: there is no database service left to wait for. The API runs
+    # on the host, so this healthcheck reports unhealthy until it is started.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/healthz || exit 1"]
       interval: 10s
@@ -100,8 +67,9 @@ services:
   #              key_ip_seen > 7d, key_ip_daily > 90d. This is the
   #              docs/ip-tracking.md retention promise actually being kept.
   #   reconcile  RUNS HERE, for real. tools/reconcile/reconcile.sh, exit code
-  #              preserved verbatim (1=drift 2=no DATABASE_URL 3=no psql
-  #              4=psql failed). No `|| true` anywhere near it.
+  #              preserved verbatim (1=drift 2=no DATABASE_URL 3=no sqlite3
+  #              4=sqlite3 failed 5=stranded hold 6=no such database file).
+  #              No `|| true` anywhere near it.
   #   ip-purge, hold-sweep
   #              NOT WIRED. Both are Rust binaries and this compose file has no
   #              server image and no Rust build stage, so no container in it can
@@ -110,20 +78,31 @@ services:
   #              and does nothing is the same failure class as a money check that
   #              returns 0 while the money is wrong. Run them on the host, on the
   #              same cadence, until a server image exists.
+  #
+  # NOT YET PORTED TO SQLITE. This service predates the SQLite migration and is
+  # kept, not dropped, so the work is not lost — but its wiring is still
+  # Postgres: the image below is used for its psql client, the DSNs below are
+  # postgres://, and it mounts neither a sqlite3 binary nor the API's data
+  # directory. Until that is ported the nightly run FAILS LOUDLY (retention: psql
+  # against a DSN with no server; reconcile: reconcile.sh exit 2 on a non-SQLite
+  # URL, or exit 3 with no sqlite3) rather than reporting a clean sheet. Porting
+  # this service is open work.
   # ---------------------------------------------------------------------------
   scheduler:
-    # psql client only. NOT the money database — the postgres service above is.
+    # psql client only. NOT a database: the money database is the SQLite file the
+    # API opens on the host, and there is no database service in this file.
     image: postgres:16
     container_name: apikita-scheduler
     entrypoint: ["/bin/sh", "/usr/local/bin/maintenance-entrypoint.sh"]
     # schedule = nightly loop. one-shot verbs for operators/CI: once, retention, reconcile.
     command: ["schedule"]
     environment:
-      # Same DSN as .env.example's local stack value, reached over the compose
-      # network by service name instead of localhost.
+      # Stale: still a Postgres DSN, and there is no Postgres any more.
       DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-dev}@postgres:5432/apikita
       # reconcile.sh reads this. Deliberately separate from DATABASE_URL so a bad
       # DSN disarms the reconciliation job alone, not the retention sweep.
+      # Stale too: reconcile.sh now requires a SQLite URL, and this container
+      # cannot reach the API's data directory.
       RECONCILE_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-dev}@postgres:5432/apikita
       # Nightly run time, UTC hour 0-23. 03:00 UTC is a quiet hour for the stack.
       SCHEDULE_HOUR_UTC: ${SCHEDULE_HOUR_UTC:-3}
@@ -131,17 +110,9 @@ services:
       - ./.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro
       # Read-only: reconcile.sh + reconcile.sql, unmodified and unowned by this job.
       - ./tools/reconcile:/usr/local/share/reconcile:ro
-    # Never start sweeping before the database accepts connections.
-    depends_on:
-      postgres:
-        condition: service_healthy
     # No healthcheck on purpose: this container serves nothing and listens on
     # nothing, so any probe would be theatre. Its liveness signal is the nightly
     # job log line, and a failed job is a non-zero exit, not a silent success.
     # Nightly cadence needs it back after a reboot, and `unless-stopped` matches
     # every other service here.
     restart: unless-stopped
-
-volumes:
-  pgdata:
-  pbdata:
