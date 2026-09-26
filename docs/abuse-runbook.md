@@ -99,7 +99,7 @@ looked the way it did. Without it, you have no defence.
 
 | Finding | Outcome |
 | --- | --- |
-| Violation clear and severe | Terminate. Do not refund (see the ToS section 3 exception — forfeiture is legally risky) |
+| Violation clear and severe | Terminate. The terms are non-refundable, but **forfeiture is still legally risky** — record the decision and the reason, do not simply keep the balance |
 | Violation minor | Warn, restore, monitor |
 | False positive | Restore immediately, and note why the signal fired |
 | **Uncertain** | **Do not terminate.** Restrict, monitor, gather more |
@@ -179,7 +179,7 @@ proof of abuse on its own.
 | --- | --- |
 | Read customer prompts to investigate | Violates a stated promise; needs a policy change first |
 | Terminate without a written record | Indefensible if challenged |
-| Silently keep a suspended customer's money | The ToS refund exception applies |
+| Silently keep a suspended customer's money | The terms are non-refundable, but silently keeping it is still not defensible — record the forfeiture and tell the customer why |
 | Ignore an upstream complaint because it seems minor | The relationship is the business |
 
 ## Tooling needed

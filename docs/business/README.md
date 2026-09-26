@@ -57,7 +57,7 @@ Treat every number in this folder as a placeholder until it is not.
 | --- | --- |
 | Upstream permits resale? | **Resolved — permitted** (re-check per provider) |
 | Payment rail | **Decided — Midtrans, dynamic QRIS, Snap + server webhook** |
-| Refund policy | **Decided — prepaid, non-refundable** |
+| Refund policy | **Decided — prepaid, non-refundable with no exception**; enforced in code (inbound refunds refused, nothing written). Legal review remains a Gate 0 item |
 | Deposit floor | Decided — 10,000 IDR; first-deposit minimum still open |
 | Entity (personal vs. PT) | **Open** — affects dispute posture and volume ceiling |
 | Upstream rates verified | **Open** — every rate-card figure is `[UNVERIFIED]` |

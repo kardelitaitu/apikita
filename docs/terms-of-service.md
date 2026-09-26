@@ -56,21 +56,38 @@ This is the most commercially important section.
 | Rate changes | We may change prices with notice |
 | Minimums | A first-deposit minimum and a re-top-up minimum apply |
 
-### The refund clause must be precise
+### The refund clause — settled: non-refundable, no exception
 
-**Non-refundable is enforceable against a customer who changes their mind. It is
-NOT enforceable against non-delivery.** If we take payment and provide no service —
-or cannot provide it — the customer is entitled to their money back regardless of
-what this document says, and a QRIS dispute will generally favour the payer.
+**Decided: deposits and unused credit are non-refundable, with no non-delivery
+carve-out.** The earlier draft carried an exception returning unused credit where
+service could not be provided. That exception is **withdrawn** — see
+[`decisions.md`](decisions.md) §Money.
 
 Draft language:
 
-> Unused credit is non-refundable except where required by law or where we are
-> unable to provide the service for which the credit was purchased. Where service
-> cannot be provided, unused credit will be returned.
+> All deposits and unused credit are non-refundable. No refund is provided for
+> change of mind, for unused credit, or for any other reason.
 
-**Do not write "non-refundable" without the exception.** A clause that overreaches
-is more likely to be struck down entirely than a narrow one.
+The system matches this: there is **no code path and no operator procedure that
+returns money**. An inbound Midtrans `refund`/`partial_refund` notification is
+refused and changes nothing (see
+[`server/api-spec.md`](server/api-spec.md) §`POST /webhooks/midtrans`).
+
+> ⚠️ **Open legal risk — flagged, not resolved.** Withdrawing the carve-out was a
+> deliberate business decision, and the legal consequence is **not settled**:
+>
+> - A clause that overreaches is more likely to be **struck down in its entirety**
+>   than a narrow one — so this may reduce, not increase, the clause's protective
+>   value.
+> - `business/05-risk.md` records that on non-delivery **the payer generally
+>   prevails at the dispute stage regardless of the stated policy**, because
+>   Midtrans is a domestic rail with a real merchant entity behind it.
+> - "Non-refundable" therefore scopes liability to *unwanted* service, not to
+>   *undelivered* service. A chargeback returns the money at the rail whether or
+>   not these terms permit it.
+>
+> This is a **lawyer's call and remains a Gate 0 item**. The text above records the
+> decision; it does not certify it is enforceable.
 
 ### Expiry
 
@@ -186,7 +203,7 @@ there would be nothing to deliver.
 | Requirement | Where enforced |
 | --- | --- |
 | Cross-border forwarding disclosed before first use | Signup + pre-topup notice |
-| Non-refundable stated with the non-delivery exception | Terms + top-up screen |
+| Non-refundable stated (no exception) | Terms + top-up screen |
 | Acceptable use published and linked | Terms + an abuse contact |
 | Prompts genuinely not stored | Code review; see [`data-retention.md`](data-retention.md) |
 | Retention periods stated accurately | Matches the schema |

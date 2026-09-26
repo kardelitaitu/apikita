@@ -235,8 +235,12 @@ and refused**, never applied:
 **An unalerted refusal is silent**, which is indistinguishable from a refund bug —
 so alert on that log line. It is the only signal that a refund was ever asked for.
 
-A customer claiming the non-delivery exception is answered by the Terms of
-Service, not by an operator debiting a wallet.
+The terms are non-refundable with no exception, so a customer asking for money back
+is answered by the Terms of Service — not by an operator debiting a wallet. Note the
+exposure that remains: a chargeback returns the money **at the rail** regardless of
+the terms, and the platform's records will still show the credit. See
+[`business/05-risk.md`](business/05-risk.md) and
+[`website/04-payments.md`](website/04-payments.md).
 
 ## Non-money actions
 
