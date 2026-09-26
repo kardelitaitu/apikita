@@ -74,7 +74,8 @@ import Base from '../layouts/Base.astro';
   // The auth island. Marketing pages ship no JavaScript; this page is an
   // interactive surface and is the only place this bundle loads.
   import { pb, exchangeForSession } from '../lib/pocketbase';
-  import { describeError } from '../lib/errors';
+  import { renderLoginError } from '../lib/login-error';
+  import { apiFetch, ApiError, type Me } from '../lib/api';
 
   const errorBox = document.getElementById('auth-error') as HTMLDivElement;
   const googleButton = document.getElementById('google-signin') as HTMLButtonElement;
@@ -85,11 +86,24 @@ import Base from '../layouts/Base.astro';
   const next = new URLSearchParams(window.location.search).get('next');
   const destination = next && next.startsWith('/') && !next.startsWith('//') ? next : '/dashboard';
 
+  // Someone who already holds a valid session should never be shown the login
+  // form — send them straight on to the destination they came for.
+  //
+  // redirectOn401 MUST stay false. With the default (true) a signed-out visitor
+  // gets a 401, apiFetch calls redirectToLogin(), and the browser lands on
+  // /login?next=/login — a loop that looks like the page reloading forever.
+  // Probing from an auth page means owning the 401 yourself, exactly as
+  // /auth/exchange does (lib/pocketbase.ts).
+  void apiFetch<Me>('/api/me', { redirectOn401: false })
+    .then(() => window.location.replace(destination))
+    // 401 is the normal signed-out case, not an error: stay on the form and stay
+    // silent. Only a genuinely broken probe is worth the console.
+    .catch((err: unknown) => {
+      if (!(err instanceof ApiError) || err.status !== 401) console.warn(err);
+    });
+
   function showError(err: unknown): void {
-    const view = describeError(err);
-    errorBox.textContent = view.requestId
-      ? `${view.message} (request_id: ${view.requestId})`
-      : view.message;
+    renderLoginError(errorBox, err);
     errorBox.hidden = false;
   }
 

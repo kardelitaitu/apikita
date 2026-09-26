@@ -1,5 +1,6 @@
 ---
 import Base from './Base.astro';
+import Nav from '../components/Nav.astro';
 
 // The authenticated shell. One place owns the sticky header, the live-balance
 // badge and the error surface, so every dashboard page inherits them.
@@ -7,39 +8,12 @@ interface Props {
   title: string;
 }
 const { title } = Astro.props;
-
-// The header is the one element every dashboard page inherits, so the nav lives
-// here and nowhere else — otherwise a page can only be reached by typing its URL.
-const links = [
-  { href: '/dashboard', label: 'Dashboard' },
-  { href: '/dashboard/keys', label: 'API keys' },
-  { href: '/dashboard/wallet', label: 'Wallet' },
-  { href: '/dashboard/usage', label: 'Usage' },
-  { href: '/dashboard/settings', label: 'Settings' },
-];
-
-const path = Astro.url.pathname.replace(/\/+$/, '') || '/';
-// /dashboard prefixes every route below it, so only the leaf routes claim their
-// sub-pages — creating a key still reads as "API keys".
-const isCurrent = (href: string) =>
-  path === href || (href !== '/dashboard' && path.startsWith(`${href}/`));
 ---
 
 <Base title={`${title} — apikita`} description="apikita dashboard." chrome={false}>
   <header class="sticky top-0 z-10 border-b border-edge bg-surface-raised/95 backdrop-blur">
     <div class="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3 px-6 py-3">
-      <nav class="flex w-full flex-wrap items-center gap-x-5 gap-y-1 text-sm sm:w-auto">
-        <a href="/" class="font-semibold tracking-tight">apikita</a>
-        {links.map(({ href, label }) => (
-          <a
-            href={href}
-            aria-current={isCurrent(href) ? 'page' : undefined}
-            class:list={[isCurrent(href) ? 'font-medium text-brand' : 'text-ink-muted hover:text-brand']}
-          >
-            {label}
-          </a>
-        ))}
-      </nav>
+      <Nav variant="dashboard" class="w-full sm:w-auto" />
 
       <div class="flex items-center gap-4">
         <!--

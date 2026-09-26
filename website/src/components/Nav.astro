@@ -1,0 +1,71 @@
+---
+// The one site nav. Both shells render this — the marketing pages through
+// Base.astro, the dashboard through DashboardLayout.astro — so the two can
+// never drift apart again.
+//
+// Zero JavaScript, static links only: Base.astro ships no <script> and this
+// component must not add one. It never asks whether the visitor is signed in;
+// that state belongs to the dashboard island, not to a static nav.
+interface Props {
+  /** `dashboard` = the authenticated shell: the dashboard routes, no sign-in CTA. */
+  variant?: 'marketing' | 'dashboard';
+  /** Layout classes for the shell that mounts it (the nav itself owns no width). */
+  class?: string;
+}
+
+const { variant = 'marketing', class: className } = Astro.props;
+
+const links =
+  variant === 'dashboard'
+    ? [
+        { href: '/dashboard', label: 'Dashboard' },
+        { href: '/dashboard/keys', label: 'API keys' },
+        { href: '/dashboard/wallet', label: 'Wallet' },
+        { href: '/dashboard/usage', label: 'Usage' },
+        { href: '/dashboard/settings', label: 'Settings' },
+      ]
+    : [
+        { href: '/', label: 'Home' },
+        { href: '/models', label: 'Models' },
+        { href: '/docs/quickstart', label: 'Docs' },
+      ];
+
+const path = Astro.url.pathname.replace(/\/+$/, '') || '/';
+// /dashboard prefixes every route below it, so only the leaf routes claim their
+// sub-pages — creating a key still reads as "API keys".
+const isCurrent = (href: string) =>
+  path === href || (href !== '/dashboard' && path.startsWith(`${href}/`));
+---
+
+<!--
+  flex-wrap with a smaller gap, never a hidden menu: four items plus the CTA do
+  not fit one line at 375px, and nothing may be dropped at small widths.
+-->
+<nav
+  class:list={[
+    'flex flex-wrap items-center justify-between gap-x-4 gap-y-2 text-sm text-ink-muted',
+    className,
+  ]}
+>
+  <a href="/" class="font-semibold tracking-tight text-ink">apikita</a>
+
+  <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+    {links.map(({ href, label }) => (
+      <a
+        href={href}
+        aria-current={isCurrent(href) ? 'page' : undefined}
+        class:list={[isCurrent(href) ? 'font-medium text-brand' : 'hover:text-brand']}
+      >
+        {label}
+      </a>
+    ))}
+    {variant === 'marketing' && (
+      <a
+        href="/login"
+        class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong"
+      >
+        Sign in
+      </a>
+    )}
+  </div>
+</nav>

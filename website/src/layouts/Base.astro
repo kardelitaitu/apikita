@@ -1,5 +1,6 @@
 ---
 import '../styles/global.css';
+import Nav from '../components/Nav.astro';
 
 // Zero-JS base layout. No <script>, no client:* directives, ever.
 interface Props {
@@ -23,13 +24,9 @@ const year = new Date().getFullYear();
   <body class="min-h-screen bg-surface text-ink antialiased">
     {chrome && (
     <header class="border-b border-edge">
-      <nav class="mx-auto flex max-w-4xl items-center justify-between px-6 py-4">
-        <a href="/" class="font-semibold tracking-tight">apikita</a>
-        <div class="flex gap-6 text-sm text-ink-muted">
-          <a href="/#pricing" class="hover:text-brand">Pricing</a>
-          <a href="/docs/quickstart" class="hover:text-brand">Quickstart</a>
-        </div>
-      </nav>
+      <div class="mx-auto max-w-4xl px-6 py-4">
+        <Nav />
+      </div>
     </header>
     )}
 
