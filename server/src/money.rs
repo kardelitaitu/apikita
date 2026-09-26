@@ -17,9 +17,15 @@ pub enum PaymentAction {
     Credit {
         amount_idr: i64,
     },
-    DebitRefund {
-        amount_idr: i64,
-    },
+    /// Midtrans can still SEND a refund - a merchant-panel refund, a
+    /// chargeback - and this server does NOT apply it. The platform does not do
+    /// refunds: no wallet debit, no ledger row, no `topups.status` change.
+    ///
+    /// Deliberately its own variant rather than `Unrecognised`: a refusal is a
+    /// POLICY, and routing it through the unknown-status arm would mislabel a
+    /// deliberate decision as a classification gap. It is also not `Pending` -
+    /// the refusal is final, not in progress.
+    RefundRefused,
     /// The payment will never settle. Carries the `topups.status` value to
     /// persist, so the mapping lives here with the vocabulary it maps and the
     /// handler has no unreachable branch to forget about.
@@ -75,8 +81,11 @@ pub fn verify_midtrans_signature(notification: &MidtransNotification, server_key
 /// sets is `Unrecognised` and must be surfaced, never assumed to be in progress.
 /// Money arrives.
 const CREDIT_STATUSES: [&str; 2] = ["capture", "settlement"];
-/// Money goes back. `partial_refund` included: an unhandled status corrupts the
-/// ledger (docs/server/api-spec.md:285-288).
+/// Refunds. Enumerated for the same reason as the credit set: this platform does
+/// NOT do refunds, so this must be an auditable list of the statuses refused BY
+/// POLICY - never implied by a catch-all arm, which would make a deliberate
+/// refusal indistinguishable from a status the server has never seen.
+/// `partial_refund` included: it is the same refusal.
 const REFUND_STATUSES: [&str; 2] = ["refund", "partial_refund"];
 /// Legitimate in-progress states: nothing to do yet, and 200 is the right answer.
 /// `pending` is what Midtrans sends while the customer has not paid; `authorize`
@@ -114,9 +123,7 @@ pub fn evaluate_payment_status(status: &str, stored_amount_idr: i64) -> PaymentA
         };
     }
     if REFUND_STATUSES.contains(&status) {
-        return PaymentAction::DebitRefund {
-            amount_idr: stored_amount_idr,
-        };
+        return PaymentAction::RefundRefused;
     }
     if let Some(schema_status) = terminal_status(status) {
         return PaymentAction::TerminalNoAction {
@@ -209,9 +216,11 @@ mod tests {
             evaluate_payment_status("capture", 50000),
             PaymentAction::Credit { amount_idr: 50000 }
         );
+        // The platform does NOT do refunds: a refund status is refused, never
+        // debited (see `a_refund_notification_is_never_classified_as_a_debit`).
         assert_eq!(
             evaluate_payment_status("refund", 50000),
-            PaymentAction::DebitRefund { amount_idr: 50000 }
+            PaymentAction::RefundRefused
         );
         assert_eq!(
             evaluate_payment_status("cancel", 50000),
@@ -229,6 +238,17 @@ mod tests {
             evaluate_payment_status("pending", 50000),
             PaymentAction::Pending
         );
+    }
+
+    #[test]
+    fn a_refund_notification_is_never_classified_as_a_debit() {
+        for status in ["refund", "partial_refund"] {
+            assert_eq!(
+                evaluate_payment_status(status, 50_000),
+                PaymentAction::RefundRefused,
+                "{status} must be refused, never debited"
+            );
+        }
     }
 
     #[test]

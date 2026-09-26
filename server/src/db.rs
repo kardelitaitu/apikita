@@ -1,8 +1,6 @@
 use crate::error::AppError;
 use chrono::Utc;
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 use std::time::Duration;
@@ -98,20 +96,22 @@ pub enum TopupCreditResult {
     /// RE-CREDITED the wallet, flipping the row back to `settled` and duplicating
     /// money. The stricter predicate closes that. Reporting the closed case as
     /// `AlreadySettled` would be a lie about a refunded order, so it gets its own
-    /// variant, mirroring `RefundResult::NotSettled`.
+    /// variant.
     NotSettleable { status: String },
 }
 
-/// The ONE ledger `ref` every money event of a topup is filed under.
+/// The ledger `ref` a topup's credit is filed under.
 ///
 /// docs/website/02-data-model.md:79 defines the column - "ref TEXT, -- topup id,
 /// usage batch id, etc." - and the same document's credit transaction writes
 /// `ref` as the topup id (lines 386-387). So a topup's ledger rows are keyed by
-/// the TOPUP id, and the credit and the refund of one top-up must be filed under
-/// the SAME value or no join can pair them and the audit trail cannot answer
-/// "what happened to top-up X". Both write paths go through here so the
-/// vocabulary cannot drift again (the refund used to write the Midtrans
-/// `order_id` instead).
+/// the TOPUP id, and the audit trail must be able to answer "what happened to
+/// top-up X" from that one value. The credit path goes through here so the
+/// vocabulary cannot drift again (it used to write the Midtrans `order_id`
+/// instead).
+///
+/// The refund path that used to share this ref is gone: this platform does not
+/// do refunds.
 pub fn topup_ledger_ref(topup_id: Uuid) -> String {
     topup_id.to_string()
 }
@@ -192,8 +192,8 @@ pub async fn credit_topup_transaction(
 
     // 4. Append to ledger. `created_at` shares the settle instant, so the row,
     //    the wallet and the ledger all carry one timestamp. The ref is the TOPUP
-    //    id (`topup_ledger_ref`), the same value the refund files under, so the
-    //    credit and its reversal can be joined (docs/website/02-data-model.md:79).
+    //    id (`topup_ledger_ref`), so the row is selectable by top-up
+    //    (docs/website/02-data-model.md:79).
     let ref_str = topup_ledger_ref(topup_id);
     sqlx::query(
         "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'topup', ?, ?, ?)",
@@ -209,222 +209,6 @@ pub async fn credit_topup_transaction(
     tx.commit().await?;
 
     Ok(TopupCreditResult::Settled { new_balance })
-}
-
-/// What a refund attempt did.
-#[derive(Debug, PartialEq, Eq)]
-pub enum RefundResult {
-    /// The wallet was debited and a `refund` ledger row appended.
-    Refunded { new_balance: i64 },
-    /// This order was already refunded - a replayed webhook. Nothing written.
-    AlreadyRefunded,
-    /// No such order.
-    NotFound,
-    /// The topup was never settled, so there is nothing to give back.
-    NotSettled { status: String },
-    /// The refund amount disagrees with the STORED `topups.amount_idr`. NOTHING
-    /// was written.
-    ///
-    /// The exact mirror of `TopupCreditResult::AmountMismatch`: the payload is
-    /// never trusted over our own row (docs/server/api-spec.md:284 - "compare
-    /// amount against the stored row; mismatch -> reject", and :295 - "the amount
-    /// comes from our stored row, never the payload").
-    ///
-    /// This is a refusal, not a refund. Without it the amount the caller sent was
-    /// the amount debited, so a signed notification naming more than the top-up
-    /// drained the wallet and left the row reading `refunded` for a figure it
-    /// never held.
-    AmountMismatch,
-    /// The wallet cannot cover the refund: the money has already been spent.
-    ///
-    /// NOTHING was written - not the ledger, not the topup status - so the
-    /// operator can see the topup still sitting in `settled` and resolve it by
-    /// hand. Deliberately distinct from `Refunded`: a refund that cannot be
-    /// applied is a real-world event, not a success.
-    InsufficientBalance { balance_idr: i64, required_idr: i64 },
-}
-
-/// Whether a topup in `status` may be refunded, and if not, why.
-#[derive(Debug, PartialEq, Eq)]
-pub enum RefundDecision {
-    Refund,
-    AlreadyRefunded,
-    NotSettled,
-}
-
-/// The pure decision behind the refund, split out so it is testable without a
-/// database.
-///
-/// `refunded` is checked before `settled`: a second refund of the same order is
-/// a replay, not a refund, and must not debit twice.
-pub fn refund_decision(status: &str) -> RefundDecision {
-    match status {
-        "refunded" => RefundDecision::AlreadyRefunded,
-        "settled" => RefundDecision::Refund,
-        // `pending`, `denied`, `expired`: money never arrived, so there is
-        // nothing to give back. Refunding these would create money.
-        _ => RefundDecision::NotSettled,
-    }
-}
-
-/// Atomically refunds a settled topup: debits the wallet and appends a `refund`
-/// ledger row, in one transaction, so `balance_idr = SUM(delta_idr)` still holds.
-///
-/// The debit carries `balance_idr >= ?1` as a predicate on the UPDATE itself,
-/// the same guard `debit_usage_transaction` uses: a concurrent request cannot race
-/// the check, and `CHECK (balance_idr >= 0)` is the backstop rather than the thing
-/// that refuses the debit (docs/decisions.md D3 - wallets are non-negative).
-///
-/// Idempotent under replay: the row is moved out of `settled` by a conditional
-/// UPDATE, and only the statement that performs that move proceeds, so a second
-/// refund of the same order is a no-op.
-///
-/// The amount is validated against the STORED `topups.amount_idr` and the debit
-/// is taken from that stored value, never from the caller's figure - the same
-/// rule the credit path applies (docs/server/api-spec.md:284, :295). A mismatch
-/// is `AmountMismatch` with NOTHING written: the claim in step 1 is rolled back.
-///
-/// `webhook_amount_idr` is what the CALLER claims, not what the top-up was: the
-/// parameter was named `stored_amount_idr` while carrying the webhook payload's
-/// value, and the debit followed the name's promise instead of the value.
-pub async fn refund_topup_transaction(
-    pool: &SqlitePool,
-    order_id: &str,
-    webhook_amount_idr: i64,
-) -> Result<RefundResult, AppError> {
-    let mut tx = begin_immediate(pool).await?;
-
-    // 1. Claim the refund by moving the row out of `settled`, in one conditional
-    //    statement. The Postgres original locked the row with `FOR UPDATE` and
-    //    then decided in Rust; SQLite has no row locks and rejects `FOR UPDATE`
-    //    (measured), so the status transition IS the guard and the write lock it
-    //    takes is what serializes two concurrent refunds.
-    //
-    //    The claim reads `amount_idr` back as well, because the amount that moves
-    //    is OUR row's, never the payload's: the caller's figure is only ever
-    //    compared against it.
-    //
-    //    Claiming before the amount check is safe because both happen in this one
-    //    transaction: the amount-mismatch path and the insufficient-balance path
-    //    below BOTH roll the claim back, leaving the topup `settled` exactly as
-    //    the original did - nothing written, no money moved.
-    let claimed = sqlx::query(
-        "UPDATE topups SET status = 'refunded' WHERE order_id = ? AND status = 'settled' \
-         RETURNING id, account_id, amount_idr",
-    )
-    .bind(order_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(claimed) = claimed else {
-        // 2. Nothing was written. One SELECT decides which refusal this is.
-        let existing = sqlx::query("SELECT status FROM topups WHERE order_id = ?")
-            .bind(order_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-        tx.rollback().await?;
-
-        return Ok(match existing {
-            None => RefundResult::NotFound,
-            Some(row) => {
-                let status: String = row.get("status");
-                match refund_decision(&status) {
-                    RefundDecision::AlreadyRefunded => RefundResult::AlreadyRefunded,
-                    // `Refund` is unreachable: the claim above would have matched
-                    // a `settled` row. Every other status had no money arrive, so
-                    // there is nothing to give back.
-                    RefundDecision::Refund | RefundDecision::NotSettled => {
-                        RefundResult::NotSettled { status }
-                    }
-                }
-            }
-        });
-    };
-
-    let topup_id: Uuid = claimed.get::<Hyphenated, _>("id").into_uuid();
-    let account_id: Uuid = claimed.get::<Hyphenated, _>("account_id").into_uuid();
-    let stored_amount_idr: i64 = claimed.get("amount_idr");
-
-    // 3. The amount must match the STORED row, exactly as the credit path
-    //    requires (step 2 there). Checked AFTER the status decision - so a
-    //    replayed refund still reads as a replay - and BEFORE the debit, so a
-    //    mismatch leaves the topup `settled`, the wallet untouched and the ledger
-    //    empty. The claim above is rolled back for exactly that reason.
-    //
-    //    `webhook_amount_idr` is what the CALLER claims, not what the top-up was:
-    //    the parameter was named `stored_amount_idr` while carrying the webhook
-    //    payload's value, and the debit followed the name's promise instead of the
-    //    value. The debit below moves `stored_amount_idr` - the value read from
-    //    our own row - and only after the two have been proved equal.
-    if stored_amount_idr != webhook_amount_idr {
-        tx.rollback().await?;
-        return Ok(RefundResult::AmountMismatch);
-    }
-
-    // 4. Debit the wallet, by the STORED amount. The guard is inside the
-    //    statement: when it matches no row the account cannot cover the refund,
-    //    and nothing may be written. `?1` is referenced twice, as the debit and as
-    //    the floor (measured working, with three binds for `?1 ?2`).
-    let wallet = sqlx::query(
-        "UPDATE wallets SET balance_idr = balance_idr - ?1, updated_at = ?2 WHERE account_id = ?3 AND balance_idr >= ?1 RETURNING balance_idr",
-    )
-    .bind(stored_amount_idr)
-    .bind(Utc::now())
-    .bind(account_id.hyphenated())
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let new_balance: i64 = match wallet {
-        Some(w) => w.get("balance_idr"),
-        None => {
-            // The decision was already made by the predicate; this read only fills
-            // in the error detail, and failing it must not turn a visible refusal
-            // into an opaque 500.
-            let balance_idr: i64 =
-                sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
-                    .bind(account_id.hyphenated())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-
-            // Roll back explicitly: nothing is written - including the status
-            // claim above - so the topup stays `settled` and the ledger gains no
-            // row it cannot back.
-            tx.rollback().await?;
-
-            return Ok(RefundResult::InsufficientBalance {
-                balance_idr,
-                required_idr: stored_amount_idr,
-            });
-        }
-    };
-
-    // 5. Append the refund row. `delta_idr` is negative: the ledger sums to the
-    //    balance, and a refund takes money out. The row is already `refunded` -
-    //    the claim in step 1 is what moved it, and nothing here writes the status
-    //    again.
-    //
-    //    The ref is the SAME topup id the credit wrote (topup_ledger_ref), not the
-    //    Midtrans order id: one logical top-up must be selectable by one ref value,
-    //    or the credit and its refund cannot be joined and the audit trail cannot
-    //    answer "what happened to top-up X" (docs/website/02-data-model.md:79).
-    sqlx::query(
-        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'refund', ?, ?, ?)",
-    )
-    .bind(account_id.hyphenated())
-    .bind(-stored_amount_idr)
-    .bind(topup_ledger_ref(topup_id))
-    .bind(new_balance)
-    .bind(Utc::now())
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    Ok(RefundResult::Refunded { new_balance })
 }
 
 /// What a settlement attempt actually did.
@@ -451,8 +235,8 @@ pub enum UsageSettlement {
 
 /// The pure shortfall decision: how much of `cost_idr` the wallet can actually pay.
 ///
-/// Split out from the SQL so the clamp is testable without a database, exactly as
-/// `refund_decision` is. The rule is a clamp of the DEBIT, never of the balance:
+/// Split out from the SQL so the clamp is testable without a database. The rule is
+/// a clamp of the DEBIT, never of the balance:
 /// the debit can be at most what the wallet holds, so the balance lands on 0 and
 /// `CHECK (balance_idr >= 0)` is the backstop rather than the thing that refuses
 /// the debit. Forcing the full debit would drive the balance negative, which
@@ -563,7 +347,7 @@ pub async fn debit_usage_transaction(
             // So record what actually happened, in this same transaction: the real
             // token counters and a ledger row for what was ACTUALLY debited. The
             // shortfall is logged at error level - a silent undercharge is the same
-            // class of defect as a silent refund.
+            // class of defect as money silently moved twice.
             return settle_partial_usage(
                 tx,
                 account_id,
@@ -693,10 +477,7 @@ async fn record_usage(
 }
 
 /// The wallet balance, or 0 when the account has no wallet row.
-async fn read_balance(
-    tx: &mut Transaction<'_, Sqlite>,
-    account_id: Uuid,
-) -> Result<i64, AppError> {
+async fn read_balance(tx: &mut Transaction<'_, Sqlite>, account_id: Uuid) -> Result<i64, AppError> {
     // Annotated, not inferred: `unwrap_or(0)` alone would leave the scalar type to
     // default to i32, which is wrong for money. `balance_idr` is a 64-bit INTEGER,
     // and a balance above `i32::MAX` would fail to decode rather than read back.
@@ -1462,82 +1243,6 @@ mod tests {
         }
     }
 
-    /// A refund is only ever applied to a topup that actually settled, and only
-    /// once. `refunded` is checked first, so a replayed webhook cannot debit
-    /// twice; `pending`/`denied`/`expired` never had money, so refunding them
-    /// would create money out of nothing.
-    #[test]
-    fn refund_decision_only_refunds_a_settled_topup_once() {
-        assert_eq!(refund_decision("settled"), RefundDecision::Refund);
-
-        // Replay: the second refund of the same order must not debit again.
-        assert_eq!(refund_decision("refunded"), RefundDecision::AlreadyRefunded);
-
-        // No money ever arrived for these.
-        assert_eq!(refund_decision("pending"), RefundDecision::NotSettled);
-        assert_eq!(refund_decision("denied"), RefundDecision::NotSettled);
-        assert_eq!(refund_decision("expired"), RefundDecision::NotSettled);
-
-        // An unknown status is refused rather than assumed refundable.
-        assert_eq!(refund_decision("something-new"), RefundDecision::NotSettled);
-    }
-
-    /// The refund outcome must stay distinguishable: an operator has to be able
-    /// to tell a completed refund from one the wallet could not cover, because
-    /// the second leaves the topup `settled` and needs a human.
-    #[test]
-    fn refund_outcomes_are_distinct_and_carry_the_amounts() {
-        assert_ne!(
-            RefundResult::Refunded { new_balance: 0 },
-            RefundResult::InsufficientBalance {
-                balance_idr: 0,
-                required_idr: 0
-            }
-        );
-        assert_ne!(
-            RefundResult::Refunded { new_balance: 1 },
-            RefundResult::AlreadyRefunded
-        );
-        assert_ne!(
-            RefundResult::NotFound,
-            RefundResult::NotSettled {
-                status: "pending".to_string()
-            }
-        );
-
-        // An amount that disagrees with the stored row is its OWN outcome, not a
-        // flavour of success: it is the refusal that replaced the unbounded debit.
-        assert_ne!(
-            RefundResult::AmountMismatch,
-            RefundResult::Refunded { new_balance: 0 }
-        );
-        assert_ne!(RefundResult::AmountMismatch, RefundResult::AlreadyRefunded);
-        assert_ne!(
-            RefundResult::AmountMismatch,
-            RefundResult::InsufficientBalance {
-                balance_idr: 0,
-                required_idr: 0
-            }
-        );
-
-        // The refusal carries both figures, so the log and the operator can see
-        // the shortfall without another query.
-        let refusal = RefundResult::InsufficientBalance {
-            balance_idr: 1000,
-            required_idr: 50000,
-        };
-        match refusal {
-            RefundResult::InsufficientBalance {
-                balance_idr,
-                required_idr,
-            } => {
-                assert_eq!(balance_idr, 1000);
-                assert_eq!(required_idr, 50000);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
     /// The clamp rule behind a settlement the balance cannot cover in full.
     ///
     /// This is the whole money decision and it is pure, so it is tested here
@@ -1834,7 +1539,6 @@ mod tests {
             "balance_idr must equal SUM(ledger.delta_idr) after a paired settlement"
         );
     }
-
 
     /// Runs the assertions against a fresh account in its OWN migrated SQLite
     /// database, then closes that database whether the assertions passed or
@@ -2134,245 +1838,44 @@ mod tests {
         assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
     }
 
-    /// The refund TRANSACTION, not just the pure decision: refunding a settled topup
-    /// debits the wallet by the STORED amount and appends a refund row with a
-    /// NEGATIVE delta; a replay does not debit twice; a topup that never settled is
-    /// refused (refunding it would create money); and a refund the balance cannot
-    /// cover writes NOTHING and leaves the topup settled for an operator. The
-    /// reconciliation invariant is asserted after EVERY case.
-    ///
-    /// The fixture refunds the whole stored amount because that is the only amount
-    /// a refund may move - `refund_topup_transaction` validates the caller's figure
-    /// against `topups.amount_idr` and refuses a disagreement. This test used to
-    /// refund 20_000 of a 50_000 top-up, which was only possible while the debit
-    /// followed the caller instead of the row.
-    ///
-    /// Runs by default against its own migrated SQLite database (port phase 5).
-    #[tokio::test]
-    async fn refund_debits_once_refuses_unsettled_and_writes_nothing_when_short() {
-        run_with_teardown(refund_assertions).await;
-    }
-
-    async fn refund_assertions(pool: SqlitePool, account_id: Uuid) {
-        const TOPUP: i64 = 50_000;
-        // The amount a refund moves IS the stored amount: anything else is
-        // refused as `AmountMismatch` before a single write.
-        const REFUND: i64 = TOPUP;
-
-        let settled_order = fund_through_topup(&pool, account_id, TOPUP).await;
-
-        // 1. A settled topup is refunded: the wallet is DEBITED and the ledger gains
-        //    a NEGATIVE row under the SAME topup id the credit used, so the pair
-        //    joins (docs/website/02-data-model.md:79).
-        let settled_topup_id = topup_id(&pool, &settled_order).await;
-        assert_eq!(
-            refund_topup_transaction(&pool, &settled_order, REFUND)
-                .await
-                .expect("refunding a settled topup"),
-            RefundResult::Refunded {
-                new_balance: TOPUP - REFUND
-            },
-            "the refund must debit the wallet by the refunded amount"
-        );
-        assert_eq!(wallet_balance(&pool, account_id).await, TOPUP - REFUND);
-        assert_eq!(
-            ledger_rows(&pool, account_id, "refund").await,
-            vec![(-REFUND, Some(settled_topup_id.to_string()))],
-            "the refund must append ONE row with reason=refund and a negative delta"
-        );
-        assert_eq!(
-            topup_status(&pool, &settled_order).await,
-            "refunded",
-            "a completed refund must mark the topup refunded"
-        );
-        assert_eq!(
-            ledger_drift_rows(&pool, account_id).await,
-            0,
-            "balance_idr must equal SUM(ledger.delta_idr) after a refund"
-        );
-
-        // 2. REPLAYED refund: a second webhook for the same order is a no-op. The
-        //    check is on the status, so it cannot debit twice.
-        assert_eq!(
-            refund_topup_transaction(&pool, &settled_order, REFUND)
-                .await
-                .expect("a replayed refund is a recorded outcome, not an error"),
-            RefundResult::AlreadyRefunded,
-            "a replayed refund must not debit twice"
-        );
-        assert_eq!(
-            wallet_balance(&pool, account_id).await,
-            TOPUP - REFUND,
-            "a replayed refund must leave the balance alone"
-        );
-        assert_eq!(
-            ledger_rows(&pool, account_id, "refund").await.len(),
-            1,
-            "a replayed refund must not append a second ledger row"
-        );
-        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
-
-        // 3. A topup that was NEVER settled is refused. Its money never arrived, so
-        //    a refund would take it from the customer's existing balance - money
-        //    created out of nothing.
-        let pending_order = format!("test_topup_{}", Uuid::new_v4().simple());
-        create_topup(&pool, account_id, 10_000, &pending_order).await;
-        assert_eq!(
-            refund_topup_transaction(&pool, &pending_order, 10_000)
-                .await
-                .expect("an unsettled topup is a recorded outcome, not an error"),
-            RefundResult::NotSettled {
-                status: "pending".to_string()
-            },
-            "refunding a topup that never settled must be refused"
-        );
-        assert_eq!(
-            topup_status(&pool, &pending_order).await,
-            "pending",
-            "a refused refund must not touch the topup"
-        );
-        assert_eq!(
-            wallet_balance(&pool, account_id).await,
-            TOPUP - REFUND,
-            "a refused refund must not move the wallet"
-        );
-        assert_eq!(
-            ledger_rows(&pool, account_id, "refund").await.len(),
-            1,
-            "a refused refund must not append a ledger row"
-        );
-        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
-
-        // 4. A refund the balance cannot cover: the money has already been spent.
-        //    NOTHING is written - not the ledger, not the topup status - so the topup
-        //    stays visible as settled for a human, and the balance does not go negative
-        //    (docs/decisions.md: "Overdraft - Not permitted").
-        let short_order = format!("test_topup_{}", Uuid::new_v4().simple());
-        create_topup(&pool, account_id, 10_000, &short_order).await;
-        assert_eq!(
-            credit_topup_transaction(&pool, &short_order, 10_000)
-                .await
-                .expect("settle the topup to be refunded"),
-            TopupCreditResult::Settled {
-                new_balance: TOPUP - REFUND + 10_000
-            }
-        );
-
-        // Spend the whole balance, so the refund has nothing to draw on.
-        let key_id = test_support::api_key(&pool, account_id).await;
-        assert_eq!(
-            debit_usage_transaction(
-                &pool,
-                account_id,
-                Some(key_id),
-                100,
-                0,
-                50,
-                TOPUP - REFUND + 10_000,
-                Some("test_refund_drain"),
-                0,
-            )
-            .await
-            .expect("drain the wallet"),
-            UsageSettlement::Settled { new_balance: 0 }
-        );
-        assert_eq!(wallet_balance(&pool, account_id).await, 0);
-
-        let ledger_before = ledger_row_count(&pool, account_id).await;
-        assert_eq!(
-            refund_topup_transaction(&pool, &short_order, 10_000)
-                .await
-                .expect("an unaffordable refund is a recorded outcome, not an error"),
-            RefundResult::InsufficientBalance {
-                balance_idr: 0,
-                required_idr: 10_000
-            },
-            "a refund the balance cannot cover must be reported, not forced"
-        );
-        assert_eq!(
-            topup_status(&pool, &short_order).await,
-            "settled",
-            "an unaffordable refund must leave the topup settled, so an operator can see it"
-        );
-        assert_eq!(
-            wallet_balance(&pool, account_id).await,
-            0,
-            "an unaffordable refund must not drive the balance negative"
-        );
-        assert_eq!(
-            ledger_row_count(&pool, account_id).await,
-            ledger_before,
-            "an unaffordable refund must write nothing"
-        );
-        assert_eq!(
-            ledger_rows(&pool, account_id, "refund").await.len(),
-            1,
-            "an unaffordable refund must not append a refund row"
-        );
-        assert_eq!(
-            ledger_drift_rows(&pool, account_id).await,
-            0,
-            "balance_idr must equal SUM(ledger.delta_idr) after an unaffordable refund"
-        );
-    }
-
     /// ONE logical top-up must be selectable by ONE ledger ref.
     ///
     /// docs/website/02-data-model.md:79 defines the column as "topup id, usage
-    /// batch id, etc." - the top-up's OWN id. The credit path wrote that id; the
-    /// refund path wrote the Midtrans order_id instead, so the two rows for one
-    /// top-up carried two different identities: no join paired them, and
-    /// ledger_sum_for_ref could not answer "what happened to top-up X".
+    /// batch id, etc." - the top-up's OWN id. The credit path must write that id,
+    /// never the Midtrans order_id, or the audit trail cannot answer "what
+    /// happened to top-up X" from a single ref value.
+    ///
+    /// This used to be a credit-and-refund pair, asserting the two rows shared one
+    /// ref. The refund path is gone - this platform does not do refunds - so only
+    /// the credit half remains, which is the half the join key depends on.
     ///
     /// Runs by default against its own migrated SQLite database (port phase 5).
     #[tokio::test]
-    async fn credit_and_refund_of_one_topup_share_one_ledger_ref() {
+    async fn a_topup_credit_is_filed_under_the_topup_id_not_the_order_id() {
         run_with_teardown(one_ref_assertions).await;
     }
 
     async fn one_ref_assertions(pool: SqlitePool, account_id: Uuid) {
         const TOPUP: i64 = 50_000;
-        // A refund moves the stored amount and nothing else, so the fixture's
-        // refund equals the top-up it reverses.
-        const REFUND: i64 = TOPUP;
 
-        // Fund through the REAL credit path, then refund through the real refund
-        // path: this is one logical money event, written by two transactions.
         let order_id = fund_through_topup(&pool, account_id, TOPUP).await;
         let stored_id = topup_id(&pool, &order_id).await;
         let topup_ref = stored_id.to_string();
 
-        assert_eq!(
-            refund_topup_transaction(&pool, &order_id, REFUND)
-                .await
-                .expect("refund the settled top-up"),
-            RefundResult::Refunded {
-                new_balance: TOPUP - REFUND
-            },
-            "the fixture must refund through the real refund path"
-        );
-
-        // The defect, stated as the property the audit trail needs: ONE ref value
-        // selects the whole ledger history of this top-up - the credit AND the
-        // refund, in the order they happened.
+        // The property the audit trail needs: the topup's OWN id selects the
+        // credit, with the delta the wallet actually moved by.
         assert_eq!(
             ledger_rows_for_ref(&pool, account_id, &topup_ref).await,
-            vec![
-                ("topup".to_string(), TOPUP),
-                ("refund".to_string(), -REFUND)
-            ],
-            "the credit and its refund must share ONE ref (the topup id), or no join can pair them"
+            vec![("topup".to_string(), TOPUP)],
+            "the credit must be filed under the topup id"
         );
-
-        // And the net move under that one ref is the top-up net of what was given
-        // back - the question reconciliation asks about a top-up.
         assert_eq!(
             ledger_sum_for_ref(&pool, account_id, &topup_ref).await,
-            TOPUP - REFUND,
-            "one ref must net to what this top-up actually left in the wallet"
+            TOPUP,
+            "one ref must net to what this top-up left in the wallet"
         );
 
-        // The order id must NOT be a second identity for the same rows.
+        // The order id must NOT be a second identity for the same row.
         assert_eq!(
             ledger_rows_for_ref(&pool, account_id, &order_id).await,
             Vec::<(String, i64)>::new(),
@@ -2381,98 +1884,6 @@ mod tests {
 
         assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
     }
-
-    /// A refund whose amount is NOT the stored one must be REFUSED, with nothing
-    /// written. This is the refund mirror of the credit test's case 3 above.
-    ///
-    /// THE DEFECT: the refund took its amount from the webhook PAYLOAD and debited
-    /// it without ever reading `topups.amount_idr`, so the only thing bounding the
-    /// debit was `balance_idr >= ?`. A signed notification naming more than the
-    /// top-up drained the whole wallet in one call, the topup still read `refunded`
-    /// for a figure it never held, and the ledger agreed with the wallet - the row
-    /// was written from the same unchecked value - so reconciliation saw nothing.
-    ///
-    /// The wallet here holds TWO top-ups, so the inflated refund is AFFORDABLE: the
-    /// balance guard cannot be what saves us, which is the point.
-    ///
-    /// Runs by default against its own migrated SQLite database (port phase 5).
-    #[tokio::test]
-    async fn refund_rejects_an_amount_that_is_not_the_stored_one() {
-        run_with_teardown(refund_amount_mismatch_assertions).await;
-    }
-
-    async fn refund_amount_mismatch_assertions(pool: SqlitePool, account_id: Uuid) {
-        const TOPUP: i64 = 50_000;
-        const INFLATED: i64 = 999_999;
-
-        let order_id = fund_through_topup(&pool, account_id, TOPUP).await;
-        let topup_ref = topup_id(&pool, &order_id).await.to_string();
-
-        // A second, independent top-up: the wallet now holds 100_000, so the
-        // inflated figure below is a refund the balance COULD cover. Written with
-        // the raw helpers rather than `fund_through_topup`, which opens a
-        // zero-balance wallet and would collide with the one just funded.
-        let other_order = format!("test_topup_{}", Uuid::new_v4().simple());
-        create_topup(&pool, account_id, TOPUP, &other_order).await;
-        assert_eq!(
-            credit_topup_transaction(&pool, &other_order, TOPUP)
-                .await
-                .expect("settle the second top-up"),
-            TopupCreditResult::Settled {
-                new_balance: 2 * TOPUP
-            }
-        );
-        assert_eq!(wallet_balance(&pool, account_id).await, 2 * TOPUP);
-        let ledger_before = ledger_row_count(&pool, account_id).await;
-
-        assert_eq!(
-            refund_topup_transaction(&pool, &order_id, INFLATED)
-                .await
-                .expect("a mismatch is a recorded outcome, not an error"),
-            RefundResult::AmountMismatch,
-            "an amount that disagrees with the stored top-up must be refused"
-        );
-
-        assert_eq!(
-            wallet_balance(&pool, account_id).await,
-            2 * TOPUP,
-            "a refused refund must not debit - not the payload amount, not the stored one"
-        );
-        assert_eq!(
-            topup_status(&pool, &order_id).await,
-            "settled",
-            "a refused refund must not mark the top-up refunded"
-        );
-        assert_eq!(
-            ledger_row_count(&pool, account_id).await,
-            ledger_before,
-            "a refused refund must append no ledger row"
-        );
-        assert_eq!(
-            ledger_rows_for_ref(&pool, account_id, &topup_ref).await,
-            vec![("topup".to_string(), TOPUP)],
-            "the only ledger row under this top-up must still be the credit"
-        );
-        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
-
-        // The STORED amount still refunds, and it debits exactly that - so the
-        // refusal is about the amount, not about refusing refunds.
-        assert_eq!(
-            refund_topup_transaction(&pool, &order_id, TOPUP)
-                .await
-                .expect("refund the stored amount"),
-            RefundResult::Refunded { new_balance: TOPUP },
-            "the stored amount must still refund cleanly"
-        );
-        assert_eq!(wallet_balance(&pool, account_id).await, TOPUP);
-        assert_eq!(topup_status(&pool, &order_id).await, "refunded");
-        assert_eq!(
-            ledger_rows_for_ref(&pool, account_id, &topup_ref).await,
-            vec![("topup".to_string(), TOPUP), ("refund".to_string(), -TOPUP)]
-        );
-        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
-    }
-
     /// release_reservation_transaction had no direct test. Releasing a hold must
     /// credit the wallet by exactly the held amount and append a matching POSITIVE
     /// row under the SAME reserve_% ref, so the pair nets to zero, the stranded-hold
@@ -3157,7 +2568,8 @@ mod tests {
     }
 
     /// REGRESSION for the money-duplication defect plan section 4.5 found while
-    /// executing: settle → refund → the original SETTLEMENT webhook replays.
+    /// executing: settle → an OUT-OF-BAND refund → the original SETTLEMENT
+    /// webhook replays.
     ///
     /// The guard this replaced short-circuited only on `status == 'settled'`, so a
     /// row that had already been refunded fell through and was settled a second
@@ -3168,6 +2580,10 @@ mod tests {
     /// is refused — plus `TopupCreditResult::NotSettleable`, a fourth outcome,
     /// because reporting a refunded order as "already settled" is a lie an operator
     /// would act on.
+    ///
+    /// The refund is written here as raw SQL rather than through a function: the
+    /// platform does not do refunds, so the only way a row reaches `refunded` is an
+    /// operator acting outside this codebase. The guard must still hold.
     #[tokio::test]
     async fn a_settlement_replayed_after_a_refund_is_refused_and_credits_nothing() {
         let db = TestDb::new().await;
@@ -3186,15 +2602,33 @@ mod tests {
         );
         assert_eq!(test_support::balance(&db.pool, account_id).await, AMOUNT);
 
-        assert!(
-            matches!(
-                refund_topup_transaction(&db.pool, &order_id, AMOUNT)
-                    .await
-                    .expect("refund"),
-                RefundResult::Refunded { new_balance: 0 }
-            ),
-            "a settled topup must refund"
-        );
+        // The refund is now an OUT-OF-BAND action: this platform does not do
+        // refunds, so NO code path performs one. This fixture reproduces exactly
+        // what such an action would leave behind - the row moved to `refunded`,
+        // the wallet debited, and a `refund` ledger row - written as raw SQL so
+        // the test does not depend on a money-moving function that no longer
+        // exists. `reason = 'refund'` is reserved-but-unreachable in production.
+        sqlx::query("UPDATE topups SET status = 'refunded' WHERE order_id = ?")
+            .bind(&order_id)
+            .execute(&db.pool)
+            .await
+            .expect("mark the topup refunded out of band");
+        sqlx::query("UPDATE wallets SET balance_idr = balance_idr - ? WHERE account_id = ?")
+            .bind(AMOUNT)
+            .bind(account_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("debit the wallet the way an out-of-band refund would");
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES (?, ?, 'refund', ?, 0, ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(-AMOUNT)
+        .bind(topup_id(&db.pool, &order_id).await.to_string())
+        .bind(Utc::now())
+        .execute(&db.pool)
+        .await
+        .expect("append the out-of-band refund row");
         assert_eq!(test_support::balance(&db.pool, account_id).await, 0);
         assert_eq!(
             test_support::ledger_sum(&db.pool, account_id).await,
@@ -3229,88 +2663,6 @@ mod tests {
         assert_eq!(
             status, "refunded",
             "the replay must not flip the row back to settled"
-        );
-
-        db.close().await;
-    }
-
-    /// REGRESSION for plan section 4.3, trap 2, and the real concurrency test
-    /// section 9 check 4 still owed.
-    ///
-    /// A deferred `BEGIN` that reads and then writes can be refused at the lock
-    /// upgrade with `SQLITE_BUSY_SNAPSHOT` — an error that **cannot be resolved by
-    /// retrying**, because the transaction has to be rolled back and restarted. It
-    /// appears only under contention, so no test that opens one transaction at a
-    /// time can see it.
-    ///
-    /// Every transaction here takes the write lock up front through
-    /// `begin_immediate`, so five concurrent refunds serialize instead of
-    /// deadlocking on an upgrade: exactly one refunds, the rest observe the row
-    /// already refunded, and **none returns an error**. That last clause is the
-    /// assertion — an `Err` here would mean either the unrecoverable upgrade or a
-    /// `database is locked` once the bounded `busy_timeout` wait ran out.
-    #[tokio::test]
-    async fn concurrent_refunds_serialize_without_losing_the_write_lock() {
-        let db = TestDb::new().await;
-        let account_id = test_support::account_with_wallet(&db.pool).await;
-        const AMOUNT: i64 = 10_000;
-        const CONCURRENCY: usize = 5;
-
-        let order_id = test_support::pending_topup(&db.pool, account_id, AMOUNT).await;
-        assert_eq!(
-            credit_topup_transaction(&db.pool, &order_id, AMOUNT)
-                .await
-                .expect("settle"),
-            TopupCreditResult::Settled {
-                new_balance: AMOUNT
-            }
-        );
-
-        let mut tasks = Vec::with_capacity(CONCURRENCY);
-        for _ in 0..CONCURRENCY {
-            let pool = db.pool.clone();
-            let order_id = order_id.clone();
-            tasks.push(tokio::spawn(async move {
-                refund_topup_transaction(&pool, &order_id, AMOUNT).await
-            }));
-        }
-
-        let mut refunded = 0;
-        let mut already = 0;
-        for task in tasks {
-            // This `expect` IS the check: a refund must either win the lock or see
-            // the row already refunded. An error means the port lost the write lock.
-            match task
-                .await
-                .expect("a refund task panicked")
-                .expect("a refund must never error under contention")
-            {
-                RefundResult::Refunded { .. } => refunded += 1,
-                RefundResult::AlreadyRefunded => already += 1,
-                other => panic!("unexpected refund outcome: {other:?}"),
-            }
-        }
-
-        assert_eq!(
-            refunded, 1,
-            "exactly one of five concurrent refunds may debit the wallet"
-        );
-        assert_eq!(
-            already,
-            CONCURRENCY - 1,
-            "the rest must see the row already refunded"
-        );
-
-        assert_eq!(
-            test_support::balance(&db.pool, account_id).await,
-            0,
-            "the refund must happen exactly once"
-        );
-        assert_eq!(
-            ledger_drift_rows(&db.pool, account_id).await,
-            0,
-            "{}",
-            drift_report(&db.pool, account_id).await
         );
 
         db.close().await;
