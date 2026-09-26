@@ -167,7 +167,8 @@ const errorCodes = [
         contract — match on it, not on the message.
       </p>
       <pre class="mt-4 overflow-x-auto rounded-lg border border-edge bg-surface-raised p-4 text-sm"><code>{errorShape}</code></pre>
-      <table class="mt-6 w-full border-collapse text-left text-sm">
+      <div class="overflow-x-auto">
+        <table class="mt-6 w-full border-collapse text-left text-sm">
         <thead>
           <tr class="border-b border-edge-strong">
             <th scope="col" class="py-3 pr-4 font-medium">Status</th>
@@ -187,6 +188,7 @@ const errorCodes = [
           ))}
         </tbody>
       </table>
+      </div>
       <p class="mt-4 max-w-2xl text-sm text-ink-muted">
         <code class="font-mono">Retry-After</code> is sent on 429 and 503 only, in
         seconds. On a 429 it is the real time until your window frees; on a 503 it is

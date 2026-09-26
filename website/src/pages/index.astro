@@ -162,7 +162,8 @@ const faq = [
       minimum monthly spend, no per-request fee.
     </p>
 
-    <table class="mt-6 w-full border-collapse text-left text-sm">
+    <div class="overflow-x-auto">
+        <table class="mt-6 w-full border-collapse text-left text-sm">
       <thead>
         <tr class="border-b border-edge-strong">
           <th scope="col" class="py-3 pr-4 font-medium">Token class</th>
@@ -180,6 +181,7 @@ const faq = [
         ))}
       </tbody>
     </table>
+      </div>
 
     <p class="mt-4 text-sm text-ink-muted">
       Available models: {models.join(', ')} — priced identically. Every request is

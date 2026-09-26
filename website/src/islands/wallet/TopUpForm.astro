@@ -116,7 +116,8 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
     <p id="topup-history-empty" hidden class="mt-3 text-sm text-ink-muted">
       No top-ups yet. Your first deposit has a higher minimum than later ones.
     </p>
-    <table id="topup-history" hidden class="mt-4 w-full border-collapse text-left text-sm">
+    <div class="overflow-x-auto">
+      <table id="topup-history" hidden class="mt-4 w-full border-collapse text-left text-sm">
       <thead>
         <tr class="border-b border-edge-strong">
           <th scope="col" class="py-3 pr-4 font-medium">Date</th>
@@ -126,7 +127,8 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
         </tr>
       </thead>
       <tbody id="topup-history-rows"></tbody>
-    </table>
+      </table>
+    </div>
   </section>
 </div>
 
