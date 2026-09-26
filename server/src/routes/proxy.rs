@@ -286,13 +286,43 @@ const RATE_WINDOW_CAPACITY: usize = 4096;
 fn check_rate_limit(key_id: Uuid, limit_rpm: u32, now: Instant) -> RateDecision {
     let windows = RATE_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut windows = windows.lock().unwrap_or_else(|e| e.into_inner());
+    check_rate_limit_in(&mut windows, RATE_WINDOW_CAPACITY, key_id, limit_rpm, now)
+}
 
-    if windows.len() >= RATE_WINDOW_CAPACITY {
+/// The decision itself, over an explicit table.
+///
+/// Split out from the process-wide map so the eviction rule can be pinned by a
+/// pure test: the table is synchronous and the mutex is held only for map
+/// operations, so nothing here needs a server, a clock or a database.
+fn check_rate_limit_in(
+    windows: &mut HashMap<Uuid, RateWindow>,
+    capacity: usize,
+    key_id: Uuid,
+    limit_rpm: u32,
+    now: Instant,
+) -> RateDecision {
+    // A key that ALREADY holds a window needs no room in the table, so it must
+    // never be subject to eviction: its counter is the very thing being
+    // enforced. Evicting before this lookup is what let a key sitting on its
+    // ceiling reset its own window by making another request.
+    if let Some(window) = windows.get_mut(&key_id) {
+        return window.check(limit_rpm, now);
+    }
+
+    if windows.len() >= capacity {
+        // Reclaim every window whose minute is over. Dropping one resets
+        // nothing — that key had already rolled over — so a dead window is
+        // always the victim of choice.
         windows.retain(|_, w| now.saturating_duration_since(w.started_at) < RATE_WINDOW);
-        if windows.len() >= RATE_WINDOW_CAPACITY {
-            // Still full of live windows. Dropping one hands that key a fresh
-            // window — it is allowed through MORE often, never less, which is
-            // the safe direction for a limiter to fail.
+        if windows.len() >= capacity {
+            // DELIBERATE FAIL-OPEN. The table is full of LIVE windows, so any
+            // victim is a key mid-minute and dropping it hands that key a fresh
+            // allowance — it is allowed through MORE often, never less. This is
+            // the explicit tradeoff: bounded memory (RATE_WINDOW_CAPACITY live
+            // keys) in exchange for a bounded amount of over-admission, and it
+            // is only reachable at that many simultaneously-live keys. The
+            // expired sweep above means the common case never gets here. A
+            // per-key LRU would need a dependency this build does not carry.
             if let Some(victim) = windows.keys().next().copied() {
                 windows.remove(&victim);
             }
@@ -914,6 +944,44 @@ fn stream_flag_allowed(requested: Option<bool>) -> Result<(), AppError> {
     }
 }
 
+/// The input-token estimate behind the pre-flight hold: ONE definition, shared
+/// by the handler and the tests.
+///
+/// The hold is a CEILING over every settlement of the request (proxy.rs:1094-1098,
+/// money.rs:400), and input tokens are NOT bytes. `len/4` holds only for ASCII: a
+/// UTF-8-dense body is 3 bytes per CJK character and a byte-level BPE emits about
+/// ONE token per character, so the old estimate came out ~3x short on exactly the
+/// traffic this proxy sees. The shortfall is uncollectable: settlement clamps the
+/// debit to what was reserved (db.rs:266-271) and logs a Partial, so the excess is
+/// silently written off.
+///
+/// So the two halves are counted differently:
+///
+/// * ASCII keeps the documented ~4 bytes per token.
+/// * Every byte of a multi-byte sequence is held as a whole token. This is the
+///   airtight direction rather than another heuristic: a byte-level BPE that does
+///   not carry a code point falls back to one token per BYTE, so it can never
+///   emit more tokens than the body has bytes. The dense part therefore cannot be
+///   under-counted, and the over-ask it costs is bounded by the model's output
+///   ceiling, which is what the hold is really sized by (up to 384k tokens).
+///
+/// Floored at 1 so a zero-byte body cannot reserve zero and slip past the balance
+/// guard. Kept a free function rather than inlined because the handler and the
+/// test oracle each carried their own copy of `len/4`, and a rule written twice
+/// is a rule that can disagree with itself.
+fn estimated_input_tokens(body: &[u8]) -> u64 {
+    let mut ascii_bytes = 0u64;
+    let mut multi_byte_bytes = 0u64;
+    for byte in body {
+        if byte.is_ascii() {
+            ascii_bytes += 1;
+        } else {
+            multi_byte_bytes += 1;
+        }
+    }
+    (multi_byte_bytes + ascii_bytes / 4).max(1)
+}
+
 /// The inbound body with `"stream": true` guaranteed and nothing else changed.
 ///
 /// A body that is not a JSON object is refused here — before any money moves
@@ -1077,12 +1145,14 @@ pub async fn chat_completions(
 
     // Pre-flight worst-case reservation, taken BEFORE routing.
     //
-    // Input is estimated from the raw body length (~4 bytes per token, floored
-    // at 1); the output ceiling is the request's own cap, clamped to the hard
-    // limit. The reservation must cover the dearest endpoint in the pool, not
-    // the one that happens to serve the request — otherwise a failover to a
-    // dearer provider can overdraw the balance (docs/failover.md:162-165).
-    let estimated_input = (body.len() as u64 / 4).max(1);
+    // Input is estimated from the body's CODE POINTS, not its raw length, at ~4
+    // per token and floored at 1 (see `estimated_input_tokens`: a byte count
+    // under-reserves UTF-8-dense input); the output ceiling is the request's own
+    // cap, clamped to the hard limit. The reservation must cover the dearest
+    // endpoint in the pool, not the one that happens to serve the request —
+    // otherwise a failover to a dearer provider can overdraw the balance
+    // (docs/failover.md:162-165).
+    let estimated_input = estimated_input_tokens(&body);
     // The reservation must cover the worst case the upstream can actually emit,
     // not just the client's cap. A request that omits max_tokens (or asks for
     // less than the model can produce) still lets the upstream stream up to the
@@ -1870,6 +1940,121 @@ mod tests {
         );
     }
 
+    // DEFECT: the capacity backstop ran BEFORE the requesting key was looked
+    // up, and evicted `keys().next()` — an arbitrary entry — as soon as the
+    // table was at capacity. When the only windows present are live (the sole
+    // case the preceding `retain` leaves behind), the victim was a window that
+    // was still being enforced, and dropping it silently RESET that key's
+    // minute: its next request started from zero and was ALLOWED even though it
+    // was sitting on its ceiling. That is fail-OPEN on a money-adjacent path —
+    // a key at its ceiling buys extra requests by crowding the table.
+    //
+    // Capacity 1 makes the victim unambiguous: the only entry is the key being
+    // limited, so the defect showed up as the limiter resetting the very window
+    // it was enforcing, on that key's own request.
+    #[test]
+    fn a_key_at_its_ceiling_cannot_reset_its_own_window() {
+        let now = Instant::now();
+        let capacity = 1;
+        let key = Uuid::new_v4();
+        let mut windows = HashMap::new();
+
+        assert_eq!(
+            check_rate_limit_in(&mut windows, capacity, key, 1, now),
+            RateDecision::Allow
+        );
+        // The key is at its ceiling. Its second request must be refused, and the
+        // table being full must not hand it a fresh window on the way in.
+        assert!(
+            matches!(
+                check_rate_limit_in(&mut windows, capacity, key, 1, now),
+                RateDecision::Deny { .. }
+            ),
+            "a key at its ceiling must be refused, not handed a fresh window by eviction"
+        );
+        assert_eq!(
+            windows.get(&key).map(|w| w.count),
+            Some(1),
+            "the count that justifies the refusal must survive the request"
+        );
+
+        // Repeated attempts keep being refused: the reset is not merely deferred
+        // to the next call.
+        for _ in 0..5 {
+            assert!(matches!(
+                check_rate_limit_in(&mut windows, capacity, key, 1, now),
+                RateDecision::Deny { .. }
+            ));
+        }
+        assert_eq!(windows.get(&key).map(|w| w.count), Some(1));
+    }
+
+    // The residual tradeoff, pinned so it stays deliberate. Once the table is
+    // full of LIVE windows a new key has nowhere to go, so the backstop evicts
+    // an arbitrary live window (fail-OPEN) to keep memory bounded. This is
+    // reachable only at RATE_WINDOW_CAPACITY simultaneously-live keys, and only
+    // after the expired sweep found nothing to reclaim. If this ever becomes
+    // unacceptable the fix is shared/evictable state, not a bigger map.
+    #[test]
+    fn the_live_window_backstop_stays_bounded_and_is_the_documented_fail_open() {
+        let now = Instant::now();
+        let capacity = 2;
+        let mut windows = HashMap::new();
+
+        for _ in 0..capacity {
+            check_rate_limit_in(&mut windows, capacity, Uuid::new_v4(), 1, now);
+        }
+        assert_eq!(windows.len(), capacity);
+
+        // Every window is live, so the newcomer must displace one of them.
+        assert_eq!(
+            check_rate_limit_in(&mut windows, capacity, Uuid::new_v4(), 1, now),
+            RateDecision::Allow,
+            "a key with no window of its own is still answered"
+        );
+        assert_eq!(windows.len(), capacity, "the table never exceeds its cap");
+    }
+
+    // The backstop must still reclaim memory and still answer a key that has no
+    // window of its own. Reclaiming a window whose minute is over resets
+    // nothing: that key had already rolled over.
+    #[test]
+    fn the_backstop_reclaims_expired_windows_without_wedging() {
+        let now = Instant::now();
+        let capacity = 2;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut windows = HashMap::new();
+
+        assert_eq!(
+            check_rate_limit_in(&mut windows, capacity, a, 1, now),
+            RateDecision::Allow
+        );
+        assert_eq!(
+            check_rate_limit_in(&mut windows, capacity, b, 1, now),
+            RateDecision::Allow
+        );
+        assert_eq!(windows.len(), capacity, "the table is full of live windows");
+
+        // A third key while the table is full is still answered...
+        assert_eq!(
+            check_rate_limit_in(&mut windows, capacity, Uuid::new_v4(), 1, now),
+            RateDecision::Allow
+        );
+        assert!(windows.len() <= capacity, "memory stays bounded");
+
+        // ...and once the live windows roll over the table is reclaimed rather
+        // than wedged full forever.
+        let later = now + RATE_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            check_rate_limit_in(&mut windows, capacity, Uuid::new_v4(), 1, later),
+            RateDecision::Allow
+        );
+        assert!(!windows.contains_key(&a), "an expired window is reclaimed");
+        assert!(!windows.contains_key(&b), "an expired window is reclaimed");
+        assert!(windows.len() <= capacity, "memory stays bounded");
+    }
+
     // DEFECT 2 regression: the invalidation drops the entry, and a lookup that
     // read the row before the invalidation cannot put it back.
     #[test]
@@ -1976,6 +2161,93 @@ mod tests {
             .as_str()
             .expect("docs/error-model.md:171 - always include request_id")
             .to_string()
+    }
+
+    // ---------------------------------------------------------------------
+    // The pre-flight input estimate: a hold must cover the TRUE token cost
+    // ---------------------------------------------------------------------
+
+    /// The hold is taken BEFORE the upstream is called and is the only thing
+    /// standing between a request and the balance. The handler's own comment
+    /// (proxy.rs:1094-1098) and money.rs:400 state the invariant as "never
+    /// under-reserve": the reservation is a CEILING over every settlement of the
+    /// same request.
+    ///
+    /// The input side is a byte-length heuristic, and bytes are not tokens. A
+    /// UTF-8-dense body (CJK: 3 bytes per character, and ~1 token per character
+    /// for a typical BPE tokenizer) carries roughly 3x the tokens a `len/4`
+    /// estimate assumes, so the hold comes out smaller than the true cost and the
+    /// difference is never collected: settlement clamps the debit to what was
+    /// reserved (db.rs:266-271) and logs a Partial. Uncollected revenue.
+    #[test]
+    fn the_input_estimate_covers_a_utf8_dense_body() {
+        let config = live_config();
+        let model = config
+            .models
+            .iter()
+            .find(|m| m.name == "flash")
+            .expect("the shipped config must carry the flash model");
+
+        // A body that is overwhelmingly multi-byte: ~3000 CJK characters (3
+        // bytes each) plus a small JSON envelope. A BPE tokenizer emits about
+        // ONE token per CJK character, so this body really is ~3000 input
+        // tokens - it just does not look like it to a byte counter.
+        let prompt = "请用中文详细解释这个系统的架构。".repeat(200);
+        let dense = format!(
+            r#"{{"model":"flash","stream":true,"messages":[{{"role":"user","content":"{prompt}"}}]}}"#
+        )
+        .into_bytes();
+        // The same BYTE LENGTH of ASCII. A byte-length heuristic cannot tell
+        // the two apart, which is the whole defect.
+        let sparse = vec![b'a'; dense.len()];
+        let hold = |body: &[u8]| model.worst_case_reservation_idr(estimated_input_tokens(body), 0);
+
+        // POSITIVE CONTROL: the fixture can only expose the defect if the dense
+        // body really is byte-dense (more than 4 bytes per token).
+        let dense_chars = dense.iter().filter(|b| **b & 0xC0 != 0x80).count() as u64;
+        assert!(
+            dense_chars * 4 > dense.len() as u64,
+            "the fixture must be byte-dense or it asserts nothing: {dense_chars} chars in {} bytes",
+            dense.len()
+        );
+
+        // (1) Model-free: two bodies of the SAME length, one of them dense, must
+        // not be held against the same money.
+        assert!(
+            hold(&dense) > hold(&sparse),
+            "a byte-length estimate prices a UTF-8-dense body exactly like an ASCII body of the \
+             same length (dense {} IDR vs sparse {} IDR), but the dense one costs more",
+            hold(&dense),
+            hold(&sparse)
+        );
+
+        // (2) The invariant itself (proxy.rs:1094-1098, money.rs:400): the hold
+        // is a CEILING over the settlement of this request, so it must cover the
+        // tokens the body really is - one token per CJK character plus ~4 ASCII
+        // bytes per token for the envelope.
+        let non_ascii_chars = dense
+            .iter()
+            .filter(|b| !b.is_ascii() && **b & 0xC0 != 0x80)
+            .count() as u64;
+        let ascii_bytes = dense.iter().filter(|b| b.is_ascii()).count() as u64;
+        let true_tokens = non_ascii_chars + (ascii_bytes / 4).max(1);
+        let true_cost = calculate_token_cost_idr(
+            model.price,
+            true_tokens,
+            model.rates.input_peak,
+            0,
+            model.rates.cache_read_peak,
+            0,
+            model.rates.output_peak,
+        );
+
+        assert!(
+            hold(&dense) >= true_cost,
+            "the hold must cover the true cost of the body: {true_tokens} tokens in {} bytes, \
+             hold {} IDR, but the input alone bills {true_cost} IDR",
+            dense.len(),
+            hold(&dense)
+        );
     }
 
     #[test]
@@ -2303,8 +2575,9 @@ mod tests {
     /// The worst-case hold chat_completions MUST take for this body, recomputed
     /// independently from the config: the DEAREST endpoint's worst case, over
     /// max(requested, the model's own ceiling) clamped to the hard limit. The
-    /// input side is estimated from the raw body length at ~4 bytes per token,
-    /// floored at 1 - the same lens the handler uses.
+    /// input side goes through the SAME `estimated_input_tokens` the handler
+    /// calls - the estimate is not re-derived here, because a second copy of a
+    /// rule is a second rule.
     fn expected_hold_idr(
         config: &AppConfig,
         model: &str,
@@ -2341,7 +2614,7 @@ mod tests {
             .iter()
             .find(|m| m.name == model)
             .expect("the model must be in the config");
-        let estimated_input = (body.len() as u64 / 4).max(1);
+        let estimated_input = estimated_input_tokens(body);
         let max_output = max_tokens
             .unwrap_or(0)
             .max(model_cfg.max_output_tokens)
