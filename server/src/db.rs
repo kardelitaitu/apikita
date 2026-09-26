@@ -19,6 +19,20 @@ pub enum TopupCreditResult {
     AmountMismatch,
 }
 
+/// The ONE ledger `ref` every money event of a topup is filed under.
+///
+/// docs/website/02-data-model.md:79 defines the column - "ref TEXT, -- topup id,
+/// usage batch id, etc." - and the same document's credit transaction writes
+/// `ref` as the topup id (lines 386-387). So a topup's ledger rows are keyed by
+/// the TOPUP id, and the credit and the refund of one top-up must be filed under
+/// the SAME value or no join can pair them and the audit trail cannot answer
+/// "what happened to top-up X". Both write paths go through here so the
+/// vocabulary cannot drift again (the refund used to write the Midtrans
+/// `order_id` instead).
+pub fn topup_ledger_ref(topup_id: Uuid) -> String {
+    topup_id.to_string()
+}
+
 /// Atomically settles a topup and credits the wallet, recording an append-only ledger row.
 pub async fn credit_topup_transaction(
     pool: &PgPool,
@@ -73,13 +87,12 @@ pub async fn credit_topup_transaction(
     let new_balance: i64 = wallet.get("balance_idr");
 
     // 6. Append to ledger
-    let ref_str = topup_id.to_string();
     sqlx::query(
         "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES ($1, $2, 'topup', $3, $4, now())",
     )
     .bind(account_id)
     .bind(amount_idr)
-    .bind(ref_str)
+    .bind(topup_ledger_ref(topup_id))
     .bind(new_balance)
     .execute(&mut *tx)
     .await?;
@@ -215,12 +228,17 @@ pub async fn refund_topup_transaction(
 
     // 4. Append the refund row. `delta_idr` is negative: the ledger sums to the
     //    balance, and a refund takes money out.
+    //
+    //    The ref is the SAME topup id the credit wrote (topup_ledger_ref), not the
+    //    Midtrans order id: one logical top-up must be selectable by one ref value,
+    //    or the credit and its refund cannot be joined and the audit trail cannot
+    //    answer "what happened to top-up X" (docs/website/02-data-model.md:79).
     sqlx::query(
         "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES ($1, $2, 'refund', $3, $4, now())",
     )
     .bind(account_id)
     .bind(-amount_idr)
-    .bind(order_id)
+    .bind(topup_ledger_ref(topup_id))
     .bind(new_balance)
     .execute(&mut *tx)
     .await?;
@@ -1797,6 +1815,25 @@ mod tests {
             .expect("count ledger rows")
     }
 
+    /// Every ledger row under one ref, oldest first, as (reason, delta_idr).
+    ///
+    /// This is the join the audit trail depends on: one ref value must select every
+    /// row that belongs to one logical money event.
+    async fn ledger_rows_for_ref(
+        pool: &PgPool,
+        account_id: Uuid,
+        reference: &str,
+    ) -> Vec<(String, i64)> {
+        sqlx::query_as(
+            "SELECT reason, delta_idr FROM ledger WHERE account_id = $1 AND ref = $2 ORDER BY id",
+        )
+        .bind(account_id)
+        .bind(reference)
+        .fetch_all(pool)
+        .await
+        .expect("read ledger rows for ref")
+    }
+
     /// The net ledger move under one ref. A hold and its release must sum to zero.
     async fn ledger_sum_for_ref(pool: &PgPool, account_id: Uuid, reference: &str) -> i64 {
         sqlx::query_scalar(
@@ -1960,7 +1997,9 @@ mod tests {
         let settled_order = fund_through_topup(&pool, account_id, TOPUP).await;
 
         // 1. A settled topup is refunded: the wallet is DEBITED and the ledger gains
-        //    a NEGATIVE row under the order id.
+        //    a NEGATIVE row under the SAME topup id the credit used, so the pair
+        //    joins (docs/website/02-data-model.md:79).
+        let settled_topup_id = topup_id(&pool, &settled_order).await;
         assert_eq!(
             refund_topup_transaction(&pool, &settled_order, REFUND)
                 .await
@@ -1973,7 +2012,7 @@ mod tests {
         assert_eq!(wallet_balance(&pool, account_id).await, TOPUP - REFUND);
         assert_eq!(
             ledger_rows(&pool, account_id, "refund").await,
-            vec![(-REFUND, Some(settled_order.clone()))],
+            vec![(-REFUND, Some(settled_topup_id.to_string()))],
             "the refund must append ONE row with reason=refund and a negative delta"
         );
         assert_eq!(
@@ -2110,6 +2149,71 @@ mod tests {
             0,
             "balance_idr must equal SUM(ledger.delta_idr) after an unaffordable refund"
         );
+    }
+
+    /// ONE logical top-up must be selectable by ONE ledger ref.
+    ///
+    /// docs/website/02-data-model.md:79 defines the column as "topup id, usage
+    /// batch id, etc." - the top-up's OWN id. The credit path wrote that id; the
+    /// refund path wrote the Midtrans order_id instead, so the two rows for one
+    /// top-up carried two different identities: no join paired them, and
+    /// ledger_sum_for_ref could not answer "what happened to top-up X".
+    ///
+    /// Needs a live, migrated Postgres - DATABASE_URL=... cargo test --lib -- --ignored.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn credit_and_refund_of_one_topup_share_one_ledger_ref() {
+        run_with_teardown(live_pool().await, one_ref_assertions).await;
+    }
+
+    async fn one_ref_assertions(pool: PgPool, account_id: Uuid) {
+        const TOPUP: i64 = 50_000;
+        const REFUND: i64 = 20_000;
+
+        // Fund through the REAL credit path, then refund through the real refund
+        // path: this is one logical money event, written by two transactions.
+        let order_id = fund_through_topup(&pool, account_id, TOPUP).await;
+        let stored_id = topup_id(&pool, &order_id).await;
+        let topup_ref = stored_id.to_string();
+
+        assert_eq!(
+            refund_topup_transaction(&pool, &order_id, REFUND)
+                .await
+                .expect("refund the settled top-up"),
+            RefundResult::Refunded {
+                new_balance: TOPUP - REFUND
+            },
+            "the fixture must refund through the real refund path"
+        );
+
+        // The defect, stated as the property the audit trail needs: ONE ref value
+        // selects the whole ledger history of this top-up - the credit AND the
+        // refund, in the order they happened.
+        assert_eq!(
+            ledger_rows_for_ref(&pool, account_id, &topup_ref).await,
+            vec![
+                ("topup".to_string(), TOPUP),
+                ("refund".to_string(), -REFUND)
+            ],
+            "the credit and its refund must share ONE ref (the topup id), or no join can pair them"
+        );
+
+        // And the net move under that one ref is the top-up net of what was given
+        // back - the question reconciliation asks about a top-up.
+        assert_eq!(
+            ledger_sum_for_ref(&pool, account_id, &topup_ref).await,
+            TOPUP - REFUND,
+            "one ref must net to what this top-up actually left in the wallet"
+        );
+
+        // The order id must NOT be a second identity for the same rows.
+        assert_eq!(
+            ledger_rows_for_ref(&pool, account_id, &order_id).await,
+            Vec::<(String, i64)>::new(),
+            "the Midtrans order id must not be a second ref vocabulary for a top-up"
+        );
+
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
     }
 
     /// release_reservation_transaction had no direct test. Releasing a hold must
