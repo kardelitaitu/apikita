@@ -278,7 +278,11 @@ fn print_summary(
     writeln!(out, "holds: {}", holds.len()).ok();
 
     if holds.is_empty() {
-        writeln!(out, "result: OK - no reservation hold is stranded; zero rows is the invariant").ok();
+        writeln!(
+            out,
+            "result: OK - no reservation hold is stranded; zero rows is the invariant"
+        )
+        .ok();
         return;
     }
 
@@ -556,17 +560,20 @@ mod tests {
 
     #[test]
     fn parse_args_accepts_a_positive_custom_bound() {
-        let options =
-            parse_args_from(["--max-hold-age-seconds", "1200"].into_iter().map(String::from))
-                .expect("valid bound");
+        let options = parse_args_from(
+            ["--max-hold-age-seconds", "1200"]
+                .into_iter()
+                .map(String::from),
+        )
+        .expect("valid bound");
         assert_eq!(options.max_hold_age_seconds, 1200);
         assert!(!options.release);
     }
 
     #[test]
     fn parse_args_sets_release_flag() {
-        let options = parse_args_from(["--release"].into_iter().map(String::from))
-            .expect("release flag");
+        let options =
+            parse_args_from(["--release"].into_iter().map(String::from)).expect("release flag");
         assert!(options.release);
         assert_eq!(options.max_hold_age_seconds, DEFAULT_MAX_HOLD_AGE_SECONDS);
     }
@@ -574,7 +581,9 @@ mod tests {
     #[test]
     fn parse_args_combines_release_and_bound() {
         let options = parse_args_from(
-            ["--release", "--max-hold-age-seconds", "60"].into_iter().map(String::from),
+            ["--release", "--max-hold-age-seconds", "60"]
+                .into_iter()
+                .map(String::from),
         )
         .expect("combined flags");
         assert!(options.release);
@@ -591,7 +600,9 @@ mod tests {
     #[test]
     fn parse_args_rejects_a_non_integer_bound() {
         let err = parse_args_from(
-            ["--max-hold-age-seconds", "ten"].into_iter().map(String::from),
+            ["--max-hold-age-seconds", "ten"]
+                .into_iter()
+                .map(String::from),
         )
         .expect_err("non-integer value");
         assert!(err.contains("expects an integer"), "got {err:?}");
@@ -600,9 +611,12 @@ mod tests {
     #[test]
     fn parse_args_rejects_a_non_positive_bound() {
         for bad in ["0", "-5"] {
-            let err =
-                parse_args_from(["--max-hold-age-seconds", bad].into_iter().map(String::from))
-                    .expect_err("non-positive value");
+            let err = parse_args_from(
+                ["--max-hold-age-seconds", bad]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .expect_err("non-positive value");
             assert!(err.contains("must be positive"), "got {err:?} for {bad}");
         }
     }

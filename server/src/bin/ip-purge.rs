@@ -18,7 +18,6 @@
 //! unlinkable. Both are needed, and neither substitutes for the other.
 
 use std::env;
-use std::str::FromStr;
 
 use apikita_server::{db, ip_tracking};
 use tracing::{error, info};
@@ -69,12 +68,17 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `from_str` is the `FromStr` trait method, so the trait belongs in scope
+    // where it is USED. At crate scope it compiled the binary with an unused
+    // import, which `cargo clippy -- -D warnings` - the CI gate - rejects.
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::str::FromStr;
     use uuid::Uuid;
 
     /// A migrated on-disk SQLite URL in the system temp directory.
     async fn migrated_temp_db() -> (String, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("apikita-ip-purge-test-{}.db", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("apikita-ip-purge-test-{}.db", Uuid::new_v4()));
         let url = format!("sqlite://{}", path.to_str().unwrap().replace('\\', "/"));
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
             .unwrap()
