@@ -18,6 +18,7 @@ surface, priced at a fixed margin over wholesale cost.
 | [`docs/cache-pricing-options.md`](docs/cache-pricing-options.md) | **The open commercial decision — cache-heavy pricing** |
 | [`docs/launch-checklist.md`](docs/launch-checklist.md) | **Launch tasks, gated.** What must be true before taking money |
 | [`docs/architecture.md`](docs/architecture.md) | The system end to end — the authoritative stack |
+| [`docs/wind-down.md`](docs/wind-down.md) | Closing the service: the balance payout runbook |
 | [`docs/topology.md`](docs/topology.md) | The triangle: Cloudflare, relay, Northflank, failover |
 | [`docs/server/api-spec.md`](docs/server/api-spec.md) | Every endpoint, auth scheme, enforcement order |
 | [`server/migrations/20260925000000_initial_schema.sql`](server/migrations/20260925000000_initial_schema.sql) | The SQLite schema — source of truth |

@@ -19,6 +19,7 @@ size.
 | Google account link | PocketBase | Personal |
 | Telegram ID | Embedded SQLite (the database file) | Personal, pseudonymous |
 | Wallet balance + ledger | Embedded SQLite (the database file) | **Financial** |
+| Payout destination (wind-down only) | Embedded SQLite | **Deleted 30 days after payout** — see §Wind-down |
 | Top-up history (amounts, dates) | Embedded SQLite (the database file) | **Financial** |
 | Token usage per day | Embedded SQLite (the database file) | Behavioural |
 | API keys | Embedded SQLite (the database file) | Credentials (hashed) — the plaintext is never stored |
@@ -79,9 +80,8 @@ anything holding money, and PocketBase users are never hard-deleted.
 
 Closure means:
 
-1. `accounts.status = 'closed'`.
-2. **Revoke all sessions** immediately — the user is out.
-3. **Revoke all API keys** immediately — no further spend.
+1. `accounts.status = 'closed'` — set **only once the balance is zero** (step 6).
+2. **Revoke all sessions** — the user is out.
 4. **Retain the ledger and top-ups** (financial record).
 5. **Anonymise what can be anonymised** — email replaced with a tombstone in
    PocketBase, Telegram link removed, review body cleared if requested.
@@ -91,6 +91,28 @@ Closure means:
 **Never close an account that still holds a balance.** Non-refundable policy
 covers an unwanted service; it does not let you keep funds for a service you are
 refusing to provide.
+
+### Wind-down
+
+If **we** stop operating the service, the balance is not merely left zero — it is
+**paid back**. That is a different event from a customer closing their own account:
+platform-initiated, and it discharges the obligation rather than declining it. The
+threshold, classification and rounding are settled in
+[`decisions.md`](decisions.md) §Money; the procedure is
+[`wind-down.md`](wind-down.md).
+
+Two consequences for retention:
+
+| Data | Retention |
+| --- | --- |
+| **Payout destination** (bank code, account number, holder name, or wallet address) | Collected on request and re-confirmed inside the notice window. **Deleted 30 days after the payout completes** — it is PII with a short life |
+| **The payout reference** (`ledger.ref`, e.g. `closure_<run_id>`) | **Kept indefinitely** — it is a financial record, and the ledger is the business |
+
+The **re-confirmation requirement** is not optional. Closure revokes the only contact
+channel (step 2), and bank details older than the closure window are stale — merged
+banks, closed accounts. Pay only to a destination confirmed inside the window, and only
+to an account in the customer's own name: a bounced transfer is recoverable, a
+wrong-account transfer is not.
 
 ## The cross-border question
 

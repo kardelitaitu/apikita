@@ -1,3 +1,15 @@
+> **Status: considered, not adopted — historical.** Do not treat this as the shipped
+> design. The stack here (Postgres/JSON documents) was replaced by embedded SQLite;
+> the sibling banner at §3 already records that. It is kept, and deliberately not
+> deleted, because it is the **only written record** of two things the current
+> decisions still depend on: the global crypto rail intent (NOWPayments, stablecoins)
+> and the **PPh 22 0.21%** reference. Its **USD 2.00 crypto deposit minimum is the
+> likely origin of the USD 2.00 wind-down payout floor** in
+> [`decisions.md`](decisions.md) §Money. Also note its QRIS minimum (Rp 10.000)
+> disagrees with `min_first_deposit = 50000` in `config/apikita.toml`.
+>
+> Referenced from exactly one place: the register's wind-down rows.
+
 this is rough plan need to be audited:
 
 # Product Specification & Architecture Document: SaaS Top-Up Billing System

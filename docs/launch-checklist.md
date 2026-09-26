@@ -18,7 +18,11 @@ business can operate at all.
 - [ ] Record the outcome in [`config/provider1.md`](../config/provider1.md).
 - [ ] Decide the contracting entity (personal or PT) — affects dispute posture,
       volume ceiling, and tax.
-- [ ] Legal review of [`terms-of-service.md`](terms-of-service.md).
+- [ ] Legal review of [`terms-of-service.md`](terms-of-service.md) — **including the
+      wind-down clause**. The specific legal and tax questions are listed in
+      [`decisions.md`](decisions.md) §"Genuinely open": outbound transfers by the
+      entity, PP 55/2022 on refunded revenue, the crypto regime for stablecoin
+      payouts, KYC/AML on a payee identified by email, and unclaimed balances.
 - [ ] Publish the Terms of Service, including the cross-border forwarding disclosure.
 - [ ] Publish a privacy policy matching [`data-retention.md`](data-retention.md).
 
@@ -152,6 +156,7 @@ That said, the ones that block *launch* specifically are:
 | **Abuse-report contact** | Gate 5 — required to publish the terms |
 | **Support cost per customer** | Commercial model; not a launch blocker but the decisive business input |
 | **Credit expiry implementation** | Policy settled (2 years per deposit); the code is not written — no per-deposit expiry column, no sweep job, no refusal of a spend against aged credit |
+| **Wind-down runbook exercised** | Policy settled (balances above USD 2.00 paid out) and the runbook is written, but the payout is manual and has never been executed. It touches money and there is no treasury — so it is **not** a launch blocker on the same footing as a deployment, but it must be walked through against a scratch database before it is ever needed |
 
 The rest — Northflank prices, a second provider, a staging environment, review
 moderation policy, the second-operator threshold, the bot runtime — are open but

@@ -28,7 +28,7 @@ that are now the live exposure:
    permission to resell at scale. Check whether volume triggers a different
    agreement.
 
-**The refund posture is "non-refundable, with no exception" — and that is narrower
+**The refund posture is "non-refundable during operation, no exception" — and that is narrower
 than the protection it looks like.** Policy is non-refundable, which is enforceable
 against a customer who changes their mind. Withdrawing the non-delivery carve-out
 ([`decisions.md`](../decisions.md) §Money) does **not** make the platform immune to
@@ -48,6 +48,12 @@ path is deleted and inbound refund notifications are refused), so the return hap
 money is gone from the merchant account while their wallet still shows the credit.
 No ledger-drift check fires, because the ledger never moved. **The only fast signal
 is the `error!` refusal log — unalerted, this is a silent loss.**
+
+**Mitigated at wind-down, not during operation:** if we close the service, balances
+above USD 2.00 are paid out ([`decisions.md`](../decisions.md) §Money,
+[`wind-down.md`](../wind-down.md)). That covers the *deliberate* shutdown case. It does
+**not** cover an upstream disappearing overnight, a chargeback, or a customer who never
+claims — those remain the exposures below.
 
 **Added risk of dropping the carve-out:** a clause that overreaches is more likely
 to be struck down *in its entirety* than a narrow one. Withdrawing the exception may

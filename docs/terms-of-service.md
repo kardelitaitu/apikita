@@ -19,6 +19,7 @@ Three things the business does that customers must be told **before** they pay:
 | **Prompts are forwarded to a provider in mainland China** | Materially affects the customer's data |
 | **Deposits are non-refundable** | A payment term; cannot be introduced after the fact |
 | **Credit expires 2 years after deposit** | A term that extinguishes value; must be disclosed before it can be relied on |
+| **Unused credit is paid out if the service closes** | A commitment on our side; stating it builds trust and reduces dispute exposure |
 | **Prompts are not logged by us, but the upstream's retention applies** | Otherwise "we do not store your data" is misleading |
 
 **The third is the one operators most want to skip, and the one that causes the
@@ -57,7 +58,7 @@ This is the most commercially important section.
 | Rate changes | We may change prices with notice |
 | Minimums | A first-deposit minimum and a re-top-up minimum apply |
 
-### The refund clause — settled: non-refundable, no exception
+### The refund clause — settled: non-refundable during operation, no exception
 
 **Decided: deposits and unused credit are non-refundable, with no non-delivery
 carve-out.** The earlier draft carried an exception returning unused credit where
@@ -67,12 +68,17 @@ service could not be provided. That exception is **withdrawn** — see
 Draft language:
 
 > All deposits and unused credit are non-refundable. No refund is provided for
-> change of mind, for unused credit, or for any other reason.
+> change of mind, for unused credit, or for any other reason, except as provided
+> in the wind-down clause below.
 
-The system matches this: there is **no code path and no operator procedure that
-returns money**. An inbound Midtrans `refund`/`partial_refund` notification is
-refused and changes nothing (see
+The system matches this: there is **no code path that returns money in response to a
+customer request**, and no self-serve refund. An inbound Midtrans
+`refund`/`partial_refund` notification is refused and changes nothing (see
 [`server/api-spec.md`](server/api-spec.md) §`POST /webhooks/midtrans`).
+
+**Scope — this clause governs normal operation, not wind-down.** If *we* decide to
+stop operating the service, we pay balances back. That is a different thing: the
+customer did not ask, and we are not declining. See §Wind-down below.
 
 > ⚠️ **Open legal risk — flagged, not resolved.** Withdrawing the carve-out was a
 > deliberate business decision, and the legal consequence is **not settled**:
@@ -100,7 +106,8 @@ Draft language:
 
 > Credit expires 2 years (24 months) after the date of the deposit that created it.
 > Expiry is calculated per deposit, not from the account's most recent activity.
-> Credit that has expired is no longer usable and is not refundable.
+> Credit that has expired is no longer usable and is not refundable — except at
+> wind-down, where expiry is waived (§Wind-down).
 
 **Per deposit, not per account.** A wallet that receives top-ups over time holds
 credit of several ages; the clock runs on each deposit from its own date. The
@@ -197,12 +204,65 @@ Draft language:
 | Acceptable-use violation | Suspend, investigate, then terminate or restore |
 | Non-payment | Not applicable — prepaid |
 | Suspected fraud or account takeover | Immediate suspension |
-| Upstream terminates our access | Service ends; see the refund clause for unused credit |
+| Upstream terminates our access | Service ends — see §Wind-down |
+| We cease operating the service | See §Wind-down |
 
-**The last row is a real scenario.** The entire supply side could end without notice
-(see [`business/05-risk.md`](business/05-risk.md) R1). The terms must say what happens to
-unused credit in that case — and the honest answer is that it is returned, because
-there would be nothing to deliver.
+**The last two rows are real scenarios.** The entire supply side could end without
+notice (see [`business/05-risk.md`](business/05-risk.md) R1), or we may wind the
+service down ourselves. Both end up in the same place, and the honest answer is that
+unused credit is **paid back** — there would be nothing left to deliver. That is what
+§Wind-down specifies.
+
+### Wind-down — balances are paid out on closure
+
+**Decided: when the service closes, every balance above USD 2.00 is paid out.**
+Settled in [`decisions.md`](decisions.md) §Money; the procedure is
+[`wind-down.md`](wind-down.md). This is the one thing that overrides the
+non-refundable clause above.
+
+Draft language:
+
+> If we decide to stop operating the service, we will give at least **30 days'
+> notice**. On the wind-down date every balance is frozen, and we will pay out the
+> remaining balance of every account holding **more than USD 2.00**.
+>
+> - Customers who paid through Midtrans (QRIS) are paid by **bank transfer**, to an
+>   account in the customer's own name.
+> - Customers whose deposits settled in a stablecoin are paid in **USD stablecoin**.
+>
+> The USD/IDR rate is the Bank Indonesia **JISDOR** rate on the wind-down date,
+> fixed once for all payouts, and each payout is **rounded down** to the nearest
+> cent. Balances of USD 2.00 or less are not paid automatically; you may claim one
+> within **12 months** of the notice, and we cover the transfer fee. Section 3 does
+> not limit this section.
+
+**Three things to be precise about:**
+
+- **The threshold, not a floor on deposits.** USD 2.00 is a *payout* threshold, not a
+  balance a customer is required to keep. A customer who deposits 50,000 IDR and
+  spends down below it has done nothing wrong, which is why the claim window exists
+  (see [`decisions.md`](decisions.md) §Money).
+- **Which rail decides the payout.** The rail a customer paid on. Anyone who used
+  Midtrans is treated as Indonesian and paid by bank transfer. This can never be
+  applied retroactively, and it never pays crypto to an Indonesian.
+- **Expiry is waived.** Credit that would have expired is paid anyway. The schema
+  holds one un-aged balance, so expired and live credit are not distinguishable —
+  and clawing credit back at the moment we stop serving would be forfeiture wearing
+  a policy's clothes.
+
+> ⚠️ **Open legal and tax questions — flagged, not resolved.** Whether the entity can
+> make outbound transfers at all; refunding revenue already taxed under PP 55/2022;
+> the crypto regime (Bappebti/OJK, PMK 50/2025 0.21% PPh 22) and whether paying a
+> resident in stablecoin is itself a regulated act; KYC/AML on a payee whose only
+> identity may be an email; and the treatment of unclaimed balances. Listed in
+> [`decisions.md`](decisions.md) §"Genuinely open". This clause **reduces** exposure
+> and is the one clause that should not be weakened.
+
+**⚠️ Not implemented.** There is no treasury, no disbursement integration and no
+payout code. Closing the service today is a **manual procedure** documented in
+[`wind-down.md`](wind-down.md) — deliberately, because a payout path with no traffic
+is the same hazard the codebase already removed every callerless money-moving
+function for.
 
 ## 8. Changes to these terms
 
@@ -227,7 +287,8 @@ there would be nothing to deliver.
 | Requirement | Where enforced |
 | --- | --- |
 | Cross-border forwarding disclosed before first use | Signup + pre-topup notice |
-| Non-refundable stated (no exception) | Terms + top-up screen |
+| Non-refundable stated (no exception during operation) | Terms + top-up screen |
+| Wind-down payout stated | Terms + top-up screen |
 | Acceptable use published and linked | Terms + an abuse contact |
 | Prompts genuinely not stored | Code review; see [`data-retention.md`](data-retention.md) |
 | Retention periods stated accurately | Matches the schema |
@@ -237,7 +298,12 @@ not do is worse than no policy, because it is a demonstrable false statement.
 
 ## Open items
 
-- [ ] Legal review — **required before launch**.
+- [ ] Legal review — **required before launch**, and it must include the wind-down
+      clause (see §Wind-down and `decisions.md` §"Genuinely open" for the specific
+      legal and tax questions).
+- [x] ~~Wind-down payout threshold, classification and rate basis.~~ **Settled:
+      above USD 2.00, rail decides the payout, JISDOR rate frozen once.** The
+      *runbook* is written; the code is not, and there is no disbursement rail.
 - [x] ~~Credit expiry: yes or no, and for how long.~~ **Settled: 2 years from
 deposit date, per deposit** (see §Expiry). The *implementation* below is still open.
 - [ ] Credit expiry **implementation**: a schema field for per-deposit expiry, a

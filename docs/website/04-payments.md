@@ -84,7 +84,8 @@ These do not depend on the field order and are safe to implement now:
 
 ## The non-refundable caveat
 
-Policy is non-refundable. That scopes liability to *unwanted* service — it does
+Policy is non-refundable **during operation**. That scopes liability to *unwanted*
+service — it does
 **not** cover *undelivered* service. If payment succeeds and the service cannot be
 delivered, the customer paid for nothing, and a QRIS dispute through the payment
 provider generally favours the payer on non-delivery.

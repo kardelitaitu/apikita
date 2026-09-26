@@ -235,8 +235,11 @@ and refused**, never applied:
 **An unalerted refusal is silent**, which is indistinguishable from a refund bug —
 so alert on that log line. It is the only signal that a refund was ever asked for.
 
-The terms are non-refundable with no exception, so a customer asking for money back
-is answered by the Terms of Service — not by an operator debiting a wallet. Note the
+The terms are non-refundable during operation, so a customer asking for money back
+is answered by the Terms of Service — there is **no refund endpoint and no operator
+refund action**. Do not confuse this with **wind-down**: if we close the service, an
+operator *does* pay balances out, by the documented manual procedure in
+[`wind-down.md`](wind-down.md). That is platform-initiated, not a refund on request. Note the
 exposure that remains: a chargeback returns the money **at the rail** regardless of
 the terms, and the platform's records will still show the credit. See
 [`business/05-risk.md`](business/05-risk.md) and
