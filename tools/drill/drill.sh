@@ -145,7 +145,10 @@ emit() { tee -a "$LOG" < "$1"; }
 fail() { printf 'drill: %s\n' "$*" >&2; printf 'drill: %s\n' "$*" >> "$LOG" 2>/dev/null || :; }
 
 TMP="${TMPDIR:-/tmp}"
-STAGE="$TMP/drill.$"
+# $$, not $: a lone dollar is a LITERAL in POSIX sh, so "drill.$" named every
+# run's staging directory the SAME - concurrent drills shared OUT/ERR/metrics/
+# reconcile.out and one run's cleanup_tmp deleted the tree another was using.
+STAGE="$TMP/drill.$$"
 if ! mkdir -p "$STAGE"; then
     printf 'drill: cannot create a working directory at %s\n' "$STAGE" >&2
     exit 2
