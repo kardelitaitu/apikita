@@ -177,24 +177,18 @@ The runner, against scratch SQLite databases (fixtures in `.agents/reconcile-ver
 - A seeded stranded hold 26h old, wallet otherwise balanced → exit `5`, printing
   the hold with its `age_seconds`. A hold under the bound does not fail the gate.
 
-### `reconcile.sql` is still Postgres SQL — the runner cannot pass today
+### `reconcile.sql` runs on SQLite — verified
 
-**This is a real, currently-failing gap, not a caveat.** `reconcile.sql` in this
-directory still uses Postgres `::text` casts. `sqlite3` rejects them:
+**The gap this section used to report is CLOSED.** `reconcile.sql` now uses
+SQLite casts — `CAST(w.balance_idr AS TEXT)` and
+`CAST(COALESCE(SUM(l.delta_idr), 0) AS TEXT)` — and the query runs under the
+`sqlite3` CLI exactly as `reconcile.sh` feeds it. Reproduced against a scratch
+database migrated from `server/migrations/20260925000000_initial_schema.sql`:
 
-```
-Parse error near line 29: unrecognized token: ":"
-  HEN 'NO WALLET ROW'             ELSE w.balance_idr::text        END AS balance
-                                      error here ---^
-```
+- Clean sheet → exit `0` (check 1 passes; the hold sweep still reports).
+- Drift injected → exit `1`; ledger money with no wallets row → exit `1`.
+- An old stranded hold → exit `5`.
 
-Check 1 therefore exits `4` on every run, and because check 1 runs first the
-hold check never reports. The exit codes above were reproduced with a
-`CAST(… AS TEXT)` copy of the query in `.agents/reconcile-verify/probe/`; the
-committed `reconcile.sql` still needs the two-line fix:
-
-- `w.balance_idr::text` → `CAST(w.balance_idr AS TEXT)`
-- `COALESCE(SUM(l.delta_idr), 0)::text` → `CAST(COALESCE(SUM(l.delta_idr), 0) AS TEXT)`
-
-`reconcile.sql` was outside the file fence this README was resolved under, so it
-was left untouched and the gap is reported here instead of fixed silently.
+One dependency to know about: the query is a FULL OUTER JOIN, which SQLite has
+supported only since **3.39.0** (2022-06-25). On an older CLI the query fails
+and the script exits `4` loudly — a visible failure, never a false pass.

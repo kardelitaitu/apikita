@@ -33,13 +33,15 @@
 # a new one: an existing consumer that only knows 0-5 still treats 6 as a
 # failure, because every non-zero code is one. See README.md.
 #
-# KNOWN GAP, not hidden: $SQL_FILE (reconcile.sql) has NOT been ported to SQLite.
-# It still uses Postgres `::text` casts, which sqlite3 rejects with
-# "unrecognized token: ':'" - so check 1 exits 4 on every run until that file is
-# fixed. The fix is CAST(w.balance_idr AS TEXT) and
-# CAST(COALESCE(SUM(l.delta_idr), 0) AS TEXT). reconcile.sql is outside the fence
-# this script was resolved under, so the gap is reported here rather than fixed
-# silently. The stranded-hold SQL below IS ported (strftime for the age).
+# VERIFIED PORTED (this header previously reported the OPPOSITE as a known gap):
+# $SQL_FILE (reconcile.sql) now uses SQLite casts - CAST(w.balance_idr AS TEXT)
+# and CAST(COALESCE(SUM(l.delta_idr), 0) AS TEXT) - and the drift query runs
+# under the sqlite3 CLI. Measured against a scratch database migrated from
+# server/migrations: clean sheet exits 0, injected drift exits 1, ledger money
+# with no wallets row exits 1, and an old stranded hold exits 5. One dependency
+# that statement carries: the query is a FULL OUTER JOIN, which SQLite has
+# supported only since 3.39.0 (2022-06-25) - on an older CLI the query fails and
+# the script exits 4 loudly, never a false pass.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 SQL_FILE="$SCRIPT_DIR/reconcile.sql"
