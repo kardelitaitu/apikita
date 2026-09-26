@@ -31,7 +31,8 @@ leaked session cannot spend money.
 
 ## Status
 
-**Implemented and green.** `cargo test --lib` → **289 passed / 0 failed / 2 ignored**,
+**Implemented and green.** `cargo test --lib` → **297 passed / 0 failed / 2 ignored**
+(measured 2026-09-26 at commit 0488577),
 against a migrated temp SQLite file per test (`src/test_support.rs`) — no database
 server to start and no `DATABASE_URL` needed. The 2 ignored tests drive a real
 PocketBase auth exchange and need a live `POCKETBASE_URL`; identity is still
