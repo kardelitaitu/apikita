@@ -1578,13 +1578,13 @@ mod tests {
     /// `test_support::pending_topup` mints its own order id, which is what most
     /// fixtures want; these tests need to name the order because they replay the
     /// same one (a replayed webhook, a second refund) and assert on it by name.
-    /// Every NOT NULL column is bound: the strict schema has no DEFAULT for `id`
-    /// or `created_at`, so the Postgres `INSERT INTO topups (account_id, ...)`
+    /// Every NOT NULL column is bound: the strict schema has no DEFAULT for `id`,
+    /// `created_at` or `rail`, so the Postgres `INSERT INTO topups (account_id, ...)`
     /// shape fails at runtime with a NOT NULL constraint error.
     async fn create_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64, order_id: &str) {
         sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
-             VALUES (?, ?, ?, ?, 'pending', ?)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at)
+             VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
         )
         .bind(Uuid::new_v4().hyphenated())
         .bind(account_id.hyphenated())

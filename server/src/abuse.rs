@@ -425,8 +425,8 @@ mod tests {
     ) {
         for _ in 0..count {
             sqlx::query(
-                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
-                 VALUES (?, ?, 10000, ?, 'pending', ?)",
+                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at)
+                 VALUES (?, ?, 10000, ?, 'pending', 'midtrans', ?)",
             )
             .bind(Uuid::new_v4().hyphenated())
             .bind(account_id.hyphenated())

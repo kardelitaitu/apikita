@@ -142,6 +142,14 @@ CREATE TABLE topups (
   status      TEXT NOT NULL DEFAULT 'pending'
               CHECK (status IN ('pending','settled','denied','expired','refunded')),
   snap_token  TEXT,
+  -- Which payment rail funded this top-up. It decides the payout method at
+  -- wind-down: a Midtrans customer is paid back by bank transfer, anyone else in
+  -- USD stablecoin. Deliberately NOT NULL with NO DEFAULT -- a default of
+  -- 'midtrans' would silently mislabel a row written by a path that forgot to
+  -- name its rail, whereas this fails loudly. The value set is FROZEN: SQLite
+  -- has no ALTER TABLE ... ADD CONSTRAINT, so widening a CHECK means a 12-step
+  -- table rebuild. Only the two rails that exist may appear here.
+  rail        TEXT NOT NULL CHECK (rail IN ('midtrans','crypto')),
   created_at  TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00'),
   settled_at  TEXT CHECK (settled_at IS NULL
                           OR settled_at GLOB '????-??-??T??:??:??*+00:00')

@@ -646,8 +646,12 @@ pub async fn create_topup(
     // `created_at` has no default: the Postgres schema defaulted it to `now()`,
     // and that default was removed so that no SQL-side time can ever be written
     // in the other format (plan section 4.6, rule 2).
+    //
+    // `rail` is named explicitly and is `'midtrans'` because Midtrans QRIS is the
+    // only rail implemented. The column is NOT NULL with no default precisely so
+    // that a future second rail cannot inherit this literal by omission.
     sqlx::query(
-        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, rail, created_at) VALUES (?, ?, ?, ?, 'pending', ?, 'midtrans', ?)",
     )
     .bind(topup_id.hyphenated())
     .bind(account_id.hyphenated())
@@ -1022,8 +1026,8 @@ mod tests {
         // uuid was expected).
         let topup_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
-             VALUES (?, ?, ?, ?, 'pending', ?)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at)
+             VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
         )
         .bind(topup_id.hyphenated())
         .bind(account_id.hyphenated())
@@ -1729,8 +1733,8 @@ mod tests {
         // schema has no DEFAULT for either.
         let pending_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
-             VALUES (?, ?, ?, ?, 'pending', ?)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+             VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
         )
         .bind(pending_id.hyphenated())
         .bind(account_id.hyphenated())
@@ -1743,8 +1747,8 @@ mod tests {
 
         let other_order = format!("test_other_{}", Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
-             VALUES (?, ?, ?, ?, 'pending', ?)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+             VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
         )
         .bind(Uuid::new_v4().hyphenated())
         .bind(other_account_id.hyphenated())
@@ -2230,8 +2234,8 @@ mod tests {
         for _ in 0..count {
             let order_id = format!("test_cap_{}", Uuid::new_v4().simple());
             sqlx::query(
-                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
-                 VALUES (?, ?, ?, ?, 'pending', ?)",
+                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+                 VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
             )
             .bind(Uuid::new_v4().hyphenated())
             .bind(account_id.hyphenated())
@@ -2599,8 +2603,8 @@ mod tests {
         let topup_id = Uuid::new_v4();
         let order_id = format!("topup_{topup_id}");
         sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, created_at) \
-             VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, rail, created_at) \
+             VALUES (?, ?, ?, ?, 'pending', ?, 'midtrans', ?)",
         )
         .bind(topup_id.hyphenated())
         .bind(account_id.hyphenated())
@@ -2631,8 +2635,8 @@ mod tests {
         for status in ["pending", "settled", "denied", "expired", "refunded"] {
             let order_id = format!("test_status_{}", Uuid::new_v4().simple());
             sqlx::query(
-                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+                 VALUES (?, ?, ?, ?, ?, 'midtrans', ?)",
             )
             .bind(Uuid::new_v4().hyphenated())
             .bind(account_id.hyphenated())
@@ -2648,8 +2652,8 @@ mod tests {
         // ...and anything outside it is refused, not silently stored.
         let bad_order = format!("test_status_bad_{}", Uuid::new_v4().simple());
         let refused = sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
-             VALUES (?, ?, ?, ?, 'partially_paid', ?)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+             VALUES (?, ?, ?, ?, 'partially_paid', 'midtrans', ?)",
         )
         .bind(Uuid::new_v4().hyphenated())
         .bind(account_id.hyphenated())

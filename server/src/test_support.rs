@@ -330,8 +330,8 @@ pub async fn api_key(pool: &SqlitePool, account_id: Uuid) -> Uuid {
 pub async fn pending_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) -> String {
     let order_id = format!("order_test_{}", Uuid::new_v4().simple());
     sqlx::query(
-        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
-         VALUES (?, ?, ?, ?, 'pending', ?)",
+        "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at)
+         VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
     )
     .bind(Uuid::new_v4().hyphenated())
     .bind(account_id.hyphenated())
@@ -504,8 +504,8 @@ mod tests {
         // The column is required: an INSERT that forgets it is refused, not
         // silently defaulted. This is the loud failure the missing DEFAULT buys.
         let forgot = sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
-             VALUES (?, ?, 1000, ?, 'pending', ?)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+             VALUES (?, ?, 1000, ?, 'midtrans', ?)",
         )
         .bind(Uuid::new_v4().hyphenated())
         .bind(account_id.hyphenated())
