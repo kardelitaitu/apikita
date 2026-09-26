@@ -66,9 +66,10 @@ fn credit_balance_to_publish(result: &Result<TopupCreditResult, AppError>) -> Op
 }
 
 /// The balance to announce for a refund outcome, or None when nothing changed.
-/// A replayed refund (`AlreadyRefunded`) and a refund the wallet cannot cover
-/// (`InsufficientBalance` - the 409 path) wrote nothing, so neither may
-/// announce a balance that did not move.
+/// A replayed refund (`AlreadyRefunded`), a refund whose amount disagrees with
+/// the stored row (`AmountMismatch` - the 400 path) and a refund the wallet
+/// cannot cover (`InsufficientBalance` - the 409 path) all wrote nothing, so
+/// none of them may announce a balance that did not move.
 fn refund_balance_to_publish(result: &Result<RefundResult, AppError>) -> Option<i64> {
     match result {
         Ok(RefundResult::Refunded { new_balance }) => Some(*new_balance),
@@ -266,6 +267,23 @@ pub async fn handle_midtrans_webhook(
                     (
                         StatusCode::CONFLICT,
                         error_body("topup_not_settled", "topup was never settled"),
+                    )
+                }
+                Ok(RefundResult::AmountMismatch) => {
+                    // The refund branch used to debit whatever `gross_amount` the
+                    // payload carried, so a signed notification naming more than
+                    // the top-up drained the wallet. Same refusal, and the same
+                    // body, as the credit branch's mismatch above: the amount
+                    // comes from OUR stored row, never the payload
+                    // (docs/server/api-spec.md:284, :295).
+                    error!(
+                        order_id = %payload.order_id,
+                        amount_idr,
+                        "Refund rejected: amount mismatch with stored record"
+                    );
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "amount mismatch"})),
                     )
                 }
                 Ok(RefundResult::InsufficientBalance {
@@ -584,7 +602,8 @@ mod tests {
 
     /// The refund mirror. The 409 insufficient-balance path is the one that
     /// matters: it is a CONFLICT, not a success, and NOTHING was written - so
-    /// announcing a balance there would invent money movement.
+    /// announcing a balance there would invent money movement. `AmountMismatch`
+    /// joins it: a rejected refund debits nothing, so it publishes nothing.
     #[test]
     fn a_refund_announces_a_balance_only_when_it_debited() {
         assert_eq!(
@@ -594,12 +613,23 @@ mod tests {
             Some(12_000)
         );
 
+        // The amount-mismatch refusal is the regression this change exists for:
+        // the debit that used to happen here is gone, so the announcement must be
+        // gone with it. Pinned on its own so a future edit cannot quietly re-add
+        // it to the "publishes" set.
+        assert_eq!(
+            refund_balance_to_publish(&Ok(RefundResult::AmountMismatch)),
+            None,
+            "a rejected refund wrote nothing and must publish nothing"
+        );
+
         for unchanged in [
             Ok(RefundResult::AlreadyRefunded),
             Ok(RefundResult::NotFound),
             Ok(RefundResult::NotSettled {
                 status: "pending".into(),
             }),
+            Ok(RefundResult::AmountMismatch),
             Ok(RefundResult::InsufficientBalance {
                 balance_idr: 1_000,
                 required_idr: 50_000,
@@ -1263,5 +1293,102 @@ mod tests {
         );
         assert_eq!(topup_status_of(&pool, &order_id).await, "refunded");
         assert_reconciled(&pool, account_id, "after a replayed refund").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. A REFUND whose amount is NOT the stored one is rejected, nothing changes.
+    // -----------------------------------------------------------------------
+
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn live_webhook_refund_rejects_an_amount_that_is_not_the_stored_one() {
+        run_live(refund_wrong_amount_assertions).await;
+    }
+
+    /// THE DEFECT, end to end through the handler. The refund branch parsed
+    /// `gross_amount` out of the PAYLOAD and debited it without ever reading
+    /// `topups.amount_idr`, so a signed refund notification carrying more than
+    /// the top-up debited the larger figure - one call draining the wallet while
+    /// the top-up still read `refunded` for an amount it never was. The ledger
+    /// could not catch it either: the row was written from the SAME unchecked
+    /// value, so the books stayed internally consistent while the money was gone.
+    ///
+    /// docs/server/api-spec.md:284 mandates comparing the amount against the
+    /// STORED row; :295 says "the amount comes from our stored row, never the
+    /// payload". The credit branch honours that; this one must too.
+    async fn refund_wrong_amount_assertions(pool: PgPool, account_id: Uuid, state: AppState) {
+        const STORED: i64 = 50_000;
+        const INFLATED: i64 = 100_000;
+
+        // TWO settled top-ups, so the wallet holds 100_000 and an inflated refund
+        // of the FIRST one is AFFORDABLE. The guarded UPDATE
+        // (`balance_idr >= $1`) cannot save us here, which is exactly the
+        // reported consequence: a single notification drains the whole wallet.
+        let first = pending_topup(&pool, account_id, STORED).await;
+        assert_eq!(
+            credit_topup_transaction(&pool, &first, STORED)
+                .await
+                .expect("settle the first fixture topup"),
+            TopupCreditResult::Settled {
+                new_balance: STORED
+            }
+        );
+        let second = pending_topup(&pool, account_id, STORED).await;
+        assert_eq!(
+            credit_topup_transaction(&pool, &second, STORED)
+                .await
+                .expect("settle the second fixture topup"),
+            TopupCreditResult::Settled {
+                new_balance: 2 * STORED
+            }
+        );
+        assert_reconciled(&pool, account_id, "after funding the fixture").await;
+
+        // A genuine signature over 100000.00 for a top-up that was 50_000.
+        let inflated = notification(
+            &first,
+            "200",
+            &format!("{INFLATED}.00"),
+            "refund",
+            LIVE_TEST_SERVER_KEY,
+        );
+        let (status, body) = post(&state, inflated).await;
+
+        // The MONEY is asserted before the HTTP status: the reported defect is a
+        // debit, and a handler that answers 400 while crediting anyway would pass
+        // a status-only test.
+        assert_eq!(
+            balance_of(&pool, account_id).await,
+            2 * STORED,
+            "a mismatched refund must debit NOTHING - not the payload amount, not the stored one"
+        );
+        assert_eq!(
+            topup_status_of(&pool, &first).await,
+            "settled",
+            "a refused refund must not mark the top-up refunded"
+        );
+        assert_eq!(
+            ledger_rows_of(&pool, account_id, "refund").await.len(),
+            0,
+            "a refused refund must append no ledger row"
+        );
+        assert_reconciled(&pool, account_id, "after a mismatched refund").await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an amount that disagrees with the stored top-up must be rejected,              never debited. body: {body}"
+        );
+        assert_eq!(body["error"], json!("amount mismatch"), "{body}");
+
+        // The STORED amount still refunds cleanly: the refusal is about the
+        // amount, not about refusing refunds.
+        let honest = notification(&first, "200", "50000.00", "refund", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post(&state, honest).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["status"], json!("refunded"), "{body}");
+        assert_eq!(balance_of(&pool, account_id).await, STORED);
+        assert_eq!(topup_status_of(&pool, &first).await, "refunded");
+        assert_reconciled(&pool, account_id, "after the stored-amount refund").await;
     }
 }

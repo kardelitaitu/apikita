@@ -113,6 +113,19 @@ pub enum RefundResult {
     NotFound,
     /// The topup was never settled, so there is nothing to give back.
     NotSettled { status: String },
+    /// The refund amount disagrees with the STORED `topups.amount_idr`. NOTHING
+    /// was written.
+    ///
+    /// The exact mirror of `TopupCreditResult::AmountMismatch`: the payload is
+    /// never trusted over our own row (docs/server/api-spec.md:284 - "compare
+    /// amount against the stored row; mismatch -> reject", and :295 - "the amount
+    /// comes from our stored row, never the payload").
+    ///
+    /// This is a refusal, not a refund. Without it the amount the caller sent was
+    /// the amount debited, so a signed notification naming more than the top-up
+    /// drained the wallet and left the row reading `refunded` for a figure it
+    /// never held.
+    AmountMismatch,
     /// The wallet cannot cover the refund: the money has already been spent.
     ///
     /// NOTHING was written - not the ledger, not the topup status - so the
@@ -155,20 +168,31 @@ pub fn refund_decision(status: &str) -> RefundDecision {
 ///
 /// Idempotent under replay: the topup row is locked `FOR UPDATE` and its status
 /// decides, so a second refund of the same order is a no-op.
+///
+/// The amount is validated against the STORED `topups.amount_idr` and the debit
+/// is taken from that stored value, never from the caller's figure - the same
+/// rule the credit path applies (docs/server/api-spec.md:284, :295). A mismatch
+/// is `AmountMismatch` with NOTHING written.
+///
+/// `webhook_amount_idr` is what the CALLER claims, not what the top-up was: the
+/// parameter was named `stored_amount_idr` while carrying the webhook payload's
+/// value, and the debit followed the name's promise instead of the value.
 pub async fn refund_topup_transaction(
     pool: &PgPool,
     order_id: &str,
-    amount_idr: i64,
+    webhook_amount_idr: i64,
 ) -> Result<RefundResult, AppError> {
     let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
 
     // 1. Lock the topups row, so two concurrent refunds cannot both pass the
-    //    status check below.
-    let topup =
-        sqlx::query("SELECT id, account_id, status FROM topups WHERE order_id = $1 FOR UPDATE")
-            .bind(order_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    //    status check below. `amount_idr` is read for the SAME reason the credit
+    //    path reads it: the amount to move is OUR row's, never the payload's.
+    let topup = sqlx::query(
+        "SELECT id, account_id, amount_idr, status FROM topups WHERE order_id = $1 FOR UPDATE",
+    )
+    .bind(order_id)
+    .fetch_optional(&mut *tx)
+    .await?;
 
     let Some(topup) = topup else {
         return Ok(RefundResult::NotFound);
@@ -176,6 +200,7 @@ pub async fn refund_topup_transaction(
 
     let topup_id: Uuid = topup.get("id");
     let account_id: Uuid = topup.get("account_id");
+    let stored_amount_idr: i64 = topup.get("amount_idr");
     let status: String = topup.get("status");
 
     match refund_decision(&status) {
@@ -184,12 +209,26 @@ pub async fn refund_topup_transaction(
         RefundDecision::Refund => {}
     }
 
-    // 2. Debit the wallet. The guard is inside the statement: when it matches no
-    //    row the account cannot cover the refund, and nothing may be written.
+    // 2. The amount must match the stored row, exactly as the credit path
+    //    requires (step 3 there). Checked AFTER the status decision so a replayed
+    //    refund still reads as a replay, and BEFORE any write, so a mismatch
+    //    leaves the topup `settled`, the wallet untouched and the ledger empty.
+    if stored_amount_idr != webhook_amount_idr {
+        return Ok(RefundResult::AmountMismatch);
+    }
+
+    // 3. Debit the wallet, by the STORED amount - the same value the check above
+    //    just proved the caller named. The parameter is named `stored_amount_idr`
+    //    here because that is what it is; before, the name described the stored
+    //    row while the value arriving was the PAYLOAD's, which is how the debit
+    //    came to be unbounded by anything but the balance.
+    //
+    //    The guard is inside the statement: when it matches no row the account
+    //    cannot cover the refund, and nothing may be written.
     let wallet = sqlx::query(
         "UPDATE wallets SET balance_idr = balance_idr - $1, updated_at = now() WHERE account_id = $2 AND balance_idr >= $1 RETURNING balance_idr",
     )
-    .bind(amount_idr)
+    .bind(stored_amount_idr)
     .bind(account_id)
     .fetch_optional(&mut *tx)
     .await?;
@@ -215,18 +254,18 @@ pub async fn refund_topup_transaction(
 
             return Ok(RefundResult::InsufficientBalance {
                 balance_idr,
-                required_idr: amount_idr,
+                required_idr: stored_amount_idr,
             });
         }
     };
 
-    // 3. Mark the topup refunded.
+    // 4. Mark the topup refunded.
     sqlx::query("UPDATE topups SET status = 'refunded' WHERE id = $1")
         .bind(topup_id)
         .execute(&mut *tx)
         .await?;
 
-    // 4. Append the refund row. `delta_idr` is negative: the ledger sums to the
+    // 5. Append the refund row. `delta_idr` is negative: the ledger sums to the
     //    balance, and a refund takes money out.
     //
     //    The ref is the SAME topup id the credit wrote (topup_ledger_ref), not the
@@ -237,7 +276,7 @@ pub async fn refund_topup_transaction(
         "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) VALUES ($1, $2, 'refund', $3, $4, now())",
     )
     .bind(account_id)
-    .bind(-amount_idr)
+    .bind(-stored_amount_idr)
     .bind(topup_ledger_ref(topup_id))
     .bind(new_balance)
     .execute(&mut *tx)
@@ -1331,6 +1370,21 @@ mod tests {
             }
         );
 
+        // An amount that disagrees with the stored row is its OWN outcome, not a
+        // flavour of success: it is the refusal that replaced the unbounded debit.
+        assert_ne!(
+            RefundResult::AmountMismatch,
+            RefundResult::Refunded { new_balance: 0 }
+        );
+        assert_ne!(RefundResult::AmountMismatch, RefundResult::AlreadyRefunded);
+        assert_ne!(
+            RefundResult::AmountMismatch,
+            RefundResult::InsufficientBalance {
+                balance_idr: 0,
+                required_idr: 0
+            }
+        );
+
         // The refusal carries both figures, so the log and the operator can see
         // the shortfall without another query.
         let refusal = RefundResult::InsufficientBalance {
@@ -1977,11 +2031,17 @@ mod tests {
     }
 
     /// The refund TRANSACTION, not just the pure decision: refunding a settled topup
-    /// debits the wallet by the amount and appends a refund row with a NEGATIVE
-    /// delta; a replay does not debit twice; a topup that never settled is refused
-    /// (refunding it would create money); and a refund the balance cannot cover
-    /// writes NOTHING and leaves the topup settled for an operator. The reconciliation
-    /// invariant is asserted after EVERY case.
+    /// debits the wallet by the STORED amount and appends a refund row with a
+    /// NEGATIVE delta; a replay does not debit twice; a topup that never settled is
+    /// refused (refunding it would create money); and a refund the balance cannot
+    /// cover writes NOTHING and leaves the topup settled for an operator. The
+    /// reconciliation invariant is asserted after EVERY case.
+    ///
+    /// The fixture refunds the whole stored amount because that is the only amount
+    /// a refund may move - `refund_topup_transaction` validates the caller's figure
+    /// against `topups.amount_idr` and refuses a disagreement. This test used to
+    /// refund 20_000 of a 50_000 top-up, which was only possible while the debit
+    /// followed the caller instead of the row.
     ///
     /// Needs a live, migrated Postgres - DATABASE_URL=... cargo test --lib -- --ignored.
     #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
@@ -1992,7 +2052,9 @@ mod tests {
 
     async fn refund_assertions(pool: PgPool, account_id: Uuid) {
         const TOPUP: i64 = 50_000;
-        const REFUND: i64 = 20_000;
+        // The amount a refund moves IS the stored amount: anything else is
+        // refused as `AmountMismatch` before a single write.
+        const REFUND: i64 = TOPUP;
 
         let settled_order = fund_through_topup(&pool, account_id, TOPUP).await;
 
@@ -2168,7 +2230,9 @@ mod tests {
 
     async fn one_ref_assertions(pool: PgPool, account_id: Uuid) {
         const TOPUP: i64 = 50_000;
-        const REFUND: i64 = 20_000;
+        // A refund moves the stored amount and nothing else, so the fixture's
+        // refund equals the top-up it reverses.
+        const REFUND: i64 = TOPUP;
 
         // Fund through the REAL credit path, then refund through the real refund
         // path: this is one logical money event, written by two transactions.
@@ -2213,6 +2277,98 @@ mod tests {
             "the Midtrans order id must not be a second ref vocabulary for a top-up"
         );
 
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+    }
+
+    /// A refund whose amount is NOT the stored one must be REFUSED, with nothing
+    /// written. This is the refund mirror of the credit test's case 3 above.
+    ///
+    /// THE DEFECT: the refund took its amount from the webhook PAYLOAD and debited
+    /// it without ever reading `topups.amount_idr`, so the only thing bounding the
+    /// debit was `balance_idr >= $1`. A signed notification naming more than the
+    /// top-up drained the whole wallet in one call, the topup still read `refunded`
+    /// for a figure it never held, and the ledger agreed with the wallet - the row
+    /// was written from the same unchecked value - so reconciliation saw nothing.
+    ///
+    /// The wallet here holds TWO top-ups, so the inflated refund is AFFORDABLE: the
+    /// balance guard cannot be what saves us, which is the point.
+    ///
+    /// Needs a live, migrated Postgres - DATABASE_URL=... cargo test --lib -- --ignored.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn refund_rejects_an_amount_that_is_not_the_stored_one() {
+        run_with_teardown(live_pool().await, refund_amount_mismatch_assertions).await;
+    }
+
+    async fn refund_amount_mismatch_assertions(pool: PgPool, account_id: Uuid) {
+        const TOPUP: i64 = 50_000;
+        const INFLATED: i64 = 999_999;
+
+        let order_id = fund_through_topup(&pool, account_id, TOPUP).await;
+        let topup_ref = topup_id(&pool, &order_id).await.to_string();
+
+        // A second, independent top-up: the wallet now holds 100_000, so the
+        // inflated figure below is a refund the balance COULD cover. Written with
+        // the raw helpers rather than `fund_through_topup`, which opens a
+        // zero-balance wallet and would collide with the one just funded.
+        let other_order = format!("test_topup_{}", Uuid::new_v4().simple());
+        create_topup(&pool, account_id, TOPUP, &other_order).await;
+        assert_eq!(
+            credit_topup_transaction(&pool, &other_order, TOPUP)
+                .await
+                .expect("settle the second top-up"),
+            TopupCreditResult::Settled {
+                new_balance: 2 * TOPUP
+            }
+        );
+        assert_eq!(wallet_balance(&pool, account_id).await, 2 * TOPUP);
+        let ledger_before = ledger_row_count(&pool, account_id).await;
+
+        assert_eq!(
+            refund_topup_transaction(&pool, &order_id, INFLATED)
+                .await
+                .expect("a mismatch is a recorded outcome, not an error"),
+            RefundResult::AmountMismatch,
+            "an amount that disagrees with the stored top-up must be refused"
+        );
+
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            2 * TOPUP,
+            "a refused refund must not debit - not the payload amount, not the stored one"
+        );
+        assert_eq!(
+            topup_status(&pool, &order_id).await,
+            "settled",
+            "a refused refund must not mark the top-up refunded"
+        );
+        assert_eq!(
+            ledger_row_count(&pool, account_id).await,
+            ledger_before,
+            "a refused refund must append no ledger row"
+        );
+        assert_eq!(
+            ledger_rows_for_ref(&pool, account_id, &topup_ref).await,
+            vec![("topup".to_string(), TOPUP)],
+            "the only ledger row under this top-up must still be the credit"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        // The STORED amount still refunds, and it debits exactly that - so the
+        // refusal is about the amount, not about refusing refunds.
+        assert_eq!(
+            refund_topup_transaction(&pool, &order_id, TOPUP)
+                .await
+                .expect("refund the stored amount"),
+            RefundResult::Refunded { new_balance: TOPUP },
+            "the stored amount must still refund cleanly"
+        );
+        assert_eq!(wallet_balance(&pool, account_id).await, TOPUP);
+        assert_eq!(topup_status(&pool, &order_id).await, "refunded");
+        assert_eq!(
+            ledger_rows_for_ref(&pool, account_id, &topup_ref).await,
+            vec![("topup".to_string(), TOPUP), ("refund".to_string(), -TOPUP)]
+        );
         assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
     }
 
