@@ -176,6 +176,14 @@ if [ "$HOLD_STATUS" -ne 0 ]; then
     exit 4
 fi
 
+# A Windows sqlite3 emits CRLF, and command substitution keeps the CR of every
+# line but the last. The age field parsed with ${line##*|} would then end in a
+# CR, fail the *[!0-9]* guard, and be forced to 0 - never over the bound. Since
+# the rows are ORDER BY held_at ASC, an over-bound hold followed by any newer
+# hold was silently missed: the gate exited 0 instead of 5, failing OPEN. The
+# strip is a no-op on LF-only output (ids and refs never contain a CR).
+HOLD_ROWS=$(printf '%s\n' "$HOLD_ROWS" | tr -d '\r')
+
 # --- sqlite3 diagnostics -----------------------------------------------------
 # Surfaced, never counted as drift.
 if [ -s "$ERR" ]; then
