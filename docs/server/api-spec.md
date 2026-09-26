@@ -185,8 +185,12 @@ Creates a top-up and returns a Midtrans Snap token.
 { "amount_idr": 50000 }
 
 // 200 response
-{ "topup_id": "uuid", "order_id": "topup_<uuid>", "snap_token": "..." }
+{ "topup_id": "uuid", "order_id": "topup_<uuid>", "snap_token": "...", "environment": "sandbox" }
 ```
+
+`environment` is the Midtrans environment the server used — exactly `sandbox` or
+`production` — so the browser can check that the Snap environment it was built
+for matches, since the two are configured on separate platforms.
 
 Server validates the amount against the configured minimums (**first deposit vs
 re-top-up differ** — see
