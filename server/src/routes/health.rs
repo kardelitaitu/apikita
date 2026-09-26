@@ -200,7 +200,7 @@ mod tests {
         // yet, so any connection that exists after the probe was opened BY the probe.
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(&format!(
             "sqlite://{}",
-            db.dir_path().join("test.db").display()
+            db.db_path().display()
         ))
         .expect("parse the migrated file as a sqlite url");
         let pool = sqlx::sqlite::SqlitePoolOptions::new()

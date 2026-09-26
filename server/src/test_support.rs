@@ -29,13 +29,13 @@
 //! the very drift the money tests assert against — a fixture that cannot pass while
 //! the code under test is correct.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
-use tempfile::TempDir;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::db::{credit_topup_transaction, init_pool, TopupCreditResult};
@@ -45,6 +45,130 @@ use crate::db::{credit_topup_transaction, init_pool, TopupCreditResult};
 /// of it, and a schema change that is not expressible in the migration shows up as
 /// a test failure instead of as a fixture that happens to agree with itself.
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+/// The one migrated schema every test database is copied from.
+///
+/// MEASURED, because the cost was invisible while it was spread over 68 tests.
+/// Running the migrator against a fresh file costs ~84 ms here and creating the
+/// per-test temporary directory ~117 ms, so the old `TestDb::new` (migrate + a
+/// `TempDir` of its own + `init_pool`) cost ~261 ms — roughly 18 s of the suite's
+/// ~21 s of work. The schema is identical for every test, so it is migrated ONCE
+/// and every test database is a file copy of it: ~1.5 ms.
+///
+/// The migration still runs through the real `MIGRATOR`, and
+/// [`build_template`] asserts the tables landed before any copy is handed out, so
+/// a migrator that silently applied nothing still fails the suite — loudly, and
+/// at the template rather than as 68 confusing "no such table" errors.
+static TEMPLATE: OnceCell<PathBuf> = OnceCell::const_new();
+
+/// The sidecars a WAL database can leave beside its file. Copied and removed
+/// alongside it, because a `-wal` that survived a checkpoint still holds
+/// committed frames and a copy without them is not the database that was migrated.
+const SIDECARS: [&str; 2] = ["-wal", "-shm"];
+
+/// Files `close` could not delete because Windows had not released the handle
+/// yet, held so the next `TestDb::new` can delete them instead.
+///
+/// MEASURED: the release is normally immediate, but roughly one close in two
+/// thousand is still refused after a 100 ms wait — bimodal, so it is a handle
+/// that has genuinely not been closed rather than a slow one. Failing a test for
+/// that would make the suite flaky over a temp file, while deleting nothing would
+/// leak one database per test. Deferring gets both: by the time the next test
+/// database is built the handle is gone, so the file does go away — just not on
+/// the schedule Windows chose.
+static ORPHANS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+async fn template_path() -> &'static PathBuf {
+    TEMPLATE.get_or_init(build_template).await
+}
+
+/// Deletes every file a previous `close` had to defer, plus its sidecars.
+fn reap_orphans() {
+    let pending: Vec<PathBuf> =
+        std::mem::take(&mut *ORPHANS.lock().unwrap_or_else(|e| e.into_inner()));
+    for path in pending {
+        delete_database_file(&path);
+    }
+}
+
+/// Migrates one schema-only database and returns its path.
+///
+/// WAL is entered here and checkpointed before the file is closed, exactly as the
+/// old per-test setup did: `init_pool` then opens a file that is already in WAL,
+/// so it never has to convert one.
+async fn build_template() -> PathBuf {
+    // One file, one process: the uuid keeps two concurrently running test
+    // binaries from copying each other's template. It lives in the system temp
+    // directory and is not deleted on exit - bounded at one small file per test
+    // run, which is the same trade-off the old design already made for any test
+    // that panicked before `close`.
+    let path = std::env::temp_dir().join(format!("apikita-test-template-{}.db", Uuid::new_v4()));
+    let url = sqlite_url(&path);
+
+    let setup_options = SqliteConnectOptions::from_str(&url)
+        .expect("parse the template database url")
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true);
+
+    let setup = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(setup_options)
+        .await
+        .expect("create the template database file");
+    MIGRATOR
+        .run(&setup)
+        .await
+        .expect("apply the real migration to the template database");
+
+    // Fold the WAL into the file so a copy of it is self-contained.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(&setup)
+        .await
+        .expect("checkpoint the template database");
+
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'usage_daily'",
+    )
+    .fetch_one(&setup)
+    .await
+    .expect("read the template schema");
+    assert_eq!(
+        tables, 1,
+        "the template must be migrated: from here on every test database is a copy of it, \
+         and only this function ever sees the migrator run"
+    );
+
+    setup.close().await;
+    path
+}
+
+/// Deletes a database file and its sidecars, reporting whether it went away.
+///
+/// Best-effort on purpose: the caller decides what a refusal means, because a
+/// file the OS still has open is not a failed test.
+fn delete_database_file(path: &Path) -> bool {
+    let removed = std::fs::remove_file(path).is_ok();
+    for suffix in SIDECARS {
+        let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
+        if sidecar.exists() {
+            let _ = std::fs::remove_file(&sidecar);
+        }
+    }
+    removed
+}
+
+/// Copies the migrated template to `dest`, carrying any sidecar along with it.
+fn copy_template(template: &Path, dest: &Path) {
+    std::fs::copy(template, dest).expect("copy the migrated template to the test database");
+    for suffix in SIDECARS {
+        let src = PathBuf::from(format!("{}{suffix}", template.display()));
+        if src.exists() {
+            std::fs::copy(&src, PathBuf::from(format!("{}{suffix}", dest.display())))
+                .expect("copy the template sidecar");
+        }
+    }
+}
 
 /// The connection string `init_pool` needs to reach a file at `path`.
 ///
@@ -62,52 +186,39 @@ pub struct TestDb {
     /// The pool the tests use. Same constructor, and therefore the same pragmas,
     /// as the server.
     pub pool: SqlitePool,
-    /// Held only so the directory is removed when the test ends. Never read.
-    _dir: TempDir,
+    /// The file the pool is open on, so `close` can delete it.
+    path: PathBuf,
 }
 
 impl TestDb {
-    /// A fresh, migrated database in its own temporary directory.
+    /// A fresh, migrated database on its own file.
     ///
-    /// Three steps, and the order matters. The file is created and migrated by a
-    /// single connection, exactly as `bin/migrate.rs` does, because
-    /// [`init_pool`] deliberately does not set `create_if_missing` and because WAL
-    /// has to be entered while the database has no other readers — sqlx's own
-    /// source notes that changing into WAL needs an exclusive lock
-    /// `sqlite3_busy_timeout()` cannot wait on.
+    /// The schema is copied from the one migrated template (see [`TEMPLATE`])
+    /// rather than migrated again, and the file goes straight into the system
+    /// temporary directory instead of into a `TempDir` of its own: both of those
+    /// were pure per-test overhead and together they were ~200 ms of the ~261 ms
+    /// this used to cost. What is left is the part that has to be real —
+    /// [`init_pool`], the constructor production uses, opening the file with the
+    /// production pragmas.
     pub async fn new() -> Self {
-        let dir = tempfile::tempdir().expect("create a temp directory for the test database");
-        let path = dir.path().join("test.db");
-        let url = sqlite_url(&path);
+        reap_orphans();
+        let template = template_path().await;
+        let path = std::env::temp_dir().join(format!("apikita-test-{}.db", Uuid::new_v4()));
+        copy_template(template, &path);
 
-        let setup_options = SqliteConnectOptions::from_str(&url)
-            .expect("parse the test database url")
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true);
-
-        let setup = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(setup_options)
+        let pool = init_pool(&sqlite_url(&path))
             .await
-            .expect("create the test database file");
-        MIGRATOR
-            .run(&setup)
-            .await
-            .expect("apply the real migration to the test database");
-        setup.close().await;
-
-        let pool = init_pool(&url).await.expect("open the test pool");
-        TestDb { pool, _dir: dir }
+            .expect("open the test pool");
+        TestDb { pool, path }
     }
 
-    /// The directory the database file lives in. Test-only, for asserting that it
-    /// really is cleaned up.
-    pub fn dir_path(&self) -> &Path {
-        self._dir.path()
+    /// The file the database lives on. Test-only, for the health probe that opens
+    /// a second pool onto the same file, and for asserting that it is cleaned up.
+    pub fn db_path(&self) -> &Path {
+        &self.path
     }
 
-    /// Closes the pool and removes the directory.
+    /// Closes the pool and deletes the file.
     ///
     /// `pool.close()` is awaited rather than merely dropped because it waits for
     /// every connection to close, which is what releases the file handles. Dropping
@@ -115,18 +226,38 @@ impl TestDb {
     /// would race it.
     ///
     /// MEASURED, because the assumption is wrong in the convenient direction: while
-    /// a pooled SQLite connection is open, `remove_dir_all` on that directory is
-    /// REFUSED on Windows (SQLite's win32 VFS does not ask for `FILE_SHARE_DELETE`
-    /// for the main database or its `-wal`/`-shm` sidecars). A test that panics
-    /// therefore never reaches `close` and leaves one small directory behind in the
-    /// system temp. That is the accepted cost of per-test isolation: bounded, and
+    /// a pooled SQLite connection is open, deleting that file is REFUSED on Windows
+    /// (SQLite's win32 VFS does not ask for `FILE_SHARE_DELETE` for the main
+    /// database or its `-wal`/`-shm` sidecars) — which is exactly why the await
+    /// is here.
+    ///
+    /// A file the OS still refuses to release is deferred to the next
+    /// [`TestDb::new`] (see [`ORPHANS`]) rather than failing the test: the leak is
+    /// what matters and the deferral still prevents it, whereas failing would make
+    /// the suite flaky over a temp file. A test that panics never reaches `close`
+    /// at all and leaves one small file behind in the system temp — bounded, and
     /// far cheaper than the single shared database these tests used to race
     /// through, which was the alternative.
     pub async fn close(self) {
-        let TestDb { pool, _dir } = self;
+        let TestDb { pool, path } = self;
         pool.close().await;
         drop(pool);
-        drop(_dir);
+
+        // Normally one try. The wait is bounded and non-blocking — a
+        // `std::thread::sleep` here would block the very runtime whose background
+        // task is closing the connection, and the file would then never be
+        // released at all (measured: 25 of 284 tests failed that way).
+        let mut deleted = delete_database_file(&path);
+        for _ in 0..20 {
+            if deleted {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            deleted = delete_database_file(&path);
+        }
+        if !deleted {
+            ORPHANS.lock().unwrap_or_else(|e| e.into_inner()).push(path);
+        }
     }
 }
 
@@ -337,47 +468,123 @@ mod tests {
         db.close().await;
     }
 
-    /// The database really is temporary: closing it removes its directory.
+    /// A top-up must record which payment rail funded it, and the value set is
+    /// frozen.
+    ///
+    /// The rail decides the payout method at wind-down ("anyone who used Midtrans
+    /// is considered Indonesian"), so a row that does not name one is unpayable.
+    /// That is why this column is NOT NULL with no DEFAULT: a path that forgot to
+    /// name its rail fails loudly here instead of being silently mislabelled as
+    /// the only rail that exists today. Asserted rather than assumed because the
+    /// default-less shape is invisible in Rust — a `DEFAULT 'midtrans'` would
+    /// compile and pass every other test in this file.
+    ///
+    /// The value set is frozen because SQLite cannot add a CHECK value later
+    /// without a 12-step table rebuild, so the vocabulary is pinned to the two
+    /// rails that exist rather than left open.
+    #[tokio::test]
+    async fn a_topup_must_name_its_rail_and_the_value_set_is_frozen() {
+        let db = TestDb::new().await;
+
+        // (a) NOT NULL, (c) no default: both in the declared column shape.
+        let declared: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('topups') \
+             WHERE name = 'rail' AND \"notnull\" = 1 AND dflt_value IS NULL",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the topups schema");
+        assert_eq!(
+            declared, 1,
+            "topups.rail must exist, be NOT NULL, and carry no DEFAULT"
+        );
+
+        let account_id = account_with_wallet(&db.pool).await;
+
+        // The column is required: an INSERT that forgets it is refused, not
+        // silently defaulted. This is the loud failure the missing DEFAULT buys.
+        let forgot = sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
+             VALUES (?, ?, 1000, ?, 'pending', ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(format!("test_rail_missing_{}", Uuid::new_v4().simple()))
+        .bind(chrono::Utc::now())
+        .execute(&db.pool)
+        .await;
+        assert!(
+            forgot.is_err(),
+            "an INSERT that names no rail must be refused, not defaulted"
+        );
+
+        // (b) The frozen vocabulary round-trips...
+        for rail in ["midtrans", "crypto"] {
+            sqlx::query(
+                "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+                 VALUES (?, ?, 1000, ?, 'pending', ?, ?)",
+            )
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
+            .bind(format!("test_rail_{rail}_{}", Uuid::new_v4().simple()))
+            .bind(rail)
+            .bind(chrono::Utc::now())
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(|e| panic!("{rail} must be a documented rail: {e}"));
+        }
+
+        // ...and a third rail is refused, not silently stored.
+        let refused = sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+             VALUES (?, ?, 1000, ?, 'pending', 'bank_transfer', ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(format!("test_rail_bad_{}", Uuid::new_v4().simple()))
+        .bind(chrono::Utc::now())
+        .execute(&db.pool)
+        .await;
+        assert!(
+            refused.is_err(),
+            "an undocumented rail must be refused by the CHECK constraint"
+        );
+
+        db.close().await;
+    }
+
+    /// The database really is temporary: closing it removes its file.
     ///
     /// Asserted rather than assumed because the tempting assumption is false. While
-    /// a pooled SQLite connection is open, `remove_dir_all` on that directory is
-    /// REFUSED on Windows — measured, and the reason `TestDb::close` awaits
-    /// `pool.close()` instead of trusting drop order. Without this test, a change
-    /// that replaced `close` with a plain drop would leak a temp directory per test
-    /// run and nobody would notice until a CI runner filled its disk.
+    /// a pooled SQLite connection is open, deleting that file is REFUSED on
+    /// Windows — measured, and the reason `TestDb::close` awaits `pool.close()`
+    /// instead of trusting drop order. Without this test, a change that replaced
+    /// `close` with a plain drop would leak a database file per test and nobody
+    /// would notice until a CI runner filled its disk.
+    ///
+    /// The check is done after a SECOND database is built, because a file whose
+    /// handle Windows has not released is reaped there and not before: the
+    /// guarantee under test is that the file does not outlive the test run, not
+    /// that Windows releases it within one call.
     #[tokio::test]
     async fn the_temp_database_is_removed_when_it_is_closed() {
         let db = TestDb::new().await;
-        let dir_path = db.dir_path().to_path_buf();
+        let db_path = db.db_path().to_path_buf();
 
         assert!(
-            dir_path.join("test.db").exists(),
+            db_path.exists(),
             "the database file must exist while the database is open"
         );
 
         db.close().await;
+        let second = TestDb::new().await;
 
         assert!(
-            !dir_path.exists(),
-            "closing the test database must remove its directory: {}",
-            dir_path.display()
+            !db_path.exists(),
+            "closing the test database must remove its file: {}",
+            db_path.display()
         );
-    }
 
-    #[tokio::test]
-    async fn zz_measure_testdb_new() {
-        let t = std::time::Instant::now();
-        for _ in 0..30 {
-            let db = TestDb::new().await;
-            db.close().await;
-        }
-        println!("MEASURE 30x TestDb::new+close = {:?}", t.elapsed());
-
-        let t = std::time::Instant::now();
-        for _ in 0..30 {
-            let d = tempfile::tempdir().unwrap();
-            drop(d);
-        }
-        println!("MEASURE 30x bare tempdir = {:?}", t.elapsed());
+        second.close().await;
     }
 }
