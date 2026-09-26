@@ -1,0 +1,102 @@
+---
+import Base from '../../layouts/Base.astro';
+import { rateClasses, tickerModels, type Availability } from '../../lib/models';
+
+// Every registered model, with the rates the customer is billed, IDR per 1M
+// tokens. The figures come from ../lib/models — the same module the hero ticker
+// on / reads — so this page and the landing page cannot drift.
+//
+// availability is what the customer may actually buy, and it decides how the
+// figures are drawn: only a model that can be called today gets the money
+// accent. A model that would return 503 (registered, weight 0.0) or is a mock
+// placeholder is marked on its face and its figures stay in the muted ink, so
+// no un-callable price can be read as buyable.
+const marks: Record<Availability, string> = {
+  available: 'Available',
+  'coming-soon': 'Coming soon',
+  placeholder: 'Placeholder',
+};
+
+// The two billing bases, in the order they are shown. Peak is the basis billed
+// today; off-peak is reference only. Neither basis is chargeable for a model
+// that is not available — the card says "Not billed" on both.
+const bases: { key: 'peak' | 'offPeak'; label: string; billed: boolean }[] = [
+  { key: 'peak', label: 'Peak', billed: true },
+  { key: 'offPeak', label: 'Off-peak', billed: false },
+];
+---
+
+<Base
+  title="Models — apikita"
+  description="Every model apikita serves, with its per-token rates in IDR."
+>
+  <article class="space-y-10">
+    <header>
+      <h1 class="text-2xl font-semibold tracking-tight">Models</h1>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        Every model registered with apikita, with the rates we bill per
+        1,000,000 tokens in IDR. Peak is the basis billed today; off-peak rates
+        are shown for reference only. Each model lists the same three token
+        classes: Input, Cache hit and Output.
+      </p>
+    </header>
+
+    <section>
+      <h2 class="text-2xl font-semibold tracking-tight">All models</h2>
+      <ul class="mt-6 grid gap-6">
+        {tickerModels.map((model) => {
+          const buyable = model.availability === 'available';
+          return (
+            <li class="rounded-lg border border-edge bg-surface-raised p-5">
+              <div class="flex flex-wrap items-baseline justify-between gap-2">
+                <h3 class="font-mono font-medium">{model.name}</h3>
+                <span
+                  class:list={[
+                    'rounded border px-1.5 py-0.5 text-xs font-medium',
+                    buyable ? 'border-edge-strong text-ink-subtle' : 'border-warn-edge text-warn',
+                  ]}
+                >
+                  {marks[model.availability]}
+                </span>
+              </div>
+              <p class="mt-1 text-sm text-ink-subtle">{model.note}</p>
+
+              <div class="mt-4 grid gap-4 sm:grid-cols-2">
+                {bases.map((base) => (
+                  <div class="rounded-md border border-edge bg-surface-sunken p-3">
+                    <div class="flex items-baseline justify-between gap-2">
+                      <h4 class="text-sm font-medium">{base.label}</h4>
+                      <span class="text-xs text-ink-subtle">
+                        {buyable && base.billed ? 'Billed today' : 'Not billed'}
+                      </span>
+                    </div>
+                    <dl class="mt-2 space-y-1 text-sm">
+                      {rateClasses.map((tokenClass, i) => (
+                        <div class="flex items-baseline justify-between gap-2">
+                          <dt class="text-ink-muted">{tokenClass}</dt>
+                          <dd
+                            class:list={[
+                              'font-mono tabular-nums',
+                              buyable && base.billed ? 'text-accent' : 'text-ink-subtle',
+                            ]}
+                          >
+                            IDR {model[base.key][i]}/M
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+                  </div>
+                ))}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+
+    <p class="text-sm text-ink-muted">
+      <a href="/#pricing" class="underline hover:text-brand">See the pricing table</a>
+      for what each token class is and how usage is billed.
+    </p>
+  </article>
+</Base>
