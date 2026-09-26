@@ -25,9 +25,11 @@ See [the stranded-hold section](#the-check-reconciliation-cannot-make-stranded-h
 Every customer's money lives in two places:
 
 - `wallets.balance_idr` - the cached current balance for an account.
-- `ledger.delta_idr` - an append-only log of every credit (topup, refund) and
-  debit (usage, adjustment). The ledger is **authoritative**; `wallets` is a
-  cache of it.
+- `ledger.delta_idr` - an append-only log of every credit (topup) and debit
+  (usage, adjustment). The ledger is **authoritative**; `wallets` is a cache of
+  it. The credit path files its row under the **topup id**, and **there is no
+  refund writer** any more — no `reason='refund'` row is ever appended, so no
+  pairing may expect one.
 
 For every account, the cached balance must equal the sum of its ledger deltas:
 

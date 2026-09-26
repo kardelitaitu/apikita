@@ -50,8 +50,11 @@ opinion.
 - [ ] Amount validated against the **stored** `topups` row, never the payload.
 - [ ] Crediting is idempotent by `order_id`.
 - [ ] Crediting is atomic with the `topups` status update and the ledger row.
-- [ ] `refund` and `partial_refund` statuses handled (debit), even though the
-      policy is non-refundable.
+- [ ] `refund` and `partial_refund` statuses **refused, not handled**: a signed
+      refund notification returns 200 with `{"status":"refund_not_supported"}`,
+      logs at `error!`, and writes nothing — the topup stays `settled`, no ledger
+      row is appended, the wallet cannot move. **Alerting on that refusal is what
+      makes it visible** — unalerted, a refusal is indistinguishable from a bug.
 
 ### Ledger and balance
 

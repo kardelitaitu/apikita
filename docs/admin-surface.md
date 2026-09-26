@@ -18,8 +18,10 @@ traffic. There is no back door.**
 | Editing PocketBase records directly for money | Identity system holding money state; the two stores diverge |
 | Deleting rows to "fix" data | Destroys the audit trail that makes disputes resolvable |
 
-**An adjustment is a ledger row, not an edit.** The `ledger.reason` enum already
-has `adjustment` and `refund` for exactly this.
+**An adjustment is a ledger row, not an edit.** The `ledger.reason` enum has
+`adjustment` for exactly this. It also carries a `refund` value that **nothing
+writes** — the platform does not refund (see
+[Money actions](#money-actions--the-ones-that-need-care)).
 
 ## What exists today
 
@@ -143,10 +145,14 @@ Inferred from the abuse runbook, ToS, and support scenarios:
 | View top-up and webhook history | read | Payment disputes |
 | View abuse signals per account | read | Abuse detection |
 | **Credit an adjustment** | **money** | Reconciliation fixes, goodwill |
-| **Refund a top-up** | **money** | ToS §3 non-delivery exception, disputes |
 | Force-logout (revoke sessions) | security | Account takeover |
 | Cancel a pending link code | security | Linking abuse |
 | Moderate a review | content | Review room |
+
+**Refunding a top-up is not on this list and is not a capability.** The platform
+does not refund — there is no endpoint to call and no operator action that moves
+money back to a payer. A refund request is answered by the Terms of Service, not
+by an operator. See [Money actions](#money-actions--the-ones-that-need-care).
 
 ## Access model
 
@@ -179,13 +185,20 @@ the holes appear.
 
 ## Money actions — the ones that need care
 
-> **Status: NOT IMPLEMENTED.** Neither `/adjust` nor `/refund` exists in
+> **Status: NOT IMPLEMENTED.** `/adjust` does not exist in
 > `server/src/routes/mod.rs`. This is design for the "with revenue" phase, kept
-> because the rules are the hard part. Until they exist, money actions are SQL by
+> because the rules are the hard part. Until it exists, money actions are SQL by
 > the owner, documented — see [Rollout](#rollout).
 
-Two actions move money outside the Midtrans webhook. Both are necessary; both are
-dangerous.
+**One action moves money outside the Midtrans webhook: the adjustment.** It is
+necessary, and it is dangerous.
+
+**A refund is not a second one.** The platform does not refund: an inbound
+Midtrans `refund` or `partial_refund` notification is acknowledged and **refused**
+(200 with `{"status":"refund_not_supported"}`, logged at `error!`), and nothing is
+written — the topup stays `settled`, no ledger row is appended, the wallet cannot
+move. The refund code path is gone, so there is no implementation to call and no
+operator action to reach for.
 
 ### Adjustment
 
@@ -204,28 +217,26 @@ Rules:
    during an audit.
 4. **Logged with the operator's account id**, not just the affected account.
 
-### Refund
+### Refund — not offered
 
-Used for: the ToS non-delivery exception, and disputes arriving from the payer.
+**The platform does not refund, and no refund endpoint is planned.** There is no
+`POST /api/admin/topups/:id/refund` to design against, because the refund code
+path has been deleted.
 
-```json
-POST /api/admin/topups/:id/refund
-{ "reason": "service not delivered", "note": "..." }
-```
+An inbound Midtrans `refund` or `partial_refund` notification is **acknowledged
+and refused**, never applied:
 
-Rules:
+1. **200** with body `{"status":"refund_not_supported"}` — acknowledged so
+   Midtrans does not retry a notification that can never succeed.
+2. Logged at **`error!`**, so the refusal is visible.
+3. **Nothing written.** The topup stays `settled`, no ledger row is appended, and
+   the wallet cannot move.
 
-1. Sets `topups.status = 'refunded'`.
-2. **Debits the wallet** via a ledger row with `reason='refund'`.
-3. **Refuses if the balance is insufficient** — the customer may have spent it.
-   That case is a decision, not an automatic negative balance.
-4. Where Midtrans is involved, the money movement happens **with Midtrans**, and
-   our ledger records the consequence. Do not represent a Midtrans refund as one
-   we performed unilaterally.
+**An unalerted refusal is silent**, which is indistinguishable from a refund bug —
+so alert on that log line. It is the only signal that a refund was ever asked for.
 
-**A refund that would drive the balance negative must not silently succeed.** The
-customer spent credit they are now claiming back; that is a business decision with a
-real cost, and it needs a human.
+A customer claiming the non-delivery exception is answered by the Terms of
+Service, not by an operator debiting a wallet.
 
 ## Non-money actions
 
@@ -271,8 +282,7 @@ source). `admin_audit` holds: `id`, `operator_id` -> accounts (RESTRICT), `actio
 | **Admin endpoints excluded from customer API docs** | Reduces surface for probing |
 
 **The two-person rule needs a decision:** below what amount is one operator enough?
-A reasonable starting point is any adjustment or refund above a few hundred thousand
-IDR.
+A reasonable starting point is any adjustment above a few hundred thousand IDR.
 
 ## What the admin surface must NOT do
 
@@ -300,7 +310,7 @@ See [`observability.md`](observability.md).
 | Phase | Surface | Status |
 | --- | --- | --- |
 | **Launch** | Read-only + suspend/restore. Money actions via SQL by the owner, documented | **Routes built**; `/keys/:id/revoke` on the admin path is still planned (the customer route exists). **No UI** |
-| **With revenue** | Adjustments and refunds as endpoints with notes and audit | Not built |
+| **With revenue** | Adjustments as an endpoint, with notes and audit. **Not refunds** — the platform does not refund | Not built |
 | **Later** | Second-operator threshold, dedicated UI, more roles | Not built |
 
 **Starting read-only is deliberate.** The dangerous actions are the money ones, and
