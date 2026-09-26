@@ -436,3 +436,184 @@ weight = 1.0
 # difference is the version behind the name (V4.1-Flash-0910 vs
 # V4-Flash-0731). If only one needs to be public, keep "flash" and drop the
 # alias -- offering both means maintaining two names for one product.
+# ===========================================================================
+# deepseek-v4-pro -- real third model. Registered, NEVER ROUTED (weight 0.0).
+# ===========================================================================
+#
+# Pricing verified. provider1.md:35-37 (price list) and provider1.md:49-51
+# (derived IDR), FX CNY x 2,676.78 as documented at provider1.md:9-11.
+# Model version DeepSeek-V4-Pro-0813.
+#
+#   class        CNY off / peak     x 2676.78 -> IDR off / peak
+#   input        2.25 / 4.50        6,022.76 / 12,045.50
+#   output       6.75 / 13.50      18,068.27 / 36,136.53
+#   cache read   0.075 / 0.15         200.76 / 401.52
+#
+# Registered but deliberately not routable: every endpoint below carries
+# weight = 0.0, which the router filters on, so this model can never be
+# selected. See the scope note at provider1.md:71-88 -- the commercial
+# objection is recorded, not resolved.
+
+[[models]]
+name = "deepseek-v4-pro"
+description = "Higher-capability reasoning tier. Priced above flash."
+price = 1.5
+
+max_context_tokens = 1000000
+max_output_tokens = 384000
+supports_vision = true
+supports_thinking = true
+
+billing_basis = "peak"
+
+[models.rates]
+# IDR per 1M = CNY price x 2676.78. CNY source: off 0.075/2.25/6.75,
+# peak 0.15/4.5/13.5 (provider1.md:35-37).
+cache_read_offpeak = 200.76     # ¥0.075
+cache_read_peak    = 401.52     # ¥0.15
+input_offpeak      = 6022.76    # ¥2.25
+input_peak         = 12045.50   # ¥4.50
+output_offpeak     = 18068.27   # ¥6.75
+output_peak        = 36136.53   # ¥13.50
+
+[[models.endpoints]]
+name = "primary"
+url = "https://api.abc.com/v1"
+upstream_model = "deepseek-v4-pro"
+api_key_envs = [
+  "APK_V4PRO_PRIMARY_KEY_1",
+]
+concurrency_per_key = 0        # not offered for routing -- weight 0, never routed
+weight = 0.0
+supports_stream_options = true
+
+# ===========================================================================
+# dummy-glm-5.3-flash / dummy-glm-5.2 / dummy-qwen-4-max
+# ===========================================================================
+#
+# *** MOCK PLACEHOLDERS. NOT REAL MODELS. ***
+#
+# These three entries exist only so config and the website ticker carry a
+# legible shape for models that are not purchasable. No provider was
+# consulted, no resale terms were read, and NO PRICE HERE IS VERIFIED --
+# see the marked section at provider1.md:90-125. The CNY figures are
+# invented. Every endpoint carries weight = 0.0, so none of these can ever
+# be routed; that is structural (the router filters on weight > 0), not a
+# consequence of a missing API key. Delete these blocks before launch.
+
+# --- dummy-glm-5.3-flash (PLACEHOLDER) -------------------------------------
+
+[[models]]
+name = "dummy-glm-5.3-flash"
+description = "PLACEHOLDER -- not a real model. Never routed."
+price = 1.5
+
+max_context_tokens = 1000000
+max_output_tokens = 384000
+supports_vision = true
+supports_thinking = true
+
+billing_basis = "peak"
+
+[models.rates]
+# INVENTED. IDR per 1M = made-up CNY x 2676.78. Not verified anywhere.
+cache_read_offpeak = 21.41      # "¥0.008" (invented)
+cache_read_peak    = 42.83      # "¥0.016" (invented)
+input_offpeak      = 1070.71    # "¥0.40" (invented)
+input_peak         = 2141.42    # "¥0.80" (invented)
+output_offpeak     = 4282.85    # "¥1.60" (invented)
+output_peak        = 8565.70    # "¥3.20" (invented)
+
+[[models.endpoints]]
+name = "placeholder"
+url = "https://api.example.invalid/v1"
+upstream_model = "dummy-glm-5.3-flash"
+api_key_envs = [
+  "APK_DUMMY_GLM53FLASH_KEY_1",
+]
+concurrency_per_key = 0        # mock placeholder -- weight 0, never routed
+weight = 0.0
+supports_stream_options = true
+
+# --- dummy-glm-5.2 (PLACEHOLDER) -------------------------------------------
+
+[[models]]
+name = "dummy-glm-5.2"
+description = "PLACEHOLDER -- not a real model. Never routed."
+price = 1.5
+
+max_context_tokens = 1000000
+max_output_tokens = 384000
+supports_vision = true
+supports_thinking = true
+
+billing_basis = "peak"
+
+[models.rates]
+# INVENTED. IDR per 1M = made-up CNY x 2676.78. Not verified anywhere.
+cache_read_offpeak = 160.61     # "¥0.06" (invented)
+cache_read_peak    = 321.21     # "¥0.12" (invented)
+input_offpeak      = 3212.14    # "¥1.20" (invented)
+input_peak         = 6424.27    # "¥2.40" (invented)
+output_offpeak     = 12848.54   # "¥4.80" (invented)
+output_peak        = 25697.09   # "¥9.60" (invented)
+
+[[models.endpoints]]
+name = "placeholder"
+url = "https://api.example.invalid/v1"
+upstream_model = "dummy-glm-5.2"
+api_key_envs = [
+  "APK_DUMMY_GLM52_KEY_1",
+]
+concurrency_per_key = 0        # mock placeholder -- weight 0, never routed
+weight = 0.0
+supports_stream_options = true
+
+# --- dummy-qwen-4-max (PLACEHOLDER) ----------------------------------------
+
+[[models]]
+name = "dummy-qwen-4-max"
+description = "PLACEHOLDER -- not a real model. Never routed."
+price = 1.5
+
+max_context_tokens = 1000000
+max_output_tokens = 384000
+supports_vision = true
+supports_thinking = true
+
+billing_basis = "peak"
+
+[models.rates]
+# INVENTED. IDR per 1M = made-up CNY x 2676.78. Not verified anywhere.
+cache_read_offpeak = 401.52     # "¥0.15" (invented)
+cache_read_peak    = 803.03     # "¥0.30" (invented)
+input_offpeak      = 8030.34    # "¥3.00" (invented)
+input_peak         = 16060.68   # "¥6.00" (invented)
+output_offpeak     = 32121.36   # "¥12.00" (invented)
+output_peak        = 64242.72   # "¥24.00" (invented)
+
+[[models.endpoints]]
+name = "placeholder"
+url = "https://api.example.invalid/v1"
+upstream_model = "dummy-qwen-4-max"
+api_key_envs = [
+  "APK_DUMMY_QWEN4MAX_KEY_1",
+]
+concurrency_per_key = 0        # mock placeholder -- weight 0, never routed
+weight = 0.0
+supports_stream_options = true
+
+# ===========================================================================
+# What a customer pays (rate x price), IDR per 1M, at the PEAK basis (M = 1.50)
+# -- the four models appended above.
+# ===========================================================================
+#
+#   deepseek-v4-pro       in 18,068    out 54,205    cache 602
+#   dummy-glm-5.3-flash   in  3,212    out 12,849    cache  64   [PLACEHOLDER]
+#   dummy-glm-5.2         in  9,636    out 38,546    cache 482   [PLACEHOLDER]
+#   dummy-qwen-4-max      in 24,091    out 96,364    cache 1,205 [PLACEHOLDER]
+#
+# The three dummy rows are MOCK figures on models that are not routable and
+# not purchasable. They are shown on the marketing ticker only, and every one
+# of their cards is marked as a placeholder on its face.
+

@@ -13,11 +13,22 @@
 import { confirmationError, passwordRuleError } from './auth-flow.ts';
 
 /**
- * The models the proxy currently exposes: config/apikita.toml, [[models]]
- * `name = ...`. The same two the KeyManagement island offers, because a page
- * that described a different set would be describing a different product.
+ * The models the proxy exposes by name: config/apikita.toml, [[models]]
+ * `name = ...`, in file order. Two are routed today (`flash`,
+ * `deepseek-v4-flash`); `deepseek-v4-pro` and the three `dummy-*` entries
+ * are registered with `weight = 0.0` on every endpoint and can never be
+ * selected. The KeyManagement island offers its own subset and is not driven
+ * from this list, so the two can differ while this list stays the config's
+ * full inventory.
  */
-export const ENABLED_MODELS: readonly string[] = ['flash', 'deepseek-v4-flash'];
+export const ENABLED_MODELS: readonly string[] = [
+  'flash',
+  'deepseek-v4-flash',
+  'deepseek-v4-pro',
+  'dummy-glm-5.3-flash',
+  'dummy-glm-5.2',
+  'dummy-qwen-4-max',
+];
 
 /**
  * Whether a key whose stored allowlist is `allowlist` may call `model`.

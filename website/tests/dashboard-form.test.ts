@@ -50,10 +50,10 @@ test('the model-access summary says "nothing" for empty and "all" only for the f
   assert.match(none, /deny by default/);
 
   const all = describeModelAccess([...ENABLED_MODELS]);
-  assert.match(all, /^All 2 enabled models/);
+  assert.match(all, /^All 6 enabled models/);
 
   const some = describeModelAccess(['flash']);
-  assert.match(some, /^1 of 2 enabled models/);
+  assert.match(some, /^1 of 6 enabled models/);
   assert.match(some, /flash/);
 
   // A key created while another model was enabled still carries it; the summary
@@ -61,7 +61,7 @@ test('the model-access summary says "nothing" for empty and "all" only for the f
   const retired = describeModelAccess(['flash', 'a-retired-model']);
   assert.match(retired, /not currently enabled/);
   assert.match(retired, /a-retired-model/);
-  assert.match(retired, /^1 of 2 enabled models/);
+  assert.match(retired, /^1 of 6 enabled models/);
 });
 
 test('a limit field accepts blank and zero, and refuses anything else', () => {

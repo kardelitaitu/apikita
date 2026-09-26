@@ -36,8 +36,10 @@ Transcribed from the provider's pricing table.
 | | | Output | ¥6.75 | ¥13.50 |
 | | | Cache read | ¥0.075 | ¥0.15 |
 
-**In use:** `deepseek-flash` and `deepseek-v4-flash` only. `deepseek-v4-pro` is
-priced above the flash models but is **not offered** — see scope note below.
+**In use:** `deepseek-flash` and `deepseek-v4-flash` are the routed models.
+`deepseek-v4-pro` has **moved to offered** and is now registered in
+`apikita.toml` with `weight = 0.0` on every endpoint, so it is exposed but
+never routed. See the scope note below, which has been revisited.
 
 ### Derived IDR (x 2,676.78)
 
@@ -70,10 +72,44 @@ it is simply 46%, not 50%.
 
 ## Scope decision
 
-`deepseek-v4-pro` is **not offered**. Its output costs ~3.4x flash output, and
-at the markup needed to be profitable it may not undercut what customers pay
-today. Flash is where the arbitrage is. Revisit only with evidence that a pro
-tier sells.
+**Original decision (superseded — kept for the record):** `deepseek-v4-pro` is
+**not offered**. Its output costs ~3.4x flash output, and at the markup needed
+to be profitable it may not undercut what customers pay today. Flash is where
+the arbitrage is. Revisit only with evidence that a pro tier sells.
+
+**Revisited:** the decision has been reopened and `deepseek-v4-pro` is now
+**registered** in `apikita.toml` as a real third model. It is priced from the
+verified figures in the table above (derived IDR in the table at :44-51). It is
+registered with `weight = 0.0` on every endpoint — exposed but never routed —
+so the earlier commercial objection is not yet answered by traffic; the model
+exists in config and on the marketing page, and routing it remains a separate,
+deliberate decision.
+
+## Unverified placeholders — not purchased, not routed
+
+> **These are MOCK placeholders. Nothing in this section is real.** No provider
+> was consulted for any of these models, no resale terms were read or agreed,
+> and **no price below has been verified against anything**. The rows exist so
+> that `apikita.toml` and the website ticker have a legible shape for models
+> that are not yet purchasable. They are registered with `weight = 0.0` on
+> every endpoint and therefore can never be routed. Do not bill against them,
+> do not quote them to a customer, and do not treat any figure here as a cost
+> basis. Delete this whole section the moment a real price list arrives.
+
+The columns deliberately match the verified table above so the structure is
+legible, but the values are invented:
+
+| Model ID | Version | Class | Off-peak | Peak (2x) |
+| --- | --- | --- | ---: | ---: |
+| `dummy-glm-5.3-flash` | PLACEHOLDER — invented | Input | ¥0.40 | ¥0.80 |
+| | | Output | ¥1.60 | ¥3.20 |
+| | | Cache read | ¥0.008 | ¥0.016 |
+| `dummy-glm-5.2` | PLACEHOLDER — invented | Input | ¥1.20 | ¥2.40 |
+| | | Output | ¥4.80 | ¥9.60 |
+| | | Cache read | ¥0.06 | ¥0.12 |
+| `dummy-qwen-4-max` | PLACEHOLDER — invented | Input | ¥3.00 | ¥6.00 |
+| | | Output | ¥12.00 | ¥24.00 |
+| | | Cache read | ¥0.15 | ¥0.30 |
 
 ## Open items
 
