@@ -26,31 +26,19 @@ const SNAP_JS_URL =
 // empty value means no payment can be opened — the submit handler says so
 // rather than calling snap.pay() with no key.
 const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
-// Midtrans prefixes its keys by environment: `SB-Mid-client-...` is sandbox, a
-// bare `Mid-client-...` is production. That prefix is the one cross-check this
-// page can make against the server's environment without a shared config
-// service, and it is what makes a mismatch visible: the server cannot read a
-// build-time Pages variable, so the browser is the only side that can see both.
-// `unknown` (no key, or a format we do not recognise) disables the check rather
-// than guessing.
-const SNAP_KEY_ENV: 'production' | 'sandbox' | 'unknown' = SNAP_CLIENT_KEY.trim().startsWith(
-  'SB-Mid-client-',
-)
-  ? 'sandbox'
-  : SNAP_CLIENT_KEY.trim().startsWith('Mid-client-')
-    ? 'production'
-    : 'unknown';
 // The host rule above, applied to the same value: anything but an explicit
-// "production" is sandbox. Normalising it here is what lets the browser compare
-// like with like — an unset Pages variable IS sandbox, exactly as an unset
-// MIDTRANS_ENV is server-side, so local dev is not reported as a mismatch.
+// "production" is sandbox. This is the browser-side value the script compares
+// against the environment the server reports on the create-topup response, and
+// normalising it here is what makes the two comparable — an unset Pages variable
+// IS sandbox, exactly as an unset MIDTRANS_ENV is server-side, so a local dev
+// build does not read as a mismatch. It is also published as
+// `data-midtrans-env` for operators and tests.
 const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbox';
 ---
 
 <div
   id="topup-island"
   data-midtrans-env={MIDTRANS_HOST_ENV}
-  data-midtrans-key-env={SNAP_KEY_ENV}
   data-midtrans-key-missing={SNAP_CLIENT_KEY.trim() === '' ? 'true' : 'false'}
 >
   <form id="topup-form" class="max-w-md space-y-4" novalidate>
@@ -169,6 +157,7 @@ const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbo
   import type { Noticeable } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
   import { getLiveStore } from '../../lib/live';
+  import { midtransEnvMismatch } from '../../lib/midtrans-env.ts';
 
   // Mirrors the server's own rule in server/src/routes/account.rs create_topup:
   // the minimum depends on whether the account has ever SETTLED a top-up. A
@@ -189,6 +178,14 @@ const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbo
     topup_id: string;
     order_id: string;
     snap_token: string | null;
+    /**
+     * Which Midtrans environment the server created this session against:
+     * exactly "sandbox" or "production" (server/src/routes/account.rs,
+     * `CreateTopupResponse`). Absent on an older server or when Pages is
+     * deployed ahead of the API — see `midtransEnvMismatch`, which fails open
+     * on that rather than blocking every top-up.
+     */
+    environment?: string;
   }
 
   /** Subset of the Snap.js global that this island uses. */
@@ -226,36 +223,21 @@ const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbo
   // cross the boundary on.
   const island = document.getElementById('topup-island') as HTMLElement;
   const midtransEnv = island.dataset.midtransEnv ?? 'sandbox';
-  const midtransKeyEnv = island.dataset.midtransKeyEnv ?? 'unknown';
   const midtransKeyMissing = island.dataset.midtransKeyMissing === 'true';
 
   /**
-   * The two Midtrans environments are set on two platforms and nothing keeps
-   * them in sync, so this is the only place both are visible at once.
+   * The one environment fault this side can see on its own: a build with no
+   * public client key cannot open Snap at all, whatever the server does.
    *
-   * A mismatch is fatal and must be loud: a sandbox token handed to the live
-   * Snap host (or the reverse) never opens the payment sheet, the server has
-   * already written a `pending` top-up row, and the customer would otherwise
-   * wait forever for a credit that is never coming. Named in full so whoever
-   * reads it can fix it, and returned as a notice rather than thrown so the
-   * request id is not lost.
+   * That is a fact about this bundle, not a guess, so it is checked before the
+   * request and a misconfigured deployment creates no top-up row. The other
+   * direction — this build's environment against the server's — needs the
+   * server's answer and is checked after the create-topup call resolves, before
+   * `snap.pay()` (see the submit handler and lib/midtrans-env.ts). The key's
+   * PREFIX is never consulted: Midtrans documents no environment prefix for
+   * client keys, and the key is not what picks the host.
    */
-  function environmentMismatch(): Noticeable | null {
-    // 'unknown' means an empty or unrecognised key, so it is never itself a
-    // mismatch — the missing-key check below owns that case. Checked first so
-    // an empty key cannot fall through this branch and go unnoticed.
-    if (midtransKeyEnv !== 'unknown' && midtransKeyEnv !== midtransEnv) {
-      return {
-        message:
-          `Payment is unavailable: this site is configured for Midtrans '${midtransEnv}' ` +
-          `but its public client key belongs to '${midtransKeyEnv}'. Nothing was charged and no top-up ` +
-          `was created. The site operator must set PUBLIC_MIDTRANS_ENV and PUBLIC_MIDTRANS_CLIENT_KEY to ` +
-          `the same environment and rebuild (see docs/deployment.md).`,
-        requestId: null,
-      };
-    }
-    // Matched, but the key is absent entirely: also unpayable, and also worth
-    // naming rather than discovering after a token has been created.
+  function clientKeyProblem(): Noticeable | null {
     if (midtransKeyMissing) {
       return {
         message:
@@ -406,12 +388,11 @@ const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbo
     const amount = validate();
     if (amount === null) return;
 
-    // Checked BEFORE the request, so a misconfigured deployment creates no
-    // top-up row at all. This is the only moment both environments are visible
-    // on one side of the wire.
-    const misconfigured = environmentMismatch();
-    if (misconfigured) {
-      showNotice(misconfigured);
+    // Checked BEFORE the request: no client key means Snap cannot open, and a
+    // top-up row that can never be paid helps nobody.
+    const unpayable = clientKeyProblem();
+    if (unpayable) {
+      showNotice(unpayable);
       return;
     }
 
@@ -425,14 +406,40 @@ const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbo
           body: JSON.stringify({ amount_idr: amount }),
         });
 
-        const snap = (window as unknown as { snap?: SnapGlobal }).snap;
-        if (!created.snap_token || !snap) {
-          // The order exists server-side, so it is honest to show it as pending
-          // rather than to pretend the payment started.
+        // The server has answered, so this build's Midtrans environment can now
+        // be compared against the one the session was REALLY created against —
+        // the fact the old client-key-prefix guess was standing in for. Checked
+        // here, before `snap.pay()`: a token minted against the other
+        // environment can never be paid, so prevention saves the customer a
+        // payment that would certainly fail. An absent `environment` (older
+        // server, Pages deployed first) is "cannot check" and proceeds.
+        if (midtransEnvMismatch(midtransEnv, created.environment) === 'mismatch') {
+          // The order exists server-side and stays pending; there is no expiry
+          // sweep for `topups`, so it is reported rather than silently dropped.
           markPending(created.order_id, amount);
           showNotice({
             message:
-              'Payment could not be opened in this browser, so nothing was charged. The order is recorded as pending and will stay pending until it is paid. If this happens on every attempt, the site may be configured for the wrong Midtrans environment — the operator should check that MIDTRANS_ENV and PUBLIC_MIDTRANS_ENV match (see docs/deployment.md).',
+              `Payment is unavailable: this site is built for Midtrans '${midtransEnv}', but the ` +
+              `server created this order against '${created.environment}'. Nothing was charged. The ` +
+              `order is recorded as pending and will stay pending until it is paid. The site operator ` +
+              `must set PUBLIC_MIDTRANS_ENV (Cloudflare Pages) and MIDTRANS_ENV (server) to the same ` +
+              `environment and redeploy both (see docs/deployment.md).`,
+            requestId: null,
+          });
+          void loadHistory();
+          return;
+        }
+
+        const snap = (window as unknown as { snap?: SnapGlobal }).snap;
+        if (!created.snap_token || !snap) {
+          // The order exists server-side, so it is honest to show it as pending
+          // rather than to pretend the payment started. The environments agree
+          // (checked above) or the server did not say, so the cause is this
+          // browser or this build, not a cross-environment misconfiguration.
+          markPending(created.order_id, amount);
+          showNotice({
+            message:
+              'Payment could not be opened in this browser, so nothing was charged. The order is recorded as pending and will stay pending until it is paid. If this happens on every attempt, the Snap script may be blocked or failed to load — check the browser console and any content blocker.',
             requestId: null,
           });
           void loadHistory();
