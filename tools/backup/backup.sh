@@ -1,32 +1,51 @@
 #!/bin/sh
-# apikita Postgres backup - the tooling docs/backup-and-restore.md specifies.
+# apikita SQLite backup - the tooling docs/backup-and-restore.md specifies.
 #
 # What it does, in order:
-#   1. resolve DATABASE_URL (falls back to the documented local dev DSN)
-#   2. locate pg_dump/pg_restore: host PATH, else the "postgres" compose service
+#   1. resolve DATABASE_URL (falls back to the local development database)
+#   2. require the sqlite3 CLI
 #   3. REFUSE to continue unless BACKUP_ENCRYPTION_KEY is set (exit 6). A silent
 #      plaintext downgrade is the failure mode this tool exists to prevent.
-#   4. pg_dump -Fc into a temp file, then VERIFY it with "pg_restore --list".
-#      An empty or unlistable dump is a FAILURE (exit 5), never a warning: a
-#      truncated dump is the classic backup that "succeeds" and restores nothing.
+#   4. take the copy with SQLite's .backup (the online backup API), then VERIFY it:
+#      the 16-byte SQLite header, then PRAGMA integrity_check over the whole file.
+#      An empty, truncated or corrupt copy is a FAILURE (exit 5), never a warning:
+#      the classic silent backup is one that "succeeds" and restores nothing.
 #   5. encrypt to the artifact (openssl AES-256-CBC, PBKDF2, 200k iters) and
-#      VERIFY the ciphertext decrypts back into a listable archive (exit 7).
+#      VERIFY the ciphertext by decrypting it back and running the same header +
+#      integrity_check on the result (exit 7).
 #   6. run the offsite hook OFFSITE_CMD with the artifact path as its argument
 #      (exit 8 on failure). Unset OFFSITE_CMD is exit 1: "offsite copy missing"
 #      is an alert in docs/backup-and-restore.md ("Offsite is not a detail").
 #   7. prune artifacts older than BACKUP_RETENTION_DAYS, never the newest (exit 9)
 #
+# WHY .backup AND NOT cp
+#   SQLite's correct copy primitive for a database another process may be writing
+#   is the online backup API, which the CLI exposes as the .backup dot-command. It
+#   takes a read lock for the duration of each step and, crucially, it reads the
+#   database THROUGH the WAL - so it sees committed transactions that are still
+#   sitting in the -wal file. A raw cp of a live WAL database does not: it copies
+#   the main file (which may be missing committed frames) and either drops the -wal
+#   or leaves a mismatched pair. VACUUM INTO would also be consistent, but it
+#   requires its output path not to exist and it rewrites the whole database, which
+#   is a different tool for a different job. .backup is the primitive that matches
+#   what this script needs: a consistent snapshot of a live database.
+#
 # Exit codes (3 and 4 keep tools/reconcile/reconcile.sh's meanings):
-#   0  backup complete: dump written, verified, encrypted, offsite copy made
+#   0  backup complete: copy taken, verified, encrypted, offsite copy made
 #   1  local backup written and verified, but NO offsite copy (OFFSITE_CMD unset)
-#   2  DATABASE_URL is set but is not a postgres:// / postgresql:// DSN
-#   3  pg_dump / pg_restore not available (no host client and no usable container)
-#   4  pg_dump ran but failed (connection, permissions, disk)
-#   5  the dump is empty or cannot be listed by pg_restore - it is not a backup
+#   2  DATABASE_URL is set but is not a sqlite:// URL, or names an in-memory database
+#   3  the sqlite3 CLI is not available (not installed / not on PATH)
+#   4  the .backup ran but failed (unreadable file, disk full, lock held)
+#   5  the copy is empty or is not a readable SQLite database - it is not a backup
 #   6  BACKUP_ENCRYPTION_KEY is not set (refusing to write a plaintext dump)
-#   7  encryption failed, or the encrypted artifact did not decrypt to a listable archive
+#   7  encryption failed, or the encrypted artifact did not decrypt to an intact database
 #   8  the offsite hook (OFFSITE_CMD) failed
 #   9  destination directory is not writable, or retention pruning failed
+#
+# There is no container fallback any more, and adding one would be dead code:
+# docker-compose.yml has no database service to exec into (docker compose config
+# --services -> nginx, scheduler), so "docker compose exec postgres ..." could only
+# ever fail at runtime. A missing sqlite3 is exit 3, loudly.
 #
 # The encryption key is read from the environment and passed to openssl as
 # "env:BACKUP_ENCRYPTION_KEY", so it never appears in the process list.
@@ -41,12 +60,23 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 BACKUP_DIR="${BACKUP_DIR:-$REPO_ROOT/tmp/backups}"
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
-DEFAULT_DATABASE_URL="${BACKUP_DEFAULT_DATABASE_URL:-postgres://postgres:dev@localhost:5432/apikita}"
-COMPOSE_FILE="${COMPOSE_FILE:-$REPO_ROOT/docker-compose.yml}"
-CONTAINER_SERVICE="${CONTAINER_SERVICE:-postgres}"
+# The fallback is this repo's local development database, spelled as an absolute
+# path on purpose. "sqlite://data/server.db" (docs/local-development.md) is
+# relative to the SERVER's working directory; a cron job resolving it against its
+# own cwd would back up nothing, or worse, create an empty database and "succeed".
+BACKUP_DEFAULT_DATABASE_URL="${BACKUP_DEFAULT_DATABASE_URL:-sqlite://$REPO_ROOT/server/data/server.db}"
 ARTIFACT_PREFIX="${ARTIFACT_PREFIX:-apikita}"
 
 fail() { echo "backup: $*" >&2; }
+
+# --- the sqlite3 CLI ---------------------------------------------------------
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    fail "the sqlite3 CLI is not installed or not on PATH"
+    fail "  looked for: sqlite3 on PATH. There is no container fallback:"
+    fail "  docker-compose.yml has no database service (services: nginx, scheduler)"
+    fail "  install the SQLite command-line shell and retry"
+    exit 3
+fi
 
 # --- the DSN -----------------------------------------------------------------
 DSN="${DATABASE_URL:-}"
@@ -54,42 +84,42 @@ case "$DSN" in
     *[![:space:]]*) ;;
     *)
         fail "DATABASE_URL is not set (unset, empty or whitespace only)"
-        fail "using the documented local development DSN instead:"
-        fail "  $DEFAULT_DATABASE_URL"
-        fail "  (docs/local-development.md:124) - LOCAL dev stack only, never production"
-        DSN="$DEFAULT_DATABASE_URL"
+        fail "using the local development database instead:"
+        fail "  $BACKUP_DEFAULT_DATABASE_URL"
+        fail "  (docs/local-development.md) - LOCAL dev database only, never production"
+        DSN="$BACKUP_DEFAULT_DATABASE_URL"
         ;;
 esac
 case "$DSN" in
-    postgres://*|postgresql://*) ;;
+    sqlite://*) DB_PATH=${DSN#sqlite://} ;;
+    sqlite:*)   DB_PATH=${DSN#sqlite:} ;;
     *)
-        fail "DATABASE_URL is not a postgres:// or postgresql:// DSN: '$DSN'"
+        fail "DATABASE_URL is not a sqlite:// URL: '$DSN'"
+        fail "  expected e.g. sqlite://data/server.db (there is no database server any more)"
         exit 2
         ;;
 esac
-
-# --- pg_dump / pg_restore ----------------------------------------------------
-# This host has no PostgreSQL client; the local stack runs one inside the
-# "postgres" compose service. Prefer a host client when one exists, else exec in
-# the container. list_archive() reads the archive from stdin so it works for both.
-if command -v pg_dump >/dev/null 2>&1 && command -v pg_restore >/dev/null 2>&1; then
-    dump_db() { pg_dump "$@"; }
-    list_archive() { pg_restore --list; }
-    DUMP_TOOL="pg_dump (host PATH)"
-elif command -v docker >/dev/null 2>&1 && [ -f "$COMPOSE_FILE" ]; then
-    dump_db() { docker compose -f "$COMPOSE_FILE" exec -T "$CONTAINER_SERVICE" pg_dump "$@"; }
-    list_archive() { docker compose -f "$COMPOSE_FILE" exec -T "$CONTAINER_SERVICE" pg_restore --list; }
-    DUMP_TOOL="docker compose exec -T $CONTAINER_SERVICE pg_dump"
-else
-    fail "pg_dump/pg_restore are not on PATH, and no usable container fallback exists"
-    fail "  looked for: docker on PATH + $COMPOSE_FILE"
-    fail "install the PostgreSQL client, or run this where the stack runs"
-    exit 3
+DB_PATH=${DB_PATH%%\?*}
+if [ -z "$DB_PATH" ] || [ "$DB_PATH" = ":memory:" ]; then
+    fail "DATABASE_URL does not name a file: '$DSN'"
+    fail "  an in-memory database cannot be backed up from outside the process"
+    exit 2
+fi
+# A relative path is relative to the SERVER's working directory
+# (docs/local-development.md: "relative to server/"), not to this script's cwd.
+case "$DB_PATH" in
+    /*|?:[\\/]*) ;;
+    *) DB_PATH="$REPO_ROOT/server/$DB_PATH" ;;
+esac
+if [ ! -f "$DB_PATH" ]; then
+    fail "no such database file: $DB_PATH"
+    fail "  create it with 'cargo run --bin migrate' (from server/)"
+    exit 4
 fi
 
 # --- the encryption key, BEFORE anything is written --------------------------
-# Checked here, not at the point of use: a dump that has already been written
-# must never be left on disk unencrypted because the key turned out to be absent.
+# Checked here, not at the point of use: a copy that has already been written must
+# never be left on disk unencrypted because the key turned out to be absent.
 if [ -z "${BACKUP_ENCRYPTION_KEY:-}" ]; then
     fail "BACKUP_ENCRYPTION_KEY is not set"
     fail "refusing to write an UNENCRYPTED dump: docs/backup-and-restore.md requires"
@@ -112,49 +142,83 @@ case "$BACKUP_RETENTION_DAYS" in
 esac
 
 TMP="${TMPDIR:-/tmp}"
-STAMP=$$
+STAMP=$
 RAW="$TMP/$ARTIFACT_PREFIX.$STAMP.dump"
 DEC="$TMP/$ARTIFACT_PREFIX.$STAMP.verify.dump"
 TMP_ART="$TMP/$ARTIFACT_PREFIX.$STAMP.enc"
-LIST="$TMP/$ARTIFACT_PREFIX.$STAMP.list"
 ERRA="$TMP/$ARTIFACT_PREFIX.$STAMP.err"
 PRUNE_LIST="$TMP/$ARTIFACT_PREFIX.$STAMP.prune"
-trap 'rm -f "$RAW" "$DEC" "$TMP_ART" "$LIST" "$ERRA" "$PRUNE_LIST"' EXIT HUP INT TERM
+trap 'rm -f "$RAW" "$DEC" "$TMP_ART" "$ERRA" "$PRUNE_LIST"' EXIT HUP INT TERM
 
-# The raw dump is plaintext and contains emails and every balance: keep it
+# The raw copy is plaintext and contains emails and every balance: keep it
 # unreadable to anyone but the owner while it exists.
 umask 077
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 ARTIFACT="$BACKUP_DIR/$ARTIFACT_PREFIX-$TS.dump.enc"
 
-# --- dump, and verify the DUMP itself ----------------------------------------
-dump_db -Fc -d "$DSN" > "$RAW" 2>"$ERRA"
+# An artifact is only usable if the 16-byte SQLite header is there and
+# integrity_check agrees. This replaces "pg_restore --list": the same question -
+# "is this a real, intact database?" - asked of a different format.
+is_sqlite_file() {
+    [ -f "$1" ] || return 1
+    head -c 16 -- "$1" 2>/dev/null | grep -q 'SQLite format 3' || return 1
+    return 0
+}
+integrity_ok() {
+    sqlite3 -readonly -bail -noheader "$1" "PRAGMA integrity_check;" 2>/dev/null | head -1
+}
+
+# ---------------------------------------------------------------------------
+# sqlite_dot <db-file> <dot-command> <dir of the command's path argument>
+#
+# The sqlite3 CLI's dot-commands resolve their path argument with the C library,
+# so an MSYS/Git-Bash absolute path like /c/dev/... is NOT translated and the
+# command fails with "cannot open". cd'ing into the argument's directory and using
+# a bare basename is the one form that works on every host. The database file
+# itself is opened by the CLI (which does translate), so it is passed absolutely.
+# ---------------------------------------------------------------------------
+sqlite_dot() {
+    _db="$1"; _cmd="$2"; _argdir="$3"
+    ( cd -- "$_argdir" && sqlite3 -bail "$_db" "$_cmd" )
+}
+
+# --- take the copy -----------------------------------------------------------
+# .backup writes a consistent snapshot of the LIVE database into the temp file.
+# It is run against the source by its absolute path (the CLI translates that) and
+# the output path is given as a bare basename from its own directory (which it
+# does not).
+RAW_DIR=$(dirname -- "$RAW"); RAW_BASE=$(basename -- "$RAW")
+sqlite_dot "$DB_PATH" ".backup '$RAW_BASE'" "$RAW_DIR" >/dev/null 2>"$ERRA"
 STATUS=$?
 if [ "$STATUS" -ne 0 ]; then
-    fail "pg_dump failed (exit $STATUS):"
+    fail "the .backup of $DB_PATH failed (exit $STATUS):"
     [ -s "$ERRA" ] && cat "$ERRA" >&2
     exit 4
 fi
 
 SIZE=$(wc -c < "$RAW" | tr -d ' ')
 if [ "$SIZE" -eq 0 ]; then
-    fail "pg_dump exited 0 but produced an EMPTY dump - not a backup"
+    fail "the backup produced an EMPTY copy - not a backup"
     exit 5
 fi
 
-if ! list_archive < "$RAW" > "$LIST" 2>"$ERRA"; then
-    fail "the dump is not a readable custom-format archive (pg_restore --list failed):"
-    [ -s "$ERRA" ] && cat "$ERRA" >&2
-    fail "a dump that cannot be listed is a FAILURE, not a warning"
+if ! is_sqlite_file "$RAW"; then
+    fail "the copy is not a SQLite database (no 'SQLite format 3' header): $RAW"
+    fail "a copy that cannot be read is a FAILURE, not a warning"
     exit 5
 fi
-TOC=$(grep -c '^[0-9]' "$LIST" 2>/dev/null || echo 0)
+COPY_INTEGRITY=$(integrity_ok "$RAW")
+if [ "$COPY_INTEGRITY" != "ok" ]; then
+    fail "PRAGMA integrity_check on the copy says: '${COPY_INTEGRITY:-<no output>}' (not 'ok')"
+    fail "the copy is corrupt - it is not a backup"
+    exit 5
+fi
 
 # --- encrypt -----------------------------------------------------------------
-# AES-256-CBC + PBKDF2-HMAC-SHA256 (200000 iterations, random salt). This is
-# real symmetric encryption, not obfuscation - and not authenticated encryption:
-# see README.md, "Encryption", for what that does and does not guarantee.
+# AES-256-CBC + PBKDF2-HMAC-SHA256 (200000 iterations, random salt). This is real
+# symmetric encryption, not obfuscation - and not authenticated encryption: see
+# README.md, "Encryption", for what that does and does not guarantee.
 if ! openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
         -pass env:BACKUP_ENCRYPTION_KEY -in "$RAW" -out "$TMP_ART" 2>"$ERRA"; then
     fail "encryption failed:"
@@ -162,17 +226,23 @@ if ! openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
     exit 7
 fi
 
-# Verify the ciphertext, not just the plaintext: decrypt it back and list the
-# result. A wrong key, a truncated ciphertext, or a corrupt archive all fail here.
+# Verify the ciphertext, not just the plaintext: decrypt it back and check the
+# result is still an intact database. A wrong key, a truncated ciphertext, or a
+# corrupt copy all fail here.
 if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
         -pass env:BACKUP_ENCRYPTION_KEY -in "$TMP_ART" -out "$DEC" 2>"$ERRA"; then
     fail "the encrypted artifact did not decrypt (wrong key, or corrupt ciphertext):"
     [ -s "$ERRA" ] && cat "$ERRA" >&2
     exit 7
 fi
-if ! list_archive < "$DEC" > "$LIST" 2>"$ERRA"; then
-    fail "the decrypted artifact is not a readable archive - the backup is not restorable:"
-    [ -s "$ERRA" ] && cat "$ERRA" >&2
+if ! is_sqlite_file "$DEC"; then
+    fail "the decrypted artifact is not a SQLite database - the backup is not restorable"
+    exit 7
+fi
+DEC_INTEGRITY=$(integrity_ok "$DEC")
+if [ "$DEC_INTEGRITY" != "ok" ]; then
+    fail "the decrypted artifact failed integrity_check: '${DEC_INTEGRITY:-<no output>}' (not 'ok')"
+    fail "the backup is not restorable"
     exit 7
 fi
 
@@ -187,8 +257,8 @@ rm -f "$RAW" "$DEC"
 ESIZE=$(wc -c < "$ARTIFACT" | tr -d ' ')
 SHA=$(openssl dgst -sha256 -r "$ARTIFACT" 2>/dev/null | cut -d' ' -f1)
 echo "backup: $ARTIFACT"
-echo "backup: dump $SIZE bytes -> artifact $ESIZE bytes, $TOC TOC entries, sha256=$SHA"
-echo "backup: dumped with $DUMP_TOOL; encrypted AES-256-CBC/PBKDF2-200k"
+echo "backup: copy $SIZE bytes -> artifact $ESIZE bytes, integrity_check=ok, sha256=$SHA"
+echo "backup: copied with .backup (SQLite online backup API) from $DB_PATH; encrypted AES-256-CBC/PBKDF2-200k"
 
 # --- offsite -----------------------------------------------------------------
 # The hook is the pluggable seam: any provider (rclone, aws-cli, s3cmd, rsync,

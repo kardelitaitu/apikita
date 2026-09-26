@@ -1,27 +1,28 @@
-# Postgres backup (the tooling `docs/backup-and-restore.md` specifies)
+# SQLite backup (the tooling `docs/backup-and-restore.md` specifies)
 
 [`docs/backup-and-restore.md`](../../docs/backup-and-restore.md) states the backup strategy;
 this directory is the part of it that runs. The doc's daily-full-logical-dump layer
-is implemented here as a `pg_dump -Fc` artifact that is **verified before it is
-declared a success**, encrypted at rest, handed to a pluggable offsite hook, and
-pruned on a retention window.
+is implemented here as a SQLite snapshot that is **verified before it is declared a
+success**, encrypted at rest, handed to a pluggable offsite hook, and pruned on a
+retention window.
 
 **An untested backup is a belief** (the doc's first line, and this tool's design
-rule). A dump that `pg_dump` exited 0 on is not a backup until `pg_restore --list`
-reads it - and neither is a ciphertext until it decrypts back into an archive that
-lists. Both checks are exit-code gates here, never warnings.
+rule). A file the copy step exited 0 on is not a backup until it is read back -
+the 16-byte SQLite header **and** `PRAGMA integrity_check` - and neither is a
+ciphertext until it decrypts back into a database that passes the same two checks.
+Both are exit-code gates here, never warnings.
 
 ## Files
 
-- `backup.sh` - a POSIX shell runner. Dumps, verifies, encrypts, verifies again,
+- `backup.sh` - a POSIX shell runner. Copies, verifies, encrypts, verifies again,
   runs the offsite hook, prunes. Documented exit-code contract below.
 
 ## How to run
 
 ```sh
-export DATABASE_URL='postgres://postgres:dev@localhost:5432/apikita'   # local dev only
-export BACKUP_ENCRYPTION_KEY='<key from your secret manager>'          # REQUIRED
-export OFFSITE_CMD='rclone copy --sftp-host ... "$1" remote:apikita-backups'
+export DATABASE_URL='sqlite://data/server.db'                    # local dev only
+export BACKUP_ENCRYPTION_KEY='<key from your secret manager>'    # REQUIRED
+export OFFSITE_CMD='rclone copy "$1" remote:apikita-backups'
 sh tools/backup/backup.sh
 ```
 
@@ -29,31 +30,39 @@ sh tools/backup/backup.sh
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `DATABASE_URL` | - | The DSN to dump. Falls back to the documented local dev DSN when unset (see below). |
+| `DATABASE_URL` | - | The SQLite database to copy. Falls back to the local development database when unset (see below). |
 | `BACKUP_ENCRYPTION_KEY` | - | **Required.** Passphrase for the artifact. Absent means exit 6 - never a plaintext dump. |
-| `BACKUP_DIR` | `<repo>/tmp/backups` | Destination directory for artifacts (gitignored). |
+| `BACKUP_DIR` | `<repo>/tmp/backups` | Destination directory for artifacts (gitignored). **Not `BACKUP_DEST`.** |
 | `BACKUP_RETENTION_DAYS` | `30` | Prune artifacts older than this. The doc's daily-dump retention. |
 | `OFFSITE_CMD` | - | Offsite hook. Unset means exit 1: the backup is local only. |
-| `BACKUP_DEFAULT_DATABASE_URL` | `postgres://postgres:dev@localhost:5432/apikita` | The documented fallback DSN (`docs/local-development.md`). |
+| `BACKUP_DEFAULT_DATABASE_URL` | `sqlite://<repo>/server/data/server.db` | The fallback when `DATABASE_URL` is unset. An **absolute** path on purpose - see below. |
 | `ARTIFACT_PREFIX` | `apikita` | Artifact filename prefix. Also scopes retention pruning. |
-| `COMPOSE_FILE` / `CONTAINER_SERVICE` | `<repo>/docker-compose.yml` / `postgres` | The container fallback for `pg_dump`. |
 
 Artifacts are named `<prefix>-<UTC timestamp>.dump.enc`, e.g.
-`apikita-20260925T210104Z.dump.enc`. The name carries the time; the mtime is what
+`apikita-20260926T033819Z.dump.enc`. The name carries the time; the mtime is what
 retention uses.
 
 ### DATABASE_URL is optional on purpose
 
 Unset, empty, or whitespace-only `DATABASE_URL` falls back to the **local
-development** DSN with a loud warning on stderr. `tools/reconcile/reconcile.sh`
-exits 2 in that case, deliberately: it is a gate, and a gate that silently picks a
-database is a gate that can pass against the wrong one. A backup tool has the
-opposite need - it runs from cron with no environment, and the alternative to the
-documented default is no backup at all. **The default is local dev; pointing this
-at production is an explicit `DATABASE_URL`.**
+development** database with a loud warning on stderr.
+`tools/reconcile/reconcile.sh` exits 2 in that case, deliberately: it is a gate,
+and a gate that silently picks a database is a gate that can pass against the
+wrong one. A backup tool has the opposite need - it runs from cron with no
+environment, and the alternative to the documented default is no backup at all.
+**The default is local dev; pointing this at production is an explicit
+`DATABASE_URL`.**
 
-A `DATABASE_URL` that is set but is not a `postgres://`/`postgresql://` DSN is exit
-2: an obviously wrong value is never silently replaced by the default.
+A `DATABASE_URL` that is set but is not a `sqlite://` URL is exit 2: an obviously
+wrong value is never silently replaced by the default. A leftover `postgres://`
+URL is refused **by name** with a `case`, not prefix-stripped into a plausible
+filename.
+
+**The fallback is an absolute path.** `sqlite://data/server.db` is relative to the
+**server's** working directory (`docs/local-development.md`: "relative to
+`server/`"). A cron job resolving that against its own cwd would back up nothing,
+or worse, create an empty database and "succeed". The script therefore resolves a
+relative path against `server/`, and the built-in default is absolute.
 
 ## Exit codes
 
@@ -62,42 +71,67 @@ operator learns one table. The rest are this tool's own.
 
 | Code | Meaning |
 | ---- | ------- |
-| `0`  | Complete - dump written, verified, encrypted, verified again, offsite copy made, retention applied. |
+| `0`  | Complete - copy taken, verified, encrypted, verified again, offsite copy made, retention applied. |
 | `1`  | Local backup written and verified, but **no offsite copy** (`OFFSITE_CMD` unset). The doc is explicit that a backup on the same host as the database is not a backup, so this is not a pass. |
-| `2`  | `DATABASE_URL` is set but is not a `postgres://` / `postgresql://` DSN. |
-| `3`  | `pg_dump`/`pg_restore` not available: not on PATH, and no usable container fallback. |
-| `4`  | `pg_dump` ran but failed (connection, permissions, disk). |
-| `5`  | **The dump is empty or `pg_restore --list` cannot read it.** It is not a backup. |
+| `2`  | `DATABASE_URL` is set but is not a `sqlite://` URL, or names an in-memory database. |
+| `3`  | The `sqlite3` CLI is not available: not installed, not on `PATH`, and no container fallback (there is none - see below). |
+| `4`  | The `.backup` ran but failed (unreadable file, disk full, lock held), or the database file does not exist. |
+| `5`  | **The copy is empty, or is not a readable, intact SQLite database.** It is not a backup. |
 | `6`  | `BACKUP_ENCRYPTION_KEY` is not set - refused before writing anything. |
-| `7`  | Encryption failed, or the encrypted artifact did not decrypt into a listable archive. |
+| `7`  | Encryption failed, or the encrypted artifact did not decrypt into an intact database. |
 | `8`  | The offsite hook failed. The local artifact is kept; the offsite copy is missing. |
 | `9`  | Destination not writable, or retention pruning failed. |
 
 Codes `1`, `5`, `6`, `7` and `8` are distinct from each other deliberately: "no
-offsite copy" is an alert with a different fix from "the dump is unreadable", and
+offsite copy" is an alert with a different fix from "the copy is unreadable", and
 collapsing them into a generic failure is how the wrong thing gets investigated.
+
+**Changed from the PostgreSQL version:** `2` is about a `sqlite://` URL rather
+than a `postgres://` DSN; `3` is about the `sqlite3` CLI rather than
+`pg_dump`/`pg_restore`; `4` also covers a missing database file; and `5`/`7` are
+about the SQLite header and `integrity_check` rather than `pg_restore --list`.
+
+## The copy: `.backup`, not `cp`, and not `VACUUM INTO`
+
+**`.backup` was chosen, and the reason is the whole point of a backup.**
+
+The CLI implements `.backup` with SQLite's **online backup API**. It is
+transactionally consistent against a database another process may be writing, and
+crucially it **reads through the WAL**: it sees committed transactions that are
+still sitting in the `-wal` file. A raw `cp` of a live WAL database does not - it
+copies the main file, which may be missing committed frames, and either drops the
+`-wal` or leaves a mismatched pair. **A backup that silently omits committed
+transactions is the worst outcome this tool can produce**, so `cp` is never used.
+
+**`VACUUM INTO` is the other correct primitive, and it was rejected for a
+different reason.** It is also consistent, but it *rewrites the whole database* -
+it is a compaction, not a snapshot - and it refuses to run if the output path
+already exists, which turns an idempotent retry into a special case. `.backup`
+is the primitive that matches what this script needs: a faithful snapshot of a
+live database, byte-for-byte at the page level, with the WAL folded in.
+
+The copy is written to `$TMPDIR` with `umask 077`, verified, encrypted, and
+deleted - it never lands in `BACKUP_DIR`, and it is removed by an `EXIT` trap even
+on failure. The artifact is published with `mv`, so a reader never sees a
+half-written file under the final name.
 
 ## What is verified, and how
 
 | Step | Check | Failure |
 | ---- | ----- | ------- |
-| Dump is non-empty | byte count of the raw dump | exit 5 |
-| Dump is a real archive | `pg_restore --list` reads it | exit 5 |
+| Copy is non-empty | byte count of the raw copy | exit 5 |
+| Copy is a real database | the 16-byte `SQLite format 3` header | exit 5 |
+| Copy is intact | `PRAGMA integrity_check` = `ok` over the whole file | exit 5 |
 | Artifact decrypts | the ciphertext decrypts back | exit 7 |
-| Decrypted artifact is a real archive | `pg_restore --list` reads it | exit 7 |
+| Decrypted artifact is a real, intact database | header + `integrity_check` | exit 7 |
 | Offsite copy exists | the hook exits 0 | exit 8 |
 | Retention ran | `find` scan succeeded | exit 9 |
 
-The plaintext dump is written to `$TMPDIR` with `umask 077`, verified, encrypted,
-and deleted - it never lands in `BACKUP_DIR`, and it is removed by an `EXIT` trap
-even on failure. The artifact is published with `mv`, so a reader never sees a
-half-written file under the final name.
-
 This is the answer to the doc's monitoring line "a backup job that reports success
-while producing a tiny file is the classic silent failure": a truncated or
-empty dump cannot reach exit 0, because the listing step - not the size alone - is
-the gate. The tool still prints the artifact's size and SHA-256 so the size alert
-the doc asks for can be built on top.
+while producing a tiny file is the classic silent failure": a truncated or empty
+copy cannot reach exit 0, because the header and `integrity_check` - not the size
+alone - are the gate. The tool still prints the artifact's size and SHA-256 so the
+size alert the doc asks for can be built on top.
 
 ## Encryption
 
@@ -117,24 +151,25 @@ honestly:
   is the threat the doc names ("an unencrypted dump in object storage is a breach
   waiting for a misconfiguration").
 - **Tamper detection does not.** A party who can modify the offsite object could
-  flip ciphertext bits and the tool would not detect it before `pg_restore` does
-  something undefined. The mitigations are outside this script and are the
-  provider's job: object versioning/immutability, and treating the offsite bucket
-  as write-only from the backup host. The SHA-256 printed at write time is for
-  the size/anomaly alerting in the doc, not for authentication.
-- `age` is **not** installed on this host. `gpg` **is** (`/usr/bin/gpg`), and
-  `gpg --symmetric` would give authenticated encryption. `openssl` was chosen
-  because it is the standard tool here, is present, and covers the encryption
-  *and* the SHA-256 the size/anomaly alert wants in a single dependency - not
-  because GPG is unavailable. Moving to an authenticated cipher is a deliberate,
-  worthwhile change, not a limitation of this host.
+  flip ciphertext bits and the tool would not detect it. The mitigations are
+  outside this script and are the provider's job: object versioning/immutability,
+  and treating the offsite bucket as write-only from the backup host. The SHA-256
+  printed at write time is for the size/anomaly alerting in the doc, not for
+  authentication.
+- `age` is **not** installed on this host. `gpg` **is**, and `gpg --symmetric`
+  would give authenticated encryption. `openssl` was chosen because it is the
+  standard tool here, is present, and covers the encryption *and* the SHA-256 the
+  size/anomaly alert wants in a single dependency - not because GPG is
+  unavailable. Moving to an authenticated cipher is a deliberate, worthwhile
+  change, not a limitation of this host.
 
 Restoring, once the key is at hand:
 
 ```sh
-openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:BACKUP_ENCRYPTION_KEY \
-  -in apikita-20260925T210104Z.dump.enc > backup.dump
-pg_restore --clean --if-exists -d scratch backup.dump   # docs/backup-and-restore.md
+BACKUP_ENCRYPTION_KEY='<key>' openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+  -pass env:BACKUP_ENCRYPTION_KEY -in apikita-20260926T033819Z.dump.enc > backup.db
+# then, to prove it restores (docs/backup-and-restore.md):
+sh tools/drill/drill.sh --target apikita_drill_scratch.db --dump backup.db
 ```
 
 ## Offsite: a hook, and a decision nobody has made
@@ -161,64 +196,68 @@ for whoever wires the cron job, not a default to invent here.
 
 | Decision | Why it is not this script's to make |
 | -------- | ----------------------------------- |
-| **Which offsite provider** | Costs money, needs an account and credentials, and the doc's "a different provider from the one running Postgres" is a policy choice. |
+| **Which offsite provider** | Costs money, needs an account and credentials, and the doc's "a different provider from the one running the database" is a policy choice. |
 | **Key custody** | Where `BACKUP_ENCRYPTION_KEY` lives (secret manager, hardware, split custody), who can read it, and the rotation/escrow plan. **Losing it makes every artifact useless** - the doc says so. |
 | **Scheduling** | Nothing runs this yet: no cron, no compose service, no CI job. `tools/reconcile/` has the same gap. |
-| **PITR (RPO 15 minutes)** | **This tool does not meet the doc's RPO.** A daily logical dump loses up to 24 hours; the 15-minute RPO comes from continuous WAL archiving / managed PITR, which the doc's open item assigns to `wal-g` or a managed offering. Nothing here implements it. |
-| **The restore drill** | The doc's quarterly rehearsal, with the ledger-reconciliation gate, is a separate procedure (`tools/reconcile/reconcile.sh` covers the ledger half on a live DB). This tool proves an artifact is *readable*, not that it *restores*. |
-| **PocketBase** | The doc ranks it below Postgres but it is not backed up here at all. |
+| **PITR (RPO 15 minutes)** | **This tool does not meet the doc's RPO.** A daily snapshot loses up to 24 hours; the 15-minute RPO comes from continuous WAL archiving / managed PITR, which the doc's open item assigns to `wal-g` or a managed offering. Nothing here implements it. SQLite makes this *easier* than Postgres did - the `-wal` file can be archived - but nothing here does it. |
+| **The restore drill** | The doc's quarterly rehearsal, with the ledger-reconciliation gate, is `tools/drill/drill.sh`. This tool proves an artifact is *readable and intact*, not that it *restores*; the drill is what proves that. |
+| **PocketBase** | The doc ranks it below the money database but it is not backed up here at all. |
 
 ## Verified status
 
-Verified against the **local** PostgreSQL 16 dev stack (compose service
-`postgres`, database `apikita`), on 2026-09-25, with every exit code exercised for
-real - no fabricated output:
+Verified on 2026-09-26 against scratch SQLite databases built from
+`server/migrations/20260925000000_initial_schema.sql` (fixtures under
+`.agents/sqlite-port/`). Every exit code below was produced for real; no output
+is fabricated.
 
 | # | Scenario | Result |
 | - | -------- | ------ |
-| a | Real backup of the local dev DB | exit 0; 113,861-byte dump -> 113,888-byte artifact, 89 TOC entries; `pg_restore --list` on the decrypted artifact lists the archive |
-| a2 | Same, `OFFSITE_CMD` unset | exit 1; the local artifact is still written and verified |
-| b | `DATABASE_URL` at an unreachable host | exit 4, `pg_dump: error: connection to server ... failed` |
-| c | `BACKUP_ENCRYPTION_KEY` unset | exit 6; **zero files** written to the destination |
-| d | A 40-day-old artifact with `BACKUP_RETENTION_DAYS=30` | pruned, exit 0; the newest artifact and unrelated files untouched |
+| a | Real backup of the scratch database, `OFFSITE_CMD` unset | **exit 1**; 237,568-byte copy -> 237,600-byte artifact, `integrity_check=ok`, artifact written and verified |
+| a2 | Same, with an offsite hook | **exit 0**; the hook received the artifact, the offsite copy exists |
+| b | `BACKUP_ENCRYPTION_KEY` unset | **exit 6**; **zero files** written to the destination |
+| c | `DATABASE_URL` = a leftover `postgres://` URL | **exit 2**, refused by name |
+| c2 | `DATABASE_URL` = `mysql://...` | **exit 2** |
+| c3 | `DATABASE_URL` = `sqlite::memory:` | **exit 2** |
+| d | `DATABASE_URL` naming a missing file | **exit 4** |
+| e | `sqlite3` off `PATH` | **exit 3** |
+| f | `BACKUP_DIR` cannot be created (its parent is a file) | **exit 9** |
+| g | `BACKUP_RETENTION_DAYS=abc` | warned, defaulted to 30, backup still completed |
+| h | Two 40-day-old artifacts with `BACKUP_RETENTION_DAYS=30` | both pruned; the fresh artifact and an unrelated `.txt` untouched |
+| i | A 90-day-old artifact with `BACKUP_RETENTION_DAYS=1` | pruned (a fresh one was written), and the fresh one survived |
 
-**Mutation-checked.** Each guard was removed and the failure re-run, to prove the
-guard - not something incidental - is what stops it:
+### Mutation-checked
 
-- dump guards removed -> exit 0 with a **32-byte artifact wrapping an empty dump**
-  that `pg_restore` rejects (`input file is too short`): the silent success the
-  verification step exists to prevent.
-- key check removed **and** a plaintext fallback added -> exit 0 with a 113,861-byte
-  artifact whose first five bytes are `PGDMP`: **the database was written to disk
-  unencrypted, and reported as a success.** This is the silent downgrade exit 6
-  prevents.
-- age filter removed -> a 5-day-old artifact, well inside the 30-day window, was
-  deleted.
-- newest-artifact guard removed -> the newest artifact was deleted too, leaving an
-  empty backup directory.
+Each guard was removed and the bad behaviour reproduced, to prove the guard - not
+something incidental - is what stops it. Every mutant ran as a **copy under
+`.agents/`**; the shipped `backup.sh` sha256 was
+`81476b16d9d6b10270046869ba0a805570fea5198fbe494dfbd67604292a27fc` **before and
+after**, so "restored" is verified, not claimed.
+
+| Mutation | Unmutated | Mutated |
+| -------- | --------- | ------- |
+| The verify-decrypt step uses a **different key** from the encrypt step | exit 0, artifact published | **exit 7**, `bad decrypt` from OpenSSL, **0 artifacts published**. This is what the decrypt-back verification catches: without it the run would exit 0 with an artifact the real key cannot open - a silently useless backup. |
+| The copy is replaced by `head -c 4000` of the database (a truncated file) | exit 0, `integrity_check=ok` | **exit 5**, `integrity_check` = `<no output>`, **0 artifacts published** |
 
 ### Not verified
 
-- **Any real offsite provider.** The hook was exercised with `cp` and `true` only.
-  No credentials exist here, and none were invented.
-- **A restore.** No scratch database was provisioned, so the doc's ledger
-  reconciliation gate has not been run against a restored artifact. `pg_restore
-  --list` proves the archive is intact and readable; it does not prove the data
-  restores.
-- **Encryption against a hostile adversary.** No key-rotation, wrong-key, or
-  tamper case beyond a wrong passphrase (which fails closed at exit 7).
+- **Any real offsite provider.** The hook was exercised with `cp` only. No
+  credentials exist here, and none were invented.
+- **A restore of the artifact.** `tools/drill/drill.sh` is the tool that proves
+  that; this README's rows are about producing and verifying an artifact.
+- **Encryption against a hostile adversary.** No key-rotation or tamper case
+  beyond a wrong passphrase (which fails closed at exit 7).
+- **`.backup` against a *concurrent writer* under load.** The WAL behaviour is
+  the documented property of the backup API and was exercised against a WAL-mode
+  database, but not under sustained concurrent write load.
 - **A schedule.** Nothing invokes this automatically.
 
 ## Notes for whoever wires this up
 
-- **This host has no `psql`/`pg_dump`.** The script prefers a host client when one
-  exists, and otherwise execs into the `postgres` compose service - which is how
-  every result above was produced. When the container fallback is used,
-  `DATABASE_URL` is resolved **inside the compose network**: `localhost:5432`
-  (the documented default) and the service name `postgres` both reach the local
-  database, but a host-only address (e.g. `host.docker.internal`) may not.
-- The container fallback also needs Docker and the compose file. On a host without
-  Docker, install the PostgreSQL client - the tool then uses it directly.
+- **There is no container fallback any more, and one would be dead code.**
+  `docker compose config --services` returns `nginx` and `scheduler` - there is no
+  database service to `exec` into, so a `docker compose exec postgres ...` path
+  could only ever fail at runtime. The script needs the `sqlite3` CLI on `PATH`
+  and the database file readable. A missing `sqlite3` is exit 3, loudly.
 - `docs/backup-and-restore.md` is the contract and was **not edited**. Its open
   item "Offsite storage provider and encryption key custody" should be ticked only
   when a provider is chosen and the key has a custodian - not because this script

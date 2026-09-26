@@ -1,6 +1,10 @@
 #!/bin/sh
 # apikita alert checks - the checks docs/observability.md's alert table can run
-# with psql alone, plus an honest statement of the ones it cannot.
+# with the sqlite3 CLI alone, plus an honest statement of the ones it cannot.
+#
+# The database is embedded SQLite: a FILE the API opens, named by DATABASE_URL.
+# There is no database server, no host and no port, so these checks read the file
+# directly with the sqlite3 CLI. See tools/reconcile/README.md.
 #
 # docs/observability.md:97-107 lists 9 alerts. Several need a metrics backend
 # (error rate, relay 5xx, DB disk, all-providers-unhealthy) and one needs a log
@@ -22,12 +26,18 @@
 #                          its "HOLD SWEEP" line; if that line is missing the
 #                          script FAILS rather than assuming zero.
 #
-# Not run here, and why (printed on every run):
+# Not run here, and why (printed on every run). Three of these are no longer
+# merely unchecked - tools/alert/probe.sh covers them WITHOUT a database, and the
+# NOT CHECKED block says so per line rather than dropping them, so the split
+# between "this script cannot" and "nothing can" stays legible:
 #   - webhook rejection: server/src/routes/webhooks.rs emits it as a structured
 #     LOG line (warn! at :116 for a bad signature, error! at :188 for an amount
 #     mismatch). There is no counter column anywhere, so "any topup.rejected" is
-#     not answerable from SQL. Needs a metrics backend or a log counter.
-#   - API down / relay 5xx / relay down: external probes, not database checks.
+#     not answerable from SQL. probe.sh counts it in the server's captured stdout.
+#   - API down / relay down: external probes, not database checks. probe.sh does
+#     both. (Relay down is still unchecked HERE, and always will be: it is not a
+#     database fact.)
+#   - relay 5xx: nginx status counts. Needs a metrics backend or access logs.
 #   - all providers unhealthy: upstream circuit-breaker state, in-process.
 #   - DB disk >80%: volume usage, not a SQL-visible fact.
 #   - error rate >5%: HTTP counters over a 5-minute window.
@@ -38,14 +48,15 @@
 #   1  FIRED    - at least one alert fired and was delivered (or throttled). The
 #                 tool worked; something real is wrong. Mirrors tools/backup's 1
 #                 ("ran, but the news is not all good").
-#   2  CONFIG   - DATABASE_URL is set but is not a postgres:// / postgresql:// DSN
-#   3  MISSING  - no usable psql: not on PATH, and no docker compose fallback
-#   4  FAILED   - psql or reconcile ran and failed (connection, permissions, SQL)
+#   2  CONFIG   - DATABASE_URL is set but is not a sqlite:// URL, or names an
+#                 in-memory database (which this script cannot read)
+#   3  MISSING  - sqlite3 is not installed / not on PATH
+#   4  FAILED   - sqlite3 or reconcile ran and failed (unreadable file, SQL error)
 #   5  UNDELIVERED - an alert fired and could NOT be delivered. An alert nobody
 #                 receives is not a pass; this code exists so it cannot be one.
 #   6  UNKNOWN  - a check could not run (reconcile could not run, its HOLD SWEEP
-#                 line was unparseable, or psql returned something that is not a
-#                 count). Unknown is not clean.
+#                 line was unparseable, the database file is missing, or sqlite3
+#                 returned something that is not a count). Unknown is not clean.
 #
 # 5 outranks 1, and 2/3/4/6 outrank 1: "something is wrong" is only good news if
 # you heard about it, and a check that did not run is not a check that passed.
@@ -56,9 +67,13 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 RECONCILE="$REPO_ROOT/tools/reconcile/reconcile.sh"
 
-DEFAULT_DATABASE_URL="${ALERT_DEFAULT_DATABASE_URL:-postgres://postgres:dev@localhost:5432/apikita}"
-COMPOSE_FILE="${COMPOSE_FILE:-$REPO_ROOT/docker-compose.yml}"
-CONTAINER_SERVICE="${CONTAINER_SERVICE:-postgres}"
+# The fallback is this repo's local development database, spelled as an absolute
+# path on purpose. "sqlite://data/server.db" (docs/local-development.md) is
+# relative to the SERVER's working directory; a cron job resolving it against its
+# own cwd would open a nonexistent file and report exit 6 forever, or worse,
+# create an empty one. A default that depends on the caller's cwd is a default
+# that silently checks nothing.
+DEFAULT_DATABASE_URL="${ALERT_DEFAULT_DATABASE_URL:-sqlite://$REPO_ROOT/server/data/server.db}"
 
 for arg in "$@"; do
     echo "check-alerts: unknown argument: $arg" >&2
@@ -72,7 +87,14 @@ if [ ! -f "$RECONCILE" ]; then
     exit 6
 fi
 
-# --- DSN ---------------------------------------------------------------------
+# --- sqlite3 -----------------------------------------------------------------
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "check-alerts: sqlite3 is not installed or not on PATH" >&2
+    echo "check-alerts: install the SQLite command-line shell (sqlite3) and retry" >&2
+    exit 3
+fi
+
+# --- DATABASE_URL ------------------------------------------------------------
 # Same policy as tools/backup/backup.sh, for the same reason: this runs from cron
 # with no environment, and the alternative to the documented local dev default is
 # no check at all. Pointing it at production is an explicit DATABASE_URL.
@@ -81,106 +103,62 @@ case "$DSN" in
     *[![:space:]]*) ;;
     *)
         echo "check-alerts: DATABASE_URL is not set (unset, empty or whitespace only)" >&2
-        echo "check-alerts: using the documented local development DSN instead:" >&2
+        echo "check-alerts: using the local development database instead:" >&2
         echo "check-alerts:   $DEFAULT_DATABASE_URL" >&2
-        echo "check-alerts:   (docs/local-development.md) - LOCAL dev stack only, never production" >&2
+        echo "check-alerts:   (docs/local-development.md) - LOCAL dev database only, never production" >&2
         DSN="$DEFAULT_DATABASE_URL"
         ;;
 esac
+
+# A case, not a blind prefix strip: a leftover postgres:// URL must be refused
+# loudly rather than rewritten into a relative path that happens to be a
+# plausible filename (tools/reconcile/reconcile.sh makes the same argument).
 case "$DSN" in
-    postgres://*|postgresql://*) ;;
+    sqlite://*) DB_PATH=${DSN#sqlite://} ;;
+    sqlite:*)   DB_PATH=${DSN#sqlite:} ;;
     *)
-        echo "check-alerts: DATABASE_URL is not a postgres:// or postgresql:// DSN: '$DSN'" >&2
+        echo "check-alerts: DATABASE_URL is not a sqlite:// URL: '$DSN'" >&2
+        echo "check-alerts: expected e.g. sqlite://data/server.db" >&2
         exit 2
         ;;
 esac
+DB_PATH=${DB_PATH%%\?*}
+if [ -z "$DB_PATH" ] || [ "$DB_PATH" = ":memory:" ]; then
+    echo "check-alerts: DATABASE_URL does not name a file: $DSN" >&2
+    echo "check-alerts: an in-memory database cannot be checked from outside the process" >&2
+    exit 2
+fi
+# A relative path in DATABASE_URL is relative to the SERVER's working directory
+# (docs/local-development.md: "relative to server/"), not to this script's cwd.
+# Resolving it here means the documented "sqlite://data/server.db" is found
+# whether this runs from the repo root, from server/, or from cron.
+case "$DB_PATH" in
+    /*|?:[\\/]*) ;;
+    *) DB_PATH="$REPO_ROOT/server/$DB_PATH" ;;
+esac
 export DATABASE_URL="$DSN"
-DSN_DB=$(printf '%s' "$DSN" | sed 's|?.*$||' | sed 's|.*/||')
-[ -n "$DSN_DB" ] || DSN_DB="apikita"
+
+# The checks read the file the API owns, so a missing file is UNKNOWN (exit 6),
+# not an empty database. Reporting "0 rows, CLEAN" against a file that is not
+# there is the exact silent pass this directory exists to prevent.
+if [ ! -f "$DB_PATH" ]; then
+    echo "check-alerts: no such database file: $DB_PATH" >&2
+    echo "check-alerts: create it with 'DATABASE_URL=$DSN cargo run --bin migrate' (from server/)" >&2
+    exit 6
+fi
 
 TMP="${TMPDIR:-/tmp}"
-
-# --- psql, host or container -------------------------------------------------
-# This host may have no psql (tools/reconcile/README.md and tools/backup/README.md
-# document the same), so the container is the fallback. The chosen mode is used for
-# this script's own query - and, when the host has no psql, a shim goes on PATH so
-# the reconcile.sh this script DELEGATES to can run as well. Without that, checks 1
-# and 3 would report MISSING/UNKNOWN against a database this script can plainly
-# reach: a false alarm dressed as a broken check.
-HOST_PSQL=0
-command -v psql >/dev/null 2>&1 && HOST_PSQL=1
-HAS_DOCKER=0
-if command -v docker >/dev/null 2>&1 && [ -f "$COMPOSE_FILE" ]; then
-    HAS_DOCKER=1
-fi
-
-if [ "$HOST_PSQL" -eq 1 ]; then
-    PSQL_MODE="host"
-elif [ "$HAS_DOCKER" -eq 1 ]; then
-    PSQL_MODE="container"
-else
-    echo "check-alerts: psql is not on PATH and no docker compose fallback is usable" >&2
-    echo "check-alerts: looked for: psql on PATH, docker on PATH + $COMPOSE_FILE" >&2
-    exit 3
-fi
-
-# The shim forwards to the same psql this script uses, so reconcile.sh's exit codes
-# and error text are psql's own. It streams a host -f file to psql's stdin, because
-# the container cannot see host paths (reconcile.sh passes -f reconcile.sql).
-SHIM_DIR=""
-if [ "$HOST_PSQL" -eq 0 ]; then
-    SHIM_DIR="$TMP/check-alerts-shim.$$"
-    mkdir -p "$SHIM_DIR" || { echo "check-alerts: cannot create $SHIM_DIR" >&2; exit 3; }
-    cat > "$SHIM_DIR/psql" <<'SHIM'
-#!/bin/sh
-# Generated by tools/alert/check-alerts.sh. Forwards to the real psql inside the
-# compose service so tools/reconcile/reconcile.sh can run on a host without psql.
-set -u
-args=""
-stdin_file=""
-skip_next=0
-for a in "$@"; do
-    if [ "$skip_next" -eq 1 ]; then
-        stdin_file="$a"; skip_next=0; continue
-    fi
-    case "$a" in
-        postgres://*|postgresql://*) continue ;;
-        -f) skip_next=1; continue ;;
-    esac
-    args="$args '$a'"
-done
-if [ -n "$stdin_file" ]; then
-    eval "exec docker compose -f \"$SHIM_COMPOSE\" exec -T \"$SHIM_SERVICE\" psql -U postgres -d \"$SHIM_DB\" $args -f -" < "$stdin_file"
-else
-    eval "exec docker compose -f \"$SHIM_COMPOSE\" exec -T \"$SHIM_SERVICE\" psql -U postgres -d \"$SHIM_DB\" $args"
-fi
-SHIM
-    chmod +x "$SHIM_DIR/psql" || { echo "check-alerts: cannot chmod $SHIM_DIR/psql" >&2; exit 3; }
-    PATH="$SHIM_DIR:$PATH"
-    export PATH
-    SHIM_COMPOSE="$COMPOSE_FILE"; SHIM_SERVICE="$CONTAINER_SERVICE"; SHIM_DB="$DSN_DB"
-    export SHIM_COMPOSE SHIM_SERVICE SHIM_DB
-    echo "check-alerts: no host psql; reconcile.sh runs through a shim onto docker compose exec -T $CONTAINER_SERVICE psql"
-fi
-
-PSQL_ERR="$TMP/check-alerts.$$.psql.err"
+SQL_ERR="$TMP/check-alerts.$$.sqlite.err"
 REC_OUT="$TMP/check-alerts.$$.reconcile.out"
 REC_ERR="$TMP/check-alerts.$$.reconcile.err"
-cleanup_tmp() {
-    rm -f "$PSQL_ERR" "$REC_OUT" "$REC_ERR"
-    [ -n "$SHIM_DIR" ] && rm -rf "$SHIM_DIR"
-    return 0
-}
+cleanup_tmp() { rm -f "$SQL_ERR" "$REC_OUT" "$REC_ERR"; return 0; }
 trap cleanup_tmp EXIT HUP INT TERM
 
-# ON_ERROR_STOP=1 matters: without it psql prints a SQL error and still exits 0.
-psql_scalar() {
-    if [ "$PSQL_MODE" = "host" ]; then
-        psql "$DSN" -v ON_ERROR_STOP=1 -t -A -c "$1" 2>"$PSQL_ERR"
-    else
-        docker compose -f "$COMPOSE_FILE" exec -T "$CONTAINER_SERVICE" \
-            psql "$DSN" -v ON_ERROR_STOP=1 -t -A -c "$1" 2>"$PSQL_ERR"
-    fi
+# -readonly: an alert check must never write. -bail: stop at the first error and
+# exit non-zero for it instead of printing a partial answer. Default list output
+# is already pipe-separated with no header, matching the old psql -t -A -F'|'.
+sqlite_scalar() {
+    sqlite3 -readonly -bail -noheader -separator '|' "$DB_PATH" "$1" 2>"$SQL_ERR"
 }
 
 FIRE_FAILED=0
@@ -203,12 +181,11 @@ fire() {
     esac
 }
 
-DSN_REDACTED=$(printf '%s' "$DSN" | sed 's|://[^@/]*@|://***@|')
-echo "check-alerts: mode=$PSQL_MODE dsn=$DSN_REDACTED (password never printed)"
+echo "check-alerts: mode=sqlite3 db=$DB_PATH (the API's database file; no server, no DSN)"
 
 # --- Checks 1 + 3: ledger drift and stranded holds, via reconcile.sh ----------
 # The exit code is reconcile's own, deliberately: this script does not re-derive
-# drift. See tools/reconcile/README.md for its 0-5 contract.
+# drift. See tools/reconcile/README.md for its 0-6 contract.
 sh "$RECONCILE" >"$REC_OUT" 2>"$REC_ERR"
 REC=$?
 sed 's/^/check-alerts: | /' "$REC_OUT"
@@ -236,16 +213,20 @@ case "$REC" in
         echo "check-alerts: OK  ledger drift: 0 accounts"
         ;;
     2)
-        echo "check-alerts: UNKNOWN - reconcile could not run: DATABASE_URL is not set for it" >&2
+        echo "check-alerts: UNKNOWN - reconcile could not run: DATABASE_URL is not a usable SQLite URL for it" >&2
         fail_with 6
         ;;
     3)
-        echo "check-alerts: MISSING - reconcile could not run: psql is not on PATH for it" >&2
+        echo "check-alerts: MISSING - reconcile could not run: sqlite3 is not on PATH for it" >&2
         fail_with 3
         ;;
     4)
-        echo "check-alerts: FAILED - reconcile ran and psql failed (connection, permissions or SQL error)" >&2
+        echo "check-alerts: FAILED - reconcile ran and sqlite3 failed (unreadable file or SQL error)" >&2
         fail_with 4
+        ;;
+    6)
+        echo "check-alerts: UNKNOWN - reconcile could not run: it found no database file at $DB_PATH" >&2
+        fail_with 6
         ;;
     *)
         echo "check-alerts: UNKNOWN - reconcile returned an unexpected exit code: $REC" >&2
@@ -267,12 +248,14 @@ else
 fi
 
 # --- Check 2: balance negative ----------------------------------------------
-NEG=$(psql_scalar "SELECT COUNT(*) FROM wallets WHERE balance_idr < 0;")
-PSQL_STATUS=$?
-if [ "$PSQL_STATUS" -ne 0 ]; then
-    echo "check-alerts: FAILED - the balance-negative check could not run (psql exit $PSQL_STATUS):" >&2
-    if [ -s "$PSQL_ERR" ]; then
-        sed 's/^/check-alerts:   /' "$PSQL_ERR" >&2
+# -bail makes a SQL error a non-zero exit, so a failed query can never be read as
+# a zero count. (psql needed ON_ERROR_STOP=1 for the same reason.)
+NEG=$(sqlite_scalar "SELECT COUNT(*) FROM wallets WHERE balance_idr < 0;")
+SQL_STATUS=$?
+if [ "$SQL_STATUS" -ne 0 ]; then
+    echo "check-alerts: FAILED - the balance-negative check could not run (sqlite3 exit $SQL_STATUS):" >&2
+    if [ -s "$SQL_ERR" ]; then
+        sed 's/^/check-alerts:   /' "$SQL_ERR" >&2
     fi
     fail_with 4
 else
@@ -292,15 +275,19 @@ else
 fi
 
 # --- the alerts this cannot deliver, stated on EVERY run ---------------------
+# Three of the eight are covered by tools/alert/probe.sh, which needs no database
+# at all. They stay listed, marked, so nobody reads "not checked here" as "not
+# checked anywhere" - and so nobody claims this script covers them.
 cat >&2 <<'NOTCOVERED'
-check-alerts: NOT CHECKED HERE (needs a metrics backend or an external probe):
-check-alerts:   webhook_rejection  - server/src/routes/webhooks.rs emits it as a structured LOG line
-check-alerts:                        (warn! at :116 for a bad signature, error! at :188 for an amount
-check-alerts:                        mismatch). No counter column exists, so "any topup.rejected" is
-check-alerts:                        not answerable from SQL.
-check-alerts:   api_down           - external GET /health probe, 2-minute window
-check-alerts:   relay_5xx          - nginx access-log status counts
-check-alerts:   relay_down         - external probe
+check-alerts: NOT CHECKED HERE (needs a metrics backend, an external probe or a log counter):
+check-alerts:   webhook_rejection  - COVERED BY tools/alert/probe.sh (counts the log line). No SQL
+check-alerts:                        can answer it: server/src/routes/webhooks.rs emits it as a
+check-alerts:                        structured LOG line (warn! at :116, error! at :188) and no
+check-alerts:                        counter column exists.
+check-alerts:   api_down           - COVERED BY tools/alert/probe.sh (external GET /health probe).
+check-alerts:   relay_down         - COVERED BY tools/alert/probe.sh (external probe of the relay).
+check-alerts:   relay_5xx          - nginx access-log status counts; access logs are disabled for
+check-alerts:                        privacy (docs/edge-relay.md). Needs a metrics backend.
 check-alerts:   all_providers_unhealthy - upstream circuit-breaker state, in-process
 check-alerts:   db_disk            - volume usage
 check-alerts:   error_rate         - HTTP counters over a 5-minute window

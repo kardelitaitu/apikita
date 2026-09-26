@@ -3,56 +3,79 @@
 # sections "The restore drill" (procedure) and "Pass criteria".
 #
 # WHY THIS EXISTS
-#   "An untested backup is a belief." A dump that has never been restored and
+#   "An untested backup is a belief." A copy that has never been restored and
 #   reconciled is a file, not a recovery plan. This tool turns the claim "we can
 #   restore" into a measured, repeatable, logged result:
 #     restore time  -> the real RTO, which the doc asks for explicitly
+#     integrity     -> PRAGMA integrity_check on the RESTORED file
 #     drift rows    -> THE check: wallets must equal the ledger
-#     row counts    -> the restored database is plausibly the one we dumped
+#     row counts    -> the restored database is plausibly the one we copied
 #     spot-check    -> a known account's balance matches the source
 #
+# WHAT A "DUMP" IS NOW
+#   The database is embedded SQLite: a FILE the API opens, named by DATABASE_URL.
+#   There is no pg_dump and no server, so the artifact IS the database file, taken
+#   with SQLite's own online-copy primitive: .backup, which the CLI implements
+#   with the backup API. That matters - it is transactionally consistent against a
+#   live writer and it folds in the WAL, which a raw cp of a live WAL database is
+#   NOT (cp can miss committed frames still sitting in the -wal file). The restore
+#   is .restore, the same API in reverse. Nothing here is a no-op: the artifact is
+#   a real second file, the restore really writes it, and every check below runs
+#   against the RESTORED file, never against the source.
+#
+#   The artifact is therefore UNENCRYPTED, exactly as the old pg_dump artifact was
+#   (tools/backup/backup.sh encrypts its own artifacts; this drill restores a
+#   plain one, and decrypting first remains the operator's step).
+#
 # SAFETY, FIRST AND LOUDEST
-#   This tool creates and DROPS a database, so it must never point at the live
-#   one. A --target (or DRILL_TARGET) is REQUIRED, and the tool REFUSES (exit 5)
-#   unless the name looks like a scratch instance:
-#     * it equals DRILL_LIVE_DB (default "apikita")             -> refuse
-#     * it is postgres / template0 / template1                  -> refuse
-#     * it contains prod / prd / live / production              -> refuse
+#   This tool creates and DELETES a database FILE, so it must never point at the
+#   live one. A --target (or DRILL_TARGET) is REQUIRED, and the tool REFUSES
+#   (exit 5) unless the name looks like a scratch instance:
+#     * it equals DRILL_LIVE_DB (default "apikita")               -> refuse
+#     * it is apikita.db / server.db                              -> refuse
+#     * it is the basename of the --source database file          -> refuse
+#     * it contains prod / prd / live / production                -> refuse
 #     * it contains none of scratch/drill/test/tmp/temp/rehearsal -> refuse
-#   The guard runs BEFORE any database is contacted, and a refusal is exit 5 -
-#   distinct from every other failure, so "I pointed it at production" is
+#   The guard runs BEFORE any file is read, created or deleted, and a refusal is
+#   exit 5 - distinct from every other failure, so "I pointed it at production" is
 #   unmistakable in a log or a CI job.
 #
 # WHAT IT DOES, IN THE DOC'S ORDER
 #    1. guard the target (above)
-#    2. obtain a dump: --dump <file>, else a fresh pg_dump -Fc of the source
-#    3. preflight: the archive must be listable (pg_restore --list)
-#    4. DROP + CREATE the scratch database, so it is clean by construction
-#    5. TIME the restore: pg_restore --clean --if-exists -d <scratch> <dump>
+#    2. obtain an artifact: --dump <file>, else a fresh .backup of the source
+#    3. preflight: the artifact must BE a SQLite database (header + integrity_check)
+#    4. delete any leftover scratch file, so it is clean by construction
+#    5. TIME the restore: .restore the artifact into the scratch file
+#    5b. integrity_check the RESTORED file - a byte-perfect copy of a corrupt
+#        source is still not a restorable database
 #    6. verify.sql against the scratch: row counts, money totals, key hashes
 #    7. row counts vs the source, plus the spot-check account's balance
-#    8. THE check: tools/reconcile/reconcile.sh with DATABASE_URL=<scratch dsn>
-#    9. DROP the scratch database
+#    8. THE check: tools/reconcile/reconcile.sh with DATABASE_URL=<scratch file>
+#    9. delete the scratch file
 #   10. write the drill log
 #
-# Exit codes (3 and 4 keep tools/reconcile/reconcile.sh's meanings):
-#   0  PASS    - restore completed, zero drifting rows, every criterion met
-#   1  FAIL    - a check failed: drift, row counts, spot-check, or no key hashes
-#   2  usage   - no --target, a bad option, or a target that is not a bare identifier
-#   3  missing - a required tool is absent (psql/pg_restore/pg_dump, docker, reconcile.sh)
-#   4  db      - a database command failed (connection, permissions, SQL error)
+# Exit codes (3, 4 and 6 keep tools/reconcile/reconcile.sh's meanings):
+#   0  PASS    - restore completed, integrity ok, zero drifting rows, every criterion met
+#   1  FAIL    - a check failed: drift, integrity, row counts, spot-check, or no key hashes
+#   2  usage   - no --target, a bad option, or a target that is not a bare *.db filename
+#   3  missing - a required tool is absent (sqlite3, reconcile.sh, verify.sql)
+#   4  db      - a sqlite3 command failed (unreadable file, SQL error)
 #   5  REFUSED - the target looks like the live database. NOTHING was touched.
-#   6  dump    - the dump is missing, empty, or not a readable archive
-#   7  restore - pg_restore failed: the restore itself is broken
-#   8  teardown- the scratch database could not be dropped (it is still there)
+#   6  dump    - the artifact is missing, empty, or not a readable SQLite database
+#   7  restore - the restore itself failed, or the RESTORED file failed integrity_check
+#   8  teardown- the scratch file could not be deleted (it is still there)
+#
+# 6 means "bad artifact" here and "no such database file" in
+# tools/reconcile/reconcile.sh. Deliberately the same news - there is no usable
+# database to work with - so the two tables still read as one.
 #
 # THE CHECK IS NOT REIMPLEMENTED HERE
-#   Drift is defined in exactly one place: tools/reconcile/reconcile.sql, driven
-#   by tools/reconcile/reconcile.sh. Step 8 INVOKES THAT SCRIPT with the scratch
-#   DSN as DATABASE_URL. Its exit code is the drill's drift verdict (0 pass, 1
-#   drift). A second copy of the query in this directory would be a second
-#   definition of "drift", and two definitions is how a detector stops being
-#   trusted.
+#   Drift is defined in exactly one place: tools/reconcile/reconcile.sql, driven by
+#   tools/reconcile/reconcile.sh. Step 8 INVOKES THAT SCRIPT with the scratch file
+#   as DATABASE_URL. Its exit code is the drill's drift verdict (0 pass, 1 drift,
+#   5 stranded hold, 6 no such file). A second copy of the query in this directory
+#   would be a second definition of "drift", and two definitions is how a detector
+#   stops being trusted.
 #
 # Verified vs assumed: see README.md next to this file.
 
@@ -63,46 +86,42 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 DRILL_TARGET="${DRILL_TARGET:-}"
 DRILL_DUMP="${DRILL_DUMP:-}"
-DRILL_SOURCE_DSN="${DRILL_SOURCE_DSN:-${DATABASE_URL:-}}"
+DRILL_SOURCE_URL="${DRILL_SOURCE_URL:-${DATABASE_URL:-}}"
 DRILL_LIVE_DB="${DRILL_LIVE_DB:-apikita}"
 DRILL_LOG_DIR="${DRILL_LOG_DIR:-$REPO_ROOT/.agents/drill-logs}"
 DRILL_SPOT_ACCOUNT_ID="${DRILL_SPOT_ACCOUNT_ID:-}"
 DRILL_KEEP_SCRATCH="${DRILL_KEEP_SCRATCH:-0}"
 DRILL_ROW_TOLERANCE="${DRILL_ROW_TOLERANCE:-0}"
 # Row counts are compared "within expected range of live" (the doc's pass
-# criteria), not exactly: the source keeps accepting writes between the dump and
-# the count, so an exact match is unachievable on a live database and would make
-# the drill red for the wrong reason. The default is 5% per metric, which still
-# catches the failure the doc actually warns about - a truncated dump loses a
-# whole table or most of its rows, not 5% of them.
+# criteria), not exactly: the source keeps accepting writes between the artifact
+# and the count, so an exact match is unachievable on a live database and would
+# make the drill red for the wrong reason. The default is 5% per metric, which
+# still catches the failure the doc actually warns about - a truncated copy loses
+# a whole table or most of its rows, not 5% of them.
 DRILL_ROW_TOLERANCE_PCT="${DRILL_ROW_TOLERANCE_PCT:-5}"
-DRILL_USER="${DRILL_USER:-postgres}"
-DRILL_PASSWORD="${DRILL_PASSWORD:-dev}"
-DRILL_DB_HOST="${DRILL_DB_HOST:-}"
-COMPOSE_FILE="${COMPOSE_FILE:-$REPO_ROOT/docker-compose.yml}"
-COMPOSE_DIR=$(cd -- "$(dirname -- "$COMPOSE_FILE")" && pwd)
-COMPOSE_BASE=$(basename -- "$COMPOSE_FILE")
-CONTAINER_SERVICE="${CONTAINER_SERVICE:-postgres}"
+DRILL_SCRATCH_DIR="${DRILL_SCRATCH_DIR:-${TMPDIR:-/tmp}}"
 RECONCILE_SH="${RECONCILE_SH:-$REPO_ROOT/tools/reconcile/reconcile.sh}"
 VERIFY_SQL="$SCRIPT_DIR/verify.sql"
 RTO_BUDGET_SECONDS="${RTO_BUDGET_SECONDS:-14400}"
 
 VERIFY_ONLY=0
-USAGE="usage: sh tools/drill/drill.sh --target <scratch-db> [--dump <file>] [--verify-only] [--keep-scratch] [--log-dir <dir>]"
+USAGE="usage: sh tools/drill/drill.sh --target <scratch-file.db> [--dump <file>] [--verify-only] [--keep-scratch] [--log-dir <dir>]"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --target)         [ $# -ge 2 ] || { printf 'drill: --target needs a value\n' >&2; exit 2; }; DRILL_TARGET="$2"; shift 2 ;;
+        --target)         [ $# -ge 2 ] || { printf '%s\n' 'drill: --target needs a value' >&2; exit 2; }; DRILL_TARGET="$2"; shift 2 ;;
         --target=*)       DRILL_TARGET="${1#--target=}"; shift ;;
-        --dump)           [ $# -ge 2 ] || { printf 'drill: --dump needs a value\n' >&2; exit 2; }; DRILL_DUMP="$2"; shift 2 ;;
+        --dump)           [ $# -ge 2 ] || { printf '%s\n' 'drill: --dump needs a value' >&2; exit 2; }; DRILL_DUMP="$2"; shift 2 ;;
         --dump=*)         DRILL_DUMP="${1#--dump=}"; shift ;;
-        --source)         [ $# -ge 2 ] || { printf 'drill: --source needs a value\n' >&2; exit 2; }; DRILL_SOURCE_DSN="$2"; shift 2 ;;
-        --source=*)       DRILL_SOURCE_DSN="${1#--source=}"; shift ;;
-        --live-db)        [ $# -ge 2 ] || { printf 'drill: --live-db needs a value\n' >&2; exit 2; }; DRILL_LIVE_DB="$2"; shift 2 ;;
+        --source)         [ $# -ge 2 ] || { printf '%s\n' 'drill: --source needs a value' >&2; exit 2; }; DRILL_SOURCE_URL="$2"; shift 2 ;;
+        --source=*)       DRILL_SOURCE_URL="${1#--source=}"; shift ;;
+        --live-db)        [ $# -ge 2 ] || { printf '%s\n' 'drill: --live-db needs a value' >&2; exit 2; }; DRILL_LIVE_DB="$2"; shift 2 ;;
         --live-db=*)      DRILL_LIVE_DB="${1#--live-db=}"; shift ;;
-        --log-dir)        [ $# -ge 2 ] || { printf 'drill: --log-dir needs a value\n' >&2; exit 2; }; DRILL_LOG_DIR="$2"; shift 2 ;;
+        --log-dir)        [ $# -ge 2 ] || { printf '%s\n' 'drill: --log-dir needs a value' >&2; exit 2; }; DRILL_LOG_DIR="$2"; shift 2 ;;
         --log-dir=*)      DRILL_LOG_DIR="${1#--log-dir=}"; shift ;;
-        --spot-account)   [ $# -ge 2 ] || { printf 'drill: --spot-account needs a value\n' >&2; exit 2; }; DRILL_SPOT_ACCOUNT_ID="$2"; shift 2 ;;
+        --scratch-dir)    [ $# -ge 2 ] || { printf '%s\n' 'drill: --scratch-dir needs a value' >&2; exit 2; }; DRILL_SCRATCH_DIR="$2"; shift 2 ;;
+        --scratch-dir=*)  DRILL_SCRATCH_DIR="${1#--scratch-dir=}"; shift ;;
+        --spot-account)   [ $# -ge 2 ] || { printf '%s\n' 'drill: --spot-account needs a value' >&2; exit 2; }; DRILL_SPOT_ACCOUNT_ID="$2"; shift 2 ;;
         --spot-account=*) DRILL_SPOT_ACCOUNT_ID="${1#--spot-account=}"; shift ;;
         --keep-scratch)   DRILL_KEEP_SCRATCH=1; shift ;;
         --verify-only)    VERIFY_ONLY=1; shift ;;
@@ -126,13 +145,11 @@ emit() { tee -a "$LOG" < "$1"; }
 fail() { printf 'drill: %s\n' "$*" >&2; printf 'drill: %s\n' "$*" >> "$LOG" 2>/dev/null || :; }
 
 TMP="${TMPDIR:-/tmp}"
-STAGE="$TMP/drill.$$"
+STAGE="$TMP/drill.$"
 if ! mkdir -p "$STAGE"; then
     printf 'drill: cannot create a working directory at %s\n' "$STAGE" >&2
     exit 2
 fi
-SHIM_DIR="$STAGE/shim"
-SCRATCH_CREATED=0
 OUT="$STAGE/out"
 ERR="$STAGE/err"
 SRC_METRICS="$STAGE/src.metrics"
@@ -141,69 +158,121 @@ REC_OUT="$STAGE/reconcile.out"
 REC_ERR="$STAGE/reconcile.err"
 DUMP="$DRILL_DUMP"
 
+SCRATCH_CREATED=0
+SCRATCH_PATH=""
+
 cleanup_tmp() { rm -rf "$STAGE" 2>/dev/null || :; }
 trap 'cleanup_tmp' EXIT HUP INT TERM
 
 # ---------------------------------------------------------------------------
-# Tool resolution: host client, else the postgres compose service.
+# Tool resolution: the sqlite3 CLI is the ONLY client.
+#
+# There is no container fallback any more, and adding one would be dead code:
+# docker-compose.yml has no database service to exec into (docker compose config
+# --services -> nginx, scheduler), so a "docker compose exec postgres ..." path
+# could only ever fail at runtime. A missing sqlite3 is exit 3, loudly.
 # ---------------------------------------------------------------------------
-CLIENT=""
-if command -v psql >/dev/null 2>&1 && command -v pg_restore >/dev/null 2>&1 \
-        && command -v pg_dump >/dev/null 2>&1; then
-    CLIENT=host
-    [ -n "$DRILL_DB_HOST" ] || DRILL_DB_HOST=127.0.0.1
-    CLIENT_DESC="host psql/pg_restore/pg_dump"
-elif command -v docker >/dev/null 2>&1 && [ -f "$COMPOSE_FILE" ]; then
-    CLIENT=container
-    [ -n "$DRILL_DB_HOST" ] || DRILL_DB_HOST=postgres
-    CLIENT_DESC="docker compose exec -T $CONTAINER_SERVICE (pg_dump/pg_restore/psql)"
-else
+if ! command -v sqlite3 >/dev/null 2>&1; then
     CLIENT=none
-    CLIENT_DESC="none"
+    CLIENT_DESC="none (sqlite3 is not installed or not on PATH)"
+else
+    CLIENT=sqlite3
+    CLIENT_DESC="sqlite3 CLI $(sqlite3 --version 2>/dev/null | cut -d' ' -f1-2)"
 fi
 
+abs_path() { # an absolute path for a file that may not exist yet
+    _d=$(dirname -- "$1"); _b=$(basename -- "$1")
+    _ad=$(cd -- "$_d" 2>/dev/null && pwd) || _ad=""
+    if [ -z "$_ad" ]; then printf '%s' "$1"; else printf '%s/%s' "$_ad" "$_b"; fi
+}
+
 # ---------------------------------------------------------------------------
-# STEP 1 - the safety guard. Pure string logic: it runs before anything is
-# contacted, created or dropped.
+# sqlite_dot <db-file> <dot-command> <dir of the command's path argument>
+#
+# The sqlite3 CLI's dot-commands (.backup/.restore) resolve their path argument
+# with the C library, so an MSYS/Git-Bash absolute path like /c/dev/... is NOT
+# translated and the command fails with "cannot open". cd'ing into the argument's
+# directory and using a bare basename is the one form that works on every host, so
+# every dot-command here goes through this wrapper. The database file itself is
+# opened by the CLI (which does translate), so it is passed as an absolute path.
+# A directory that does not exist makes the subshell fail, which is what we want:
+# loud, not a silent no-op.
+# ---------------------------------------------------------------------------
+sqlite_dot() {
+    _db="$1"; _cmd="$2"; _argdir="$3"
+    ( cd -- "$_argdir" && sqlite3 -bail "$_db" "$_cmd" )
+}
+
+# An artifact/database is only usable if the 16-byte SQLite header is there. A
+# zero-length or truncated file fails this before anything is restored from it.
+is_sqlite_file() {
+    [ -f "$1" ] || return 1
+    head -c 16 -- "$1" 2>/dev/null | grep -q 'SQLite format 3' || return 1
+    return 0
+}
+
+# Integrity is checked with -readonly: the check must not be able to repair the
+# thing it is measuring.
+integrity_ok() {
+    sqlite3 -readonly -bail -noheader -separator '|' "$1" "PRAGMA integrity_check;" 2>/dev/null | head -1
+}
+
+# ---------------------------------------------------------------------------
+# STEP 1 - the safety guard. Pure string logic: it runs before anything is read,
+# created or deleted.
 # ---------------------------------------------------------------------------
 guard_target() {
     if [ -z "$DRILL_TARGET" ]; then
-        fail "no target: the drill creates and DROPS a database, so it needs an explicit SCRATCH database"
+        fail "no target: the drill creates and DELETES a database file, so it needs an explicit SCRATCH file"
         fail "  $USAGE"
-        fail "  docs/backup-and-restore.md: \"Provision a scratch Postgres (never restore over production)\""
+        fail "  docs/backup-and-restore.md: never restore over production"
         return 2
     fi
-    case "$DRILL_TARGET" in
-        *[!A-Za-z0-9_]*)
-            fail "target '$DRILL_TARGET' is not a bare SQL identifier (letters, digits, underscore only)"
-            fail "  a target with quotes, dashes or a DSN in it is not a database name"
-            return 2
-            ;;
-    esac
-
+    # The target is a FILE now, so the check is not "is this a bare SQL identifier"
+    # but "is this a bare filename". Anything containing a separator, a drive
+    # colon, a space or a quote is a path or a DSN, not a name - refuse it rather
+    # than let it escape --scratch-dir. This is also what keeps a leftover
+    # postgres:// DSN from being rewritten into a plausible-looking filename.
+    if [ -n "$(printf '%s' "$DRILL_TARGET" | tr -d 'A-Za-z0-9_.-')" ]; then
+        fail "target '$DRILL_TARGET' is not a bare filename (letters, digits, dot, dash, underscore only)"
+        fail "  pass a NAME, not a path or a DSN; the directory is --scratch-dir (default ${TMPDIR:-/tmp})"
+        return 2
+    fi
     LOW=$(printf '%s' "$DRILL_TARGET" | tr 'A-Z' 'a-z')
     LIVE_LOW=$(printf '%s' "$DRILL_LIVE_DB" | tr 'A-Z' 'a-z')
 
     if [ "$LOW" = "$LIVE_LOW" ]; then
         fail "REFUSING: target '$DRILL_TARGET' IS the live database name (DRILL_LIVE_DB='$DRILL_LIVE_DB')"
-        fail "  this drill DROPs and recreates its target. Restoring over production is the one"
-        fail "  thing docs/backup-and-restore.md forbids outright: \"never restore over production\"."
-        fail "  nothing was contacted, created or dropped."
-        fail "  name a scratch database instead, e.g. --target apikita_scratch"
+        fail "  this drill DELETES and rewrites its target. Restoring over production is the one"
+        fail "  thing docs/backup-and-restore.md forbids outright: never restore over production."
+        fail "  nothing was read, created or deleted."
+        fail "  name a scratch file instead, e.g. --target apikita_drill_scratch.db"
         return 5
     fi
-    for reserved in postgres template0 template1; do
+    # The PostgreSQL maintenance-database names are gone with the server. Their
+    # SQLite equivalent is the live database FILENAME: the default local database
+    # is server/data/server.db, and apikita.db is what it is called in the docs.
+    for reserved in apikita.db server.db; do
         if [ "$LOW" = "$reserved" ]; then
-            fail "REFUSING: target '$DRILL_TARGET' is a PostgreSQL maintenance database ('$reserved')"
-            fail "  the drill would DROP it. nothing was contacted, created or dropped."
+            fail "REFUSING: target '$DRILL_TARGET' is a live-looking database filename ('$reserved')"
+            fail "  the drill would DELETE it. nothing was read, created or deleted."
             return 5
         fi
     done
+    # And the real thing: the file --source points at. The guard has to know the
+    # source's basename, which is why it is computed before the guard runs.
+    if [ -n "${SOURCE_BASENAME:-}" ] && [ "$LOW" = "$SOURCE_BASENAME" ]; then
+        fail "REFUSING: target '$DRILL_TARGET' IS the source database file (--source names it)"
+        fail "  restoring over the source would destroy the database this drill exists to protect."
+        fail "  nothing was read, created or deleted."
+        fail "  name a scratch file instead, e.g. --target apikita_drill_scratch.db"
+        return 5
+    fi
     case "$LOW" in
         *prod*|*prd*|*live*)
             fail "REFUSING: target '$DRILL_TARGET' looks like a LIVE database, not a scratch one"
-            fail "  nothing was contacted, created or dropped."
-            fail "  name a scratch database instead, e.g. --target apikita_scratch"
+            fail "  nothing was read, created or deleted."
+            fail "  name a scratch file instead, e.g. --target apikita_drill_scratch.db"
             return 5
             ;;
     esac
@@ -212,91 +281,22 @@ guard_target() {
         *)
             fail "REFUSING: target '$DRILL_TARGET' does not look like a scratch database"
             fail "  the name must contain one of: scratch, drill, test, tmp, temp, rehearsal"
-            fail "  (DRILL_LIVE_DB='$DRILL_LIVE_DB' is refused outright; so are postgres/template0/template1)"
-            fail "  nothing was contacted, created or dropped."
+            fail "  (DRILL_LIVE_DB='$DRILL_LIVE_DB' is refused outright; so are apikita.db and server.db)"
+            fail "  nothing was read, created or deleted."
             return 5
             ;;
     esac
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# Database plumbing.
-# ---------------------------------------------------------------------------
-dsn_for_db() { printf 'postgres://%s:%s@%s:5432/%s' "$DRILL_USER" "$DRILL_PASSWORD" "$DRILL_DB_HOST" "$1"; }
-
-# compose_run - run a command inside the compose service.
-#
-# Runs from the compose file's own directory with the file's BASENAME, and with
-# MSYS_NO_PATHCONV=1. Both matter on Windows: an absolute /c/... path passed to
-# docker.exe through -f is reinterpreted as C:\c\... and compose fails with
-# "cannot find the path specified" - a path-conversion bug, not a missing file.
-compose_run() {
-    ( cd -- "$COMPOSE_DIR" && MSYS_NO_PATHCONV=1 docker compose -f "$COMPOSE_BASE" "$@" )
-}
-
-psql_dsn() { # psql_dsn <dsn> [psql args...]   (SQL on stdin)
-    dsn="$1"; shift
-    if [ "$CLIENT" = host ]; then
-        psql "$dsn" "$@"
-    else
-        compose_run exec -T "$CONTAINER_SERVICE" psql "$dsn" "$@"
-    fi
-}
-
-pg_dump_dsn() {
-    dsn="$1"; shift
-    if [ "$CLIENT" = host ]; then
-        pg_dump "$@" -d "$dsn"
-    else
-        compose_run exec -T "$CONTAINER_SERVICE" pg_dump "$@" -d "$dsn"
-    fi
-}
-
-pg_restore_stdin() { # stdin is the archive
-    if [ "$CLIENT" = host ]; then
-        pg_restore "$@"
-    else
-        compose_run exec -T "$CONTAINER_SERVICE" pg_restore "$@"
-    fi
-}
-
-# The shim lets tools/reconcile/reconcile.sh - which calls a bare "psql" - run on
-# a host with no PostgreSQL client, by execing the real psql inside the compose
-# service. This is the same technique tools/reconcile/README.md documents for
-# verifying that gate on this host. Argv is preserved exactly; "-f <path>"
-# carries a HOST path that does not exist in the container, so it is translated
-# to stdin.
-make_psql_shim() {
-    mkdir -p "$SHIM_DIR" || return 1
-    cat > "$SHIM_DIR/psql" <<'SHIM'
-#!/bin/sh
-# Generated by tools/drill/drill.sh - a psql that runs the real psql inside the
-# postgres compose service. Argv order and content are preserved; -f <file> is
-# read from a host path and piped in on stdin, because the container cannot see
-# the host filesystem.
-set -u
-AF="$TMPDIR_SHIM/args.$$"
-: > "$AF"
-FILE=""
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -f)  FILE="$2"; shift 2 ;;
-        -f*) FILE=$(printf '%s' "$1" | cut -c3-); shift ;;
-        *)   printf '%s\n' "$1" >> "$AF"; shift ;;
+    # Last, not first: a target that IS the live database must be refused as
+    # REFUSED (exit 5) even when it is spelled without the .db suffix, so the
+    # "I pointed the drill at production" signal stays unmistakable.
+    case "$DRILL_TARGET" in
+        *.db) ;;
+        *)
+            fail "target '$DRILL_TARGET' is not a .db file"
+            fail "  the database is a FILE now (embedded SQLite); name it e.g. apikita_drill_scratch.db"
+            return 2
+            ;;
     esac
-done
-set --
-while IFS= read -r a; do set -- "$@" "$a"; done < "$AF"
-rm -f "$AF"
-export MSYS_NO_PATHCONV=1
-if [ -n "$FILE" ]; then
-    [ -r "$FILE" ] || { echo "drill-psql-shim: cannot read $FILE" >&2; exit 3; }
-    exec sh -c 'D=$1; S=$2; shift 2; cd -- "$D" || exit 1; MSYS_NO_PATHCONV=1 exec docker compose -f "'"$DRILL_COMPOSE_BASE"'" exec -T "$S" psql "$@"' _ "$DRILL_COMPOSE_DIR" "$DRILL_SERVICE" "$@" < "$FILE"
-fi
-exec sh -c 'D=$1; S=$2; shift 2; cd -- "$D" || exit 1; MSYS_NO_PATHCONV=1 exec docker compose -f "'"$DRILL_COMPOSE_BASE"'" exec -T "$S" psql "$@"' _ "$DRILL_COMPOSE_DIR" "$DRILL_SERVICE" "$@"
-SHIM
-    chmod +x "$SHIM_DIR/psql" 2>/dev/null || :
     return 0
 }
 
@@ -329,19 +329,20 @@ drill:   $*"
 teardown() {
     if [ "$SCRATCH_CREATED" != 1 ]; then return 0; fi
     if [ "$DRILL_KEEP_SCRATCH" = 1 ]; then
-        say "drill: --keep-scratch: LEAVING the scratch database '$DRILL_TARGET' in place (doc step 7 skipped)"
+        say "drill: --keep-scratch: LEAVING the scratch database '$SCRATCH_PATH' in place (doc step 7 skipped)"
         SCRATCH_CREATED=0
         return 0
     fi
-    printf 'DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' "$DRILL_TARGET" > "$OUT"
-    if ! psql_dsn "$(dsn_for_db postgres)" -v ON_ERROR_STOP=1 -q < "$OUT" > "$OUT.o" 2>"$ERR"; then
-        fail "could not drop the scratch database '$DRILL_TARGET' - IT IS STILL THERE:"
-        [ -s "$ERR" ] && cat "$ERR" >&2
+    # -wal and -shm go with it: leaving a stale WAL next to a deleted database is
+    # confusing at best, and a corrupted scratch database at worst.
+    rm -f "$SCRATCH_PATH" "$SCRATCH_PATH-wal" "$SCRATCH_PATH-shm" 2>/dev/null || :
+    if [ -e "$SCRATCH_PATH" ]; then
+        fail "could not delete the scratch database '$SCRATCH_PATH' - IT IS STILL THERE"
         SCRATCH_CREATED=1
         return 8
     fi
     SCRATCH_CREATED=0
-    say "drill: step 9 teardown - dropped the scratch database '$DRILL_TARGET'"
+    say "drill: step 9 teardown - deleted the scratch database '$SCRATCH_PATH'"
     return 0
 }
 
@@ -351,10 +352,37 @@ finish() { # finish <exit code>
     exit "$code"
 }
 
+# --- the source: a SQLite URL, refused loudly if it is not --------------------
+# A case, not a blind prefix strip: a leftover Postgres URL must be refused by
+# name rather than rewritten into a relative path that happens to be a plausible
+# filename (tools/reconcile/reconcile.sh makes the same argument).
+SOURCE_PATH=""
+SOURCE_BASENAME=""
+if [ -n "$DRILL_SOURCE_URL" ]; then
+    case "$DRILL_SOURCE_URL" in
+        sqlite://*) SOURCE_PATH=${DRILL_SOURCE_URL#sqlite://} ;;
+        sqlite:*)   SOURCE_PATH=${DRILL_SOURCE_URL#sqlite:} ;;
+        *)
+            printf 'drill: DRILL_SOURCE_URL/DATABASE_URL is not a SQLite URL: %s\n' "$DRILL_SOURCE_URL" >&2
+            printf 'drill: expected e.g. sqlite://data/server.db (there is no database server any more)\n' >&2
+            exit 2
+            ;;
+    esac
+    SOURCE_PATH=${SOURCE_PATH%%\?*}
+    case "$SOURCE_PATH" in
+        ''|':memory:')
+            printf 'drill: the source URL does not name a file: %s\n' "$DRILL_SOURCE_URL" >&2
+            printf 'drill: an in-memory database cannot be copied or restored from outside the process\n' >&2
+            exit 2
+            ;;
+    esac
+    SOURCE_BASENAME=$(basename -- "$SOURCE_PATH" | tr 'A-Z' 'a-z')
+fi
+
 say "drill: ================= apikita RESTORE DRILL ================="
 say "drill: date_utc     $STAMP"
 say "drill: run_by       ${USER:-${USERNAME:-$(id -un 2>/dev/null || echo unknown)}} on $(hostname 2>/dev/null || echo unknown-host)"
-say "drill: target       ${DRILL_TARGET:-<none>}   (scratch; refused if it is the live db)"
+say "drill: target       ${DRILL_TARGET:-<none>}   (scratch file; refused if it is the live db)"
 say "drill: live_db      $DRILL_LIVE_DB"
 say "drill: mode         $([ "$VERIFY_ONLY" = 1 ] && echo 'verify-only (no restore, no teardown)' || echo 'full drill')"
 say "drill: log          $LOG"
@@ -365,16 +393,25 @@ say "drill: step 1 - safety guard on the target name"
 guard_target
 GUARD_CODE=$?
 if [ "$GUARD_CODE" != 0 ]; then
-    say "drill: step 1 REFUSED - target '${DRILL_TARGET:-<none>}' rejected (exit $GUARD_CODE). No database was contacted."
+    say "drill: step 1 REFUSED - target '${DRILL_TARGET:-<none>}' rejected (exit $GUARD_CODE). No database was touched."
     say "drill: result       REFUSED (exit $GUARD_CODE)"
     finish "$GUARD_CODE"
 fi
 say "drill: step 1 OK - '$DRILL_TARGET' is a scratch name, not '$DRILL_LIVE_DB'"
 
+SCRATCH_PATH=$(abs_path "$DRILL_SCRATCH_DIR/$DRILL_TARGET")
+SCRATCH_DIR=$(dirname -- "$SCRATCH_PATH")
+if ! mkdir -p "$SCRATCH_DIR" 2>/dev/null; then
+    fail "cannot create the scratch directory: $SCRATCH_DIR"
+    say "drill: result       FAIL (exit 2)"
+    finish 2
+fi
+
 # --- tool availability ------------------------------------------------------
 if [ "$CLIENT" = none ]; then
-    fail "no PostgreSQL client: psql/pg_restore/pg_dump are not on PATH, and no docker fallback exists"
-    fail "  looked for: psql, pg_restore, pg_dump on PATH; docker + $COMPOSE_FILE"
+    fail "no SQLite client: sqlite3 is not on PATH"
+    fail "  there is no container fallback: docker-compose.yml has no database service"
+    fail "  (docker compose config --services -> nginx, scheduler) to exec into"
     say "drill: result       FAIL (exit 3)"
     finish 3
 fi
@@ -389,28 +426,53 @@ if [ ! -f "$VERIFY_SQL" ]; then
     say "drill: result       FAIL (exit 3)"
     finish 3
 fi
-say "drill: client       $CLIENT_DESC  (db host '$DRILL_DB_HOST')"
+say "drill: client       $CLIENT_DESC"
 
-if [ -z "$DRILL_SOURCE_DSN" ]; then
-    DRILL_SOURCE_DSN=$(dsn_for_db "$DRILL_LIVE_DB")
-    say "drill: source       $DRILL_SOURCE_DSN (defaulted: local stack, db '$DRILL_LIVE_DB')"
-else
-    say "drill: source       $DRILL_SOURCE_DSN"
+if [ -z "$DRILL_SOURCE_URL" ]; then
+    fail "no source: set DATABASE_URL (or --source) to the SQLite database to copy"
+    fail "  there is deliberately no local default here: a drill that silently picks a"
+    fail "  database can prove a restore of the wrong one. export DATABASE_URL='sqlite://data/server.db'"
+    say "drill: result       FAIL (exit 2)"
+    finish 2
 fi
-SCRATCH_DSN=$(dsn_for_db "$DRILL_TARGET")
+SOURCE_PATH=$(abs_path "$SOURCE_PATH")
+say "drill: source       $DRILL_SOURCE_URL"
+say "drill: source_file  $SOURCE_PATH"
+if [ ! -f "$SOURCE_PATH" ]; then
+    fail "the source database file does not exist: $SOURCE_PATH"
+    fail "  create it with 'cargo run --bin migrate' (from server/)"
+    say "drill: result       FAIL (exit 6)"
+    finish 6
+fi
+# A source that is not a SQLite database is not a drill: SQLite will happily open a
+# zero-length file as a brand-new EMPTY database, and every check downstream would
+# then agree - 0 rows against 0 rows, 0 drifting accounts - and report PASS for a
+# restore of nothing. That is precisely the silent pass this tool exists to prevent,
+# so the source gets the same header check the artifact gets.
+if ! is_sqlite_file "$SOURCE_PATH"; then
+    fail "the source is not a SQLite database (no 'SQLite format 3' header): $SOURCE_PATH"
+    fail "  an empty or non-database file would restore to an empty database and PASS every check"
+    say "drill: result       FAIL (exit 6)"
+    finish 6
+fi
+SCRATCH_URL="sqlite://$SCRATCH_PATH"
 
 RESTORE_MS=""
 BACKUP_AGE_S=""
+INTEGRITY=""
 
 if [ "$VERIFY_ONLY" != 1 ]; then
-    # --- STEP 2: obtain a dump ----------------------------------------------
+    # --- STEP 2: obtain an artifact -----------------------------------------
     if [ -z "$DUMP" ]; then
-        DUMP="$REPO_ROOT/.agents/drill-dumps/drill-$STAMP-$SAFE_TARGET.dump"
+        DUMP="$REPO_ROOT/.agents/drill-dumps/drill-$STAMP-$SAFE_TARGET.db"
         mkdir -p "$(dirname -- "$DUMP")" || { fail "cannot create $(dirname -- "$DUMP")"; finish 2; }
-        say "drill: step 2 - no --dump given, taking a fresh pg_dump -Fc of the source"
+        say "drill: step 2 - no --dump given, taking a fresh .backup of the source"
+        say "drill:   (the SQLite backup API: transactionally consistent against a live writer,"
+        say "drill:    and it folds in the WAL - which a raw cp of a live WAL database does not)"
         umask 077
-        if ! pg_dump_dsn "$DRILL_SOURCE_DSN" -Fc > "$DUMP" 2>"$ERR"; then
-            fail "pg_dump failed:"
+        rm -f "$DUMP"
+        if ! sqlite_dot "$SOURCE_PATH" ".backup '$(basename -- "$DUMP")'" "$(dirname -- "$DUMP")" > "$OUT" 2>"$ERR"; then
+            fail "the .backup of the source failed:"
             [ -s "$ERR" ] && cat "$ERR" >&2
             rm -f "$DUMP"
             say "drill: result       FAIL (exit 6)"
@@ -419,14 +481,15 @@ if [ "$VERIFY_ONLY" != 1 ]; then
     else
         say "drill: step 2 - restoring the supplied artifact $DUMP"
     fi
+    DUMP=$(abs_path "$DUMP")
     if [ ! -f "$DUMP" ]; then
-        fail "the dump does not exist: $DUMP"
+        fail "the artifact does not exist: $DUMP"
         say "drill: result       FAIL (exit 6)"
         finish 6
     fi
     DUMP_BYTES=$(wc -c < "$DUMP" | tr -d ' ')
     if [ "$DUMP_BYTES" -eq 0 ]; then
-        fail "the dump is EMPTY ($DUMP_BYTES bytes) - a truncated dump looks successful and restores nothing"
+        fail "the artifact is EMPTY ($DUMP_BYTES bytes) - a truncated copy looks successful and restores nothing"
         say "drill: result       FAIL (exit 6)"
         finish 6
     fi
@@ -441,67 +504,105 @@ if [ "$VERIFY_ONLY" != 1 ]; then
     else
         BACKUP_AGE_S="unknown"
     fi
-    say "drill: dump         $DUMP"
-    say "drill: dump_size    $DUMP_BYTES bytes  sha256=$DUMP_SHA"
+    say "drill: artifact     $DUMP"
+    say "drill: artifact_size $DUMP_BYTES bytes  sha256=$DUMP_SHA"
     say "drill: backup_age   ${BACKUP_AGE_S}s at restore time"
 
-    # --- STEP 3: the archive must be readable -------------------------------
-    say "drill: step 3 - preflight: pg_restore --list on the archive"
-    if ! pg_restore_stdin --list < "$DUMP" > "$OUT" 2>"$ERR"; then
-        fail "the dump is not a readable custom-format archive (pg_restore --list failed):"
-        [ -s "$ERR" ] && cat "$ERR" >&2
+    # --- STEP 3: the artifact must be a readable database -------------------
+    # This replaces pg_restore --list. It asks the same question - "is this a real,
+    # intact database file?" - of a different format: the 16-byte SQLite header,
+    # then PRAGMA integrity_check over the whole file. A truncated or garbage
+    # artifact fails HERE (exit 6), before anything is restored from it.
+    say "drill: step 3 - preflight: SQLite header + PRAGMA integrity_check on the artifact"
+    if ! is_sqlite_file "$DUMP"; then
+        fail "the artifact is not a SQLite database (no 'SQLite format 3' header): $DUMP"
+        fail "  a file that cannot be read is a FAILURE, not a warning"
         say "drill: result       FAIL (exit 6)"
         finish 6
     fi
-    TOC=$(grep -c '^[0-9]' "$OUT" 2>/dev/null || echo 0)
-    say "drill: preflight    OK - $TOC table-of-contents entries"
+    PRE_INTEGRITY=$(integrity_ok "$DUMP")
+    if [ "$PRE_INTEGRITY" != "ok" ]; then
+        fail "PRAGMA integrity_check on the artifact says: '${PRE_INTEGRITY:-<no output>}' (not 'ok')"
+        fail "  the artifact is corrupt - restoring it cannot produce a sound database"
+        say "drill: result       FAIL (exit 6)"
+        finish 6
+    fi
+    say "drill: preflight    OK - SQLite database, integrity_check=ok"
 
-    # --- STEP 4: create the scratch database --------------------------------
-    say "drill: step 4 - DROP + CREATE the scratch database '$DRILL_TARGET'"
-    say "drill:   (a leftover scratch db from an aborted run must not be restored over)"
-    {
-        printf 'DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' "$DRILL_TARGET"
-        printf 'CREATE DATABASE "%s";\n' "$DRILL_TARGET"
-    } > "$OUT"
-    if ! psql_dsn "$(dsn_for_db postgres)" -v ON_ERROR_STOP=1 -q < "$OUT" >"$OUT.o" 2>"$ERR"; then
-        fail "could not create the scratch database '$DRILL_TARGET':"
-        [ -s "$ERR" ] && cat "$ERR" >&2
+    # --- STEP 4: clear the scratch file -------------------------------------
+    # A leftover scratch database from an aborted run must not be restored over: a
+    # restore that "succeeds" onto a stale file proves nothing about the artifact.
+    # Delete it first, so the file that exists afterwards is one this run created
+    # from the artifact and from nothing else.
+    say "drill: step 4 - deleting any leftover scratch database '$SCRATCH_PATH'"
+    rm -f "$SCRATCH_PATH" "$SCRATCH_PATH-wal" "$SCRATCH_PATH-shm" 2>/dev/null || :
+    if [ -e "$SCRATCH_PATH" ]; then
+        fail "a file exists at $SCRATCH_PATH and could not be deleted - refusing to restore over it"
         say "drill: result       FAIL (exit 4)"
         finish 4
     fi
-    SCRATCH_CREATED=1
 
     # --- STEP 5: TIME the restore -------------------------------------------
-    say "drill: step 5 - RESTORE (timed): pg_restore --clean --if-exists -d <scratch> <dump>"
+    # .restore is the SQLite backup API in reverse: it writes the artifact's
+    # contents into the target database. That is a real restore operation, not a
+    # copy of the file, so the timing is a restore time.
+    say "drill: step 5 - RESTORE (timed): .restore <artifact> into <scratch>"
     T0=$(now_ms)
-    if ! pg_restore_stdin --clean --if-exists -d "$SCRATCH_DSN" < "$DUMP" > "$OUT" 2>"$ERR"; then
+    if ! sqlite_dot "$SCRATCH_PATH" ".restore '$(basename -- "$DUMP")'" "$(dirname -- "$DUMP")" > "$OUT" 2>"$ERR"; then
         RESTORE_MS=$(( $(now_ms) - T0 ))
-        fail "pg_restore FAILED after ${RESTORE_MS}ms - the restore itself is broken:"
+        fail "the restore FAILED after ${RESTORE_MS}ms - the restore itself is broken:"
         [ -s "$ERR" ] && cat "$ERR" >&2
         [ -s "$OUT" ] && cat "$OUT" >&2
         record "restore_ms    $RESTORE_MS"
         record "result        FAIL (exit 7)"
         say "$RESULTS"
+        SCRATCH_CREATED=1
         teardown || :
         say "drill: log          $LOG"
         finish 7
     fi
+    SCRATCH_CREATED=1
     RESTORE_MS=$(( $(now_ms) - T0 ))
     RESTORE_S=$((RESTORE_MS / 1000))
     RESTORE_FRAC=$((RESTORE_MS % 1000))
-    [ -s "$ERR" ] && { say "drill: pg_restore diagnostics (stderr):"; emit "$ERR"; }
+    [ -s "$ERR" ] && { say "drill: restore diagnostics (stderr):"; emit "$ERR"; }
     say "drill: RESTORE TIME $((RESTORE_MS / 1000)).$(printf '%03d' "$RESTORE_FRAC") s  (${RESTORE_MS} ms) - this is the real RTO"
     if [ "$RESTORE_S" -le "$RTO_BUDGET_SECONDS" ]; then
         say "drill:   within the documented RTO budget of ${RTO_BUDGET_SECONDS}s"
     else
         say "drill:   OVER the documented RTO budget of ${RTO_BUDGET_SECONDS}s - the RTO claim in docs/backup-and-restore.md is FALSE"
     fi
+
+    # --- STEP 5b: the RESTORED file must itself be intact -------------------
+    # New with the SQLite port, and it earns its place: "the restore ran" is not
+    # the same claim as "the result is a sound database". A byte-perfect copy of a
+    # corrupt source restores perfectly and is still unrestorable.
+    say "drill: step 5b - PRAGMA integrity_check on the RESTORED database"
+    INTEGRITY=$(integrity_ok "$SCRATCH_PATH")
+    if [ "$INTEGRITY" != "ok" ]; then
+        fail "the RESTORED database failed integrity_check: '${INTEGRITY:-<no output>}' (not 'ok')"
+        fail "  the restore wrote a database SQLite will not vouch for - do NOT trust it"
+        record "integrity     ${INTEGRITY:-<no output>} (FAIL)"
+        record "result        FAIL (exit 7)"
+        say "$RESULTS"
+        teardown || :
+        say "drill: log          $LOG"
+        finish 7
+    fi
+    say "drill: integrity    ok (RESTORED database)"
 else
-    say "drill: --verify-only - skipping steps 2-5 (dump, preflight, create, restore)"
+    say "drill: --verify-only - skipping steps 2-5 (artifact, preflight, clear, restore)"
     say "drill: verifying the EXISTING database '$DRILL_TARGET' as if it were the restored one"
+    if [ ! -f "$SCRATCH_PATH" ]; then
+        fail "--verify-only: no such database file: $SCRATCH_PATH"
+        say "drill: result       FAIL (exit 6)"
+        finish 6
+    fi
+    INTEGRITY=$(integrity_ok "$SCRATCH_PATH")
+    say "drill: integrity    ${INTEGRITY:-<no output>} (existing database, not restored by this run)"
     # SCRATCH_CREATED deliberately stays 0: this mode did not create the database,
-    # so it must not DROP it either. Teardown owns only what this run made.
-    say "drill:   (teardown skipped: this run did not create '$DRILL_TARGET')"
+    # so it must not delete it either. Teardown owns only what this run made.
+    say "drill:   (teardown skipped: this run did not create '$SCRATCH_PATH')"
 fi
 
 # ---------------------------------------------------------------------------
@@ -509,18 +610,18 @@ fi
 # ---------------------------------------------------------------------------
 FAILED=0
 say "drill: step 6 - verify.sql against the scratch database (row counts, money totals, key hashes)"
-if ! psql_dsn "$SCRATCH_DSN" -v ON_ERROR_STOP=1 -t -A -F'|' < "$VERIFY_SQL" > "$SCR_METRICS" 2>"$ERR"; then
-    fail "psql failed reading the scratch database:"
+if ! sqlite3 -readonly -bail -noheader -separator '|' "$SCRATCH_PATH" < "$VERIFY_SQL" > "$SCR_METRICS" 2>"$ERR"; then
+    fail "sqlite3 failed reading the scratch database:"
     [ -s "$ERR" ] && cat "$ERR" >&2
     say "drill: result       FAIL (exit 4)"
     teardown || :
     finish 4
 fi
-[ -s "$ERR" ] && { say "drill: psql diagnostics (diagnostic, NOT drift):"; emit "$ERR"; }
+[ -s "$ERR" ] && { say "drill: sqlite3 diagnostics (diagnostic, NOT drift):"; emit "$ERR"; }
 emit "$SCR_METRICS"
 
-if ! psql_dsn "$DRILL_SOURCE_DSN" -v ON_ERROR_STOP=1 -t -A -F'|' < "$VERIFY_SQL" > "$SRC_METRICS" 2>"$ERR"; then
-    fail "psql failed reading the SOURCE database - row counts and the spot-check need it:"
+if ! sqlite3 -readonly -bail -noheader -separator '|' "$SOURCE_PATH" < "$VERIFY_SQL" > "$SRC_METRICS" 2>"$ERR"; then
+    fail "sqlite3 failed reading the SOURCE database - row counts and the spot-check need it:"
     [ -s "$ERR" ] && cat "$ERR" >&2
     say "drill: result       FAIL (exit 4)"
     teardown || :
@@ -548,7 +649,7 @@ for m in accounts wallets ledger api_keys topups usage_daily api_keys_with_key_h
     elif [ "$d" -gt "$TOL" ]; then
         fail "row count SHORT for $m: source=$s scratch=$t (delta $d > allowed $TOL)"
         fail "  more than ${DRILL_ROW_TOLERANCE_PCT}% of this table is missing from the restore - the classic"
-        fail "  truncated dump. Raise DRILL_ROW_TOLERANCE_PCT only with a reason you would defend in a postmortem."
+        fail "  truncated artifact. Raise DRILL_ROW_TOLERANCE_PCT only with a reason you would defend in a postmortem."
         FAILED=1
     fi
 done
@@ -571,11 +672,14 @@ say "drill:   ledger_sum_idr (ledger)  source=$(metric "$SRC_METRICS" ledger_sum
 # STEP 7 - spot-check a known account against the source (doc step 5).
 # ---------------------------------------------------------------------------
 say "drill: step 7 - spot-check a known account's balance against the source"
-SPOT_SQL='SELECT w.balance_idr::text, COALESCE((SELECT sum(delta_idr) FROM ledger l WHERE l.account_id = w.account_id), 0)::text FROM wallets w WHERE w.account_id = '
+# No ::text cast any more: CAST(... AS TEXT) is the SQLite spelling, and both
+# values are rendered as TEXT so an integer 1000 and a text '1000' cannot be
+# compared as if they were different.
+SPOT_SQL="SELECT CAST(w.balance_idr AS TEXT) || '|' || CAST(COALESCE((SELECT sum(delta_idr) FROM ledger l WHERE l.account_id = w.account_id), 0) AS TEXT) FROM wallets w WHERE w.account_id = "
 ACCT="$DRILL_SPOT_ACCOUNT_ID"
 if [ -z "$ACCT" ]; then
-    ACCT=$(printf "SELECT w.account_id FROM wallets w JOIN accounts a ON a.id = w.account_id ORDER BY w.balance_idr DESC, w.account_id LIMIT 1;\n" \
-        | psql_dsn "$DRILL_SOURCE_DSN" -v ON_ERROR_STOP=1 -t -A 2>"$ERR" | tr -d '\r' | head -1)
+    ACCT=$(printf '%s' "SELECT w.account_id FROM wallets w JOIN accounts a ON a.id = w.account_id ORDER BY w.balance_idr DESC, w.account_id LIMIT 1;" \
+        | sqlite3 -readonly -bail -noheader "$SOURCE_PATH" 2>"$ERR" | head -1)
     if [ -z "$ACCT" ]; then
         say "drill:   no wallets row exists in the source - the spot-check has nothing to compare"
         say "drill:   (recorded as NOT APPLICABLE, not as a pass)"
@@ -593,9 +697,9 @@ if [ -n "$ACCT" ]; then
             fail "refusing to interpolate '$ACCT' into SQL - it is not a UUID"
             FAILED=1 ;;
         *)
-            printf "%s'%s';\n" "$SPOT_SQL" "$ACCT" > "$OUT"
-            SRC_SPOT=$(psql_dsn "$DRILL_SOURCE_DSN" -v ON_ERROR_STOP=1 -t -A -F'|' < "$OUT" 2>"$ERR" | tr -d '\r' | head -1)
-            SCR_SPOT=$(psql_dsn "$SCRATCH_DSN" -v ON_ERROR_STOP=1 -t -A -F'|' < "$OUT" 2>"$ERR" | tr -d '\r' | head -1)
+            printf "%s'%s';" "$SPOT_SQL" "$ACCT" > "$OUT"
+            SRC_SPOT=$(sqlite3 -readonly -bail -noheader "$SOURCE_PATH" < "$OUT" 2>"$ERR" | head -1)
+            SCR_SPOT=$(sqlite3 -readonly -bail -noheader "$SCRATCH_PATH" < "$OUT" 2>"$ERR" | head -1)
             say "drill:   account $ACCT  source='$SRC_SPOT'  scratch='$SCR_SPOT'   (balance_idr|ledger_sum)"
             if [ -z "$SRC_SPOT" ]; then
                 fail "spot-check: the account has NO wallets row in the SOURCE - cannot compare"
@@ -619,41 +723,30 @@ fi
 # ---------------------------------------------------------------------------
 say "drill: step 8 - THE CHECK: wallets must equal the ledger"
 say "drill:   invoking the repository's single drift definition: tools/reconcile/reconcile.sh"
-say "drill:   DATABASE_URL=<scratch dsn> sh $RECONCILE_SH"
+say "drill:   DATABASE_URL=<scratch file> sh $RECONCILE_SH"
+# No psql shim any more, and none is needed: reconcile.sh calls the same sqlite3
+# CLI this script just used, against the same file.
 REC_STATUS=0
-if [ "$CLIENT" = host ]; then
-    DATABASE_URL="$SCRATCH_DSN" sh "$RECONCILE_SH" > "$REC_OUT" 2>"$REC_ERR" || REC_STATUS=$?
-else
-    if ! make_psql_shim; then
-        fail "could not generate the psql shim needed to run reconcile.sh without a host client"
-        say "drill: result       FAIL (exit 3)"
-        teardown || :
-        finish 3
-    fi
-    say "drill:   (no host psql: reconcile.sh runs against a shim that execs psql in the '$CONTAINER_SERVICE' service)"
-    # The shim reads these from its environment, so the drill's own
-    # configuration reaches it without the shim having to be re-rendered.
-    export DRILL_COMPOSE_DIR="$COMPOSE_DIR" DRILL_COMPOSE_BASE="$COMPOSE_BASE" \
-           DRILL_SERVICE="$CONTAINER_SERVICE" TMPDIR_SHIM="$SHIM_DIR"
-    PATH="$SHIM_DIR:$PATH" DATABASE_URL="$SCRATCH_DSN" sh "$RECONCILE_SH" > "$REC_OUT" 2>"$REC_ERR" || REC_STATUS=$?
-fi
+DATABASE_URL="$SCRATCH_URL" sh "$RECONCILE_SH" > "$REC_OUT" 2>"$REC_ERR" || REC_STATUS=$?
 [ -s "$REC_OUT" ] && emit "$REC_OUT"
 [ -s "$REC_ERR" ] && { say "drill: reconcile stderr:"; emit "$REC_ERR"; }
 
 case "$REC_STATUS" in
     0) say "drill:   drift check PASSED - reconcile.sh exited 0 (zero drifting rows)" ;;
     1) fail "drift check FAILED - reconcile.sh exited 1: the wallet cache disagrees with the authoritative ledger"
-       fail "  THE CHECK is the gate: docs/backup-and-restore.md - \"Zero rows from the reconciliation query is the gate\""
+       fail "  THE CHECK is the gate: docs/backup-and-restore.md - zero rows from the reconciliation query is the gate"
        fail "  either the restore is corrupt or the source data has a bug; both block trusting a recovery"
        FAILED=1 ;;
-    2) fail "reconcile.sh exited 2: DATABASE_URL was not passed correctly - this is a drill bug"
+    2) fail "reconcile.sh exited 2: DATABASE_URL was not a usable SQLite URL - this is a drill bug"
        FAILED=1 ;;
-    3) fail "reconcile.sh exited 3: no psql available to it"
+    3) fail "reconcile.sh exited 3: no sqlite3 available to it"
        FAILED=1 ;;
-    4) fail "reconcile.sh exited 4: psql failed against the scratch database"
+    4) fail "reconcile.sh exited 4: sqlite3 failed against the scratch database"
        FAILED=1 ;;
     5) fail "reconcile.sh exited 5: a stranded reservation hold older than the bound - money unaccounted for"
        fail "  structurally invisible to the drift query; see tools/reconcile/README.md"
+       FAILED=1 ;;
+    6) fail "reconcile.sh exited 6: no such database file - the restored file is GONE"
        FAILED=1 ;;
     *) fail "reconcile.sh exited $REC_STATUS"
        FAILED=1 ;;
@@ -676,9 +769,10 @@ say "drill: ---------------- drill log ----------------"
 say "drill: date_utc      $STAMP"
 say "drill: run_by        ${USER:-${USERNAME:-$(id -un 2>/dev/null || echo unknown)}} on $(hostname 2>/dev/null || echo unknown-host)"
 say "drill: target        ${DRILL_TARGET:-<none>}   (live_db=$DRILL_LIVE_DB, refused if equal)"
-say "drill: dump          ${DUMP:-<none>}"
-[ -n "${DUMP_SHA:-}" ] && say "drill: dump_sha256   $DUMP_SHA  ($DUMP_BYTES bytes, $TOC TOC entries)"
+say "drill: artifact      ${DUMP:-<none>}"
+[ -n "${DUMP_SHA:-}" ] && say "drill: artifact_sha256 $DUMP_SHA  (${DUMP_BYTES} bytes)"
 say "drill: backup_age    ${BACKUP_AGE_S:-<none: verify-only>} s at restore time"
+say "drill: integrity     ${INTEGRITY:-<none>} (PRAGMA integrity_check on the RESTORED database)"
 if [ -n "$RESTORE_MS" ]; then
     say "drill: restore_ms    $RESTORE_MS  ($((RESTORE_MS / 1000)).$(printf '%03d' "$((RESTORE_MS % 1000))") s) - the real RTO"
 else
@@ -691,7 +785,7 @@ say "drill: log           $LOG"
 say "drill: ------------------------------------------"
 
 if [ "$CODE" = 0 ]; then
-    say "drill: PASS - the backup restored, reconciles with the ledger, and matches the source."
+    say "drill: PASS - the artifact restored, is intact, reconciles with the ledger, and matches the source."
     say "drill: This is measured evidence for the RTO/RPO claim in docs/backup-and-restore.md."
 else
     say "drill: FAIL (exit $CODE) - do NOT claim a working restore until this is green."
