@@ -181,6 +181,45 @@ fn check_spend_limit(requested_idr: i64, spend_used_idr: i64) -> Result<(), AppE
     Ok(())
 }
 
+/// Rejects a requested `token_limit` that cannot be enforced.
+///
+/// 0 means "no limit", which the proxy honours by SKIPPING the check
+/// (`proxy.rs`: `if token_limit > 0`). That is exactly why a negative value must
+/// be refused here instead of stored: every non-positive limit reads as
+/// "unlimited" on the request path, so a negative ceiling would silently become
+/// no ceiling at all — the opposite of the budget the operator set. Same error
+/// shape as `check_spend_limit`, with the field named in `details.reason`.
+fn check_token_limit(requested: i64) -> Result<(), AppError> {
+    if requested < 0 {
+        return Err(AppError::KeyLimitExceeded {
+            details: Some(json!({
+                "reason": "invalid_token_limit",
+                "token_limit": requested,
+                "window_days": SPEND_WINDOW_DAYS,
+            })),
+        });
+    }
+    Ok(())
+}
+
+/// The same refusal for `rate_limit_rpm`.
+///
+/// `proxy.rs`: "Setting `rate_limit_rpm` to 0 disables the check entirely." A
+/// negative value therefore does not throttle harder — it disables throttling,
+/// which is the opposite of what the operator asked for. Refused here, with the
+/// field named, rather than stored and silently obeyed.
+fn check_rate_limit(requested: i32) -> Result<(), AppError> {
+    if requested < 0 {
+        return Err(AppError::KeyLimitExceeded {
+            details: Some(json!({
+                "reason": "invalid_rate_limit_rpm",
+                "rate_limit_rpm": requested,
+            })),
+        });
+    }
+    Ok(())
+}
+
 pub async fn list_keys(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -287,6 +326,11 @@ pub async fn create_key(
     // A key starts with no usage, so its window spend is 0; validate the
     // requested limit against that before storing it.
     check_spend_limit(payload.spend_limit_idr, 0)?;
+    // The other two ceilings are validated here too, BEFORE the INSERT: a
+    // negative value is stored as-is and then read as "no limit" by the proxy,
+    // so accepting it would answer 201 and enforce nothing.
+    check_token_limit(payload.token_limit)?;
+    check_rate_limit(payload.rate_limit_rpm)?;
 
     let key_record = sqlx::query(
         r#"
@@ -339,6 +383,15 @@ pub async fn update_key(
         let spend_used_idr =
             key_spend_used(&state.pool, account_id, id, Utc::now().date_naive()).await?;
         check_spend_limit(requested, spend_used_idr)?;
+    }
+    // A patch that is absent leaves the column alone (COALESCE below), so only a
+    // present value is validated — but a present negative one must be refused
+    // before the UPDATE runs, or it replaces a working ceiling with "unlimited".
+    if let Some(requested) = payload.token_limit {
+        check_token_limit(requested)?;
+    }
+    if let Some(requested) = payload.rate_limit_rpm {
+        check_rate_limit(requested)?;
     }
 
     let models_json = payload.models.map(|m| serde_json::to_value(m).unwrap());
@@ -478,6 +531,44 @@ mod tests {
         assert_eq!(details["window_days"], 30);
     }
 
+    /// docs/website/06-api-keys-and-limits.md line 45: "A limit of `0` or `null`
+    /// means 'no limit of this kind'." A NEGATIVE value is not that: the proxy
+    /// skips any limit it reads as non-positive (`proxy.rs`: `if token_limit > 0`,
+    /// and `limit_reached` is `limit > 0 && used >= limit`), so a negative ceiling
+    /// would be stored and then honoured as UNLIMITED - the exact opposite of the
+    /// ceiling the operator asked for. Same refusal, same error shape as
+    /// `check_spend_limit`; only the reason and the field name differ.
+    #[test]
+    fn test_check_token_limit() {
+        assert!(check_token_limit(0).is_ok(), "0 is the documented no-limit");
+        assert!(check_token_limit(1_000_000).is_ok());
+        let err = check_token_limit(-1).unwrap_err();
+        assert!(matches!(&err, AppError::KeyLimitExceeded { .. }));
+        assert_eq!(err.code(), "key_limit_exceeded");
+        assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
+        let details = err.details().unwrap();
+        assert_eq!(details["reason"], "invalid_token_limit");
+        assert_eq!(details["token_limit"], -1);
+        assert_eq!(details["window_days"], 30);
+    }
+
+    /// The same rule for the per-minute ceiling. 0 disables the check entirely
+    /// (`proxy.rs`: "Setting `rate_limit_rpm` to 0 disables the check"), which is
+    /// exactly why a negative one must never reach the row: it would disable the
+    /// check the operator believed they had just set.
+    #[test]
+    fn test_check_rate_limit() {
+        assert!(check_rate_limit(0).is_ok(), "0 is the documented no-limit");
+        assert!(check_rate_limit(60).is_ok());
+        let err = check_rate_limit(-5).unwrap_err();
+        assert!(matches!(&err, AppError::KeyLimitExceeded { .. }));
+        assert_eq!(err.code(), "key_limit_exceeded");
+        assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
+        let details = err.details().unwrap();
+        assert_eq!(details["reason"], "invalid_rate_limit_rpm");
+        assert_eq!(details["rate_limit_rpm"], -5);
+    }
+
     // -----------------------------------------------------------------------
     // Live Postgres. Ignored rather than silently skipped, exactly like the
     // settlement tests in db.rs and the cap tests in abuse.rs: a test that
@@ -495,9 +586,9 @@ mod tests {
     };
     // Postgres keeps timestamptz at microsecond resolution, so the live tests
     // truncate a computed instant before comparing it to the stored value.
-    use chrono::SubsecRound;
     use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
     use crate::routes::events::RealtimeHub;
+    use chrono::SubsecRound;
     use std::sync::{Arc, Mutex, MutexGuard};
 
     /// The ONE process-wide lock over the proxy's key-metadata cache.
@@ -567,9 +658,7 @@ mod tests {
     async fn live_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
             .expect("set DATABASE_URL to a migrated Postgres instance");
-        init_pool(&database_url)
-            .await
-            .expect("connect to Postgres")
+        init_pool(&database_url).await.expect("connect to Postgres")
     }
 
     async fn create_account(pool: &PgPool) -> Uuid {
@@ -749,7 +838,11 @@ mod tests {
         .expect("create_key must succeed")
         .into_response();
 
-        assert_eq!(res.status(), StatusCode::CREATED, "creation must answer 201");
+        assert_eq!(
+            res.status(),
+            StatusCode::CREATED,
+            "creation must answer 201"
+        );
         let body: Value = json_body(res).await;
         (
             serde_json::from_value(body["id"].clone()).expect("id is a UUID"),
@@ -847,7 +940,10 @@ mod tests {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "the digest must be lowercase hex: {stored}"
         );
-        assert_ne!(stored, plaintext, "the plaintext must not be the stored value");
+        assert_ne!(
+            stored, plaintext,
+            "the plaintext must not be the stored value"
+        );
 
         // And nowhere in the row: a dump must not yield a usable credential.
         let row_text: String =
@@ -1456,7 +1552,11 @@ mod tests {
         .await
         .expect("a valid update must succeed")
         .into_response();
-        assert_eq!(res.status(), StatusCode::OK, "the documented update response");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "the documented update response"
+        );
 
         let row = sqlx::query(
             "SELECT label, models, spend_limit_idr, token_limit, rate_limit_rpm, expires_at
@@ -1698,6 +1798,178 @@ mod tests {
             models,
             json!([]),
             "the empty allowlist must be what was persisted"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// A NEGATIVE CEILING IS REFUSED, AND NOTHING IS WRITTEN.
+    ///
+    /// The pure tests above only prove the check itself. This one proves the
+    /// HANDLERS call it: the proxy skips every limit it reads as non-positive
+    /// (`if rate_limit_rpm > 0`, `limit_reached` = `limit > 0 && used >= limit`),
+    /// so a negative value that reached the row would silently turn the ceiling
+    /// into "unlimited" - the operator sets a budget and gets none. The row
+    /// count is asserted too: a handler that refuses with an error but has
+    /// already INSERTed (or one that stores the value and errors afterwards)
+    /// would leave exactly the key this defect is about behind.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn creating_a_key_with_a_negative_limit_is_refused_and_writes_no_row() {
+        let _cache = CacheLock::acquire();
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        // The control: 0 is the documented "no limit of this kind" and MUST stay
+        // accepted, so the refusal below cannot come from rejecting non-positive
+        // values wholesale.
+        create_key_via_handler(&state, &headers, "unlimited", vec!["flash".into()], 0).await;
+
+        for (token_limit, rate_limit_rpm, reason) in [
+            (-1_i64, 0_i32, "invalid_token_limit"),
+            (0, -1, "invalid_rate_limit_rpm"),
+            (-1, -1, "invalid_token_limit"),
+        ] {
+            let err = match create_key(
+                State(state.clone()),
+                headers.clone(),
+                Json(CreateKeyRequest {
+                    label: Some("negative".into()),
+                    models: vec!["flash".into()],
+                    spend_limit_idr: 0,
+                    token_limit,
+                    rate_limit_rpm,
+                    expires_at: None,
+                }),
+            )
+            .await
+            {
+                Ok(_) => panic!(
+                    "a negative limit must be refused: token_limit={token_limit}, \
+                     rate_limit_rpm={rate_limit_rpm}"
+                ),
+                Err(err) => err,
+            };
+
+            // The SAME shape `check_spend_limit` uses: the shared
+            // `key_limit_exceeded` code, a 402, and `details.reason` naming the
+            // offending field so the dashboard can point at it.
+            assert_eq!(err.code(), "key_limit_exceeded");
+            assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
+            let details = err.details().unwrap();
+            assert_eq!(details["reason"], reason);
+        }
+
+        // Only the control key exists. A refused create must write NOTHING.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM api_keys WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count the account's keys");
+        assert_eq!(
+            rows, 1,
+            "the three refused creates must not have inserted a row"
+        );
+
+        let negative_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM api_keys
+             WHERE account_id = $1 AND (token_limit < 0 OR rate_limit_rpm < 0)",
+        )
+        .bind(account_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count negative limits");
+        assert_eq!(negative_rows, 0, "no negative limit may reach the row");
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        delete_fixture_rows(&pool, account_id).await;
+    }
+
+    /// The same rule on the UPDATE path, where it matters most: the row already
+    /// exists and is enforcing. A negative PATCH that lands replaces a working
+    /// ceiling with "unlimited", so the assertion is not just the 402 - it is
+    /// that the stored value is UNCHANGED.
+    #[ignore = "requires live Postgres: DATABASE_URL pointing at a migrated schema"]
+    #[tokio::test]
+    async fn updating_a_key_with_a_negative_limit_is_refused_and_leaves_the_row_alone() {
+        let _cache = CacheLock::acquire();
+        let pool = live_pool().await;
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (key_id, _, _) =
+            create_key_via_handler(&state, &headers, "limited", vec!["flash".into()], 0).await;
+
+        // Give the key real, non-zero ceilings so "unchanged" is a meaningful
+        // assertion rather than 0 == 0 by accident.
+        let res = update_key(
+            State(state.clone()),
+            Path(key_id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: None,
+                models: None,
+                spend_limit_idr: None,
+                token_limit: Some(500),
+                rate_limit_rpm: Some(60),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("a positive update must succeed")
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK, "the control update must land");
+
+        for (token_limit, rate_limit_rpm, reason) in [
+            (Some(-1_i64), None, "invalid_token_limit"),
+            (None, Some(-1_i32), "invalid_rate_limit_rpm"),
+        ] {
+            let err = match update_key(
+                State(state.clone()),
+                Path(key_id),
+                headers.clone(),
+                Json(UpdateKeyRequest {
+                    label: None,
+                    models: None,
+                    spend_limit_idr: None,
+                    token_limit,
+                    rate_limit_rpm,
+                    expires_at: None,
+                }),
+            )
+            .await
+            {
+                Ok(_) => panic!("a negative limit must be refused on update: {reason}"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code(), "key_limit_exceeded");
+            assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(err.details().unwrap()["reason"], reason);
+        }
+
+        let (token_limit, rate_limit_rpm): (i64, i32) =
+            sqlx::query_as("SELECT token_limit, rate_limit_rpm FROM api_keys WHERE id = $1")
+                .bind(key_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the row back");
+        assert_eq!(
+            (token_limit, rate_limit_rpm),
+            (500, 60),
+            "a refused update must leave the enforced limits untouched"
         );
 
         assert_eq!(
