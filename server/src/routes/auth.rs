@@ -9,9 +9,9 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{SqlitePool, Row};
-use uuid::Uuid;
+use sqlx::{Row, SqlitePool};
 use uuid::fmt::Hyphenated;
+use uuid::Uuid;
 
 use crate::config::{AppConfig, SessionsConfig};
 use crate::error::AppError;
@@ -515,8 +515,8 @@ mod tests {
         .bind(&order_id)
         .bind(Utc::now())
         .execute(pool)
-            .await
-            .expect("create topup");
+        .await
+        .expect("create topup");
 
         let credited = credit_topup_transaction(pool, &order_id, amount_idr)
             .await
@@ -776,14 +776,12 @@ mod tests {
         // have no DEFAULT in the strict SQLite schema, so the Postgres shape (which
         // relied on one) fails at runtime rather than at compile time.
         let seeded_account_id = test_support::account(&pool).await;
-        sqlx::query(
-            "UPDATE accounts SET pb_user_id = ? WHERE id = ?",
-        )
-        .bind(&seeded_pb_user_id)
-        .bind(seeded_account_id.hyphenated())
-        .execute(&pool)
-        .await
-        .expect("link the pre-existing account to its PocketBase identity");
+        sqlx::query("UPDATE accounts SET pb_user_id = ? WHERE id = ?")
+            .bind(&seeded_pb_user_id)
+            .bind(seeded_account_id.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("link the pre-existing account to its PocketBase identity");
         test_support::wallet(&pool, seeded_account_id).await;
         settle_topup(&pool, seeded_account_id, 73_500).await;
 

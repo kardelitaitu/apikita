@@ -12,10 +12,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use tracing::info;
-use uuid::Uuid;
 use uuid::fmt::Hyphenated;
+use uuid::Uuid;
 
 use crate::config::{AppConfig, WalletConfig};
 use crate::error::AppError;
@@ -91,7 +91,10 @@ fn hash_string(s: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn resolve_account_from_cookie(pool: &SqlitePool, headers: &HeaderMap) -> Result<Uuid, AppError> {
+async fn resolve_account_from_cookie(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<Uuid, AppError> {
     let cookie_hdr = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -931,8 +934,8 @@ mod tests {
 
     use crate::db::credit_topup_transaction;
     use crate::routes::events::RealtimeHub;
-    use crate::test_support::{self, TestDb};
     use crate::routes::test_env::{EnvGuard, EnvLock};
+    use crate::test_support::{self, TestDb};
     use axum::body::to_bytes;
     use std::sync::Arc;
 
@@ -1743,14 +1746,14 @@ mod tests {
             "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at) \
              VALUES (?, ?, ?, ?, 'pending', ?)",
         )
-            .bind(Uuid::new_v4().hyphenated())
-            .bind(other_account_id.hyphenated())
-            .bind(1_234_567)
-            .bind(&other_order)
-            .bind(Utc::now())
-            .execute(&pool)
-            .await
-            .expect("create the other account topup");
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(other_account_id.hyphenated())
+        .bind(1_234_567)
+        .bind(&other_order)
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .expect("create the other account topup");
 
         let (status, body) = respond(get_topups(
             State(pool.clone()),

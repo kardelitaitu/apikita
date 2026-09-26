@@ -8,14 +8,14 @@ use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
-use uuid::Uuid;
 use uuid::fmt::Hyphenated;
+use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::routes::proxy::{invalidate_key_cache, AppState};
 use crate::routes::hash_token;
+use crate::routes::proxy::{invalidate_key_cache, AppState};
 
 #[derive(Debug, Serialize)]
 pub struct ApiKeyDto {
@@ -640,8 +640,7 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::db::{
-        credit_topup_transaction, debit_usage_transaction, TopupCreditResult,
-        UsageSettlement,
+        credit_topup_transaction, debit_usage_transaction, TopupCreditResult, UsageSettlement,
     };
     // Postgres keeps timestamptz at microsecond resolution, so the live tests
     // truncate a computed instant before comparing it to the stored value.
@@ -994,10 +993,10 @@ mod tests {
              COALESCE(revoked_at, '') || '|' || created_at
              FROM api_keys WHERE id = ?",
         )
-                .bind(key_id.hyphenated())
-                .fetch_one(&pool)
-                .await
-                .expect("read the whole row");
+        .bind(key_id.hyphenated())
+        .fetch_one(&pool)
+        .await
+        .expect("read the whole row");
         assert!(
             !row_text.contains(&plaintext),
             "the plaintext key appears in its own row: {row_text}"
@@ -1917,12 +1916,11 @@ mod tests {
         }
 
         // Only the control key exists. A refused create must write NOTHING.
-        let rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id = ?")
-                .bind(account_id.hyphenated())
-                .fetch_one(&pool)
-                .await
-                .expect("count the account's keys");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("count the account's keys");
         assert_eq!(
             rows, 1,
             "the three refused creates must not have inserted a row"

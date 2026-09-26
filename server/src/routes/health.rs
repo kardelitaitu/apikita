@@ -48,8 +48,8 @@ pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
     use crate::test_support::TestDb;
+    use axum::body::to_bytes;
     use serde_json::{json, Value};
     use std::str::FromStr;
     use std::time::Duration;

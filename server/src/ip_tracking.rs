@@ -61,7 +61,7 @@ use chrono::{NaiveDate, Utc};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use std::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -882,9 +882,14 @@ mod tests {
 
         // Inside both windows.
         let recent = today - chrono::Duration::days(SEEN_RETENTION_DAYS - 1);
-        record_key_ip(&db.pool, key_id, recent, &ip_hash(&salt, &ip("203.0.113.1")))
-            .await
-            .expect("recent row");
+        record_key_ip(
+            &db.pool,
+            key_id,
+            recent,
+            &ip_hash(&salt, &ip("203.0.113.1")),
+        )
+        .await
+        .expect("recent row");
 
         // Past the hash window but inside the aggregate window: the hash goes,
         // the count stays. That asymmetry is the privacy design.
@@ -895,9 +900,14 @@ mod tests {
 
         // Past both.
         let ancient = today - chrono::Duration::days(DAILY_RETENTION_DAYS + 1);
-        record_key_ip(&db.pool, key_id, ancient, &ip_hash(&salt, &ip("203.0.113.3")))
-            .await
-            .expect("ancient row");
+        record_key_ip(
+            &db.pool,
+            key_id,
+            ancient,
+            &ip_hash(&salt, &ip("203.0.113.3")),
+        )
+        .await
+        .expect("ancient row");
 
         let purged = purge_expired(&db.pool, today).await.expect("purge");
         assert!(

@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use sha2::{Digest, Sha256};
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -86,7 +86,9 @@ pub async fn resolve_account_from_cookie(
     .await?;
 
     match session {
-        Some(s) => Ok(s.try_get::<uuid::fmt::Hyphenated, _>("account_id")?.into_uuid()),
+        Some(s) => Ok(s
+            .try_get::<uuid::fmt::Hyphenated, _>("account_id")?
+            .into_uuid()),
         None => Err(AppError::Unauthenticated),
     }
 }
@@ -581,9 +583,11 @@ mod tests {
             chrono::Utc::now() + chrono::Duration::days(30),
         )
         .await;
-        assert!(resolve_account_from_cookie(&revoked.db.pool, &revoked.cookie_header())
-            .await
-            .is_err());
+        assert!(
+            resolve_account_from_cookie(&revoked.db.pool, &revoked.cookie_header())
+                .await
+                .is_err()
+        );
         revoked.close().await;
 
         let expired = SessionFixture::new(
@@ -592,9 +596,11 @@ mod tests {
             chrono::Utc::now() - chrono::Duration::days(1),
         )
         .await;
-        assert!(resolve_account_from_cookie(&expired.db.pool, &expired.cookie_header())
-            .await
-            .is_err());
+        assert!(
+            resolve_account_from_cookie(&expired.db.pool, &expired.cookie_header())
+                .await
+                .is_err()
+        );
         expired.close().await;
     }
 

@@ -5,7 +5,7 @@ use axum::{
 };
 use futures_util::{stream, Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
@@ -16,8 +16,8 @@ use std::{
     time::Duration,
 };
 use tokio::sync::broadcast::error::RecvError;
-use uuid::Uuid;
 use uuid::fmt::Hyphenated;
+use uuid::Uuid;
 
 use crate::config::RealtimeConfig;
 use crate::error::AppError;
@@ -363,87 +363,47 @@ fn last_event_id(headers: &HeaderMap) -> Option<u64> {
 }
 
 /// SHA-256 hex of a session token.
-
 ///
-
 /// Carried over from the Postgres branch, where the shared resolver in
 /// `crate::routes` took a `PgPool`. It is now a `SqlitePool` too, so this local
 /// copy is equivalent to it and is kept so the handler and its tests run the same
 /// resolver. The token is hashed, never stored raw.
-
 fn hash_string(s: &str) -> String {
-
     let mut hasher = Sha256::new();
-
     hasher.update(s.as_bytes());
-
     hex::encode(hasher.finalize())
-
 }
-
-
 
 /// The account a request's session cookie resolves to, against SQLite.
-
 async fn resolve_account_from_cookie(
-
     pool: &SqlitePool,
-
     headers: &HeaderMap,
-
 ) -> Result<Uuid, AppError> {
-
     let cookie_hdr = headers
-
         .get(axum::http::header::COOKIE)
-
         .and_then(|v| v.to_str().ok())
-
         .ok_or(AppError::Unauthenticated)?;
 
-
-
     for piece in cookie_hdr.split(';') {
-
         let piece = piece.trim();
-
         if let Some(token) = piece.strip_prefix("session=") {
-
             let token_hash = hash_string(token);
-
             let session = sqlx::query(
-
                 "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
-
             )
-
             .bind(token_hash)
-
             .bind(chrono::Utc::now())
-
             .fetch_optional(pool)
-
             .await?;
 
-
-
             if let Some(s) = session {
-
                 return Ok(s.try_get::<Hyphenated, _>("account_id")?.into_uuid());
-
             }
-
         }
-
     }
 
-
-
     Err(AppError::Unauthenticated)
-
 }
-
-
 
 pub async fn sse_events_handler(
     State(state): State<AppState>,
@@ -815,7 +775,10 @@ mod tests {
         );
 
         let mut live_headers = HeaderMap::new();
-        live_headers.insert(header::COOKIE, HeaderValue::from_static("session=live-token"));
+        live_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=live-token"),
+        );
         assert_eq!(
             resolve_account_from_cookie(&db.pool, &live_headers)
                 .await

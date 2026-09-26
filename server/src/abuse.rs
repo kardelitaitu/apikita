@@ -22,7 +22,7 @@
 //! this module holds no state and no second view of the configuration.
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::AppError;

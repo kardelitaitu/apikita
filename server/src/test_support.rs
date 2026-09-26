@@ -297,7 +297,10 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .expect("read busy_timeout");
-        assert_eq!(busy, 5_000, "busy_timeout is what replaces FOR UPDATE waiting");
+        assert_eq!(
+            busy, 5_000,
+            "busy_timeout is what replaces FOR UPDATE waiting"
+        );
 
         db.close().await;
     }
