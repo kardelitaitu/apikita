@@ -104,10 +104,7 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("migration failed: {err}").into());
     }
 
-    let version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(-1);
+    let version = applied_schema_version(&pool).await;
     let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
         .fetch_one(&pool)
         .await
@@ -131,6 +128,17 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     check_preconditions(&journal, fk)?;
 
     Ok(())
+}
+
+/// The schema version the log reports: the version sqlx actually applied,
+/// from sqlx's own tracking table. `PRAGMA user_version` read 0 forever —
+/// sqlx never sets it — so the "logged, not assumed" version line was a
+/// constant zero (measured 2026-09-26 against a freshly migrated database).
+async fn applied_schema_version(pool: &sqlx::SqlitePool) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
 }
 
 /// The three preconditions the schema's constraints depend on, as a pure check
@@ -241,6 +249,40 @@ mod tests {
             format!("sqlite://{}", path.to_str().unwrap().replace('\\', "/")),
             path,
         )
+    }
+
+    #[tokio::test]
+    async fn the_reported_schema_version_is_the_sqlx_applied_version() {
+        // MEASURED (2026-09-26): the log claimed schema_version=0 on a freshly
+        // migrated database whose _sqlx_migrations row says 20260925000000 —
+        // sqlx never sets PRAGMA user_version, so the "logged, not assumed"
+        // version line reported a constant zero. The reported value must be
+        // the version sqlx actually applied.
+        let (url, path) = temp_db_url();
+        run(&url)
+            .await
+            .expect("migrate run must succeed against a fresh database");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("reopen the migrated database");
+
+        let applied: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
+                .fetch_one(&pool)
+                .await
+                .expect("read the sqlx migrations table");
+        assert_eq!(applied, 20_260_925_000_000, "the fixture migration ran");
+
+        assert_eq!(
+            applied_schema_version(&pool).await,
+            applied,
+            "the logged schema_version must be the sqlx-applied version, not PRAGMA user_version"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
