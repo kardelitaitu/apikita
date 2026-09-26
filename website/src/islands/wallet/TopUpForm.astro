@@ -141,7 +141,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
 
 <script>
   import { apiFetch } from '../../lib/api';
-  import { describeError, renderNotice } from '../../lib/errors';
+  import { describeError, fieldInput, renderNotice } from '../../lib/errors';
   import type { Noticeable } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
   import { getLiveStore } from '../../lib/live';
@@ -375,6 +375,9 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
       } catch (err) {
         const view = describeError(err);
         showNotice(view);
+        // The API calls the amount field `amount_idr`; a 422 that names it moves
+        // focus to the input. A failure with no field keeps the notice alone.
+        fieldInput(view.field, { amount_idr: amountInput, amount: amountInput })?.focus();
       } finally {
         submit.disabled = false;
       }

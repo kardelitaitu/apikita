@@ -81,6 +81,8 @@ import Base from '../layouts/Base.astro';
   const googleButton = document.getElementById('google-signin') as HTMLButtonElement;
   const form = document.getElementById('password-signin') as HTMLFormElement;
   const submit = document.getElementById('password-submit') as HTMLButtonElement;
+  const emailInput = document.getElementById('email') as HTMLInputElement;
+  const passwordInput = document.getElementById('password') as HTMLInputElement;
 
   /** Preserve the destination across the login round trip. */
   const next = new URLSearchParams(window.location.search).get('next');
@@ -103,7 +105,9 @@ import Base from '../layouts/Base.astro';
     });
 
   function showError(err: unknown): void {
-    renderLoginError(errorBox, err);
+    // A 422 that names a field moves focus to it; every other failure just writes
+    // the notice. The map is the page's own field names -> inputs.
+    renderLoginError(errorBox, err, { email: emailInput, password: passwordInput });
     errorBox.hidden = false;
   }
 

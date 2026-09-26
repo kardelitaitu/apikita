@@ -11,7 +11,8 @@
 // Node loads this module directly (the test suite), which is why the import
 // carries an explicit `.ts` extension.
 
-import { describeError, inlineNotice } from './errors.ts';
+import { describeError, renderFieldError } from './errors.ts';
+import type { FocusableField } from './errors.ts';
 
 /** The single element the login notice writes to. */
 export interface NoticeText {
@@ -21,11 +22,16 @@ export interface NoticeText {
 /**
  * Render a failed sign-in into login's one notice element.
  *
- * The whole error view is handed to the shared `inlineNotice`, so the notice is
- * `<message> (<request_id>)` — the same shape the keys modal shows. Login
- * previously wrote `<message> (request_id: <id>)`; the shared shape drops the
- * redundant `request_id:` label and shows the same id.
+ * The whole error view is handed to the shared `renderFieldError`, so the notice
+ * is `<message> (<request_id>)` — the same shape the keys modal shows — and a
+ * validation error that names `email` or `password` moves focus to that input.
+ * Login previously wrote `<message> (request_id: <id>)`; the shared shape drops
+ * the redundant `request_id:` label and shows the same id.
  */
-export function renderLoginError(target: NoticeText, err: unknown): void {
-  target.textContent = inlineNotice(describeError(err));
+export function renderLoginError(
+  target: NoticeText,
+  err: unknown,
+  inputs: Readonly<Record<string, FocusableField | null | undefined>> = {},
+): FocusableField | null {
+  return renderFieldError(target, describeError(err), inputs);
 }

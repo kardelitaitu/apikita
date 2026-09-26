@@ -124,7 +124,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
 
 <script>
   import { apiFetch, ApiError } from '../../lib/api';
-  import { describeError, inlineNotice } from '../../lib/errors';
+  import { describeError, inlineNotice, renderFieldError } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
   import { buildCreateKeyRequest, plaintextKeyOf } from '../../lib/dashboard-form';
 
@@ -326,8 +326,16 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       openSecretStep(plaintext);
     } catch (err) {
       if (err instanceof ApiError) {
-        const view = describeError(err);
-        formErr.textContent = inlineNotice(view);
+        // A 422 names the rejected input in details.field (docs/error-model.md),
+        // so move focus to it instead of only writing the sentence. An error with
+        // no field — or one this form does not know — still renders the notice.
+        renderFieldError(formErr, describeError(err), {
+          label: $('k-label'),
+          spend_limit_idr: $('k-spend'),
+          token_limit: $('k-token'),
+          rate_limit_rpm: $('k-rate'),
+          expires_on: $('k-expires'),
+        });
       } else {
         formErr.textContent = err instanceof Error ? err.message : 'Could not create the key.';
       }

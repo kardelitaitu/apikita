@@ -56,6 +56,48 @@ export function inlineNotice(notice: Noticeable): string {
   return notice.requestId === null ? notice.message : `${notice.message} (${notice.requestId})`;
 }
 
+/** A focusable input — the minimum a field error needs; an `<input>` satisfies it. */
+export interface FocusableField {
+  focus(): void;
+}
+
+/**
+ * The input a server-named field points at, or null.
+ *
+ * docs/error-model.md rule 5: a validation error names the rejected input as
+ * `details.field` so the UI can point at it without parsing prose.
+ * `inputs` is the page's own field-name -> element map. A name the page does not
+ * recognise, or no field at all, returns null so the caller keeps its plain
+ * notice instead of guessing or throwing.
+ */
+export function fieldInput(
+  field: string | null,
+  inputs: Readonly<Record<string, FocusableField | null | undefined>>,
+): FocusableField | null {
+  return field === null ? null : inputs[field] ?? null;
+}
+
+/**
+ * Render a one-element error notice and, when the server named a rejected field,
+ * move focus to it. Returns the focused input (or null) so a caller may also
+ * scroll it into view.
+ *
+ * The message and the field travel together in one `ErrorView`, so a caller has
+ * no second argument to drop — the same single-argument rule the other renderers
+ * follow. With no field (or one this page does not know) it is exactly
+ * `inlineNotice`: the notice renders and nothing is focused.
+ */
+export function renderFieldError(
+  target: { textContent: string | null },
+  view: ErrorView,
+  inputs: Readonly<Record<string, FocusableField | null | undefined>> = {},
+): FocusableField | null {
+  target.textContent = inlineNotice(view);
+  const input = fieldInput(view.field, inputs);
+  input?.focus();
+  return input;
+}
+
 export function describeError(err: unknown): ErrorView {
   if (!(err instanceof ApiError)) {
     return {

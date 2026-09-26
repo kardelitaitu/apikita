@@ -25,8 +25,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { ApiError, apiFetch } from '../src/lib/api.ts';
-import { describeError, inlineNotice, renderNotice } from '../src/lib/errors.ts';
+import { describeError, fieldInput, inlineNotice, renderFieldError, renderNotice } from '../src/lib/errors.ts';
 import type { ErrorView, NoticeTarget } from '../src/lib/errors.ts';
+import { renderLoginError } from '../src/lib/login-error.ts';
 
 const REQUEST_ID = 'req_5ff7d8a4beed40978e295ee50c71daac';
 
@@ -219,4 +220,65 @@ test('a 5xx puts its correlation id on screen; a 4xx without one does not', asyn
   renderNotice(forbidden, describeError(await apiError(403, 'forbidden', { request_id: REQUEST_ID })));
   assert.equal(forbidden.message.textContent, 'You do not have permission to do that.');
   assert.equal(forbidden.correlation.textContent, '');
+});
+
+/** A minimal input stand-in that records whether it was focused. */
+function fakeInput(): { focusCount: number; focus(): void } {
+  return {
+    focusCount: 0,
+    focus() {
+      this.focusCount += 1;
+    },
+  };
+}
+
+test('a named field resolves to the page input; an unknown or absent one does not', () => {
+  const email = fakeInput();
+  const password = fakeInput();
+  const inputs = { email, password };
+
+  assert.equal(fieldInput(null, inputs), null, 'no field must not focus anything');
+  assert.equal(fieldInput('email', inputs), email);
+  assert.equal(fieldInput('password', inputs), password);
+  // A field this page does not own is not guessed at: the notice still renders.
+  assert.equal(fieldInput('nickname', inputs), null);
+});
+
+test('renderFieldError writes the notice and moves focus to the named input', async () => {
+  const err = await apiError(422, 'validation_failed', { details: { field: 'spend_limit_idr' } });
+  const target = { textContent: null as string | null };
+  const spend = fakeInput();
+  const label = fakeInput();
+
+  const focused = renderFieldError(target, describeError(err), { spend_limit_idr: spend, label });
+
+  assert.equal(target.textContent, 'Invalid value for "spend_limit_idr".');
+  assert.equal(focused, spend);
+  assert.equal(spend.focusCount, 1);
+  assert.equal(label.focusCount, 0, 'the wrong input must not be focused');
+});
+
+test('renderFieldError with no field renders the notice and focuses nothing', async () => {
+  const err = await apiError(422, 'validation_failed');
+  const target = { textContent: null as string | null };
+  const label = fakeInput();
+
+  const focused = renderFieldError(target, describeError(err), { label });
+
+  assert.equal(target.textContent, 'Invalid value.');
+  assert.equal(focused, null);
+  assert.equal(label.focusCount, 0);
+});
+
+test('the login renderer focuses the input a server-named field points at', async () => {
+  const err = await apiError(422, 'validation_failed', { details: { field: 'email' } });
+  const box = { textContent: null as string | null };
+  const email = fakeInput();
+  const password = fakeInput();
+
+  renderLoginError(box, err, { email, password });
+
+  assert.equal(box.textContent, 'Invalid value for "email".');
+  assert.equal(email.focusCount, 1);
+  assert.equal(password.focusCount, 0);
 });
