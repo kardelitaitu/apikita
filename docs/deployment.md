@@ -166,18 +166,38 @@ Both sides use the same rule — only an explicit `production` selects the live 
 anything else (including unset or a typo) is sandbox — but that rule only decides what
 a *given* value means. It cannot detect that the two values disagree.
 
-A mismatch fails **silently**. A sandbox `snap_token` is not redeemable by the live
-Snap host, and vice versa, so the payment sheet never opens. The top-up row the server
-already wrote stays `pending` forever and no credit is created — the customer is
-charged nothing, but the wallet also never fills and the failure surfaces nowhere.
+A mismatch fails **silently**, but the two directions are not equally bad. The server
+calls Snap *before* it writes anything, and only inserts the top-up row once that call
+succeeds ([`server/src/routes/account.rs:558-572`](../server/src/routes/account.rs)):
+
+- **Server sandbox, browser production.** The server's Snap call is rejected, so no
+  top-up row is ever written. Nothing is charged and nothing is left pending — the
+  request just fails.
+- **Server production, browser sandbox.** This is the genuinely bad direction. The
+  server mints a real `snap_token`, then the browser calls `snap.pay` against the
+  sandbox host, which cannot redeem it, so the payment sheet never opens. The row *was*
+  written and stays `pending` forever, with no credit created — the customer is charged
+  nothing, but the wallet never fills and the failure surfaces nowhere.
 
 - The client key (`PUBLIC_MIDTRANS_CLIENT_KEY`) must belong to the **same
-  environment** as `PUBLIC_MIDTRANS_ENV`. Midtrans prefixes keys by environment
-  (`SB-Mid-client-...` is sandbox); a mismatched pair is caught in the browser and
-  reported to the customer instead of silently hanging.
+  environment** as `PUBLIC_MIDTRANS_ENV`. Midtrans *conventionally* prefixes keys by
+  environment — `SB-Mid-client-...` for sandbox, `Mid-client-...` for production — but
+  that prefix is a convention, not a documented guarantee: no Midtrans reference page
+  states the rule, and this repo carries no client-key sample to check it against, only
+  `SB-Mid-server-` placeholders. The browser's check therefore catches an **internally
+  inconsistent Pages build** — `PUBLIC_MIDTRANS_ENV` disagreeing with
+  `PUBLIC_MIDTRANS_CLIENT_KEY` — and reports that to the customer instead of silently
+  hanging. It cannot catch a **server/Pages disagreement**: it compares two Pages values
+  and cannot read the server's `MIDTRANS_ENV` (see above), so a self-consistent Pages
+  pair whose key belongs to the other environment than the server passes the check.
+  Keeping the server and Pages values in step is left to the operator.
 - Set all three (`MIDTRANS_ENV`, `PUBLIC_MIDTRANS_ENV`, `PUBLIC_MIDTRANS_CLIENT_KEY`)
   in the **same deploy**, then rebuild Pages — changing the Pages value alone has no
   effect until a rebuild (see above).
+
+The authoritative check is being moved server-side — a parallel change is adding the
+server's own environment to the create-topup response — so this section will be updated
+when that lands.
 
 ## Database backups
 
@@ -197,7 +217,7 @@ The wallet ledger is the business.
 | Frontend deploys before server | Calls a 404 endpoint | R3 handles it; redeploy in order |
 | Bad migration, data damaged | Possible data loss | Restore from the pre-migration backup |
 | Env var changed on Pages | No effect until rebuild | Rebuild |
-| `MIDTRANS_ENV` ≠ `PUBLIC_MIDTRANS_ENV` | Payment sheet never opens; top-up stuck `pending`; no credit, silently | Set both in one deploy, rebuild Pages. The browser now names the mismatch instead of hanging |
+| `MIDTRANS_ENV` ≠ `PUBLIC_MIDTRANS_ENV` | Payment sheet never opens; no credit, silently. No top-up row at all when the server is sandbox; a row stuck `pending` when the server is production | Set both in one deploy, rebuild Pages. The browser names an inconsistent Pages build, but nothing detects the server/Pages disagreement — the operator must keep the values in step |
 | Relay config changed | Not automatic — it is not part of the app deploy | SSH or a config repo; test `nginx -t` first |
 | **Relay down** | **Total outage**; the backend is unreachable | It is a single point of failure — see [\`edge-relay.md\`](edge-relay.md) |
 | Postgres volume lost | **Total loss of funds data** | Restore; this is why backups are tested |
