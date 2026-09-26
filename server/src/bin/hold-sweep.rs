@@ -103,18 +103,28 @@ impl StrandedHold {
     }
 }
 
+#[derive(Debug)]
 struct Options {
     max_hold_age_seconds: i64,
     release: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
+    parse_args_from(env::args().skip(1))
+}
+
+/// Parses the CLI arguments from an explicit iterator so the rules can be
+/// pinned by a unit test without reaching into the process's `argv`.
+fn parse_args_from<I>(args: I) -> Result<Options, String>
+where
+    I: Iterator<Item = String>,
+{
     let mut options = Options {
         max_hold_age_seconds: DEFAULT_MAX_HOLD_AGE_SECONDS,
         release: false,
     };
 
-    let mut args = env::args().skip(1);
+    let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--max-hold-age-seconds" => {
@@ -239,6 +249,7 @@ async fn release_hold(pool: &SqlitePool, hold: &StrandedHold) -> Result<i64, sql
 }
 
 fn print_summary(
+    out: &mut impl std::io::Write,
     holds: &[StrandedHold],
     bound_seconds: i64,
     release: bool,
@@ -246,34 +257,41 @@ fn print_summary(
 ) {
     // Plain stdout: the output is meant to be pasted into an incident verbatim,
     // so it must not depend on a log filter being set.
-    println!("stranded-hold sweep");
-    println!(
+    writeln!(out, "stranded-hold sweep").ok();
+    writeln!(
+        out,
         "bound: {}s ({}) - a hold older than this is an incident, not a late release",
         bound_seconds,
         format_age(bound_seconds)
-    );
-    println!(
+    )
+    .ok();
+    writeln!(
+        out,
         "mode:  {}",
         if release {
             "release (opt-in)"
         } else {
             "report-only"
         }
-    );
-    println!("holds: {}", holds.len());
+    )
+    .ok();
+    writeln!(out, "holds: {}", holds.len()).ok();
 
     if holds.is_empty() {
-        println!("result: OK - no reservation hold is stranded; zero rows is the invariant");
+        writeln!(out, "result: OK - no reservation hold is stranded; zero rows is the invariant").ok();
         return;
     }
 
-    println!();
-    println!(
+    writeln!(out).ok();
+    writeln!(
+        out,
         "{:<8} {:<38} {:<44} {:>14} {:>10} {:>5}",
         "AGE", "ACCOUNT", "RESERVATION REF", "AMOUNT_IDR", "HELD_AT", "ROWS"
-    );
+    )
+    .ok();
     for hold in holds {
-        println!(
+        writeln!(
+            out,
             "{:<8} {:<38} {:<44} {:>14} {:>10} {:>5}",
             format_age(hold.age_seconds),
             hold.account_id,
@@ -281,8 +299,9 @@ fn print_summary(
             hold.amount_idr,
             hold.held_at.format("%Y-%m-%dT%H:%M:%SZ"),
             hold.row_count
-        );
-        println!("         pb_user_id={}", hold.pb_user_id);
+        )
+        .ok();
+        writeln!(out, "         pb_user_id={}", hold.pb_user_id).ok();
     }
 
     let over: Vec<&StrandedHold> = holds
@@ -292,24 +311,28 @@ fn print_summary(
     let over_total: i64 = over.iter().map(|h| h.amount_idr.abs()).sum();
     let held_total: i64 = holds.iter().map(|h| h.amount_idr.abs()).sum();
 
-    println!();
-    println!("total stranded: {} IDR", held_total);
-    println!(
+    writeln!(out).ok();
+    writeln!(out, "total stranded: {} IDR", held_total).ok();
+    writeln!(
+        out,
         "over bound:     {} of {} ({} IDR)",
         over.len(),
         holds.len(),
         over_total
-    );
+    )
+    .ok();
 
     if release {
-        println!("released:       {}", released.len());
+        writeln!(out, "released:       {}", released.len()).ok();
     }
     if !over.is_empty() {
-        println!(
+        writeln!(
+            out,
             "result: ALERT - {} hold(s) exceeded the {} bound; money is stranded",
             over.len(),
             format_age(bound_seconds)
-        );
+        )
+        .ok();
     }
 }
 
@@ -420,6 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     print_summary(
+        &mut std::io::stdout(),
         &holds,
         options.max_hold_age_seconds,
         options.release,
@@ -492,5 +516,154 @@ mod tests {
         assert_eq!(format_age(90), "1m30s");
         assert_eq!(format_age(3_600), "1h0m");
         assert_eq!(format_age(90_000), "1d1h");
+    }
+
+    /// Builds a stranded hold with the given age and amount, for the summary
+    /// rendering tests.
+    fn sample_hold(age_seconds: i64, amount_idr: i64, over: bool) -> StrandedHold {
+        StrandedHold {
+            account_id: Uuid::nil(),
+            pb_user_id: "pb_test".into(),
+            reservation_ref: "reserve_test".into(),
+            amount_idr,
+            held_at: Utc::now() - chrono::Duration::seconds(age_seconds),
+            age_seconds,
+            row_count: 1,
+        }
+        .apply_over(over)
+    }
+
+    /// Helper: marks whether the hold is reported as over the bound by setting an
+    /// age above/below a fixed 900s bound used only for rendering fixtures.
+    trait OverMark {
+        fn apply_over(self, over: bool) -> Self;
+    }
+    impl OverMark for StrandedHold {
+        fn apply_over(mut self, over: bool) -> Self {
+            if over {
+                self.age_seconds = 900 + 1;
+            }
+            self
+        }
+    }
+
+    #[test]
+    fn parse_args_defaults_to_the_standard_bound_and_report_only() {
+        let options = parse_args_from(std::iter::empty()).expect("no args is valid");
+        assert_eq!(options.max_hold_age_seconds, DEFAULT_MAX_HOLD_AGE_SECONDS);
+        assert!(!options.release);
+    }
+
+    #[test]
+    fn parse_args_accepts_a_positive_custom_bound() {
+        let options =
+            parse_args_from(["--max-hold-age-seconds", "1200"].into_iter().map(String::from))
+                .expect("valid bound");
+        assert_eq!(options.max_hold_age_seconds, 1200);
+        assert!(!options.release);
+    }
+
+    #[test]
+    fn parse_args_sets_release_flag() {
+        let options = parse_args_from(["--release"].into_iter().map(String::from))
+            .expect("release flag");
+        assert!(options.release);
+        assert_eq!(options.max_hold_age_seconds, DEFAULT_MAX_HOLD_AGE_SECONDS);
+    }
+
+    #[test]
+    fn parse_args_combines_release_and_bound() {
+        let options = parse_args_from(
+            ["--release", "--max-hold-age-seconds", "60"].into_iter().map(String::from),
+        )
+        .expect("combined flags");
+        assert!(options.release);
+        assert_eq!(options.max_hold_age_seconds, 60);
+    }
+
+    #[test]
+    fn parse_args_rejects_a_missing_bound_value() {
+        let err = parse_args_from(["--max-hold-age-seconds"].into_iter().map(String::from))
+            .expect_err("missing value");
+        assert!(err.contains("needs a value"), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_args_rejects_a_non_integer_bound() {
+        let err = parse_args_from(
+            ["--max-hold-age-seconds", "ten"].into_iter().map(String::from),
+        )
+        .expect_err("non-integer value");
+        assert!(err.contains("expects an integer"), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_args_rejects_a_non_positive_bound() {
+        for bad in ["0", "-5"] {
+            let err =
+                parse_args_from(["--max-hold-age-seconds", bad].into_iter().map(String::from))
+                    .expect_err("non-positive value");
+            assert!(err.contains("must be positive"), "got {err:?} for {bad}");
+        }
+    }
+
+    #[test]
+    fn parse_args_rejects_an_unknown_argument() {
+        let err = parse_args_from(["--bogus"].into_iter().map(String::from))
+            .expect_err("unknown argument");
+        assert!(err.contains("unknown argument"), "got {err:?}");
+    }
+
+    #[test]
+    fn summary_reports_ok_when_no_holds_exist() {
+        let mut buf = Vec::new();
+        print_summary(&mut buf, &[], DEFAULT_MAX_HOLD_AGE_SECONDS, false, &[]);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("mode:  report-only"));
+        assert!(out.contains("holds: 0"));
+        assert!(out.contains("result: OK - no reservation hold is stranded"));
+        assert!(!out.contains("ALERT"));
+    }
+
+    #[test]
+    fn summary_reports_holds_within_the_bound_as_non_alert() {
+        let holds = vec![sample_hold(100, -500, false)];
+        let mut buf = Vec::new();
+        print_summary(&mut buf, &holds, DEFAULT_MAX_HOLD_AGE_SECONDS, false, &[]);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("total stranded: 500 IDR"));
+        assert!(out.contains("over bound:     0 of 1"));
+        assert!(!out.contains("ALERT"));
+    }
+
+    #[test]
+    fn summary_reports_an_alert_when_a_hold_exceeds_the_bound() {
+        let holds = vec![
+            sample_hold(100, -500, false),
+            sample_hold(900, -2_000, true),
+        ];
+        let mut buf = Vec::new();
+        print_summary(&mut buf, &holds, DEFAULT_MAX_HOLD_AGE_SECONDS, false, &[]);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("over bound:     1 of 2"));
+        assert!(out.contains("result: ALERT - 1 hold(s) exceeded"));
+    }
+
+    #[test]
+    fn summary_reports_released_count_in_release_mode() {
+        let holds = vec![sample_hold(900, -2_000, true)];
+        let released = vec![sample_hold(900, -2_000, true)];
+        let mut buf = Vec::new();
+        print_summary(
+            &mut buf,
+            &holds,
+            DEFAULT_MAX_HOLD_AGE_SECONDS,
+            true,
+            &released,
+        );
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("mode:  release (opt-in)"));
+        assert!(out.contains("released:       1"));
+        assert!(out.contains("result: ALERT - 1 hold(s) exceeded"));
     }
 }
