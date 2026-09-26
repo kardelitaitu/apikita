@@ -166,7 +166,8 @@ Both sides use the same rule — only an explicit `production` selects the live 
 anything else (including unset or a typo) is sandbox — but that rule only decides what
 a *given* value means. It cannot detect that the two values disagree.
 
-A mismatch fails **silently**, but the two directions are not equally bad. The server
+A mismatch is never diagnosed as a mismatch, and the two directions are not equally
+bad. The server
 calls Snap *before* it writes anything, and only inserts the top-up row once that call
 succeeds ([`server/src/routes/account.rs:558-572`](../server/src/routes/account.rs)):
 
@@ -182,8 +183,11 @@ succeeds ([`server/src/routes/account.rs:558-572`](../server/src/routes/account.
 - The client key (`PUBLIC_MIDTRANS_CLIENT_KEY`) must belong to the **same
   environment** as `PUBLIC_MIDTRANS_ENV`. Midtrans *conventionally* prefixes keys by
   environment — `SB-Mid-client-...` for sandbox, `Mid-client-...` for production — but
-  that prefix is a convention, not a documented guarantee: no Midtrans reference page
-  states the rule, and this repo carries no client-key sample to check it against, only
+  that prefix is a convention, not a documented guarantee: Midtrans does not
+  contractually specify the client-key format, no reference page states the rule, and it
+  is corroborated only by example — Midtrans's own sandbox demo page uses an
+  `SB-Mid-client-...` key, while the bare production prefix comes from a third-party
+  guide. This repo carries no client-key sample to check it against, only
   `SB-Mid-server-` placeholders. The browser's check therefore catches an **internally
   inconsistent Pages build** — `PUBLIC_MIDTRANS_ENV` disagreeing with
   `PUBLIC_MIDTRANS_CLIENT_KEY` — and reports that to the customer instead of silently
