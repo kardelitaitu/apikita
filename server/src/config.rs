@@ -426,21 +426,100 @@ mod tests {
 
     #[test]
     fn test_load_apikita_toml() {
-        // Test parsing the root config/apikita.toml
+        // Test parsing the root config/apikita.toml.
         let paths = ["../config/apikita.toml", "config/apikita.toml"];
-        let mut loaded = false;
-        for p in &paths {
-            if Path::new(p).exists() {
-                let config = AppConfig::load_from_file(p).expect("Failed to load apikita.toml");
-                assert_eq!(config.pricing.currency, "IDR");
-                assert_eq!(config.wallet.min_first_deposit, 50000);
-                assert_eq!(config.wallet.min_topup, 10000);
-                assert!(config.models.len() >= 2);
-                loaded = true;
-                break;
-            }
+        let path = paths
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .expect("Could not find apikita.toml for testing");
+        let config = AppConfig::load_from_file(path).expect("Failed to load apikita.toml");
+        assert_eq!(config.pricing.currency, "IDR");
+        assert_eq!(config.wallet.min_first_deposit, 50000);
+        assert_eq!(config.wallet.min_topup, 10000);
+        assert!(config.models.len() >= 2);
+    }
+
+    /// A config that prices against no model cannot reserve or bill, so the
+    /// defect must be caught at load rather than booting a server that silently
+    /// serves an empty catalogue.
+    #[test]
+    fn an_empty_model_list_is_refused_at_validate() {
+        let mut config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        config.models.clear();
+        let err = config
+            .validate()
+            .expect_err("an empty model list must be refused")
+            .to_string();
+        assert!(err.contains("At least one model"), "got {err}");
+    }
+
+    /// A non-positive price multiplier would size every reservation from zero,
+    /// so it is refused at load exactly like a missing rate.
+    #[test]
+    fn a_zero_or_negative_model_price_is_refused_at_validate() {
+        for bad in [0.0, -1.0] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            config.models[0].price = bad;
+            let err = config
+                .validate()
+                .expect_err("a non-positive price must be refused")
+                .to_string();
+            assert!(
+                err.contains("invalid price multiplier <= 0"),
+                "got {err} for price {bad}"
+            );
         }
-        assert!(loaded, "Could not find apikita.toml for testing");
+    }
+
+    /// A model whose peak rates are absent reserves nothing and can never bill
+    /// the peak it is documented to charge, so the missing figure is fatal.
+    #[test]
+    fn a_model_without_peak_rates_is_refused_at_validate() {
+        for field in ["input_peak", "output_peak"] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            if field == "input_peak" {
+                config.models[0].rates.input_peak = 0.0;
+            } else {
+                config.models[0].rates.output_peak = 0.0;
+            }
+            let err = config
+                .validate()
+                .expect_err("a model without peak rates must be refused")
+                .to_string();
+            assert!(err.contains("missing peak rates"), "got {err} for {field}");
+        }
+    }
+
+    /// A trust entry with no `/PREFIX` is not an ADDRESS/PREFIX pair, and a
+    /// silent skip would trust the wrong relay — so the malformed rule is named
+    /// and rejected, not forgiven. Exercised directly because `parse_cidrs`
+    /// (run by `validate`) rejects a bare token with its own message and never
+    /// reaches this guard.
+    #[test]
+    fn a_trust_entry_without_a_prefix_is_rejected() {
+        let err = validate_trusted_proxy_width(&["not-an-address".to_string()])
+            .expect_err("a trust entry without a prefix must be rejected")
+            .to_string();
+        assert!(err.contains("expected ADDRESS/PREFIX"), "got {err}");
+    }
+
+    /// A trust entry whose prefix will not parse (`/abc`) reaches the second
+    /// parse guard in `validate_trusted_proxy_width` — the address parses but
+    /// the prefix does not, which must also be named and rejected. This is
+    /// exercised directly because `parse_cidrs` (run by `validate`) rejects a
+    /// malformed prefix with its own message and never reaches this guard.
+    #[test]
+    fn a_trust_entry_with_an_unparseable_prefix_is_rejected() {
+        let err = validate_trusted_proxy_width(&["10.0.0.1/abc".to_string()])
+            .expect_err("an unparseable prefix must be rejected")
+            .to_string();
+        assert!(err.contains("expected ADDRESS/PREFIX"), "got {err}");
     }
 
     /// The shipped default must survive the width rule it is documented to
