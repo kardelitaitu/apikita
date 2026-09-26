@@ -44,7 +44,7 @@
     </div>
     <p class="mt-1 text-sm text-ink-muted">Token classes are reported per day, separately — never as one summed number.</p>
 
-    <div id="usage-empty" hidden class="mt-4 rounded-lg border border-edge bg-surface-raised p-6 text-sm text-ink-muted">
+    <div id="usage-daily-empty" hidden class="mt-4 rounded-lg border border-edge bg-surface-raised p-6 text-sm text-ink-muted">
       No usage recorded in this period yet. Create an API key, then call
       <code class="font-mono">POST /v1/chat/completions</code> — see the
       <a href="/docs/quickstart" class="underline">quickstart</a>.
@@ -71,20 +71,19 @@
   import { apiFetch, ApiError } from '../../lib/api';
   import { describeError, inlineNotice } from '../../lib/errors';
   import { formatIdr, formatCount } from '../../lib/format';
-
-  interface UsageBucket {
-    date: string;
-    input_tokens: number;
-    cache_read_tokens: number;
-    output_tokens: number;
-    cost_idr: number;
-  }
+  // The request window and the newest-bucket pick are pure rules, so they live in
+  // lib/ and are pinned by tests/usage-window.test.ts. They cannot live in this
+  // <script> block: astro does not type-check it and node --test cannot load it,
+  // which is how `?from=-30d` (a 422 every load) shipped green.
+  import { bucketDay, newestBucket, usageWindowQuery, type UsageBucket } from '../../lib/usage.ts';
 
   const $ = (id: string) => document.getElementById(id) as HTMLElement;
   const errorEl = $('usage-error');
   const statusEl = $('usage-daily-status');
   const rowsEl = $('usage-rows');
-  const emptyEl = $('usage-empty');
+  // NOT `usage-empty`: /dashboard's own island owns that id and this island is
+  // rendered on the same page (pages/dashboard.astro). Two writers, one id.
+  const emptyEl = $('usage-daily-empty');
 
   function showError(msg: string): void {
     errorEl.textContent = msg;
@@ -114,7 +113,7 @@
     for (const b of buckets) {
       const tr = document.createElement('tr');
       tr.innerHTML =
-        '<th scope="row" class="py-2 pr-4 font-normal">' + escapeHtml(b.date || '—') + '</th>' +
+        '<th scope="row" class="py-2 pr-4 font-normal">' + escapeHtml(bucketDay(b) ?? '—') + '</th>' +
         '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.input_tokens) + '</td>' +
         '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.cache_read_tokens) + '</td>' +
         '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.output_tokens) + '</td>' +
@@ -144,15 +143,16 @@
         [];
       buckets = arr as UsageBucket[];
     }
-    const today = buckets.length ? buckets[buckets.length - 1] : null;
-    return { buckets, today };
+    // The server orders `day DESC` (account.rs:190), so "today" is the newest
+    // day, not the last element of the array.
+    return { buckets, today: newestBucket(buckets) };
   }
 
   async function loadUsage(): Promise<void> {
     clearError();
     statusEl.textContent = 'Loading…';
     try {
-      const payload = await apiFetch<unknown>('/api/usage?from=-30d');
+      const payload = await apiFetch<unknown>('/api/usage' + usageWindowQuery());
       const { buckets, today } = parseUsage(payload);
       renderToday(today);
       renderRows(buckets);
