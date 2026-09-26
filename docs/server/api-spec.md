@@ -298,12 +298,34 @@ The only source of wallet credits.
 
 - The amount comes from **our stored row**, never the payload.
 - `order_id` is unique in SQLite — the database enforces idempotency.
-- Handle `settlement`/`capture` as credit; `deny`/`cancel`/`expire` as terminal;
-  **`refund`/`partial_refund` as debit** even though the policy is
-  non-refundable — disputes arrive uninvited, and an unhandled status corrupts the
-  ledger.
+- Handle `settlement`/`capture` as credit; `deny`/`cancel`/`expire` as terminal.
+- **`refund`/`partial_refund` are refused, never applied** — see below.
 - Respond 200 fast; slow responses get retried, compounding idempotency needs.
 - Signature verification is why the Midtrans server key is server-only.
+
+**`refund` / `partial_refund`: the platform does not do refunds.**
+
+These two statuses are acknowledged with **HTTP 200** and the explicit body:
+
+```json
+{"status": "refund_not_supported"}
+```
+
+and logged at `error!`. The notification changes **nothing**:
+
+- `topups.status` stays `settled` — it is not set to `refunded`.
+- **No `ledger` row is written**, so `wallets.balance_idr` cannot move.
+- **Nothing is published to the realtime stream** — no `balance` event is emitted,
+  because no balance changed.
+- `evaluate_payment_status` returns the named `PaymentAction::RefundRefused` for
+  these two statuses. That variant is **deliberately distinct from
+  `PaymentAction::Unrecognised`**: refusing a refund is a policy answer, not a
+  status we failed to parse. The wallet-debiting refund path is removed.
+
+200 is the right status even though we are refusing: a non-2xx makes Midtrans retry
+a notification that can never succeed. The exposure this creates is a business
+problem, not a code path — it is recorded in
+[docs/website/04-payments.md](../website/04-payments.md).
 
 ---
 
@@ -489,7 +511,7 @@ documented cost of the key-metadata cache and is **not closed by these routes**.
 | Endpoint | Effect |
 | --- | --- |
 | `POST /api/admin/accounts/:id/adjust` | Money: ledger row, `reason='adjustment'` |
-| `POST /api/admin/topups/:id/refund` | Money: `status='refunded'` + ledger debit |
+| ~~`POST /api/admin/topups/:id/refund`~~ | **Not planned.** The wallet-debiting refund machinery was removed — see [the webhook section](#post-webhooksmidtrans). A refund happens at the rail, never against the wallet |
 | `POST /api/admin/keys/:id/revoke` | `revoked_at` (the customer route `POST /api/keys/:id/revoke` exists today) |
 | `POST /api/admin/accounts/:id/logout-all` | Revoke all sessions |
 | `DELETE /api/admin/link-codes/:id` | Invalidate a pending code |

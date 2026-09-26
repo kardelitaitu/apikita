@@ -9,7 +9,7 @@ sensitive document in the set.
 | --- | --- |
 | Rail | **QRIS only**, via Midtrans Snap |
 | Card | **Disabled deliberately** — a flat per-transaction fee is ~20% of a 10k top-up |
-| Refunds | **Non-refundable** by policy; see the caveat below |
+| Refunds | **Non-refundable** by policy; an inbound `refund` notification is **refused, never applied**. See the caveat below |
 | Crediting | **Server webhook only** |
 | Idempotency | By `order_id` |
 | Settlement | To a bank account, T+1/T+2 |
@@ -56,11 +56,21 @@ These do not depend on the field order and are safe to implement now:
 2. **Compare `gross_amount` against your own stored `topups` row.** Never credit
    the amount from the payload.
 3. Match on `order_id`. Unknown → reject and log.
-4. Treat `settlement` (and `capture`) as credit events. `deny`, `cancel`,
-   `expire`, `refund`, `partial_refund` are terminal non-credit (or debit) events.
-5. **Idempotent:** if the `topups` row is already `settled`, return 200 and do
+4. Treat `settlement` (and `capture`) as credit events. `deny`, `cancel` and
+   `expire` are terminal non-credit events.
+5. **`refund` and `partial_refund` are refused — the platform does not do
+   refunds.** Acknowledge with **HTTP 200** and
+   `{"status": "refund_not_supported"}`, log it at `error!`, and change
+   **nothing**: the topup stays `settled`, **no ledger row is written**, the
+   wallet cannot move, and **nothing is published to the realtime stream**.
+   `evaluate_payment_status` returns the named `PaymentAction::RefundRefused`
+   for these statuses — deliberately distinct from `PaymentAction::Unrecognised`,
+   because refusing a refund is a policy answer, not an unparsed status. The
+   wallet-debiting refund path is **removed**. 200 is still correct: a non-2xx
+   makes Midtrans retry a notification that can never succeed.
+6. **Idempotent:** if the `topups` row is already `settled`, return 200 and do
    nothing. Midtrans retries; a double credit is real money.
-6. Respond **200 quickly**. Slow webhooks get retried, which compounds the
+7. Respond **200 quickly**. Slow webhooks get retried, which compounds the
    idempotency requirement.
 
 ## Amounts and fee handling
@@ -83,9 +93,24 @@ Practical consequences:
 
 - Keep a reserve covering outstanding wallet liabilities. Non-refundable reduces
   expected payouts; it does not make them zero.
-- Handle `refund` and `partial_refund` webhook statuses even though the policy
-  says no refunds — they may arrive from a dispute, and an unhandled status
-  leaves the ledger inconsistent.
+- **A refund or chargeback returns the customer's money AT THE RAIL while their
+  wallet keeps the credit. That is negative float, and it is the deliberate
+  operational cost of this policy — not a harmless no-op.**
+  - The webhook for `refund`/`partial_refund` is answered **200
+    `{"status": "refund_not_supported"}`** and changes nothing: the topup stays
+    `settled`, no ledger row is written, the wallet cannot move, and nothing is
+    pushed to the realtime stream. See
+    [`docs/server/api-spec.md`](../server/api-spec.md) §`POST /webhooks/midtrans`.
+  - Because the ledger does not move, **no ledger-drift check fires** — the wallet
+    still equals the sum of its ledger, and `topups` still says `settled`. The
+    **fast** signal is the `error!` log line and nothing else; the monthly
+    Midtrans-vs-`topups` reconciliation below is where it eventually surfaces, up
+    to a month later.
+  - **Mitigation: alert on that refusal.** The `error!` line is the only fast
+    signal this policy has, so it must page — a `refund_not_supported` sitting in
+    a log file is the failure mode. And hold a **reserve** sized to the refunds
+    the rail could force back, so wallet liabilities stay covered when one lands.
+    Unalerted, the refusal is invisible until the bank account is short.
 - Record the policy in the terms of service the user accepts at top-up.
 
 ## Settlement lag
