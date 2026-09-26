@@ -167,8 +167,8 @@ anything else (including unset or a typo) is sandbox — but that rule only deci
 a *given* value means. It cannot detect that the two values disagree.
 
 A mismatch is never diagnosed as a mismatch, and the two directions are not equally
-bad. The server
-calls Snap *before* it writes anything, and only inserts the top-up row once that call
+bad. The server calls Snap *before* it writes anything, and only inserts the top-up row
+once that call
 succeeds ([`server/src/routes/account.rs:558-572`](../server/src/routes/account.rs)):
 
 - **Server sandbox, browser production.** The server's Snap call is rejected, so no
