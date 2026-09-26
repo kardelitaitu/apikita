@@ -68,8 +68,31 @@ fn credit_balance_to_publish(result: &Result<TopupCreditResult, AppError>) -> Op
 
 pub async fn handle_midtrans_webhook(
     State(state): State<AppState>,
-    Json(payload): Json<MidtransNotification>,
+    payload: Result<Json<MidtransNotification>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // A body that fails to deserialize never reaches the typed payload, and
+    // axum's default rejection is a PLAIN-TEXT response - a contract violation
+    // (docs/error-model.md:10: every error returns JSON). Answered here, in
+    // the same flat JSON shape the rest of this endpoint uses, with the
+    // extractor's own status: 400 for syntactically invalid JSON, 415 for a
+    // missing content-type, 422 for JSON that does not fit the notification.
+    // Midtrans retries a non-2xx, which is correct: a malformed delivery is
+    // worth re-sending once the sender's format is fixed.
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            warn!(
+                status = %rejection.status(),
+                body = %rejection.body_text(),
+                "Midtrans webhook rejected: malformed request body"
+            );
+            return (
+                rejection.status(),
+                Json(json!({"error": "invalid webhook body"})),
+            );
+        }
+    };
+
     // The handler works on the pool throughout; only the realtime publish needs
     // the hub, which is why the extractor is AppState rather than SqlitePool.
     let pool = &state.pool;
@@ -694,7 +717,7 @@ mod tests {
         state: &AppState,
         payload: MidtransNotification,
     ) -> (StatusCode, serde_json::Value) {
-        let res = handle_midtrans_webhook(State(state.clone()), Json(payload))
+        let res = handle_midtrans_webhook(State(state.clone()), Ok(Json(payload)))
             .await
             .into_response();
         let status = res.status();
@@ -1272,5 +1295,110 @@ mod tests {
         assert_eq!(balance_of(&pool, account_id).await, 2 * STORED);
         assert_eq!(topup_status_of(&pool, &first).await, "settled");
         assert_reconciled(&pool, account_id, "after the stored-amount refund").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // MALFORMED BODIES. The typed `Json(payload)` extractor answers BEFORE the
+    // handler runs when the body is not a `MidtransNotification`, and axum's
+    // default rejection is a PLAIN-TEXT response - which violates
+    // docs/error-model.md:10 ("Every error returns the same JSON"). The only
+    // way to reach that extractor path is a raw request through a real router,
+    // which the typed `post` helper above cannot do.
+    // -----------------------------------------------------------------------
+
+    /// Posts a RAW body through a real router, the way Midtrans would.
+    async fn post_raw(state: &AppState, body: &str) -> (StatusCode, String, serde_json::Value) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route("/webhooks/midtrans", post(handle_midtrans_webhook))
+            .with_state(state.clone());
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/midtrans")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("build the raw request"),
+            )
+            .await
+            .expect("the router must respond");
+
+        let status = res.status();
+        let content_type = res
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("every response must have a readable body");
+        let parsed = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, content_type, parsed)
+    }
+
+    /// docs/error-model.md:10 - EVERY error returns the same JSON. A body that
+    /// fails to deserialize (a field missing, Midtrans renaming one, a truncated
+    /// POST) is answered by the EXTRACTOR, not the handler, so the signature
+    /// check never runs and the JSON guarantee was never asserted - until now.
+    #[tokio::test]
+    async fn live_webhook_answers_a_malformed_body_with_json_not_plain_text() {
+        run_live(|pool, _account_id, state| async move {
+            // (a) Valid JSON that is not a MidtransNotification: required
+            //     fields are missing.
+            let (status, content_type, body) = post_raw(&state, r#"{"order_id":"x"}"#).await;
+            assert!(
+                content_type.starts_with("application/json"),
+                "a malformed body must be answered with JSON (error-model.md:10), \
+                 got content-type '{content_type}' status {status}"
+            );
+            assert!(
+                !body.is_null(),
+                "the rejection body must parse as JSON, got: {body}"
+            );
+            assert!(
+                status.is_client_error(),
+                "a malformed body is a client error, got {status}"
+            );
+
+            // (b) Not JSON at all.
+            let (status, content_type, body) = post_raw(&state, "not json at all").await;
+            assert!(
+                content_type.starts_with("application/json"),
+                "a non-JSON body must be answered with JSON (error-model.md:10), \
+                 got content-type '{content_type}' status {status}"
+            );
+            assert!(!body.is_null(), "the rejection body must parse as JSON");
+            assert!(status.is_client_error(), "got {status}");
+
+            // (c) Control: a WELL-FORMED but unsigned notification still goes
+            //     through the handler and keeps its own JSON shape - the fix
+            //     must not have moved the happy path.
+            let unsigned = MidtransNotification {
+                order_id: "order_x".to_string(),
+                status_code: "200".to_string(),
+                gross_amount: "50000.00".to_string(),
+                transaction_status: "settlement".to_string(),
+                signature_key: "not-a-real-signature".to_string(),
+                fraud_status: None,
+            };
+            let bytes = serde_json::to_string(&unsigned).expect("serialize the control body");
+            let (status, content_type, body) = post_raw(&state, &bytes).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "the signature refusal must stay JSON, got '{content_type}'"
+            );
+
+            // Nothing above may have written anything, whatever it answered.
+            assert_reconciled(&pool, _account_id, "after malformed bodies").await;
+        })
+        .await;
     }
 }
