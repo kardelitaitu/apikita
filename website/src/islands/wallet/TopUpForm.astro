@@ -26,9 +26,33 @@ const SNAP_JS_URL =
 // empty value means no payment can be opened — the submit handler says so
 // rather than calling snap.pay() with no key.
 const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
+// Midtrans prefixes its keys by environment: `SB-Mid-client-...` is sandbox, a
+// bare `Mid-client-...` is production. That prefix is the one cross-check this
+// page can make against the server's environment without a shared config
+// service, and it is what makes a mismatch visible: the server cannot read a
+// build-time Pages variable, so the browser is the only side that can see both.
+// `unknown` (no key, or a format we do not recognise) disables the check rather
+// than guessing.
+const SNAP_KEY_ENV: 'production' | 'sandbox' | 'unknown' = SNAP_CLIENT_KEY.trim().startsWith(
+  'SB-Mid-client-',
+)
+  ? 'sandbox'
+  : SNAP_CLIENT_KEY.trim().startsWith('Mid-client-')
+    ? 'production'
+    : 'unknown';
+// The host rule above, applied to the same value: anything but an explicit
+// "production" is sandbox. Normalising it here is what lets the browser compare
+// like with like — an unset Pages variable IS sandbox, exactly as an unset
+// MIDTRANS_ENV is server-side, so local dev is not reported as a mismatch.
+const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbox';
 ---
 
-<div id="topup-island">
+<div
+  id="topup-island"
+  data-midtrans-env={MIDTRANS_HOST_ENV}
+  data-midtrans-key-env={SNAP_KEY_ENV}
+  data-midtrans-key-missing={SNAP_CLIENT_KEY.trim() === '' ? 'true' : 'false'}
+>
   <form id="topup-form" class="max-w-md space-y-4" novalidate>
     <div>
       <label for="topup-amount" class="block text-sm font-medium">Amount (IDR)</label>
@@ -196,6 +220,54 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
   const historyRows = document.getElementById('topup-history-rows') as HTMLElement;
   const historyEmpty = document.getElementById('topup-history-empty') as HTMLElement;
 
+  // Read from the island root, not re-derived here: Astro gives the <script> no
+  // access to the frontmatter constants, and re-reading import.meta.env in the
+  // browser would be undefined. The root is the single source these two values
+  // cross the boundary on.
+  const island = document.getElementById('topup-island') as HTMLElement;
+  const midtransEnv = island.dataset.midtransEnv ?? 'sandbox';
+  const midtransKeyEnv = island.dataset.midtransKeyEnv ?? 'unknown';
+  const midtransKeyMissing = island.dataset.midtransKeyMissing === 'true';
+
+  /**
+   * The two Midtrans environments are set on two platforms and nothing keeps
+   * them in sync, so this is the only place both are visible at once.
+   *
+   * A mismatch is fatal and must be loud: a sandbox token handed to the live
+   * Snap host (or the reverse) never opens the payment sheet, the server has
+   * already written a `pending` top-up row, and the customer would otherwise
+   * wait forever for a credit that is never coming. Named in full so whoever
+   * reads it can fix it, and returned as a notice rather than thrown so the
+   * request id is not lost.
+   */
+  function environmentMismatch(): Noticeable | null {
+    // 'unknown' means an empty or unrecognised key, so it is never itself a
+    // mismatch — the missing-key check below owns that case. Checked first so
+    // an empty key cannot fall through this branch and go unnoticed.
+    if (midtransKeyEnv !== 'unknown' && midtransKeyEnv !== midtransEnv) {
+      return {
+        message:
+          `Payment is unavailable: this site is configured for Midtrans '${midtransEnv}' ` +
+          `but its public client key belongs to '${midtransKeyEnv}'. Nothing was charged and no top-up ` +
+          `was created. The site operator must set PUBLIC_MIDTRANS_ENV and PUBLIC_MIDTRANS_CLIENT_KEY to ` +
+          `the same environment and rebuild (see docs/deployment.md).`,
+        requestId: null,
+      };
+    }
+    // Matched, but the key is absent entirely: also unpayable, and also worth
+    // naming rather than discovering after a token has been created.
+    if (midtransKeyMissing) {
+      return {
+        message:
+          `Payment is unavailable: this site was built without PUBLIC_MIDTRANS_CLIENT_KEY, so Snap ` +
+          `cannot open. Nothing was charged and no top-up was created. The site operator must set it ` +
+          `and rebuild (see docs/deployment.md).`,
+        requestId: null,
+      };
+    }
+    return null;
+  }
+
   let minimumIdr = RETOPUP_MIN_IDR;
   let historyLoaded = false;
 
@@ -334,6 +406,15 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
     const amount = validate();
     if (amount === null) return;
 
+    // Checked BEFORE the request, so a misconfigured deployment creates no
+    // top-up row at all. This is the only moment both environments are visible
+    // on one side of the wire.
+    const misconfigured = environmentMismatch();
+    if (misconfigured) {
+      showNotice(misconfigured);
+      return;
+    }
+
     submit.disabled = true;
     void (async () => {
       try {
@@ -351,7 +432,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
           markPending(created.order_id, amount);
           showNotice({
             message:
-              'Payment could not be opened in this browser, so nothing was charged. The order is recorded as pending and will stay pending until it is paid.',
+              'Payment could not be opened in this browser, so nothing was charged. The order is recorded as pending and will stay pending until it is paid. If this happens on every attempt, the site may be configured for the wrong Midtrans environment — the operator should check that MIDTRANS_ENV and PUBLIC_MIDTRANS_ENV match (see docs/deployment.md).',
             requestId: null,
           });
           void loadHistory();
