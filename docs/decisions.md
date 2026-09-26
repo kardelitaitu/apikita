@@ -199,10 +199,16 @@ As of Phases 0–5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
   `concurrent_requests_cannot_overdraw_a_one_request_balance` — had been
   `#[ignore = "requires live Postgres"]` and were therefore never executed
   automatically. They now are.
-- **`sessions.last_seen_at` is seeded but the 7-day idle bound is not enforced.**
-  The column exists so the register's *"30 days absolute, 7 days idle"* becomes
-  representable; enforcing the idle half needs a write on the request path, which is
-  a design decision rather than a port.
+- **`sessions.last_seen_at` now ENFORCES the 7-day idle bound as well as the
+  30-day absolute one.** The idle half needed a write on the request path, and that
+  design decision is now made: resolving a session cookie is the activity signal, so
+  `resolve_account_from_cookie` refuses a session whose stored `last_seen_at` is
+  older than `idle_days` and only then moves it to now (`routes/mod.rs`,
+  `session_is_live_at`). The write lives on the session endpoints only — `/v1/*`
+  authenticates API keys, not cookies, so the proxy hot path is untouched. An idle
+  bound at or above the absolute lifetime is inert by construction, because a
+  session's `expires_at` is seeded `login + absolute_days`; only a value BELOW the
+  absolute lifetime (the shipped 7 against 30) changes any outcome.
 
 This marker exists so the register does not lie in either direction. Here,
 **settled means the direction is chosen, not that the tree matches it** — the register

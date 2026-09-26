@@ -192,7 +192,11 @@ Identity and money now live in different systems, so they can drift.
   PocketBase, and alerts on orphans.
 - **Never hard-delete a PocketBase user.** A deleted user with a funded wallet is
   money nobody can reach.
-- An auth outage does **not** lock out existing users — sessions live in SQLite.
+- An auth outage does **not** lock out existing users — sessions live in SQLite,
+  and a PocketBase that answers **5xx or 429** is treated as an outage (500,
+  retryable) rather than as a rejected token. Only a **4xx refusal** is a 401.
+  Collapsing the two would log every signed-in customer out during a 30-second
+  PocketBase restart.
 
 ## Open questions
 

@@ -87,11 +87,25 @@ opinion.
 - [x] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
       dashboard endpoints.
 - [x] Logout revokes the session row; "sign out everywhere" revokes all of them.
-- [ ] Suspension revokes sessions **and** keys atomically.
-- [ ] Admin endpoints require the operator flag; an operator cannot act on
+- [x] Suspension revokes sessions **and** keys atomically.
+- [x] Admin endpoints require the operator flag; an operator cannot act on
       themselves.
-- [ ] Every admin action writes an `admin_audit` row in the same transaction.
+- [x] Every admin action writes an `admin_audit` row in the same transaction.
+- [x] Session lifetime is **30 days absolute and 7 days idle**, both enforced.
+      The idle half is measured from `sessions.last_seen_at`, which moves when a
+      session cookie resolves on a dashboard endpoint and is **not** touched by
+      `/v1/*` (that path authenticates API keys, not cookies).
 - [ ] Link-code redemption is rate-limited per account and per IP.
+
+> **The three admin items above were implemented in `server/src/routes/admin.rs`
+> and covered by live tests, but the boxes stayed unchecked** — the checklist had
+> drifted *behind* the code. `require_operator` runs before any target lookup (so
+> a non-operator gets an identical 403 for a present and an absent id), one
+> `BEGIN IMMEDIATE` transaction does the status change, the session revocations,
+> the key revocations and the single `admin_audit` insert, and a failed suspend
+> writes no audit row. Link-code redemption is the one item that is genuinely
+> unbuilt: `grep -r 'link_code|redeem' server/src` returns nothing — the table
+> exists in the schema and no code reads it.
 
 ## Gate 4 — Data promises that must be true
 

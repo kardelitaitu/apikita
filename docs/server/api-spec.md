@@ -479,7 +479,7 @@ Identical in every handler, and **steps 1–3 run before the target is read**:
 
 | Case | Status | Code |
 | --- | --- | --- |
-| Missing, unknown, revoked or expired cookie | 401 | `unauthenticated` |
+| Missing, unknown, revoked, expired or **idle** cookie | 401 | `unauthenticated` |
 | Authenticated, `is_operator = false` | 403 | `forbidden` |
 | Operator acting on their own account (including the read-only lookup) | 403 | `forbidden` |
 | Operator, target id absent | 404 | `not_found` |
@@ -488,6 +488,30 @@ Identical in every handler, and **steps 1–3 run before the target is read**:
 Because steps 1–3 precede the target lookup, **a non-operator gets the same 403
 for an existing and an absent id** — the response cannot enumerate account ids.
 An operator gets an honest 404 for an absent target.
+
+### Session lifetime: 30 days absolute, 7 days idle
+
+Both halves are enforced ([decisions.md](../decisions.md), Gate 3):
+
+- **Absolute** — `sessions.expires_at`, seeded at login as `now + absolute_days`
+  (`config/apikita.toml`, `[sessions] absolute_days = 30`).
+- **Idle** — `sessions.last_seen_at`, the last time the credential was actually
+  **used**. Resolving a session cookie on any cookie-authenticated endpoint moves
+  it to now; a session idle for longer than `idle_days` (7) is refused as
+  unauthenticated, and a **refused** session does not move the timestamp.
+
+Three consequences worth stating rather than discovering:
+
+1. **The activity write is on the cookie endpoints only.** `/v1/*` authenticates
+   API keys, not cookies, so it never touches `sessions` — the proxy hot path is
+   unaffected.
+2. **A caller cannot tell "idle" from "dead".** Both are 401 `unauthenticated`,
+   the same rule already applied to revoked and expired sessions.
+3. **An `idle_days` at or above `absolute_days` is inert by construction**,
+   because `expires_at` is seeded from the same login instant. Only an idle bound
+   *below* the absolute lifetime — the shipped 7 against 30 — changes behaviour,
+   so a misconfiguration can never cut a session shorter than the register
+   promises.
 
 **403 is authorization, not authentication** — the caller is authenticated, we
 know who they are, and they may not do this ([error-model.md](../error-model.md),
