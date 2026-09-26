@@ -10,9 +10,21 @@
 // PUBLIC_* values are INLINED INTO BROWSER JAVASCRIPT AND ARE NOT SECRET. The
 // Midtrans server key is server-only and must never appear here.
 
-// Sandbox per MIDTRANS_ENV=sandbox in .env.example. Production is
-// https://app.midtrans.com/snap/snap.js.
-const SNAP_JS_URL = 'https://app.sandbox.midtrans.com/snap/snap.js';
+// Which Snap host the page loads follows PUBLIC_MIDTRANS_ENV — the browser-side
+// mirror of the server's MIDTRANS_ENV (see .env.example). The rule is copied
+// from the server rather than invented: ONLY an explicit "production" selects
+// the live host, so an unset value or a typo stays on sandbox and a bad value
+// can never move real money (server/src/routes/account.rs `is_production`).
+// Sandbox is therefore the default for local dev, where the variable is unset.
+const MIDTRANS_ENV = (import.meta.env.PUBLIC_MIDTRANS_ENV ?? '').trim().toLowerCase();
+const SNAP_JS_URL =
+  MIDTRANS_ENV === 'production'
+    ? 'https://app.midtrans.com/snap/snap.js'
+    : 'https://app.sandbox.midtrans.com/snap/snap.js';
+// Public by design and environment-specific: the sandbox and production client
+// keys differ, so this must be set at build time alongside the host above. An
+// empty value means no payment can be opened — the submit handler says so
+// rather than calling snap.pay() with no key.
 const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
 ---
 
@@ -46,6 +58,15 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
     </button>
   </form>
 
+  <!--
+    Fee disclosure. docs/website/04-payments.md:70 requires the fee be shown before
+    payment. There is no fee to show: the amount model is GROSS and the server
+    credits the entered amount unchanged (server/src/db.rs credit_topup_transaction
+    adds amount_idr with no deduction), and neither the API response nor
+    config/apikita.toml exposes a customer-facing fee. So this states what actually
+    happens, filled in below from the amount the user is about to pay, rather than
+    inventing a rate.
+  -->
   <p id="topup-fee" class="mt-3 max-w-md text-xs text-ink-muted">
     QRIS is the only enabled rail — card payments are deliberately disabled. The
     amount you enter is gross: you pay it and the full amount is credited to your
@@ -161,6 +182,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
   const amountInput = document.getElementById('topup-amount') as HTMLInputElement;
   const hint = document.getElementById('topup-hint') as HTMLElement;
   const errorLine = document.getElementById('topup-error') as HTMLElement;
+  const feeLine = document.getElementById('topup-fee') as HTMLElement;
   const submit = document.getElementById('topup-submit') as HTMLButtonElement;
   const pending = document.getElementById('topup-pending') as HTMLElement;
   const pendingAmount = document.getElementById('topup-pending-amount') as HTMLElement;
@@ -178,6 +200,26 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
   function setError(message: string | null): void {
     errorLine.textContent = message ?? '';
     errorLine.hidden = message === null;
+  }
+
+  /**
+   * The fee line, recomputed from the amount actually entered.
+   *
+   * The amount model is GROSS (docs/website/04-payments.md:122) and the server
+   * credits the entered amount with no deduction (server/src/db.rs
+   * credit_topup_transaction), so the customer-facing fee is a real, computed
+   * zero — not an unknown, and not a rate invented here. Both figures come from
+   * the amount the user typed, so the "what lands in the balance" half of the
+   * disclosure (docs/website/03-functional-spec.md:143) is shown before payment.
+   */
+  function renderFee(amountIdr: number | null): void {
+    feeLine.textContent =
+      amountIdr === null
+        ? 'QRIS is the only enabled rail — card payments are deliberately disabled. ' +
+          'The amount you enter is gross: you pay it and the full amount is credited to your balance.'
+        : `QRIS is the only enabled rail — card payments are deliberately disabled. ` +
+          `You pay ${formatIdr(amountIdr)} gross and ${formatIdr(amountIdr)} is credited to your ` +
+          `balance — there is no top-up fee.`;
   }
 
   // Takes the whole notice, not a message plus an id: there is no second
@@ -210,6 +252,7 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
       return null;
     }
     setError(null);
+    renderFee(amount);
     return amount;
   }
 
@@ -336,7 +379,12 @@ const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
     })();
   });
 
-  amountInput.addEventListener('input', () => setError(null));
+  amountInput.addEventListener('input', () => {
+    setError(null);
+    // A stale fee for the previous amount is the surprise this line exists to
+    // prevent, so it goes back to the general statement until the next validate.
+    renderFee(null);
+  });
 
   // A settlement pushes a `balance` event, so the history and the pending panel
   // follow the stream instead of polling for the webhook.
