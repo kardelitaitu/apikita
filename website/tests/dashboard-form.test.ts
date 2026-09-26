@@ -152,19 +152,21 @@ test('only a create response can reveal a plaintext key, and a missing one is ne
 
 test('the create-key request carries the chosen expiry day, inclusive', () => {
   const built = buildCreateKeyRequest(
-    fields({ label: ' prod ', models: ['flash'], spend_limit_idr: '50000', rate_limit_rpm: '60', expires_on: '2025-12-31' }),
+    fields({ label: ' prod ', models: ['flash'], spend_limit_idr: '50000', rate_limit_rpm: '60', expires_on: '2099-12-31' }),
   );
   assert.ok(built.ok, JSON.stringify(built));
 
   // `expires_at: null` was hardcoded here; a key set to expire on the 31st must
   // not be dead for all of the 31st, so the day is sent as its last millisecond.
+  // The fixture is a far-future day rather than a fixed near one because a past
+  // expiry is now refused outright (see the past-expiry test below).
   assert.deepEqual(built.body, {
     label: 'prod',
     models: ['flash'],
     spend_limit_idr: 50000,
     token_limit: 0,
     rate_limit_rpm: 60,
-    expires_at: '2025-12-31T23:59:59.999Z',
+    expires_at: '2099-12-31T23:59:59.999Z',
   });
 });
 
@@ -201,5 +203,76 @@ test('a limit the API would reject is refused locally, with the field named', ()
   assert.equal(blank.body.spend_limit_idr, 0);
   assert.equal(blank.body.token_limit, 0);
   assert.equal(blank.body.rate_limit_rpm, 0);
+});
+
+// The three tests below pin values that pass a digits-only check but that the
+// server's integer types refuse. All three used to reach `fetch` and come back as
+// axum's raw generic 400 — not the local sentence `limitError` exists to give.
+
+test('a limit larger than the field\'s Rust integer type is refused locally', () => {
+  // server/src/routes/keys.rs line 42: `rate_limit_rpm: i32`. 3e9 is all
+  // digits, so /^\d+$/ let it through, and serde rejected it with a 400.
+  assert.match(String(limitError('3000000000', 'Rate (req/min)', 2_147_483_647)), /2,147,483,647/);
+  assert.equal(limitError('2147483647', 'Rate (req/min)', 2_147_483_647), null);
+
+  // ...and the builder applies that bound, naming the field the user must fix.
+  const rate = buildCreateKeyRequest(fields({ rate_limit_rpm: '3000000000' }));
+  assert.ok(!rate.ok, JSON.stringify(rate));
+  assert.match(rate.error, /Rate \(req\/min\)/);
+  assert.match(rate.error, /whole number/);
+
+  // Lines 38-40: `i64` for both money and tokens — but i64::MAX is already past
+  // JavaScript's exact-integer ceiling, so the bound that matters is that one:
+  // `Number('9223372036854775807')` is 9223372036854776000, a different limit
+  // than the user typed.
+  assert.equal(limitError('9007199254740991', 'Token limit', Number.MAX_SAFE_INTEGER), null);
+  assert.notEqual(limitError('9223372036854775807', 'Token limit', Number.MAX_SAFE_INTEGER), null);
+
+  const spend = buildCreateKeyRequest(fields({ spend_limit_idr: '9223372036854775808' }));
+  assert.ok(!spend.ok, JSON.stringify(spend));
+  assert.match(spend.error, /Spend limit \(IDR\)/);
+
+  const token = buildCreateKeyRequest(fields({ token_limit: '9223372036854775807' }));
+  assert.ok(!token.ok, JSON.stringify(token));
+  assert.match(token.error, /Token limit/);
+});
+
+test('a limit that is not a safe integer after conversion is refused, never sent as a float', () => {
+  // 23 digits: /^\d+$/ passes, but Number() gives 1e+23 and JSON.stringify emits
+  // "1e+23", which serde's i64 deserialiser refuses — another raw 400.
+  const digits = '99999999999999999999999';
+  assert.match(String(limitError(digits, 'Spend limit (IDR)')), /Spend limit \(IDR\)/);
+
+  const built = buildCreateKeyRequest(fields({ spend_limit_idr: digits }));
+  assert.ok(!built.ok, JSON.stringify(built));
+  assert.match(built.error, /Spend limit \(IDR\)/);
+
+  // Whatever does get sent is a plain integer literal in the JSON payload.
+  const ok = buildCreateKeyRequest(fields({ spend_limit_idr: '9007199254740991' }));
+  assert.ok(ok.ok, JSON.stringify(ok));
+  assert.equal(JSON.stringify(ok.body).includes('e+'), false, JSON.stringify(ok.body));
+});
+
+test('an expiry date in the past is refused; today and the future are not', () => {
+  // Nothing on the server rejects a past expires_at, so the key would be created
+  // and immediately render "Expired" in the list — a key that can never
+  // authenticate. Blank is still "never expires".
+  const past = buildCreateKeyRequest(fields({ expires_on: '2020-01-01' }));
+  assert.ok(!past.ok, JSON.stringify(past));
+  assert.match(past.error, /today or a future date/);
+
+  // "Today" is a valid last day: expiryToIso ends the chosen day at 23:59:59.999Z.
+  const today = new Date().toISOString().slice(0, 10);
+  const todayBuilt = buildCreateKeyRequest(fields({ expires_on: today }));
+  assert.ok(todayBuilt.ok, JSON.stringify(todayBuilt));
+
+  // A far-future date is untouched by the guard, and blank stays null.
+  const future = buildCreateKeyRequest(fields({ expires_on: '2099-12-31' }));
+  assert.ok(future.ok, JSON.stringify(future));
+  assert.equal(future.body.expires_at, '2099-12-31T23:59:59.999Z');
+
+  const never = buildCreateKeyRequest(fields({ expires_on: '' }));
+  assert.ok(never.ok, JSON.stringify(never));
+  assert.equal(never.body.expires_at, null);
 });
 

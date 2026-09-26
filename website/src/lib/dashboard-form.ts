@@ -96,12 +96,30 @@ export function describeModelAccess(
  * The shape check is a whole-number test, not `Number()` — `Number()` accepts
  * `-5`, `1e3`, `0x10` and `1.5`, four values the API's integer fields do not
  * mean. Same discipline as `parseRetryAfter`.
+ *
+ * `max` is the largest value the field's Rust type can hold: `i32` for
+ * `rate_limit_rpm` and `i64` for the two money/token limits
+ * (server/src/routes/keys.rs lines 38-42). A string of digits is not enough —
+ * `3000000000` is all digits and overflows `i32`, and a 23-digit
+ * `spend_limit_idr` becomes `1e+23` through `Number()`, which
+ * `JSON.stringify` emits as a float and serde's `i64` refuses. Either one is
+ * rejected by axum before a handler runs, so the user would get the server's raw
+ * generic 400 instead of the local sentence this function exists to give.
+ * `Number.isSafeInteger` catches the second case; `value > max` the first.
+ *
+ * The default is JavaScript's own safe-integer ceiling, which is the contract
+ * this function had before `max` existed: any run of digits, bounded only by
+ * what the language can represent exactly.
  */
-export function limitError(raw: string, label: string): string | null {
+export function limitError(raw: string, label: string, max = Number.MAX_SAFE_INTEGER): string | null {
   const text = raw.trim();
   if (text === '') return null;
   if (!/^\d+$/.test(text)) {
     return `${label} must be a whole number of 0 or more. Leave it blank or 0 for no limit.`;
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value) || value > max) {
+    return `${label} must be a whole number between 0 and ${max.toLocaleString('en-US')}. Leave it blank or 0 for no limit.`;
   }
   return null;
 }
@@ -184,15 +202,24 @@ function wholeNumber(raw: string): number {
  * 3. **An impossible date is refused, not downgraded to "never".** `expiryToIso`
  *    returns null for 2025-02-30, and a non-blank field that parses to nothing
  *    must not quietly become a key that never expires.
+ * 4. **A past expiry day is refused too.** Nothing stops the API accepting an
+ *    `expires_at` already behind us, so the key would be created and then list
+ *    itself as "Expired" the moment it appeared — a key that cannot ever
+ *    authenticate. Blank still means "never expires".
  */
 export function buildCreateKeyRequest(fields: CreateKeyFields): CreateKeyBuild {
-  const limits: [raw: string, label: string][] = [
-    [fields.spend_limit_idr, 'Spend limit (IDR)'],
-    [fields.token_limit, 'Token limit'],
-    [fields.rate_limit_rpm, 'Rate (req/min)'],
+  // The bounds are the server's own field types (server/src/routes/keys.rs lines
+  // 38-42): i64 for the two money/token limits, i32 for the per-minute rate. The
+  // i64 fields are bounded by MAX_SAFE_INTEGER instead, because a larger value —
+  // i64::MAX included — cannot survive JSON.stringify as the number the user
+  // typed, so sending it would store a different limit than the one shown.
+  const limits: [raw: string, label: string, max: number][] = [
+    [fields.spend_limit_idr, 'Spend limit (IDR)', Number.MAX_SAFE_INTEGER],
+    [fields.token_limit, 'Token limit', Number.MAX_SAFE_INTEGER],
+    [fields.rate_limit_rpm, 'Rate (req/min)', 2_147_483_647],
   ];
-  for (const [raw, label] of limits) {
-    const error = limitError(raw, label);
+  for (const [raw, label, max] of limits) {
+    const error = limitError(raw, label, max);
     if (error !== null) return { ok: false, error };
   }
 
@@ -200,6 +227,11 @@ export function buildCreateKeyRequest(fields: CreateKeyFields): CreateKeyBuild {
   const expires_at = expiryToIso(expires_on);
   if (expires_on !== '' && expires_at === null) {
     return { ok: false, error: 'Expires on must be a real calendar date, or blank for a key that never expires.' };
+  }
+  // `expiryToIso` ends the chosen day at 23:59:59.999Z, so a date is past only
+  // once that whole day is behind us — today is still a valid last day.
+  if (expires_at !== null && Date.parse(expires_at) < Date.now()) {
+    return { ok: false, error: 'Expires on must be today or a future date, or blank for a key that never expires.' };
   }
 
   return {
