@@ -18,11 +18,18 @@ business can operate at all.
 - [ ] Record the outcome in [`config/provider1.md`](../config/provider1.md).
 - [ ] Decide the contracting entity (personal or PT) — affects dispute posture,
       volume ceiling, and tax.
+> **Gate 0 partial — owner-deferred.** The legal review below is **deferred by decision**
+> until turnover approaches 4.8 billion IDR/year (the PP 55/2022 UMKM ceiling). The owner
+> is operating personally for now. **The residual risk is accepted knowingly**: no lawyer
+> review, no corporate bank account, and no limited liability at launch. The crypto rail
+> is parked entirely, which removes the largest compliance surface; everything else about
+> the money path is settled in [`decisions.md`](decisions.md).
+
 - [ ] Legal review of [`terms-of-service.md`](terms-of-service.md) — **including the
-      wind-down clause**. The specific legal and tax questions are listed in
-      [`decisions.md`](decisions.md) §"Genuinely open": outbound transfers by the
-      entity, PP 55/2022 on refunded revenue, the crypto regime for stablecoin
-      payouts, KYC/AML on a payee identified by email, and unclaimed balances.
+      wind-down clause**. Explicitly deferred until the 4.8b IDR trigger; re-open then.
+      Questions for that review are listed in [`decisions.md`](decisions.md)
+      §"Genuinely open": outbound transfers without a PT, PP 55/2022 on refunded
+      revenue, KYC/AML on a payee identified by email, and unclaimed balances.
 - [ ] Publish the Terms of Service, including the cross-border forwarding disclosure.
 - [ ] Publish a privacy policy matching [`data-retention.md`](data-retention.md).
 

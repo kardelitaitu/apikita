@@ -110,7 +110,7 @@ strongest argument for 2.00 over 1.50, and it is why the config sets it.
 | Is the business viable? | **Yes, for chat and mixed workloads at M = 2.00** |
 | Viable at M = 1.50? | Only chat-shaped usage |
 | Is every customer profitable? | **No** — cache-heavy loses money at any markup |
-| Decisive unknown | **Support cost per customer** — still unmeasured |
+| Decisive unknown | **Support cost per customer** — still unmeasured. **Placeholder in use: 25,000 IDR/customer/month**, used throughout this model. The model is therefore usable now, and the placeholder is the number to replace with real data |
 
 **Segment by workload, not by spend.** A cache-heavy customer at 20M tokens/month
 is a liability; a chat-shaped one at the same volume is profitable. Volume alone

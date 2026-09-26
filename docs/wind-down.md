@@ -28,7 +28,7 @@ traffic is that same hazard, shipped deliberately. **Write the code when a rail 
 | Rate | **Bank Indonesia JISDOR on the wind-down date, frozen once** for all payouts |
 | Classification | **Ever settled a Midtrans top-up ⇒ Indonesian ⇒ bank transfer. Otherwise ⇒ USD stablecoin** |
 | Rounding | **Down to the cent** — the platform absorbs the remainder, never creating money |
-| Sub-threshold | **Not paid automatically.** Claimable within **12 months**; the company covers the transfer fee |
+| Sub-threshold | **Discharged too** — paid on request with the company covering the transfer fee. The threshold governs what is *automatic*, not what is *owed* |
 | Unclaimed | **A retained liability** — never recognised as revenue |
 | Expiry | **Waived.** The whole balance is paid |
 | Ledger | **Reuse `reason='refund'`** — see why below |
@@ -112,9 +112,12 @@ SELECT w.account_id, w.balance_idr
    AND w.balance_idr <= (2 * :closure_usd_idr_rate);
 ```
 
-These are **not forfeited.** Publish an address for claims, allow **12 months**, cover
-the transfer fee. Keep unclaimed amounts as a **retained liability** — do not book them
-as income.
+These are **not forfeited**, and they are not held back for a fee either. Pay them on
+request and cover the transfer fee: the threshold decides what is *automatic*, not what
+is *owed*. A customer who deposited 50,000 IDR and spent down below USD 2.00 has done
+nothing wrong, and withholding the residue is the unjust-enrichment exposure the
+consumer-protection review exists to catch. Keep anything genuinely unclaimed as a
+**retained liability** — do not book it as income.
 
 ## Step 5 — Pay out
 

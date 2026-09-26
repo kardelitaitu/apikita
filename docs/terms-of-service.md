@@ -232,16 +232,18 @@ Draft language:
 >
 > The USD/IDR rate is the Bank Indonesia **JISDOR** rate on the wind-down date,
 > fixed once for all payouts, and each payout is **rounded down** to the nearest
-> cent. Balances of USD 2.00 or less are not paid automatically; you may claim one
-> within **12 months** of the notice, and we cover the transfer fee. Section 3 does
-> not limit this section.
+> cent. **Every remaining balance is paid, including balances of USD 2.00 or less** —
+> we cover the transfer fee. Section 3 does not limit this section.
 
 **Three things to be precise about:**
 
-- **The threshold, not a floor on deposits.** USD 2.00 is a *payout* threshold, not a
-  balance a customer is required to keep. A customer who deposits 50,000 IDR and
-  spends down below it has done nothing wrong, which is why the claim window exists
-  (see [`decisions.md`](decisions.md) §Money).
+- **Why there is no floor in practice.** USD 2.00 names the point above which a payout
+  is automatic, but balances at or below it are **discharged on request, with us
+  covering the transfer fee** — so no reachable balance is ever stranded. A customer
+  who deposits 50,000 IDR and spends down below the threshold has done nothing wrong,
+  and "we already gave you nothing" is not a defensible answer. Making this
+  unconditional was a deliberate choice: it removes the consumer-protection exposure
+  from stacking a payout floor on top of expiry and non-refundability.
 - **Which rail decides the payout.** The rail a customer paid on. Anyone who used
   Midtrans is treated as Indonesian and paid by bank transfer. This can never be
   applied retroactively, and it never pays crypto to an Indonesian.
@@ -250,13 +252,14 @@ Draft language:
   and clawing credit back at the moment we stop serving would be forfeiture wearing
   a policy's clothes.
 
-> ⚠️ **Open legal and tax questions — flagged, not resolved.** Whether the entity can
-> make outbound transfers at all; refunding revenue already taxed under PP 55/2022;
-> the crypto regime (Bappebti/OJK, PMK 50/2025 0.21% PPh 22) and whether paying a
-> resident in stablecoin is itself a regulated act; KYC/AML on a payee whose only
-> identity may be an email; and the treatment of unclaimed balances. Listed in
-> [`decisions.md`](decisions.md) §"Genuinely open". This clause **reduces** exposure
-> and is the one clause that should not be weakened.
+> ⚠️ **Legal review deferred — a decision, not an oversight.** The owner has decided to
+> operate personally and to defer legal review until turnover approaches **4.8 billion
+> IDR/year** (the PP 55/2022 UMKM ceiling, above which a PT and normal corporate tax
+> follow). Consequence accepted: at launch there is **no lawyer review, no corporate
+> bank account, and no limited liability**. This clause nonetheless **reduces** exposure
+> and is the one clause that should not be weakened — re-open the review the moment the
+> trigger is in sight. The specific questions are listed in
+> [`decisions.md`](decisions.md) §"Genuinely open".
 
 **⚠️ Not implemented.** There is no treasury, no disbursement integration and no
 payout code. Closing the service today is a **manual procedure** documented in
