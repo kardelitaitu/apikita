@@ -20,12 +20,27 @@ import assert from 'node:assert/strict';
 import {
   ENABLED_MODELS,
   allowsModel,
+  buildCreateKeyRequest,
   describeModelAccess,
   expiryToIso,
   limitError,
   passwordChangeError,
   plaintextKeyOf,
+  type CreateKeyFields,
 } from '../src/lib/dashboard-form.ts';
+
+/** The create-key form as the island reads it, with one field overridden. */
+function fields(overrides: Partial<CreateKeyFields> = {}): CreateKeyFields {
+  return {
+    label: 'prod',
+    models: ['flash'],
+    spend_limit_idr: '0',
+    token_limit: '0',
+    rate_limit_rpm: '0',
+    expires_on: '',
+    ...overrides,
+  };
+}
 
 test('an empty allowlist permits nothing, and every listed model is permitted', () => {
   // Deny by default. This is the inversion the suite exists to catch.
@@ -126,3 +141,65 @@ test('only a create response can reveal a plaintext key, and a missing one is ne
   assert.equal(plaintextKeyOf(null), null);
   assert.equal(plaintextKeyOf(undefined), null);
 });
+
+// The three tests below are the create-key request itself. The island used to
+// hardcode `expires_at: null` while collecting nothing that could fill it, and
+// coerced every limit with a local `num()` that turned `-5` into `0` silently —
+// so a negative spend limit reached the server and earned a 402 from
+// `check_spend_limit`, and the expiry helpers were dead code. All three fail
+// against that behaviour: the first two because no builder existed, the third
+// because `-5` was never refused.
+
+test('the create-key request carries the chosen expiry day, inclusive', () => {
+  const built = buildCreateKeyRequest(
+    fields({ label: ' prod ', models: ['flash'], spend_limit_idr: '50000', rate_limit_rpm: '60', expires_on: '2025-12-31' }),
+  );
+  assert.ok(built.ok, JSON.stringify(built));
+
+  // `expires_at: null` was hardcoded here; a key set to expire on the 31st must
+  // not be dead for all of the 31st, so the day is sent as its last millisecond.
+  assert.deepEqual(built.body, {
+    label: 'prod',
+    models: ['flash'],
+    spend_limit_idr: 50000,
+    token_limit: 0,
+    rate_limit_rpm: 60,
+    expires_at: '2025-12-31T23:59:59.999Z',
+  });
+});
+
+test('a blank expiry is "never", and an impossible date is refused rather than downgraded', () => {
+  const never = buildCreateKeyRequest(fields({ expires_on: '  ' }));
+  assert.ok(never.ok, JSON.stringify(never));
+  assert.equal(never.body.expires_at, null);
+
+  // expiryToIso returns null for 2025-02-30; a field the user filled in must not
+  // quietly become a key that never expires.
+  const impossible = buildCreateKeyRequest(fields({ expires_on: '2025-02-30' }));
+  assert.ok(!impossible.ok, JSON.stringify(impossible));
+  assert.match(impossible.error, /real calendar date/);
+});
+
+test('a limit the API would reject is refused locally, with the field named', () => {
+  const negative: [keyof CreateKeyFields, string][] = [
+    ['spend_limit_idr', 'Spend limit (IDR)'],
+    ['token_limit', 'Token limit'],
+    ['rate_limit_rpm', 'Rate (req/min)'],
+  ];
+  for (const [field, label] of negative) {
+    // The old island's num() sent 0 here instead, so nothing was refused and a
+    // negative spend limit earned a 402 the customer should never read.
+    const built = buildCreateKeyRequest(fields({ [field]: '-5' }));
+    assert.ok(!built.ok, `${field}: ${JSON.stringify(built)}`);
+    assert.match(built.error, /whole number/);
+    assert.ok(built.error.includes(label), `${field}: ${built.error}`);
+  }
+
+  // Blank stays the API's own "no limit of this kind" (0), not an error.
+  const blank = buildCreateKeyRequest(fields({ spend_limit_idr: '', token_limit: ' ', rate_limit_rpm: '' }));
+  assert.ok(blank.ok, JSON.stringify(blank));
+  assert.equal(blank.body.spend_limit_idr, 0);
+  assert.equal(blank.body.token_limit, 0);
+  assert.equal(blank.body.rate_limit_rpm, 0);
+});
+

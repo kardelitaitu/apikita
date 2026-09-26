@@ -136,6 +136,85 @@ export function expiryToIso(date: string): string | null {
   return end.toISOString();
 }
 
+/** The create-key form's raw string fields, exactly as the island reads them. */
+export interface CreateKeyFields {
+  label: string;
+  models: readonly string[];
+  spend_limit_idr: string;
+  token_limit: string;
+  rate_limit_rpm: string;
+  expires_on: string;
+}
+
+/**
+ * The `POST /api/keys` body the form produces. Mirrors `CreateKeyRequest` in
+ * server/src/routes/keys.rs lines 32-44, including `expires_at`, which the island
+ * used to hardcode to `null` — a field it collected but never sent.
+ */
+export interface CreateKeyBody {
+  label: string;
+  models: string[];
+  spend_limit_idr: number;
+  token_limit: number;
+  rate_limit_rpm: number;
+  expires_at: string | null;
+}
+
+export type CreateKeyBuild = { ok: true; body: CreateKeyBody } | { ok: false; error: string };
+
+/** A blank limit field is the API's own "no limit of this kind" (0), not a guess. */
+function wholeNumber(raw: string): number {
+  const text = raw.trim();
+  return text === '' ? 0 : Number(text);
+}
+
+/**
+ * The create-key request, or the first reason it must not be sent.
+ *
+ * This is the single place the island's form becomes a request, so the three
+ * rules the API enforces on the way in are checked where the user can still see
+ * them:
+ *
+ * 1. **Every limit goes through `limitError`.** A negative `spend_limit_idr`
+ *    earns a 402 from `check_spend_limit` in server/src/routes/keys.rs, and the
+ *    island's old `num()` helper silently turned `-5` into `0` instead of
+ *    saying so — a value the user typed, quietly replaced.
+ * 2. **The chosen expiry day is sent.** `expiryToIso` makes the day inclusive;
+ *    blank is `null`, which the API reads as "never".
+ * 3. **An impossible date is refused, not downgraded to "never".** `expiryToIso`
+ *    returns null for 2025-02-30, and a non-blank field that parses to nothing
+ *    must not quietly become a key that never expires.
+ */
+export function buildCreateKeyRequest(fields: CreateKeyFields): CreateKeyBuild {
+  const limits: [raw: string, label: string][] = [
+    [fields.spend_limit_idr, 'Spend limit (IDR)'],
+    [fields.token_limit, 'Token limit'],
+    [fields.rate_limit_rpm, 'Rate (req/min)'],
+  ];
+  for (const [raw, label] of limits) {
+    const error = limitError(raw, label);
+    if (error !== null) return { ok: false, error };
+  }
+
+  const expires_on = fields.expires_on.trim();
+  const expires_at = expiryToIso(expires_on);
+  if (expires_on !== '' && expires_at === null) {
+    return { ok: false, error: 'Expires on must be a real calendar date, or blank for a key that never expires.' };
+  }
+
+  return {
+    ok: true,
+    body: {
+      label: fields.label.trim(),
+      models: [...fields.models],
+      spend_limit_idr: wholeNumber(fields.spend_limit_idr),
+      token_limit: wholeNumber(fields.token_limit),
+      rate_limit_rpm: wholeNumber(fields.rate_limit_rpm),
+      expires_at,
+    },
+  };
+}
+
 /**
  * The plaintext key a create response is allowed to reveal, or null.
  *

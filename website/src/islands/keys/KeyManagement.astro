@@ -75,6 +75,14 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
             </div>
           </div>
 
+          <div>
+            <label for="k-expires" class="block text-sm font-medium">Expires on</label>
+            <input id="k-expires" name="expires_on" type="date"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+            <p class="mt-1 text-xs text-ink-muted">Optional. The key works through the end of this day.
+              Leave blank for a key that never expires.</p>
+          </div>
+
           <div id="key-form-error" hidden class="rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
 
           <div class="flex justify-end gap-3 pt-2">
@@ -118,6 +126,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   import { apiFetch, ApiError } from '../../lib/api';
   import { describeError, inlineNotice } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
+  import { buildCreateKeyRequest, plaintextKeyOf } from '../../lib/dashboard-form';
 
   const MODELS_ALL = ['flash', 'deepseek-v4-flash'];
 
@@ -280,20 +289,24 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     clearError();
     const form = e.currentTarget as HTMLFormElement;
     const fd = new FormData(form);
-    const label = String(fd.get('label') ?? '').trim();
-    const models = Array.from(fd.getAll('models')).map(String);
-    const num = (n: string) => {
-      const v = Number(n);
-      return Number.isFinite(v) && v > 0 ? v : 0;
-    };
-    const body = {
-      label,
-      models,
-      spend_limit_idr: num(String(fd.get('spend_limit_idr') ?? '0')),
-      token_limit: num(String(fd.get('token_limit') ?? '0')),
-      rate_limit_rpm: num(String(fd.get('rate_limit_rpm') ?? '0')),
-      expires_at: null,
-    };
+    const formErr = $('key-form-error') as HTMLElement;
+
+    // Every limit and the expiry go through the tested helpers in
+    // lib/dashboard-form.ts, so a bad value is refused here with a sentence the
+    // user can act on rather than sent on to earn a 402 or a 422.
+    const built = buildCreateKeyRequest({
+      label: String(fd.get('label') ?? ''),
+      models: Array.from(fd.getAll('models')).map(String),
+      spend_limit_idr: String(fd.get('spend_limit_idr') ?? ''),
+      token_limit: String(fd.get('token_limit') ?? ''),
+      rate_limit_rpm: String(fd.get('rate_limit_rpm') ?? ''),
+      expires_on: String(fd.get('expires_on') ?? ''),
+    });
+    if (!built.ok) {
+      formErr.textContent = built.error;
+      formErr.hidden = false;
+      return;
+    }
 
     const submitBtn = $('key-submit') as HTMLButtonElement;
     submitBtn.disabled = true;
@@ -301,16 +314,17 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     try {
       const res = await apiFetch<{ id: string; key: string; prefix: string }>('/api/keys', {
         method: 'POST',
-        body: JSON.stringify(body),
+        body: JSON.stringify(built.body),
       });
-      if (typeof res.key !== 'string' || res.key.length === 0) {
-        // Missing plaintext field — stop, do not invent one.
+      // Only the create response can reveal a key, and a missing field is never
+      // invented — both rules live in plaintextKeyOf.
+      const plaintext = plaintextKeyOf(res);
+      if (plaintext === null) {
         openSecretStep(undefined);
         return;
       }
-      openSecretStep(res.key);
+      openSecretStep(plaintext);
     } catch (err) {
-      const formErr = $('key-form-error') as HTMLElement;
       if (err instanceof ApiError) {
         const view = describeError(err);
         formErr.textContent = inlineNotice(view);
