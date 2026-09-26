@@ -322,7 +322,11 @@ pub mod test_env {
                 flag.store(true, Ordering::SeqCst);
             });
 
-            std::thread::sleep(Duration::from_millis(200));
+            // 50 ms, down from 200 ms. The property is "the contender did not get
+            // in during a window in which it demonstrably would have": an
+            // unblocked thread reaches that store in microseconds, so a 10,000x
+            // margin is still a proof and the wait is not the point of the test.
+            std::thread::sleep(Duration::from_millis(50));
             assert!(
                 !entered.load(Ordering::SeqCst),
                 "a second test must NOT get in while the first holds the env lock - that mutual exclusion is what stops two tests interleaving writes to a process-global variable"

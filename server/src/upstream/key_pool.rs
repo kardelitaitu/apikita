@@ -39,6 +39,35 @@ struct Policy {
     cooldown: Duration,
     rate_limit_status: Vec<u16>,
     max_attempts: usize,
+    /// Test-only virtual clock offset, so a cooldown wait needs no real sleeping.
+    ///
+    /// Same device `CircuitBreaker` already uses: the alternative is a test that
+    /// sleeps for the whole cooldown, and the shortest cooldown the configuration
+    /// can express is one second — 1.05 s of the suite spent idle.
+    #[cfg(test)]
+    clock_offset: Mutex<Duration>,
+}
+
+impl Policy {
+    /// Current time, shifted by the test-only virtual clock.
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            let offset = *self.clock_offset.lock().unwrap_or_else(|e| e.into_inner());
+            Instant::now() + offset
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    /// Test-only: advance this pool's virtual clock.
+    #[cfg(test)]
+    fn advance(&self, elapsed: Duration) {
+        let mut offset = self.clock_offset.lock().unwrap_or_else(|e| e.into_inner());
+        *offset += elapsed;
+    }
 }
 
 #[derive(Debug)]
@@ -112,14 +141,22 @@ impl KeyPool {
                 cooldown: Duration::from_secs(cooldown_seconds),
                 rate_limit_status,
                 max_attempts,
+                #[cfg(test)]
+                clock_offset: Mutex::new(Duration::ZERO),
             }),
         }
+    }
+
+    /// Test-only: advance this pool's virtual clock.
+    #[cfg(test)]
+    fn advance(&self, elapsed: Duration) {
+        self.policy.advance(elapsed);
     }
 
     /// Take the least-loaded key that is not cooling, or None when every key is
     /// parked. The returned lease holds one in-flight slot until it is reported.
     pub fn acquire(&self) -> Option<KeyLease> {
-        let now = Instant::now();
+        let now = self.policy.now();
         let slot = self
             .keys
             .iter()
@@ -169,7 +206,7 @@ impl KeyLease {
     /// just frees the slot.
     pub fn report_status(self, status: u16) {
         if self.policy.rate_limit_status.contains(&status) {
-            self.slot.park(Instant::now(), self.policy.cooldown);
+            self.slot.park(self.policy.now(), self.policy.cooldown);
         }
         self.slot.release();
     }
@@ -241,7 +278,10 @@ mod tests {
         a.report_status(429);
         assert!(pool.acquire().is_none(), "key is parked for 1s");
 
-        std::thread::sleep(Duration::from_millis(1050));
+        // The virtual clock, not a 1.05 s sleep: the cooldown is one second
+        // because that is the shortest the configuration can express, and this
+        // test is about the deadline expiring, not about wall-clock time passing.
+        pool.advance(Duration::from_millis(1001));
         assert!(pool.acquire().is_some(), "cooldown elapsed, key is usable");
     }
 
