@@ -756,8 +756,8 @@ mod tests {
 
         let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, created_at)
-             VALUES (?, ?, ?, ?, 'pending', ?)",
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at)
+             VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
         )
         .bind(Uuid::new_v4().hyphenated())
         .bind(account_id.hyphenated())
