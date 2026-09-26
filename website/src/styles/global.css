@@ -74,6 +74,17 @@
   --color-ok-edge: #2f7a55; /* 3.14:1 on its own panel */
   --color-ok-surface: #06251a; /* panel background — as above */
   --color-ok-ink: #8ff0c4; /* 11.99:1 on its own panel */
+
+  /* --- Motion: the hero rate ticker ------------------------------------- */
+  /* The ticker is pure CSS — no script, no island. It translates by exactly
+     half the track height, and the track holds exactly two identical copies of
+     the card list, so half the track IS one copy and the loop has no seam. */
+  --animate-ticker: ticker 40s linear infinite;
+
+  @keyframes ticker {
+    from { transform: translateY(0); }
+    to { transform: translateY(-50%); }
+  }
 }
 
 /* ============================================================================
@@ -90,6 +101,68 @@
 ::selection {
   background-color: var(--color-brand);
   color: var(--color-brand-ink);
+}
+
+/* ============================================================================
+   Hero rate ticker
+
+   SEAM RULES. The loop is only invisible if one period is exactly one copy of
+   the card list. Three things enforce that, and each one alone breaks it:
+     1. The track holds TWO byte-identical copies of the list.
+     2. Spacing between cards is each card's own margin-bottom, never a
+        container `gap` — with gap, one period is copy + gap while -50%
+        translates copy + gap/2, and the loop jumps by half a gap every cycle.
+     3. Every card has a fixed height and shrink-0, so the two copies cannot
+        measure differently and the halves stay equal.
+   The viewport clips with overflow: hidden at an explicit height. */
+.ticker {
+  height: 18.75rem;
+  overflow: hidden;
+  /* Cards must not be selectable-drag targets mid-translate; the content is
+     still read by assistive tech, which ignores the animation entirely. */
+  user-select: none;
+}
+
+.ticker__track {
+  animation: var(--animate-ticker);
+  will-change: transform;
+}
+
+/* Pause so a rate can actually be read. :focus-within is deliberately absent —
+   the cards hold no focusable elements, so it would be dead code. */
+.ticker:hover .ticker__track {
+  animation-play-state: paused;
+}
+
+.ticker__copy {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ticker__card {
+  height: 9rem;
+  margin-bottom: 0.75rem;
+}
+
+/* Reduced motion: the animation stops, so the clip and the duplicate must go
+   too. A bare `animation: none` would leave the list cut off mid-card behind
+   overflow: hidden — hiding content from exactly the users who asked for less
+   motion. Without the animation the duplicate is not needed to close a loop,
+   so it is removed rather than shown twice. */
+@media (prefers-reduced-motion: reduce) {
+  .ticker {
+    height: auto;
+    overflow: visible;
+  }
+
+  .ticker__track {
+    animation: none;
+  }
+
+  .ticker__copy[aria-hidden="true"] {
+    display: none;
+  }
 }
 
 /* One shared focus guard instead of a per-element class. Deliberately NOT in
