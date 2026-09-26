@@ -8,9 +8,17 @@
 #
 # There is no database container. The API uses embedded SQLite at the path in
 # DATABASE_URL (default sqlite://data/server.db) — a file on this host, not a
-# service. Postgres and the PocketBase container were removed by the SQLite
-# migration (docs/plans/sqlite-migration.md); PocketBase returns as a Rust
-# implementation in Phase 6, and it will not be a container either.
+# service. The Postgres container was removed when the schema moved to embedded
+# SQLite (docs/plans/sqlite-migration.md); that migration only changed the
+# database engine, not identity.
+#
+# PocketBase is a SEPARATE concern and is NOT part of the SQLite migration. It is
+# still the identity provider until Phase 6 replaces it with a Rust
+# implementation (todo.md:133); the server still calls it at POCKETBASE_URL for
+# every login (server/src/routes/auth.rs), so removing this file's PocketBase
+# service did not remove the dependency. It is run here as a standalone binary in
+# local dev (docs/local-development.md) rather than a container, and Phase 6's
+# Rust replacement will also be process-local — never a container.
 #
 # Resetting the local database is a file operation, not a volume one, and the
 # instructions live with the rest of the dev loop in docs/local-development.md —
