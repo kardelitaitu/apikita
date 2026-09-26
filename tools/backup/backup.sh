@@ -155,7 +155,12 @@ trap 'rm -f "$RAW" "$DEC" "$TMP_ART" "$ERRA" "$PRUNE_LIST"' EXIT HUP INT TERM
 umask 077
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
-ARTIFACT="$BACKUP_DIR/$ARTIFACT_PREFIX-$TS.dump.enc"
+# The artifact name carries the process stamp too: the timestamp has ONE-SECOND
+# resolution, so two runs completing in the same second would mv their
+# ciphertext to the SAME path - the second silently overwriting the first, both
+# reporting success, one backup gone. The stamp (the same pid-unique STAMP the
+# temp files use) makes the name unique per run.
+ARTIFACT="$BACKUP_DIR/$ARTIFACT_PREFIX-$TS-$STAMP.dump.enc"
 
 # An artifact is only usable if the 16-byte SQLite header is there and
 # integrity_check agrees. This replaces "pg_restore --list": the same question -

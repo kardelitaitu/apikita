@@ -38,9 +38,11 @@ sh tools/backup/backup.sh
 | `BACKUP_DEFAULT_DATABASE_URL` | `sqlite://<repo>/server/data/server.db` | The fallback when `DATABASE_URL` is unset. An **absolute** path on purpose - see below. |
 | `ARTIFACT_PREFIX` | `apikita` | Artifact filename prefix. Also scopes retention pruning. |
 
-Artifacts are named `<prefix>-<UTC timestamp>.dump.enc`, e.g.
-`apikita-20260926T033819Z.dump.enc`. The name carries the time; the mtime is what
-retention uses.
+Artifacts are named `<prefix>-<UTC timestamp>-<pid>.dump.enc`, e.g.
+`apikita-20260926T033819Z-4123.dump.enc`. The name carries the time and the
+process id of the run that made it: the timestamp has one-second resolution, so
+two runs completing in the same second would otherwise overwrite each other's
+artifact while both reported success. The mtime is what retention uses.
 
 ### DATABASE_URL is optional on purpose
 
@@ -167,7 +169,7 @@ Restoring, once the key is at hand:
 
 ```sh
 BACKUP_ENCRYPTION_KEY='<key>' openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-  -pass env:BACKUP_ENCRYPTION_KEY -in apikita-20260926T033819Z.dump.enc > backup.db
+  -pass env:BACKUP_ENCRYPTION_KEY -in apikita-20260926T033819Z-4123.dump.enc > backup.db
 # then, to prove it restores (docs/backup-and-restore.md):
 sh tools/drill/drill.sh --target apikita_drill_scratch.db --dump backup.db
 ```
