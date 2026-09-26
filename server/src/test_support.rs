@@ -363,4 +363,21 @@ mod tests {
             dir_path.display()
         );
     }
+
+    #[tokio::test]
+    async fn zz_measure_testdb_new() {
+        let t = std::time::Instant::now();
+        for _ in 0..30 {
+            let db = TestDb::new().await;
+            db.close().await;
+        }
+        println!("MEASURE 30x TestDb::new+close = {:?}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        for _ in 0..30 {
+            let d = tempfile::tempdir().unwrap();
+            drop(d);
+        }
+        println!("MEASURE 30x bare tempdir = {:?}", t.elapsed());
+    }
 }
