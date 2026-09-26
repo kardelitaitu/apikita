@@ -40,18 +40,21 @@ without a refresh, falling back to polling if the stream drops.
 
 ## Status
 
-**Built and building.** `npm run build` emits 12 pages and `npm test` passes 18 tests.
+**Built and building.** Measured: `npm run build` emits 14 pages and `npm test`
+passes 27 tests (`node --test "tests/**/*.test.ts"` reports `# tests 27`, `# pass 27`).
 What exists today:
 
 - **Public pages** — `/` (landing + pricing), `/login`, `/signup`, `/verify`,
   `/reset`, `/reset/confirm`, `/docs` and `/docs/quickstart`.
-- **Dashboard** — `/dashboard` plus `/dashboard/{keys,usage,wallet}`.
+- **Dashboard** — `/dashboard` plus `/dashboard/{keys,usage,wallet}`, and the
+  `/dashboard/keys/new` and `/dashboard/settings` pages.
 - **Islands** — `islands/keys/KeyManagement.astro`, `islands/usage/UsageAnalytics.astro`,
   `islands/wallet/TopUpForm.astro`, each mounted by its page.
 - **Shared layer** — `lib/{api,errors,format,live,pocketbase,retry-wait,auth-flow}.ts`.
 
-Not built yet: `/dashboard/keys/new` and `/dashboard/settings` are specified
-(`docs/website/03-functional-spec.md` lines 17, 20) but have no page.
+`/dashboard/keys/new` and `/dashboard/settings` are specified
+(`docs/website/03-functional-spec.md` lines 17, 20) and both have a page
+(`src/pages/dashboard/keys/new.astro`, `src/pages/dashboard/settings.astro`).
 
 Design and the authoritative built-vs-planned inventory:
 [`docs/website/README.md`](../docs/website/README.md).

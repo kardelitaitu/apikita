@@ -32,7 +32,8 @@ It does **not** proxy LLM requests. That is [`server/`](../../server/README.md).
 
 **The website is built and builds green.** Measured for this revision:
 `cd website && npm run build` emits **14 static pages** and `npm test` passes
-**24 tests** (`node --test "tests/**/*.test.ts"`). Every route in the spec's table
+**27 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 27`, `# pass 27`).
+Every route in the spec's table
 (lines 9-21) now has a page. What follows separates what exists from what is
 designed-but-unbuilt; unbuilt items are marked, never deleted.
 
@@ -91,10 +92,12 @@ the islands call these; `website/tests/auth-flow.test.ts` and
 `POST /api/keys` call site; the page adds the allowlist-semantics explanation the
 modal cannot fit.
 
-> **Status: NOT IMPLEMENTED (no UI).** Logout and "sign out everywhere" have server
-> routes (`/auth/logout`, `/auth/logout-all`) and the dashboard shell carries both
-> controls (`layouts/DashboardLayout.astro`), but "sign out everywhere" is only in the
-> header today — `/dashboard/settings` links to it rather than repeating it.
+**Logout and "sign out everywhere" are implemented.** Both controls render in the
+dashboard shell (`layouts/DashboardLayout.astro`, the `#logout` and `#logout-all`
+buttons) and are wired to `POST /auth/logout` and `POST /auth/logout-all`
+respectively; each clears the local token and redirects to `/login`. "Sign out
+everywhere" lives only in the header — `/dashboard/settings` links to it rather than
+repeating it.
 
 > **Status: NOT IMPLEMENTED.** Telegram link/unlink is read-only.
 > `docs/server/api-spec.md` specifies `POST /api/telegram/link-code` and
@@ -124,7 +127,7 @@ state, checked against the tree rather than assumed:
 | Create API keys, all models | [06-api-keys-and-limits.md](06-api-keys-and-limits.md) | **Built** — `KeyManagement` island over `/api/keys` |
 | Usage limits (spend / token / rate / expiry) | [06-api-keys-and-limits.md](06-api-keys-and-limits.md) | **UI built** (limit fields in the island). Server-side enforcement in `server/src/routes/proxy.rs` not verified here |
 | Google + email/password login | [03-functional-spec.md](03-functional-spec.md), [../architecture/identity.md](../architecture/identity.md) | **Pages built** (`/login`, `/signup`). The Google round-trip was not exercised |
-| Logout + sign out everywhere | [03-functional-spec.md](03-functional-spec.md), [05-security-decisions.md](05-security-decisions.md) | **Routes built**, **no UI control** (see above) |
+| Logout + sign out everywhere | [03-functional-spec.md](03-functional-spec.md), [05-security-decisions.md](05-security-decisions.md) | **Built** — header controls in `layouts/DashboardLayout.astro` call `POST /auth/logout` and `POST /auth/logout-all` |
 | Password reset | [03-functional-spec.md](03-functional-spec.md) | **Built** — `/reset`, `/reset/confirm`, covered by `tests/auth-flow.test.ts` |
 
 ### Next step
