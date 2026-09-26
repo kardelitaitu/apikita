@@ -1004,4 +1004,49 @@ mod tests {
 
         db.close().await;
     }
+
+    #[test]
+    fn daily_salt_default_builds_a_fresh_salt() {
+        // The `Default` impl backs `#[derive(Default)]` callers and the app's
+        // lazy init; it must produce a real, non-guessable salt for today.
+        let salt = DailySalt::default();
+        let day = today_utc();
+        assert_ne!(
+            salt.salt_for_day(day),
+            [0u8; 32],
+            "a default salt must not be all zeroes"
+        );
+    }
+
+    #[test]
+    fn the_zero_prefix_mask_is_explicitly_zero() {
+        // `prefix == 0` is the documented special case: shifting a 32- or
+        // 128-bit value by its full width is undefined and would panic on the
+        // request path, so both masks return 0 explicitly.
+        assert_eq!(v4_mask(0), 0);
+        assert_eq!(v6_mask(0), 0);
+    }
+
+    #[tokio::test]
+    async fn recording_past_the_sharing_threshold_warns_once() {
+        // docs/ip-tracking.md: a key seen from >20 distinct domestic IPs in a
+        // day is a sharing-suspicion flag for a human, not a refusal. The
+        // warning is logged at the crossing (distinct_ips == SHARING_SUSPICION_IPS + 1),
+        // which is the branch that must not silently stop firing.
+        let db = TestDb::new().await;
+        let (_, key_id) = create_key(&db.pool).await;
+        let day = today_utc();
+        let salt = [9u8; 32];
+
+        for i in 1..=(SHARING_SUSPICION_IPS + 1) {
+            let address = format!("198.51.100.{i}");
+            let hash = ip_hash(&salt, &ip(&address));
+            let counts = record_key_ip(&db.pool, key_id, day, &hash)
+                .await
+                .expect("record request source");
+            assert_eq!(counts.distinct_ips, i, "the {i}-th distinct IP");
+        }
+
+        db.close().await;
+    }
 }
