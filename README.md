@@ -108,7 +108,7 @@ What exists today:
 | --- | --- |
 | [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → **289 passed / 0 failed / 2 ignored**, against a temp SQLite file — no server to start. The 2 ignored need a live PocketBase. |
 | [`website/`](website/README.md) | Astro site. `npm run build` → 17 pages; `npm test` → 64 passed. |
-| [`tools/`](tools/) | `reconcile`, `alert`, `fake-upstream`, `fake-midtrans`, and the SQLite probes — each with a documented exit-code contract. `backup`/`drill` still implement the **PostgreSQL** procedure and cannot back up the shipped SQLite database yet. |
+| [`tools/`](tools/) | `reconcile`, `alert`, `fake-upstream`, `fake-midtrans`, and the SQLite probes — each with a documented exit-code contract. `backup`, `drill`, `alert` and the maintenance jobs all drive the `sqlite3` CLI against the embedded database. |
 | [`telegram/`](telegram/README.md) | Design only — no code yet. |
 
 Not yet: a deployment, a live Midtrans round-trip, and the operational gates in

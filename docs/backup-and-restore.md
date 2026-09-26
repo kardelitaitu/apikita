@@ -38,7 +38,8 @@ ledger is the business.
 > consequences worth naming: (1) the database is on a **persistent volume**, so a
 > backup that does not leave that volume is not a backup; and (2) copying a live
 > SQLite file without `VACUUM INTO`/`.backup` can capture a torn WAL — use the
-> online-backup form. The shipped tooling still targets Postgres; see Open items.
+> online-backup form. The shipped tooling does exactly this — `.backup` (the online
+> backup API), header + `integrity_check` verification, then the reconcile gate.
 
 **The pre-migration snapshot is not optional.** It is the cheapest rollback that
 exists; see [`deployment.md`](deployment.md).
@@ -167,12 +168,14 @@ silent failure.** Alert on size, not just exit code.
       before success, encrypted, retention-pruned, with an offsite hook and a documented exit-code
       contract. **This is the daily-snapshot half only** — it does **not** meet the 15-minute RPO;
       the continuous layer is still unchosen.
-      > **NOT YET PORTED — this is the sharpest open item in the document.**
-      > `tools/backup/backup.sh` and `tools/drill/drill.sh` still implement the **PostgreSQL**
-      > procedure: they require a `postgres://` `DATABASE_URL`, resolve `pg_dump`/`pg_restore`/
-      > `psql`, and refuse anything else (exit 2). With the server on embedded SQLite that means
-      > **the shipped tooling cannot back up or restore the production database at all.** The
-      > mechanism above (copy the file, reconcile, verify) is what the tools must become. Tracked
+      > **PORTED (was the sharpest open item in this document).** `tools/backup/backup.sh` and
+      > `tools/drill/drill.sh` now implement the **SQLite** procedure: a `.backup` copy, header +
+      > `integrity_check` on both the artifact and the **restored** file, and the reconcile gate.
+      > They refuse a `postgres://` `DATABASE_URL` by name (exit 2). Verified end-to-end against a
+      > scratch database built from the migration: a balanced source restores and reconciles green; a
+      > drifted source **fails** (exit 1); a truncated or zero-length artifact is caught by the header
+      > check (exit 6); and a zero-length *source* is refused, because SQLite opens an empty file as a
+      > fresh database and the drill would otherwise pass on a restore of nothing. Was tracked
       > in [`tools/backup/README.md`](../tools/backup/README.md) and
       > [`tools/drill/README.md`](../tools/drill/README.md).
 - [ ] Offsite storage provider and encryption key custody.

@@ -140,10 +140,14 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
           before success, retention-pruned, with an offsite hook and a documented exit-code
           contract. Verified locally: real backup succeeds; missing key refuses and writes nothing;
           a corrupt/empty dump fails rather than reporting success.
-    - [ ] **Port `backup.sh`/`drill.sh` off PostgreSQL.** Both still require a `postgres://`
-          `DATABASE_URL` and `pg_dump`/`pg_restore`/`psql`, so today they **cannot** back up or
-          restore the shipped SQLite database. See
-          [`docs/backup-and-restore.md`](docs/backup-and-restore.md) §Open items.
+    - [x] **Port `backup.sh`/`drill.sh` off PostgreSQL.** **DONE** — both now drive the `sqlite3`
+          CLI against `DATABASE_URL`, using `.backup` (the online backup API, so a live WAL writer
+          cannot produce a torn copy) plus header and `integrity_check` verification. Verified
+          end-to-end against a scratch database from the migration, including the failure paths:
+          drifted source fails (exit 1), corrupt/truncated artifact fails (exit 6), a zero-length
+          source is refused rather than reported as a passing restore, and a missing encryption key
+          refuses and writes nothing. See
+          [`docs/backup-and-restore.md`](docs/backup-and-restore.md).
     - [ ] Offsite storage provider + encryption key custody — **a human decision**, still open. Note
           `backup.sh` is a daily snapshot, so it does NOT meet the 15-minute RPO; the continuous
           layer remains to be chosen.
