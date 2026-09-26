@@ -20,8 +20,10 @@ const models = ['flash', 'deepseek-v4-flash'];
 
 // The hero rate ticker: one card per model per billing basis, each card showing
 // the three token classes, IDR per 1M tokens. Peak is what a customer is billed
-// today (config: billing_basis = "peak"), so the off-peak figures are shown for
-// reference only and are marked as not billed.
+// today (config: billing_basis = "peak"), so each off-peak card carries its own
+// "Not billed" badge and renders its figures in the muted ink, never the
+// money-reserved accent. The marking is per-card and self-contained: there is
+// deliberately no separate explanatory note under the ticker.
 const rateClasses = ['Input', 'Cache hit', 'Output'];
 const peakPrices = rates.map((rate) => rate.price);
 const offPeakPrices = ['2,008', '40', '8,030'];
@@ -245,10 +247,6 @@ const faq = [
           ))}
         </div>
       </div>
-      <p class="mt-3 text-xs leading-relaxed text-ink-muted">
-        You are billed the Peak rates, every request, at any hour. Off-peak rates are
-        published for reference only and are not billed.
-      </p>
     </aside>
   </section>
 
