@@ -18,6 +18,7 @@ Three things the business does that customers must be told **before** they pay:
 | --- | --- |
 | **Prompts are forwarded to a provider in mainland China** | Materially affects the customer's data |
 | **Deposits are non-refundable** | A payment term; cannot be introduced after the fact |
+| **Credit expires 2 years after deposit** | A term that extinguishes value; must be disclosed before it can be relied on |
 | **Prompts are not logged by us, but the upstream's retention applies** | Otherwise "we do not store your data" is misleading |
 
 **The third is the one operators most want to skip, and the one that causes the
@@ -89,11 +90,34 @@ refused and changes nothing (see
 > This is a **lawyer's call and remains a Gate 0 item**. The text above records the
 > decision; it does not certify it is enforceable.
 
-### Expiry
+### Expiry — settled: credit expires 2 years after deposit
 
-**Open decision:** do credits expire? If they do, it must be stated and the period
-must be reasonable. An expiring balance that is never refunded is a consumer-
-protection problem.
+**Decided: unused credit expires 2 years (24 months) from the date it was
+deposited.** Settled in [`decisions.md`](decisions.md) §Money; the period is stated
+here because it must be disclosed before it is relied on.
+
+Draft language:
+
+> Credit expires 2 years (24 months) after the date of the deposit that created it.
+> Expiry is calculated per deposit, not from the account's most recent activity.
+> Credit that has expired is no longer usable and is not refundable.
+
+**Per deposit, not per account.** A wallet that receives top-ups over time holds
+credit of several ages; the clock runs on each deposit from its own date. The
+alternative — expiry from last activity — would silently extend the life of old
+credit, which is not what was decided.
+
+> ⚠️ **Open legal risk — flagged, not resolved.** An expiring balance that is never
+> refunded is a consumer-protection concern in Indonesia; 2 years is a defensible
+> period but the interaction with the non-refundable clause is **not settled**. This
+> remains part of the Gate 0 legal review.
+
+**⚠️ Not implemented.** Nothing in the system currently expires credit. There is no
+`expires_at` on `wallets`, no sweep job, and no code that would refuse a spend
+against aged credit. **This section is a promise the system does not yet keep**, and
+per the warning at the end of this document a policy claiming something the code does
+not do is worse than no policy. Implementing it — schema, sweep job, and the
+disclosure on the top-up screen — is a build task, not a decision.
 
 ## 4. Acceptable use
 
@@ -214,8 +238,11 @@ not do is worse than no policy, because it is a demonstrable false statement.
 ## Open items
 
 - [ ] Legal review — **required before launch**.
-- [ ] Credit expiry: yes or no, and for how long.
-- [ ] Liability cap figure.
+- [x] ~~Credit expiry: yes or no, and for how long.~~ **Settled: 2 years from
+deposit date, per deposit** (see §Expiry). The *implementation* below is still open.
+- [ ] Credit expiry **implementation**: a schema field for per-deposit expiry, a
+      sweep job, and refusal of a spend against expired credit. The policy is settled;
+      the code is not written.
 - [ ] Whether an entity (PT) exists to contract with, or a personal account — see
       [`business/05-risk.md`](business/05-risk.md) R1.
 - [ ] Complaint handling process, and who owns it.

@@ -60,6 +60,9 @@ open. Do not re-open a settled decision in a document — change it here instead
 | `status='refunded'` / ledger `reason='refund'` | **Reserved but unreachable** | No production writer remains. The CHECK values stay because migrations are forward-only and additive-only — removing one is a table rebuild. The only writer left is a test fixture simulating an out-of-band bank action |
 | Refund: scope of the policy | **Non-refundable with no non-delivery exception** — settled by the owner | There is no code path and no operator procedure that returns money. The register previously carried a non-delivery carve-out; that carve-out is withdrawn, and [`terms-of-service.md`](terms-of-service.md) now states the same. The terms remain a **draft outline requiring legal review (Gate 0)** — the text records the decision, it does not certify it is enforceable |
 | Refund: enforceability caveat (**not resolved here**) | **Recorded, deliberately not fixed** | `terms-of-service.md:61-72` and `business/05-risk.md:31-46` warn that a non-refundable clause which overreaches is likelier to be struck down *in its entirety* than a narrow one, and that on non-delivery the payer generally prevails at the dispute stage **regardless of the stated policy**. Withdrawing the carve-out therefore may reduce, not increase, the clause's protective value. This is a lawyer's call; it is written down so it is not discovered later |
+| Credit expiry | **2 years (24 months) from each deposit's own date** | Settled by the owner. Per deposit, not per account or from last activity — a wallet holds credit of several ages, and expiry-from-last-activity would silently extend old credit. |
+| Credit expiry: implementation | **Not built — the terms promise something the code does not do yet** | There is no per-deposit expiry column, no sweep job, and no refusal of a spend against aged credit. Policy is settled; the code is a build task in [`launch-checklist.md`](launch-checklist.md). Flagged because a policy the code does not keep is worse than no policy |
+| Credit expiry: legal caveat | **Recorded, not resolved** | An expiring balance that is never refunded is a consumer-protection concern in Indonesia. 2 years is defensible, but the interaction with the non-refundable clause is not settled — part of the Gate 0 legal review |
 | Refund: accepted risk | **Negative float, visible only via the refusal alert** | A chargeback returns the customer's money at the rail while the wallet keeps the credit. Because the ledger does not move, no drift check fires; the `error!` line is the only fast signal, and the monthly Midtrans-vs-`topups` reconciliation surfaces it up to a month later. Mitigation: alert on the refusal and hold a reserve. **Unalerted, this is a silent loss.** See [`website/04-payments.md`](website/04-payments.md) |
 
 ### API behaviour
@@ -206,7 +209,7 @@ These need information that does not exist yet, not a design decision:
 | A second upstream provider | Reading its resale terms |
 | Support cost per customer | Real usage data |
 | Whether a staging environment exists | A cost decision |
-| Credit expiry policy | A legal/commercial decision |
+
 | Abuse-report contact | Publishing the terms |
 | Review moderation policy | Operating experience |
 

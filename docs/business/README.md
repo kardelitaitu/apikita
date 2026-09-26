@@ -59,6 +59,7 @@ Treat every number in this folder as a placeholder until it is not.
 | Payment rail | **Decided — Midtrans, dynamic QRIS, Snap + server webhook** |
 | Refund policy | **Decided — prepaid, non-refundable with no exception**; enforced in code (inbound refunds refused, nothing written). Legal review remains a Gate 0 item |
 | Deposit floor | Decided — 10,000 IDR; first-deposit minimum still open |
+| Credit expiry | **Decided — 2 years (24 months) from each deposit's own date.** Legal review of the interaction with the non-refundable clause remains open |
 | Entity (personal vs. PT) | **Open** — affects dispute posture and volume ceiling |
 | Upstream rates verified | **Open** — every rate-card figure is `[UNVERIFIED]` |
 | Region margin ceiling | **Open** — competitor pricing vs. M=1.50 unmeasured |
