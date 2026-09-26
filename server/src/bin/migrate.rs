@@ -75,6 +75,7 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     // SQLite creates the database file but never its parent directory, and a
     // missing directory surfaces only as "unable to open database file".
     let filename: PathBuf = options.get_filename().to_path_buf();
+    refuse_drive_relative_db_path(&filename.to_string_lossy())?;
     if let Some(parent) = filename.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent)?;
@@ -146,11 +147,73 @@ fn check_preconditions(journal: &str, fk: i64) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// Refuse a database path that SPELLS itself absolute but is drive-relative on
+/// this host: a leading `/` (or `\`) with no drive prefix, as an MSYS/Git-Bash
+/// URL like `sqlite:///c/dev/...` produces on Windows.
+///
+/// MEASURED (2026-09-26): such a URL made this binary treat `/c/dev/...` as
+/// `C:\c\dev\...` — `create_dir_all` fabricated that tree at the ROOT OF C:,
+/// the whole schema was built there, and the log printed the path the operator
+/// wrote. The server (create_if_missing=false) fails loudly on the same URL,
+/// so the divergence is invisible until a deploy starts a server against an
+/// unmigrated database. The relative-path form (`sqlite://data/server.db`,
+/// resolved against the cwd) stays accepted: that is the documented spelling.
+fn refuse_drive_relative_db_path(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let looks_absolute = filename.starts_with('/') || filename.starts_with('\\');
+    if looks_absolute && !std::path::Path::new(filename).is_absolute() {
+        error!(
+            database_url_path = %filename,
+            "this path starts with a separator but is not absolute on this host \
+             (an MSYS-style /c/... URL is drive-relative on Windows); it would be \
+             created at the drive root (C:\\c\\...). Pass a drive-letter absolute \
+             path (sqlite://C:/dev/...) or the documented relative form \
+             (sqlite://data/server.db, resolved against server/)"
+        );
+        return Err(format!(
+            "database path '{filename}' is not absolute on this host; refusing to \
+             create it at a drive-relative location"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
     use uuid::Uuid;
+
+    #[test]
+    fn an_msys_style_absolute_url_is_refused_instead_of_creating_the_schema_at_the_drive_root() {
+        // MEASURED (2026-09-26): `DATABASE_URL=sqlite:///c/dev/... cargo run
+        // --bin migrate` treated "/c/dev/..." as a DRIVE-RELATIVE Windows path,
+        // fabricated C:\c\dev\... at the root of C:, built the whole 18-table
+        // schema there, and logged the fictional path the operator wrote. The
+        // recovery hint other tools print ("create it with 'DATABASE_URL=...
+        // cargo run --bin migrate'") is spelled in exactly this MSYS form, so
+        // the trap sits on the documented path.
+        let refused = refuse_drive_relative_db_path("/c/dev/apikita/.agents/mig-probe.db");
+        if cfg!(windows) {
+            assert!(
+                refused.is_err(),
+                "a /c/... path is drive-relative on Windows and must be refused: {refused:?}"
+            );
+        } else {
+            // On Unix the same string IS an absolute path and harmless here.
+            refused.expect("/c/... is absolute on Unix");
+        }
+    }
+
+    #[test]
+    fn a_windows_absolute_and_a_relative_path_are_both_accepted() {
+        refuse_drive_relative_db_path("C:/dev/apikita/server/data/server.db")
+            .expect("a drive-letter absolute path is unambiguous");
+        refuse_drive_relative_db_path("data/server.db")
+            .expect("a relative path is resolved against the cwd by design");
+        refuse_drive_relative_db_path("/dev/apikita/server.db")
+            .expect_err("a root-relative path (leading separator, no drive) is the same trap");
+    }
 
     #[test]
     fn preconditions_pass_when_wal_and_foreign_keys_are_on() {
@@ -174,7 +237,10 @@ mod tests {
     /// fail with ERROR_INVALID_NAME. See `.workbuddy-ai/memory/2026-09-26.md`.
     fn temp_db_url() -> (String, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("apikita-migrate-test-{}.db", Uuid::new_v4()));
-        (format!("sqlite://{}", path.to_str().unwrap().replace('\\', "/")), path)
+        (
+            format!("sqlite://{}", path.to_str().unwrap().replace('\\', "/")),
+            path,
+        )
     }
 
     #[tokio::test]
@@ -190,12 +256,11 @@ mod tests {
             .connect(&url)
             .await
             .expect("reopen the migrated database");
-        let table_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count tables");
+        let table_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'")
+                .fetch_one(&pool)
+                .await
+                .expect("count tables");
         assert!(table_count > 0, "migrations must have created tables");
 
         pool.close().await;
