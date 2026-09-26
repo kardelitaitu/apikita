@@ -59,12 +59,18 @@ impl KeySlot {
         // Poison is recovered rather than propagated: this lock is taken on
         // every key selection and every cooldown report, so one panicking
         // thread must not permanently fail the request path.
-        let until = *self.cooldown_until.lock().unwrap_or_else(|e| e.into_inner());
+        let until = *self
+            .cooldown_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         matches!(until, Some(until) if now < until)
     }
 
     fn park(&self, now: Instant, cooldown: Duration) {
-        *self.cooldown_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(now + cooldown);
+        *self
+            .cooldown_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(now + cooldown);
     }
 
     fn release(&self) {
@@ -269,7 +275,10 @@ mod tests {
         let poisoner = Arc::clone(&slot);
         assert!(
             std::thread::spawn(move || {
-                let _guard = poisoner.cooldown_until.lock().expect("fresh lock is unpoisoned");
+                let _guard = poisoner
+                    .cooldown_until
+                    .lock()
+                    .expect("fresh lock is unpoisoned");
                 panic!("poison the cooldown lock");
             })
             .join()
@@ -278,7 +287,9 @@ mod tests {
         );
 
         // acquire -> is_cooling reads the poisoned lock.
-        let lease = pool.acquire().expect("selection must survive a poisoned lock");
+        let lease = pool
+            .acquire()
+            .expect("selection must survive a poisoned lock");
         assert_eq!(lease.key(), "key-0");
 
         // report_status -> park writes the poisoned lock.
