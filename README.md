@@ -20,7 +20,7 @@ surface, priced at a fixed margin over wholesale cost.
 | [`docs/architecture.md`](docs/architecture.md) | The system end to end — the authoritative stack |
 | [`docs/topology.md`](docs/topology.md) | The triangle: Cloudflare, relay, Northflank, failover |
 | [`docs/server/api-spec.md`](docs/server/api-spec.md) | Every endpoint, auth scheme, enforcement order |
-| [`docs/website/02-data-model.md`](docs/website/02-data-model.md) | SQLite schema (parser-validated) |
+| [`server/migrations/20260925000000_initial_schema.sql`](server/migrations/20260925000000_initial_schema.sql) | The SQLite schema — source of truth |
 | [`docs/business/README.md`](docs/business/README.md) | Does the business work — pricing, model, risks |
 
 ### Building it
@@ -106,9 +106,9 @@ What exists today:
 
 | Surface | State |
 | --- | --- |
-| [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → 200 passed / 75 ignored; the live database suite passes against real Postgres. |
-| [`website/`](website/README.md) | Astro site. `npm run build` → 15 pages; `npm test` → 52 passed. |
-| [`tools/`](tools/) | `reconcile`, `backup`, `drill`, `alert`, `fake-upstream`, `fake-midtrans` — each with a documented exit-code contract. |
+| [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → **289 passed / 0 failed / 2 ignored**, against a temp SQLite file — no server to start. The 2 ignored need a live PocketBase. |
+| [`website/`](website/README.md) | Astro site. `npm run build` → 17 pages; `npm test` → 64 passed. |
+| [`tools/`](tools/) | `reconcile`, `alert`, `fake-upstream`, `fake-midtrans`, and the SQLite probes — each with a documented exit-code contract. `backup`/`drill` still implement the **PostgreSQL** procedure and cannot back up the shipped SQLite database yet. |
 | [`telegram/`](telegram/README.md) | Design only — no code yet. |
 
 Not yet: a deployment, a live Midtrans round-trip, and the operational gates in

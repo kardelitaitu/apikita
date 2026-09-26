@@ -17,13 +17,20 @@ size.
 | Email | PocketBase | **Personal** |
 | Password hash | PocketBase | Sensitive, but not usable if leaked (hashed) |
 | Google account link | PocketBase | Personal |
-| Telegram ID | Postgres | Personal, pseudonymous |
-| Wallet balance + ledger | Postgres | **Financial** |
-| Top-up history (amounts, dates) | Postgres | **Financial** |
-| Token usage per day | Postgres | Behavioural |
-| API keys | Postgres | Credentials (hashed) — the plaintext is never stored |
-| Reviews + edit history | Postgres | Opinion, published aggregate only |
-| Sessions | Postgres | Contains IP hash and user agent |
+| Telegram ID | Embedded SQLite (the database file) | Personal, pseudonymous |
+| Wallet balance + ledger | Embedded SQLite (the database file) | **Financial** |
+| Top-up history (amounts, dates) | Embedded SQLite (the database file) | **Financial** |
+| Token usage per day | Embedded SQLite (the database file) | Behavioural |
+| API keys | Embedded SQLite (the database file) | Credentials (hashed) — the plaintext is never stored |
+| Reviews + edit history | Embedded SQLite (the database file) | Opinion, published aggregate only |
+| Sessions | Embedded SQLite (the database file) | Contains IP hash and user agent |
+
+> **Wording change only — no retention fact moved.** The money store used to be a
+> managed PostgreSQL service; it is now **embedded SQLite**, a file the API opens.
+> Every row, every retention period and every "never stored" claim above is
+> unchanged. **This table is restated on the customer-facing
+> [`/privacy`](../../website/src/pages/privacy.astro) page**, which must be updated
+> in the same change if any of it moves again.
 
 ## What is NOT stored
 

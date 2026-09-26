@@ -17,8 +17,8 @@ service — and identity comes from PocketBase until Phase 6 replaces it in Rust
 [`docs/architecture.md`](../docs/architecture.md) and
 [`docs/plans/sqlite-migration.md`](../docs/plans/sqlite-migration.md).
 
-Framework is not yet fixed; Tokio is assumed, with `axum` for HTTP as the
-whitepaper implies.
+**Tokio + `axum`** for HTTP, **`sqlx`** (SQLite feature) for storage — the
+framework is fixed by the code, not assumed.
 
 ## Full specification
 
@@ -31,4 +31,17 @@ leaked session cannot spend money.
 
 ## Status
 
-Empty scaffolding. Nothing implemented.
+**Implemented and green.** `cargo test --lib` → **289 passed / 0 failed / 2 ignored**,
+against a migrated temp SQLite file per test (`src/test_support.rs`) — no database
+server to start and no `DATABASE_URL` needed. The 2 ignored tests drive a real
+PocketBase auth exchange and need a live `POCKETBASE_URL`; identity is still
+PocketBase until migration Phase 6.
+
+Migrations are applied by the `migrate` binary, never on boot:
+
+```bash
+DATABASE_URL=sqlite://data/server.db cargo run --bin migrate
+```
+
+It creates the file, applies `./migrations`, and exits non-zero unless
+`journal_mode` is `wal` and `foreign_keys` is on. Nothing is deployed yet.

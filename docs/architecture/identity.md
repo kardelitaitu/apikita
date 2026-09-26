@@ -3,9 +3,10 @@
 How a person becomes an account, and how that account is reached from the website
 and the Telegram bot.
 
-> **Stack:** identity lives in **PocketBase**; money lives in **PostgreSQL**. See
-> [`docs/architecture.md`](../architecture.md). This document covers the identity
-> side; the money schema is in
+> **Stack:** identity lives in **PocketBase** — still, until migration Phase 6
+> replaces it in Rust; money lives in **embedded SQLite** (a file the API opens,
+> not a service). See [`docs/architecture.md`](../architecture.md). This document
+> covers the identity side; the money schema is in
 > [`docs/website/02-data-model.md`](../website/02-data-model.md).
 
 ## The shape of the thing
@@ -14,14 +15,14 @@ An **account** owns the wallet. Identities link to it. A person can have several
 identities and still have one balance.
 
 ```
-        PocketBase                    Postgres
+        PocketBase                    SQLite (embedded)
    +---------------------+      +----------------------+
    | users (auth)        |      | accounts             |
    |   - google identity |<---->|   - pb_user_id       |
    |   - password identity|     |   - wallet balance   |
    +---------------------+      |   - api_keys         |
                                 |   - sessions         |
-   telegram_links (PG) ---------+                      |
+   telegram_links (SQLite) -----+                      |
    +---------------------+      +----------------------+
 ```
 
@@ -42,7 +43,7 @@ weeks and add new ways to get security wrong.
 **Rust issues its own session.** After PocketBase authenticates a user, the
 browser exchanges the PocketBase token with the Rust API, which resolves
 `pb_user_id` → `accounts` and issues an opaque session cookie (a row in
-Postgres `sessions`). The PocketBase token is not used as the API credential, so
+the SQLite `sessions` table). The PocketBase token is not used as the API credential, so
 PocketBase stays off the request hot path.
 
 ## Table ownership
@@ -50,14 +51,16 @@ PocketBase stays off the request hot path.
 | Table | Store | Purpose |
 | --- | --- | --- |
 | `users` | PocketBase | Email, password hash, Google link, `verified` |
-| `accounts` | Postgres | `pb_user_id` link, status |
-| `sessions` | Postgres | Server-side sessions |
-| `telegram_links` | Postgres | `telegram_id` → account |
-| `link_codes` | Postgres | Telegram binding codes |
+| `accounts` | SQLite | `pb_user_id` link, status |
+| `sessions` | SQLite | Server-side sessions |
+| `telegram_links` | SQLite | `telegram_id` → account |
+| `link_codes` | SQLite | Telegram binding codes |
 
-There is deliberately **no `credentials` table and no `identities` table in
-Postgres.** PocketBase *is* the identity store. Duplicating it would create two
-sources of truth about who someone is.
+There is deliberately **no `credentials` table in SQLite.** PocketBase *is* the
+identity store. Duplicating it would create two sources of truth about who
+someone is. (The schema does carry an empty `identities` table — created for
+Phase 6 and populated only when PocketBase is replaced. Until then it holds
+nothing and PocketBase stays authoritative.)
 
 ## Invariants
 
@@ -65,9 +68,9 @@ sources of truth about who someone is.
    password; both resolve to the same wallet.
 2. **`api_keys.account_id` and `wallets.account_id` reference the account**, never
    an identity or a PocketBase id directly.
-3. **Postgres is never authoritative about who a user is.** It stores a reference
+3. **SQLite is never authoritative about who a user is.** It stores a reference
    (`pb_user_id`) and nothing else about identity.
-4. **Never hard-delete a PocketBase user.** The wallet is in Postgres and nothing
+4. **Never hard-delete a PocketBase user.** The wallet is in SQLite and nothing
    cascades across the boundary. Set `status = 'closed'`.
 5. **`link_codes` are single-use and expiring.** Binding happens on redemption
    only.
@@ -128,7 +131,7 @@ transition) is specified in
 
 ## Sessions
 
-Server-side sessions in Postgres, not JWTs. This is what makes logout real.
+Server-side sessions in SQLite, not JWTs. This is what makes logout real.
 
 - Login creates a `sessions` row; the cookie carries an opaque random value and
   only its hash is stored.
@@ -145,7 +148,7 @@ Schema and indexes: [`docs/website/02-data-model.md`](../website/02-data-model.m
 > linking mechanism only.
 
 Telegram is **not** an OAuth2 provider, so PocketBase cannot model it. It is a
-custom table in Postgres.
+custom table in SQLite.
 
 ### Flow
 
@@ -176,7 +179,7 @@ This is the highest-risk endpoint in the Telegram surface.
 
 Wallet credits happen on the **server webhook only** — never the client callback,
 never the amount in the payload. Idempotency is by `order_id` (unique in
-Postgres). A user may legitimately top up from both surfaces in one day, so
+SQLite). A user may legitimately top up from both surfaces in one day, so
 idempotency is per-order, not per-account.
 
 See [`docs/website/04-payments.md`](../website/04-payments.md).
@@ -189,7 +192,7 @@ Identity and money now live in different systems, so they can drift.
   PocketBase, and alerts on orphans.
 - **Never hard-delete a PocketBase user.** A deleted user with a funded wallet is
   money nobody can reach.
-- An auth outage does **not** lock out existing users — sessions live in Postgres.
+- An auth outage does **not** lock out existing users — sessions live in SQLite.
 
 ## Open questions
 

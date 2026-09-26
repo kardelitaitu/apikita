@@ -3,7 +3,7 @@
 > **Superseded on stack — read [`docs/architecture.md`](../architecture.md) first.**
 >
 > The system is: Cloudflare Pages (frontend), **edge relay**, Rust on Northflank
-> (API + proxy), **PostgreSQL** (money), **PocketBase** (identity only).
+> (API + proxy), **embedded SQLite** (money), **PocketBase** (identity only).
 >
 > | # | Status | Implement from |
 > | --- | --- | --- |
@@ -18,15 +18,15 @@ Resolutions for three structural security issues raised during design.
 
 > **Correction notice.** An earlier draft claimed PocketBase "has no token
 > revocation". **That is wrong** — it has native per-record revocation. Our stack
-> does not rely on it (Postgres sessions are used instead), but the claim was
+> does not rely on it (SQLite sessions are used instead), but the claim was
 > incorrect and is corrected here.
 
 ### How the threats map to the new stack
 
 | Threat | Was handled by | Now handled by |
 | --- | --- | --- |
-| User sets their own balance | PocketBase API rules | **Rust authorization** + Postgres `CHECK` |
-| Stolen session token | PocketBase `tokenKey` rotation | **Postgres `sessions`** row revocation |
+| User sets their own balance | PocketBase API rules | **Rust authorization** + SQLite `CHECK` |
+| Stolen session token | PocketBase `tokenKey` rotation | **SQLite `sessions`** row revocation |
 | Account pre-hijacking | PocketBase's unverified-record logic | Unchanged — still PocketBase, still gated on `!Verified()` |
 ---
 
@@ -38,18 +38,19 @@ When money was going to live in PocketBase, its API rules were the obstacle: the
 are **row-level, not field-level**, so a rule letting a user update their own auth
 record let them write **every field on it** — including `balance_idr`.
 
-**This is no longer the design.** Money is in Postgres. The section is kept because
+**This is no longer the design.** Money is in SQLite. The section is kept because
 the reasoning explains why the `wallets` table exists separately and why the
 `CHECK` constraint is load-bearing.
 
 ### Solution — money is unreachable from the client
 
-Money lives in **PostgreSQL**, and the client has no database credential at all.
+Money lives in **embedded SQLite** (a file the API owns), and the client has no
+database credential at all.
 
 | Store | Client access | Mutated by |
 | --- | --- | --- |
 | PocketBase (identity) | own profile fields | PocketBase flows |
-| **Postgres (money)** | **none — no client DB access** | **Rust only** |
+| **SQLite (money)** | **none — no client DB access** | **Rust only** |
 
 Every wallet read and write goes through the Rust API, which:
 
@@ -66,7 +67,7 @@ balance_idr BIGINT NOT NULL DEFAULT 0 CHECK (balance_idr >= 0)
 ### Why the current design is stronger
 
 The PocketBase design would have needed a workaround: a user who could edit their
-profile could edit their balance. Postgres has no such limitation — the client has
+profile could edit their balance. SQLite has no such limitation — the client has
 **no database credential at all**, so the problem does not exist.
 
 The remaining risk is a Rust authorization bug, which is why the `CHECK`
@@ -88,7 +89,7 @@ The Rust API is the only path to money. It must therefore:
 
 > **Not our mechanism.** This section explains how PocketBase revokes tokens. Our
 > stack does **not** use PocketBase tokens as API credentials — Rust issues opaque
-> **server-side sessions** stored in Postgres, so logout deletes a row and revokes
+> **server-side sessions** stored in SQLite, so logout deletes a row and revokes
 > immediately, with no TTL window.
 >
 > **Implement from [`docs/architecture.md`](../architecture.md) §Sessions, not from here.**
@@ -201,7 +202,7 @@ The trigger is mundane: a bulk import, a migration, a support action, or an admi
 setting `verified = true` by hand.
 
 > **Still applies.** `verified` remains a PocketBase field and is still the
-> control that gates the pre-hijacking defenses. Nothing about the Postgres/Rust
+> control that gates the pre-hijacking defenses. Nothing about the SQLite/Rust
 > split changes this.
 
 ### Solution — treat verification as a security control, not a flag
@@ -284,8 +285,8 @@ address, an attacker could register it elsewhere and take the account.
 
 | # | Issue | Resolution in the CURRENT stack | Verified against |
 | --- | --- | --- | --- |
-| D1 | Client could write own balance | Money in Postgres, no client DB access, Rust authorization + `CHECK (balance_idr >= 0)` | Postgres schema; [`02-data-model.md`](02-data-model.md) |
-| D2 | Token revocation | **Superseded** — Postgres `sessions` rows; logout revokes immediately | [`docs/architecture.md`](../architecture.md) §Sessions |
+| D1 | Client could write own balance | Money in SQLite, no client DB access, Rust authorization + `CHECK (balance_idr >= 0)` | Shipped schema: [`server/migrations/20260925000000_initial_schema.sql`](../../server/migrations/20260925000000_initial_schema.sql); design record: [`02-data-model.md`](02-data-model.md) |
+| D2 | Token revocation | **Superseded** — SQLite `sessions` rows; logout revokes immediately | [`docs/architecture.md`](../architecture.md) §Sessions |
 | D3 | Verification disables anti-hijacking | Unchanged — `verified` gated to PocketBase's own flows; hook rejects client writes | `apis/record_auth_with_oauth2.go:340-362` |
 
 ## Open items

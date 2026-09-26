@@ -1,21 +1,35 @@
-# 02 — Data Model (PostgreSQL)
+# 02 — Data Model (historical: the PostgreSQL schema)
+
+> **SUPERSEDED — this document no longer describes the running system.** The
+> server was ported from PostgreSQL to **embedded SQLite** (a file the API opens,
+> no service, no DSN). The authoritative schema is
+> [`server/migrations/20260925000000_initial_schema.sql`](../../server/migrations/20260925000000_initial_schema.sql),
+> every table `STRICT`; the port and its dialect deltas are recorded in
+> [`docs/plans/sqlite-migration.md`](../plans/sqlite-migration.md).
+>
+> The DDL below is the **Postgres** schema as designed, and it is kept as the
+> reasoning behind the current tables: the column set, the constraints, the
+> transaction shapes and the index-coverage argument all still hold. What does
+> **not** carry over is the dialect — see "Postgres-isms that the port replaced"
+> at the end. Read [`docs/architecture.md`](../architecture.md) §Database for
+> what ships today.
 
 Schema for everything except identity.
 
 > **Rewritten for the Postgres + PocketBase split.** The earlier version specified
 > PocketBase collections and API rules. Identity now lives in PocketBase; money and
-> usage live in Postgres. See [`docs/architecture.md`](../architecture.md).
+> usage live in the store. See [`docs/architecture.md`](../architecture.md).
 
 ## Division of ownership
 
 | Concern | Store |
 | --- | --- |
 | Accounts, passwords, Google login, verification, reset, MFA | **PocketBase** |
-| Wallet, keys, limits, top-ups, usage, ledger, sessions | **Postgres** |
+| Wallet, keys, limits, top-ups, usage, ledger, sessions | **SQLite** (was Postgres) |
 
-**The golden rule:** Postgres never becomes authoritative about *who* a user is,
-and PocketBase never holds money. Rust reads identity from PocketBase and writes
-money to Postgres — never the reverse.
+**The golden rule:** the money store never becomes authoritative about *who* a
+user is, and PocketBase never holds money. Rust reads identity from PocketBase and
+writes money to SQLite — never the reverse.
 
 ## Extensions
 
@@ -415,7 +429,8 @@ CREATE TABLE review_sessions (
 **Staged values are not the review.** Nothing is written to `reviews` until the
 flow completes, so abandoning halfway leaves an existing review untouched.
 
-**Could live in Redis instead.** It is transient and does not need durability. Postgres is specified because the stack already has it and the row count is tiny;
+**Could live in Redis instead.** It is transient and does not need durability. The
+database is specified because the stack already has it and the row count is tiny;
 move it to Redis only if the write volume justifies another dependency.
 
 Sweep expired rows on a schedule.
@@ -440,12 +455,12 @@ its index:
 | Abuse signal — `key_ip_seen.api_key_id` | composite PK (leftmost) |
 | Audit view — `admin_audit.operator_id` | composite index |
 
-### Postgres indexes PK and UNIQUE columns automatically
+### PK and UNIQUE columns are indexed automatically
 
 **Do not add an explicit index for a column that is already a `PRIMARY KEY` or
-carries a `UNIQUE` constraint.** It is redundant: PostgreSQL creates a unique
+carries a `UNIQUE` constraint.** It is redundant: the engine creates a unique
 B-tree index for both, and a duplicate costs write throughput and storage for no
-read benefit.
+read benefit. (True of SQLite too — it backs `UNIQUE` with an implicit index.)
 
 That covers `order_id`, `token_hash`, `telegram_id`, `code`, and
 `pb_user_id` in this schema — each is constrained, each already indexed.
@@ -487,8 +502,30 @@ The wallet ledger is the business.
    unique index, and edits are appended to `review_history`.
 10. **Admin actions write `admin_audit`, and money moves only via `ledger`** —
     never a direct balance edit.
-11. **This document is the only place tables are defined.** Other docs reference it;
-    a second copy of the DDL drifted once already (missing `is_operator`).
+11. ~~**This document is the only place tables are defined.**~~ **No longer true, and
+    deliberately so.** The authority is
+    [`server/migrations/20260925000000_initial_schema.sql`](../../server/migrations/20260925000000_initial_schema.sql);
+    this document is the design record. The rule it was protecting still stands —
+    **one source of truth per table** — which is why the DDL above is not
+    re-dialected to SQLite here: a hand-ported second copy would drift exactly the
+    way the old one did (missing `is_operator`).
+
+## Postgres-isms that the port replaced
+
+The DDL above is Postgres. These constructs did **not** survive the port; the
+current forms are in the migration SQL, and the reasons are in
+[`docs/plans/sqlite-migration.md`](../plans/sqlite-migration.md).
+
+| Postgres form (above) | Shipped SQLite form |
+| --- | --- |
+| `UUID ... DEFAULT gen_random_uuid()`, `CREATE EXTENSION pgcrypto` | `TEXT PRIMARY KEY`, the id bound from Rust |
+| `BIGSERIAL PRIMARY KEY` | `INTEGER PRIMARY KEY` (rowid alias) |
+| `TIMESTAMPTZ ... DEFAULT now()` | `TEXT` RFC3339 written from Rust — **never** SQL. SQLite has no `now()`, and the schema's `GLOB` `CHECK` rejects SQLite's own `CURRENT_TIMESTAMP` form |
+| `JSONB` | `TEXT` holding JSON |
+| `BOOLEAN` | `INTEGER` with `CHECK (x IN (0,1))` |
+| `SELECT ... FOR UPDATE` | **no such thing** — `BEGIN IMMEDIATE` plus a conditional-`UPDATE` claim |
+| `RETURNING balance_idr` (fine) / data-modifying CTE (not) | `RETURNING` works; a data-modifying CTE is a syntax error |
+| Partial index (`... WHERE revoked_at IS NULL`) | unchanged — SQLite supports partial indexes |
 
 ## Open items
 

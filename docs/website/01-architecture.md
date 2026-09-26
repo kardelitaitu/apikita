@@ -1,7 +1,7 @@
 # 01 — Architecture
 
 > **Superseded on stack — read [`docs/architecture.md`](../architecture.md) first.**
-> This document specified Cloudflare Pages Functions + PocketBase. The system now uses a Rust backend on Northflank with PostgreSQL. The frontend-internal sections below remain useful; the stack and backend sections are superseded.
+> This document specified Cloudflare Pages Functions + PocketBase. The system now uses a Rust backend on Northflank with embedded SQLite. The frontend-internal sections below remain useful; the stack and backend sections are superseded.
 
 ## Requirement that drives the design
 
@@ -21,14 +21,14 @@ document covers the frontend's internal structure.
 | Hosting | **Cloudflare Pages** | Static assets at the edge. |
 | Edge relay | **nginx on a VPS** | TLS, filtering, flood absorption before Northflank. See [`../edge-relay.md`](../edge-relay.md) |
 | Backend | **Rust on Northflank** | Auth orchestration, wallet, keys, limits, webhook, SSE, proxy. |
-| Money | **PostgreSQL** | Transactions, constraints, the ledger. |
+| Money | **SQLite** (embedded) | Transactions, constraints, the ledger. |
 | Identity | **PocketBase** | Google + password, verify, reset. Auth only. |
 | Payments | **Midtrans Snap** | QRIS top-ups. |
 
 > **This table previously named Pages Functions as a BFF and PocketBase as the
 > database.** Both are gone: the Rust server is the backend, and money lives in
-> Postgres. Superseded sections below are marked; the frontend internals remain
-> valid.
+> embedded SQLite. Superseded sections below are marked; the frontend internals
+> remain valid.
 
 **Astro is decided** — reasoning and rejected alternatives are below.
 
@@ -44,7 +44,7 @@ Cloudflare  (DNS, TLS at edge, DDoS)
 Edge relay  (nginx on a VPS - TLS, rate limits, body caps)
   |
   v
-Northflank: Rust API + proxy  --->  PostgreSQL (money, sessions)
+Northflank: Rust API + proxy  --->  SQLite file (money, sessions)
                                 --->  PocketBase  (identity only)
 ```
 
@@ -68,14 +68,14 @@ hold a password flow, a database transaction, or a long-lived SSE connection. Th
 ### Realtime
 
 **SSE from the Rust API.** PocketBase's realtime cannot help — the wallet and usage
-data live in Postgres, which PocketBase does not stream. Contract:
+data live in SQLite, which PocketBase does not stream. Contract:
 [`docs/realtime.md`](../realtime.md).
 ## Auth token handling
 
 - PocketBase handles initial authentication (password, Google OAuth2) and issues a short-lived token.
 - The browser immediately exchanges this token with the Rust backend via `POST /auth/exchange`.
-- The Rust server verifies the token, resolves or registers `accounts.pb_user_id`, and issues an **opaque server-side session cookie** (`HttpOnly, Secure, SameSite=Lax`) backed by PostgreSQL.
-- **Logout is explicit and immediate**: `POST /auth/logout` revokes the session row in PostgreSQL; `POST /auth/logout-all` revokes all active sessions for the account.
+- The Rust server verifies the token, resolves or registers `accounts.pb_user_id`, and issues an **opaque server-side session cookie** (`HttpOnly, Secure, SameSite=Lax`) backed by SQLite.
+- **Logout is explicit and immediate**: `POST /auth/logout` revokes the session row in SQLite; `POST /auth/logout-all` revokes all active sessions for the account.
 - Never put upstream provider keys, database URLs, or the Midtrans server key in client-visible config.
 
 ## Secrets
@@ -94,7 +94,7 @@ Only `PUBLIC_*` variables may reach the client. See `.env.example`.
 ## Deployment
 
 - **Static assets (Astro)** → Cloudflare Pages, built from the repo.
-- **API + Proxy (Rust) & PostgreSQL** → Northflank with persistent volume. The wallet ledger lives in PostgreSQL.
+- **API + Proxy (Rust) + embedded SQLite** → Northflank with a persistent volume for the database file. The wallet ledger lives in SQLite.
 - **PocketBase** → Northflank or container host with persistent volume (SQLite for identity only).
 - **Region:** keep Northflank and database geographically close to the Midtrans webhook receiver and Indonesian users (e.g. Singapore region).
 

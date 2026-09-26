@@ -34,7 +34,15 @@ To keep user experience seamless, currency shifting happens entirely on the clie
 
 ---
 
-## 3. Database Schema Blueprint (PostgreSQL / MongoDB Design)
+## 3. Database Schema Blueprint (illustrative — not the shipped schema)
+
+> **This section is a proposal, not the data model.** The shipped schema is
+> [`server/migrations/20260925000000_initial_schema.sql`](../server/migrations/20260925000000_initial_schema.sql)
+> (embedded SQLite, every table `STRICT`); the design record is
+> [`docs/website/02-data-model.md`](website/02-data-model.md). The JSON documents
+> below describe a document-store shape (Postgres `JSONB` or MongoDB) that was
+> considered for this billing prototype and **was not adopted** — the real model is
+> relational, with money in `wallets.balance_idr` and `ledger.delta_idr`.`
 
 ### `users` Collection / Table
 Stores core identities and the single source of truth balance metrics.

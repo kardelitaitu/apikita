@@ -26,9 +26,14 @@ pipeline itself.
 | Lint | `cargo clippy -- -D warnings` | Yes |
 | Build | `cargo build` | Yes |
 | Unit tests | Pure logic | Yes |
-| **Integration tests** | A real Postgres, real schema, fake upstream | **Yes** |
+| **Integration tests** | A real database (bundled SQLite), real schema, fake upstream | **Yes** |
 | Schema check | Migrations apply cleanly to an empty database | Yes |
+| Website typecheck / tests / build | The frontend toolchain | Yes |
 | Secret scan | No key or token committed | Yes |
+
+**There is no service container and no `DATABASE_URL` in CI.** SQLite is bundled, so
+the database is a file and the test suite needs no environment at all — see
+[the integration section](#bundled-sqlite-in-ci-and-why-the-old-objection-is-gone).
 
 ### On merge to `main`
 
@@ -47,7 +52,9 @@ pipeline itself.
 
 ## The integration tests that matter
 
-Ordinary unit tests do not protect money. These do, and they need a real database:
+Ordinary unit tests do not protect money. These do, and they need a real database —
+which, since the port, is a migrated temp **file** each test builds for itself
+(`server/src/test_support.rs`), not a server somebody has to start:
 
 | Test | Asserts |
 | --- | --- |
@@ -68,34 +75,91 @@ and it catches the entire class of balance bugs.
 **Two of these need the fake upstream to fail deliberately** — see
 [`local-development.md`](local-development.md). A fake that only succeeds tests nothing.
 
-## Real Postgres in CI, not SQLite
+## Bundled SQLite in CI, and why the old objection is gone
 
-**Do not substitute SQLite for testing.** The schema depends on Postgres behaviour:
+> **This section used to say the opposite** — "Real Postgres in CI, not SQLite /
+> **Do not substitute SQLite for testing**" — on the grounds that the schema
+> depended on Postgres behaviour, and that a SQLite test of concurrent-webhook
+> idempotency would "give false confidence about the exact scenario that duplicates
+> money". **That premise has been superseded by design, and the suite now settles it
+> empirically.** The old text is kept here as the record of what changed; the port
+> itself is in [`plans/sqlite-migration.md`](plans/sqlite-migration.md).
 
-| Feature used | SQLite difference |
-| --- | --- |
-| `BIGINT` and `CHECK` constraints | Weakly enforced |
-| Partial unique indexes | Different semantics |
-| `FOR UPDATE` row locking | **Not equivalent** — the idempotency test would pass while production races |
-| `JSONB` | Different type entirely |
+The old argument rested on Postgres features. Each was replaced rather than faked:
 
-**The `FOR UPDATE` row is the one that matters.** Concurrent-webhook idempotency
-depends on real Postgres locking; a SQLite test would give false confidence about
-the exact scenario that duplicates money.
+| Then (Postgres) | Now (SQLite) | Consequence for the tests |
+| --- | --- | --- |
+| `SELECT ... FOR UPDATE` row locking | `BEGIN IMMEDIATE` + a conditional-`UPDATE` claim | The claim is a real serialization point in SQLite too, so the idempotency test exercises the production mechanism instead of approximating it |
+| Partial unique indexes | unchanged — SQLite has them | No difference to test |
+| `JSONB` | `TEXT` holding JSON | No difference to test |
+| `BIGINT` + `CHECK` | `STRICT` tables + `CHECK` | `STRICT` makes "money is INTEGER" **enforced**, not merely declared |
 
-CI runs Postgres as a service container with the same major version as production.
+**The specific objection was that the concurrency test would pass while production
+raced.** That is now measured, not assumed: the ported test
+`concurrent_requests_cannot_overdraw_a_one_request_balance` is the only real
+concurrency proof of the overdraw fix, it used to be ignored — `#[ignore = "requires
+live Postgres"]`, i.e. it never ran in CI — and it now runs by default against a
+migrated temp file with the **production** pragmas (`journal_mode=wal`,
+`foreign_keys=ON`, `busy_timeout`, `synchronous`), because `TestDb` hands its file
+to `db::init_pool` rather than building a test-only pool.
+
+So CI runs **bundled SQLite**, and the database is a file — no `services:`, no
+`DATABASE_URL` for the tests:
+
+```yaml
+- name: Apply migrations to an empty database
+  working-directory: server
+  env:
+    DATABASE_URL: sqlite://ci-schema-check.db
+  run: |
+    rm -f ci-schema-check.db ci-schema-check.db-wal ci-schema-check.db-shm
+    cargo run --bin migrate
+```
+
+**There is no longer an ignored database tier.** `cargo test` is the whole suite:
+measured on the merged tree, `cargo test --lib` reports **289 passed / 0 failed /
+2 ignored**, where the previous arrangement reported 200 passed / 75 ignored and
+needed a live Postgres to run the difference. The 2 remaining ignores are **not**
+database tests — they need a *configured* PocketBase (collections, not just a
+running container), which CI does not provide. CI names them and skips them, so the
+exclusion is explicit rather than hidden behind a bare `#[ignore]`:
+
+```yaml
+- name: Integration tests (bundled SQLite)
+  working-directory: server
+  run: >-
+    cargo test --lib
+    -- --skip a_new_login_after_suspend_is_still_refused
+    --skip live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
+```
+
+**Why skipping by name is right and not a dodge:** both tests drive a real PocketBase
+auth exchange and have no seam to fake, and identity is still PocketBase — migration
+Phases 6 and 7 are not done. When Phase 6 lands, those two become ordinary tests and
+the skip flags come out.
 
 ## Schema validation in CI
 
 Two checks, both cheap:
 
-1. **Migrations apply to an empty database** without error.
-2. **The resulting schema matches the documented schema.** The documents in
-   [`website/02-data-model.md`](website/02-data-model.md) are the source; drift means one is wrong.
+1. **Migrations apply to an empty database** without error. CI deletes the file
+   first, so "empty" is literal rather than assumed, then runs `cargo run --bin
+   migrate`, which applies the whole `./migrations` set and exits non-zero unless
+   `journal_mode` is `wal` and `foreign_keys` is on.
+2. **The resulting schema matches the documented schema.** The **source of truth is
+   now the migration itself** —
+   [`server/migrations/20260925000000_initial_schema.sql`](../server/migrations/20260925000000_initial_schema.sql)
+   — and
+   [`tools/sqlite-probes/validate-migration-schema.py`](../tools/sqlite-probes/README.md)
+   parses it. [`website/02-data-model.md`](website/02-data-model.md) is the
+   **historical Postgres design**, kept for the reasoning, and is deliberately not
+   the drift target: it is no longer the shipped DDL.
 
-**A drift check is worth the effort here** because the schema is documented before it
-is implemented (see [`admin-surface.md`](admin-surface.md)) — nothing else would catch the
-documents and migrations diverging.
+**A drift check is worth the effort here** because the schema was documented before it
+was implemented (see [`admin-surface.md`](admin-surface.md)) — nothing else catches the
+migrations and their documentation diverging. One such divergence has already
+happened (a second copy of the DDL went stale, missing `is_operator`), which is why
+there is exactly one copy now.
 
 ## Migration safety gate
 
@@ -104,7 +168,7 @@ CI should **reject** a migration that:
 | Pattern | Why |
 | --- | --- |
 | `DROP COLUMN` / `DROP TABLE` | Destructive in one step; see expand/contract |
-| `ALTER COLUMN ... SET NOT NULL` on an existing column | Breaks the running server |
+| `ALTER COLUMN ... SET NOT NULL` on an existing column | Breaks the running server (SQLite cannot do it in place at all — it needs a table rebuild) |
 | `RENAME` | Breaks the running server |
 | Missing backfill for a new `NOT NULL` column | Fails on a populated table |
 
@@ -130,7 +194,7 @@ they race, and a rollback becomes ambiguous.
 | Secret | Where |
 | --- | --- |
 | Deploy credentials | CI secret store |
-| `DATABASE_URL` (production) | CI secret store, **gated to the `main` branch** |
+| `DATABASE_URL` (production) | CI secret store, **gated to the `main` branch**. It is a `sqlite://<path>` **file path**, not a credential — but it names the volume the ledger lives on, so it stays out of PRs |
 | Provider/API keys | **Never in CI** — runtime on Northflank only |
 
 - **Pull requests from forks must not receive secrets.** Fork PRs run tests with no
@@ -166,13 +230,14 @@ See [`deployment.md`](deployment.md) and [`backup-and-restore.md`](backup-and-re
 
 ## Cost
 
-**CI minutes are near-zero for this project.** A Rust build with caching plus a
-Postgres service container fits any free tier comfortably.
+**CI minutes are near-zero for this project.** A Rust build with caching fits any
+free tier comfortably — and the port removed the last piece of infrastructure the
+pipeline had to stand up.
 
 | Consideration | Note |
 | --- | --- |
 | `cargo` build caching | The difference between 2 minutes and 15 |
-| Postgres service container | Included |
+| Database service container | **Gone** — SQLite is bundled, so CI starts no second process |
 | Frontend build | Static output; seconds |
 
 Keep the free tier in mind when choosing a provider — see
@@ -183,5 +248,7 @@ Keep the free tier in mind when choosing a provider — see
 - [x] CI provider: **GitHub Actions** — [`decisions.md`](decisions.md).
 - [ ] Whether a staging environment exists, or CI deploys straight to production.
 - [x] Migration tooling: **sqlx migrate** — [`decisions.md`](decisions.md).
-- [ ] Whether the schema-drift check is implemented now or after first migration.
+- [ ] Whether the schema-drift check runs as a CI step or stays a local probe —
+  `tools/sqlite-probes/validate-migration-schema.py` exists and parses the
+  migration, but no workflow step invokes it yet.
 - [ ] Cache configuration for build times.

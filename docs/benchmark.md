@@ -47,11 +47,13 @@ We must answer five concrete questions through empirical testing:
 * **Target Endpoint:** `POST /webhooks/midtrans` and usage settlement `debit_usage_transaction`.
 * **Workload:** 100 concurrent workers hammering wallet credits and proxy usage debits across 50 distinct accounts.
 * **What it stresses:**
-  - PostgreSQL row-level locks (`SELECT ... FOR UPDATE` on `topups` and `wallets`).
+  - Single-writer serialisation on `topups` and `wallets` — `BEGIN IMMEDIATE` plus a
+    conditional-`UPDATE` claim (the SQLite replacement for `SELECT ... FOR UPDATE`,
+    which SQLite does not have).
   - Connection pool saturation (`max_connections = 10` on 0.2 vCPU).
   - Append-only write throughput on `ledger` and `usage_daily` upserts.
 * **Pass Criteria:**
-  - Zero deadlocks (`40P01`).
+  - Zero `SQLITE_BUSY` failures and zero write-transaction deadlocks.
   - Zero balance discrepancies: post-test reconciliation query returns 0 errors.
   - $> 100\text{ settlements/sec}$ with connection pool size = 10.
 

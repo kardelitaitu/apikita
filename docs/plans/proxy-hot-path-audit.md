@@ -27,9 +27,11 @@ would **regress** behaviour if applied literally.
 
 **The premise error:** the blueprint frames `rusqlite` vs `sqlx` as a live question about
 existing inefficiency. **There is no `rusqlite` in this repository** — not in
-`Cargo.toml`, not in `Cargo.lock`. The server uses `sqlx` 0.8 with the `postgres`
-feature. So the question is a *forward-looking* choice for the SQLite port, not a
-current problem, and [§3](#3-the-rusqlite-vs-sqlx-question) answers it on that basis.
+`Cargo.toml`, not in `Cargo.lock`. At the time of writing the server used `sqlx` 0.8
+with the `postgres` feature, so the question was a *forward-looking* choice for the
+SQLite port, and [§3](#3-the-rusqlite-vs-sqlx-question) answered it on that basis.
+**The port has since landed and followed this document: `sqlx` 0.8 with the `sqlite`
+feature is what ships.** The reasoning in §3 is kept as the record of why.
 
 ---
 

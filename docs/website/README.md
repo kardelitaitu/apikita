@@ -3,7 +3,7 @@
 Design for the customer-facing web surface. **Parts of it are built** — the
 Status section below marks what exists and what is still design.
 
-**Stack lives in [`docs/architecture.md`](../architecture.md)** — Pages + Rust (Northflank) + Postgres (money) + PocketBase (identity). That document is authoritative; the docs below cover design detail.
+**Stack lives in [`docs/architecture.md`](../architecture.md)** — Pages + Rust (Northflank) + embedded SQLite (money) + PocketBase (identity). That document is authoritative; the docs below cover design detail.
 
 **The frontend's contract with the backend is
 [`docs/server/api-spec.md`](../server/api-spec.md)** — every endpoint the dashboard
@@ -12,7 +12,7 @@ calls.
 | Doc | Covers |
 | --- | --- |
 | [01-architecture.md](01-architecture.md) | Frontend internals. **Superseded on stack** — see `docs/architecture.md` |
-| [02-data-model.md](02-data-model.md) | PostgreSQL schema: tables, constraints, transactions, backups |
+| [02-data-model.md](02-data-model.md) | Data model — **the DDL is the historical PostgreSQL design**; the shipped schema is `server/migrations/20260925000000_initial_schema.sql` |
 | [03-functional-spec.md](03-functional-spec.md) | Every page, flow, and state |
 | [04-payments.md](04-payments.md) | Midtrans QRIS top-up, webhook, settlement, reconciliation |
 | [05-security-decisions.md](05-security-decisions.md) | Wallet immutability, session revocation, verification integrity |
@@ -31,8 +31,8 @@ It does **not** proxy LLM requests. That is [`server/`](../../server/README.md).
 ## Status
 
 **The website is built and builds green.** Measured for this revision:
-`cd website && npm run build` emits **15 static pages** and `npm test` passes
-**52 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 52`, `# pass 52`).
+`cd website && npm run build` emits **17 static pages** and `npm test` passes
+**64 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 64`, `# pass 64`).
 Every route in the spec's table
 (lines 9-21) now has a page. What follows separates what exists from what is
 designed-but-unbuilt; unbuilt items are marked, never deleted.
@@ -105,11 +105,13 @@ repeating it.
 > routes. `/dashboard/settings` therefore shows the linked state and explains the flow
 > without shipping a control that could not work.
 
-**One decision has overtaken the code.** `src/lib/pocketbase.ts`, `login.astro`,
-`signup.astro` and `verify.astro` all speak to PocketBase, while
-[`docs/decisions.md`](../decisions.md) settles identity as **Rust-owned** and records
-PocketBase as going. The pages work against the older split and will need rework
-when the port lands — flagged here, not resolved here.
+**Identity is still PocketBase — this is not an inconsistency.** `src/lib/pocketbase.ts`,
+`login.astro`, `signup.astro` and `verify.astro` speak to PocketBase, and so does the
+server: migration **Phases 6 (identity) and 7 (admin) are not done**, `auth.rs` still
+reads `POCKETBASE_URL`, and two tests remain ignored because they need a live
+PocketBase. `docs/decisions.md` records the **target** — identity Rust-owned — but the
+shipped system is the PocketBase split. What the pages need is rework when Phase 6
+lands, not a fix now.
 
 **Not verified by this document:** that the islands' request and response shapes
 match `server/src/routes/` field-for-field. Both sides exist; the contract between
@@ -135,8 +137,11 @@ state, checked against the tree rather than assumed:
 The page layer is largely written. What remains:
 
 1. ~~PocketBase collections and API rules~~ ([02-data-model.md](02-data-model.md)) —
-   **superseded**: [`docs/decisions.md`](../decisions.md) settles identity as
-   Rust-owned with the PocketBase id column dropped, so this is no longer the work.
+   **not work in this repository.** [`docs/decisions.md`](../decisions.md) settles the
+   *target* (identity Rust-owned, PocketBase id column dropped), but that is migration
+   Phase 6 and it has **not landed** — PocketBase is still the identity provider and
+   `auth.rs` still reads `POCKETBASE_URL`. Configuring PocketBase collections is
+   therefore still required to run the stack today, not superseded work.
 2. ~~Astro pages and the dashboard islands~~ — **built**; see "What exists today".
    No page gaps remain: every route in the spec's table has a file.
 3. **Proxy-side key enforcement and limit checks**
@@ -154,20 +159,30 @@ document used to list as open is settled there, or has been overtaken:
 
 - ~~Frontend framework on Pages~~ — **decided: Astro + islands** (register §Stack)
 - ~~Session lifetime and refresh policy~~ — **decided: 30 days absolute, 7 days idle** (§Identity)
-- ~~Migration tooling for Postgres (sqlx assumed)~~ — **decided: `sqlx migrate`, forward-only** (§Operations); the store itself is now **SQLite**, not Postgres (§Stack)
+- ~~Migration tooling for Postgres (sqlx assumed)~~ — **decided: `sqlx migrate`, forward-only** (§Operations); the store itself is now **SQLite**, not Postgres (§Stack) — applied by `DATABASE_URL=sqlite://<path> cargo run --bin migrate`
 - ~~First-deposit minimum (50k-100k under discussion)~~ — **decided: 50,000 IDR**; re-top-up 10,000 IDR (§Product behaviour and limits)
 - ~~Whether exceeding a spend limit returns 402 or 429~~ — **decided: 402** for a spend-limit breach, **429** for a rate-limit breach (§API behaviour)
 - ~~Proxy cache TTL for key metadata~~ — **decided: 60 seconds** (§API behaviour)
-- ~~Reconciliation job between Postgres and PocketBase~~ — **moot**: the two-store
-  split is being retired (§Stack, §"Migration in flight"). No reconciliation
-  decision is recorded, because there is no longer a second store to reconcile.
+- ~~Reconciliation job between Postgres and PocketBase~~ — **moot for money, live for
+  identity**: the money store is a single SQLite file, but identity is still
+  PocketBase until Phase 6, so `accounts.pb_user_id` can still drift from it. No
+  reconciliation decision is recorded; the orphan check in
+  [`../architecture/identity.md`](../architecture/identity.md) §Reconciliation is still
+  the outstanding work.
 
 Nothing in this document is still open. Genuinely open items are in the register's
 §"Genuinely open"; build tasks are in [`launch-checklist.md`](../launch-checklist.md).
 
 ### Verified
 
-The Postgres schema in [02-data-model.md](02-data-model.md) was parsed and checked
-(when it was written; **not re-run for this revision**):
-20 statements, 9 tables, 9 foreign keys all resolving, no identity columns in
-Postgres, and no money column using a floating-point type.
+The schema in [02-data-model.md](02-data-model.md) was parsed and checked when it was
+written — that was the **Postgres** design, and it is **not re-run and no longer the
+shipped schema**:
+20 statements, 9 tables, 9 foreign keys all resolving, no identity columns in the
+money store, and no money column using a floating-point type.
+
+The shipped schema is
+[`server/migrations/20260925000000_initial_schema.sql`](../../server/migrations/20260925000000_initial_schema.sql),
+every table `STRICT`, validated by
+[`tools/sqlite-probes/validate-migration-schema.py`](../../tools/sqlite-probes/validate-migration-schema.py)
+(see [`docs/architecture.md`](../architecture.md) §Database).
