@@ -97,35 +97,67 @@ runs `ip-purge` and `hold-sweep` from it - and to delete the `NOT WIRED` lines
 from the banner in the same commit, so the log never claims a wiring the compose
 file does not have.
 
-## NOT YET PORTED: the compose service that runs this script
+## The compose service that runs this script - PORTED
 
-**This is open work, and it is outside this directory.** The entrypoint here is
-ported; the `scheduler` service in `docker-compose.yml` is **not**. It still is:
+The `scheduler` service in `docker-compose.yml` **is ported to SQLite** and its
+jobs run for real. It was not always: it ran `image: postgres:16` for its `psql`
+client, carried two `postgres://` DSNs, and mounted neither a `sqlite3` binary nor
+the API's data directory - so it could never succeed at either job, on any host.
+What it is now:
 
 ```yaml
 scheduler:
-  image: postgres:16                      # kept for its psql client
+  build: { context: ., dockerfile: .docker/maintenance/Dockerfile }  # sqlite3, no psql
+  working_dir: /srv/apikita/server        # so reconcile.sh resolves the relative DSN
   environment:
-    DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-dev}@postgres:5432/apikita
-    RECONCILE_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-dev}@postgres:5432/apikita
+    DATABASE_URL: sqlite://data/server.db
+    RECONCILE_DATABASE_URL: sqlite://data/server.db   # separate on purpose, see above
+    APP_DIR: /srv/apikita                 # pinned, not left to the entrypoint default
+    SCHEDULE_HOUR_UTC: ${SCHEDULE_HOUR_UTC:-3}
   volumes:
     - ./.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro
     - ./tools/reconcile:/usr/local/share/reconcile:ro
+    - ./server/data:/srv/apikita/server/data          # the database file
 ```
 
-**Two things must change there, and neither is this directory's to change:**
+Four things are load-bearing here, and each one was a real failure before it was
+fixed. Do not "simplify" any of them away:
 
-1. **The image must stop being `postgres:16` and must gain a `sqlite3` binary.**
-   There is no Postgres any more, and `psql` is not the client these jobs use.
-2. **Both DSNs must become `sqlite://` URLs, and the API's data directory must be
-   mounted.** The database is a file on the host; a container that cannot see it
-   cannot run either job.
+1. **The image is `.docker/maintenance/Dockerfile`, not `postgres:16`.** That file
+   exists for exactly one reason: to put the `sqlite3` CLI on `PATH`. It is
+   `alpine` (the same base as the `nginx` service above, and `sqlite` is an apk
+   package) pinned to an explicit tag. There is **no Postgres client in it**, and
+   putting `postgres:16` back would restore the bug this port fixed: `psql` is not
+   the client these jobs use and cannot open a SQLite file at all.
+2. **Both DSNs are `sqlite://data/server.db`.** They stay **two separate
+   variables** - that is the design in the Environment table above, not an
+   oversight: a bad DSN disarms the reconciliation job alone instead of taking the
+   retention sweep down with it. Collapsing them into one removes that property.
+3. **The third mount, `./server/data` -> `/srv/apikita/server/data`.** Without it
+   the container cannot see the database at all - the one problem that made this
+   service permanently unable to succeed rather than merely wrong.
+4. **`working_dir: /srv/apikita/server`, and the mount above is _not_ `:ro`.**
 
-**Until that happens the nightly run FAILS LOUDLY, and that is the point.** The
-entrypoint refuses a non-SQLite `DATABASE_URL` **by name** rather than guessing a
-filename, refuses to run a database job when `sqlite3` is absent, and refuses a
-missing database file - each a reported failure, never a clean sheet against a
-database it never opened. The banner says all of this on every start.
+   The entrypoint resolves a relative `sqlite://` path itself, against
+   `${APP_DIR}/server/`. `reconcile.sh` does **not**: it gets the raw DSN and
+   resolves a relative path against its own CWD (`reconcile.sh:93`). Run from the
+   image default `/`, reconciliation looks for `/data/server.db`, reports exit
+   `6` "no such database file", and the Gate 2 money check silently never runs
+   against the real database while the retention sweep passes. `working_dir`
+   points both jobs at the same file.
+
+   The mount is writable because the **retention job is a `DELETE`**
+   (`key_ip_seen`/`key_ip_daily`, `run_retention` below) and a `DELETE` against a
+   read-only mount fails on every host - the retention promise would never be
+   kept. The two repo mounts stay `:ro`: what this service must never write is the
+   repo's source, not the data directory. `reconcile.sh` still opens the database
+   `-readonly` by itself; the write privilege is the retention sweep's alone.
+
+**What the entrypoint still refuses, loudly, and should.** A non-SQLite
+`DATABASE_URL` is refused **by name** rather than guessed into a filename, a
+database job does not run when `sqlite3` is absent, and a missing database file is
+a reported failure - never a clean sheet against a database it never opened. The
+banner says all of this on every start.
 
 ## Usage
 
@@ -181,15 +213,20 @@ unchanged (`0`/`1`/`2`).
 
 ## Mounts
 
-Both are read-only; this service never writes to the repo.
+Three, all bind mounts of the host checkout. **The first two are read-only; the
+third cannot be** - see the reasoning in the ported-service section above.
 
 - `./.docker/maintenance/entrypoint.sh` -> `/usr/local/bin/maintenance-entrypoint.sh`
 - `./tools/reconcile` -> `/usr/local/share/reconcile` (`reconcile.sh` +
   `reconcile.sql`, unmodified and unowned by this job)
+- `./server/data` -> `/srv/apikita/server/data` - the API's data directory, so
+  `sqlite://data/server.db` resolves to the same file the API writes. Writable,
+  because the retention job is a `DELETE` and a read-only mount makes that `DELETE`
+  fail on every host; `reconcile.sh` opens the file `-readonly` on its own.
 
-**A third mount is required once the service is ported**: the directory holding the
-SQLite database (the API's data directory). Without it the container cannot see the
-file and every database job fails - loudly, by design, but it will never succeed.
+The directory is gitignored (`server/data/`, `.gitignore:30-34`) and may not exist
+on a fresh checkout. An empty source directory is harmless and honest: the jobs
+report "no such database file" rather than a clean sheet.
 
 ## No healthcheck, on purpose
 
@@ -202,8 +239,11 @@ other service in the compose file.
 
 Verified by execution on 2026-09-26 against a scratch SQLite database built from
 `server/migrations/20260925000000_initial_schema.sql` (fixture under
-`.agents/sqlite-port/`), running the entrypoint directly with
-`DATABASE_URL`/`RECONCILE_SH` overridden. Real output, no fabricated results.
+`.agents/sqlite-port/`), first running the entrypoint directly with
+`DATABASE_URL`/`RECONCILE_SH` overridden, then — after the compose service was
+ported — through the shipped `docker compose` service and its built image (second
+table below). Real output, no fabricated results. Read **Not verified** at the end
+before trusting any of it.
 
 | # | Scenario | Result |
 | - | -------- | ------ |
@@ -216,6 +256,27 @@ Verified by execution on 2026-09-26 against a scratch SQLite database built from
 | g | `DATABASE_URL` naming a missing file | **exit 1**, "no such database file ... (nothing was swept)" |
 | h | `sqlite3` off `PATH` | **exit 1** and the job says so; the database is untouched |
 | i | unknown verb / `SCHEDULE_HOUR_UTC=99` / `=abc` | **exit 2** |
+
+### The ported compose service, verified through `docker compose` (2026-09-26)
+
+The rows above exercised the entrypoint **directly**. These exercise the shipped
+`docker-compose.yml` service and the built image, which is what the port actually
+changed. Same fixture (`server/data/server.db`, built from
+`server/migrations/20260925000000_initial_schema.sql` plus a balanced
+account/wallet/ledger and two seeded retention rows).
+
+| # | Command | Result |
+| - | ------- | ------ |
+| j | `docker compose config --services` | `nginx`, `scheduler` - still exactly two, no database service |
+| k | `docker compose build scheduler` | image built from `.docker/maintenance/Dockerfile` |
+| l | `docker compose run --rm --entrypoint sh scheduler -c 'command -v sqlite3; command -v psql || echo "psql absent (correct)"; sqlite3 --version'` | `/usr/bin/sqlite3`, `psql absent (correct)`, `3.48.0` |
+| m | `docker compose run --rm --entrypoint sh scheduler -c 'ls -la /srv/apikita/server/data/ && test -f /srv/apikita/server/data/server.db && echo DATABASE VISIBLE'` | the file plus its `-wal`/`-shm` sidecars, then `DATABASE VISIBLE` - the third mount is real |
+| n | `docker compose run --rm scheduler once`, clean database | **exit 0**; `job retention: OK - key_ip_seen deleted=1 (retain 7d), key_ip_daily deleted=1 (retain 90d)` and `job reconcile: OK - 0 drifting accounts` |
+| o | `docker compose run --rm scheduler once`, drift injected (wallet 1009 vs ledger 1000) | **exit 1**; `reconcile: DRIFT DETECTED - 1 account(s)...` naming `acc-0001\|1009\|1000`, then `job reconcile: FAILED - exit 1`. Restored afterwards, and `once` returned to **exit 0** |
+
+A check that cannot fail is not a check, which is why row `o` exists next to `n`:
+the same command, same image, same mount, differing only in the data, changes the
+exit code and names the drifting account.
 
 ### Mutation-checked
 
@@ -230,12 +291,29 @@ after**.
 
 ### Not verified
 
-- **The compose service itself.** `scheduler` is still `postgres:16` with postgres
-  DSNs (see the open item above). The entrypoint was exercised directly, not
-  through `docker compose run`.
-- **A container with `sqlite3` installed.** No image here has one yet, which is
-  precisely why the missing-client path is exercised above.
-- **A full nightly cycle at 03:00 UTC.** The `schedule` loop was not waited out;
-  the one-shot verbs were used, which is what they exist for.
+- **A full nightly cycle at 03:00 UTC.** The `schedule` loop was not waited out -
+  that is a 24h wait, and the one-shot verbs exist precisely so the same jobs are
+  testable without it. The loop itself (`next_run_epoch` + `sleep`) is unchanged by
+  this port and unexercised here.
 - **The two Rust binaries.** `ip-purge` and `hold-sweep` are NOT WIRED, by
   construction.
+- **`docker compose run scheduler once` on a host whose checkout has LF working-tree
+  files.** The two script mounts (`entrypoint.sh`, `reconcile.sh`/`.sql`) are shell
+  and SQL files executed **inside** the container. This machine's checkout has them
+  with CRLF line endings (`git config core.autocrlf=true`, no `.gitattributes`
+  pinning them), and a CRLF `/bin/sh` script fails immediately with
+  `set: line 86: illegal option -` - before any job runs. That is a pre-existing
+  property of this checkout, not of the port: it breaks the mount regardless of the
+  image, and it is outside the files this port was fenced to. The rows in the table
+  above were produced from an **LF copy** of the same committed files under
+  `.agents/sqlite-port/lf/` (the project directory passed to
+  `docker compose --project-directory`), with the mounted scripts byte-identical to
+  the committed ones except for line endings. On a Linux host or a checkout with
+  `core.autocrlf=false`/`.gitattributes` forcing LF, the literal commands run
+  unmodified. The right fix is a `.gitattributes` entry forcing LF on
+  `*.sh`/`*.sql`; it is not in this fence, so it is reported rather than done.
+- **`reconcile.sql`'s drift query is verified here only as a whole.** The gate's
+  `reconcile.sql` gap recorded in `tools/reconcile/README.md` was fixed in that
+  file before this run (it now uses `CAST(... AS TEXT)`, not Postgres `::text`), and
+  the drift detection in row `o` exercised it end to end. This README does not
+  re-audit that file.
