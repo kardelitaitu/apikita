@@ -140,9 +140,11 @@ everyone.
 | --- | --- | --- | --- |
 | `PUBLIC_API_BASE_URL` | Cloudflare Pages | **Build time** | No |
 | `PUBLIC_MIDTRANS_CLIENT_KEY` | Cloudflare Pages | **Build time** | No |
+| `PUBLIC_MIDTRANS_ENV` | Cloudflare Pages | **Build time** | No |
 | `DATABASE_URL` | Northflank | Runtime | **Yes** |
 | Provider API keys | Northflank | Runtime | **Yes** |
 | `MIDTRANS_SERVER_KEY` | Northflank | Runtime | **Yes** |
+| `MIDTRANS_ENV` | Northflank | Runtime | No |
 | Google OAuth secret | Northflank | Runtime | **Yes** |
 
 **Pages variables are baked in at build time.** Changing one requires a rebuild,
@@ -151,6 +153,31 @@ happened".
 
 **`PUBLIC_*` is inlined into browser JavaScript.** It is not secret. Putting a real
 secret there publishes it.
+
+### `MIDTRANS_ENV` and `PUBLIC_MIDTRANS_ENV` must match
+
+`MIDTRANS_ENV` (Northflank, read at runtime) and `PUBLIC_MIDTRANS_ENV` (Cloudflare
+Pages, inlined at build time) select which Midtrans host each side talks to. They are
+**two independent variables on two platforms, set at two different times**, and
+**nothing enforces that they agree**. Nothing can: the Pages value is baked into the
+browser bundle, so the server cannot read it at runtime.
+
+Both sides use the same rule — only an explicit `production` selects the live host,
+anything else (including unset or a typo) is sandbox — but that rule only decides what
+a *given* value means. It cannot detect that the two values disagree.
+
+A mismatch fails **silently**. A sandbox `snap_token` is not redeemable by the live
+Snap host, and vice versa, so the payment sheet never opens. The top-up row the server
+already wrote stays `pending` forever and no credit is created — the customer is
+charged nothing, but the wallet also never fills and the failure surfaces nowhere.
+
+- The client key (`PUBLIC_MIDTRANS_CLIENT_KEY`) must belong to the **same
+  environment** as `PUBLIC_MIDTRANS_ENV`. Midtrans prefixes keys by environment
+  (`SB-Mid-client-...` is sandbox); a mismatched pair is caught in the browser and
+  reported to the customer instead of silently hanging.
+- Set all three (`MIDTRANS_ENV`, `PUBLIC_MIDTRANS_ENV`, `PUBLIC_MIDTRANS_CLIENT_KEY`)
+  in the **same deploy**, then rebuild Pages — changing the Pages value alone has no
+  effect until a rebuild (see above).
 
 ## Database backups
 
@@ -170,6 +197,7 @@ The wallet ledger is the business.
 | Frontend deploys before server | Calls a 404 endpoint | R3 handles it; redeploy in order |
 | Bad migration, data damaged | Possible data loss | Restore from the pre-migration backup |
 | Env var changed on Pages | No effect until rebuild | Rebuild |
+| `MIDTRANS_ENV` ≠ `PUBLIC_MIDTRANS_ENV` | Payment sheet never opens; top-up stuck `pending`; no credit, silently | Set both in one deploy, rebuild Pages. The browser now names the mismatch instead of hanging |
 | Relay config changed | Not automatic — it is not part of the app deploy | SSH or a config repo; test `nginx -t` first |
 | **Relay down** | **Total outage**; the backend is unreachable | It is a single point of failure — see [\`edge-relay.md\`](edge-relay.md) |
 | Postgres volume lost | **Total loss of funds data** | Restore; this is why backups are tested |
