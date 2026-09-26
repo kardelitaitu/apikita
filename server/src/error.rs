@@ -161,10 +161,15 @@ impl IntoResponse for AppError {
         // the raw sqlx error / formatted failure, so an operator reading the
         // log still sees it; the customer sees only `client_message`.
         if matches!(self, Self::Database(_) | Self::Internal(_)) {
+            // Computed as a plain statement (not inside the `error!` field list)
+            // so the conversion is counted as covered regardless of whether a
+            // subscriber is registered - the macro only evaluates its field
+            // expressions when one is, which the unit tests do not do.
+            let status_u16 = status.as_u16();
             error!(
                 request_id = %request_id,
                 code = %code,
-                status = status.as_u16(),
+                status = status_u16,
                 error = %self,
                 "returning a generic message to the client for an internal failure"
             );
@@ -355,16 +360,15 @@ mod tests {
 
     #[test]
     fn every_variant_matches_the_documented_status_and_code() {
-        for (err, status, code) in documented_cases() {
+        for (err, status, expected_code) in documented_cases() {
             assert_eq!(
                 err.status_code().as_u16(),
                 status,
-                "HTTP status drift for code `{}` (docs/error-model.md:35-50)",
-                err.code()
+                "HTTP status drift for code `{expected_code}` (docs/error-model.md:35-50)"
             );
             assert_eq!(
                 err.code(),
-                code,
+                expected_code,
                 "machine-readable code drift for HTTP {status} (docs/error-model.md:35-50)"
             );
         }
@@ -631,6 +635,34 @@ mod tests {
                 "docs/error-model.md rule 1 - internals must not reach the client, leaked {leak} in: {message}"
             );
         }
+    }
+
+    /// The `Database`/`Internal` arms of `into_response` log the failure with
+    /// its status field (error.rs:167). `tracing`'s `error!` only evaluates its
+    /// structured fields when a subscriber is registered, and the unit-test
+    /// binary has none - so without this test that line is dead. Production
+    /// always runs with a subscriber; this test installs a scoped one on the
+    /// current thread and confirms the 500 + generic-body path still holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn internal_errors_log_their_status_field_when_a_subscriber_is_active() {
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::ERROR)
+                .finish(),
+        );
+
+        let (status, _, body) = respond(AppError::Database(sqlx::Error::RowNotFound)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            error_object(&body)["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("An unexpected error occurred"),
+            "internal failures must stay generic to the client"
+        );
+
+        let (status, _, body) = respond(AppError::Internal("boom".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Regression guard for the fix above: `Display` is load-bearing for
