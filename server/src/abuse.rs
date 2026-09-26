@@ -552,9 +552,22 @@ mod tests {
         // MAX(created_at) instead of MIN would answer ~86340, one read off the
         // window length would answer 86400, and one read off "now" would answer
         // 86400 as well. None of them can produce 1800.
+        //
+        // `now` is taken AFTER the nine bulk rows, not before them. Those rows
+        // are nine sequential round trips whose only job is to fill the cap, and
+        // MEASURED under a loaded suite they can take more than the one second of
+        // headroom above - which turned this assertion into `1799 != 1800`,
+        // intermittently, in about one run in four. The pinned row is the one the
+        // assertion reads, so it is the one whose instant has to be fresh.
+        insert_api_keys_at(
+            &pool,
+            account_id,
+            Utc::now() - Duration::seconds(60),
+            limit - 1,
+        )
+        .await;
         let now = Utc::now();
         let ages_out_in_1800s = now - key_creation_window() + Duration::seconds(1800);
-        insert_api_keys_at(&pool, account_id, now - Duration::seconds(60), limit - 1).await;
         insert_api_keys_at(&pool, account_id, ages_out_in_1800s, 1).await;
 
         let (status, refusal, body) = call_create_key(&state, &headers).await;
