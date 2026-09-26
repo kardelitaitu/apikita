@@ -212,8 +212,11 @@ impl RealtimeHub {
         match history.front() {
             None => Resume::Snapshot,
             // The buffer starts after the next id the client expected, so
-            // something in between was dropped.
-            Some(oldest) if oldest.id > last_id + 1 => Resume::Snapshot,
+            // something in between was dropped. Saturating, not `+1`: the id is
+            // CLIENT INPUT (`Last-Event-ID`), and `u64::MAX + 1` overflowed -
+            // a panic in a debug build, reachable with one hand-crafted
+            // reconnect header.
+            Some(oldest) if oldest.id > last_id.saturating_add(1) => Resume::Snapshot,
             Some(_) => {
                 let after: Vec<RealtimeEvent> = history
                     .iter()
@@ -608,6 +611,28 @@ mod tests {
             Resume::Replay(events) => assert_eq!(events.len(), 2),
             Resume::Snapshot => panic!("id 3 is contiguous with the buffer"),
         }
+    }
+
+    /// Last-Event-ID is CLIENT INPUT: `last_event_id()` parses whatever u64 the
+    /// header carries, and `resume` used to answer `oldest.id > last_id + 1` -
+    /// which overflows on `u64::MAX`, panicking the stream handler in a debug
+    /// build from one hand-crafted reconnect header.
+    #[test]
+    fn resume_survives_a_client_sent_u64_max_last_event_id() {
+        let hub = RealtimeHub::new(&hub_config(10, 5));
+        let owner = Uuid::new_v4();
+        for i in 1..=3i64 {
+            hub.publish(RealtimeEvent::balance(owner, i));
+        }
+
+        // No buffer reaches back to u64::MAX: the only correct answer is a
+        // snapshot, and it must not cost a panic to say so.
+        assert!(
+            matches!(hub.resume(Some(u64::MAX)), Resume::Snapshot),
+            "an id the buffer cannot possibly reach must snapshot"
+        );
+        // The boundary one below the overflow: still just a very large id.
+        assert!(matches!(hub.resume(Some(u64::MAX - 1)), Resume::Snapshot));
     }
 
     #[test]
