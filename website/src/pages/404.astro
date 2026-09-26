@@ -1,0 +1,23 @@
+---
+import Base from '../layouts/Base.astro';
+
+// The static host serves this file (dist/404.html) for an unknown route. The
+// relay in front of the local build does not: its try_files ends in =404, so
+// nginx answers unknown ROUTES with its own page here — this one is what
+// production serves. Zero <script>, like every other marketing page.
+---
+
+<Base
+  title="Page not found — apikita"
+  description="That page does not exist. Return to the apikita homepage or read the quickstart."
+>
+  <h1 class="text-4xl font-semibold tracking-tight">Page not found</h1>
+  <p class="mt-6 max-w-2xl text-ink-muted">
+    There is nothing at this address. It may have moved, or the link that brought
+    you here may have been wrong.
+  </p>
+  <ul class="mt-8 flex flex-wrap gap-x-6 gap-y-2">
+    <li><a href="/" class="font-medium text-brand hover:text-brand-strong">Back to the homepage</a></li>
+    <li><a href="/docs" class="font-medium text-brand hover:text-brand-strong">Read the docs</a></li>
+  </ul>
+</Base>

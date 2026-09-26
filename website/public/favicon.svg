@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Brand green on the page colour. One stroked glyph, no fonts, no scripts,
+       no external references: nothing to fail to load, and legible at 16x16. -->
+  <rect width="32" height="32" rx="7" fill="#040d09"/>
+  <path d="M8.5 24 16 8l7.5 16M12.4 19h7.2" fill="none" stroke="#3fd97f" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
