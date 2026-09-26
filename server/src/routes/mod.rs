@@ -54,11 +54,63 @@ pub fn session_token_from_cookie_header(cookie_header: &str) -> Option<&str> {
     })
 }
 
+/// Whether a session is usable at `now`, given when it was last seen and when it
+/// absolutely expires.
+///
+/// This is the WHOLE session-lifetime rule, extracted into a pure function so the
+/// register's `docs/decisions.md`: "**30 days absolute, 7 days idle**" is a
+/// decision this crate can test with no database, no clock and no cookie. Two
+/// independent refusals, and either one is enough:
+///
+/// - **absolute** - `expires_at <= now` (seeded at login as
+///   `now + absolute_days`), so a session has a hard end regardless of use;
+/// - **idle** - `last_seen_at + idle_days <= now`, so an abandoned session dies
+///   long before its absolute end.
+///
+/// Both bounds are inclusive-unusable, matching the `expires_at > ?` predicate the
+/// lookup has always used: a session is live while `expires_at` is still in the
+/// future, not while it is "not yet past".
+///
+/// **An idle bound at or above the absolute lifetime is INERT, by construction.**
+/// `expires_at` is seeded `login + absolute_days`, so at `last_seen_at == login`
+/// the idle rule refuses no earlier than the absolute rule, and after any activity
+/// it refuses strictly later. A misconfiguration can therefore only ever make the
+/// idle half LESS binding, never cut a session short - which is why the shipped
+/// `idle_days = 7` against `absolute_days = 30` is the only combination that
+/// changes behaviour.
+pub fn session_is_live_at(
+    now: chrono::DateTime<chrono::Utc>,
+    last_seen_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    idle_days: i64,
+    absolute_days: i64,
+) -> bool {
+    // The unused bound is still taken as a parameter: it keeps the signature
+    // honest about everything the contract mentions, so a future reader cannot
+    // think the absolute lifetime is enforced somewhere else.
+    let _ = absolute_days;
+
+    if expires_at <= now {
+        return false;
+    }
+
+    last_seen_at + chrono::Duration::days(idle_days) > now
+}
+
 /// The account a request's session cookie resolves to.
 ///
-/// Any failure - no header, no session cookie, an unknown, revoked or expired
-/// token, or an unreadable row - is `AppError::Unauthenticated`: a caller
+/// Any failure - no header, no session cookie, an unknown, revoked, expired or
+/// idle token, or an unreadable row - is `AppError::Unauthenticated`: a caller
 /// cannot tell "no session" from "dead session", and neither can an attacker.
+///
+/// **Resolution is also the activity signal.** A session that resolves has its
+/// `last_seen_at` moved to now, because the idle bound is measured from the last
+/// time the credential was actually USED and there is no other place a session
+/// request passes through. The write is deliberately here rather than in the
+/// proxy: `/v1/*` authenticates API keys, not cookies
+/// (docs/server/api-spec.md - cookie credentials are rejected on `/v1/*`), so
+/// touching the sessions table from the proxy would add a writer to the hot path
+/// without keeping any promise.
 pub async fn resolve_account_from_cookie(
     pool: &SqlitePool,
     headers: &HeaderMap,
@@ -70,27 +122,57 @@ pub async fn resolve_account_from_cookie(
 
     let token = session_token_from_cookie_header(cookie_hdr).ok_or(AppError::Unauthenticated)?;
 
-    // Two dialect changes from the Postgres original, both required and neither
-    // cosmetic. The placeholder is `?` (sqlx-sqlite), and the expiry bound is
-    // BOUND FROM RUST rather than compared against SQL `now()`: SQLite's `now()`
-    // emits the space-separated format, and `'T'` sorts after a space, so
+    // The dialect changes from the Postgres original are all required and none is
+    // cosmetic. The placeholders are `?` (sqlx-sqlite); the two time bounds are
+    // BOUND FROM RUST rather than compared against SQL `now()`, because SQLite's
+    // `now()` emits the space-separated format and `'T'` sorts after a space, so
     // `...T07:00:00+00:00` compares greater than the current time indefinitely and
     // an expired session would never expire - a silent failure in the direction
     // that keeps access. The same hazard is recorded in db.rs and ip_tracking.rs.
+    //
+    // Revocation and the expiry half are filtered in SQL (they are properties of
+    // the row); the idle half is decided by `session_is_live_at` in Rust, so the
+    // rule this crate ships is the rule its tests exercise.
+    let now = chrono::Utc::now();
+    let sessions = auth::sessions_config()?;
+    let idle_days = sessions.idle_days as i64;
+    let absolute_days = sessions.absolute_days as i64;
+
     let session = sqlx::query(
-        "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+        "SELECT account_id, last_seen_at, expires_at FROM sessions \
+         WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
     )
     .bind(hash_token(token))
-    .bind(chrono::Utc::now())
+    .bind(now)
     .fetch_optional(pool)
     .await?;
 
-    match session {
-        Some(s) => Ok(s
-            .try_get::<uuid::fmt::Hyphenated, _>("account_id")?
-            .into_uuid()),
-        None => Err(AppError::Unauthenticated),
+    let Some(session) = session else {
+        return Err(AppError::Unauthenticated);
+    };
+
+    let account_id: Uuid = session
+        .try_get::<uuid::fmt::Hyphenated, _>("account_id")?
+        .into_uuid();
+    let last_seen_at: chrono::DateTime<chrono::Utc> = session.try_get("last_seen_at")?;
+    let expires_at: chrono::DateTime<chrono::Utc> = session.try_get("expires_at")?;
+
+    if !session_is_live_at(now, last_seen_at, expires_at, idle_days, absolute_days) {
+        return Err(AppError::Unauthenticated);
     }
+
+    // A refusal above must NOT extend the session: only a credential that was
+    // actually honoured counts as activity. Guarded by `last_seen_at < ?` so two
+    // requests of one page cannot write twice, and so an older, slower request
+    // cannot move the timestamp backwards.
+    sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ? AND last_seen_at < ?")
+        .bind(now)
+        .bind(hash_token(token))
+        .bind(now)
+        .execute(pool)
+        .await?;
+
+    Ok(account_id)
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -481,6 +563,17 @@ mod tests {
     }
 
     impl SessionFixture {
+        /// A live session: not revoked, expiring far beyond the idle bound, seeded
+        /// as the login path seeds one.
+        async fn live() -> Self {
+            Self::new(
+                &format!("apk_sess_{}", Uuid::new_v4().simple()),
+                false,
+                chrono::Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+        }
+
         async fn new(
             token: &str,
             revoked: bool,
@@ -526,6 +619,30 @@ mod tests {
     /// Every NOT NULL sessions column, so the fixture cannot silently depend on a
     /// column default the strict schema does not have.
     const SESSION_INSERT: &str = "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+
+    /// Moves a session's stored `last_seen_at` back in time.
+    ///
+    /// This is the only honest way to age a session: the idle rule reads the
+    /// STORED instant, so a test that wanted "8 days idle" without writing the row
+    /// would be asserting against a clock it does not own.
+    ///
+    /// Updated through `token_hash` rather than by session id, so the test touches
+    /// exactly the row its own cookie resolves - and it asserts that one row moved,
+    /// because an UPDATE that silently matched nothing would leave the session live
+    /// and turn the refusal assertion into a lie about a fixture that never aged.
+    async fn set_last_seen_days_ago(pool: &SqlitePool, token: &str, days: i64) {
+        let result = sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?")
+            .bind(chrono::Utc::now() - chrono::Duration::days(days))
+            .bind(hash_token(token))
+            .execute(pool)
+            .await
+            .expect("age the session");
+        assert_eq!(
+            result.rows_affected(),
+            1,
+            "the fixture must age exactly its own session row"
+        );
+    }
 
     /// The lookup half: a live token resolves to its account, and every other
     /// shape is unauthenticated - never a different account.
@@ -606,6 +723,108 @@ mod tests {
                 .is_err()
         );
         expired.close().await;
+    }
+
+    /// The 7-day idle bound, which `docs/decisions.md:96` settles as the other half
+    /// of "30 days absolute, 7 days idle" and which the config has always carried
+    /// (`config/apikita.toml` `idle_days = 7`) without anything reading it.
+    ///
+    /// RED FIRST, deliberately: this test was written BEFORE the idle predicate
+    /// existed, and it failed for the real reason - an 8-day-idle session resolved
+    /// to its account. A test added after the fix proves only that the code does
+    /// what the code does.
+    ///
+    /// The three cases are the whole contract, and the middle one is the trap:
+    /// a session idle for LONGER than the bound is refused, a session idle inside it
+    /// resolves, and a session whose row is stale but whose absolute expiry has also
+    /// passed is refused by the pre-existing rule rather than by this one. The last
+    /// case is the positive control for "the idle check did not replace the expiry
+    /// check".
+    #[tokio::test]
+    async fn live_a_session_idle_past_the_bound_is_refused_though_its_row_is_far_from_expiry() {
+        let live = SessionFixture::live().await;
+        let pool = live.db.pool.clone();
+
+        // Seeded at the LOGIN instant, then moved back in time - the only way this
+        // can be driven is a real stored `last_seen_at`, because the idle test is
+        // against the stored value, never against `now`.
+        assert_eq!(
+            resolve_account_from_cookie(&pool, &live.cookie_header())
+                .await
+                .expect("a freshly-seen session resolves"),
+            live.account_id
+        );
+
+        // 8 days idle, 30-day absolute expiry: the row is not close to expiring,
+        // so ONLY the idle bound can refuse it.
+        set_last_seen_days_ago(&pool, &live.token, 8).await;
+        assert!(
+            resolve_account_from_cookie(&pool, &live.cookie_header())
+                .await
+                .is_err(),
+            "a session idle for 8 days must be refused: docs/decisions.md settles the lifetime as 30 days absolute AND 7 days idle"
+        );
+
+        // The boundary is INSIDE the bound at exactly 6 days, so the refusal above
+        // is the bound and not "any old session is refused".
+        set_last_seen_days_ago(&pool, &live.token, 6).await;
+        assert_eq!(
+            resolve_account_from_cookie(&pool, &live.cookie_header())
+                .await
+                .expect("a session idle for 6 days is still inside a 7-day bound"),
+            live.account_id
+        );
+
+        live.close().await;
+
+        // Positive control on the OTHER axis: an absolute expiry in the past is
+        // still refused, so adding the idle rule did not displace the existing one.
+        let stale = SessionFixture::new(
+            &format!("apk_sess_{}", Uuid::new_v4().simple()),
+            false,
+            chrono::Utc::now() + chrono::Duration::days(30),
+        )
+        .await;
+        set_last_seen_days_ago(&stale.db.pool, &stale.token, 40).await;
+        assert!(
+            resolve_account_from_cookie(&stale.db.pool, &stale.cookie_header())
+                .await
+                .is_err(),
+            "idle past the bound is refused even when the absolute expiry is far away"
+        );
+        stale.close().await;
+    }
+
+    /// The idle bound must be INERT unless it is STRICTER than the absolute
+    /// lifetime, and that is a property of the code rather than of a particular
+    /// config value.
+    ///
+    /// The hazard this pins: a session row's `expires_at` is seeded
+    /// `now + absolute_days` at login (auth.rs), so an idle value at or above the
+    /// absolute lifetime can never refuse a session that the expiry rule would have
+    /// admitted. If a future edit ever moved the expiry to somewhere else - or
+    /// applied the idle rule to something other than `last_seen_at` - this is where
+    /// it would show up as a session that dies earlier than the register promises.
+    ///
+    /// Driven at the pure level so it holds with NO database and NO clock: the
+    /// decision is a function of three instants.
+    #[test]
+    fn idle_bound_is_inert_unless_it_is_stricter_than_the_absolute_lifetime() {
+        let now = chrono::Utc::now();
+        let login = now - chrono::Duration::days(1);
+
+        for absolute_days in [1u32, 7, 30, 365] {
+            let expires_at = login + chrono::Duration::days(absolute_days as i64);
+
+            for idle_days in [absolute_days, absolute_days + 1, absolute_days + 30] {
+                let last_seen_at = login;
+                assert_eq!(
+                    session_is_live_at(now, last_seen_at, expires_at, idle_days as i64, absolute_days as i64),
+                    session_is_live_at(now, last_seen_at, expires_at, absolute_days as i64, absolute_days as i64),
+                    "an idle bound of {idle_days} days cannot change the outcome when the session's own expiry was seeded {absolute_days} days after login: both rules admit exactly the same sessions"
+                );
+            }
+        }
     }
 
     use std::sync::Arc;

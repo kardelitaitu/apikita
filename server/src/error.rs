@@ -661,7 +661,7 @@ mod tests {
             "internal failures must stay generic to the client"
         );
 
-        let (status, _, body) = respond(AppError::Internal("boom".into())).await;
+        let (status, _, _body) = respond(AppError::Internal("boom".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 

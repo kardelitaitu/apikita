@@ -137,11 +137,53 @@ fn pb_http_client() -> Result<&'static reqwest::Client, AppError> {
 
 static PB_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// What a PocketBase auth-refresh HTTP status means for OUR caller.
+///
+/// Extracted from `verify_pb_token` because it is the whole of the contract and
+/// it needs no network to state: the function below cannot be driven without a
+/// live PocketBase (which is why two tests in this crate carry `#[ignore]`), but
+/// this decision can be, and that is precisely the part that was wrong.
+///
+/// The distinction is between an upstream that is BROKEN and one that ANSWERED:
+///
+/// - **2xx** - the token is good; the caller parses the record id out of the body,
+///   so a 2xx with an unreadable body is still a rejection (`parse_pb_user_id`)
+///   rather than a retryable outage: PocketBase answered, we just cannot use it.
+/// - **any other status with a 5xx or 429 shape** - PocketBase is down, restarting,
+///   or throttling us. `AppError::Internal` -> 500, so the client retries instead
+///   of throwing the session away (docs/architecture/identity.md: an auth outage
+///   must not lock users out). Before this mapping existed, every one of these was
+///   collapsed into 401 by `!status.is_success()`, and a 30-second PocketBase
+///   restart logged every signed-in customer out.
+/// - **any remaining 4xx** - PocketBase actively refused this credential. That is
+///   the only shape that may be `Unauthenticated`.
+///
+/// Classified by `is_server_error() || TOO_MANY_REQUESTS` rather than by an
+/// explicit 4xx list on purpose: a 5xx shape PocketBase grows later is treated as
+/// an outage by default, which is the safe direction - the cost of a wrong "retry"
+/// is a wasted request, and the cost of a wrong "your token is dead" is a
+/// customer logged out mid-use.
+fn pb_status_to_error(status: reqwest::StatusCode) -> Result<(), AppError> {
+    if status.is_success() {
+        return Ok(());
+    }
+
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::Internal(format!(
+            "PocketBase auth-refresh returned {status} (outage, retryable)"
+        )));
+    }
+
+    Err(AppError::Unauthenticated)
+}
+
 /// Verify a PocketBase auth token and return the real record id behind it.
 ///
 /// A rejected token is 401. A PocketBase outage is *not* a rejected token: it
 /// returns 500 so the client retries instead of discarding a good session
 /// (docs/architecture/identity.md - an auth outage must not lock users out).
+/// The status split lives in `pb_status_to_error`, which is unit-tested; only the
+/// round trip to PocketBase is untestable without a live provider.
 async fn verify_pb_token(token: &str) -> Result<String, AppError> {
     let auth_value =
         reqwest::header::HeaderValue::from_str(token).map_err(|_| AppError::Unauthenticated)?;
@@ -155,9 +197,9 @@ async fn verify_pb_token(token: &str) -> Result<String, AppError> {
         .await
         .map_err(|e| AppError::Internal(format!("PocketBase auth-refresh unreachable: {e}")))?;
 
-    if !response.status().is_success() {
-        return Err(AppError::Unauthenticated);
-    }
+    // An outage and a rejection are different answers, and only the second one
+    // may end a customer's session - see `pb_status_to_error`.
+    pb_status_to_error(response.status())?;
 
     let body = response
         .text()
@@ -176,7 +218,7 @@ static SESSIONS_CONFIG: OnceLock<SessionsConfig> = OnceLock::new();
 /// SessionsConfig is not part of the router state (State<SqlitePool>), so the config
 /// file is read once per process and cached. Same resolution order as main.rs:
 /// APIKITA_CONFIG_PATH, then config/, then ../config/.
-fn sessions_config() -> Result<&'static SessionsConfig, AppError> {
+pub(crate) fn sessions_config() -> Result<&'static SessionsConfig, AppError> {
     if let Some(config) = SESSIONS_CONFIG.get() {
         return Ok(config);
     }
@@ -389,6 +431,65 @@ pub async fn logout_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The documented promise the code does not keep: "A PocketBase outage is
+    /// *not* a rejected token: it returns 500 so the client retries instead of
+    /// discarding a good session (docs/architecture/identity.md - an auth outage
+    /// must not lock users out)" (the doc comment on `verify_pb_token` itself).
+    ///
+    /// Only the TRANSPORT-error branch upheld that. A PocketBase that ANSWERED with
+    /// a 500 - a crashed collection, a proxy error page, a restarted instance -
+    /// was collapsed by `!response.status().is_success()` into
+    /// `AppError::Unauthenticated`, i.e. a 401. The client then DISCARDS the user's
+    /// token and sends them to the login page: the outage is reported as "your
+    /// credential is bad", which is both false and unrecoverable by retrying.
+    ///
+    /// Written RED FIRST against the pre-fix code, which returned `Unauthenticated`
+    /// for every one of the 5xx/429 cases below.
+    ///
+    /// The platform vendors the mapping into a pure function deliberately: no
+    /// network seam is needed to pin it, which is the reason the two remaining
+    /// `#[ignore]`d tests in this crate have to exist at all.
+    #[test]
+    fn a_pocketbase_outage_is_retryable_and_only_a_rejection_is_unauthenticated() {
+        use reqwest::StatusCode as Pb;
+
+        // The upstream is BROKEN, not the credential. 500/502/503/504 are outage
+        // shapes; 429 is "try again shortly" and explicitly not a bad token.
+        for status in [
+            Pb::INTERNAL_SERVER_ERROR,
+            Pb::BAD_GATEWAY,
+            Pb::SERVICE_UNAVAILABLE,
+            Pb::GATEWAY_TIMEOUT,
+            Pb::TOO_MANY_REQUESTS,
+        ] {
+            assert!(
+                matches!(pb_status_to_error(status), Err(AppError::Internal(_))),
+                "a PocketBase {status} is an OUTAGE: it must be Internal (500, retryable), never Unauthenticated, or a customer's good session is thrown away and they cannot retry their way back in"
+            );
+        }
+
+        // The upstream ANSWERED and rejected the credential. This is the only
+        // shape that may tell the client its token is dead.
+        for status in [
+            Pb::UNAUTHORIZED,
+            Pb::FORBIDDEN,
+            Pb::NOT_FOUND,
+            Pb::BAD_REQUEST,
+        ] {
+            assert!(
+                matches!(pb_status_to_error(status), Err(AppError::Unauthenticated)),
+                "a PocketBase {status} is a REJECTED credential and must stay a 401 - changing this would let a dead token look like a transient failure"
+            );
+        }
+
+        // The positive control: success is not an error at all, so the mapping
+        // cannot be "everything is Internal" or "everything is Unauthenticated".
+        assert!(
+            pb_status_to_error(Pb::OK).is_ok(),
+            "a 2xx must map to Ok, or nothing above measures a real boundary"
+        );
+    }
 
     #[test]
     fn refresh_url_trims_trailing_slash() {
