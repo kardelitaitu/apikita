@@ -225,7 +225,6 @@ These need information that does not exist yet, not a design decision:
 | A second upstream provider | Reading its resale terms |
 | Support cost per customer | Real usage data |
 | Whether a staging environment exists | A cost decision |
-
 | Abuse-report contact | Publishing the terms |
 | Review moderation policy | Operating experience |
 
