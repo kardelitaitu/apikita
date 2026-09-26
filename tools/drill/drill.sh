@@ -107,6 +107,33 @@ RTO_BUDGET_SECONDS="${RTO_BUDGET_SECONDS:-14400}"
 VERIFY_ONLY=0
 USAGE="usage: sh tools/drill/drill.sh --target <scratch-file.db> [--dump <file>] [--verify-only] [--keep-scratch] [--log-dir <dir>]"
 
+# Numeric knobs are refused HERE, before any file is read or written. A knob
+# that only fails mid-run is the worst kind of config error: '%' in
+# DRILL_ROW_TOLERANCE_PCT is the MODULO operator in shell arithmetic, so the
+# step-6b expansion dies, and POSIX says an expansion error exits a
+# non-interactive shell - the drill would stop mid-restore with exit 1, which
+# this script's own table documents as "a check failed: drift". A typo must
+# not be able to page that. tools/alert/probe.sh refuses its knobs for the
+# same reason: a threshold in the message must not be a lie.
+for DRILL_KNOB in DRILL_ROW_TOLERANCE DRILL_ROW_TOLERANCE_PCT RTO_BUDGET_SECONDS; do
+    eval "DRILL_KNOB_VAL=\${$DRILL_KNOB:-}"
+    case "$DRILL_KNOB_VAL" in
+        ''|*[!0-9]*)
+            printf 'drill: %s=%s is not a non-negative integer\n' "$DRILL_KNOB" "$DRILL_KNOB_VAL" >&2
+            printf '%s\n' "$USAGE" >&2
+            exit 2
+            ;;
+    esac
+done
+case "$DRILL_KEEP_SCRATCH" in
+    0|1) ;;
+    *)
+        printf 'drill: DRILL_KEEP_SCRATCH=%s is not 0 or 1\n' "$DRILL_KEEP_SCRATCH" >&2
+        printf '%s\n' "$USAGE" >&2
+        exit 2
+        ;;
+esac
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --target)         [ $# -ge 2 ] || { printf '%s\n' 'drill: --target needs a value' >&2; exit 2; }; DRILL_TARGET="$2"; shift 2 ;;
