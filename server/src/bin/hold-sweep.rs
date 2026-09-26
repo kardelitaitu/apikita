@@ -380,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = match db::init_pool(&database_url).await {
         Ok(pool) => pool,
         Err(err) => {
-            error!("Could not connect to Postgres: {err}");
+            error!("Could not connect to the database (SQLite): {err}");
             // Non-zero, so a scheduler notices a sweep that did not run. A sweep
             // that silently stops running is how a detector stops detecting.
             std::process::exit(1);
