@@ -57,7 +57,8 @@
 # Exit codes (3, 4 and 6 keep tools/reconcile/reconcile.sh's meanings):
 #   0  PASS    - restore completed, integrity ok, zero drifting rows, every criterion met
 #   1  FAIL    - a check failed: drift, integrity, row counts, spot-check, or no key hashes
-#   2  usage   - no --target, a bad option, or a target that is not a bare *.db filename
+#   2  usage   - no --target, a bad option, a target that is not a bare *.db
+#                 filename, or a knob that is not a usable number
 #   3  missing - a required tool is absent (sqlite3, reconcile.sh, verify.sql)
 #   4  db      - a sqlite3 command failed (unreadable file, SQL error)
 #   5  REFUSED - the target looks like the live database. NOTHING was touched.

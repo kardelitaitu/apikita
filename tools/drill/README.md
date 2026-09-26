@@ -123,7 +123,7 @@ Codes `3`, `4` and `6` keep their meanings from
 | ---- | ------- |
 | `0` | **PASS** - restore completed, `integrity_check` ok, zero drifting rows, every pass criterion met. |
 | `1` | **FAIL** - a check failed: drift, integrity, row counts, spot-check, or no usable `key_hash`. |
-| `2` | **usage** - no `--target`, an unknown option, a target that is not a bare `*.db` filename, a non-SQLite `DATABASE_URL`, or no source at all. |
+| `2` | **usage** - no `--target`, an unknown option, a target that is not a bare `*.db` filename, a numeric knob that is not a usable number (`DRILL_ROW_TOLERANCE`, `DRILL_ROW_TOLERANCE_PCT`, `RTO_BUDGET_SECONDS` must be non-negative integers; `DRILL_KEEP_SCRATCH` must be `0` or `1`), a non-SQLite `DATABASE_URL`, or no source at all. |
 | `3` | **missing tool** - `sqlite3` not on `PATH`, or `reconcile.sh`/`verify.sql` missing. |
 | `4` | **database failure** - a `sqlite3` command failed (unreadable file, SQL error). |
 | `5` | **REFUSED** - the target looks like the live database. **Nothing was touched.** |
