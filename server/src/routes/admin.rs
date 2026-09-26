@@ -488,9 +488,7 @@ mod tests {
     async fn live_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
             .expect("set DATABASE_URL to a migrated Postgres instance");
-        init_pool(&database_url)
-            .await
-            .expect("connect to Postgres")
+        init_pool(&database_url).await.expect("connect to Postgres")
     }
 
     fn live_config() -> Arc<AppConfig> {
@@ -631,7 +629,11 @@ mod tests {
         .expect("create_key must succeed")
         .into_response();
 
-        assert_eq!(res.status(), StatusCode::CREATED, "creation must answer 201");
+        assert_eq!(
+            res.status(),
+            StatusCode::CREATED,
+            "creation must answer 201"
+        );
         let body: Value = json_body(res).await;
         (
             serde_json::from_value(body["id"].clone()).expect("id is a UUID"),
@@ -967,7 +969,11 @@ mod tests {
         // (d) exactly ONE audit row, with the right operator/action/target and a
         // non-null detail carrying the counts.
         let audit = audit_rows(&pool, victim).await;
-        assert_eq!(audit.len(), 1, "exactly one audit row per suspend: {audit:?}");
+        assert_eq!(
+            audit.len(),
+            1,
+            "exactly one audit row per suspend: {audit:?}"
+        );
         let (audit_operator, action, target_type, detail) = &audit[0];
         assert_eq!(*audit_operator, operator, "the OPERATOR must be recorded");
         assert_eq!(action, "suspend");
@@ -1318,7 +1324,11 @@ mod tests {
             1,
             "resume must NOT revoke sessions"
         );
-        assert_eq!(live_keys(&pool, victim).await, 1, "resume must NOT revoke keys");
+        assert_eq!(
+            live_keys(&pool, victim).await,
+            1,
+            "resume must NOT revoke keys"
+        );
         let key_revoked: Option<DateTime<Utc>> =
             sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = $1")
                 .bind(key_id)
@@ -1417,7 +1427,10 @@ mod tests {
                 .await
                 .expect("read token_hash");
         let text = body.to_string();
-        assert!(!text.contains(&key_hash), "the lookup leaked key_hash: {text}");
+        assert!(
+            !text.contains(&key_hash),
+            "the lookup leaked key_hash: {text}"
+        );
         assert!(
             !text.contains(&session_hash),
             "the lookup leaked token_hash: {text}"

@@ -26,7 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting ApiKita Gateway Server");
 
     // Load configuration
-    let config_path = env::var("APIKITA_CONFIG_PATH").unwrap_or_else(|_| "config/apikita.toml".into());
+    let config_path =
+        env::var("APIKITA_CONFIG_PATH").unwrap_or_else(|_| "config/apikita.toml".into());
     let config = match AppConfig::load_from_file(&config_path) {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -48,9 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Database connection
-    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@localhost:5432/apikita".into()
-    });
+    let database_url = env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/apikita".into());
 
     let pool = match db::init_pool(&database_url).await {
         Ok(p) => {
@@ -64,7 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.circuit_breaker.request_timeout_seconds))
+        .timeout(std::time::Duration::from_secs(
+            config.circuit_breaker.request_timeout_seconds,
+        ))
         .build()?;
 
     // The realtime fan-out is process-wide: every open /events stream and every

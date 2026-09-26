@@ -23,9 +23,7 @@ use crate::db::{
     ReservationResult, UsageSettlement,
 };
 use crate::error::AppError;
-use crate::ip_tracking::{
-    ip_hash, record_key_ip, resolve_client_ip, today_utc, DailySalt, IpCidr,
-};
+use crate::ip_tracking::{ip_hash, record_key_ip, resolve_client_ip, today_utc, DailySalt, IpCidr};
 use crate::money::calculate_token_cost_idr;
 // Only the tests re-derive the reservation: the handler calls the ONE shared
 // rule on ModelConfig, so a second copy of the arithmetic cannot drift from it.
@@ -220,7 +218,9 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 enum RateDecision {
     Allow,
     /// Refused; `retry_after_secs` is how long until the window rolls over.
-    Deny { retry_after_secs: u64 },
+    Deny {
+        retry_after_secs: u64,
+    },
 }
 
 /// One key's request counter for the current minute.
@@ -576,28 +576,31 @@ async fn load_key_metadata(
     };
 
     // Not cached if an invalidation landed while this row was being read.
-    cache.lock().unwrap_or_else(|e| e.into_inner()).insert_if_unchanged(
-        key_hash.to_string(),
-        meta.clone(),
-        Instant::now(),
-        seen_generation,
-    );
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert_if_unchanged(
+            key_hash.to_string(),
+            meta.clone(),
+            Instant::now(),
+            seen_generation,
+        );
 
     Ok(meta)
 }
 
 /// Drop one key from the metadata cache, addressed by its HASH.
-
+///
 /// The hash is the only identifier the cache ever holds — the plaintext key
 /// exists nowhere but the caller's Authorization header — so this is the only
 /// handle an invalidation could take, and it keeps the function safe to call
 /// with a value that has already been logged or stored.
-
+///
 /// Call this whenever a key's enforcement inputs change: revocation, and a
 /// narrowed limit or allowlist. `config` is needed only to reach the same
 /// `OnceLock` instance the request path uses, so the process-wide cache stays
 /// the single source the two paths share.
-
+///
 /// RESIDUAL STALENESS, stated plainly: this cache lives in THIS process. An
 /// invalidation here does not reach any other instance behind the load
 /// balancer, so a key revoked on instance A can still be honoured by instance B
@@ -789,7 +792,12 @@ impl Stream for MeteredStream {
 /// documented 1-second floor applies, and `cause` records which path produced
 /// the 503 so an operator can see why the floor applied instead of a real
 /// number (docs/error-model.md:96 forbids an unexplained value).
-fn no_upstream_retry_after(cooldown: Option<u64>, model: &str, cause: &str, account_id: Uuid) -> u64 {
+fn no_upstream_retry_after(
+    cooldown: Option<u64>,
+    model: &str,
+    cause: &str,
+    account_id: Uuid,
+) -> u64 {
     match cooldown {
         Some(secs) => secs,
         None => {
@@ -1110,9 +1118,13 @@ pub async fn chat_completions(
     // docs call it the primary limit: the report names the limit that actually
     // stopped the request, and a key at both ceilings is reported as spend.
     if spend_limit_idr > 0 {
-        let spend_used_idr =
-            key_spend_used(&state.pool, account_id, key_id, chrono::Utc::now().date_naive())
-                .await?;
+        let spend_used_idr = key_spend_used(
+            &state.pool,
+            account_id,
+            key_id,
+            chrono::Utc::now().date_naive(),
+        )
+        .await?;
         if limit_reached(spend_limit_idr, spend_used_idr) {
             return Err(AppError::KeyLimitExceeded {
                 details: Some(json!({
@@ -1127,9 +1139,13 @@ pub async fn chat_completions(
     }
 
     if token_limit > 0 {
-        let tokens_used =
-            key_tokens_used(&state.pool, account_id, key_id, chrono::Utc::now().date_naive())
-                .await?;
+        let tokens_used = key_tokens_used(
+            &state.pool,
+            account_id,
+            key_id,
+            chrono::Utc::now().date_naive(),
+        )
+        .await?;
         if limit_reached(token_limit, tokens_used) {
             return Err(AppError::KeyLimitExceeded {
                 details: Some(json!({
@@ -1206,13 +1222,9 @@ pub async fn chat_completions(
     // The balance can never go negative (docs/decisions.md D3) — the CHECK
     // constraint is never bypassed and no unaffordable request is admitted.
     let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
-    let held = reserve_balance_transaction(
-        &state.pool,
-        account_id,
-        reservation,
-        Some(&reservation_ref),
-    )
-    .await?;
+    let held =
+        reserve_balance_transaction(&state.pool, account_id, reservation, Some(&reservation_ref))
+            .await?;
 
     let reserved_idr = match held {
         ReservationResult::Held { reserved_idr, .. } => reserved_idr,
@@ -1236,7 +1248,13 @@ pub async fn chat_completions(
     // settlement task takes ownership of the guard; if settlement commits the
     // debit it defuses the guard (the hold was already credited back in that same
     // transaction) and on every other path the guard's Drop releases it.
-    let mut guard = ReservationGuard::new(&state.pool, account_id, reserved_idr, &reservation_ref, &meta.model);
+    let mut guard = ReservationGuard::new(
+        &state.pool,
+        account_id,
+        reserved_idr,
+        &reservation_ref,
+        &meta.model,
+    );
 
     // Every admission check has passed and the hold is out of the wallet, so
     // this request is actually being served — which is what makes its source
@@ -1257,8 +1275,14 @@ pub async fn chat_completions(
             // hold must come back. Defuse the guard so its Drop does not release
             // the same hold a second time, then release synchronously here.
             guard.defuse();
-            release_quietly(&state.pool, account_id, reserved_idr, &reservation_ref, &meta.model)
-                .await;
+            release_quietly(
+                &state.pool,
+                account_id,
+                reserved_idr,
+                &reservation_ref,
+                &meta.model,
+            )
+            .await;
             return Err(upstream_error(err, &meta.model, account_id, upstream));
         }
     };
@@ -1412,7 +1436,14 @@ async fn settle_after_stream(
         // No usage reported: nothing billed, so the whole hold must come back.
         // Defuse the guard (its Drop must not release a second time) then release.
         guard.defuse();
-        release_quietly(&pool, account_id, reserved_idr, &guard.reservation_ref, &guard.model).await;
+        release_quietly(
+            &pool,
+            account_id,
+            reserved_idr,
+            &guard.reservation_ref,
+            &guard.model,
+        )
+        .await;
         return;
     };
 
@@ -1429,7 +1460,14 @@ async fn settle_after_stream(
         // Stranded hold on a routing race: give it back, defusing the guard so
         // its Drop does not release a second time.
         guard.defuse();
-        release_quietly(&pool, account_id, reserved_idr, &guard.reservation_ref, &guard.model).await;
+        release_quietly(
+            &pool,
+            account_id,
+            reserved_idr,
+            &guard.reservation_ref,
+            &guard.model,
+        )
+        .await;
         return;
     };
 
@@ -1569,7 +1607,14 @@ async fn settle_after_stream(
                 "Proxy settlement failed"
             );
             guard.defuse();
-            release_quietly(&pool, account_id, reserved_idr, &guard.reservation_ref, &guard.model).await;
+            release_quietly(
+                &pool,
+                account_id,
+                reserved_idr,
+                &guard.reservation_ref,
+                &guard.model,
+            )
+            .await;
         }
     }
 }
@@ -1585,7 +1630,8 @@ async fn release_quietly(
     reservation_ref: &str,
     model: &str,
 ) {
-    match release_reservation_transaction(pool, account_id, reserved_idr, Some(reservation_ref)).await
+    match release_reservation_transaction(pool, account_id, reserved_idr, Some(reservation_ref))
+        .await
     {
         Ok(_) => {}
         Err(err) => error!(
@@ -1610,9 +1656,18 @@ mod tests {
     fn an_available_cooldown_is_passed_through_unchanged() {
         // docs/error-model.md:99-110: the value IS the pool's shortest
         // remaining cooldown, so it must not be re-rounded or replaced.
-        assert_eq!(no_upstream_retry_after(Some(30), "flash", "t", Uuid::nil()), 30);
-        assert_eq!(no_upstream_retry_after(Some(1), "flash", "t", Uuid::nil()), 1);
-        assert_eq!(no_upstream_retry_after(Some(900), "flash", "t", Uuid::nil()), 900);
+        assert_eq!(
+            no_upstream_retry_after(Some(30), "flash", "t", Uuid::nil()),
+            30
+        );
+        assert_eq!(
+            no_upstream_retry_after(Some(1), "flash", "t", Uuid::nil()),
+            1
+        );
+        assert_eq!(
+            no_upstream_retry_after(Some(900), "flash", "t", Uuid::nil()),
+            900
+        );
     }
 
     #[test]
@@ -1620,11 +1675,14 @@ mod tests {
         // docs/error-model.md:112 - "Floor it at 1 second. A zero or negative
         // value is a malformed header." The floor is the documented value, not
         // an estimate; the warn! inside records the cause.
-        assert_eq!(no_upstream_retry_after(None, "flash", "transport error", Uuid::nil()), 1);
+        assert_eq!(
+            no_upstream_retry_after(None, "flash", "transport error", Uuid::nil()),
+            1
+        );
         assert_eq!(
             no_upstream_retry_after(None, "flash", "every endpoint unhealthy", Uuid::nil()),
-            1
-            , "the floor must never be 0, which would be a malformed header"
+            1,
+            "the floor must never be 0, which would be a malformed header"
         );
     }
 
@@ -1805,7 +1863,10 @@ mod tests {
             cache_read_tokens: 0,
             output_tokens: 1,
         };
-        assert_eq!(settlement_plan(Some(partial)), SettlementPlan::Bill(partial));
+        assert_eq!(
+            settlement_plan(Some(partial)),
+            SettlementPlan::Bill(partial)
+        );
 
         // Zero-valued but PRESENT usage is a report, not an absence: the upstream
         // spoke, so it is billed rather than washed.
@@ -1845,10 +1906,22 @@ mod tests {
     #[test]
     fn a_limit_blocks_at_and_above_the_ceiling() {
         assert!(!limit_reached(0, 0), "0 means no limit");
-        assert!(!limit_reached(0, 10_000_000), "0 never blocks, whatever was used");
-        assert!(!limit_reached(50_000, 49_999), "one unit under the ceiling is fine");
-        assert!(limit_reached(50_000, 50_000), "exactly at the ceiling is out of budget");
-        assert!(limit_reached(50_000, 60_000), "over the ceiling stays blocked");
+        assert!(
+            !limit_reached(0, 10_000_000),
+            "0 never blocks, whatever was used"
+        );
+        assert!(
+            !limit_reached(50_000, 49_999),
+            "one unit under the ceiling is fine"
+        );
+        assert!(
+            limit_reached(50_000, 50_000),
+            "exactly at the ceiling is out of budget"
+        );
+        assert!(
+            limit_reached(50_000, 60_000),
+            "over the ceiling stays blocked"
+        );
         // A negative limit is refused at key-management time, so it can never be
         // stored; it is treated as "no limit" rather than blocking every request.
         assert!(!limit_reached(-1, 10));
@@ -1873,11 +1946,17 @@ mod tests {
         let mut w = RateWindow::new(start);
 
         for i in 0..3 {
-            assert_eq!(w.check(3, start), RateDecision::Allow, "request {i} is within 3 rpm");
+            assert_eq!(
+                w.check(3, start),
+                RateDecision::Allow,
+                "request {i} is within 3 rpm"
+            );
         }
         assert_eq!(
             w.check(3, start),
-            RateDecision::Deny { retry_after_secs: 60 },
+            RateDecision::Deny {
+                retry_after_secs: 60
+            },
             "the fourth request in the same minute is refused"
         );
     }
@@ -1899,8 +1978,14 @@ mod tests {
 
         // At the boundary the window restarts: the counter is zeroed, not just
         // aged, so a key at its ceiling gets a full allowance again.
-        assert_eq!(w.check(3, start + Duration::from_secs(60)), RateDecision::Allow);
-        assert_eq!(w.check(3, start + Duration::from_secs(60)), RateDecision::Allow);
+        assert_eq!(
+            w.check(3, start + Duration::from_secs(60)),
+            RateDecision::Allow
+        );
+        assert_eq!(
+            w.check(3, start + Duration::from_secs(60)),
+            RateDecision::Allow
+        );
     }
 
     #[test]
@@ -1915,7 +2000,9 @@ mod tests {
         let late = start + Duration::from_millis(59_500);
         assert_eq!(
             w.check(1, late),
-            RateDecision::Deny { retry_after_secs: 1 },
+            RateDecision::Deny {
+                retry_after_secs: 1
+            },
             "sub-second remainders floor at 1"
         );
     }
@@ -2066,8 +2153,15 @@ mod tests {
 
         c.remove("hash-a");
 
-        assert_eq!(c.get("hash-a", now), None, "the revoked key is gone immediately");
-        assert!(c.get("hash-b", now).is_some(), "only the named key is dropped");
+        assert_eq!(
+            c.get("hash-a", now),
+            None,
+            "the revoked key is gone immediately"
+        );
+        assert!(
+            c.get("hash-b", now).is_some(),
+            "only the named key is dropped"
+        );
         assert_eq!(c.order.len(), c.len(), "no orphaned eviction slot");
     }
 
@@ -2112,12 +2206,18 @@ mod tests {
         );
 
         assert!(stream_flag_allowed(Some(true)).is_ok());
-        assert!(stream_flag_allowed(None).is_ok(), "absent keeps the default");
+        assert!(
+            stream_flag_allowed(None).is_ok(),
+            "absent keeps the default"
+        );
     }
 
     #[test]
     fn the_stream_flag_is_read_only_from_a_real_bool() {
-        assert_eq!(requested_stream_flag(&json!({"stream": false})), Some(false));
+        assert_eq!(
+            requested_stream_flag(&json!({"stream": false})),
+            Some(false)
+        );
         assert_eq!(requested_stream_flag(&json!({"stream": true})), Some(true));
         assert_eq!(requested_stream_flag(&json!({"stream": null})), None);
         assert_eq!(requested_stream_flag(&json!({"stream": "false"})), None);
@@ -2130,7 +2230,11 @@ mod tests {
         let forced = force_streaming(json!({"model": "flash", "stream": true, "temperature": 0.2}))
             .expect("a JSON object is accepted");
         assert_eq!(forced["stream"], json!(true));
-        assert_eq!(forced["temperature"], json!(0.2), "the body is otherwise untouched");
+        assert_eq!(
+            forced["temperature"],
+            json!(0.2),
+            "the body is otherwise untouched"
+        );
 
         // A non-object body is refused before any money moves.
         assert!(force_streaming(json!([1, 2])).is_err());
@@ -2275,8 +2379,15 @@ mod tests {
         // empty tail after the terminator.
         let lines: Vec<&str> = frame.split('\n').collect();
         assert_eq!(lines.len(), 4, "frame shape is wrong: {lines:?}");
-        assert_eq!(lines[0], "event: error", "the event name must be exactly `error`");
-        assert!(lines[1].starts_with("data: "), "line 2 must be data, got {:?}", lines[1]);
+        assert_eq!(
+            lines[0], "event: error",
+            "the event name must be exactly `error`"
+        );
+        assert!(
+            lines[1].starts_with("data: "),
+            "line 2 must be data, got {:?}",
+            lines[1]
+        );
         assert_eq!(lines[2], "", "the blank line terminates the event");
         assert_eq!(lines[3], "", "nothing may follow the terminator");
 
@@ -2304,7 +2415,10 @@ mod tests {
             .unwrap_or_else(|e| panic!("the data field must be machine-parseable JSON: {e}"));
 
         assert_eq!(parsed["error"]["code"], json!("upstream_failed"));
-        assert_eq!(parsed["error"]["message"], json!("The upstream stream failed."));
+        assert_eq!(
+            parsed["error"]["message"],
+            json!("The upstream stream failed.")
+        );
         assert!(
             parsed["error"]["request_id"].is_string(),
             "the frame must carry the documented request_id"
@@ -2329,7 +2443,11 @@ mod tests {
 
         // Only the three framing newlines survive: after `event:`, after
         // `data:`, and the blank terminator.
-        assert_eq!(frame.matches('\n').count(), 3, "unexpected newline in {frame:?}");
+        assert_eq!(
+            frame.matches('\n').count(),
+            3,
+            "unexpected newline in {frame:?}"
+        );
         assert_eq!(
             frame.split('\n').filter(|l| l.starts_with("data:")).count(),
             1,
@@ -2351,11 +2469,15 @@ mod tests {
         assert_ne!(first, second, "request_id must be generated per event");
 
         for id in [&first, &second] {
-            assert!(id.starts_with("req_"), "documented form is req_..., got {id}");
+            assert!(
+                id.starts_with("req_"),
+                "documented form is req_..., got {id}"
+            );
             let hex = &id["req_".len()..];
             assert_eq!(hex.len(), 32, "the suffix is a bare uuid, got {id}");
             assert!(
-                hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                hex.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
                 "the suffix is lowercase hex, got {id}"
             );
         }
@@ -2713,8 +2835,7 @@ mod tests {
         with_fixture(pool.clone(), account_id, async move {
             let err = call_chat_completions(&state, &key, body)
                 .await
-                .err()
-                .expect("with no provider key in the environment the upstream is unreachable");
+                .expect_err("with no provider key in the environment the upstream is unreachable");
             assert_eq!(
                 err.status_code(),
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -3246,8 +3367,7 @@ mod tests {
             // money step under test, with no upstream faked.
             let err = call_chat_completions(&state, &key, body)
                 .await
-                .err()
-                .expect("with no provider key in the environment the upstream is unreachable");
+                .expect_err("with no provider key in the environment the upstream is unreachable");
             assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
 
             let holds: Vec<i64> = ledger_deltas(&pool_for_assertions, account_id)
@@ -3397,12 +3517,10 @@ mod tests {
         let assertions = tokio::spawn(async move {
             let funded = call_chat_completions(&state, &funded_key, body)
                 .await
-                .err()
-                .expect("a model outside the allowlist is always refused");
+                .expect_err("a model outside the allowlist is always refused");
             let broke = call_chat_completions(&state, &broke_key, body)
                 .await
-                .err()
-                .expect("a model outside the allowlist is always refused");
+                .expect_err("a model outside the allowlist is always refused");
 
             let answer = (funded.status_code(), funded.code());
             assert_eq!(
@@ -3435,10 +3553,7 @@ mod tests {
                 funded_opening,
                 "the balance must be untouched by a model denial"
             );
-            assert_eq!(
-                wallet_balance(&pool_for_assertions, broke_account).await,
-                0
-            );
+            assert_eq!(wallet_balance(&pool_for_assertions, broke_account).await, 0);
 
             for account in [funded_account, broke_account] {
                 assert_eq!(
@@ -3488,8 +3603,7 @@ mod tests {
         with_fixture(pool.clone(), account_id, async move {
             let err = call_chat_completions(&state, &key, body)
                 .await
-                .err()
-                .expect("an empty wallet cannot cover the worst case");
+                .expect_err("an empty wallet cannot cover the worst case");
 
             assert_eq!(
                 err.status_code(),
@@ -3510,10 +3624,7 @@ mod tests {
 
             // A reservation that matched no row writes nothing: no ledger row, no
             // drift, no stranded hold.
-            assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
-                0
-            );
+            assert_eq!(wallet_balance(&pool_for_assertions, account_id).await, 0);
             assert_eq!(
                 ledger_deltas(&pool_for_assertions, account_id).await,
                 Vec::<(i64, Option<String>)>::new(),
@@ -3560,8 +3671,7 @@ mod tests {
         with_fixture(pool.clone(), account_id, async move {
             let err = call_chat_completions(&state, &key, body)
                 .await
-                .err()
-                .expect("the key is exactly at its ceiling, which already blocks");
+                .expect_err("the key is exactly at its ceiling, which already blocks");
 
             assert_eq!(
                 err.status_code(),

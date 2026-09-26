@@ -56,11 +56,15 @@ impl KeySlot {
     }
 
     fn is_cooling(&self, now: Instant) -> bool {
-        matches!(*self.cooldown_until.lock().unwrap(), Some(until) if now < until)
+        // Poison is recovered rather than propagated: this lock is taken on
+        // every key selection and every cooldown report, so one panicking
+        // thread must not permanently fail the request path.
+        let until = *self.cooldown_until.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(until, Some(until) if now < until)
     }
 
     fn park(&self, now: Instant, cooldown: Duration) {
-        *self.cooldown_until.lock().unwrap() = Some(now + cooldown);
+        *self.cooldown_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(now + cooldown);
     }
 
     fn release(&self) {
@@ -89,7 +93,10 @@ impl KeyPool {
         max_attempts: usize,
     ) -> Self {
         Self {
-            keys: keys.into_iter().map(|k| Arc::new(KeySlot::new(k))).collect(),
+            keys: keys
+                .into_iter()
+                .map(|k| Arc::new(KeySlot::new(k)))
+                .collect(),
             policy: Arc::new(Policy {
                 cooldown: Duration::from_secs(cooldown_seconds),
                 rate_limit_status,
@@ -250,6 +257,36 @@ mod tests {
         let after_500 = pool.acquire().expect("500 does not park the key");
         assert_eq!(after_500.key(), "key-1");
         after_500.report_success();
+    }
+
+    #[test]
+    fn a_poisoned_cooldown_lock_recovers_instead_of_panicking() {
+        // Same hazard as the salt lock: one thread panicking while holding the
+        // cooldown guard must not make every later selection and park panic.
+        let pool = pool(1, 30);
+        let slot = Arc::clone(&pool.keys[0]);
+
+        let poisoner = Arc::clone(&slot);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoner.cooldown_until.lock().expect("fresh lock is unpoisoned");
+                panic!("poison the cooldown lock");
+            })
+            .join()
+            .is_err(),
+            "the poisoning thread must have panicked while holding the guard"
+        );
+
+        // acquire -> is_cooling reads the poisoned lock.
+        let lease = pool.acquire().expect("selection must survive a poisoned lock");
+        assert_eq!(lease.key(), "key-0");
+
+        // report_status -> park writes the poisoned lock.
+        lease.report_status(429);
+        assert!(
+            pool.acquire().is_none(),
+            "the park must still take effect on a poisoned lock"
+        );
     }
 
     #[test]

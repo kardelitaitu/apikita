@@ -691,7 +691,6 @@ mod tests {
     /// impossible to mistake for one that did.
     const LIVE_TEST_SERVER_KEY: &str = "SB-Mid-server-WEBHOOK-LIVE-TEST";
 
-
     async fn live_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
             .expect("set DATABASE_URL to a migrated Postgres instance");
@@ -847,7 +846,10 @@ mod tests {
     /// Snap tests writing an invalid key with no restore and no lock; those
     /// tests now take the same lock and restore through the same guard, which
     /// removes the race at its source instead of repairing its symptom here.
-    async fn post(state: &AppState, payload: MidtransNotification) -> (StatusCode, serde_json::Value) {
+    async fn post(
+        state: &AppState,
+        payload: MidtransNotification,
+    ) -> (StatusCode, serde_json::Value) {
         let res = handle_midtrans_webhook(State(state.clone()), Json(payload))
             .await
             .into_response();
@@ -1086,7 +1088,11 @@ mod tests {
         // REPLAY: Midtrans retries. docs/website/04-payments.md:61 - return 200
         // and do nothing. A double credit is real money.
         let (status, body) = post(&state, settle).await;
-        assert_eq!(status, StatusCode::OK, "a replay is a 200, not an error: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a replay is a 200, not an error: {body}"
+        );
         assert_eq!(body["status"], json!("already_settled"), "{body}");
 
         assert_eq!(
@@ -1171,13 +1177,7 @@ mod tests {
         // "foobar" is not a Midtrans status. The defect: an unknown value used
         // to fall through to Pending, so the topup stayed pending forever while
         // the handler answered 200 and logged nothing.
-        let payload = notification(
-            &order_id,
-            "200",
-            "50000.00",
-            "foobar",
-            LIVE_TEST_SERVER_KEY,
-        );
+        let payload = notification(&order_id, "200", "50000.00", "foobar", LIVE_TEST_SERVER_KEY);
 
         let (status, body) = post(&state, payload).await;
 

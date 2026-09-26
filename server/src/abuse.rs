@@ -633,8 +633,7 @@ mod tests {
         // refused again, which reads as a broken limiter - so it must read 1.
         // The 300ms is re-derived per call and the margin below absorbs the few
         // milliseconds the handler takes, so the assertion cannot race itself.
-        let almost_aged_out =
-            Utc::now() - key_creation_window() + Duration::milliseconds(300);
+        let almost_aged_out = Utc::now() - key_creation_window() + Duration::milliseconds(300);
         repin_api_keys(&pool, account_id, almost_aged_out).await;
         let (status, refusal, body) = call_create_key(&state, &headers).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
@@ -672,7 +671,10 @@ mod tests {
 
         let topup_limit = configured_limits().topup_per_hour;
         let key_limit = configured_limits().key_creation_per_day;
-        assert!(topup_limit > 0 && key_limit > 0, "the fixture assumes live caps");
+        assert!(
+            topup_limit > 0 && key_limit > 0,
+            "the fixture assumes live caps"
+        );
 
         let now = Utc::now();
         let two_hours_old = now - Duration::hours(2);

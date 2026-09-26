@@ -1,13 +1,12 @@
+use sha2::{Digest, Sha256, Sha512};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
 use tokio::time::sleep;
 
 #[derive(Clone)]
 struct BenchmarkKey {
-    id: usize,
     in_flight: Arc<AtomicUsize>,
     cooldown_until: Arc<AtomicI64>,
 }
@@ -75,7 +74,10 @@ async fn bench_hot_path_key_validation() {
     let ops_per_sec = (iterations as f64 / elapsed.as_secs_f64()) as u64;
     let avg_latency_micros = elapsed.as_micros() as f64 / iterations as f64;
 
-    println!("    Result: {} ops completed in {:.2?}", iterations, elapsed);
+    println!(
+        "    Result: {} ops completed in {:.2?}",
+        iterations, elapsed
+    );
     println!("    Throughput : {:>10} ops/sec", ops_per_sec);
     println!("    Avg Latency: {:>10.3} µs/op", avg_latency_micros);
     if ops_per_sec >= 10_000 {
@@ -87,7 +89,9 @@ async fn bench_hot_path_key_validation() {
 
 /// Scenario 2: Measures Midtrans SHA-512 constant-time verification throughput
 async fn bench_midtrans_signatures() {
-    println!("--> [Scenario 2] Benchmarking Midtrans SHA-512 Signature Verification (50,000 ops)...");
+    println!(
+        "--> [Scenario 2] Benchmarking Midtrans SHA-512 Signature Verification (50,000 ops)..."
+    );
 
     let order_id = "topup_9153b2bd-4ba5-4068-bafb-673c98b2130f";
     let status_code = "200";
@@ -112,7 +116,10 @@ async fn bench_midtrans_signatures() {
     let ops_per_sec = (iterations as f64 / elapsed.as_secs_f64()) as u64;
     let avg_latency_micros = elapsed.as_micros() as f64 / iterations as f64;
 
-    println!("    Result: {} signatures verified in {:.2?}", iterations, elapsed);
+    println!(
+        "    Result: {} signatures verified in {:.2?}",
+        iterations, elapsed
+    );
     println!("    Throughput : {:>10} sigs/sec", ops_per_sec);
     println!("    Avg Latency: {:>10.3} µs/op", avg_latency_micros);
     println!("    Status     : [PASS] Instantaneous webhook validation\n");
@@ -126,8 +133,7 @@ async fn bench_100_key_pool_routing() {
     // Create 100 keys
     let keys: Arc<Vec<BenchmarkKey>> = Arc::new(
         (0..100)
-            .map(|id| BenchmarkKey {
-                id,
+            .map(|_| BenchmarkKey {
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 cooldown_until: Arc::new(AtomicI64::new(0)),
             })
@@ -193,16 +199,30 @@ async fn bench_100_key_pool_routing() {
     let elapsed = start.elapsed();
     let rps = (total_requests as f64 / elapsed.as_secs_f64()) as u64;
 
-    println!("    Result: {}/{} requests succeeded in {:.2?}", successful, total_requests, elapsed);
+    println!(
+        "    Result: {}/{} requests succeeded in {:.2?}",
+        successful, total_requests, elapsed
+    );
     println!("    Throughput : {:>10} req/sec across 100 keys", rps);
-    println!("    Success Rate: {:>9.2}%", (successful as f64 / total_requests as f64) * 100.0);
-    println!("    Status     : [PASS] 100-key router absorbs 10% throttles without client failure\n");
+    println!(
+        "    Success Rate: {:>9.2}%",
+        (successful as f64 / total_requests as f64) * 100.0
+    );
+    println!(
+        "    Status     : [PASS] 100-key router absorbs 10% throttles without client failure\n"
+    );
 }
 
 /// Scenario 4: Simulates 500 concurrent streaming SSE connections
 async fn bench_concurrent_streaming_streams(concurrency: usize) {
-    println!("--> [Scenario 4] Benchmarking Concurrent SSE Streams ({} simultaneous connections)...", concurrency);
-    println!("    Simulating {} concurrent streams, 20 chunks each, 5ms token interval...", concurrency);
+    println!(
+        "--> [Scenario 4] Benchmarking Concurrent SSE Streams ({} simultaneous connections)...",
+        concurrency
+    );
+    println!(
+        "    Simulating {} concurrent streams, 20 chunks each, 5ms token interval...",
+        concurrency
+    );
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(concurrency);
@@ -235,10 +255,21 @@ async fn bench_concurrent_streaming_streams(concurrency: usize) {
     let tokens_per_sec = (total_tokens as f64 / elapsed.as_secs_f64()) as u64;
     let mb_per_sec = (total_volume_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64();
 
-    println!("    Result: {} streams finished in {:.2?}", concurrency, elapsed);
+    println!(
+        "    Result: {} streams finished in {:.2?}",
+        concurrency, elapsed
+    );
     println!("    Total Tokens Pumped : {:>10}", total_tokens);
-    println!("    Token Throughput    : {:>10} tokens/sec", tokens_per_sec);
+    println!(
+        "    Token Throughput    : {:>10} tokens/sec",
+        tokens_per_sec
+    );
     println!("    Bandwidth Pumping   : {:>10.2} MB/s", mb_per_sec);
-    println!("    Estimated Socket RAM: {:>10.2} MB (well within 256MB limit)", (concurrency * 35) as f64 / 1024.0);
-    println!("    Status              : [PASS] 0.2 vCPU easily handles 500 concurrent active streams\n");
+    println!(
+        "    Estimated Socket RAM: {:>10.2} MB (well within 256MB limit)",
+        (concurrency * 35) as f64 / 1024.0
+    );
+    println!(
+        "    Status              : [PASS] 0.2 vCPU easily handles 500 concurrent active streams\n"
+    );
 }

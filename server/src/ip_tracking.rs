@@ -129,13 +129,17 @@ impl DailySalt {
     pub fn salt_for_day(&self, day: NaiveDate) -> [u8; 32] {
         // Rotate under the write lock only when the day actually moved.
         {
-            let state = self.state.read().expect("salt lock");
+            // A poisoned lock is recovered, not propagated: the poisoning thread
+            // was the one panicking, and this lock is on the path of every
+            // proxied request — refusing it would turn one transient panic into
+            // a permanent one. Same convention as the rest of the server.
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
             if state.day == day {
                 return state.bytes;
             }
         }
 
-        let mut state = self.state.write().expect("salt lock");
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         // Re-check under the write lock: another request may have rotated while
         // this one waited, and rotating twice would drop the salt those
         // in-flight requests are about to use.
@@ -369,7 +373,9 @@ impl IpCidr {
             std::net::IpAddr::V6(_) => 128,
         };
         if prefix > max {
-            return Err(format!("{text}: prefix {prefix} exceeds {max} for this address family"));
+            return Err(format!(
+                "{text}: prefix {prefix} exceeds {max} for this address family"
+            ));
         }
         Ok(Self { base, prefix })
     }
@@ -478,7 +484,10 @@ mod tests {
     #[test]
     fn the_same_ip_and_salt_hash_the_same() {
         let salt = [7u8; 32];
-        assert_eq!(ip_hash(&salt, &ip("203.0.113.9")), ip_hash(&salt, &ip("203.0.113.9")));
+        assert_eq!(
+            ip_hash(&salt, &ip("203.0.113.9")),
+            ip_hash(&salt, &ip("203.0.113.9"))
+        );
     }
 
     #[test]
@@ -486,8 +495,14 @@ mod tests {
         let salt = [7u8; 32];
         let other_salt = [8u8; 32];
 
-        assert_ne!(ip_hash(&salt, &ip("203.0.113.9")), ip_hash(&salt, &ip("203.0.113.10")));
-        assert_ne!(ip_hash(&salt, &ip("203.0.113.9")), ip_hash(&other_salt, &ip("203.0.113.9")));
+        assert_ne!(
+            ip_hash(&salt, &ip("203.0.113.9")),
+            ip_hash(&salt, &ip("203.0.113.10"))
+        );
+        assert_ne!(
+            ip_hash(&salt, &ip("203.0.113.9")),
+            ip_hash(&other_salt, &ip("203.0.113.9"))
+        );
     }
 
     #[test]
@@ -561,6 +576,45 @@ mod tests {
         assert_ne!(fresh_salt(), fresh_salt(), "two fresh salts must differ");
     }
 
+    #[test]
+    fn a_poisoned_salt_lock_recovers_instead_of_panicking() {
+        // The lock is poisoned the only way it can be: a thread panics while
+        // holding the write guard. Every later access then sees Err(Poisoned),
+        // and the module must recover the guard rather than panic again — a
+        // second panic here would make one transient failure permanent, on a
+        // path every proxied request takes.
+        let day = NaiveDate::from_ymd_opt(2026, 9, 25).expect("date");
+        let next = NaiveDate::from_ymd_opt(2026, 9, 26).expect("date");
+        let salt = std::sync::Arc::new(DailySalt::seeded(day, [1u8; 32]));
+
+        let poisoner = std::sync::Arc::clone(&salt);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoner.state.write().expect("fresh lock is unpoisoned");
+                panic!("poison the salt lock");
+            })
+            .join()
+            .is_err(),
+            "the poisoning thread must have panicked while holding the guard"
+        );
+
+        // The read guard (the common path: the held day matches).
+        assert_eq!(
+            salt.salt_for_day(day),
+            [1u8; 32],
+            "a poisoned salt lock must still yield the held salt"
+        );
+
+        // The write guard (the rotation path), still poisoned.
+        let rotated = salt.salt_for_day(next);
+        assert_ne!(rotated, [1u8; 32], "rotation must still mint a new salt");
+        assert_eq!(
+            salt.salt_for_day(next),
+            rotated,
+            "and the rotated salt must be stable"
+        );
+    }
+
     fn cidr(text: &str) -> IpCidr {
         IpCidr::parse(text).expect("parse cidr")
     }
@@ -584,8 +638,14 @@ mod tests {
         assert!(cidr("10.0.0.0/8").contains(&ip("10.255.255.255")));
         assert!(cidr("203.0.113.9/32").contains(&ip("203.0.113.9")));
         assert!(!cidr("203.0.113.9/32").contains(&ip("203.0.113.10")));
-        assert!(cidr("0.0.0.0/0").contains(&ip("8.8.8.8")), "/0 covers everything");
-        assert!(!cidr("0.0.0.0/0").contains(&ip("::1")), "families never mix");
+        assert!(
+            cidr("0.0.0.0/0").contains(&ip("8.8.8.8")),
+            "/0 covers everything"
+        );
+        assert!(
+            !cidr("0.0.0.0/0").contains(&ip("::1")),
+            "families never mix"
+        );
 
         assert!(cidr("2001:db8::/32").contains(&ip("2001:db8::1")));
         assert!(!cidr("2001:db8::/32").contains(&ip("2001:db9::1")));
@@ -594,7 +654,10 @@ mod tests {
     #[test]
     fn a_malformed_cidr_is_rejected_not_silently_truncated() {
         assert!(IpCidr::parse("10.0.0.0").is_err(), "no prefix");
-        assert!(IpCidr::parse("10.0.0.0/33").is_err(), "prefix past the family");
+        assert!(
+            IpCidr::parse("10.0.0.0/33").is_err(),
+            "prefix past the family"
+        );
         assert!(IpCidr::parse("2001:db8::/129").is_err());
         assert!(IpCidr::parse("not-an-ip/24").is_err());
         assert!(IpCidr::parse("10.0.0.0/x").is_err());
@@ -621,15 +684,24 @@ mod tests {
         // "caller, relay": the rightmost is the relay itself, so the caller is
         // the entry before it.
         let headers = forwarded_for("203.0.113.9, 172.17.0.5");
-        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &headers, &trusted), ip("203.0.113.9"));
+        assert_eq!(
+            resolve_client_ip(ip("172.17.0.5"), &headers, &trusted),
+            ip("203.0.113.9")
+        );
 
         // Two hops of trusted proxy: still the caller, not a relay.
         let chained = forwarded_for("203.0.113.9, 172.17.0.7, 172.17.0.5");
-        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &chained, &trusted), ip("203.0.113.9"));
+        assert_eq!(
+            resolve_client_ip(ip("172.17.0.5"), &chained, &trusted),
+            ip("203.0.113.9")
+        );
 
         // A forged entry to the LEFT of the real one is not where we look.
         let forged = forwarded_for("1.2.3.4, 203.0.113.9, 172.17.0.5");
-        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &forged, &trusted), ip("203.0.113.9"));
+        assert_eq!(
+            resolve_client_ip(ip("172.17.0.5"), &forged, &trusted),
+            ip("203.0.113.9")
+        );
     }
 
     #[test]
@@ -639,14 +711,23 @@ mod tests {
         // Every claimed address is a trusted proxy: the caller is not known, so
         // record the relay rather than trusting a header entry.
         let all_trusted = forwarded_for("172.17.0.7, 172.17.0.5");
-        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &all_trusted, &trusted), ip("172.17.0.5"));
+        assert_eq!(
+            resolve_client_ip(ip("172.17.0.5"), &all_trusted, &trusted),
+            ip("172.17.0.5")
+        );
 
         // Garbage entries are skipped, not crashed on.
         let garbage = forwarded_for("not-an-ip, , 172.17.0.5");
-        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &garbage, &trusted), ip("172.17.0.5"));
+        assert_eq!(
+            resolve_client_ip(ip("172.17.0.5"), &garbage, &trusted),
+            ip("172.17.0.5")
+        );
 
         // No header at all.
-        assert_eq!(resolve_client_ip(ip("172.17.0.5"), &HeaderMap::new(), &trusted), ip("172.17.0.5"));
+        assert_eq!(
+            resolve_client_ip(ip("172.17.0.5"), &HeaderMap::new(), &trusted),
+            ip("172.17.0.5")
+        );
     }
 
     #[test]
@@ -673,8 +754,10 @@ mod tests {
     fn the_salt_never_appears_in_a_debug_print() {
         // A byte value chosen so its hex form cannot appear by coincidence in
         // the date: [0xAB; 32] would print as a run of "ababab...".
-        let salt =
-            DailySalt::seeded(NaiveDate::from_ymd_opt(2026, 9, 25).expect("date"), [0xABu8; 32]);
+        let salt = DailySalt::seeded(
+            NaiveDate::from_ymd_opt(2026, 9, 25).expect("date"),
+            [0xABu8; 32],
+        );
         let printed = format!("{salt:?}");
         assert!(
             !printed.contains("ababab"),
@@ -691,9 +774,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     async fn test_pool() -> PgPool {
-        let database_url =
-            std::env::var("DATABASE_URL").expect("set DATABASE_URL to a migrated Postgres instance");
-        crate::db::init_pool(&database_url).await.expect("connect to Postgres")
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("set DATABASE_URL to a migrated Postgres instance");
+        crate::db::init_pool(&database_url)
+            .await
+            .expect("connect to Postgres")
     }
 
     /// Serializes the purge tests. `purge_expired` deletes globally rather than
@@ -754,20 +839,35 @@ mod tests {
 
         let first = ip_hash(&salt, &ip("203.0.113.9"));
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &first).await.expect("first request"),
-            KeyIpCounts { distinct_ips: 1, request_count: 1 }
+            record_key_ip(&pool, key_id, day, &first)
+                .await
+                .expect("first request"),
+            KeyIpCounts {
+                distinct_ips: 1,
+                request_count: 1
+            }
         );
 
         // Same address again: the request counts, the distinct count does not.
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &first).await.expect("repeat request"),
-            KeyIpCounts { distinct_ips: 1, request_count: 2 }
+            record_key_ip(&pool, key_id, day, &first)
+                .await
+                .expect("repeat request"),
+            KeyIpCounts {
+                distinct_ips: 1,
+                request_count: 2
+            }
         );
 
         let second = ip_hash(&salt, &ip("203.0.113.10"));
         assert_eq!(
-            record_key_ip(&pool, key_id, day, &second).await.expect("new ip"),
-            KeyIpCounts { distinct_ips: 2, request_count: 3 }
+            record_key_ip(&pool, key_id, day, &second)
+                .await
+                .expect("new ip"),
+            KeyIpCounts {
+                distinct_ips: 2,
+                request_count: 3
+            }
         );
 
         // A different day is a different counter, so a mobile user's churn does
@@ -775,8 +875,13 @@ mod tests {
         let tomorrow = day.succ_opt().expect("next day");
         let fresh = ip_hash(&[4u8; 32], &ip("203.0.113.9"));
         assert_eq!(
-            record_key_ip(&pool, key_id, tomorrow, &fresh).await.expect("next day"),
-            KeyIpCounts { distinct_ips: 1, request_count: 1 }
+            record_key_ip(&pool, key_id, tomorrow, &fresh)
+                .await
+                .expect("next day"),
+            KeyIpCounts {
+                distinct_ips: 1,
+                request_count: 1
+            }
         );
 
         delete_fixture(&pool, account_id).await;
@@ -870,26 +975,24 @@ mod tests {
 
         purge_expired(&pool, today).await.expect("purge");
 
-        let surviving_seen: Vec<NaiveDate> = sqlx::query_scalar(
-            "SELECT day FROM key_ip_seen WHERE api_key_id = $1 ORDER BY day",
-        )
-        .bind(key_id)
-        .fetch_all(&pool)
-        .await
-        .expect("read surviving hashes");
+        let surviving_seen: Vec<NaiveDate> =
+            sqlx::query_scalar("SELECT day FROM key_ip_seen WHERE api_key_id = $1 ORDER BY day")
+                .bind(key_id)
+                .fetch_all(&pool)
+                .await
+                .expect("read surviving hashes");
         assert_eq!(
             surviving_seen,
             vec![seen_kept],
             "the day AT the 7-day cutoff ({seen_cutoff}) must be deleted and              {seen_kept}, one day inside the window, must be kept"
         );
 
-        let surviving_daily: Vec<NaiveDate> = sqlx::query_scalar(
-            "SELECT day FROM key_ip_daily WHERE api_key_id = $1 ORDER BY day",
-        )
-        .bind(key_id)
-        .fetch_all(&pool)
-        .await
-        .expect("read surviving counts");
+        let surviving_daily: Vec<NaiveDate> =
+            sqlx::query_scalar("SELECT day FROM key_ip_daily WHERE api_key_id = $1 ORDER BY day")
+                .bind(key_id)
+                .fetch_all(&pool)
+                .await
+                .expect("read surviving counts");
         // Containment, not an exact vector: `record_key_ip` writes a daily row
         // for every day it sees, so the two days seeded for the hash window are
         // legitimately INSIDE the 90-day aggregate window and survive. The

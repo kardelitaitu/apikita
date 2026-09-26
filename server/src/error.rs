@@ -144,9 +144,7 @@ impl AppError {
             // docs/error-model.md rule 5: the field name travels as
             // `details.field`, so the client highlights the input instead of
             // matching on prose.
-            Self::ValidationFailed { field, .. } => {
-                Some(serde_json::json!({ "field": field }))
-            }
+            Self::ValidationFailed { field, .. } => Some(serde_json::json!({ "field": field })),
             _ => None,
         }
     }
@@ -200,7 +198,8 @@ impl IntoResponse for AppError {
         };
         if let Some(secs) = retry_after_secs {
             if let Ok(val) = secs.to_string().parse() {
-                res.headers_mut().insert(axum::http::header::RETRY_AFTER, val);
+                res.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, val);
             }
         }
         res
@@ -255,8 +254,12 @@ mod tests {
                 message: "amount_idr must be at least 10000".into(),
                 field: "amount_idr".into(),
             },
-            AppError::RateLimited { retry_after_secs: 42 },
-            AppError::NoUpstreamAvailable { retry_after_secs: 30 },
+            AppError::RateLimited {
+                retry_after_secs: 42,
+            },
+            AppError::NoUpstreamAvailable {
+                retry_after_secs: 30,
+            },
             AppError::Database(sqlx::Error::RowNotFound),
             AppError::Internal("upstream request failed".into()),
         ]
@@ -269,10 +272,26 @@ mod tests {
             (AppError::Unauthenticated, 401, "unauthenticated"),
             (AppError::KeyRevoked, 401, "key_revoked"),
             (AppError::KeyExpired, 401, "key_expired"),
-            (AppError::InsufficientBalance { details: None }, 402, "insufficient_balance"),
-            (AppError::KeyLimitExceeded { details: None }, 402, "key_limit_exceeded"),
-            (AppError::ModelNotAllowed("m".into()), 403, "model_not_allowed"),
-            (AppError::WrongCredentialType("c".into()), 403, "wrong_credential_type"),
+            (
+                AppError::InsufficientBalance { details: None },
+                402,
+                "insufficient_balance",
+            ),
+            (
+                AppError::KeyLimitExceeded { details: None },
+                402,
+                "key_limit_exceeded",
+            ),
+            (
+                AppError::ModelNotAllowed("m".into()),
+                403,
+                "model_not_allowed",
+            ),
+            (
+                AppError::WrongCredentialType("c".into()),
+                403,
+                "wrong_credential_type",
+            ),
             (AppError::NotFound("id".into()), 404, "not_found"),
             (AppError::Conflict("dup".into()), 409, "conflict"),
             (
@@ -283,13 +302,25 @@ mod tests {
                 422,
                 "validation_failed",
             ),
-            (AppError::RateLimited { retry_after_secs: 1 }, 429, "rate_limited"),
             (
-                AppError::NoUpstreamAvailable { retry_after_secs: 30 },
+                AppError::RateLimited {
+                    retry_after_secs: 1,
+                },
+                429,
+                "rate_limited",
+            ),
+            (
+                AppError::NoUpstreamAvailable {
+                    retry_after_secs: 30,
+                },
                 503,
                 "no_upstream_available",
             ),
-            (AppError::Database(sqlx::Error::RowNotFound), 500, "internal_error"),
+            (
+                AppError::Database(sqlx::Error::RowNotFound),
+                500,
+                "internal_error",
+            ),
             (AppError::Internal("boom".into()), 500, "internal_error"),
         ]
     }
@@ -313,7 +344,9 @@ mod tests {
     }
 
     fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
-        headers.get(name).map(|v| v.to_str().expect("header is ASCII"))
+        headers
+            .get(name)
+            .map(|v| v.to_str().expect("header is ASCII"))
     }
 
     // ---------------------------------------------------------------------
@@ -435,7 +468,11 @@ mod tests {
                 "request_id must follow the documented req_... form, got {id}"
             );
             let hex = &id["req_".len()..];
-            assert_eq!(hex.len(), 32, "request_id suffix should be a bare uuid, got {id}");
+            assert_eq!(
+                hex.len(),
+                32,
+                "request_id suffix should be a bare uuid, got {id}"
+            );
             assert!(
                 hex.chars().all(|c| c.is_ascii_hexdigit()),
                 "request_id suffix must be hex, got {id}"
@@ -446,9 +483,18 @@ mod tests {
     #[tokio::test]
     async fn request_id_is_stable_within_one_error_and_unique_across_errors() {
         let (_, _, body) = respond(AppError::Unauthenticated).await;
-        let first = error_object(&body)["request_id"].as_str().unwrap().to_string();
-        let second = error_object(&body)["request_id"].as_str().unwrap().to_string();
-        assert_eq!(first, second, "one response must carry exactly one stable id");
+        let first = error_object(&body)["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second = error_object(&body)["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            first, second,
+            "one response must carry exactly one stable id"
+        );
 
         let (_, _, other) = respond(AppError::Unauthenticated).await;
         assert_ne!(
@@ -464,7 +510,10 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limited_carries_retry_after_in_seconds() {
-        let (status, headers, _) = respond(AppError::RateLimited { retry_after_secs: 42 }).await;
+        let (status, headers, _) = respond(AppError::RateLimited {
+            retry_after_secs: 42,
+        })
+        .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         let value = header_str(&headers, header::RETRY_AFTER)
             .expect("docs/error-model.md:81 - Retry-After is included on 429");
@@ -478,7 +527,10 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_retry_after_is_never_zero() {
         // docs/error-model.md:93-94 - "never below 1".
-        let (_, headers, _) = respond(AppError::RateLimited { retry_after_secs: 1 }).await;
+        let (_, headers, _) = respond(AppError::RateLimited {
+            retry_after_secs: 1,
+        })
+        .await;
         assert_eq!(header_str(&headers, header::RETRY_AFTER), Some("1"));
     }
 
@@ -541,8 +593,10 @@ mod tests {
     #[tokio::test]
     async fn a_database_error_does_not_leak_sql_or_schema_to_the_client() {
         let raw_sql = "SELECT id, balance_idr FROM wallets WHERE account_id = $1";
-        let (status, _, body) =
-            respond(AppError::Database(sqlx::Error::Protocol(raw_sql.to_string()))).await;
+        let (status, _, body) = respond(AppError::Database(sqlx::Error::Protocol(
+            raw_sql.to_string(),
+        )))
+        .await;
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         let message = error_object(&body)["message"].as_str().unwrap();

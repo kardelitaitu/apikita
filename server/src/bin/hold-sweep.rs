@@ -245,7 +245,11 @@ fn print_summary(
     );
     println!(
         "mode:  {}",
-        if release { "release (opt-in)" } else { "report-only" }
+        if release {
+            "release (opt-in)"
+        } else {
+            "report-only"
+        }
     );
     println!("holds: {}", holds.len());
 
@@ -272,7 +276,10 @@ fn print_summary(
         println!("         pb_user_id={}", hold.pb_user_id);
     }
 
-    let over: Vec<&StrandedHold> = holds.iter().filter(|h| h.over_bound(bound_seconds)).collect();
+    let over: Vec<&StrandedHold> = holds
+        .iter()
+        .filter(|h| h.over_bound(bound_seconds))
+        .collect();
     let over_total: i64 = over.iter().map(|h| h.amount_idr.abs()).sum();
     let held_total: i64 = holds.iter().map(|h| h.amount_idr.abs()).sum();
 
@@ -403,7 +410,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    print_summary(&holds, options.max_hold_age_seconds, options.release, &released);
+    print_summary(
+        &holds,
+        options.max_hold_age_seconds,
+        options.release,
+        &released,
+    );
 
     let over = holds
         .iter()
@@ -445,7 +457,8 @@ mod tests {
     fn bound_exceeds_the_worst_case_request() {
         // 120s request timeout x 1 settlement cycle = 120s worst case; the bound
         // must sit comfortably above it or every slow release would alert.
-        assert!(DEFAULT_MAX_HOLD_AGE_SECONDS > 120);
+        // Constant assertion: checked at compile time (clippy::assertions_on_constants).
+        const { assert!(DEFAULT_MAX_HOLD_AGE_SECONDS > 120) };
     }
 
     #[test]

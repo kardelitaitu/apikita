@@ -117,9 +117,10 @@ async fn verify_pb_token(token: &str) -> Result<String, AppError> {
         return Err(AppError::Unauthenticated);
     }
 
-    let body = response.text().await.map_err(|e| {
-        AppError::Internal(format!("PocketBase auth-refresh body unreadable: {e}"))
-    })?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| AppError::Internal(format!("PocketBase auth-refresh body unreadable: {e}")))?;
 
     parse_pb_user_id(&body).ok_or(AppError::Unauthenticated)
 }
@@ -138,7 +139,8 @@ fn sessions_config() -> Result<&'static SessionsConfig, AppError> {
         return Ok(config);
     }
 
-    let path = std::env::var("APIKITA_CONFIG_PATH").unwrap_or_else(|_| "config/apikita.toml".into());
+    let path =
+        std::env::var("APIKITA_CONFIG_PATH").unwrap_or_else(|_| "config/apikita.toml".into());
     let loaded = AppConfig::load_from_file(&path)
         .or_else(|_| AppConfig::load_from_file("../config/apikita.toml"))
         .map_err(|e| AppError::Internal(format!("failed to load session config: {e}")))?;
@@ -354,7 +356,10 @@ mod tests {
 
     #[test]
     fn normalizes_pb_user_id() {
-        assert_eq!(normalize_pb_user_id("  abc123  ").as_deref(), Some("abc123"));
+        assert_eq!(
+            normalize_pb_user_id("  abc123  ").as_deref(),
+            Some("abc123")
+        );
         assert_eq!(normalize_pb_user_id(""), None);
         assert_eq!(normalize_pb_user_id("   "), None);
         assert_eq!(normalize_pb_user_id("has space"), None);
@@ -498,15 +503,21 @@ mod tests {
 
     /// A live session for an existing account, created the way exchange_token
     /// creates one: the row holds only the SHA-256 of the token.
-    async fn add_live_session(pool: &PgPool, account_id: Uuid, expires_at: DateTime<Utc>) -> String {
+    async fn add_live_session(
+        pool: &PgPool,
+        account_id: Uuid,
+        expires_at: DateTime<Utc>,
+    ) -> String {
         let token = format!("apk_sess_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO sessions (account_id, token_hash, expires_at) VALUES ($1, $2, $3)")
-            .bind(account_id)
-            .bind(hash_token(&token))
-            .bind(expires_at)
-            .execute(pool)
-            .await
-            .expect("create session");
+        sqlx::query(
+            "INSERT INTO sessions (account_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(account_id)
+        .bind(hash_token(&token))
+        .bind(expires_at)
+        .execute(pool)
+        .await
+        .expect("create session");
         token
     }
 
@@ -807,11 +818,12 @@ mod tests {
         );
 
         // The wallet the balance came from.
-        let balance: i64 = sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-            .bind(account_id)
-            .fetch_one(&pool)
-            .await
-            .expect("the exchange must have created the wallet");
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the exchange must have created the wallet");
         assert_eq!(balance, 0, "the created wallet starts empty");
 
         // --- the cookie is an opaque credential, and only its hash is stored ---
@@ -971,7 +983,9 @@ mod tests {
         );
         assert_eq!(rejected.json()["error"]["code"], json!("unauthenticated"));
         assert!(
-            account_for_pb_user(&pool, &fresh_pb_user_id).await.is_some(),
+            account_for_pb_user(&pool, &fresh_pb_user_id)
+                .await
+                .is_some(),
             "a rejected exchange must not disturb the sessions that already exist"
         );
     }
@@ -1034,7 +1048,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count live sessions");
-        assert_eq!(live_before, 1, "the fixture must start with one live session");
+        assert_eq!(
+            live_before, 1,
+            "the fixture must start with one live session"
+        );
 
         // --- the real logout ---
         let response = call(logout(State(pool.clone()), cookie_header(&victim_token))).await;
@@ -1126,7 +1143,8 @@ mod tests {
         let device_a = live_account(&pool).await;
         // device_b is a SECOND session on the SAME account, which is the whole
         // point of "sign out everywhere": two accounts prove nothing.
-        let device_b = add_live_session(&pool, device_a.account_id, Utc::now() + Duration::days(30)).await;
+        let device_b =
+            add_live_session(&pool, device_a.account_id, Utc::now() + Duration::days(30)).await;
         let other = live_account(&pool).await;
 
         let outcome = tokio::spawn(logout_all_assertions(
@@ -1264,7 +1282,11 @@ mod tests {
             "the fixture's expired session must not resolve"
         );
 
-        let expired = call(logout_all(State(pool.clone()), cookie_header(&expired_token))).await;
+        let expired = call(logout_all(
+            State(pool.clone()),
+            cookie_header(&expired_token),
+        ))
+        .await;
         assert_eq!(
             expired.status,
             StatusCode::NO_CONTENT,

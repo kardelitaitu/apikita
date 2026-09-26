@@ -94,7 +94,10 @@ pub fn create_router(state: AppState) -> Router {
         // Account & Wallet
         .route("/api/me", get(account::get_me))
         .route("/api/usage", get(account::get_usage))
-        .route("/api/topups", get(account::get_topups).post(account::create_topup))
+        .route(
+            "/api/topups",
+            get(account::get_topups).post(account::create_topup),
+        )
         // API Keys
         .route("/api/keys", get(keys::list_keys).post(keys::create_key))
         .route("/api/keys/{id}", patch(keys::update_key))
@@ -111,9 +114,15 @@ pub fn create_router(state: AppState) -> Router {
             "/api/admin/accounts/{id}/restore",
             post(admin::resume_account),
         )
-        .route("/api/admin/accounts/{id}/resume", post(admin::resume_account))
+        .route(
+            "/api/admin/accounts/{id}/resume",
+            post(admin::resume_account),
+        )
         // Webhooks
-        .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook))
+        .route(
+            "/webhooks/midtrans",
+            post(webhooks::handle_midtrans_webhook),
+        )
         // Proxy
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .with_state(state)
@@ -247,7 +256,10 @@ pub mod test_env {
 
             {
                 let _guard = EnvGuard::set(REMOVED, "leaked-if-not-removed");
-                assert_eq!(std::env::var(REMOVED).as_deref(), Ok("leaked-if-not-removed"));
+                assert_eq!(
+                    std::env::var(REMOVED).as_deref(),
+                    Ok("leaked-if-not-removed")
+                );
             }
 
             assert!(
@@ -269,7 +281,10 @@ pub mod test_env {
                 panic!("unwind straight through the guard");
             }));
 
-            assert!(unwound.is_err(), "the probe closure must actually have panicked");
+            assert!(
+                unwound.is_err(),
+                "the probe closure must actually have panicked"
+            );
             assert_eq!(
                 std::env::var(PANICKED).as_deref(),
                 Ok("the-original-value"),
@@ -304,7 +319,9 @@ pub mod test_env {
             );
 
             drop(held);
-            contender.join().expect("the contender thread must not panic");
+            contender
+                .join()
+                .expect("the contender thread must not panic");
             assert!(
                 entered.load(Ordering::SeqCst),
                 "the contender must proceed once the first lock has dropped"
@@ -368,10 +385,7 @@ mod tests {
         // Tokens are opaque, so the value is everything after the FIRST '='.
         // Pinned deliberately: a parser that split on '=' or took the last
         // segment would silently truncate the credential.
-        assert_eq!(
-            session_token_from_cookie_header("session=a=b"),
-            Some("a=b")
-        );
+        assert_eq!(session_token_from_cookie_header("session=a=b"), Some("a=b"));
 
         // Duplicate names: the FIRST piece carrying a non-empty value wins and
         // the rest are ignored. Pinned because it decides which credential a
@@ -438,7 +452,12 @@ mod tests {
     }
 
     impl SessionFixture {
-        async fn new(pool: &PgPool, token: &str, revoked: bool, expires_at: chrono::DateTime<chrono::Utc>) -> Self {
+        async fn new(
+            pool: &PgPool,
+            token: &str,
+            revoked: bool,
+            expires_at: chrono::DateTime<chrono::Utc>,
+        ) -> Self {
             let pb_user_id = format!("test_{}", Uuid::new_v4().simple());
             let account_id: Uuid =
                 sqlx::query_scalar("INSERT INTO accounts (pb_user_id) VALUES ($1) RETURNING id")
@@ -524,7 +543,9 @@ mod tests {
         // A different cookie but no session cookie.
         let mut no_session = HeaderMap::new();
         no_session.insert(header::COOKIE, "a=1; b=2".parse().unwrap());
-        assert!(resolve_account_from_cookie(&pool, &no_session).await.is_err());
+        assert!(resolve_account_from_cookie(&pool, &no_session)
+            .await
+            .is_err());
 
         // No Cookie header at all.
         assert!(resolve_account_from_cookie(&pool, &HeaderMap::new())
@@ -654,7 +675,8 @@ mod tests {
         use axum::extract::connect_info::MockConnectInfo;
         use std::net::SocketAddr;
 
-        create_router(table_state()).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+        create_router(table_state())
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
     }
 
     /// Sends one credential-free request through the real router and returns the
@@ -697,16 +719,40 @@ mod tests {
         ("POST", "/api/topups", "{}"),
         ("GET", "/api/keys", ""),
         ("POST", "/api/keys", "{}"),
-        ("PATCH", "/api/keys/00000000-0000-0000-0000-000000000000", "{}"),
-        ("POST", "/api/keys/00000000-0000-0000-0000-000000000000/revoke", ""),
+        (
+            "PATCH",
+            "/api/keys/00000000-0000-0000-0000-000000000000",
+            "{}",
+        ),
+        (
+            "POST",
+            "/api/keys/00000000-0000-0000-0000-000000000000/revoke",
+            "",
+        ),
         ("GET", "/events", ""),
         // Admin: cookie + operator flag. A credential-free request stops at the
         // guard (401), which is not 404/405 - so the router matched, which is all
         // this table asserts.
-        ("GET", "/api/admin/accounts/00000000-0000-0000-0000-000000000000", ""),
-        ("POST", "/api/admin/accounts/00000000-0000-0000-0000-000000000000/suspend", ""),
-        ("POST", "/api/admin/accounts/00000000-0000-0000-0000-000000000000/restore", ""),
-        ("POST", "/api/admin/accounts/00000000-0000-0000-0000-000000000000/resume", ""),
+        (
+            "GET",
+            "/api/admin/accounts/00000000-0000-0000-0000-000000000000",
+            "",
+        ),
+        (
+            "POST",
+            "/api/admin/accounts/00000000-0000-0000-0000-000000000000/suspend",
+            "",
+        ),
+        (
+            "POST",
+            "/api/admin/accounts/00000000-0000-0000-0000-000000000000/restore",
+            "",
+        ),
+        (
+            "POST",
+            "/api/admin/accounts/00000000-0000-0000-0000-000000000000/resume",
+            "",
+        ),
         ("POST", "/webhooks/midtrans", "{}"),
         ("POST", "/v1/chat/completions", ""),
     ];
@@ -722,7 +768,10 @@ mod tests {
         // also the evidence that the parameter route exists for the METHOD as
         // well as the path.
         ("GET", "/api/keys/00000000-0000-0000-0000-000000000000"),
-        ("GET", "/api/keys/00000000-0000-0000-0000-000000000000/revoke"),
+        (
+            "GET",
+            "/api/keys/00000000-0000-0000-0000-000000000000/revoke",
+        ),
         ("GET", "/webhooks/midtrans"),
         ("GET", "/v1/chat/completions"),
     ];
@@ -743,7 +792,10 @@ mod tests {
         ("GET", "/api/me/"),
         ("GET", "/api/ME"),
         ("GET", "/health/"),
-        ("POST", "/api/keys/00000000-0000-0000-0000-000000000000/revoked"),
+        (
+            "POST",
+            "/api/keys/00000000-0000-0000-0000-000000000000/revoked",
+        ),
         ("POST", "/api/topups/extra"),
         ("GET", "/v1/chat/completion"),
     ];
@@ -839,10 +891,7 @@ mod tests {
     async fn the_key_id_route_matches_a_parameter_not_a_literal() {
         let app = table_app();
 
-        for id in [
-            SOME_KEY_ID,
-            "11111111-2222-3333-4444-555555555555",
-        ] {
+        for id in [SOME_KEY_ID, "11111111-2222-3333-4444-555555555555"] {
             let uri = format!("/api/keys/{id}");
             let status = route_status(&app, "PATCH", &uri, "{}").await;
             assert_ne!(

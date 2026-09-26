@@ -166,13 +166,12 @@ impl CircuitBreaker {
     /// Multiply the current cooldown by cooldown_multiplier, clamped to
     /// cooldown_max_seconds. A multiplier of 1.0 or less disables the backoff.
     fn next_cooldown(&self, current: Duration) -> Duration {
-        let multiplier = if self.cfg.cooldown_multiplier.is_finite()
-            && self.cfg.cooldown_multiplier > 1.0
-        {
-            self.cfg.cooldown_multiplier
-        } else {
-            1.0
-        };
+        let multiplier =
+            if self.cfg.cooldown_multiplier.is_finite() && self.cfg.cooldown_multiplier > 1.0 {
+                self.cfg.cooldown_multiplier
+            } else {
+                1.0
+            };
         let millis = (current.as_millis() as f64 * multiplier).round() as u64;
         Duration::from_millis(millis).min(Duration::from_secs(self.cfg.cooldown_max_seconds))
     }
@@ -267,11 +266,19 @@ mod tests {
     #[test]
     fn remaining_cooldown_is_none_until_the_breaker_opens() {
         let b = CircuitBreaker::new(cfg());
-        assert_eq!(b.remaining_cooldown(), None, "a Closed breaker has no cooldown");
+        assert_eq!(
+            b.remaining_cooldown(),
+            None,
+            "a Closed breaker has no cooldown"
+        );
 
         b.record_failure();
         b.record_failure();
-        assert_eq!(b.remaining_cooldown(), None, "still Closed below the threshold");
+        assert_eq!(
+            b.remaining_cooldown(),
+            None,
+            "still Closed below the threshold"
+        );
 
         b.record_failure();
         assert_eq!(b.state(), BreakerState::Open);
@@ -412,9 +419,15 @@ mod tests {
         let mut wait = 30;
         for next in [60u64, 120, 240, 480, 900, 900] {
             advance(&b, wait - 1);
-            assert!(!b.allow_request(), "not admitted before the {wait}s cooldown");
+            assert!(
+                !b.allow_request(),
+                "not admitted before the {wait}s cooldown"
+            );
             advance(&b, 1);
-            assert!(b.allow_request(), "the trial is admitted at exactly {wait}s");
+            assert!(
+                b.allow_request(),
+                "the trial is admitted at exactly {wait}s"
+            );
 
             b.record_failure();
             assert_eq!(b.state(), BreakerState::Open);

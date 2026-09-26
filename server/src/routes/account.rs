@@ -1116,11 +1116,12 @@ mod tests {
 
         // Cross-checked against a direct SELECT, so the test cannot pass on a
         // stale or hardcoded value.
-        let stored: i64 = sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
-            .bind(account_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read the wallet");
+        let stored: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the wallet");
         assert_eq!(
             stored, opening,
             "the fixture must have credited the opening balance through the real path"
@@ -1141,7 +1142,13 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["account_id", "balance_idr", "status", "telegram_linked", "usage_today"],
+            [
+                "account_id",
+                "balance_idr",
+                "status",
+                "telegram_linked",
+                "usage_today"
+            ],
             "docs/server/api-spec.md GET /api/me: {body}"
         );
         assert_eq!(body["account_id"], json!(account_id));
@@ -1152,7 +1159,12 @@ mod tests {
             .as_object()
             .expect("usage_today is an object");
         assert_eq!(usage.len(), 4, "usage_today: {body}");
-        for field in ["input_tokens", "cache_read_tokens", "output_tokens", "cost_idr"] {
+        for field in [
+            "input_tokens",
+            "cache_read_tokens",
+            "output_tokens",
+            "cost_idr",
+        ] {
             assert_eq!(
                 usage.get(field),
                 Some(&json!(0)),
@@ -1257,8 +1269,22 @@ mod tests {
         let (in_y, cache_y, out_y, cost_y) = (1_001i64, 2_002i64, 3_003i64, 55i64);
         let merged = in_a + cache_a + out_a;
 
-        insert_usage(&pool, account_id, key_a, today, (in_a, cache_a, out_a, cost_a)).await;
-        insert_usage(&pool, account_id, key_a, yesterday, (in_y, cache_y, out_y, cost_y)).await;
+        insert_usage(
+            &pool,
+            account_id,
+            key_a,
+            today,
+            (in_a, cache_a, out_a, cost_a),
+        )
+        .await;
+        insert_usage(
+            &pool,
+            account_id,
+            key_a,
+            yesterday,
+            (in_y, cache_y, out_y, cost_y),
+        )
+        .await;
         // The other account row lands on the SAME day with wildly different
         // numbers: if the query lost its account scope, they would show up.
         insert_usage(
@@ -1270,9 +1296,12 @@ mod tests {
         )
         .await;
 
-        let (status, body) =
-            respond(get_usage(State(pool.clone()), cookie_header(&token), usage_query(None, None)))
-                .await;
+        let (status, body) = respond(get_usage(
+            State(pool.clone()),
+            cookie_header(&token),
+            usage_query(None, None),
+        ))
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         let rows = body
@@ -1306,7 +1335,12 @@ mod tests {
         assert_eq!(today_row["cost_idr"], json!(cost_a), "{today_row}");
 
         // And explicitly: no counter carries the merged figure.
-        for field in ["input_tokens", "cache_read_tokens", "output_tokens", "cost_idr"] {
+        for field in [
+            "input_tokens",
+            "cache_read_tokens",
+            "output_tokens",
+            "cost_idr",
+        ] {
             assert_ne!(
                 today_row[field],
                 json!(merged),
@@ -1339,13 +1373,21 @@ mod tests {
         }
 
         let yesterday_row = &rows[1];
-        assert_eq!(yesterday_row["input_tokens"], json!(in_y), "{yesterday_row}");
+        assert_eq!(
+            yesterday_row["input_tokens"],
+            json!(in_y),
+            "{yesterday_row}"
+        );
         assert_eq!(
             yesterday_row["cache_read_tokens"],
             json!(cache_y),
             "{yesterday_row}"
         );
-        assert_eq!(yesterday_row["output_tokens"], json!(out_y), "{yesterday_row}");
+        assert_eq!(
+            yesterday_row["output_tokens"],
+            json!(out_y),
+            "{yesterday_row}"
+        );
         assert_eq!(yesterday_row["cost_idr"], json!(cost_y), "{yesterday_row}");
 
         // TENANCY: none of the other account numbers leaked in.
@@ -1534,9 +1576,12 @@ mod tests {
         assert_eq!(body, json!([]), "a future range is empty: {body}");
 
         // --- No params: the documented default window still holds. ---
-        let (status, body) =
-            respond(get_usage(State(pool.clone()), cookie_header(&token), usage_query(None, None)))
-                .await;
+        let (status, body) = respond(get_usage(
+            State(pool.clone()),
+            cookie_header(&token),
+            usage_query(None, None),
+        ))
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         let rows = body.as_array().expect("an array");
         assert_eq!(
@@ -1567,7 +1612,14 @@ mod tests {
 
     async fn usage_validation_assertions(pool: PgPool, account_id: Uuid, token: String) {
         let key = create_api_key(&pool, account_id).await;
-        insert_usage(&pool, account_id, key, Utc::now().date_naive(), (7, 8, 9, 10)).await;
+        insert_usage(
+            &pool,
+            account_id,
+            key,
+            Utc::now().date_naive(),
+            (7, 8, 9, 10),
+        )
+        .await;
 
         for (from, to, field) in [
             (Some("not-a-date"), None, "from"),
@@ -1596,9 +1648,12 @@ mod tests {
         }
 
         // The valid path is untouched by the refusals above.
-        let (status, body) =
-            respond(get_usage(State(pool.clone()), cookie_header(&token), usage_query(None, None)))
-                .await;
+        let (status, body) = respond(get_usage(
+            State(pool.clone()),
+            cookie_header(&token),
+            usage_query(None, None),
+        ))
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
     }
@@ -1670,10 +1725,15 @@ mod tests {
 
         // The documented fields, and nothing Midtrans-secret shaped. Sorted
         // because the comparison below is against the response's key set.
-        const DOCUMENTED: [&str; 6] =
-            ["amount_idr", "created_at", "id", "order_id", "settled_at", "status"];
-        const ALLOWED_STATUS: [&str; 5] =
-            ["pending", "settled", "denied", "expired", "refunded"];
+        const DOCUMENTED: [&str; 6] = [
+            "amount_idr",
+            "created_at",
+            "id",
+            "order_id",
+            "settled_at",
+            "status",
+        ];
+        const ALLOWED_STATUS: [&str; 5] = ["pending", "settled", "denied", "expired", "refunded"];
 
         for row in rows {
             let mut keys: Vec<&str> = row
@@ -1945,7 +2005,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count settled history");
-        assert_eq!(history, 1, "the fixture must have exactly one settled top-up");
+        assert_eq!(
+            history, 1,
+            "the fixture must have exactly one settled top-up"
+        );
 
         // The SAME amount that was refused a moment ago. The decision is now
         // driven by the real topups row above, not by a synthetic argument -
@@ -2394,7 +2457,9 @@ mod tests {
             .expect("the pending row must be settleable");
         assert_eq!(
             credited,
-            crate::db::TopupCreditResult::Settled { new_balance: amount },
+            crate::db::TopupCreditResult::Settled {
+                new_balance: amount
+            },
             "the 201's row must settle to exactly its amount"
         );
 

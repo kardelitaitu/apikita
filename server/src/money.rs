@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use subtle::ConstantTimeEq;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MidtransNotification {
@@ -14,12 +14,18 @@ pub struct MidtransNotification {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PaymentAction {
-    Credit { amount_idr: i64 },
-    DebitRefund { amount_idr: i64 },
+    Credit {
+        amount_idr: i64,
+    },
+    DebitRefund {
+        amount_idr: i64,
+    },
     /// The payment will never settle. Carries the `topups.status` value to
     /// persist, so the mapping lives here with the vocabulary it maps and the
     /// handler has no unreachable branch to forget about.
-    TerminalNoAction { status: &'static str },
+    TerminalNoAction {
+        status: &'static str,
+    },
     /// Midtrans sent a `transaction_status` this server does not recognise.
     ///
     /// This variant exists so an unknown value can never be silently absorbed.
@@ -49,17 +55,17 @@ pub fn compute_midtrans_signature(
 }
 
 /// Verifies signature in constant time
-pub fn verify_midtrans_signature(
-    notification: &MidtransNotification,
-    server_key: &str,
-) -> bool {
+pub fn verify_midtrans_signature(notification: &MidtransNotification, server_key: &str) -> bool {
     let expected = compute_midtrans_signature(
         &notification.order_id,
         &notification.status_code,
         &notification.gross_amount,
         server_key,
     );
-    expected.as_bytes().ct_eq(notification.signature_key.as_bytes()).into()
+    expected
+        .as_bytes()
+        .ct_eq(notification.signature_key.as_bytes())
+        .into()
 }
 
 /// Midtrans' documented `transaction_status` values, enumerated so the set is
@@ -230,15 +236,7 @@ mod tests {
         // Flash peak rates: in: 2676.78, out: 10707.12, cache: 53.54
         // M = 2.0
         // 1000 input tokens, 500 output tokens, 2000 cache read tokens
-        let cost = calculate_token_cost_idr(
-            2.0,
-            1_000,
-            2676.78,
-            2_000,
-            53.54,
-            500,
-            10707.12,
-        );
+        let cost = calculate_token_cost_idr(2.0, 1_000, 2676.78, 2_000, 53.54, 500, 10707.12);
         // in wholesale = 1000/1e6 * 2676.78 = 2.67678
         // cache wholesale = 2000/1e6 * 53.54 = 0.10708
         // out wholesale = 500/1e6 * 10707.12 = 5.35356
@@ -364,7 +362,10 @@ mod tests {
     #[test]
     fn the_idr_cost_rounds_up_never_down_and_never_truncates_to_zero() {
         // 1M tokens * 2.0 IDR/1M * 1.0 = exactly 2.0
-        assert_eq!(calculate_token_cost_idr(1.0, 1_000_000, 2.0, 0, 0.0, 0, 0.0), 2);
+        assert_eq!(
+            calculate_token_cost_idr(1.0, 1_000_000, 2.0, 0, 0.0, 0, 0.0),
+            2
+        );
         // just above an integer -> rounds UP, not to nearest, not down
         assert_eq!(
             calculate_token_cost_idr(1.0000001, 1_000_000, 2.0, 0, 0.0, 0, 0.0),
@@ -385,13 +386,13 @@ mod tests {
         assert_eq!(bill(0, 0, 0), 0);
         assert_eq!(
             calculate_token_cost_idr(PRICE, 1_000_000, 0.0, 1_000_000, 0.0, 1_000_000, 0.0),
-            0
-            , "a zero rate must charge zero, never a negative amount"
+            0,
+            "a zero rate must charge zero, never a negative amount"
         );
         assert_eq!(
             calculate_token_cost_idr(0.0, 1_000_000, R_IN, 1_000_000, R_CACHE, 1_000_000, R_OUT),
-            0
-            , "a zero multiplier must charge zero"
+            0,
+            "a zero multiplier must charge zero"
         );
         assert!(bill(0, 0, 0) >= 0);
     }
@@ -479,11 +480,16 @@ mod tests {
     /// lose money.
     #[test]
     fn the_off_peak_rate_path_is_exercised_and_is_exactly_half_of_peak() {
-        let peak = calculate_token_cost_idr(
-            PRICE, 1_000_000, R_IN, 1_000_000, R_CACHE, 1_000_000, R_OUT,
-        );
+        let peak =
+            calculate_token_cost_idr(PRICE, 1_000_000, R_IN, 1_000_000, R_CACHE, 1_000_000, R_OUT);
         let off_peak = calculate_token_cost_idr(
-            PRICE, 1_000_000, R_IN_OFFPEAK, 1_000_000, R_CACHE_OFFPEAK, 1_000_000, R_OUT_OFFPEAK,
+            PRICE,
+            1_000_000,
+            R_IN_OFFPEAK,
+            1_000_000,
+            R_CACHE_OFFPEAK,
+            1_000_000,
+            R_OUT_OFFPEAK,
         );
 
         assert_eq!(peak, 20157);
@@ -508,9 +514,8 @@ mod tests {
     #[test]
     fn the_reservation_uses_the_peak_rate_even_off_peak() {
         let peak_reservation = reserve(1_000, 4096);
-        let off_peak_reservation = calculate_preflight_reservation_idr(
-            PRICE, 1_000, R_IN_OFFPEAK, 4096, R_OUT_OFFPEAK,
-        );
+        let off_peak_reservation =
+            calculate_preflight_reservation_idr(PRICE, 1_000, R_IN_OFFPEAK, 4096, R_OUT_OFFPEAK);
 
         assert_eq!(peak_reservation, 70);
         assert_eq!(off_peak_reservation, 35);
@@ -669,10 +674,7 @@ mod tests {
         let uppercase = VECTOR_SIG.to_uppercase();
         assert_ne!(uppercase, VECTOR_SIG);
         assert!(
-            !verify_midtrans_signature(
-                &notif("order1", "200", "50000.00", &uppercase),
-                VECTOR_KEY
-            ),
+            !verify_midtrans_signature(&notif("order1", "200", "50000.00", &uppercase), VECTOR_KEY),
             "uppercase hex must be rejected: the comparison is byte-wise, not case-insensitive"
         );
     }
@@ -702,7 +704,10 @@ mod tests {
                 "a valid signature over {order_id:?} must round-trip"
             );
             assert!(
-                !verify_midtrans_signature(&notif(order_id, status_code, gross_amount, ""), VECTOR_KEY),
+                !verify_midtrans_signature(
+                    &notif(order_id, status_code, gross_amount, ""),
+                    VECTOR_KEY
+                ),
                 "an empty signature must never verify, even for empty fields"
             );
         }

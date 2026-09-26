@@ -660,7 +660,10 @@ mod tests {
     #[test]
     fn heartbeat_is_a_comment_not_an_event() {
         let frame = ": heartbeat";
-        assert!(!frame.starts_with("event:"), "heartbeat must not be an event");
+        assert!(
+            !frame.starts_with("event:"),
+            "heartbeat must not be an event"
+        );
         assert!(frame.starts_with(": "), "heartbeat is a SSE comment line");
     }
 
@@ -941,18 +944,18 @@ mod tests {
                 }
             }
             if event.as_deref() == Some(name) {
-                let data = data.unwrap_or_else(|| panic!("frame \"{name}\" carries no data: {body:?}"));
-                return serde_json::from_str(&data)
-                    .unwrap_or_else(|err| panic!("frame \"{name}\" is not JSON ({err}): {body:?}"));
+                let data =
+                    data.unwrap_or_else(|| panic!("frame \"{name}\" carries no data: {body:?}"));
+                return serde_json::from_str(&data).unwrap_or_else(|err| {
+                    panic!("frame \"{name}\" is not JSON ({err}): {body:?}")
+                });
             }
         }
         panic!("no \"{name}\" frame in the SSE body: {body:?}");
     }
 
     fn frame_count(body: &str) -> usize {
-        body.split("\n\n")
-            .filter(|f| !f.trim().is_empty())
-            .count()
+        body.split("\n\n").filter(|f| !f.trim().is_empty()).count()
     }
 
     // -----------------------------------------------------------------------
@@ -1015,7 +1018,10 @@ mod tests {
             usage.cache_read_tokens, 8_000,
             "cache reads are their own class"
         );
-        assert_eq!(usage.output_tokens, 400, "output tokens are their own class");
+        assert_eq!(
+            usage.output_tokens, 400,
+            "output tokens are their own class"
+        );
         assert_eq!(usage.cost_idr, 812, "cost is summed alongside the tokens");
 
         // docs/realtime.md:61 - the classes must never be folded together; they
@@ -1242,18 +1248,24 @@ mod tests {
         insert_usage(&pool, b_id, b_key, today(), 77_000, 66_000, 55_000, 44_000).await;
 
         let body_a = read_frames(
-            sse_events_handler(State(live_app_state(pool.clone())), cookie_headers(&a_token))
-                .await
-                .expect("account A's snapshot")
-                .into_response(),
+            sse_events_handler(
+                State(live_app_state(pool.clone())),
+                cookie_headers(&a_token),
+            )
+            .await
+            .expect("account A's snapshot")
+            .into_response(),
             2,
         )
         .await;
         let body_b = read_frames(
-            sse_events_handler(State(live_app_state(pool.clone())), cookie_headers(&b_token))
-                .await
-                .expect("account B's snapshot")
-                .into_response(),
+            sse_events_handler(
+                State(live_app_state(pool.clone())),
+                cookie_headers(&b_token),
+            )
+            .await
+            .expect("account B's snapshot")
+            .into_response(),
             2,
         )
         .await;
@@ -1468,7 +1480,10 @@ mod tests {
     /// value and not a frame count: an unfiltered stream delivers the other
     /// account's frame FIRST, and a count-based read would stop there and never
     /// notice the leak.
-    async fn read_until_balance(response: axum::response::Response, want_balance_idr: i64) -> String {
+    async fn read_until_balance(
+        response: axum::response::Response,
+        want_balance_idr: i64,
+    ) -> String {
         let mut stream = Box::pin(response.into_body().into_data_stream());
         let mut buffer = String::new();
         let deadline = tokio::time::sleep(Duration::from_secs(10));

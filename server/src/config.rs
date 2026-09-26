@@ -222,7 +222,9 @@ impl AppConfig {
         }
         for model in &self.models {
             if model.price <= 0.0 {
-                return Err(format!("Model {} has invalid price multiplier <= 0", model.name).into());
+                return Err(
+                    format!("Model {} has invalid price multiplier <= 0", model.name).into(),
+                );
             }
             if model.rates.input_peak <= 0.0 || model.rates.output_peak <= 0.0 {
                 return Err(format!("Model {} is missing peak rates", model.name).into());
@@ -270,11 +272,15 @@ fn validate_trusted_proxy_width(cidrs: &[String]) -> Result<(), Box<dyn std::err
         let address: std::net::IpAddr = text
             .split_once('/')
             .and_then(|(address, _)| address.trim().parse().ok())
-            .ok_or_else(|| format!("network.trusted_proxy_cidrs: {text}: expected ADDRESS/PREFIX"))?;
+            .ok_or_else(|| {
+                format!("network.trusted_proxy_cidrs: {text}: expected ADDRESS/PREFIX")
+            })?;
         let prefix: u8 = text
             .split_once('/')
             .and_then(|(_, prefix)| prefix.trim().parse().ok())
-            .ok_or_else(|| format!("network.trusted_proxy_cidrs: {text}: expected ADDRESS/PREFIX"))?;
+            .ok_or_else(|| {
+                format!("network.trusted_proxy_cidrs: {text}: expected ADDRESS/PREFIX")
+            })?;
 
         if prefix == 0 {
             return Err(format!(
@@ -381,7 +387,9 @@ mod tests {
         "#;
 
         let config: AppConfig = toml::from_str(toml).expect("a legacy config must still parse");
-        config.validate().expect("a legacy config must still validate");
+        config
+            .validate()
+            .expect("a legacy config must still validate");
 
         let flash = &config.models[0];
         // Absent overrides are None, and the effective rate is the model's.
@@ -389,7 +397,10 @@ mod tests {
             assert_eq!(endpoint.input_peak, None);
             assert_eq!(endpoint.output_peak, None);
             assert_eq!(endpoint.effective_input_peak(flash), flash.rates.input_peak);
-            assert_eq!(endpoint.effective_output_peak(flash), flash.rates.output_peak);
+            assert_eq!(
+                endpoint.effective_output_peak(flash),
+                flash.rates.output_peak
+            );
         }
 
         // With no overrides the endpoints TIE, and the reservation is exactly
@@ -453,7 +464,10 @@ mod tests {
             let err = validate_trusted_proxy_width(&[entry.to_string()])
                 .expect_err("a default route must be rejected");
             let message = err.to_string();
-            assert!(message.contains(entry), "message must name {entry}: {message}");
+            assert!(
+                message.contains(entry),
+                "message must name {entry}: {message}"
+            );
             assert!(
                 message.contains("default route"),
                 "message must say what is wrong: {message}"
@@ -489,7 +503,12 @@ mod tests {
     /// including a /16 and a /64 boundary rule.
     #[test]
     fn a_relay_sized_rule_is_accepted() {
-        for entry in ["203.0.113.7/32", "172.21.0.0/16", "::1/128", "2001:db8::/64"] {
+        for entry in [
+            "203.0.113.7/32",
+            "172.21.0.0/16",
+            "::1/128",
+            "2001:db8::/64",
+        ] {
             assert!(
                 validate_trusted_proxy_width(&[entry.to_string()]).is_ok(),
                 "{entry} names a relay-sized network and must be accepted"

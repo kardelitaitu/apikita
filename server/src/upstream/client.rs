@@ -136,7 +136,10 @@ fn int_field(value: &Value, key: &str) -> i64 {
 /// A non-negative integer nested one object deep — `prompt_tokens_details.cached_tokens`
 /// — or 0 when the object or the field is absent/malformed.
 fn nested_int_field(value: &Value, object: &str, key: &str) -> i64 {
-    value.get(object).map(|inner| int_field(inner, key)).unwrap_or(0)
+    value
+        .get(object)
+        .map(|inner| int_field(inner, key))
+        .unwrap_or(0)
 }
 
 /// One upstream endpoint with its key pool and breaker, flattened out of
@@ -281,8 +284,8 @@ impl UpstreamClient {
     pub fn new(config: Arc<AppConfig>) -> Self {
         let timeout_seconds = config.circuit_breaker.request_timeout_seconds;
         let mut builder = reqwest::Client::builder()
-            .tcp_nodelay(true)  // SSE: disable Nagle so small frequent frames land immediately
-            .pool_idle_timeout(std::time::Duration::from_secs(30))  // 30s: with pool_max_idle_per_host(100) and 3 endpoints the 90s default holds 300 idle sockets on a 256 MB container
+            .tcp_nodelay(true) // SSE: disable Nagle so small frequent frames land immediately
+            .pool_idle_timeout(std::time::Duration::from_secs(30)) // 30s: with pool_max_idle_per_host(100) and 3 endpoints the 90s default holds 300 idle sockets on a 256 MB container
             .pool_max_idle_per_host(100);
         if timeout_seconds > 0 {
             // A per-read timeout, not a total one: it catches an upstream that
@@ -320,12 +323,12 @@ impl UpstreamClient {
                             config.key_pool.max_key_attempts,
                         ),
                         breaker: CircuitBreaker::new(config.circuit_breaker.clone()),
-                    supports_stream_options: endpoint.supports_stream_options,
-                    // Resolved through the config's own accessors so the
-                    // upstream client and the pre-flight reservation can never
-                    // disagree about what an endpoint costs.
-                    input_peak: endpoint.effective_input_peak(model),
-                    output_peak: endpoint.effective_output_peak(model),
+                        supports_stream_options: endpoint.supports_stream_options,
+                        // Resolved through the config's own accessors so the
+                        // upstream client and the pre-flight reservation can never
+                        // disagree about what an endpoint costs.
+                        input_peak: endpoint.effective_input_peak(model),
+                        output_peak: endpoint.effective_output_peak(model),
                     })
                     .collect(),
             })
@@ -345,7 +348,10 @@ impl UpstreamClient {
 
     /// Every configured model name, in config order.
     pub fn allowed_models(&self) -> Vec<&str> {
-        self.models.iter().map(|model| model.name.as_str()).collect()
+        self.models
+            .iter()
+            .map(|model| model.name.as_str())
+            .collect()
     }
 
     /// Worst-case reservation in IDR, or `None` when the model is unknown.
@@ -379,12 +385,12 @@ impl UpstreamClient {
             // Rounding up is the same rule the 429 path follows
             // (docs/error-model.md:93-94) and it is the safe direction: a value
             // that is too low tells the client to retry before a retry can
-            // succeed. Ceiling division by hand, as in abuse.rs:62.
+            // succeed. Ceiling division via `u64::div_ceil` (stable since 1.73).
             //
             // Floor at 1: docs/error-model.md:112 - "A zero or negative value
             // is a malformed header", and a client that honours 0 retries into
             // a refusal.
-            .map(|cooldown| ((cooldown.as_millis() as u64 + 999) / 1000).max(1))
+            .map(|cooldown| (cooldown.as_millis() as u64).div_ceil(1000).max(1))
     }
 
     /// Send a streaming chat-completions request to the first endpoint that
@@ -408,13 +414,21 @@ impl UpstreamClient {
         let mut rate_limited = false;
         let mut transport = None;
 
-        for endpoint in entry.endpoints.iter().filter(|endpoint| endpoint.weight > 0.0) {
+        for endpoint in entry
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.weight > 0.0)
+        {
             if !endpoint.breaker.allow_request() {
                 unhealthy = true;
                 continue;
             }
 
-            let payload = prepare_body(&body, &endpoint.upstream_model, endpoint.supports_stream_options);
+            let payload = prepare_body(
+                &body,
+                &endpoint.upstream_model,
+                endpoint.supports_stream_options,
+            );
 
             for _ in 0..endpoint.pool.max_attempts() {
                 let Some(lease) = endpoint.pool.acquire() else {
@@ -436,11 +450,7 @@ impl UpstreamClient {
 
                         if status == 200 {
                             endpoint.breaker.record_success();
-                            return Ok(UpstreamStream::new(
-                                response,
-                                endpoint.name.clone(),
-                                lease,
-                            ));
+                            return Ok(UpstreamStream::new(response, endpoint.name.clone(), lease));
                         }
 
                         if self.is_rate_limit(status) {
@@ -494,7 +504,10 @@ impl UpstreamClient {
         payload: &Value,
     ) -> reqwest::Result<reqwest::Response> {
         self.http
-            .post(format!("{}/chat/completions", base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                base_url.trim_end_matches('/')
+            ))
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(payload)
@@ -512,7 +525,10 @@ fn prepare_body(body: &Value, upstream_model: &str, supports_stream_options: boo
         // A caller that says nothing about streaming is treated as a streaming
         // caller, because that is what this client is for. Only an explicit
         // "stream": false opts out of the usage opt-in below.
-        let streaming = object.get("stream").and_then(Value::as_bool).unwrap_or(true);
+        let streaming = object
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
 
         object.insert("model".to_string(), json!(upstream_model));
         object.insert("stream".to_string(), json!(true));
@@ -560,7 +576,8 @@ mod tests {
     use super::*;
     use crate::config::{
         CircuitBreakerConfig, KeyPoolConfig, LimitsConfig, ModelConfig, ModelEndpoint, ModelRates,
-        NetworkConfig, PricingConfig, RealtimeConfig, SessionsConfig, StreamingConfig, WalletConfig,
+        NetworkConfig, PricingConfig, RealtimeConfig, SessionsConfig, StreamingConfig,
+        WalletConfig,
     };
     use crate::upstream::circuit_breaker::BreakerState;
 
@@ -859,7 +876,10 @@ mod tests {
             reserved > cheapest,
             "the fixture must hold a dearer and a cheaper endpoint ({reserved} vs {cheapest})"
         );
-        assert_ne!(reserved, cheapest, "reserving at the CHEAPEST endpoint would under-reserve");
+        assert_ne!(
+            reserved, cheapest,
+            "reserving at the CHEAPEST endpoint would under-reserve"
+        );
 
         // An endpoint that overrides NOTHING still falls back to the model rate,
         // so an override-free pool keeps the old behaviour exactly.
@@ -923,7 +943,10 @@ mod tests {
             vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
         )]);
 
-        assert_eq!(client.models[0].endpoints[0].breaker.state(), BreakerState::Closed);
+        assert_eq!(
+            client.models[0].endpoints[0].breaker.state(),
+            BreakerState::Closed
+        );
         trip_endpoint(&client, 1);
 
         assert_eq!(
@@ -999,7 +1022,11 @@ mod tests {
                 };
                 let expected: usize = head
                     .lines()
-                    .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").map(str::to_string))
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_string)
+                    })
                     .and_then(|len| len.trim().parse().ok())
                     .unwrap_or(0);
                 if body.len() >= expected {
@@ -1013,7 +1040,10 @@ mod tests {
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
                 body.len()
             );
-            socket.write_all(response.as_bytes()).await.expect("write head");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write head");
             socket.write_all(&body).await.expect("write body");
             socket.flush().await.expect("flush");
             String::from_utf8_lossy(&buffer).into_owned()
@@ -1026,7 +1056,10 @@ mod tests {
         let client = client(vec![model("flash", vec![live])]);
 
         let mut stream = client
-            .stream_chat("flash", json!({ "model": "flash", "messages": [], "stream": true }))
+            .stream_chat(
+                "flash",
+                json!({ "model": "flash", "messages": [], "stream": true }),
+            )
             .await
             .expect("an endpoint answered 200");
         assert_eq!(stream.endpoint_name(), "live");
@@ -1053,9 +1086,15 @@ mod tests {
             request.starts_with("POST /v1/chat/completions "),
             "{request}"
         );
-        assert!(request.contains("\"model\":\"deepseek-flash\""), "{request}");
+        assert!(
+            request.contains("\"model\":\"deepseek-flash\""),
+            "{request}"
+        );
         assert!(request.contains("\"stream\":true"), "{request}");
-        assert!(request.contains("authorization: Bearer test-key"), "{request}");
+        assert!(
+            request.contains("authorization: Bearer test-key"),
+            "{request}"
+        );
     }
 
     #[tokio::test]
