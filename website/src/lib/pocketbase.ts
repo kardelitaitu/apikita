@@ -1,9 +1,9 @@
 import PocketBase from 'pocketbase';
-import { apiFetch } from './api';
+import { apiFetch } from './api.ts';
 
 /** Identity lives in PocketBase; the origin is a PUBLIC_* build-time variable. */
 export const POCKETBASE_URL: string =
-  import.meta.env.PUBLIC_POCKETBASE_URL ?? 'http://127.0.0.1:8090';
+  import.meta.env?.PUBLIC_POCKETBASE_URL ?? 'http://127.0.0.1:8090';
 
 export const pb = new PocketBase(POCKETBASE_URL);
 

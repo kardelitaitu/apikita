@@ -4,7 +4,7 @@
 // obeys: events are ABSOLUTE, never deltas, and on error the last value is kept
 // and marked stale — never blanked, never shown as live.
 
-import { ApiError, apiFetch, API_BASE, type Me, type UsageToday } from './api';
+import { ApiError, apiFetch, API_BASE, type Me, type UsageToday } from './api.ts';
 
 /** docs/realtime.md: poll every 30-60s. Never fake realtime with tight polling. */
 export const POLL_INTERVAL_MS = 30_000;
