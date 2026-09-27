@@ -73,7 +73,7 @@ MODE="run"
 
 usage() {
     echo "probe: usage: probe.sh [--check <id>]... | --list | --help" >&2
-    echo "probe: checks: api_down, relay_down, webhook_rejection, error_rate, all_providers_unhealthy (no database access at all)" >&2
+    echo "probe: checks: api_down, relay_down, webhook_rejection, refund_refusal, error_rate, all_providers_unhealthy, db_disk (no database access at all)" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -101,6 +101,13 @@ if [ "$MODE" = "list" ]; then
             "counts 'topup.rejected' in lines of $LOG_FILE not yet scanned"
     else
         printf 'probe: %-20s %-8s %s\n' "webhook_rejection" "skipped" \
+            "PROBE_LOG_FILE is unset - no log source configured, so this alert is NOT checked"
+    fi
+    if [ -n "$LOG_FILE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "refund_refusal" "covered" \
+            "counts 'refund.refused' in lines of $LOG_FILE not yet scanned"
+    else
+        printf 'probe: %-20s %-8s %s\n' "refund_refusal" "skipped" \
             "PROBE_LOG_FILE is unset - no log source configured, so this alert is NOT checked"
     fi
     if [ -n "$OPERATOR_COOKIE" ]; then
@@ -146,9 +153,9 @@ esac
 if [ -n "$CHECKS" ]; then
     for id in $CHECKS; do
         case "$id" in
-            api_down|relay_down|webhook_rejection|error_rate|all_providers_unhealthy|db_disk) ;;
+            api_down|relay_down|webhook_rejection|refund_refusal|error_rate|all_providers_unhealthy|db_disk) ;;
             *) echo "probe: unknown check: $id" >&2
-               echo "probe: known checks: api_down, relay_down, webhook_rejection, error_rate, all_providers_unhealthy, db_disk" >&2
+               echo "probe: known checks: api_down, relay_down, webhook_rejection, refund_refusal, error_rate, all_providers_unhealthy, db_disk" >&2
                exit 2 ;;
         esac
     done
@@ -442,9 +449,17 @@ check_relay_down() {
 # a line offset in PROBE_STATE_DIR: one page per rejection, not one page per run.
 # A rotation (the file shrank) rescans from the start.
 record_offset() {
+    record_offset_file "$STATE_FILE" "$1"
+}
+
+# record_offset_file <path> <value> - the same write, for a check that owns an offset
+# file other than the shared one. Checks that scan the SAME log for DIFFERENT events
+# need separate markers: a shared one would let whichever event is scanned first
+# advance past the other and silently swallow it.
+record_offset_file() {
     if mkdir -p "$STATE_DIR" 2>/dev/null; then
-        printf '%s\n' "$1" > "$STATE_FILE" 2>/dev/null || \
-            echo "probe: warning: cannot write $STATE_FILE; the same log lines will be re-scanned" >&2
+        printf '%s\n' "$2" > "$1" 2>/dev/null || \
+            echo "probe: warning: cannot write $1; the same log lines will be re-scanned" >&2
     else
         echo "probe: warning: state dir not writable ($STATE_DIR); the same log lines will be re-scanned" >&2
     fi
@@ -511,6 +526,81 @@ check_webhook_rejection() {
     return 0
 }
 
+# --- check: refund_refusal ----------------------------------------------------
+# The registry condition is "any refund.refused". docs/launch-checklist.md:68 names
+# this as the one outstanding code-shaped item in Gate 2: "unalerted, a refusal is
+# indistinguishable from a bug".
+#
+# WHY ALERT AT ALL, when the behaviour is correct: a refund refusal is the ONE
+# webhook outcome where NOTHING MOVES - the topup stays `settled`, no ledger row is
+# appended, the balance is untouched. That is also exactly what a status-mapping
+# regression routing real events into this arm would look like, so without a distinct
+# marker the two are indistinguishable. A spike therefore means either a customer
+# genuinely disputing, or a routing bug - both worth a look, neither visible any other
+# way.
+#
+# A SEPARATE offset file from webhook_rejection, deliberately. They share the log, but
+# a shared marker would let a rejection advance past a refusal (or the reverse) and
+# silently swallow the other event. One offset per alert is one event type per scan.
+check_refund_refusal() {
+    if [ -z "$LOG_FILE" ]; then
+        echo "probe: SKIPPED refund_refusal - no log source configured (PROBE_LOG_FILE unset)."
+        echo "probe:   This alert is NOT being checked. Set PROBE_LOG_FILE to the server's captured"
+        echo "probe:   stdout to enable it. A skip stated out loud, not a pass."
+        return 0
+    fi
+    if [ ! -e "$LOG_FILE" ]; then
+        echo "probe: UNKNOWN refund_refusal - PROBE_LOG_FILE=$LOG_FILE does not exist, so" >&2
+        echo "probe:   'no refusals' cannot be claimed. Unknown is not clean." >&2
+        fail_with 6
+        return 0
+    fi
+    if [ ! -r "$LOG_FILE" ]; then
+        echo "probe: FAILED refund_refusal - PROBE_LOG_FILE=$LOG_FILE is not readable" >&2
+        fail_with 4
+        return 0
+    fi
+
+    STATE_FILE="$STATE_DIR/refund_refusal.offset"
+    LAST=0
+    if [ -f "$STATE_FILE" ]; then
+        LAST=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+        case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+    fi
+    TOTAL=$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' \t')
+    case "$TOTAL" in
+        ''|*[!0-9]*)
+            echo "probe: FAILED refund_refusal - could not count lines in $LOG_FILE" >&2
+            fail_with 4
+            return 0
+            ;;
+    esac
+    if [ "$TOTAL" -lt "$LAST" ]; then
+        echo "probe: note: $LOG_FILE shrank (rotated or truncated); scanning it from the start"
+        LAST=0
+    fi
+    NEW=$((TOTAL - LAST))
+    N=0
+    if [ "$NEW" -gt 0 ]; then
+        N=$(tail -n "+$((LAST + 1))" "$LOG_FILE" | grep -c -F 'refund.refused')
+    fi
+
+    if [ "$N" -gt 0 ]; then
+        echo "probe: ALERT refund_refusal: $N 'refund.refused' line(s) in $NEW new line(s) of $LOG_FILE"
+        fire refund_refusal "$N refund refusal(s) in the $NEW new line(s) of $LOG_FILE since the last scan. No money moved on this path: check for a status-mapping regression, or a customer disputing"
+        # The scan marker advances only when somebody was actually told, for the reason
+        # webhook_rejection documents: a failed delivery must not consume the event.
+        if [ "$FIRE_RC" -eq 0 ] || [ "$FIRE_RC" -eq 1 ]; then
+            record_offset_file "$STATE_FILE" "$TOTAL"
+        else
+            echo "probe:   -> scan marker NOT advanced; the next run will see these lines again" >&2
+        fi
+    else
+        echo "probe: OK  refund_refusal: 0 'refund.refused' in $NEW new line(s) of $LOG_FILE ($TOTAL total; scanned from line $((LAST + 1)))"
+        record_offset_file "$STATE_FILE" "$TOTAL"
+    fi
+    return 0
+}
 # --- run ----------------------------------------------------------------------
 run_check() {
     case "$1" in
@@ -520,6 +610,7 @@ run_check() {
         all_providers_unhealthy) check_all_providers_unhealthy ;;
         db_disk) check_db_disk ;;
         webhook_rejection) check_webhook_rejection ;;
+        refund_refusal) check_refund_refusal ;;
     esac
     return 0
 }

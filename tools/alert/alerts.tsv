@@ -1,5 +1,6 @@
 id	title	condition	threshold	action	coverage	source
 webhook_rejection	Webhook rejection	any `topup.rejected`	any (>=1 in the window)	Investigate immediately - either an attack or a config error breaking payments	covered	docs/observability.md:99
+refund_refusal	Refund refused by policy	any `refund.refused`	any (>=1 in the window)	A refund was requested and declined. Correct behaviour - but SHOULD NOT HAPPEN in normal operation, and nothing else moves on this path, so a spike means a status-mapping regression or a customer-facing dispute	covered	docs/observability.md:99
 ledger_drift	Ledger drift	`ledger_balance_drift_idr != 0`	0 (must equal 0)	Money is wrong. Freeze changes, investigate	covered	docs/observability.md:100
 api_down	API down	`/health` failing 2 min	120s of failed /health checks	Restart/investigate; auth is down	covered	docs/observability.md:101
 relay_5xx	Relay 5xx	relay returns 502/504	any 502/504 in the window	The relay is up but the backend is not	needs-metrics	docs/observability.md:102

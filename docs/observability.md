@@ -97,6 +97,7 @@ Each has a threshold and an action. If you would not act, do not alert.
 | Alert | Condition | Action |
 | --- | --- | --- |
 | **Webhook rejection** | any `topup.rejected` | **Investigate immediately** — either an attack or a config error breaking payments |
+| **Refund refused by policy** | any `refund.refused` | Correct behaviour, but nothing else moves on this path — a spike means a status-mapping regression or a dispute |
 | **Ledger drift** | `ledger_balance_drift_idr != 0` | Money is wrong. Freeze changes, investigate |
 | **API down** | `/health` failing 2 min | Restart/investigate; auth is down |
 | **Relay 5xx** | relay returns 502/504 | The relay is up but the backend is not |
@@ -114,6 +115,19 @@ reports the age of the oldest row per age-based table, present only when that ro
 exceeded the table's window, so the alert fires when a retention **promise** is being
 broken — which is an incident at any disk size, whereas 80% full is normal for a
 working database. The row above is restated accordingly rather than silently redefined.
+
+**The refund-refusal alert is a DISTINCT event, not folded into `topup.rejected`.**
+They look similar and mean opposite things: a rejection is a payment that failed to
+land and may owe someone money, while a refusal is a refund **declined by policy**,
+which is the system working. Sharing the name would page on routine enforcement and
+would let a refusal spike hide inside a rejection count.
+
+It is alerted on even though the behaviour is correct, because a refusal is the one
+webhook outcome where **nothing moves** — the topup stays `settled`, no ledger row is
+appended, the balance is untouched. That is also exactly what a status-mapping
+regression routing real events into this arm would look like, so without a distinct
+marker the two are indistinguishable. `tools/alert/probe.sh` scans for it with its OWN
+line-offset marker, so it and `topup.rejected` cannot consume each other's events.
 
 **The all-providers-unhealthy alert is SERVED too.** `GET /api/admin/metrics` also
 reports `unhealthy_models`: the models whose EVERY routed endpoint has an open
