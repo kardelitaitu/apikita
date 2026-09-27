@@ -78,18 +78,22 @@ services:
   #              preserved verbatim (1=drift 2=no DATABASE_URL 3=no sqlite3
   #              4=sqlite3 failed 5=stranded hold 6=no such database file).
   #              No `|| true` anywhere near it.
-  #   ip-purge, hold-sweep
-  #              NOT WIRED HERE. Both are Rust binaries, and this service's image
-  #              (.docker/maintenance) deliberately contains only the sqlite3 CLI
-  #              — it is not the server image and must not become one. A server
-  #              image DOES now exist (server/Dockerfile, W17) and it ships
-  #              apikita-server and migrate; ip-purge and hold-sweep are still not
-  #              copied into it, because neither has been scheduled. This service
-  #              logs that on startup and never pretends to have run them — a
-  #              scheduler that looks like it works and does nothing is the same
-  #              failure class as a money check that returns 0 while the money is
-  #              wrong. Run them on the host, on the same cadence, until they are
-  #              wired into a scheduled container.
+  #   hold-sweep RUNS HERE, for real, REPORT-ONLY. Not the binary — this image
+  #              contains only the sqlite3 CLI and must never become the server
+  #              image — but the same DETECTOR, applied inline by
+  #              run_hold_sweep with the predicate server/src/bin/hold-sweep.rs
+  #              itself demands (a different one "would make the binary and the
+  #              library disagree about what stranded means, which is how a
+  #              detector stops being trusted") and its 900s bound. A stranded
+  #              reservation hold is INVISIBLE MONEY: the ledger still balances
+  #              and reconcile.sh is structurally blind to it. It counts, names
+  #              the accounts and refs, and exits non-zero. It NEVER moves money —
+  #              crediting a hold back is the deliberate `--release` action, so
+  #              that stays a host command.
+  #   ip-purge   NOT WIRED HERE, and its WORK IS: run_retention applies its two
+  #              DELETEs inline (see retention above), so the retention promise is
+  #              kept even though the binary does not run. The binary is a Rust
+  #              program and this image deliberately has no Rust toolchain.
   #
   # PORTED TO SQLITE. The image is built from .docker/maintenance/Dockerfile,
   # which exists only to put the sqlite3 CLI on PATH; both DSNs are sqlite://
@@ -118,7 +122,8 @@ services:
     # never runs against the real database. This is the directory server/ is
     # mounted at, and the one the API runs in.
     working_dir: /srv/apikita/server
-    # schedule = nightly loop. one-shot verbs for operators/CI: once, retention, reconcile.
+    # schedule = nightly loop. one-shot verbs for operators/CI:
+    # once, retention, reconcile, hold-sweep.
     command: ["schedule"]
     environment:
       # The retention job's database. A FILE, not a service: there is no
