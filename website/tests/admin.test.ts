@@ -21,8 +21,12 @@ import {
   actionableAccountIds,
   auditActionLabel,
   auditDetailSummary,
+  errorRateBreached,
   formatAuditTime,
+  formatErrorRate,
+  metricsPath,
   recentAuditPath,
+  ERROR_RATE_THRESHOLD,
   actionPath,
   adminErrorMessage,
   canResume,
@@ -228,4 +232,30 @@ test('an audit time is shown in WIB', () => {
 test('the recent-actions path carries the limit', () => {
   assert.equal(recentAuditPath(10), '/api/admin/audit?limit=10');
   assert.match(recentAuditPath(), /limit=50/);
+});
+
+// --- Operator metrics -------------------------------------------------------
+
+test('the metrics path is the documented one', () => {
+  assert.equal(metricsPath(), '/api/admin/metrics');
+});
+
+test('a null error rate is "no data", never a breach', () => {
+  // The server sends null on an empty window so a fresh deploy is not read as
+  // healthy. The UI must not turn that into 0% and must not alert on it.
+  const empty = { server_errors: 0, responses: 0, error_rate: null };
+  assert.equal(errorRateBreached(empty), false);
+  assert.equal(formatErrorRate(null), 'No data yet');
+});
+
+test('the threshold is 5% and is breached only ABOVE it', () => {
+  assert.equal(ERROR_RATE_THRESHOLD, 0.05);
+  assert.equal(errorRateBreached({ server_errors: 5, responses: 100, error_rate: 0.05 }), false);
+  assert.equal(errorRateBreached({ server_errors: 6, responses: 100, error_rate: 0.06 }), true);
+  assert.equal(errorRateBreached({ server_errors: 0, responses: 100, error_rate: 0 }), false);
+});
+
+test('a rate formats as a percentage', () => {
+  assert.equal(formatErrorRate(0.0512), '5.12%');
+  assert.equal(formatErrorRate(0), '0.00%');
 });

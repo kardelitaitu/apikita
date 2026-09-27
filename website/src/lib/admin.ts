@@ -320,3 +320,47 @@ export function formatAuditTime(iso: string): string {
 export function recentAuditPath(limit = 50): string {
   return `/api/admin/audit?limit=${limit}`;
 }
+
+/** `GET /api/admin/metrics` — in-process response counters for the error-rate alert. */
+export interface OperatorMetrics {
+  server_errors: number;
+  responses: number;
+  /**
+   * 5xx / responses, rounded to 4 decimals, or **null when the window is empty**.
+   * null is "no data", NOT "0% healthy" — the server sends null deliberately so a
+   * fresh deploy is not read as perfect health. Never coerce it to 0 here.
+   */
+  error_rate: number | null;
+}
+
+/** The metrics path. */
+export function metricsPath(): string {
+  return '/api/admin/metrics';
+}
+
+/** The alert threshold the row is judged against (tools/alert/alerts.tsv). */
+export const ERROR_RATE_THRESHOLD = 0.05;
+
+/**
+ * Whether the error rate has crossed the documented 5% threshold.
+ *
+ * A null rate is NOT over threshold: there is no data to breach it with, and
+ * treating "no data" as a breach would fire the alert on every fresh deploy.
+ */
+export function errorRateBreached(metrics: OperatorMetrics): boolean {
+  return metrics.error_rate !== null && metrics.error_rate > ERROR_RATE_THRESHOLD;
+}
+
+/** A percentage label for a rate, or an explicit "no data" for null. */
+export function formatErrorRate(rate: number | null): string {
+  if (rate === null) return 'No data yet';
+  return (rate * 100).toFixed(2) + '%';
+}
+
+/**
+ * The severity word for the current rate, matching the badge vocabulary the rest
+ * of the console uses.
+ */
+export function errorRateSeverity(metrics: OperatorMetrics): 'ok' | 'warn' {
+  return errorRateBreached(metrics) ? 'warn' : 'ok';
+}

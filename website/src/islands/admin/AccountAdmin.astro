@@ -120,6 +120,39 @@ import Skeleton from '../../components/Skeleton.astro';
 
   <hr class="my-8 border-edge" />
 
+  <!-- Service metrics ------------------------------------------------------- -->
+  <section aria-labelledby="admin-metrics-heading">
+    <div class="flex flex-wrap items-baseline justify-between gap-3">
+      <h2 id="admin-metrics-heading" class="text-lg font-semibold tracking-tight">Service metrics</h2>
+      <span id="admin-metrics-badge" class="rounded border border-edge-strong px-2 py-0.5 text-xs font-medium text-ink-muted">—</span>
+    </div>
+    <p class="mt-1 text-sm text-ink-muted">
+      In-process response counters since this server started. The error rate is
+      5xx responses over all responses, and the alert threshold is 5%
+      (<code class="font-mono">tools/alert</code>).
+    </p>
+
+    <div id="admin-metrics-error" hidden role="alert"
+      class="mt-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
+
+    <div id="admin-metrics-grid" hidden class="mt-4 grid gap-4 sm:grid-cols-3">
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <div class="text-xs uppercase tracking-wide text-ink-muted">Responses</div>
+        <div id="metrics-responses" class="mt-1 font-mono tabular-nums">—</div>
+      </div>
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <div class="text-xs uppercase tracking-wide text-ink-muted">Server errors (5xx)</div>
+        <div id="metrics-errors" class="mt-1 font-mono tabular-nums">—</div>
+      </div>
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <div class="text-xs uppercase tracking-wide text-ink-muted">Error rate</div>
+        <div id="metrics-rate" class="mt-1 font-mono tabular-nums">—</div>
+      </div>
+    </div>
+  </section>
+
+  <hr class="my-8 border-edge" />
+
   <!-- Lookup ---------------------------------------------------------------- -->
   <form id="admin-lookup" class="flex flex-wrap items-end gap-3">
     <div class="min-w-[22rem] flex-1">
@@ -227,7 +260,7 @@ import Skeleton from '../../components/Skeleton.astro';
 <script>
   import { apiFetch } from '../../lib/api';
   import { describeError } from '../../lib/errors';
-  import { formatIdr } from '../../lib/format';
+  import { formatIdr, formatCount } from '../../lib/format';
   import {
     accountAuditPath,
     accountListPath,
@@ -240,7 +273,11 @@ import Skeleton from '../../components/Skeleton.astro';
     canResume,
     canSuspend,
     describeAction,
+    errorRateBreached,
     formatAuditTime,
+    formatErrorRate,
+    metricsPath,
+    type OperatorMetrics,
     hasNextPage,
     isAccountId,
     listSummary,
@@ -279,6 +316,7 @@ import Skeleton from '../../components/Skeleton.astro';
         islandRoot.hidden = false;
         void loadList();
         void loadRecentActions();
+        void loadMetrics();
       } else {
         gateText.textContent = 'Operator access is required. This page is for operators only.';
       }
@@ -626,6 +664,34 @@ import Skeleton from '../../components/Skeleton.astro';
   }
 
   $('admin-recent-refresh').addEventListener('click', () => void loadRecentActions());
+
+  // --- Service metrics -------------------------------------------------------
+  const metricsError = $('admin-metrics-error');
+  const metricsGrid = $('admin-metrics-grid');
+  const metricsBadge = $('admin-metrics-badge');
+
+  async function loadMetrics(): Promise<void> {
+    metricsError.hidden = true;
+    try {
+      const m = await apiFetch<OperatorMetrics>(metricsPath());
+      metricsGrid.hidden = false;
+      $('metrics-responses').textContent = formatCount(m.responses);
+      $('metrics-errors').textContent = formatCount(m.server_errors);
+      $('metrics-rate').textContent = formatErrorRate(m.error_rate);
+
+      const breached = errorRateBreached(m);
+      metricsBadge.textContent = breached ? 'Above threshold' : 'Within threshold';
+      metricsBadge.className =
+        'rounded border px-2 py-0.5 text-xs font-medium ' +
+        (breached ? 'border-warn bg-warn-surface text-warn-ink' : 'border-ok-edge text-ok');
+    } catch (err) {
+      const status = (err as { status?: number }).status ?? 0;
+      metricsBadge.textContent = '—';
+      metricsBadge.className = 'rounded border border-edge-strong px-2 py-0.5 text-xs font-medium text-ink-muted';
+      metricsError.textContent = adminErrorMessage(status, describeError(err).message);
+      metricsError.hidden = false;
+    }
+  }
 
   async function lookup(id: string): Promise<void> {
     clearError();
