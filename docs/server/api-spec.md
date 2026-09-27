@@ -492,14 +492,15 @@ Authorization is the `accounts.is_operator` flag, plus a normal session cookie.
 
 ### Implemented routes
 
-These four exist in `server/src/routes/mod.rs` and are the whole admin surface
+These routes exist in `server/src/routes/mod.rs` and are the whole admin surface
 today. The **operator console** at `/admin`
-(`website/src/pages/admin/index.astro`) is the UI over them — lookup, plus
-suspend/resume. The UI adds no capability; it calls these routes with the same
-session cookie and every guard is enforced here, server-side.
+(`website/src/pages/admin/index.astro`) is the UI over them — browse/search,
+lookup, plus suspend/resume. The UI adds no capability; it calls these routes
+with the same session cookie and every guard is enforced here, server-side.
 
 | Endpoint | Handler | Effect |
 | --- | --- | --- |
+| `GET /api/admin/accounts` | `admin::list_accounts` | Bounded listing. Query: `q` (matches account id / PocketBase id), `status`, `limit` (1–100, default 25), `offset`. Returns `{accounts, limit, offset}` |
 | `GET /api/admin/accounts/:id` | `admin::get_account` | Read-only: `status`, `is_operator`, `created_at`, `balance_idr`, live session count, live key count. Never a credential hash |
 | `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'`; **revokes sessions and keys atomically**; one `admin_audit` row in the same transaction |
 | `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; audits it; does not restore keys |
@@ -509,7 +510,18 @@ session cookie and every guard is enforced here, server-side.
 neither is deprecated. Pick either.
 
 **Response shape.** The read-only route returns
-`{account_id, status, is_operator, created_at, balance_idr, live_sessions, live_keys}`.
+`{account_id, status, is_operator, created_at, balance_idr, live_sessions, live_keys}`,
+and the listing returns the same fields per row inside `accounts`.
+
+**The listing exists because lookup-by-id requires knowing a UUID.** It is the
+index the single-account routes assume. `q` is matched case-insensitively
+against the account id and the PocketBase id — **not email**, which lives in the
+identity provider and must not be duplicated here. `%` and `_` in `q` are
+escaped with an explicit `ESCAPE` clause, so a literal percent sign searches for
+that sign rather than matching every row. An unknown `status` value matches
+nothing rather than erroring: an empty page is a normal answer, not a bad
+request. `limit` is clamped to 1–100 and `offset` to ≥ 0, and both are echoed so
+a client can page deterministically.
 Suspend/resume return
 `{account_id, status, sessions_revoked, keys_revoked}`; resume reports both counts
 as `0` explicitly, so the caller can see that nothing was handed back.

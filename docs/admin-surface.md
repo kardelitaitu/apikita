@@ -25,12 +25,13 @@ writes** — the platform does not refund (see
 
 ## What exists today
 
-**Four admin routes are implemented** (`server/src/routes/admin.rs`, mounted in
+**Five admin routes are implemented** (`server/src/routes/admin.rs`, mounted in
 `server/src/routes/mod.rs`). Everything else in this document is **planned, not
 built** — the status of each item is marked where it appears.
 
 | Route | Handler | Effect |
 | --- | --- | --- |
+| `GET /api/admin/accounts` | `admin::list_accounts` | Bounded listing with `q`/`status` filters. Same fields as the single view, per row. Never a credential |
 | `GET /api/admin/accounts/:id` | `admin::get_account` | Read-only: `status`, `is_operator`, `created_at`, `balance_idr`, live session count, live key count |
 | `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'` + revoke every live session and API key, in one transaction |
 | `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; does not restore credentials |
@@ -42,9 +43,19 @@ built** — the status of each item is marked where it appears.
 reason about.
 
 **The admin UI now exists** at `website/src/pages/admin/index.astro` — the
-operator console (`/admin`). It is the front end for exactly the three routes
-above: look up an account by id, read its state, and suspend or resume it. The
-launch checklist's "Read-only + suspend" is now satisfied end to end, API and UI.
+operator console (`/admin`). It is the front end for the routes above: browse and
+filter the account list, look up an account by id, read its state, and suspend or
+resume it. The launch checklist's "Read-only + suspend" is satisfied end to end,
+API and UI.
+
+**Why the listing was added.** The single-account route requires the caller to
+already know a UUID, so before the listing an operator had no way to *find* an
+account — the console worked only for ids captured elsewhere. The listing is the
+index the lookup route assumes. It deliberately does **not** search by email:
+email lives in the identity provider, and the admin surface must not become a
+second identity store. The self-action rule does **not** apply to reading the
+list (reading is not acting, and hiding the operator's own row would miscount
+their inventory); it still applies to every action.
 
 The UI adds **no capability**: it calls the same routes with the same session
 cookie, and every rule below (operator flag, self-action refusal, 401/403/409)
