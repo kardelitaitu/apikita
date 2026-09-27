@@ -217,6 +217,46 @@ the spend limit and the invoice impossible to reconcile.
 Keyed by `(account_id, api_key_id, day)` so a per-key spend limit is computable
 without scanning raw events.
 
+## usage_events — per-request detail
+
+**Added by the SQLite port** ([plans/sqlite-migration.md](../plans/sqlite-migration.md)
+§4.4) and the answer to the "keep raw usage events?" question in §Open items. The
+dashboard's recent-requests feed needs per-request rows with a model and a
+timestamp; `usage_daily` is daily-granular and carries no model, so it **cannot**
+serve that view.
+
+```sql
+CREATE TABLE usage_events (
+  id                TEXT PRIMARY KEY,
+  account_id        TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  api_key_id        TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
+  model             TEXT NOT NULL,
+  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens     INTEGER NOT NULL DEFAULT 0,
+  cost_idr          INTEGER NOT NULL DEFAULT 0,
+  ref               TEXT,
+  created_at        TEXT NOT NULL
+);
+CREATE INDEX usage_events_account_idx ON usage_events (account_id, created_at DESC);
+```
+
+The three counters are separate here too — the same rule as `usage_daily`. **No
+prompt or completion text is ever stored**, which is what keeps the table inside
+Launch Gate 4's "zero prompt/completion logging".
+
+**Written in the SAME transaction as the `usage_daily` upsert** (`record_usage`
+in `server/src/db.rs`), so the detail and the aggregate can never disagree: a
+separate transaction could commit one while the other rolled back. The row is
+appended on every settlement path, including the partial one, so a request that
+was delivered is recorded even when the wallet could not cover its full cost.
+
+**Retention is 90 days** ([data-retention.md](../data-retention.md)) — it must
+outlast the 30-day spend window plus a dispute window. The purge job is **not yet
+built**; that document records the gap rather than implying it is enforced.
+`api_key_id` is `ON DELETE SET NULL`, deliberately: the table **is** the history,
+so a deleted key must not erase the requests it made.
+
 ## link_codes
 
 Telegram binding.
@@ -531,6 +571,6 @@ current forms are in the migration SQL, and the reasons are in
 
 - [x] Migration tooling: **sqlx migrate** — [`docs/decisions.md`](../decisions.md).
 - [x] Session lifetime: **30d absolute / 7d idle** — [`docs/decisions.md`](../decisions.md).
-- [ ] Whether to keep raw usage events alongside `usage_daily`.
+- [x] Whether to keep raw usage events alongside `usage_daily`. **Yes — `usage_events`.** Settled in [plans/sqlite-migration.md](../plans/sqlite-migration.md) §4.4 and now populated by the settlement transaction (`server/src/db.rs`, `record_usage`) and read by `GET /api/usage/recent` for the dashboard's recent-requests feed. Retention: **90 days** ([data-retention.md](../data-retention.md)). `usage_daily` stays the aggregate the spend window and reconciliation read; the raw events exist for per-request display only.
 - [ ] Retention for `sessions` and `ledger` (ledger: keep forever).
 - [ ] Reconciliation job: schedule and where alerts go.
