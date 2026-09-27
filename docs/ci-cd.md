@@ -255,9 +255,11 @@ cd server && cargo llvm-cov --lib --lcov --output-path coverage/lcov.info
 
 | Metric | Value |
 | --- | --- |
-| Total line coverage | **95.20%** (14,348 / 15,071) |
-| `money.rs`, `error.rs` | **100%** |
-| Files below 90% | `routes/events.rs` 86.2%, `routes/admin.rs` 86.6%, `routes/proxy.rs` 89.9% |
+| Total line coverage | **95.48%** (14,522 / 15,209) |
+| `money.rs`, `error.rs`, `config.rs` | 100% / 100% / 97.5% |
+| `routes/auth.rs` | 98.2% (was 58.6%) |
+| `routes/proxy.rs` | 91.8% (was 89.9%) |
+| Files still below 90% | `routes/events.rs` 86.2%, `routes/admin.rs` 86.6% |
 
 **The lesson from the first measurement, kept because it is the argument for
 measuring at all:** `routes/auth.rs` was at **58.6%**, by far the worst in the
@@ -266,7 +268,16 @@ flagged it — the file looked like every other file, the suite was green, and t
 only test that touched the handler was `#[ignore]`d behind a live PocketBase. It
 is now at **98.2%** via a loopback stub, with the ignore removed.
 
-**The three files still below 90% are the honest worklist**, in that order.
+**The second measurement made the same point again, in a different file.** Reading
+the uncovered *ranges* rather than the percentages showed `routes/proxy.rs`'s
+remaining gap was not scaffolding: `MeteredStream` — the wrapper that decides
+whether a customer is **billed** and whether a key is **cooled down** — was
+entirely uncovered, including the client-hangup path whose own comment records
+that dropping the body unread "is exactly the defect this is fixing". That fix had
+no test. It does now, along with the usage-tail cap, which is `91.8%` and rising.
+
+**The two files still below 90% are the honest worklist**, in that order:
+`routes/events.rs` (the SSE resume/backpressure stream) and `routes/admin.rs`.
 
 
 ## Rollback
