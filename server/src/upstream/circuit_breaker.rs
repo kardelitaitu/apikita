@@ -440,4 +440,42 @@ mod tests {
         advance(&b, 1);
         assert!(b.allow_request(), "the cooldown is capped at 900s");
     }
+
+    #[test]
+    fn a_stale_failure_report_does_not_extend_an_already_open_breaker() {
+        let b = CircuitBreaker::new(cfg());
+        trip(&b);
+
+        // A request admitted BEFORE the trip reports its failure now. The
+        // breaker is already Open, so the report must change nothing: without
+        // that guard every in-flight straggler would re-enter the cooldown
+        // math and keep pushing the trial further out, indefinitely.
+        b.record_failure();
+        assert_eq!(b.state(), BreakerState::Open);
+        assert_cooldown_is(b.remaining_cooldown(), 30);
+
+        advance(&b, 30);
+        assert!(
+            b.allow_request(),
+            "the stale report must not have pushed the trial further out"
+        );
+    }
+
+    #[test]
+    fn a_multiplier_of_one_or_less_disables_the_backoff() {
+        let mut config = cfg();
+        config.cooldown_multiplier = 1.0;
+        let b = CircuitBreaker::new(config);
+        trip(&b);
+
+        advance(&b, 30);
+        assert!(b.allow_request());
+        b.record_failure();
+        assert_eq!(b.state(), BreakerState::Open);
+
+        // multiplier 1.0: the failed HalfOpen trial re-opens at the SAME 30s
+        // cooldown instead of doubling - the documented "backoff disabled"
+        // behaviour, not a silent 30 -> 60.
+        assert_cooldown_is(b.remaining_cooldown(), 30);
+    }
 }

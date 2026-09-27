@@ -363,4 +363,26 @@ mod tests {
         assert_eq!(attempts, 1, "only one key exists, so retries stop after it");
         assert!(pool.acquire().is_none());
     }
+
+    #[test]
+    fn a_double_release_cannot_wrap_the_lease_counter() {
+        // The guard exists for the by-contract-impossible case: releasing a
+        // lease the pool never handed out. The counter must saturate at zero,
+        // not wrap to usize::MAX - a wrapped count would make the key look
+        // infinitely loaded for the rest of the process's life.
+        let slot = KeySlot::new("key-x".to_string());
+        assert_eq!(slot.in_flight.load(Ordering::Relaxed), 0);
+
+        slot.release();
+        assert_eq!(
+            slot.in_flight.load(Ordering::Relaxed),
+            0,
+            "a release from zero must not wrap the counter"
+        );
+
+        // A normal release still subtracts afterwards.
+        slot.in_flight.fetch_add(2, Ordering::Relaxed);
+        slot.release();
+        assert_eq!(slot.in_flight.load(Ordering::Relaxed), 1);
+    }
 }
