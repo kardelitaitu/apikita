@@ -36,42 +36,50 @@
 #               failed, 5 = stranded hold, 6 = no such database file.
 #               There is no `|| true` anywhere near it.
 #
-#   ip-purge    NOT WIRED IN THIS TOPOLOGY. server/src/bin/ip-purge.rs is a Rust
-#               binary that reaches the database through sqlx. server/ has no
-#               Dockerfile and docker-compose.yml has no Rust build stage, so no
-#               image in this file can contain it. This service does not pretend
-#               otherwise: it says NOT WIRED at startup and never claims to have
-#               run it. The retention WINDOW is still enforced (see above); it is
-#               the BINARY that does not run here.
+#   ip-purge    THE BINARY IS NOT WIRED; ITS WORK IS. server/src/bin/ip-purge.rs
+#               reaches the database through sqlx. server/Dockerfile exists (W17)
+#               but ships only `apikita-server` and `migrate`, so no image in THIS
+#               container has the binary. The retention WINDOW is still enforced -
+#               `run_retention` applies the same two DELETEs through sqlite3 - so
+#               the promise is kept; it is the binary that does not run here.
 #
-#   hold-sweep  NOT WIRED, same reason (server/src/bin/hold-sweep.rs). Nothing
-#               sweeps stranded reservation holds in this topology. That matters:
-#               a stranded hold is invisible money - the ledger still balances
-#               and reconciliation returns nothing - which is exactly why the
-#               900s bound exists. This gap is loud, not silent.
+#   usage-purge THE BINARY IS NOT WIRED; ITS WORK IS. Same shape as ip-purge:
+#               server/src/bin/usage-purge.rs, not shipped in the server image.
+#               `run_retention` now applies all THREE of its deletes -
+#               usage_events (90d), usage_daily (730d) and expired/revoked
+#               sessions (30d) - through sqlite3, so
+#               docs/data-retention.md is enforced here.
 #
-# Run the two Rust jobs on the HOST, on the same nightly cadence, until a server
-# image exists:
+#   hold-sweep  NOT WIRED, and NOT covered by an inline equivalent. Nothing sweeps
+#               stranded reservation holds in this topology. That matters: a
+#               stranded hold is invisible money - the ledger still balances and
+#               reconciliation returns nothing - which is exactly why the 900s
+#               bound exists. This gap is LOUD, not silent: the banner below names
+#               it on every start.
+#
+# Run the three Rust jobs on the HOST, on the same nightly cadence, until they are
+# wired into a scheduled container. Their WORK is already done in-container for
+# ip-purge and usage-purge (see run_retention); hold-sweep has no equivalent yet,
+# so it must run on the host:
 #
 #   DATABASE_URL='sqlite://data/server.db' cargo run --manifest-path server/Cargo.toml --bin ip-purge
+#   DATABASE_URL='sqlite://data/server.db' cargo run --manifest-path server/Cargo.toml --bin usage-purge
 #   DATABASE_URL='sqlite://data/server.db' cargo run --manifest-path server/Cargo.toml --bin hold-sweep
 #
 # -----------------------------------------------------------------------------
-# NOT YET PORTED, AND OUTSIDE THIS FILE: the compose service that runs this script.
+# THE COMPOSE SERVICE THAT RUNS THIS SCRIPT - PORTED.
 #
-# docker-compose.yml's `scheduler` service is still `image: postgres:16` and still
-# sets postgres:// DSNs for DATABASE_URL and RECONCILE_DATABASE_URL. It was kept for
-# its psql client, and there is no Postgres any more. Two things must change there,
-# and neither is this script's to change:
+# docker-compose.yml's `scheduler` service now builds from
+# `.docker/maintenance/Dockerfile` (the one-reason sqlite3 image) and mounts the
+# API's data directory, so the container opens the SAME file the API writes. It
+# sets sqlite:// DSNs for DATABASE_URL and RECONCILE_DATABASE_URL. This replaced
+# the earlier `image: postgres:16` service; there is no Postgres any more, and
+# psql could never have opened a SQLite file. The host run in docker-compose.yml
+# is the authoritative one - this note only records that the port happened.
 #
-#   1. the image must stop being postgres:16 and must gain a sqlite3 binary;
-#   2. both DSNs must become sqlite:// URLs, and the API's data directory must be
-#      mounted, or the container cannot see the database file at all.
-#
-# Until that happens the nightly run FAILS LOUDLY - which is the point. This script
-# refuses a non-SQLite URL by name (exit 2 from the job, reported as a failure) and
-# refuses to run at all if sqlite3 is absent, rather than reporting a clean sheet
-# against a database it never opened. The banner below says so on every start.
+# The script still refuses loudly rather than reporting a clean sheet: a non-SQLite
+# URL by name, a missing sqlite3, or a database file it cannot see all FAIL the
+# job, and the banner below says what is wired on every start.
 # -----------------------------------------------------------------------------
 #
 # NO SIMULATED WORK. Every job this service does not run is announced as NOT
@@ -139,13 +147,14 @@ banner() {
     if have_sqlite3; then
         log "CLIENT    sqlite3 $(sqlite3 --version 2>/dev/null | cut -d' ' -f1-2) on PATH"
     else
-        log "CLIENT    sqlite3 IS NOT INSTALLED IN THIS IMAGE. Every database job below will FAIL, loudly, rather than report a clean sheet against a database it never opened. The scheduler image must stop being postgres:16 and must provide a sqlite3 binary - docker-compose.yml is still unported and is NOT this script's to change."
+        log "CLIENT    sqlite3 IS NOT INSTALLED IN THIS IMAGE. Every database job below will FAIL, loudly, rather than report a clean sheet against a database it never opened. The scheduler image (`.docker/maintenance/Dockerfile`) must provide a sqlite3 binary."
     fi
-    log "WIRED     retention  - IP-tracking retention sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md retention promise)"
+    log "WIRED     retention  - age-based sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md); usage_events > 90d, usage_daily > 730d, expired/revoked sessions > 30d (docs/data-retention.md)"
     log "WIRED     reconcile  - tools/reconcile/reconcile.sh, exit code preserved (1=drift 2=no DATABASE_URL 3=no sqlite3 4=sqlite3 failed 5=stranded hold 6=no such database file)"
-    log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary and no server image exists in this compose file; it does NOT run here. The retention window above is still enforced."
-    log "NOT WIRED hold-sweep - server/src/bin/hold-sweep.rs is a Rust binary and no server image exists in this compose file; it does NOT run here. Nothing sweeps stranded holds in this topology."
-    log "NOT WIRED ip-purge/hold-sweep are report-only gaps, not silent ones. Run them on the host on the same cadence: DATABASE_URL=... cargo run --manifest-path server/Cargo.toml --bin ip-purge (or --bin hold-sweep)"
+    log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary NOT shipped in the server image; it does NOT run here. Its retention window IS enforced inline (see retention above)."
+    log "NOT WIRED usage-purge - server/src/bin/usage-purge.rs, same: not shipped, does NOT run here. Its three sweeps ARE enforced inline (see retention above)."
+    log "NOT WIRED hold-sweep - server/src/bin/hold-sweep.rs is a Rust binary NOT shipped in the server image; it does NOT run here, and nothing inline replaces it. Nothing sweeps stranded holds in this topology."
+    log "NOT WIRED these three are report-only gaps, not silent ones. Run them on the host on the same cadence: DATABASE_URL=... cargo run --manifest-path server/Cargo.toml --bin ip-purge (or --bin usage-purge, --bin hold-sweep)"
     log "DATABASE_URL=${DATABASE_URL:-<unset>}"
     log "RECONCILE_DATABASE_URL=${RECONCILE_DATABASE_URL:-<unset>}"
     if [ -n "${DATABASE_URL:-}" ]; then
@@ -159,14 +168,38 @@ banner() {
 }
 
 # -----------------------------------------------------------------------------
-# Job 1 - retention. The runnable form of the ip-purge binary's SQL.
+# Job 1 - retention. The runnable form of the ip-purge binary's SQL, plus the
+# age-based sweep `usage-purge` performs.
 # -----------------------------------------------------------------------------
 # $1 = table, $2 = days retained. -bail makes a SQL failure a non-zero exit
 # instead of a silent zero-row success, and `SELECT changes()` returns the deleted
-# count in the same round trip - the same two counts the Rust binary logs.
+# count in the same round trip - the same counts the Rust binaries log.
+#
+# `day` is a DATE column ('YYYY-MM-DD' TEXT), so the cutoff is
+# `date('now', '-N days')` - an ISO string comparison, which the schema's GLOB
+# check guarantees. `date('now')` is UTC, matching the Rust binaries.
 retention_delete() {
     sqlite3 -bail -noheader -separator '|' "$1" \
         "DELETE FROM $2 WHERE day <= date('now', '-$3 days'); SELECT changes();" 2>"$SQL_ERR"
+}
+
+# The same sweep for a table whose age column is a full RFC3339 TIMESTAMP
+# (`usage_events.created_at`, `sessions`), not a DATE.
+#
+# THIS IS NOT THE SAME QUERY, and using the date form would silently fail: a bare
+# 'YYYY-MM-DD' cutoff compares as a STRING against 'YYYY-MM-DDTHH:MM:SS+00:00', and
+# the shorter string sorts FIRST - the DELETE would match nothing and rows would
+# survive forever, which is a retention failure in the direction that KEEPS data.
+# So the cutoff is a datetime and the comparison is on the full instant. This
+# mirrors server/src/db.rs `purge_expired_usage`, which binds an instant for the
+# same reason.
+#
+# `$4` is a full SQL predicate on the timestamp column, so the sessions case can
+# express its extra rule (a session is swept from the instant it STOPPED being
+# usable - `revoked_at` when logged out early, else `expires_at`).
+retention_delete_instant() {
+    sqlite3 -bail -noheader -separator '|' "$1" \
+        "DELETE FROM $2 WHERE $3 <= datetime('now', '-$4 days'); SELECT changes();" 2>"$SQL_ERR"
 }
 
 run_retention() {
@@ -199,12 +232,33 @@ run_retention() {
         [ -s "$SQL_ERR" ] && while IFS= read -r l; do log "job retention:   $l"; done < "$SQL_ERR"
         return 1
     }
+    # --- The age-based tables, mirroring server/src/bin/usage-purge.rs --------
+    # usage_daily.day is a DATE; usage_events.created_at and sessions.* are
+    # TIMESTAMPs, so they use the instant helper.
+    usage_daily=$(retention_delete "$DB_FILE" usage_daily 730) || {
+        log "job retention: FAILED - the usage_daily delete did not run (sqlite3 error above)"
+        return 1
+    }
+    usage_events=$(retention_delete_instant "$DB_FILE" usage_events created_at 90) || {
+        log "job retention: FAILED - the usage_events delete did not run (sqlite3 error above)"
+        return 1
+    }
+    # A session is swept from the instant it stopped being usable: revoked_at for
+    # an early logout, else expires_at. COALESCE picks whichever governs.
+    sessions=$(retention_delete_instant "$DB_FILE" sessions "COALESCE(revoked_at, expires_at)" 30) || {
+        log "job retention: FAILED - the sessions delete did not run (sqlite3 error above)"
+        return 1
+    }
+
     # A blank count is not a zero count: `SELECT changes()` always returns a row, so
     # anything non-numeric means the delete did not do what this job claims.
     case "$seen" in ''|*[!0-9]*) log "job retention: FAILED - key_ip_seen returned '$seen', not a count"; return 1 ;; esac
     case "$daily" in ''|*[!0-9]*) log "job retention: FAILED - key_ip_daily returned '$daily', not a count"; return 1 ;; esac
+    case "$usage_daily" in ''|*[!0-9]*) log "job retention: FAILED - usage_daily returned '$usage_daily', not a count"; return 1 ;; esac
+    case "$usage_events" in ''|*[!0-9]*) log "job retention: FAILED - usage_events returned '$usage_events', not a count"; return 1 ;; esac
+    case "$sessions" in ''|*[!0-9]*) log "job retention: FAILED - sessions returned '$sessions', not a count"; return 1 ;; esac
 
-    log "job retention: OK - key_ip_seen deleted=$seen (retain 7d), key_ip_daily deleted=$daily (retain 90d)"
+    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d)"
     return 0
 }
 

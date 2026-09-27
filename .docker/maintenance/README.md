@@ -76,26 +76,35 @@ for the service itself to commit it.
 
 | Job | Status | Why it cannot run here |
 | --- | --- | --- |
-| **`ip-purge`** | **NOT WIRED** | `server/src/bin/ip-purge.rs` is a **Rust binary**. `server/` has no Dockerfile and `docker-compose.yml` has no Rust build stage, so no image in this compose file can contain it. The **retention window is still enforced** (see above); it is the *binary* that does not run here. |
-| **`hold-sweep`** | **NOT WIRED** | `server/src/bin/hold-sweep.rs`, same reason. **Nothing sweeps stranded reservation holds in this topology.** This one matters most: a stranded hold is **invisible money** - the ledger still balances and reconciliation returns *nothing* - which is exactly why a detector with a 900s bound was written. The gap is loud, not silent. |
+| **`ip-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/ip-purge.rs` is a **Rust binary**. A server image **does** exist (`server/Dockerfile`), but it ships only `apikita-server` and `migrate`, so no image in *this* compose file contains it. The **retention window IS enforced** — `run_retention` applies the same two `DELETE`s through sqlite3. It is the *binary* that does not run here. |
+| **`usage-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/usage-purge.rs`, same shape. `run_retention` applies all three of its sweeps — `usage_events` (90d), `usage_daily` (730d), expired/revoked `sessions` (30d) — so `docs/data-retention.md` is enforced here. |
+| **`hold-sweep`** | **NOT WIRED** | `server/src/bin/hold-sweep.rs`, same shipping gap, and **no inline equivalent**: nothing sweeps stranded reservation holds in this topology. This one matters most: a stranded hold is **invisible money** - the ledger still balances and reconciliation returns *nothing* - which is exactly why a detector with a 900s bound was written. The gap is loud, not silent. |
 | **`benchmark`** | **NOT WIRED** | `server/src/bin/benchmark.rs`. Not a maintenance promise; it is a measurement tool and has no business running on a timer. |
 
-### The interim answer for the two Rust jobs: run them on the host
+### The interim answer for the Rust jobs: run them on the host
 
-Until a server image exists, run them on the **host**, on the same nightly cadence:
+The server image ships only `apikita-server` and `migrate`, so run these on the
+**host**, on the same nightly cadence:
 
 ```sh
 DATABASE_URL='sqlite://data/server.db' \
   cargo run --manifest-path server/Cargo.toml --bin ip-purge
 
 DATABASE_URL='sqlite://data/server.db' \
+  cargo run --manifest-path server/Cargo.toml --bin usage-purge
+
+DATABASE_URL='sqlite://data/server.db' \
   cargo run --manifest-path server/Cargo.toml --bin hold-sweep
 ```
 
-When a server image does exist, the honest change is to add a second service that
-runs `ip-purge` and `hold-sweep` from it - and to delete the `NOT WIRED` lines
-from the banner in the same commit, so the log never claims a wiring the compose
-file does not have.
+**Two of these three are already covered in-container.** `ip-purge` and
+`usage-purge` encode SQL the entrypoint applies itself, so their *retention
+promises* are kept here even though the binaries do not run. `hold-sweep` has no
+inline equivalent and is a genuine gap.
+
+The honest future change is to ship the three binaries in the server image and add
+a service that runs them - then delete the `NOT WIRED` lines from the banner in
+the **same commit**, so the log never claims a wiring the compose file lacks.
 
 ## The compose service that runs this script - PORTED
 
@@ -295,8 +304,9 @@ after**.
   that is a 24h wait, and the one-shot verbs exist precisely so the same jobs are
   testable without it. The loop itself (`next_run_epoch` + `sleep`) is unchanged by
   this port and unexercised here.
-- **The two Rust binaries.** `ip-purge` and `hold-sweep` are NOT WIRED, by
-  construction.
+- **The three Rust binaries.** `ip-purge`, `usage-purge` and `hold-sweep` are
+  BINARIES NOT WIRED, by construction. The first two have their work done inline
+  by `run_retention`; `hold-sweep` has no equivalent.
 - **`docker compose run scheduler once` on a host whose checkout has LF working-tree
   files.** The two script mounts (`entrypoint.sh`, `reconcile.sh`/`.sql`) are shell
   and SQL files executed **inside** the container. This machine's checkout has them
