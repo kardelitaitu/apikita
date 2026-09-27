@@ -254,14 +254,18 @@ branches, so the branch columns read 0/0):**
 
 | Metric | Value |
 | --- | --- |
-| Total line coverage | **95.94%** (14,697 / 15,319) |
+| Total line coverage | **96.26%** (14,693 / 15,264) |
 | `money.rs`, `error.rs`, `ip_tracking.rs` | 100% / 100% / 99.8% |
+| `routes/admin.rs` | 98.7% (was 86.6%) |
 | `routes/auth.rs` | 98.3% (was 58.6%) |
 | `routes/proxy.rs` | 91.8% (was 89.9%) |
 | Files still below 90% | `routes/events.rs` 86.2% |
+| `#[ignore]`d tests | **0** (was 2) |
 
 The two files that used to sit below 90% are now one: `routes/admin.rs` climbed to
-93.8%, leaving `routes/events.rs` alone.
+`98.7%`, leaving `routes/events.rs` alone. (An earlier revision of this table said
+93.8% for `admin.rs` — that measurement predated deleting the now-dead live-PocketBase
+fixtures, which were themselves the bulk of its uncovered lines.)
 
 **The lesson from the first measurement, kept because it is the argument for
 measuring at all:** `routes/auth.rs` was at **58.6%**, by far the worst in the
