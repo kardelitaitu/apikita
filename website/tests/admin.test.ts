@@ -15,15 +15,21 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  accountListPath,
   accountPath,
+  actionableAccountIds,
   actionPath,
   adminErrorMessage,
   canResume,
   canSuspend,
   describeAction,
+  hasNextPage,
   isAccountId,
   isSelfAction,
+  listSummary,
   type AccountStatus,
+  type AdminAccountList,
+  type AdminAccountSummary,
 } from '../src/lib/admin.ts';
 
 const ALL_STATUSES: AccountStatus[] = ['active', 'suspended', 'closed'];
@@ -102,4 +108,76 @@ test('the self-action check is case-insensitive and trims the target', () => {
   assert.equal(isSelfAction(mine, mine.toUpperCase()), true);
   assert.equal(isSelfAction(mine, ` ${mine} `), true);
   assert.equal(isSelfAction(mine, '00000000-0000-0000-0000-000000000000'), false);
+});
+
+// --- The listing ------------------------------------------------------------
+
+const OP = '3f7c1a2e-9b64-4d0a-8f21-5c6e0b9d4a10';
+
+function summary(overrides: Partial<AdminAccountSummary> = {}): AdminAccountSummary {
+  return {
+    account_id: OP,
+    status: 'active',
+    is_operator: false,
+    created_at: '2026-01-01T00:00:00Z',
+    balance_idr: 0,
+    live_sessions: 0,
+    live_keys: 0,
+    ...overrides,
+  };
+}
+
+test('the listing path sends only the parameters that are set', () => {
+  // A blank search sends no q at all, not q=.
+  assert.equal(accountListPath(), `/api/admin/accounts?limit=25`);
+  assert.equal(accountListPath({ q: '   ' }), `/api/admin/accounts?limit=25`);
+  // A real filter is carried, trimmed.
+  assert.match(accountListPath({ q: '  abc  ' }), /q=abc/);
+  assert.match(accountListPath({ status: 'suspended' }), /status=suspended/);
+  // offset 0 is omitted; a positive offset is carried.
+  assert.doesNotMatch(accountListPath({ offset: 0 }), /offset/);
+  assert.match(accountListPath({ offset: 25 }), /offset=25/);
+  // A custom limit is honoured.
+  assert.match(accountListPath({ limit: 5 }), /limit=5/);
+});
+
+test('a filter value is URL-encoded, not spliced raw', () => {
+  // A percent sign must not reach the API as a bare wildcard-looking char in the
+  // query string; URLSearchParams encodes it.
+  const path = accountListPath({ q: '%' });
+  assert.match(path, /q=%25/);
+});
+
+test('the actionable ids exclude the operator but keep everyone else', () => {
+  const other = '00000000-0000-0000-0000-000000000001';
+  const ids = actionableAccountIds(
+    [summary({ account_id: OP }), summary({ account_id: other, is_operator: true })],
+    OP,
+  );
+  assert.equal(ids.has(OP), false, 'the operator must not be offered an action on themselves');
+  // Another operator IS listed; whether an action is possible is the status rule,
+  // which the caller applies separately. The id set only removes self.
+  assert.equal(ids.has(other), true);
+});
+
+test('the actionable-ids match is case-insensitive', () => {
+  const ids = actionableAccountIds([summary({ account_id: OP })], OP.toUpperCase());
+  assert.equal(ids.size, 0);
+});
+
+test('a full page reports a possible next page; a short one does not', () => {
+  const full: AdminAccountList = { accounts: Array.from({ length: 25 }, () => summary()), limit: 25, offset: 0 };
+  const short: AdminAccountList = { accounts: [summary()], limit: 25, offset: 0 };
+  const empty: AdminAccountList = { accounts: [], limit: 25, offset: 0 };
+  assert.equal(hasNextPage(full), true);
+  assert.equal(hasNextPage(short), false);
+  assert.equal(hasNextPage(empty), false);
+});
+
+test('the listing summary counts and flags more pages', () => {
+  assert.equal(listSummary({ accounts: [], limit: 25, offset: 0 }), 'No accounts match');
+  assert.equal(listSummary({ accounts: [summary()], limit: 25, offset: 0 }), '1 account');
+  const full: AdminAccountList = { accounts: Array.from({ length: 25 }, () => summary()), limit: 25, offset: 0 };
+  assert.match(listSummary(full), /25 accounts/);
+  assert.match(listSummary(full), /more available/);
 });

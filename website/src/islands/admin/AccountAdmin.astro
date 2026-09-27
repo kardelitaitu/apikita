@@ -25,6 +25,69 @@
 </div>
 
 <div id="admin-island" hidden class="mt-6">
+  <!-- Browse / search ------------------------------------------------------- -->
+  <section aria-labelledby="admin-browse-heading">
+    <h2 id="admin-browse-heading" class="text-lg font-semibold tracking-tight">Accounts</h2>
+    <p class="mt-1 text-sm text-ink-muted">
+      Browse every account, or filter by account id. There is no email search —
+      email lives in the identity provider, not here.
+    </p>
+
+    <form id="admin-filter" class="mt-4 flex flex-wrap items-end gap-3">
+      <div class="min-w-[18rem] flex-1">
+        <label for="admin-q" class="block text-sm font-medium">Filter</label>
+        <input id="admin-q" name="q" type="search" autocomplete="off" spellcheck="false"
+          placeholder="Account id, or leave blank for all"
+          class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 font-mono text-sm" />
+      </div>
+      <div>
+        <label for="admin-status-filter" class="block text-sm font-medium">Status</label>
+        <select id="admin-status-filter" name="status"
+          class="mt-1 rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm">
+          <option value="">Any</option>
+          <option value="active">Active</option>
+          <option value="suspended">Suspended</option>
+          <option value="closed">Closed</option>
+        </select>
+      </div>
+      <button id="admin-apply" type="submit"
+        class="rounded-md border border-edge-strong px-4 py-2 text-sm font-medium hover:border-brand">Apply</button>
+      <button id="admin-clear" type="button"
+        class="rounded-md px-3 py-2 text-sm text-ink-muted hover:text-brand">Clear</button>
+    </form>
+
+    <div id="admin-list-error" hidden role="alert"
+      class="mt-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
+
+    <p id="admin-list-status" class="mt-4 text-sm text-ink-muted" aria-live="polite">Loading accounts&hellip;</p>
+
+    <div id="admin-list-wrap" hidden class="mt-2 overflow-x-auto rounded-lg border border-edge">
+      <table class="w-full border-collapse text-left text-sm">
+        <thead>
+          <tr class="border-b border-edge-strong bg-surface-sunken">
+            <th scope="col" class="px-3 py-2 font-medium">Account id</th>
+            <th scope="col" class="px-3 py-2 font-medium">Status</th>
+            <th scope="col" class="px-3 py-2 text-right font-medium">Balance</th>
+            <th scope="col" class="px-3 py-2 text-right font-medium">Sessions</th>
+            <th scope="col" class="px-3 py-2 text-right font-medium">Keys</th>
+            <th scope="col" class="px-3 py-2 font-medium"></th>
+          </tr>
+        </thead>
+        <tbody id="admin-list-rows"></tbody>
+      </table>
+    </div>
+
+    <div class="mt-3 flex items-center justify-between gap-3">
+      <button id="admin-prev" type="button" hidden
+        class="rounded-md border border-edge-strong px-3 py-1.5 text-sm font-medium hover:border-brand">Previous</button>
+      <span></span>
+      <button id="admin-next" type="button" hidden
+        class="rounded-md border border-edge-strong px-3 py-1.5 text-sm font-medium hover:border-brand">Next</button>
+    </div>
+  </section>
+
+  <hr class="my-8 border-edge" />
+
   <!-- Lookup ---------------------------------------------------------------- -->
   <form id="admin-lookup" class="flex flex-wrap items-end gap-3">
     <div class="min-w-[22rem] flex-1">
@@ -114,19 +177,27 @@
   import { describeError } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
   import {
+    accountListPath,
     accountPath,
+    actionableAccountIds,
     actionPath,
     adminErrorMessage,
     canResume,
     canSuspend,
     describeAction,
+    hasNextPage,
     isAccountId,
+    listSummary,
     type AccountStatus,
     type AdminAccount,
+    type AdminAccountList,
+    type AdminAccountSummary,
     type AdminActionResult,
   } from '../../lib/admin';
 
   let current: AdminAccount | null = null;
+  /** The operator's own account id, from /api/me. Used to exclude self from actions. */
+  let operatorAccountId = '';
 
   // --- The operator gate ------------------------------------------------------
   // Read the operator flag from GET /api/me and reveal the console only for an
@@ -134,6 +205,7 @@
   // stops rendering the console for everyone else, so no 403 is ever provoked
   // by a person who was never an operator.
   interface Me {
+    account_id?: string;
     is_operator?: boolean;
   }
   const gate = document.getElementById('admin-gate') as HTMLElement;
@@ -144,8 +216,10 @@
     try {
       const me = await apiFetch<Me>('/api/me');
       if (me.is_operator === true) {
+        operatorAccountId = me.account_id ?? '';
         gate.hidden = true;
         islandRoot.hidden = false;
+        void loadList();
       } else {
         gateText.textContent = 'Operator access is required. This page is for operators only.';
       }
@@ -157,6 +231,163 @@
   void checkOperator();
 
   const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+
+  /** The page size both the console and the server default to. */
+  const ADMIN_PAGE = 25;
+
+  // --- Browse / search -------------------------------------------------------
+  // The listing. It exists because lookup-by-id alone requires the operator to
+  // already know a UUID, which is not "administering accounts". Every row here
+  // goes through the same server authorization as the single view; the client
+  // only decides what to render.
+  const filterForm = $<HTMLFormElement>('admin-filter');
+  const qInput = $<HTMLInputElement>('admin-q');
+  const statusFilter = $<HTMLSelectElement>('admin-status-filter');
+  const listError = $('admin-list-error');
+  const listStatus = $('admin-list-status');
+  const listWrap = $('admin-list-wrap');
+  const listRows = $('admin-list-rows');
+  const prevBtn = $<HTMLButtonElement>('admin-prev');
+  const nextBtn = $<HTMLButtonElement>('admin-next');
+
+  /** The current filter/page, the single source of truth for what is displayed. */
+  let query = { q: '', status: '', offset: 0 };
+  let lastList: AdminAccountList | null = null;
+
+  function statusBadge(status: AccountStatus): string {
+    switch (status) {
+      case 'active':
+        return 'border-ok-edge bg-ok-surface text-ok-ink';
+      case 'suspended':
+        return 'border-danger-edge bg-danger-surface text-danger-ink';
+      default:
+        return 'border-edge-strong bg-surface-sunken text-ink-muted';
+    }
+  }
+
+  function rowFor(account: AdminAccountSummary): HTMLTableRowElement {
+    const tr = document.createElement('tr');
+    tr.className = 'border-b border-edge last:border-0 hover:bg-surface-sunken';
+
+    const idCell = document.createElement('td');
+    idCell.className = 'px-3 py-2 font-mono text-xs';
+    idCell.textContent = account.account_id;
+    tr.append(idCell);
+
+    const statusCell = document.createElement('td');
+    statusCell.className = 'px-3 py-2';
+    const badge = document.createElement('span');
+    badge.className = `rounded border px-2 py-0.5 text-xs font-medium ${statusBadge(account.status)}`;
+    badge.textContent = account.status;
+    statusCell.append(badge);
+    if (account.is_operator) {
+      const opBadge = document.createElement('span');
+      opBadge.className = 'ml-1 rounded border border-warn-edge px-1.5 py-0.5 text-[0.65rem] font-medium uppercase text-warn';
+      opBadge.textContent = 'operator';
+      statusCell.append(opBadge);
+    }
+    tr.append(statusCell);
+
+    for (const [text, cls] of [
+      [formatIdr(account.balance_idr), 'px-3 py-2 text-right font-mono tabular-nums text-accent'],
+      [String(account.live_sessions), 'px-3 py-2 text-right font-mono tabular-nums'],
+      [String(account.live_keys), 'px-3 py-2 text-right font-mono tabular-nums'],
+    ] as [string, string][]) {
+      const td = document.createElement('td');
+      td.className = cls;
+      td.textContent = text;
+      tr.append(td);
+    }
+
+    // The action cell: view always; suspend/resume only when the state allows and
+    // it is not the operator's own row.
+    const actionCell = document.createElement('td');
+    actionCell.className = 'px-3 py-2 text-right whitespace-nowrap';
+    const actionable = actionableAccountIds([account], operatorAccountId).size > 0;
+
+    const viewBtn = document.createElement('button');
+    viewBtn.type = 'button';
+    viewBtn.className = 'text-xs font-medium text-brand hover:underline';
+    viewBtn.textContent = 'Open';
+    viewBtn.addEventListener('click', () => {
+      input.value = account.account_id;
+      void lookup(account.account_id);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+    actionCell.append(viewBtn);
+
+    if (actionable && canSuspend(account.status)) {
+      actionCell.append(quickAction('Suspend', account.account_id, 'suspend'));
+    } else if (actionable && canResume(account.status)) {
+      actionCell.append(quickAction('Resume', account.account_id, 'resume'));
+    }
+    tr.append(actionCell);
+    return tr;
+  }
+
+  function quickAction(label: string, id: string, action: 'suspend' | 'resume'): HTMLButtonElement {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ml-2 text-xs font-medium hover:underline';
+    btn.classList.add(action === 'suspend' ? 'text-danger' : 'text-ok');
+    btn.textContent = label;
+    btn.addEventListener('click', () => askConfirmFor(action, id));
+    return btn;
+  }
+
+  function renderList(list: AdminAccountList): void {
+    lastList = list;
+    listStatus.textContent = listSummary(list);
+    listRows.replaceChildren(...list.accounts.map(rowFor));
+
+    if (list.accounts.length === 0) {
+      listWrap.hidden = true;
+    } else {
+      listWrap.hidden = false;
+    }
+
+    prevBtn.hidden = list.offset <= 0;
+    nextBtn.hidden = !hasNextPage(list);
+  }
+
+  async function loadList(): Promise<void> {
+    listError.hidden = true;
+    listStatus.hidden = false;
+    listStatus.textContent = 'Loading accounts…';
+    try {
+      const list = await apiFetch<AdminAccountList>(
+        accountListPath({ q: query.q, status: query.status, offset: query.offset }),
+      );
+      renderList(list);
+    } catch (err) {
+      const status = (err as { status?: number }).status ?? 0;
+      listStatus.hidden = true;
+      listError.textContent = adminErrorMessage(status, describeError(err).message);
+      listError.hidden = false;
+    }
+  }
+
+  filterForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    query = { q: qInput.value.trim(), status: statusFilter.value, offset: 0 };
+    void loadList();
+  });
+
+  $('admin-clear').addEventListener('click', () => {
+    qInput.value = '';
+    statusFilter.value = '';
+    query = { q: '', status: '', offset: 0 };
+    void loadList();
+  });
+
+  prevBtn.addEventListener('click', () => {
+    query = { ...query, offset: Math.max(0, query.offset - ADMIN_PAGE) };
+    void loadList();
+  });
+  nextBtn.addEventListener('click', () => {
+    query = { ...query, offset: query.offset + ADMIN_PAGE };
+    void loadList();
+  });
 
   const form = $<HTMLFormElement>('admin-lookup');
   const input = $<HTMLInputElement>('admin-account-id');
@@ -266,14 +497,22 @@
   });
 
   // --- The confirmation flow ------------------------------------------------
+  // ONE flow for both entry points: the detail pane's buttons and the row buttons
+  // in the listing. The row buttons pass their own id, so the confirmation
+  // always names the account it is about to change rather than trusting the
+  // detail pane to still be showing the right one.
   let pending: { action: 'suspend' | 'resume'; id: string } | null = null;
 
-  function askConfirm(action: 'suspend' | 'resume'): void {
-    if (!current) return;
-    pending = { action, id: current.account_id };
+  function askConfirmFor(action: 'suspend' | 'resume', id: string): void {
+    pending = { action, id };
     confirmTitle.textContent = action === 'suspend' ? 'Suspend this account?' : 'Resume this account?';
     confirmBody.textContent = describeAction(action);
     confirmBox.hidden = false;
+  }
+
+  function askConfirm(action: 'suspend' | 'resume'): void {
+    if (!current) return;
+    askConfirmFor(action, current.account_id);
   }
 
   suspendBtn.addEventListener('click', () => askConfirm('suspend'));
@@ -301,7 +540,10 @@
         ? `Account suspended. Revoked ${outcome.sessions_revoked} session(s) and ${outcome.keys_revoked} key(s).`
         : 'Account resumed. The customer must sign in again and create a new key.';
       doneBox.hidden = false;
-      await lookup(id);
+      // Refresh both views: the detail pane (if it is showing this account) and
+      // the listing row, so the two cannot disagree about the account's state.
+      if (current?.account_id === id) await lookup(id);
+      await loadList();
     } catch (err) {
       const status = (err as { status?: number }).status ?? 0;
       showNotice(err, adminErrorMessage(status, describeError(err).message));

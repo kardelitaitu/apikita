@@ -145,3 +145,89 @@ export function adminErrorMessage(status: number, fallback: string): string {
 export function isSelfAction(operatorAccountId: string, targetAccountId: string): boolean {
   return operatorAccountId.toLowerCase() === targetAccountId.trim().toLowerCase();
 }
+
+/** One row of `GET /api/admin/accounts`. Same fields as the single view. */
+export interface AdminAccountSummary {
+  account_id: string;
+  status: AccountStatus;
+  is_operator: boolean;
+  created_at: string;
+  balance_idr: number;
+  live_sessions: number;
+  live_keys: number;
+}
+
+/** The listing page the server returns from `GET /api/admin/accounts`. */
+export interface AdminAccountList {
+  accounts: AdminAccountSummary[];
+  limit: number;
+  offset: number;
+}
+
+/** The page size the console requests; matches the server's default. */
+export const ADMIN_LIST_LIMIT = 25;
+
+/**
+ * The listing URL for a filter, with the page parameters the API expects.
+ *
+ * Only non-empty values are sent, so the request the operator makes is the one
+ * they can read in the address bar: a blank search box sends no `q` at all,
+ * rather than `q=` which the server would have to treat as absent anyway.
+ */
+export function accountListPath(
+  filter: { q?: string; status?: string; offset?: number; limit?: number } = {},
+): string {
+  const params = new URLSearchParams();
+  const q = filter.q?.trim();
+  if (q) params.set('q', q);
+  const status = filter.status?.trim();
+  if (status) params.set('status', status);
+  params.set('limit', String(filter.limit ?? ADMIN_LIST_LIMIT));
+  if (filter.offset && filter.offset > 0) params.set('offset', String(filter.offset));
+  return `/api/admin/accounts?${params.toString()}`;
+}
+
+/**
+ * The account ids in a listing that the operator may act on.
+ *
+ * This exists so the console never offers a control the server will refuse. Two
+ * exclusions, both server-enforced and both explained in the UI:
+ *
+ * 1. **The operator's own account** — `refuse_self_action` refuses it, and the
+ *    operator's own balance/keys are visible on their own dashboard anyway.
+ * 2. Nothing else. Suspend/resume eligibility is a function of the row's
+ *    `status` (see `canSuspend`/`canResume`), which the row itself carries.
+ *
+ * Returning a Set keeps the caller's lookup O(1) per row when rendering a page.
+ */
+export function actionableAccountIds(
+  accounts: readonly AdminAccountSummary[],
+  operatorAccountId: string,
+): Set<string> {
+  const mine = operatorAccountId.trim().toLowerCase();
+  return new Set(
+    accounts
+      .filter((a) => a.account_id.toLowerCase() !== mine)
+      .map((a) => a.account_id),
+  );
+}
+
+/**
+ * Whether there is a next page, given the page the server returned.
+ *
+ * A full page MAY have more after it, so this is deliberately optimistic: it
+ * returns true only when the page came back full to its own limit. A short page
+ * is provably the last one, so "Next" is hidden rather than shown and then
+ * leading to an empty screen.
+ */
+export function hasNextPage(list: AdminAccountList): boolean {
+  return list.accounts.length >= list.limit;
+}
+
+/** A human count for the listing heading. */
+export function listSummary(list: AdminAccountList): string {
+  const n = list.accounts.length;
+  const noun = n === 1 ? 'account' : 'accounts';
+  if (n === 0) return 'No accounts match';
+  return `${n} ${noun}${hasNextPage(list) ? ' (more available)' : ''}`;
+}
