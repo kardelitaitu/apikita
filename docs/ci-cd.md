@@ -254,18 +254,42 @@ branches, so the branch columns read 0/0):**
 
 | Metric | Value |
 | --- | --- |
-| Total line coverage | **96.26%** (14,693 / 15,264) |
-| `money.rs`, `error.rs`, `ip_tracking.rs` | 100% / 100% / 99.8% |
+| Total line coverage | **96.64%** (14,926 / 15,445) |
+| `money.rs`, `error.rs` | 100% |
+| `ip_tracking.rs` | 99.8% |
 | `routes/admin.rs` | 98.7% (was 86.6%) |
 | `routes/auth.rs` | 98.3% (was 58.6%) |
-| `routes/proxy.rs` | 91.8% (was 89.9%) |
-| Files still below 90% | `routes/events.rs` 86.2% |
+| `routes/events.rs` | **98.1%** (was 86.2%) |
+| `routes/proxy.rs` | 91.8% (was 89.9%) — now the LOWEST in the crate |
+| **Files below 90%** | **NONE** (was 4) |
 | `#[ignore]`d tests | **0** (was 2) |
 
-The two files that used to sit below 90% are now one: `routes/admin.rs` climbed to
-`98.7%`, leaving `routes/events.rs` alone. (An earlier revision of this table said
-93.8% for `admin.rs` — that measurement predated deleting the now-dead live-PocketBase
-fixtures, which were themselves the bulk of its uncovered lines.)
+**Every file is above 90%, and the lowest is 91.8%.** That is the end of the
+worklist this section opened with — and it is worth recording how it got there,
+because none of the four initial offenders was found by looking at a number.
+
+The starting set was `auth.rs` 58.6%, `events.rs` 86.2%, `admin.rs` 86.6% and
+`proxy.rs` 89.9%. What each measurement actually revealed:
+
+- **`auth.rs`** — the *entire* `exchange_token` handler was uncovered, hidden behind
+  an `#[ignore]`d live-PocketBase test. Nothing flagged it: the file looked like
+  every other file. Now 98.3% via a loopback stub, with the ignore gone.
+- **`proxy.rs`** — not scaffolding but `MeteredStream`, the wrapper that decides
+  whether a customer is **billed** and whether a key is **cooled down**, including a
+  client-hangup path whose own comment records that dropping the body unread "is
+  exactly the defect this is fixing". That fix had no test.
+- **`admin.rs`** — test scaffolding for the crate's **last `#[ignore]`**, which
+  proved a suspended account cannot log back in. A security assertion that had never
+  once run in CI.
+- **`events.rs`** — the whole `sse_events_handler`: the connection cap, the replay
+  vs snapshot choice, the stream deadline, and cross-account isolation on **both**
+  the live and replay paths.
+
+**The method, stated once so it is reusable: read the uncovered RANGES, not the
+percentages.** A percentage tells you a file is worth opening; only the ranges tell
+you whether the gap is in logic that matters or in test scaffolding. Every one of
+the four above turned out to be the former, and every one was described in the
+source comment as load-bearing.
 
 **The lesson from the first measurement, kept because it is the argument for
 measuring at all:** `routes/auth.rs` was at **58.6%**, by far the worst in the
@@ -282,9 +306,11 @@ entirely uncovered, including the client-hangup path whose own comment records
 that dropping the body unread "is exactly the defect this is fixing". That fix had
 no test. It does now, along with the usage-tail cap, which is `91.8%` and rising.
 
-**The one file still below 90% is the honest worklist**: `routes/events.rs`
-(the SSE resume/backpressure stream) at 86.2%. `routes/admin.rs` crossed the line
-at 93.8% and dropped off it.
+**What replaces the worklist.** There is no file left to point at, so the
+remaining gap is of a different kind and worth naming honestly: this toolchain does
+not instrument BRANCHES (the lcov branch columns read 0/0), so a well-covered line
+can still hide an untaken arm. The next useful measurement is a branch-capable
+coverage run, not another hunt for a low percentage.
 
 
 ## Rollback
