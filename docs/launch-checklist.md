@@ -144,22 +144,60 @@ opinion.
 **Each of these is a statement made to customers. If the code contradicts it, the
 statement is false.**
 
-- [ ] Prompts and completions are never logged, stored, or sent to analytics.
-- [ ] No raw IP address is persisted; only a salted hash, salt deleted daily.
-- [ ] API keys stored as hashes only; the plaintext exists once, at creation.
-- [ ] Session tokens stored hashed; cookies are HttpOnly, Secure, SameSite.
-- [ ] `PUBLIC_*` variables contain nothing secret.
-- [ ] Backup encryption keys are held separately from the backups.
+- [x] Prompts and completions are never logged, stored, or sent to analytics.
+      **Enforced by a test**, not a review: `a_customer_prompt_never_reaches_the_log`
+      (`server/src/routes/proxy.rs`) drives a real request carrying a sentinel prompt
+      through the handler with a capturing subscriber installed at TRACE and asserts the
+      sentinel never appears, with a positive control so silence cannot pass.
+- [x] No raw IP address is persisted; only a salted hash, salt deleted daily.
+      `server/src/ip_tracking.rs:6-8` ("**no raw IP is stored anywhere**. What is stored
+      is an HMAC ... under a salt that changes every day and is never written down"),
+      `:16-17` (salt in memory, OS RNG, replaced at the UTC boundary).
+- [x] API keys stored as hashes only; the plaintext exists once, at creation.
+      `server/src/routes/keys.rs:388` hashes the full key BEFORE the insert; only the
+      hash is bound into the row.
+- [x] Session tokens stored hashed; cookies are HttpOnly, Secure, SameSite.
+      `server/src/routes/auth.rs:251-253` sets all three, and `:558-560` asserts the
+      serialized cookie CARRIES them, so the flags cannot be dropped silently.
+- [x] `PUBLIC_*` variables contain nothing secret.
+      No `PUBLIC_*` key is defined in `server/` or `config/`; the single mention
+      (`server/src/routes/account.rs:60`) is a comment about the browser cross-checking
+      its own value.
+- [ ] Backup encryption keys are held separately from the backups. **Not ticked, and
+      different in kind from the five above.** `tools/backup/backup.sh` does its half
+      (refuses to write a plaintext dump, exit 6; AES-256-CBC with PBKDF2 200k
+      iterations; the key passed as `env:` so it never enters the process list), but its
+      own header records "the human decisions still open (offsite provider, key
+      handling)". Key custody is a DEPLOYMENT decision, not a property of this code, so
+      ticking it from a source read would be exactly the false customer statement this
+      section warns about.
 
 ## Gate 5 — Operational readiness
 
-- [ ] `/health` checks the process and the database, **not** upstream providers.
+- [x] `/health` checks the process and the database, **not** upstream providers.
+      `server/src/routes/health.rs` probes `SELECT 1` only; the doc-comment at
+      `docs/server/api-spec.md:466-470` states the rule and why (an upstream outage must
+      not look like a dead server and trigger a restart loop). Tested, including the
+      unauthenticated-body leak rules.
 - [ ] Alerts configured: webhook rejection, ledger drift, API down, circuit open.
+      **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`, 9 of 10
+      entries `covered` — but "configured" also means a delivery channel and a schedule,
+      which are deployment decisions. The code half is done.
 - [ ] **A restore drill has been run**, with the reconciliation query passing.
 - [ ] Drill log records the measured restore time — that is the real RTO.
-- [ ] Error responses match [`error-model.md`](error-model.md), including `request_id`.
-- [ ] SSE heartbeat runs; a dropped stream surfaces as a stale indicator, not a
+- [x] Error responses match [`error-model.md`](error-model.md), including `request_id`.
+      `server/src/error.rs:233` mints `req_<uuid>` per failure and `:273` puts it in the
+      body; `error.rs:607` asserts the exact documented shape
+      `{error: {code, message, request_id}}`.
+- [x] SSE heartbeat runs; a dropped stream surfaces as a stale indicator, not a
       silently frozen balance.
+      **Now enforced by tests on both halves.** Server: `events.rs:26-28` sets a 25s
+      heartbeat (docs/realtime.md asks for 20-30s) and `:550` pins that window.
+      Frontend: `live.ts:195` marks the store `stale` on error, and
+      `a dropped stream keeps the last balance, marks it stale, and never relabels
+      polled data live` (`website/tests/live.test.ts`) asserts the last KNOWN balance
+      survives and that polled data is never presented as live — mutation-verified in
+      both directions.
 - [ ] Abuse-report contact published and monitored.
 
 ## Gate 6 — Product surfaces
