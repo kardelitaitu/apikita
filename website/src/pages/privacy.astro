@@ -47,6 +47,7 @@ const retention = [
   { what: 'Reviews', keep: 'Until deleted by user', why: 'Published aggregate; individual text is theirs' },
   { what: 'Review history', keep: 'Same as review', why: 'Needed to make an edit meaningful' },
   { what: 'link_codes', keep: 'Until used or expired + 24h', why: 'Then delete' },
+  { what: 'Link-redemption attempts', keep: '7 days', why: 'Hashed source of failed link-code attempts; used only to stop credential attacks, then deleted' },
   { what: 'Logs', keep: '30-90 days', why: 'Debugging window; not a database' },
   { what: 'Accounts (closed)', keep: 'Keep record, drop personal data', why: 'See below' },
 ];

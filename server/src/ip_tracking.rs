@@ -300,6 +300,14 @@ pub async fn record_key_ip(
 pub struct PurgedRows {
     pub seen: u64,
     pub daily: u64,
+    /// `link_redemption_attempts` rows deleted.
+    ///
+    /// Counted and reported separately rather than folded into `seen`: the two
+    /// answer different questions ("which keys were seen from where" vs "who was
+    /// guessing at link codes"), and an operator reading the sweep log needs to
+    /// know the link-code table is actually being swept. A count that cannot be
+    /// printed cannot be noticed when it silently stops moving.
+    pub link_attempts: u64,
 }
 
 /// Deletes rows past their retention window.
@@ -345,7 +353,37 @@ pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<Purged
         .await?
         .rows_affected();
 
-    Ok(PurgedRows { seen, daily })
+    // The link-code attempt counter is the SAME privacy class as `key_ip_seen` - a
+    // salted IP hash answering "who was this" - so it gets the same 7-day bound and
+    // the same sweep. Sweeping it here rather than in a second job is deliberate:
+    // two retention jobs means two places the policy can be forgotten, and this
+    // table was in fact added with NO retention policy at all before this line
+    // existed, which is the failure mode the reuse prevents from recurring.
+    //
+    // The cutoff is the SAME inclusive `<=` for the same reason documented above
+    // (an exclusive comparison silently retains N+1 days), but the VALUE is an
+    // INSTANT, not a date: `attempted_at` is a timestamp and the column is TEXT, so
+    // binding a `NaiveDate` would store `2026-09-27` and compare it as a string
+    // against `2026-09-27T03:04:05+00:00`. The shorter string sorts FIRST, so the
+    // DELETE would match nothing and the rows would survive forever - a silent
+    // retention failure in the direction that keeps data. Hence midnight UTC of the
+    // cutoff DAY, which is the instant the day begins.
+    let link_attempts = sqlx::query("DELETE FROM link_redemption_attempts WHERE attempted_at <= ?")
+        .bind(
+            seen_cutoff
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid")
+                .and_utc(),
+        )
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    Ok(PurgedRows {
+        seen,
+        daily,
+        link_attempts,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +543,7 @@ mod tests {
     use super::*;
     use crate::test_support::{self, TestDb};
     use axum::http::HeaderMap;
+    use chrono::DateTime;
     use std::net::IpAddr;
 
     fn ip(text: &str) -> IpAddr {
@@ -1000,6 +1039,103 @@ mod tests {
         assert!(
             surviving_daily.contains(&daily_kept),
             "the day one inside the 90-day window ({daily_kept}) must be kept, got {surviving_daily:?}"
+        );
+
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // The link_redemption_attempts sweep.
+    //
+    // These rows are the SAME privacy class as key_ip_seen - a salted IP hash
+    // answering "who was this, today" - so they get the SAME bound (7 days) and
+    // the SAME sweep. A second period or a second job would be a second retention
+    // policy for identical data, which is the drift data-retention.md exists to
+    // prevent.
+    // -----------------------------------------------------------------------
+
+    /// Seeds one attempt row at an explicit instant.
+    async fn seed_attempt(pool: &SqlitePool, at: DateTime<Utc>) {
+        sqlx::query("INSERT INTO link_redemption_attempts (ip_hash, attempted_at) VALUES (?, ?)")
+            .bind(ip_hash(&[5u8; 32], &ip("203.0.113.77")))
+            .bind(at)
+            .execute(pool)
+            .await
+            .expect("seed an attempt row");
+    }
+
+    async fn attempt_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM link_redemption_attempts")
+            .fetch_one(pool)
+            .await
+            .expect("count attempt rows")
+    }
+
+    /// RED FIRST: stale attempt rows are DELETED by the sweep.
+    ///
+    /// Against the pre-fix code this fails for the real reason: nothing deletes
+    /// them, so a table of per-attempt client hashes sits in the database forever -
+    /// the per-client history docs/ip-tracking.md says must not be built.
+    #[tokio::test]
+    async fn the_sweep_deletes_attempt_rows_past_the_bound_and_keeps_recent_ones() {
+        let db = TestDb::new().await;
+        let now = Utc::now();
+
+        // Far outside the window.
+        seed_attempt(
+            &db.pool,
+            now - chrono::Duration::days(SEEN_RETENTION_DAYS + 30),
+        )
+        .await;
+        // Just inside it - a live incident must still be investigable.
+        seed_attempt(&db.pool, now - chrono::Duration::days(1)).await;
+
+        assert_eq!(attempt_rows(&db.pool).await, 2, "both rows seeded");
+
+        purge_expired(&db.pool, today_utc()).await.expect("purge");
+
+        assert_eq!(
+            attempt_rows(&db.pool).await,
+            1,
+            "the row past the retention bound must be DELETED; before this fix it survived forever"
+        );
+
+        db.close().await;
+    }
+
+    /// THE BOUNDARY, PINNED EXACTLY - both directions.
+    ///
+    /// "Old rows go" passes with BOTH `<` and `<=`, which is how the window quietly
+    /// becomes N+1 days. This column is also a TIMESTAMP, not a DATE, so the cutoff
+    /// must compare instants: binding a NaiveDate here would store `2026-09-27` and
+    /// compare it as a STRING against `2026-09-27T03:04:05+00:00`, where the shorter
+    /// string sorts FIRST and the DELETE would remove nothing at all. Both halves are
+    /// asserted so neither the off-by-one nor the type confusion can return.
+    #[tokio::test]
+    async fn the_attempt_cutoff_is_inclusive_of_the_boundary_instant_and_keeps_the_rest() {
+        let db = TestDb::new().await;
+        let today = today_utc();
+        let cutoff = today - chrono::Duration::days(SEEN_RETENTION_DAYS);
+
+        // AT the cutoff instant: must go (inclusive).
+        seed_attempt(&db.pool, cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc()).await;
+        // One second INSIDE the window: must stay. This assertion fails if the
+        // cutoff becomes exclusive.
+        seed_attempt(&db.pool, cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc()).await;
+
+        purge_expired(&db.pool, today).await.expect("purge");
+
+        let surviving: Vec<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT attempted_at FROM link_redemption_attempts ORDER BY attempted_at",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("read surviving attempts");
+
+        assert_eq!(
+            surviving,
+            vec![cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc()],
+            "the instant AT the cutoff must be deleted and one second later must survive - and if this deletes NOTHING, the cutoff is being compared as a DATE against a TIMESTAMP column"
         );
 
         db.close().await;

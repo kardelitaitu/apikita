@@ -66,6 +66,7 @@ months.** The daily aggregate is what you keep.
 | Data | Keep | Why |
 | --- | --- | --- |
 | `key_ip_seen` hashes | **7 days** | Enough to investigate a live incident |
+| `link_redemption_attempts` hashes | **7 days** | Same class as `key_ip_seen`: a salted hash answering "who was this". Kept only so a live credential attack can be investigated — the `link_redemption_per_hour` cap is a rolling 1-hour window, so anything older than an hour is already inert for enforcement |
 | `key_ip_daily` counts | 90 days | Trend without history |
 | Daily salt | **deleted after the day** | Makes the hashes unlinkable forever |
 
