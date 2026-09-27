@@ -35,7 +35,7 @@ import Skeleton from '../../components/Skeleton.astro';
     </p>
 
     <form id="admin-filter" class="mt-4 flex flex-wrap items-end gap-3">
-      <div class="min-w-[18rem] flex-1">
+      <div class="w-full flex-1 sm:w-auto sm:min-w-[18rem]">
         <label for="admin-q" class="block text-sm font-medium">Filter</label>
         <input id="admin-q" name="q" type="search" autocomplete="off" spellcheck="false"
           placeholder="Account id, or leave blank for all"
@@ -155,7 +155,7 @@ import Skeleton from '../../components/Skeleton.astro';
 
   <!-- Lookup ---------------------------------------------------------------- -->
   <form id="admin-lookup" class="flex flex-wrap items-end gap-3">
-    <div class="min-w-[22rem] flex-1">
+    <div class="w-full flex-1 sm:w-auto sm:min-w-[22rem]">
       <label for="admin-account-id" class="block text-sm font-medium">Account id</label>
       <input id="admin-account-id" name="account_id" type="text" required autocomplete="off"
         spellcheck="false" placeholder="00000000-0000-0000-0000-000000000000"
