@@ -61,9 +61,9 @@ relationship and becomes a liability the moment a breach occurs.
 | --- | --- | --- |
 | **Ledger** | **Forever** | Financial record; it is the authoritative audit trail |
 | **Top-ups** | **Forever** | Financial; matches the ledger |
-| **Usage daily** | 24 months | Billing disputes, then aggregate only |
+| **Usage daily** | 24 months | Billing disputes, then aggregate only. Swept by `usage-purge` |
 | **Per-request usage** (`usage_events`) | **90 days** | Outlasts the 30-day rolling spend window plus a dispute window. Swept nightly by `cargo run --bin usage-purge`; the boundary is inclusive, so the cutoff day is deleted and exactly 89 preceding days are kept |
-| **Sessions (expired/revoked)** | 30 days | Tidy up, but keep recent for security review |
+| **Sessions (expired/revoked)** | 30 days | Tidy up, but keep recent for security review. The window runs from the instant the session STOPPED being usable — `revoked_at` for an early logout, else `expires_at`. Swept by `usage-purge` |
 | **Reviews** | Until deleted by user | Published aggregate; individual text is theirs |
 | **Review history** | Same as review | Needed to make an edit meaningful |
 | **link_codes** | Until used or expired + 24h | Then delete |
@@ -71,16 +71,24 @@ relationship and becomes a liability the moment a breach occurs.
 | **Logs** | 30-90 days | Debugging window; not a database |
 | **Accounts (closed)** | Keep record, drop personal data | See below |
 
-> **`usage_events` retention is now enforced.** `server/src/bin/usage-purge.rs`
-> deletes rows past the 90-day window, run nightly alongside `ip-purge` by
-> whatever schedules the backup and reconciliation jobs. It is idempotent, and it
-> is deliberately NOT on the request path — the settlement already writes one row
-> per billed request, and a per-request delete would add a second write to the
-> money path to do work that has to happen once a day.
+> **Age-based retention is now enforced by `server/src/bin/usage-purge.rs`,**
+> run nightly alongside `ip-purge`. It sweeps **three** tables to the periods
+> above: `usage_events` (90 days), `usage_daily` (24 months) and expired/revoked
+> `sessions` (30 days). It is idempotent, and deliberately NOT on the request
+> path — the settlement already writes a row per billed request, and a per-request
+> delete would add a second write to the money path to do work that has to happen
+> once a day.
 >
-> It deletes **only** `usage_events`. `usage_daily` is the 24-month aggregate the
-> spend window and reconciliation read; `ledger` and `topups` are financial
-> records kept forever.
+> **One job, not three.** Three retention jobs would mean three places the policy
+> can be forgotten, and that is not hypothetical: all three tables shipped with a
+> documented period and **no** purge at all, because the policy lived in this
+> document and nothing connected it to the code.
+>
+> It deliberately does **not** touch `ledger` or `topups` (financial records, kept
+> forever), `reviews`/`review_history` (kept until the user deletes them),
+> `link_codes` (its own "+24h after use/expiry" rule is a different shape), or
+> `key_ip_*`/`link_redemption_attempts` (swept by `ip-purge`, which owns the
+> salted-hash retention and the salt-rotation contract).
 
 **The ledger is never deleted, even when a customer leaves.** It is the record of
 money that moved. That is normal accounting, not a retention violation — but it

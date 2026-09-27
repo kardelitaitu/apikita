@@ -400,48 +400,102 @@ pub async fn debit_usage_transaction(
 /// comparison, never by nudging this to compensate.
 pub const USAGE_EVENTS_RETENTION_DAYS: i64 = 90;
 
-/// Deletes `usage_events` rows past their retention window. Returns the count.
+/// How long daily usage aggregates are retained, in days (~24 months).
 ///
-/// This is what makes the `data-retention.md` promise true rather than
-/// aspirational. Until this existed the table grew without bound while the doc
-/// stated a 90-day period — a stated period the code does not keep is worse than
-/// no stated period.
+/// `docs/data-retention.md`: "Usage daily | 24 months | Billing disputes, then
+/// aggregate only". 730 days is 24 months to the day at the common 365-day year;
+/// the doc states the period in months, and a day count is what the comparison
+/// needs.
+pub const USAGE_DAILY_RETENTION_DAYS: i64 = 730;
+
+/// How long an expired or revoked session row is kept, in days.
 ///
-/// THE CUTOFF IS INCLUSIVE, and the window is "today plus the preceding 89". The
-/// doc promises 90 days RETAINED, so the days kept are
-/// `today - 89 ..= today` and every row at or before `today - 90` is deleted.
-/// The comparison is therefore `<=`, not `<`: with `<` the cutoff instant
-/// itself survived and the table quietly held 91 days against a statement saying
-/// 90 — a retention window longer than documented is a broken promise, not a
-/// rounding detail. This mirrors `ip_tracking::purge_expired` exactly.
+/// `docs/data-retention.md`: "Sessions (expired/revoked) | 30 days | Tidy up, but
+/// keep recent for security review". The window runs from the session's own
+/// `expires_at` (or `revoked_at` when it was logged out early), not from
+/// creation.
+pub const SESSION_RETENTION_DAYS: i64 = 30;
+
+/// What one retention sweep deleted, per table. Named fields rather than a tuple
+/// so a caller logging the result cannot silently swap two counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PurgedUsage {
+    pub usage_events: u64,
+    pub usage_daily: u64,
+    pub sessions: u64,
+}
+
+/// The whole nightly retention sweep: `usage_events`, `usage_daily` and expired
+/// `sessions`. Returns what each table lost.
 ///
-/// `created_at` is TEXT in RFC3339 form, so the bound is an instant (midnight
-/// UTC of the cutoff day), not a bare date: binding `NaiveDate` would store
-/// `2026-09-27` and compare it as a string against `2026-09-27T03:04:05+00:00`,
-/// and the shorter string sorts FIRST — the DELETE would match nothing and rows
-/// would survive forever. That is the silent retention failure in the direction
-/// that keeps data, so the instant is explicit.
+/// ONE job sweeps every table with an age-based period, deliberately. Two
+/// retention jobs means two places the policy can be forgotten, and that is not
+/// hypothetical here: `usage_events` shipped populated with NO purge at all, and
+/// `usage_daily`/`sessions` were in the same state, because the policy lived in
+/// a document and nothing connected it to the code. Sweeping them together makes
+/// the document's retention table the thing the code executes.
 ///
-/// Run nightly. Nothing calls this on the request path: the settlement writes a
-/// row per request and a per-request delete would add a second write to the
-/// money path to do work that has to happen once a day.
-pub async fn purge_expired_usage_events(
+/// What this deliberately does NOT touch:
+/// - `ledger` and `topups` — financial records, kept **forever**.
+/// - `reviews` / `review_history` — kept until the user deletes them.
+/// - `link_codes` — its own "+24h after use/expiry" rule is a different shape.
+/// - `key_ip_*` and `link_redemption_attempts` — swept by `ip-purge`, which owns
+///   the salted-hash retention and the salt-rotation contract.
+///
+/// Every cutoff is the same inclusive `<=` at midnight UTC of the cutoff day, for
+/// the reason documented on `purge_expired_usage`: an exclusive comparison
+/// silently retains N+1 days against an N-day promise.
+pub async fn purge_expired_usage(
     pool: &SqlitePool,
     today: chrono::NaiveDate,
-) -> Result<u64, AppError> {
-    let cutoff = today - chrono::Duration::days(USAGE_EVENTS_RETENTION_DAYS);
-    let cutoff_instant = cutoff
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is a valid time")
-        .and_utc();
+) -> Result<PurgedUsage, AppError> {
+    let midnight = |days: i64| {
+        (today - chrono::Duration::days(days))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid time")
+            .and_utc()
+    };
 
-    let deleted = sqlx::query("DELETE FROM usage_events WHERE created_at <= ?")
-        .bind(cutoff_instant)
+    let usage_events = sqlx::query("DELETE FROM usage_events WHERE created_at <= ?")
+        .bind(midnight(USAGE_EVENTS_RETENTION_DAYS))
         .execute(pool)
         .await?
         .rows_affected();
 
-    Ok(deleted)
+    // `day` is a DATE in `YYYY-MM-DD` form (a TEXT column), so the bound is a
+    // date, not an instant. Binding an instant here would make the longer string
+    // sort AFTER the stored dates and the DELETE would match nothing.
+    let usage_daily = sqlx::query("DELETE FROM usage_daily WHERE day <= ?")
+        .bind(today - chrono::Duration::days(USAGE_DAILY_RETENTION_DAYS))
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    // A session is removable once it stopped being USABLE at least 30 days ago.
+    // "Stopped being usable" is `revoked_at` when it was logged out early, and
+    // `expires_at` otherwise — so the governing instant is
+    // `COALESCE(revoked_at, expires_at)`.
+    //
+    // ONLY that column is compared. Adding `AND expires_at <= cutoff` would be
+    // wrong the other way: it would retain a session revoked early whose
+    // `expires_at` is still in the future, which is the common case for a user who
+    // logs out promptly — the row would linger long past the 30 days the doc
+    // promises.
+    //
+    // The cutoff is a full RFC3339 instant because both columns are timestamps.
+    let sessions = sqlx::query(
+        "DELETE FROM sessions WHERE COALESCE(revoked_at, expires_at) <= ?",
+    )
+    .bind(midnight(SESSION_RETENTION_DAYS))
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(PurgedUsage {
+        usage_events,
+        usage_daily,
+        sessions,
+    })
 }
 
 /// Writes the two rows a settlement owns, then commits: the append-only ledger
@@ -2878,8 +2932,8 @@ mod tests {
             .expect("seed a usage event");
         }
 
-        let deleted = purge_expired_usage_events(&db.pool, today).await.unwrap();
-        assert_eq!(deleted, 1, "only the row AT the cutoff day is deleted");
+        let purged = purge_expired_usage(&db.pool, today).await.unwrap();
+        assert_eq!(purged.usage_events, 1, "only the row AT the cutoff day is deleted");
 
         // The two survivors are the second-after-cutoff and the recent one.
         let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE account_id = ?")
@@ -2913,8 +2967,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(purge_expired_usage_events(&db.pool, today).await.unwrap(), 1);
-        assert_eq!(purge_expired_usage_events(&db.pool, today).await.unwrap(), 0, "the second sweep removes nothing");
+        assert_eq!(purge_expired_usage(&db.pool, today).await.unwrap().usage_events, 1);
+        assert_eq!(
+            purge_expired_usage(&db.pool, today).await.unwrap().usage_events,
+            0,
+            "the second sweep removes nothing"
+        );
 
         db.close().await;
     }
@@ -2923,6 +2981,132 @@ mod tests {
     #[test]
     fn usage_events_retention_constant_is_documented() {
         assert_eq!(USAGE_EVENTS_RETENTION_DAYS, 90);
+    }
+
+
+    /// `usage_daily` is kept 24 months: a row at the cutoff DAY is deleted, one a
+    /// day later is kept. `day` is a TEXT date, so the bound is a date, not an
+    /// instant — binding an instant would sort after every stored date and the
+    /// DELETE would match nothing.
+    #[tokio::test]
+    async fn usage_daily_retention_deletes_the_cutoff_day_and_keeps_the_rest() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        let at_cutoff = today - chrono::Duration::days(USAGE_DAILY_RETENTION_DAYS);
+        let just_inside = at_cutoff + chrono::Duration::days(1);
+        for day in [at_cutoff, just_inside, today] {
+            sqlx::query(
+                "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens)
+                 VALUES (?, NULL, ?, 1)",
+            )
+            .bind(account_id.hyphenated())
+            .bind(day)
+            .execute(&db.pool)
+            .await
+            .expect("seed a daily row");
+        }
+
+        let purged = purge_expired_usage(&db.pool, today).await.unwrap();
+        assert_eq!(purged.usage_daily, 1, "only the cutoff DAY is deleted");
+
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_daily WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 2, "the cutoff day goes; the two newer days stay");
+
+        db.close().await;
+    }
+
+    /// Sessions are swept 30 days after they STOPPED being usable — which is
+    /// `revoked_at` for an early logout, not `expires_at`. A session revoked
+    /// early but with a far-future `expires_at` is the common case, and a naive
+    /// `expires_at <= cutoff` predicate would retain it well past the promise.
+    #[tokio::test]
+    async fn session_retention_uses_the_instant_it_stopped_being_usable() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let cutoff = (today - chrono::Duration::days(SESSION_RETENTION_DAYS))
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let future = cutoff + chrono::Duration::days(300);
+
+        // A local helper, not a closure: a closure that borrows the pool cannot be
+        // called three times without moving it.
+        async fn seed_session(
+            pool: &SqlitePool,
+            account_id: Uuid,
+            expires: chrono::DateTime<chrono::Utc>,
+            revoked: Option<chrono::DateTime<chrono::Utc>>,
+        ) {
+            let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+            sqlx::query(
+                "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at, revoked_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
+            .bind(crate::routes::hash_token(&token))
+            .bind(expires)
+            .bind(expires)
+            .bind(expires)
+            .bind(revoked)
+            .execute(pool)
+            .await
+            .expect("seed a session");
+        }
+
+        // (a) Long expired, never revoked -> deleted.
+        seed_session(&db.pool, account_id, cutoff - chrono::Duration::days(1), None).await;
+        // (b) Revoked early with a FUTURE expires_at -> deleted, on `revoked_at`.
+        seed_session(&db.pool, account_id, future, Some(cutoff - chrono::Duration::days(1))).await;
+        // (c) Still live (expires in the future, not revoked) -> kept.
+        seed_session(&db.pool, account_id, future, None).await;
+
+        let purged = purge_expired_usage(&db.pool, today).await.unwrap();
+        assert_eq!(
+            purged.sessions, 2,
+            "the expired row and the early-revoked row both go; the live one stays"
+        );
+
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1, "the live session survives");
+
+        db.close().await;
+    }
+
+    /// The sweep never touches the tables with NO age-based period: financial
+    /// records and user-owned reviews.
+    #[tokio::test]
+    async fn retention_sweep_leaves_financial_records_alone() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account_id, 5_000).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+
+        let purged = purge_expired_usage(&db.pool, today).await.unwrap();
+        assert_eq!(purged.usage_events, 0);
+        assert_eq!(purged.usage_daily, 0);
+        assert_eq!(purged.sessions, 0);
+
+        // The ledger row from the funding survives a far-future sweep.
+        let ledger: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(ledger, 1, "the ledger is kept forever");
+
+        db.close().await;
     }
 
 }

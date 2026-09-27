@@ -1,11 +1,10 @@
-//! Nightly retention sweep for per-request usage (`usage_events`).
+//! Nightly retention sweep for the age-based tables: `usage_events` (90 days),
+//! `usage_daily` (24 months) and expired/revoked `sessions` (30 days).
 //!
-//! `docs/data-retention.md` settles `usage_events` retention at **90 days** — it
-//! must outlast the 30-day rolling spend window plus a dispute window. That
-//! promise is only true if something deletes the rows, and nothing on the request
-//! path should: the settlement writes one row per billed request, and adding a
-//! per-request delete to the money path to do work that has to happen once a day
-//! would be the wrong trade.
+//! `docs/data-retention.md` states all three periods. They are only true if
+//! something deletes the rows, and nothing on the request path should: the
+//! settlement writes one row per billed request, and adding a per-request delete
+//! to it to do work that has to happen once a day would be the wrong trade.
 //!
 //! So it is a binary, alongside `ip-purge`, run by whatever schedules the backup
 //! and reconciliation jobs (`docs/backup-and-restore.md`, `tools/reconcile`).
@@ -56,12 +55,16 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let today = Utc::now().date_naive();
-    let deleted = db::purge_expired_usage_events(&pool, today).await?;
+    let purged = db::purge_expired_usage(&pool, today).await?;
 
     info!(
-        events_deleted = deleted,
-        retention_days = db::USAGE_EVENTS_RETENTION_DAYS,
-        "usage_events retention sweep complete"
+        usage_events_deleted = purged.usage_events,
+        usage_daily_deleted = purged.usage_daily,
+        sessions_deleted = purged.sessions,
+        events_retention_days = db::USAGE_EVENTS_RETENTION_DAYS,
+        daily_retention_days = db::USAGE_DAILY_RETENTION_DAYS,
+        session_retention_days = db::SESSION_RETENTION_DAYS,
+        "retention sweep complete"
     );
 
     Ok(())
