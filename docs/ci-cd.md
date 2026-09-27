@@ -306,11 +306,34 @@ entirely uncovered, including the client-hangup path whose own comment records
 that dropping the body unread "is exactly the defect this is fixing". That fix had
 no test. It does now, along with the usage-tail cap, which is `91.8%` and rising.
 
-**What replaces the worklist.** There is no file left to point at, so the
-remaining gap is of a different kind and worth naming honestly: this toolchain does
-not instrument BRANCHES (the lcov branch columns read 0/0), so a well-covered line
-can still hide an untaken arm. The next useful measurement is a branch-capable
-coverage run, not another hunt for a low percentage.
+**What replaces the worklist: branch coverage, and it is currently NOT OBTAINABLE
+here — measured, not assumed.** There is no file left to point at, so the remaining
+gap is of a different kind: this toolchain does not instrument BRANCHES (the lcov
+branch columns read 0/0), and a well-covered line can still hide an untaken arm.
+
+`cargo llvm-cov --branch` needs a nightly compiler (`the option Z is only accepted
+on the nightly compiler`), and **nightly IS installed on this machine**, so the
+measurement looked achievable. It is not:
+
+| Attempt | Result |
+| --- | --- |
+| `cargo +nightly llvm-cov --branch --lib` | suite runs (all tests pass), then `failed to collect object files` |
+| …with a custom `CARGO_TARGET_DIR` | same — ruled out the target-dir override |
+| …with `RUSTC_WRAPPER` unset | same |
+| …with a clean `CARGO_HOME` config containing **no** `rustc-wrapper` | same |
+| **`cargo llvm-cov --lib` (LINE coverage), same worktree** | **SUCCEEDS** — 459 KB of lcov |
+
+That last row is the control that makes the finding trustworthy: line coverage works
+in the very same checkout, so this is specifically `--branch` failing to find its
+instrumented objects under Windows + MSVC + sccache — not a broken environment.
+`show-env` explains why it is at least visible: llvm-cov reports
+`__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING=sccache`, i.e. it knows a pre-existing
+wrapper is present and tries to compose with it.
+
+**So the 0/0 branch columns are a real limitation of this setup, not an artefact of
+the config.** Anyone who wants branch numbers should try a Linux or macOS checkout
+first, or a machine without a global `rustc-wrapper`, before spending time on it —
+which is what this table is for.
 
 
 ## Rollback
