@@ -16,7 +16,7 @@ Pages, flows, and states. Written as behaviour, not markup.
 | `/dashboard/keys` | API key list, create, limits, revoke | Required |
 | `/dashboard/keys/new` | Create key: models + limits | Required |
 | `/dashboard/wallet` | Balance, top-up, history | Required |
-| `/dashboard/usage` | Token usage over time | Required |
+| `/dashboard/usage` | Token usage over time — flat table **and** a one-metric trend chart | Required |
 | `/dashboard/settings` | Profile, password, linked accounts | Required |
 | `/docs` | Integration guide | Public |
 
