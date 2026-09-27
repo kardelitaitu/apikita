@@ -1099,6 +1099,256 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // stream_chat FAILURE CLASSIFICATION - the failover loop.
+    //
+    // These lines were entirely uncovered, and they are the branches that decide
+    // three different things about one bad response: whether a key is PARKED (429),
+    // whether a breaker is TRIPPED (5xx), or whether the caller own request is
+    // refused without retrying a different provider (other 4xx). Getting any of them
+    // wrong either punishes healthy keys or retries a body that will never succeed.
+    // ---------------------------------------------------------------------
+
+    /// A one-shot loopback upstream answering with `status_line` and a small body,
+    /// returning the address to point an endpoint at.
+    async fn upstream_answering(status_line: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback upstream");
+        let addr = listener.local_addr().expect("local addr");
+
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}/v1")
+    }
+
+    /// Like `upstream_answering`, but serves EVERY request rather than one.
+    ///
+    /// Kept (with `#[allow(dead_code)]` and this note) because the DISTINCTION is a
+    /// real trap and no test currently needs more than one response: a one-shot stub
+    /// is wrong for a test that drives more than one attempt, because the later calls
+    /// fail at the TRANSPORT level and record failures of a different kind, silently
+    /// confounding whatever the test claims to measure. That is not hypothetical — it
+    /// is what defeated a first attempt at the 429 test above.
+    #[allow(dead_code)]
+    async fn repeating_upstream_answering(status_line: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a repeating upstream");
+        let addr = listener.local_addr().expect("local addr");
+
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let payload = response.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(payload.as_bytes()).await;
+                    let _ = socket.flush().await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}/v1")
+    }
+
+    /// A client whose single endpoint points at the given url, with its key installed.
+    fn client_pointed_at(url: &str) -> UpstreamClient {
+        std::env::set_var("APK_TEST_SOLO_KEY_1", "test-key");
+        let mut solo = endpoint("solo", 1.0);
+        solo.url = url.to_string();
+        client(vec![model("flash", vec![solo])])
+    }
+
+    /// A 429 parks the key and NEVER trips the breaker.
+    ///
+    /// The distinction is the point: a throttled key is saturated, not broken. If a
+    /// 429 tripped the breaker the whole endpoint would be taken out of service for
+    /// a provider that is merely busy.
+    #[tokio::test]
+    async fn a_rate_limited_upstream_parks_the_key_without_tripping_the_breaker() {
+        let url = upstream_answering("429 Too Many Requests", r#"{"error":"slow down"}"#).await;
+        let upstream = client_pointed_at(&url);
+
+        let err = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect_err("429 is not a success");
+
+        assert!(
+            matches!(err, UpstreamError::RateLimited),
+            "a 429 must surface as RateLimited, got {err:?}"
+        );
+        assert!(
+            upstream.models[0].endpoints[0].breaker.allow_request(),
+            "a 429 must NOT trip the breaker: a throttled key is saturated, not broken"
+        );
+
+        // THE ASSERTION ABOVE IS VACUOUS ON ITS OWN, and mutation testing proved it:
+        // ONE recorded failure leaves the breaker Closed either way (the threshold is
+        // 3), so making a 429 call `record_failure()` did not fail this test.
+        //
+        // Driving several 429s does NOT rescue it either, and finding out why was
+        // worth the effort: the pool holds one key, the first 429 PARKS it, so every
+        // later `acquire()` returns None and the loop breaks. Measured, twice - a
+        // probe confirmed the branch IS reached, and a diagnostic showed the breaker
+        // still Closed with one attempt. So the number of 429s is capped at one.
+        //
+        // What genuinely discriminates is the PARKING ITSELF, which is the observable
+        // difference between the two designs: a throttled key is parked and rotated,
+        // and the breaker stays Closed. `allow_request` therefore stays true, and the
+        // ENDPOINT reports NO cooldown - a 429 must not take a provider out of service.
+        assert_eq!(
+            upstream.shortest_cooldown_secs("flash"),
+            None,
+            "a 429 must leave NO endpoint cooldown behind: a throttled provider is still in service"
+        );
+        assert_eq!(
+            upstream.models[0].endpoints[0].breaker.state(),
+            BreakerState::Closed,
+            "the breaker must still be Closed after a 429"
+        );
+    }
+
+    /// A 5xx TRIPS the breaker and reports no healthy upstream.
+    #[tokio::test]
+    async fn a_server_error_trips_the_breaker_and_reports_no_healthy_upstream() {
+        let url = upstream_answering("500 Internal Server Error", r#"{"error":"boom"}"#).await;
+        let upstream = client_pointed_at(&url);
+
+        let err = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect_err("500 is not a success");
+
+        assert!(
+            matches!(err, UpstreamError::NoHealthyUpstream(_)),
+            "a 5xx must report NoHealthyUpstream, got {err:?}"
+        );
+
+        // POSITIVE CONTROL for the breaker half: the failure must be RECORDED, not
+        // merely not-crashed. One 500 leaves the breaker closed (threshold 3), so
+        // this drives three and asserts it opens.
+        let url2 = upstream_answering("500 Internal Server Error", "{}").await;
+        let upstream2 = client_pointed_at(&url2);
+        for _ in 0..3 {
+            let _ = upstream2
+                .stream_chat("flash", json!({ "model": "flash" }))
+                .await;
+        }
+        assert!(
+            !upstream2.models[0].endpoints[0].breaker.allow_request(),
+            "three consecutive 5xx responses must OPEN the breaker - otherwise the failure was never recorded"
+        );
+    }
+
+    /// Any OTHER 4xx is the caller bad request: refused immediately, breaker untouched.
+    ///
+    /// Retrying a different provider with the same malformed body would waste a
+    /// second upstream call and could bill for it, so the loop must return here.
+    #[tokio::test]
+    async fn a_non_rate_limit_4xx_is_refused_without_rotating_or_tripping() {
+        let url = upstream_answering("400 Bad Request", r#"{"error":"bad model"}"#).await;
+        let upstream = client_pointed_at(&url);
+
+        let err = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect_err("400 is not a success");
+
+        assert!(
+            matches!(err, UpstreamError::ServerError(400)),
+            "a non-rate-limit 4xx must surface its own status, got {err:?}"
+        );
+        assert!(
+            upstream.models[0].endpoints[0].breaker.allow_request(),
+            "the caller own bad request must NOT trip the provider breaker"
+        );
+    }
+
+    /// FAILOVER: a failing first endpoint must hand over to a healthy second one.
+    ///
+    /// This is the product central reliability claim - the client-side transparent
+    /// retry across the endpoint pool. It was uncovered.
+    #[tokio::test]
+    async fn a_failing_first_endpoint_fails_over_to_a_healthy_second() {
+        let dead = upstream_answering("500 Internal Server Error", "{}").await;
+        let healthy = upstream_answering("200 OK", "").await;
+
+        std::env::set_var("APK_TEST_DEAD_KEY_1", "dead-key");
+        std::env::set_var("APK_TEST_ALIVE_KEY_1", "alive-key");
+
+        let mut first = endpoint("dead", 1.0);
+        first.url = dead;
+        let mut second = endpoint("alive", 1.0);
+        second.url = healthy;
+
+        let upstream = client(vec![model("flash", vec![first, second])]);
+
+        let result = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await;
+
+        // The first 500s; the loop must then try the second, which answers 200.
+        match result {
+            Ok(stream) => assert_eq!(
+                stream.endpoint_name(),
+                "alive",
+                "the SECOND endpoint must have served the request after the first failed"
+            ),
+            Err(err) => panic!(
+                "the loop must fail over to a healthy endpoint rather than give up, got {err:?}"
+            ),
+        }
+    }
+
+    /// An endpoint with weight 0 is never attempted.
+    #[tokio::test]
+    async fn a_weightless_endpoint_is_skipped_entirely() {
+        let url = upstream_answering("200 OK", "").await;
+        std::env::set_var("APK_TEST_GHOST_KEY_1", "ghost-key");
+
+        let mut ghost = endpoint("ghost", 0.0);
+        ghost.url = url;
+        let upstream = client(vec![model("flash", vec![ghost])]);
+
+        let err = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect_err("a weight-0 endpoint must not be used");
+
+        assert!(
+            matches!(err, UpstreamError::NoHealthyUpstream(_)),
+            "a weight-0 endpoint is registered but never routed, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn stream_chat_reports_an_unknown_model_and_a_missing_key() {
         let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
