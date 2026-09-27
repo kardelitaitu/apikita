@@ -117,7 +117,14 @@ if [ "$MODE" = "list" ]; then
         printf 'probe: %-20s %-8s %s\n' "all_providers_unhealthy" "skipped" \
             "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
     fi
-    echo "probe: not checked by anything in tools/alert yet: relay_5xx, db_disk"
+    if [ -n "$OPERATOR_COOKIE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "db_disk" "covered" \
+            "the retention report on $API_URL/api/admin/metrics; alerts when a table holds a row past its window"
+    else
+        printf 'probe: %-20s %-8s %s\n' "db_disk" "skipped" \
+            "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+    fi
+    echo "probe: not checked by anything in tools/alert yet: relay_5xx"
     exit 0
 fi
 
@@ -139,9 +146,9 @@ esac
 if [ -n "$CHECKS" ]; then
     for id in $CHECKS; do
         case "$id" in
-            api_down|relay_down|webhook_rejection|error_rate|all_providers_unhealthy) ;;
+            api_down|relay_down|webhook_rejection|error_rate|all_providers_unhealthy|db_disk) ;;
             *) echo "probe: unknown check: $id" >&2
-               echo "probe: known checks: api_down, relay_down, webhook_rejection, error_rate, all_providers_unhealthy" >&2
+               echo "probe: known checks: api_down, relay_down, webhook_rejection, error_rate, all_providers_unhealthy, db_disk" >&2
                exit 2 ;;
         esac
     done
@@ -222,6 +229,70 @@ check_api_down() {
     done
 }
 
+# --- check: db_disk -----------------------------------------------------------
+# The alert is NAMED "DB disk >80%" but its ACTION is "Usage rows growing; check
+# retention", and that is what this check measures: whether any age-based table is
+# holding a row past its retention window. A volume percentage cannot answer it - 80%
+# full is normal for a working database - and a sweep that silently STOPPED is an
+# incident at any size, because it breaks a published retention promise.
+#
+# The route reports `retention.behind` (bool) plus `retention.oldest_days` naming the
+# lagging tables. `behind` can be NULL when the server could not run the query, and
+# null is NOT false: an unknown must never read as healthy.
+check_db_disk() {
+    if [ -z "$OPERATOR_COOKIE" ]; then
+        echo "probe: skipped db_disk: PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+        return 0
+    fi
+
+    BODY_FILE="$TMP/probe-retention.$$.json"
+    CODE=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+        --connect-timeout "$HTTP_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -H "Cookie: $OPERATOR_COOKIE" \
+        "$API_URL/api/admin/metrics" 2>"$CURL_ERR")
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        REASON=$(first_err "curl exit $RC")
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED db_disk: the metrics route did not answer ($REASON)" >&2
+        fail_with 4
+        return 0
+    fi
+    if [ "$CODE" != "200" ]; then
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED db_disk: /api/admin/metrics returned HTTP $CODE (401 = bad or expired cookie, 403 = not an operator)" >&2
+        fail_with 4
+        return 0
+    fi
+
+    BEHIND=$(sed -n 's/.*"behind":[[:space:]]*\([^,}]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    OLDEST=$(sed -n 's/.*"oldest_days":[[:space:]]*{\([^}]*\)}.*/\1/p' "$BODY_FILE" | head -n 1)
+    rm -f "$BODY_FILE"
+
+    case "$BEHIND" in
+        null)
+            # The server reported a FAILED retention read. Unknown is not healthy.
+            echo "probe: FAILED db_disk: the server could not run the retention query (behind=null); unknown is not clean" >&2
+            fail_with 6
+            return 0
+            ;;
+        true)
+            DETAIL=$(printf '%s' "$OLDEST" | tr ',' ' ' | tr -d '"' | tr ':' '=')
+            echo "probe: ALERT db_disk: retention is behind - $DETAIL"
+            fire db_disk "retention is not keeping up; rows past their window: $DETAIL"
+            return 0
+            ;;
+        false)
+            echo "probe: OK  db_disk: every age-based table is inside its retention window"
+            return 0
+            ;;
+        *)
+            echo "probe: FAILED db_disk: could not parse 'behind' from the metrics route" >&2
+            fail_with 6
+            return 0
+            ;;
+    esac
+}
 # --- check: all_providers_unhealthy -------------------------------------------
 # Threshold from alerts.tsv: "every endpoint open". The metrics route reports
 # `unhealthy_models` - the models whose EVERY routed endpoint has an open circuit -
@@ -447,6 +518,7 @@ run_check() {
         relay_down) check_relay_down ;;
         error_rate) check_error_rate ;;
         all_providers_unhealthy) check_all_providers_unhealthy ;;
+        db_disk) check_db_disk ;;
         webhook_rejection) check_webhook_rejection ;;
     esac
     return 0
@@ -461,20 +533,25 @@ else
 fi
 
 # --- what still is not checked, on EVERY run ----------------------------------
-# Five checks are covered now. These TWO are not, and saying so every run is the whole
-# point of this directory: a check that is silently absent is the failure mode, and two
-# silent absences would be two.
+# SIX checks are covered now. ONE is not, and saying so every run is the whole point of
+# this directory: a check that is silently absent is the failure mode.
 #
-# all_providers_unhealthy MOVED OUT of this list: the breaker state is in-process and
+# db_disk MOVED OUT of this list: the retention lag is measured in-process and served at
+# GET /api/admin/metrics. The old line said "volume usage, not visible to any client",
+# which was true of the VOLUME but missed that the alert's own ACTION is "check
+# retention" - and retention is something the server can answer.
+#
+# all_providers_unhealthy MOVED OUT of this list earlier: the breaker state is in-process and
 #
 # error_rate MOVED OUT of this list: the counters are in-process (server/src/error.rs)
 # and served at GET /api/admin/metrics, so it is a real check now. The line that used
 # to sit here said it needed "HTTP counters over a 5-minute window (same access logs)",
 # which was true before the counter existed and is now stale.
 cat >&2 <<'NOTCHECKED'
-probe: NOT CHECKED - 2 of the doc's 10 alerts still need a surface this cannot reach:
-probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off)
-probe:   db_disk                 - volume usage, not visible to any client
+probe: NOT CHECKED - 1 of the doc's 10 alerts still needs a surface this cannot reach:
+probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
+probe:                             The relay is a SEPARATE deployment; the backend never sees its
+probe:                             status codes, so no server-side check can answer this one.
 probe: Full table and the reasons: tools/alert/README.md. Every definition: alert.sh --list
 NOTCHECKED
 

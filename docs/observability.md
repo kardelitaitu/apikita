@@ -103,8 +103,17 @@ Each has a threshold and an action. If you would not act, do not alert.
 | **Relay down** | external check fails | Total outage — single point of failure |
 | **All providers unhealthy** | circuit open on every endpoint | Requests failing; check upstream |
 | **Balance negative** | `balance_idr < 0` | Should be impossible (CHECK constraint). A bug |
-| **DB disk >80%** | volume usage | Usage rows growing; check retention |
+| **DB disk** | any age-based table holding a row past its retention window | Usage rows growing; check retention |
 | **Error rate >5%** | 5 min window | Investigate |
+
+**The `db_disk` alert now measures RETENTION, not disk.** Its old name and condition
+("DB disk >80% / volume usage") described a signal the backend cannot see, while its
+own ACTION column asked for something it can: "check retention". Those were two
+different questions and only the second is answerable here. `GET /api/admin/metrics`
+reports the age of the oldest row per age-based table, present only when that row has
+exceeded the table's window, so the alert fires when a retention **promise** is being
+broken — which is an incident at any disk size, whereas 80% full is normal for a
+working database. The row above is restated accordingly rather than silently redefined.
 
 **The all-providers-unhealthy alert is SERVED too.** `GET /api/admin/metrics` also
 reports `unhealthy_models`: the models whose EVERY routed endpoint has an open
