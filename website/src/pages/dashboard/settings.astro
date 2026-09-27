@@ -123,10 +123,35 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
     </p>
     <p class="mt-2 text-sm text-ink-muted">
       Unlinking removes only the link: <strong>the account and its balance remain</strong>,
-      and the Telegram account can be relinked later. Linking is not yet available
-      from the dashboard — the endpoints are specified but not deployed — so the
-      current link state is shown read-only above.
+      and the Telegram account can be relinked later.
     </p>
+
+    <!-- Link code ------------------------------------------------------- -->
+    <div id="telegram-link-panel" hidden class="mt-4 rounded-md border border-edge-strong bg-surface-sunken p-4">
+      <p class="text-sm font-medium">Your link code</p>
+      <p id="link-code" class="mt-2 font-mono text-2xl tracking-[0.3em] tabular-nums">&mdash;</p>
+      <p id="link-code-instruction" class="mt-2 text-sm text-ink-muted"></p>
+      <button id="link-code-again" type="button"
+        class="mt-3 rounded-md border border-edge-strong px-3 py-1.5 text-xs font-medium hover:border-brand">
+        Issue a new code
+      </button>
+    </div>
+
+    <div id="telegram-error" hidden role="alert"
+      class="mt-3 rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+    <div id="telegram-done" hidden role="status"
+      class="mt-3 rounded-md border border-ok-edge bg-ok-surface p-3 text-sm text-ok-ink"></div>
+
+    <div class="mt-4 flex flex-wrap gap-3">
+      <button id="telegram-link" type="button" hidden
+        class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">
+        Link Telegram
+      </button>
+      <button id="telegram-unlink" type="button" hidden
+        class="rounded-md border border-danger-edge bg-danger-surface px-4 py-2 text-sm font-medium text-danger-ink hover:border-danger">
+        Unlink Telegram
+      </button>
+    </div>
   </section>
 
   <!-- Session controls ---------------------------------------------------- -->
@@ -152,7 +177,11 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
   import { describeError, renderNotice } from '../../lib/errors';
   import { pb } from '../../lib/pocketbase';
   import { describeAuthError } from '../../lib/auth-flow';
-  import { passwordChangeError } from '../../lib/dashboard-form';
+  import {
+    linkCodeInstruction,
+    passwordChangeError,
+    type LinkCodeResponse,
+  } from '../../lib/dashboard-form';
 
   /** Spec line 71: a password change invalidates every session, by design. */
   const PASSWORD_CHANGED_MESSAGE =
@@ -201,6 +230,8 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
       $('profile-status').textContent = me.status;
       // The balance is not repeated here — the header already shows it live.
       $('linked-telegram').textContent = me.telegram_linked ? 'Linked' : 'Not linked';
+      // Reveal the correct control: "Link" when unlinked, "Unlink" when linked.
+      renderTelegram(me.telegram_linked);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
       // A failed fetch says so. The placeholders stay dashes, not stale values.
@@ -283,6 +314,64 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
         passwordSubmit.disabled = false;
         passwordSubmit.textContent = 'Change password';
       });
+  });
+
+  // --- Telegram link / unlink ---------------------------------------------
+  // The endpoints were specified and are now mounted (routes/mod.rs:199-200), so
+  // this is a live control, not the read-only display it used to be. The server
+  // owns the 5-minute TTL, single-use, and the hourly issuance cap; the UI only
+  // shows what it returns.
+  const linkBtn = $('telegram-link');
+  const unlinkBtn = $('telegram-unlink');
+  const linkPanel = $('telegram-link-panel');
+  const telegramError = $('telegram-error');
+  const telegramDone = $('telegram-done');
+
+  function telegramFail(err: unknown): void {
+    telegramDone.hidden = true;
+    telegramError.textContent = describeError(err).message;
+    telegramError.hidden = false;
+  }
+
+  function showLinkCode(response: LinkCodeResponse): void {
+    telegramError.hidden = true;
+    $('link-code').textContent = response.code;
+    $('link-code-instruction').textContent = linkCodeInstruction(response.code, response.ttl_minutes);
+    linkPanel.hidden = false;
+  }
+
+  function renderTelegram(linked: boolean): void {
+    linkBtn.hidden = linked;
+    unlinkBtn.hidden = !linked;
+    if (linked) linkPanel.hidden = true;
+  }
+
+  linkBtn.addEventListener('click', () => {
+    telegramError.hidden = true;
+    telegramDone.hidden = true;
+    void apiFetch<LinkCodeResponse>('/api/telegram/link-code', { method: 'POST' })
+      .then(showLinkCode)
+      .catch(telegramFail);
+  });
+
+  $('link-code-again').addEventListener('click', () => {
+    telegramError.hidden = true;
+    void apiFetch<LinkCodeResponse>('/api/telegram/link-code', { method: 'POST' })
+      .then(showLinkCode)
+      .catch(telegramFail);
+  });
+
+  unlinkBtn.addEventListener('click', () => {
+    telegramError.hidden = true;
+    telegramDone.hidden = true;
+    void apiFetch<{ status: string; removed: number }>('/api/telegram', { method: 'DELETE' })
+      .then(() => {
+        renderTelegram(false);
+        $('linked-telegram').textContent = 'Not linked';
+        telegramDone.textContent = 'Telegram unlinked. Your account and balance are unchanged; you can link a chat again at any time.';
+        telegramDone.hidden = false;
+      })
+      .catch(telegramFail);
   });
 
   void loadProfile();

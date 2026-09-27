@@ -285,3 +285,55 @@ export function passwordChangeError(
   if (current.length === 0) return 'Enter your current password.';
   return passwordRuleError(next) ?? confirmationError(next, confirm);
 }
+
+/**
+ * The Telegram link flow, as pure logic.
+ *
+ * docs/server/api-spec.md: `POST /api/telegram/link-code` issues a 6-digit
+ * code — single-use, 5-minute TTL, bound to the account — and `DELETE
+ * /api/telegram` unlinks. The server owns issuance, expiry and the hourly cap;
+ * these helpers only format what it returns and validate what the user typed.
+ */
+
+/** The body of `POST /api/telegram/link-code` (server/src/routes/telegram.rs). */
+export interface LinkCodeResponse {
+  code: string;
+  expires_at: string;
+  ttl_minutes: number;
+}
+
+/**
+ * The Telegram code as the user should read it back.
+ *
+ * The server zero-pads the code ("000042") because redemption compares the
+ * string, so the leading zeros ARE the code. Trimming or stripping them would
+ * send the bot a different value than was issued, so this preserves them and
+ * only guards against an unexpectedly short code by refusing to pad in a way
+ * that changes meaning — it returns the code unchanged.
+ */
+export function formatLinkCode(code: string): string {
+  return code.trim();
+}
+
+/**
+ * Whether the typed code is the 6-digit shape `/link` expects.
+ *
+ * The bot redeems `{code, telegram_id}`; a code that is not six digits cannot
+ * match any issued code, so the dashboard refuses to show a "sent" state for it.
+ * Digits only — the server draws from `next_u32() % 1_000_000` and zero-pads,
+ * so letters never occur.
+ */
+export function isPlausibleLinkCode(candidate: string): boolean {
+  return /^\d{6}$/.test(candidate.trim());
+}
+
+/**
+ * The instruction text to show beside an issued code.
+ *
+ * It names the exact chat command so the user does not have to guess the syntax,
+ * and states the TTL the server reported rather than a hardcoded number — a
+ * hardcoded "5 minutes" would silently lie if the TTL changed.
+ */
+export function linkCodeInstruction(code: string, ttlMinutes: number): string {
+  return `Send /link ${formatLinkCode(code)} to the apikita bot in Telegram. The code works once and expires in ${ttlMinutes} minute${ttlMinutes === 1 ? '' : 's'}.`;
+}

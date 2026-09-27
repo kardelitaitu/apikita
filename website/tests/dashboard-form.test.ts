@@ -23,7 +23,10 @@ import {
   buildCreateKeyRequest,
   describeModelAccess,
   expiryToIso,
+  formatLinkCode,
+  isPlausibleLinkCode,
   limitError,
+  linkCodeInstruction,
   passwordChangeError,
   plaintextKeyOf,
   type CreateKeyFields,
@@ -276,3 +279,37 @@ test('an expiry date in the past is refused; today and the future are not', () =
   assert.equal(never.body.expires_at, null);
 });
 
+
+// --- Telegram link flow -----------------------------------------------------
+// docs/server/api-spec.md: the code is single-use, 5-minute TTL, and the server
+// zero-pads it. The leading zeros ARE the code, so the two things that must not
+// happen are (a) stripping them and (b) accepting a non-6-digit string as ready.
+
+test('a link code keeps its zero padding', () => {
+  // '000042' is a valid issued code, not the number 42. Stripping the zeros
+  // would send the bot a code that was never issued.
+  assert.equal(formatLinkCode('000042'), '000042');
+  assert.equal(formatLinkCode(' 123456 '), '123456');
+});
+
+test('only a six-digit string is a plausible link code', () => {
+  assert.equal(isPlausibleLinkCode('123456'), true);
+  assert.equal(isPlausibleLinkCode('000042'), true);
+  assert.equal(isPlausibleLinkCode(' 123456 '), true);
+  // Wrong lengths, letters, and empties are all refused.
+  assert.equal(isPlausibleLinkCode('12345'), false);
+  assert.equal(isPlausibleLinkCode('1234567'), false);
+  assert.equal(isPlausibleLinkCode('12ab56'), false);
+  assert.equal(isPlausibleLinkCode(''), false);
+});
+
+test('the instruction names the command and the server-stated TTL', () => {
+  const text = linkCodeInstruction('000042', 5);
+  // The exact command, with the padding intact.
+  assert.match(text, /\/link 000042/);
+  // The TTL comes from the argument, not a hardcoded "5".
+  assert.match(text, /5 minutes/);
+  // Singular at 1, so the copy never reads "1 minutes".
+  assert.match(linkCodeInstruction('123456', 1), /1 minute\b/);
+  assert.doesNotMatch(linkCodeInstruction('123456', 1), /1 minutes/);
+});
