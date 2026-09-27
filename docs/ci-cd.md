@@ -239,6 +239,35 @@ they race, and a rollback becomes ambiguous.
 
 **The last row matters more than it looks.** A test that passes on retry teaches
 everyone to re-run rather than investigate.
+## Coverage: measured, not gated
+
+The table above deliberately does NOT gate on a coverage percentage, and that
+decision stands — a percentage is not evidence that the money paths are tested.
+But "do not GATE on it" is not "do not MEASURE it": an unmeasured number cannot
+tell you where the untested code is, and the one time this was measured it found
+the worst-covered file in the crate was the **login handler**.
+
+```bash
+cd server && cargo llvm-cov --lib --lcov --output-path coverage/lcov.info
+```
+
+**Baseline, measured 2026-09-27 (`--lib`; branches were not captured by this run):**
+
+| Metric | Value |
+| --- | --- |
+| Total line coverage | **95.20%** (14,348 / 15,071) |
+| `money.rs`, `error.rs` | **100%** |
+| Files below 90% | `routes/events.rs` 86.2%, `routes/admin.rs` 86.6%, `routes/proxy.rs` 89.9% |
+
+**The lesson from the first measurement, kept because it is the argument for
+measuring at all:** `routes/auth.rs` was at **58.6%**, by far the worst in the
+repo, and the uncovered block was the *entire* `exchange_token` handler. Nothing
+flagged it — the file looked like every other file, the suite was green, and the
+only test that touched the handler was `#[ignore]`d behind a live PocketBase. It
+is now at **98.2%** via a loopback stub, with the ignore removed.
+
+**The three files still below 90% are the honest worklist**, in that order.
+
 
 ## Rollback
 
