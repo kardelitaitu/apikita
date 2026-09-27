@@ -65,10 +65,21 @@ opinion.
       refund notification returns 200 with `{"status":"refund_not_supported"}`,
       logs at `error!`, and writes nothing — the topup stays `settled`, no ledger
       row is appended, the wallet cannot move.
-- [ ] **Alerting on that refusal** — unalerted, a refusal is indistinguishable from
-      a bug. The code logs the documented event; nothing schedules or alerts on it
-      yet. This is the ONE part of this group that is genuinely outstanding, and it
-      is an ops task rather than a code defect.
+- [x] **Alerting on that refusal** — previously the ONE outstanding code-shaped item
+      in this group. `server/src/routes/webhooks.rs` now emits `event = "refund.refused"`,
+      a DISTINCT name from `topup.rejected` because they mean opposite things (a
+      rejection is a failed payment that may owe money; a refusal is a refund declined
+      by policy, i.e. the system working — sharing the name would page on routine
+      enforcement and hide a refusal spike inside a rejection count). `alerts.tsv` carries
+      the entry and `probe.sh --check refund_refusal` scans for it with its OWN
+      line-offset marker, so it and `topup.rejected` cannot consume each other's events.
+      Why alert on correct behaviour: a refusal is the one webhook outcome where NOTHING
+      moves, which is also what a status-mapping regression routing real events into this
+      arm would look like. Tested
+      (`a_refund_refusal_is_logged_under_its_own_documented_event`, mutation-verified
+      against an event rename), and the probe's marker behaviour was exercised end to end:
+      alerts once, reports 0 on the next scan, and leaves the rejection check still seeing
+      its own event.
 
 ### Ledger and balance
 
