@@ -199,6 +199,27 @@ As of Phases 0–5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
   `concurrent_requests_cannot_overdraw_a_one_request_balance` — had been
   `#[ignore = "requires live Postgres"]` and were therefore never executed
   automatically. They now are.
+- **Link-code redemption is built, and its safety is the ATTEMPT CAP, not the
+  code's secrecy.** A 6-digit code is 10^6 possibilities — nothing to a script — so
+  the endpoint is defended by counting every guess: `limits.link_redemption_per_hour`
+  (20) bounds attempts per **client IP**, and `link_code_issuance_per_hour` (10)
+  bounds codes in flight per **account**, because they are different attacks (a host
+  cycling accounts touches no account at all). **The arithmetic, computed rather
+  than asserted:** at 20 guesses/hour a host gets ~1.7 guesses inside one 5-minute
+  code window, so the per-window hit chance on a *targeted* account is ~1.7·10^-6
+  and the expected time to hit it is **~5.7 years** — the code rotates, so the space
+  does not shrink and the search cannot be amortised. Against the
+  **one-live-code-per-account** rule, that is the whole defence: the TTL is what
+  makes the cap bite, and the cap is what makes the TTL survivable. A real user
+  mistyping hits a handful of these.
+  Three properties are pinned by tests rather than intent: **failed guesses count**
+  (the attack IS the failure stream, so a counter that advanced only on success
+  would never fire — proven by refusing a *correct* code once the budget is spent);
+  **every refusal is byte-identical** (wrong/expired/used/unknown cannot be told
+  apart, or the endpoint becomes an oracle that narrows 10^6 to the few hundred
+  codes live at any moment); and **single-use holds under concurrency** (one
+  conditional `UPDATE … WHERE used_at IS NULL`, no read-then-write). Attempts are
+  stored as a **salted IP hash, never the raw address** (Gate 4).
 - **`sessions.last_seen_at` now ENFORCES the 7-day idle bound as well as the
   30-day absolute one.** The idle half needed a write on the request path, and that
   design decision is now made: resolving a session cookie is the activity signal, so

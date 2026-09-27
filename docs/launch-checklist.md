@@ -95,7 +95,7 @@ opinion.
       The idle half is measured from `sessions.last_seen_at`, which moves when a
       session cookie resolves on a dashboard endpoint and is **not** touched by
       `/v1/*` (that path authenticates API keys, not cookies).
-- [ ] Link-code redemption is rate-limited per account and per IP.
+- [x] Link-code redemption is rate-limited per account and per IP.
 
 > **The three admin items above were implemented in `server/src/routes/admin.rs`
 > and covered by live tests, but the boxes stayed unchecked** — the checklist had
@@ -103,9 +103,18 @@ opinion.
 > a non-operator gets an identical 403 for a present and an absent id), one
 > `BEGIN IMMEDIATE` transaction does the status change, the session revocations,
 > the key revocations and the single `admin_audit` insert, and a failed suspend
-> writes no audit row. Link-code redemption is the one item that is genuinely
-> unbuilt: `grep -r 'link_code|redeem' server/src` returns nothing — the table
-> exists in the schema and no code reads it.
+> writes no audit row.
+>
+> **Link-code redemption was the one item genuinely unbuilt when this note was
+> written**, and it is now built (`server/src/routes/telegram.rs`). Both caps the
+> docs demand are enforced and independently tested: **per account** by
+> `limits.link_code_issuance_per_hour` over issued codes, and **per IP** by
+> `limits.link_redemption_per_hour` over recorded attempts. The property that
+> matters is that **failed guesses count** — the attack on a 6-digit code IS the
+> failure stream, so a counter that advanced only on success would never fire.
+> Refusing a *correct* code once the budget is spent is what proves it. Every
+> refusal (wrong, expired, used, malformed, unknown) is **byte-identical**, so the
+> endpoint cannot be used as an oracle for which codes are live.
 
 ## Gate 4 — Data promises that must be true
 
@@ -136,7 +145,10 @@ statement is false.**
 - [ ] Top-up screen states the fee and the non-refundable policy before payment.
 - [ ] Deposit minimums enforced server-side (first vs re-top-up differ).
 - [ ] API key shown once, with an acknowledged warning.
-- [ ] Telegram `/link` flow works end to end.
+- [x] Telegram `/link` flow works end to end **on the server side** — issue,
+      redeem, unlink and re-link are implemented and covered by live tests. The
+      Telegram *bot* itself is still design-only (`telegram/README.md` has no code),
+      so the flow has not been exercised against the Bot API.
 - [ ] Review flow creates once and edits thereafter; withdrawal is a flag.
 - [ ] Telegram top-up feed posts on settlement only, never on creation.
 

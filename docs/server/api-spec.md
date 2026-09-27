@@ -207,15 +207,51 @@ inserts a `topups` row with status `pending`, and calls Midtrans.
 ### `POST /api/telegram/link-code`
 
 Issues a 6-digit code: single-use, 5-minute TTL, bound to the account. Invalidates
-any previous code for that account.
+any previous code for that account — the predecessor row is **deleted** in the same
+transaction as the insert, so at most ONE code is ever live per account (two live
+codes would double an attacker's chance per guess).
+
+Capped by `limits.link_code_issuance_per_hour` (default 10) over the codes the
+account has issued, so a farm cannot keep thousands in flight.
 
 ### `DELETE /api/telegram`
 
-Unlinks Telegram. **Removes one row — never the account or the wallet.**
+Unlinks Telegram. **Removes one row — never the account or the wallet.** The
+handler deletes from `telegram_links` only; the wallet and the ledger are asserted
+untouched by test.
 
-The bot calls a separate internal endpoint to redeem codes. **Redemption must be
-rate-limited per account and per IP**; a 6-digit code is brute-forceable and a
-guess attaches an attacker's Telegram to a funded wallet.
+### `POST /api/bot/link` — redemption (bot token)
+
+The bot calls this to redeem a code typed in chat. Body: `{code, telegram_id}`.
+
+**This is the highest-risk endpoint in the Telegram surface**, because a successful
+guess attaches an attacker's chat to a **funded wallet**. Its safety rests on three
+properties, each pinned by a test rather than by intent:
+
+| Property | Why it matters | Test |
+| --- | --- | --- |
+| **Every attempt counts, including failures** | The attack IS a stream of failures, so a counter that advanced only on success would never fire | `failed_guesses_are_counted_until_the_cap_refuses_even_a_correct_code` |
+| **Every refusal is byte-identical** | Distinguishing "expired" from "unknown" turns a blind 10^6 search into a walk over the few hundred codes live right now | `every_kind_of_bad_code_produces_the_same_refusal` |
+| **Single-use holds under concurrency** | One conditional `UPDATE … WHERE used_at IS NULL`, so two redemptions cannot both claim the row | `a_code_is_single_use` |
+
+Rate-limited **per IP** by `limits.link_redemption_per_hour` (default 20) over
+attempts, counted in `link_redemption_attempts` by **salted IP hash, never the raw
+address**. Computed, not asserted: at 20/hour a host gets ~1.7 guesses inside one
+5-minute code window, so the expected time to hit a *specific* account's live code
+is **~5.7 years**. The TTL is what makes the cap bite — only one code per account is
+live, and it rotates — while the cap is what makes the TTL survivable. A refused attempt is not recorded, so a throttled attacker cannot extend
+their own lockout or grow the table without bound. The per-account cap above does
+not cover this: an attacker cycling the code space touches no account at all.
+
+**Response: 200 with `{"status":"invalid_code"}` for every unsuccessful
+redemption** — wrong, expired, used, malformed and unknown alike. A 4xx would
+invite the bot's transport to retry a guess, which is the opposite of the cap's
+purpose. Success returns `{"status":"linked","account_id":…}`.
+
+The bot token is required and compared in **constant time**. **A missing
+`TELEGRAM_BOT_TOKEN` refuses rather than allows** — with no configured secret
+there is no way to distinguish the bot from an attacker, so the endpoint fails
+closed. A cookie is not a bot credential.
 
 ---
 
