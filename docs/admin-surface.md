@@ -41,9 +41,17 @@ built** — the status of each item is marked where it appears.
 `admin_audit` row with `action='resume'`. Pick either; there is no difference to
 reason about.
 
-**There is no admin UI.** These are HTTP routes only. The launch checklist asks
-for "Read-only + suspend" — this is the API half of that, and a UI would be a
-separate build (see [Rollout](#rollout)).
+**The admin UI now exists** at `website/src/pages/admin/index.astro` — the
+operator console (`/admin`). It is the front end for exactly the three routes
+above: look up an account by id, read its state, and suspend or resume it. The
+launch checklist's "Read-only + suspend" is now satisfied end to end, API and UI.
+
+The UI adds **no capability**: it calls the same routes with the same session
+cookie, and every rule below (operator flag, self-action refusal, 401/403/409)
+is enforced server-side. The console is *gated* on the `is_operator` flag that
+`GET /api/me` now returns, but that gate is cosmetic — a non-operator who
+reaches it anyway gets a 403 from the server, and the console never renders a
+control the server would reject.
 
 ### Auth and status codes
 
@@ -316,9 +324,9 @@ See [`observability.md`](observability.md).
 
 | Phase | Surface | Status |
 | --- | --- | --- |
-| **Launch** | Read-only + suspend/restore. Money actions via SQL by the owner, documented | **Routes built**; `/keys/:id/revoke` on the admin path is still planned (the customer route exists). **No UI** |
+| **Launch** | Read-only + suspend/restore. Money actions via SQL by the owner, documented | **Routes and UI built** — the operator console at `/admin`; `/keys/:id/revoke` on the admin path is still planned (the customer route exists) |
 | **With revenue** | Adjustments as an endpoint, with notes and audit. **Not refunds** — the platform does not refund | Not built |
-| **Later** | Second-operator threshold, dedicated UI, more roles | Not built |
+| **Later** | Second-operator threshold, more roles, broader operator dashboards | Not built |
 
 **Starting read-only is deliberate.** The dangerous actions are the money ones, and
 they should be implemented once there is revenue to misfile — not on day one when

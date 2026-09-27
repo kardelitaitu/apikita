@@ -162,7 +162,7 @@ Deliberately excluded, and why:
 | A staging environment | Costs money; production-only until revenue justifies it |
 | Uptime SLA | Do not promise what you cannot measure |
 | A public status page | Later |
-| An admin UI | Read-only + suspend is enough at launch |
+| An admin UI | **Built** — read-only lookup + suspend/restore at `/admin`; that was the launch bar |
 | 2FA | Later; Google sign-in already carries it |
 | Model breadth | Flash tier only |
 

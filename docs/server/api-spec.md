@@ -88,11 +88,18 @@ Everything the dashboard needs on load.
     "cost_idr": 0
   },
   "telegram_linked": false,
-  "status": "active"
+  "status": "active",
+  "is_operator": false
 }
 ```
 
 **This is the polling fallback** when SSE drops. Keep it cheap.
+
+`is_operator` is a **rendering hint, not authorization**: it lets the browser
+decide whether to show the admin entry points at all, instead of presenting links
+that answer `403`. Every admin route independently re-checks
+`accounts.is_operator` server-side (`admin.rs::require_operator`), so a forged
+value here grants nothing.
 
 ### `GET /api/usage?from=&to=`
 
@@ -486,7 +493,10 @@ Authorization is the `accounts.is_operator` flag, plus a normal session cookie.
 ### Implemented routes
 
 These four exist in `server/src/routes/mod.rs` and are the whole admin surface
-today. There is **no admin UI** — routes only.
+today. The **operator console** at `/admin`
+(`website/src/pages/admin/index.astro`) is the UI over them — lookup, plus
+suspend/resume. The UI adds no capability; it calls these routes with the same
+session cookie and every guard is enforced here, server-side.
 
 | Endpoint | Handler | Effect |
 | --- | --- | --- |
@@ -589,9 +599,9 @@ documented cost of the key-metadata cache and is **not closed by these routes**.
    from theft during an audit.
 6. **Nothing here can read prompts or plaintext keys** — neither is stored.
 
-Rollout: **read-only and suspend/restore are built; the admin key-revoke route is
-still planned.** Money actions arrive with the first revenue, not on day one.
-There is no admin UI.
+Rollout: **read-only and suspend/restore are built, API and UI; the admin
+key-revoke route is still planned.** Money actions arrive with the first revenue,
+not on day one.
 
 ## Cross-cutting rules
 
