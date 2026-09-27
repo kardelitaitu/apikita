@@ -297,6 +297,23 @@ jobs:
           # `--rm` containers exit, so the removal is allowed to fail.
           docker volume rm apikita-ci-data >/dev/null 2>&1 || true
 
+# The edge relay must actually STREAM SSE.
+      #
+      # docs/edge-relay.md:110 - "A relay that buffers SSE is worse than no relay -
+      # the UI silently stops updating." The failure answers 200 and looks connected,
+      # so nothing else in this workflow would notice. Nothing looked at relay.conf
+      # at all before this step.
+      #
+      # BOTH halves run: the text check (are the directives present on both streaming
+      # locations) and the behavioural one (do they DO what the doc claims). A typo in
+      # a directive name passes a grep and still buffers, so they are different
+      # failures and both matter.
+      - name: Check the edge relay streams SSE
+        run: |
+          set -euo pipefail
+          sh tools/relay-check/check.sh
+          sh tools/relay-check/behaviour.sh
+
       - name: Install website dependencies
         working-directory: website
         run: npm ci
