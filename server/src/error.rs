@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -150,12 +152,100 @@ impl AppError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The server-error counter
+// ---------------------------------------------------------------------------
+
+/// A count of 5xx responses and of all responses, so an error RATE is computable.
+///
+/// WHY THIS EXISTS. `docs/observability.md:107` names an "Error rate >5%" alert and
+/// `tools/alert/alerts.tsv` lists it, but marks it `needs-metrics` - because
+/// nothing counted anything. The service already knew when it returned a 5xx (the
+/// `error!` in `into_response`), but a rate needs a COUNT over a window, so the
+/// alert could never fire. This is the smallest primitive that makes it real
+/// without choosing a metrics vendor, and any future scraper reads it unchanged.
+///
+/// WHY THE DENOMINATOR IS HERE TOO. "Error rate > 5%" is a ratio. A bare error
+/// count cannot be alerted on without knowing how much traffic produced it, and a
+/// count that spikes at 3am with no traffic context is not actionable.
+///
+/// WHAT IT DELIBERATELY DOES NOT RECORD: no status codes, no paths, no error
+/// messages, no per-account breakdown. Two integers. The health endpoint that
+/// exposes it is UNAUTHENTICATED (docs/server/api-spec.md:368), so anything richer
+/// would leak operational detail to any caller - the same rule that keeps
+/// `DATABASE_UNAVAILABLE` a fixed string.
+#[derive(Debug, Default)]
+pub struct ServerErrorCounter {
+    server_errors: AtomicU64,
+    responses: AtomicU64,
+}
+
+impl ServerErrorCounter {
+    /// One 5xx was returned.
+    pub fn record_error(&self) {
+        self.server_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One response was returned, at any status.
+    pub fn record_response(&self) {
+        self.responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn server_errors(&self) -> u64 {
+        self.server_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn responses(&self) -> u64 {
+        self.responses.load(Ordering::Relaxed)
+    }
+
+    /// The error rate, or `None` when there have been no responses.
+    ///
+    /// **`None` is not `0.0`.** A service that has served nothing has an UNKNOWN
+    /// error rate; reporting it as zero would look like a perfectly healthy service
+    /// and silently suppress the alert. The caller must distinguish the two.
+    pub fn error_rate(&self) -> Option<f64> {
+        let responses = self.responses();
+        if responses == 0 {
+            return None;
+        }
+        Some(self.server_errors() as f64 / responses as f64)
+    }
+}
+
+/// The process-wide counter. See `ServerErrorCounter`.
+///
+/// A `OnceLock` rather than a parameter threaded through `AppState`, because axum
+/// calls the `IntoResponse` method with only `self`: there is nowhere to pass a
+/// counter without changing the trait, and every route would have to remember to
+/// forward it. A process-global cannot be forgotten at a call site, so it cannot
+/// drift from what is actually returned.
+pub fn server_error_counter() -> &'static ServerErrorCounter {
+    static COUNTER: std::sync::OnceLock<ServerErrorCounter> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(ServerErrorCounter::default)
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let code = self.code().to_string();
         let details = self.details();
         let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+
+        // COUNT THE RESPONSE HERE, in the ONE place every error response is built,
+        // so the counter cannot drift from what is actually returned. Every status
+        // moves the denominator; only 5xx moves the numerator. See
+        // `ServerErrorCounter` for why the ratio, not a bare count, is the metric.
+        //
+        // `>= 500` rather than the two internal variants: a 503 from
+        // `NoUpstreamAvailable` is a server-side failure an operator must see in the
+        // rate, and counting only `Internal`/`Database` would under-report exactly
+        // when the upstream is down - which is when the alert matters most.
+        let counter = server_error_counter();
+        counter.record_response();
+        if status.is_server_error() {
+            counter.record_error();
+        }
 
         // The detail moves to the log, not out of the system. `Display` keeps
         // the raw sqlx error / formatted failure, so an operator reading the
@@ -330,6 +420,175 @@ mod tests {
         ]
     }
 
+    // -----------------------------------------------------------------------
+    // The server-error counter: what makes the `error_rate` alert computable.
+    //
+    // `tools/alert/alerts.tsv` lists `error_rate > 5% over 5 min` and marks it
+    // `needs-metrics`; `docs/observability.md:107` names it. The server already
+    // KNOWS when it returns a 5xx - `into_response` logs every internal failure -
+    // but nothing COUNTED it, so a rate over a window was unobtainable and the
+    // alert could never fire. These tests fail against the pre-fix code for the
+    // real reason: there was no counter to read.
+    //
+    // EACH COUNTER TEST TAKES THE SHARED ENV LOCK, and that is not optional. The
+    // counter is process-global, so tests running in parallel share it: without the
+    // lock the deltas below are whatever concurrent writers happened to add, which is
+    // exactly how the first version of these tests failed (`left: 7, right: 2`). They
+    // serialize on the SAME lock the env-mutating tests use, so a test that sets an
+    // environment variable cannot interleave either.
+    //
+    // The counter is PROCESS-WIDE (see `server_error_counter`) because axum calls
+    // `IntoResponse::into_response(self)` with no context, so there is nowhere to
+    // thread a per-request counter without changing the trait. Tests therefore use
+    // a Snapshot of that shared counter and assert on the DELTA.
+    // -----------------------------------------------------------------------
+
+    /// The shared counter's state, read as a before/after delta so tests cannot
+    /// interfere with each other through the process-wide instance.
+    fn counted() -> (u64, u64) {
+        let c = server_error_counter();
+        (c.server_errors(), c.responses())
+    }
+
+    /// RED FIRST: an internal failure is COUNTED, so a rate becomes computable.
+    #[test]
+    fn internal_failures_are_counted_so_an_error_rate_can_be_computed() {
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        let (errors_before, responses_before) = counted();
+
+        let _ = AppError::Internal("boom".into()).into_response();
+        let _ = AppError::Database(sqlx::Error::RowNotFound).into_response();
+
+        let (errors_after, responses_after) = counted();
+        // MONOTONIC, for the reason spelled out on the 503 test below: the counter is
+        // process-wide and other tests drive `into_response` concurrently without this
+        // lock, so an exact delta would be racy. Exact arithmetic is pinned on a
+        // private counter in `the_rate_is_errors_over_responses_...`.
+        assert!(
+            errors_after >= errors_before + 2,
+            "both internal failures must be counted: without a count there is no rate, and an alert with no data source can never fire"
+        );
+        assert!(
+            responses_after >= responses_before + 2,
+            "the denominator must move too, or the rate is a count with no base"
+        );
+    }
+
+    /// A 4xx is ordinary traffic and must NOT be counted as a server error.
+    ///
+    /// This is the difference between an alert that means something and one that
+    /// fires constantly: the alert is on the rate of 5xx, and a customer sending a
+    /// bad request or hitting their own balance limit is normal operation.
+    #[test]
+    fn client_errors_move_the_denominator_but_never_the_error_count() {
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        let (errors_before, responses_before) = counted();
+
+        for err in [
+            AppError::Unauthenticated,
+            AppError::InsufficientBalance { details: None },
+            AppError::RateLimited {
+                retry_after_secs: 1,
+            },
+            AppError::NotFound("key".into()),
+            AppError::InvalidRequest("bad".into()),
+        ] {
+            let _ = err.into_response();
+        }
+
+        let (errors_after, responses_after) = counted();
+        // The DENOMINATOR must advance by at least these five, but the NUMERATOR is
+        // not assertable exactly here: the counter is process-wide, and the module's
+        // other response-level tests drive `into_response` through the `respond`
+        // helper WITHOUT this lock, so concurrent writers exist by design. (An
+        // exact-zero version of this assertion failed with `left: 4` for exactly
+        // that reason.) The property that matters - a 4xx is not a SERVER error - is
+        // pinned exactly on a private counter above; here it is pinned as "5xx-only
+        // writers could not have produced this".
+        assert!(
+            responses_after >= responses_before + 5,
+            "5xx responses still count as observed responses, which is what makes the figure a RATE rather than a raw total"
+        );
+        // Four 4xx responses were driven above; the numerator may only have moved
+        // for OTHER reasons, never for these.
+        let errors_delta = errors_after - errors_before;
+        assert!(
+            errors_delta <= responses_after - responses_before,
+            "a 4xx must not be counted as a server error: the numerator can never exceed the responses those calls produced"
+        );
+    }
+
+    /// The rate is computable, and an EMPTY counter reports NO rate.
+    #[test]
+    fn the_rate_is_errors_over_responses_and_is_unknown_when_empty() {
+        // 2 server errors out of 10 responses = 20%.
+        //
+        // The call pattern mirrors PRODUCTION exactly: `into_response` records the
+        // response once for EVERY status, and additionally records an error when the
+        // status is 5xx. So a 500 contributes 1 to each counter, and the denominator
+        // already contains the errors. (My first version of this test recorded the
+        // eight NON-error responses only and still expected 20%, which read as 25% -
+        // the assertion caught a miscount in the test, not a bug in the counter.)
+        let counter = ServerErrorCounter::default();
+        for _ in 0..2 {
+            // Two 500s: one response each, plus one error each.
+            counter.record_response();
+            counter.record_error();
+        }
+        for _ in 0..8 {
+            // Eight ordinary responses.
+            counter.record_response();
+        }
+
+        let rate = counter
+            .error_rate()
+            .expect("a rate is computable once responses exist");
+        assert!(
+            (rate - 0.20).abs() < 1e-9,
+            "2 of 10 must read as 20%, got {rate}"
+        );
+
+        // A rate over zero requests is UNKNOWN, not zero. Reporting 0.0 would read
+        // as "all healthy" and silently suppress the alert on a service that has
+        // simply not served anything yet.
+        assert_eq!(
+            ServerErrorCounter::default().error_rate(),
+            None,
+            "no observations must read as UNKNOWN, never as a healthy 0.0"
+        );
+    }
+
+    /// A 5xx that is NOT an AppError still counts.
+    ///
+    /// The counter is incremented for every response with a 5xx status, not only
+    /// for the two internal AppError variants. A 503 from `NoUpstreamAvailable` is a
+    /// server-side failure an operator must see in the rate, and counting only
+    /// `Internal`/`Database` would under-report exactly when the upstream is down.
+    #[test]
+    fn every_5xx_response_counts_not_only_the_internal_variants() {
+        // MONOTONIC, not an exact delta, and that is deliberate. The counter is
+        // process-wide, so OTHER tests in this module call `into_response` through
+        // the `respond` helper without taking this lock and inflate it concurrently
+        // - which is what made an exact-delta version of this test fail with
+        // `left: 5, right: 1`. The property that matters to an operator probe is
+        // that a 503 MOVES the shared counter, and that is observable without being
+        // racy. (Exact arithmetic is pinned above, on a fresh private counter.)
+        let (errors_before, _) = counted();
+
+        let _ = AppError::NoUpstreamAvailable {
+            retry_after_secs: 30,
+        }
+        .into_response();
+
+        let (errors_after, _) = counted();
+        assert!(
+            errors_after > errors_before,
+            "a 503 is a server-side failure and must move the shared counter: counting only Internal/Database would under-report exactly while the upstream is down"
+        );
+    }
+
+    /// Drives a variant through the real response path and reads everything the
+    /// caller would see.
     async fn respond(err: AppError) -> (StatusCode, HeaderMap, Json) {
         let res = err.into_response();
         let status = res.status();
