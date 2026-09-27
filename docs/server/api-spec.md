@@ -602,7 +602,7 @@ There is no admin UI.
 | Return only needed fields | Prevents `key_hash` or internal ids leaking |
 | Key metadata cached ≤60s | The DB must not be on every token's hot path |
 | Rate-limit: login, key creation, link-code redemption, top-up creation | All are abuse targets |
-| Money is `BIGINT` IDR end to end | No floats, ever |
+| Money is `INTEGER` IDR end to end | No floats, ever. `BIGINT` was the Postgres type; `STRICT` SQLite tables admit only `INTEGER` |
 | Log every wallet mutation with actor and reason | The `ledger` table is that record |
 | Admin endpoints require the operator flag | Not a separate credential, and never a shared secret |
 | Admin endpoints return 403 `forbidden`, not 401, for a non-operator | The caller is authenticated; this is authorization, not authentication |

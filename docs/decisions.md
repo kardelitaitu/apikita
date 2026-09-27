@@ -35,7 +35,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Second relay | **No** | The backend is already the fallback; a second relay is cost without benefit |
 | Session storage | **Server-side rows in the local SQLite database** | Makes logout revoke immediately |
 | SSE auth | **Session cookie, same-site subdomain** | A token in a query string lands in logs and history |
-| Account key | **`accounts.id` is the only key; the PocketBase id column is dropped** | Auth is the component most likely to change, so it must not own the identity |
+| Account key | **`accounts.id` is the only key (target); the PocketBase id column is dropped at Phase 6** | Auth is the component most likely to change, so it must not own the identity. **Status: `accounts.pb_user_id` is still present as `TEXT NOT NULL UNIQUE`** — it links to the live PocketBase user and is dropped only when Phase 6 retires the link |
 | Proxy/API split | **One service for now** | They share the database, key lookup, and usage accounting |
 
 ### Money
@@ -94,8 +94,8 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Decision | Value | Rationale |
 | --- | --- | --- |
 | Session lifetime | **30 days absolute, 7 days idle** | Rare re-login; bounded exposure on a stolen token |
-| Password hashing | **Argon2id, owned by the Rust API** | The qualifier is resolved: PocketBase is going, so nothing else can own it. Parameters and the rehash-on-login policy become ours to set |
-| Login methods | **Google + email/password, with reset** | Unchanged as a product decision; what changes is that the Rust API implements all of it, including the pre-hijacking defences in [`architecture/identity.md`](architecture/identity.md) |
+| Password hashing | **Argon2id, owned by the Rust API (target)** | **Status: PocketBase hashes passwords today**; the `identities.password_hash` column is created but empty. Once Phase 6 lands, Rust owns Argon2id outright and nothing else can. Parameters and the rehash-on-login policy become ours to set |
+| Login methods | **Google + email/password, with reset** | Unchanged as a product decision; **today PocketBase implements both**, and once Phase 6 moves identity into Rust the Rust API implements all of it, including the pre-hijacking defences in [`architecture/identity.md`](architecture/identity.md) |
 | Telegram | **A linked surface, not an identity provider** | One wallet, two surfaces |
 | Review writes | **Telegram only** | A second writer makes "who reviewed" ambiguous |
 | Review identity | **Keyed on the account, re-attributed on link** | Otherwise linking creates a second review slot |

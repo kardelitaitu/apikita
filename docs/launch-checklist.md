@@ -73,7 +73,7 @@ opinion.
 - [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase.
 - [x] The reconciliation query returns **zero rows** on production data.
 - [ ] `CHECK (balance_idr >= 0)` present and exercised.
-- [x] Money is `BIGINT` end to end; no float appears in any billing path.
+- [x] Money is `INTEGER` IDR end to end; no float appears in any billing path. (Was `BIGINT` under Postgres; `STRICT` SQLite tables reject `BIGINT`, so the type is now `INTEGER` — see `decisions.md` §Money.)
 
 ### Billing accuracy
 

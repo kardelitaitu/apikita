@@ -9,7 +9,7 @@ PocketBase or Pages Functions, this document wins.
 
 | Component | Runs on | Language | Purpose |
 | --- | --- | --- | --- |
-| **Website** | Cloudflare Pages | _frontend, TBD_ | Marketing, signup, dashboard |
+| **Website** | Cloudflare Pages | **Astro** + islands | Marketing, signup, dashboard |
 | **Edge relay** | Cheap Linux VPS (2 vCPU / 4 GB) | nginx + Docker | TLS, filtering, flood absorption |
 | **API + proxy** | Northflank | **Rust** | Wallet, keys, LLM proxy, limits, webhooks |
 | **Database** | Northflank, inside the API process | **SQLite** | All persistent state except identity |
