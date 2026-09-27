@@ -53,6 +53,9 @@ RELAY_URL="${PROBE_RELAY_URL:-http://127.0.0.1:8000}"
 LOG_FILE="${PROBE_LOG_FILE:-}"
 STATE_DIR="${PROBE_STATE_DIR:-${TMPDIR:-/tmp}/apikita-probe}"
 HTTP_TIMEOUT="${PROBE_HTTP_TIMEOUT:-5}"
+# The operator session cookie the metrics route requires. UNSET means the error_rate
+# check is visibly skipped, never silently passed.
+OPERATOR_COOKIE="${PROBE_OPERATOR_COOKIE:-}"
 
 TMP="${TMPDIR:-/tmp}"
 CURL_ERR="$TMP/probe.$$.curl.err"
@@ -70,7 +73,7 @@ MODE="run"
 
 usage() {
     echo "probe: usage: probe.sh [--check <id>]... | --list | --help" >&2
-    echo "probe: checks: api_down, relay_down, webhook_rejection (no database access at all)" >&2
+    echo "probe: checks: api_down, relay_down, webhook_rejection, error_rate (no database access at all)" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -100,7 +103,14 @@ if [ "$MODE" = "list" ]; then
         printf 'probe: %-20s %-8s %s\n' "webhook_rejection" "skipped" \
             "PROBE_LOG_FILE is unset - no log source configured, so this alert is NOT checked"
     fi
-    echo "probe: not checked by anything in tools/alert yet: relay_5xx, error_rate, all_providers_unhealthy, db_disk"
+    if [ -n "$OPERATOR_COOKIE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "error_rate" "covered" \
+            "GET $API_URL/api/admin/metrics as an operator; alerts above a 5% 5xx rate"
+    else
+        printf 'probe: %-20s %-8s %s\n' "error_rate" "skipped" \
+            "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+    fi
+    echo "probe: not checked by anything in tools/alert yet: relay_5xx, all_providers_unhealthy, db_disk"
     exit 0
 fi
 
@@ -122,9 +132,9 @@ esac
 if [ -n "$CHECKS" ]; then
     for id in $CHECKS; do
         case "$id" in
-            api_down|relay_down|webhook_rejection) ;;
+            api_down|relay_down|webhook_rejection|error_rate) ;;
             *) echo "probe: unknown check: $id" >&2
-               echo "probe: known checks: api_down, relay_down, webhook_rejection" >&2
+               echo "probe: known checks: api_down, relay_down, webhook_rejection, error_rate" >&2
                exit 2 ;;
         esac
     done
@@ -205,6 +215,80 @@ check_api_down() {
     done
 }
 
+# --- check: error_rate --------------------------------------------------------
+# Threshold from alerts.tsv: "5% over 5 min". The server counts 5xx responses and
+# total responses in process (`error.rs`), and serves them at
+# `GET /api/admin/metrics` behind the OPERATOR guard - not on /health, whose body is
+# pinned because the deploy gate parses it and a leak test forbids any digit in it.
+#
+# This is why the check needs PROBE_OPERATOR_COOKIE: the route is authenticated, so a
+# prober without a session cannot read it. An unset cookie is a VISIBLY SKIPPED check
+# rather than a silent pass, the same rule as an unset PROBE_LOG_FILE.
+#
+# The rate is a RATIO of two counters, and `null` is NOT zero: the server sends null
+# when it has served nothing, which is the fresh-deploy case. Treating null as 0.0
+# would report a perfectly healthy service and suppress the alert - the exact
+# failure mode the counter was built to avoid. So null is NO DATA and the check
+# says so.
+check_error_rate() {
+    if [ -z "$OPERATOR_COOKIE" ]; then
+        echo "probe: skipped error_rate: PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+        return 0
+    fi
+
+    BODY_FILE="$TMP/probe-metrics.$$.json"
+    CODE=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+        --connect-timeout "$HTTP_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -H "Cookie: $OPERATOR_COOKIE" \
+        "$API_URL/api/admin/metrics" 2>"$CURL_ERR")
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        REASON=$(first_err "curl exit $RC")
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED error_rate: the metrics route did not answer ($REASON)" >&2
+        fail_with 4
+        return 0
+    fi
+    if [ "$CODE" != "200" ]; then
+        rm -f "$BODY_FILE"
+        # 401 means the cookie is wrong or expired, 403 that it is not an operator.
+        # Either way this is a CONFIGURATION problem, not a healthy service: reporting
+        # a pass here would be the silent-absence failure this directory exists to
+        # prevent.
+        echo "probe: FAILED error_rate: /api/admin/metrics returned HTTP $CODE (401 = bad or expired cookie, 403 = not an operator)" >&2
+        fail_with 4
+        return 0
+    fi
+
+    # Pull the three fields without a JSON parser (sqlite3/curl only, no jq): the
+    # payload is flat, so a targeted grep is honest and sufficient.
+    RATE=$(sed -n 's/.*"error_rate":[[:space:]]*\([^,}]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    ERRORS=$(sed -n 's/.*"server_errors":[[:space:]]*\([0-9]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    RESPONSES=$(sed -n 's/.*"responses":[[:space:]]*\([0-9]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    rm -f "$BODY_FILE"
+
+    if [ "$RATE" = "null" ]; then
+        echo "probe: OK  error_rate: no data (null) - the service has served nothing in this window; NOT a healthy 0%"
+        return 0
+    fi
+    case "$RATE" in
+        ''|*[!0-9.]*)
+            echo "probe: FAILED error_rate: could not parse a rate from the metrics route" >&2
+            fail_with 6
+            return 0
+            ;;
+    esac
+
+    # Compare in tenths of a percent using integer arithmetic: the threshold is 5%,
+    # and shell has no float. `awk` is already a dependency of this directory.
+    BREACH=$(awk -v r="$RATE" 'BEGIN { print (r > 0.05) ? "yes" : "no" }')
+    if [ "$BREACH" = "yes" ]; then
+        echo "probe: ALERT error_rate: $RATE ($ERRORS of $RESPONSES responses) exceeds the 5% threshold"
+        fire error_rate "$ERRORS of $RESPONSES responses are 5xx ($RATE), above the 5% threshold"
+    else
+        echo "probe: OK  error_rate: $RATE ($ERRORS of $RESPONSES) is within the 5% threshold"
+    fi
+}
 # --- check: relay_down --------------------------------------------------------
 # Threshold is "1 failed external check": ONE request, no window. Any HTTP answer at
 # all means the relay is up - a 502/504 is relay_5xx's alert (still unchecked), not
@@ -304,6 +388,7 @@ run_check() {
     case "$1" in
         api_down) check_api_down ;;
         relay_down) check_relay_down ;;
+        error_rate) check_error_rate ;;
         webhook_rejection) check_webhook_rejection ;;
     esac
     return 0
@@ -318,13 +403,17 @@ else
 fi
 
 # --- what still is not checked, on EVERY run ----------------------------------
-# The three checks above are covered now. These four are not, and saying so every run
-# is the whole point of this directory: a check that is silently absent is the
-# failure mode, and four silent absences would be four.
+# Four checks are covered now. These THREE are not, and saying so every run is the
+# whole point of this directory: a check that is silently absent is the failure mode,
+# and three silent absences would be three.
+#
+# error_rate MOVED OUT of this list: the counters are in-process (server/src/error.rs)
+# and served at GET /api/admin/metrics, so it is a real check now. The line that used
+# to sit here said it needed "HTTP counters over a 5-minute window (same access logs)",
+# which was true before the counter existed and is now stale.
 cat >&2 <<'NOTCHECKED'
-probe: NOT CHECKED - 4 of the doc's 10 alerts still need a surface this cannot reach:
+probe: NOT CHECKED - 3 of the doc's 10 alerts still need a surface this cannot reach:
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off)
-probe:   error_rate              - HTTP counters over a 5-minute window (same access logs)
 probe:   all_providers_unhealthy - upstream circuit-breaker state, in-process under server/
 probe:   db_disk                 - volume usage, not visible to any client
 probe: Full table and the reasons: tools/alert/README.md. Every definition: alert.sh --list

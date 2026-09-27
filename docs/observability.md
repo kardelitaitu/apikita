@@ -106,6 +106,14 @@ Each has a threshold and an action. If you would not act, do not alert.
 | **DB disk >80%** | volume usage | Usage rows growing; check retention |
 | **Error rate >5%** | 5 min window | Investigate |
 
+**The error-rate alert is SERVED.** `error.rs` counts 5xx responses and total
+responses in process, and `GET /api/admin/metrics` (operator-only) reports them, so
+`tools/alert/probe.sh --check error_rate` measures a real number instead of declaring
+the alert unchecked. Two caveats worth knowing: the ceiling is over **handled**
+requests (a 404 for an unmatched path never reaches `AppError`, so it is not counted),
+and an empty window reports **`null`, not `0.0`** — the probe treats null as no-data
+rather than a healthy service.
+
 **What is deliberately NOT alerted:** individual 401s, individual 500s, high CPU
 with normal latency, slow upstream (their problem, and you cannot fix it).
 
