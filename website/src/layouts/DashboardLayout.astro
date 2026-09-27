@@ -33,6 +33,22 @@ const { title } = Astro.props;
           </span>
         </div>
 
+        <!--
+          Service status. Reports reachability of the API and its database, which
+          is all /health knows (docs/observability.md:193 forbids it from checking
+          upstream providers). The copy is deliberately careful: it never claims to
+          know whether a model provider is healthy.
+        -->
+        <span
+          id="service-status"
+          data-state="checking"
+          title=""
+          class="inline-flex items-center gap-2 rounded-full border border-edge-strong px-2.5 py-1 text-xs font-medium text-ink-muted data-[state=operational]:border-ok-edge data-[state=operational]:text-ok data-[state=degraded]:border-warn data-[state=degraded]:bg-warn-surface data-[state=degraded]:text-warn-ink data-[state=unreachable]:border-danger-edge data-[state=unreachable]:bg-danger-surface data-[state=unreachable]:text-danger-ink"
+        >
+          <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
+          <span id="service-status-label">Checking…</span>
+        </span>
+
         <form method="post" class="flex items-center gap-3 text-sm text-ink-muted">
           <button id="logout" type="button" class="hover:text-brand">Log out</button>
           <button id="logout-all" type="button" class="hover:text-brand">Sign out everywhere</button>
@@ -57,10 +73,51 @@ const { title } = Astro.props;
   // The dashboard island. Loads only on dashboard pages; marketing routes stay
   // JavaScript-free.
   import { getLiveStore } from '../lib/live';
-  import { apiFetch } from '../lib/api';
+  import { apiFetch, API_BASE } from '../lib/api';
   import { describeError, renderNotice } from '../lib/errors';
   import { formatIdr, formatCount } from '../lib/format';
   import { pb } from '../lib/pocketbase';
+  import {
+    healthPath,
+    statusDetail,
+    statusFromResponse,
+    statusLabel,
+    STATUS_POLL_MS,
+    type HealthBody,
+  } from '../lib/service-status';
+
+  // --- Service status -------------------------------------------------------
+  // Poll GET /health. It is unauthenticated and reports the process and the
+  // database only; the badge never claims to know upstream health. A failure to
+  // reach it is itself a status ("unreachable"), never an error banner — a status
+  // check that breaks the page it reports on would be worse than none.
+  const statusBadge = document.getElementById('service-status') as HTMLElement | null;
+  const statusLabelEl = document.getElementById('service-status-label') as HTMLElement | null;
+
+  async function refreshStatus(): Promise<void> {
+    if (!statusBadge || !statusLabelEl) return;
+    let httpStatus = 0;
+    let body: HealthBody | null = null;
+    try {
+      const res = await fetch(API_BASE + healthPath(), { headers: { Accept: 'application/json' } });
+      httpStatus = res.status;
+      try {
+        body = (await res.json()) as HealthBody;
+      } catch {
+        // A body that is not JSON is treated as no body; statusFromResponse then
+        // refuses to guess and reports "unreachable".
+      }
+    } catch {
+      httpStatus = 0;
+    }
+    const state = statusFromResponse(httpStatus, body);
+    statusBadge.dataset.state = state;
+    statusLabelEl.textContent = statusLabel(state);
+    statusBadge.title = statusDetail(state);
+  }
+
+  void refreshStatus();
+  window.setInterval(() => void refreshStatus(), STATUS_POLL_MS);
 
   const badge = document.getElementById('live-badge') as HTMLElement;
   const badgeLabel = document.getElementById('live-badge-label') as HTMLElement;
