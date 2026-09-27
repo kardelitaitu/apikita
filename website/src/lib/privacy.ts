@@ -58,7 +58,7 @@ export const retention = [
 // docs/data-retention.md, "Access and deletion requests".
 export const requests = [
   { request: 'See your data', how: 'Dashboard + bot: profile, balance, usage, keys' },
-  { request: 'Export it', how: 'A machine-readable export (not yet specified)' },
+  { request: 'Export it', how: 'Download your account data from Settings — balance, ledger, top-ups, usage and key metadata' },
   { request: 'Correct it', how: 'Edit profile; the ledger is immutable by design' },
   { request: 'Delete your account', how: 'The closure flow below, anonymising where possible' },
   { request: 'Delete a review', how: '/review withdraw — the bot path' },

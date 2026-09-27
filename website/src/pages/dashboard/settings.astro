@@ -155,6 +155,31 @@ import Skeleton from '../../components/Skeleton.astro';
     </div>
   </section>
 
+  <!-- Your data ------------------------------------------------------------ -->
+  <section class="mt-8 max-w-2xl rounded-lg border border-edge bg-surface-raised p-4">
+    <h2 class="text-lg font-semibold tracking-tight">Your data</h2>
+    <p class="mt-2 text-sm text-ink-muted">
+      Download a machine-readable copy of what this service holds for your
+      account: balance, ledger, top-ups, usage and API-key metadata. It is your
+      record to keep — for accounting, or to take elsewhere.
+    </p>
+    <p class="mt-2 text-xs text-ink-muted">
+      <strong>Metadata, not secrets.</strong> Credential hashes, session records,
+      IP hashes and internal identifiers are deliberately excluded — they are not
+      yours to hold, and they were hashed so they could not be handed out.
+    </p>
+
+    <div id="export-error" hidden role="alert"
+      class="mt-3 rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+    <div id="export-done" hidden role="status"
+      class="mt-3 rounded-md border border-ok-edge bg-ok-surface p-3 text-sm text-ok-ink"></div>
+
+    <button id="export-btn" type="button"
+      class="mt-4 rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">
+      Download my data
+    </button>
+  </section>
+
   <!-- Session controls ---------------------------------------------------- -->
   <section class="mt-8 max-w-2xl rounded-lg border border-edge bg-surface-raised p-4 text-sm text-ink-muted">
     <h2 class="text-lg font-semibold tracking-tight text-ink">Sessions</h2>
@@ -373,6 +398,49 @@ import Skeleton from '../../components/Skeleton.astro';
         telegramDone.hidden = false;
       })
       .catch(telegramFail);
+  });
+
+  // --- Data export -----------------------------------------------------------
+  // GET /api/export returns the account's own data as JSON. Downloaded via a
+  // Blob rather than a plain link so a failed request surfaces as a message here
+  // instead of navigating the tab to a raw error body. The filename is dated, so
+  // several exports do not collide in the downloads folder.
+  const exportBtn = $('export-btn') as HTMLButtonElement;
+  const exportError = $('export-error');
+  const exportDone = $('export-done');
+
+  exportBtn.addEventListener('click', () => {
+    exportError.hidden = true;
+    exportDone.hidden = true;
+    exportBtn.disabled = true;
+    const original = exportBtn.textContent;
+    exportBtn.textContent = 'Preparing…';
+
+    void apiFetch<Record<string, unknown>>('/api/export')
+      .then((data) => {
+        const text = JSON.stringify(data, null, 2);
+        const blob = new Blob([text], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const stamp = new Date().toISOString().slice(0, 10);
+        a.href = url;
+        a.download = `apikita-export-${stamp}.json`;
+        document.body.append(a);
+        a.click();
+        a.remove();
+        // Release the object URL on the next tick, once the click has been handled.
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        exportDone.textContent = `Downloaded ${(blob.size / 1024).toFixed(1)} KB.`;
+        exportDone.hidden = false;
+      })
+      .catch((err: unknown) => {
+        exportError.textContent = describeError(err).message;
+        exportError.hidden = false;
+      })
+      .finally(() => {
+        exportBtn.disabled = false;
+        exportBtn.textContent = original;
+      });
   });
 
   void loadProfile();

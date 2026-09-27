@@ -12,7 +12,7 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 | Group | Endpoints | Auth |
 | --- | --- | --- |
 | Auth | `POST /auth/exchange`, `POST /auth/logout`, `POST /auth/logout-all` | cookie / none |
-| Account | `GET /api/me`, `GET /api/usage`, `GET /api/usage/recent`, `GET /api/topups` | cookie |
+| Account | `GET /api/me`, `GET /api/usage`, `GET /api/usage/recent`, `GET /api/topups`, `GET /api/export` | cookie |
 | Keys | `GET/POST /api/keys`, `PATCH /api/keys/:id`, `POST /api/keys/:id/revoke` | cookie |
 | Wallet | `POST /api/topups` | cookie |
 | Telegram | `POST /api/telegram/link-code`, `DELETE /api/telegram` | cookie |
@@ -127,6 +127,24 @@ The three token classes are returned **separately**, never as one total, because
 each is priced differently. `api_key_id` is null when the key was deleted after
 the request (`ON DELETE SET NULL`). **Only this account's rows are ever returned**;
 nothing exposes a prompt, a completion or a key's plaintext.
+
+### `GET /api/export`
+
+The account's **own** data as one JSON document — the export
+[data-retention.md](../data-retention.md) specifies under "Access and deletion
+requests". Scope is fixed by that document's IN/OUT table, and the rule is
+**metadata, not secrets**:
+
+- **In**: account, wallet, ledger rows, top-ups, `usage_daily`, `usage_events`,
+  and API-key **metadata** (prefix, label, models, limits, expiry).
+- **Out**: `key_hash`, `token_hash`, `pb_user_id`, `snap_token`, session rows,
+  IP hashes and the Telegram chat id. **`admin_audit` is also out** — whether
+  operator actions reach the customer is a separate open decision
+  ([admin-surface.md](../admin-surface.md) Open items), which this does not
+  pre-empt.
+
+Every query is bound to the cookie-resolved account id, so a customer can only
+export their own rows.
 
 ### `GET /api/topups?limit=`
 
