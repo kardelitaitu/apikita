@@ -52,6 +52,60 @@ test('the landing page never discloses the cost basis', () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// THE SIGNUP DISCLOSURE — docs/launch-checklist.md Gate 6, claim 205:
+// "Signup shows the cross-border disclosure before the first request."
+//
+// The claim is not "the disclosure exists somewhere" — privacy.astro would satisfy
+// that — but that it appears ON THE SIGNUP SURFACE, BEFORE the customer can act.
+// A refactor that moved it to a post-signup page, or reordered the form, would
+// leave the promise looking kept while breaking the actual obligation. The
+// checklist is blunt about the stakes (lines 36-37): "Do not take a single deposit
+// before this gate closes."
+//
+// The .astro file is read as TEXT for the reason this suite documents: frontmatter
+// cannot be imported, and the guard is about what the file SAYS.
+// ---------------------------------------------------------------------------
+
+test('signup discloses where prompts are forwarded, and does so before the submit control', () => {
+  const text = read('signup.astro').toLowerCase();
+
+  // (a) The disclosure is on THIS page at all.
+  assert.ok(
+    text.includes('where your prompts go'),
+    'signup must carry the "Where your prompts go" disclosure block',
+  );
+
+  // (b) It names the destination and the part outside our control. A version that
+  //     said only "forwarded to a provider" would hide the one fact the customer
+  //     most needs: whose retention policy now applies to their prompts.
+  assert.ok(
+    text.includes('mainland china'),
+    'the disclosure must name the destination jurisdiction',
+  );
+  assert.ok(
+    text.includes('outside our control'),
+    'the disclosure must say the upstream retention policy is outside our control',
+  );
+
+  // (c) ORDERING, which is the "before the first request" half. Both markers must
+  //     be present and the disclosure must come FIRST.
+  const disclosure = text.indexOf('where your prompts go');
+  const submit = text.indexOf('signup-submit');
+  assert.ok(submit > -1, 'the signup submit control must exist for this ordering check to mean anything');
+  assert.ok(
+    disclosure < submit,
+    'the disclosure must appear BEFORE the submit control: a customer reads the form top-down, so a notice placed after the button is not consent to it',
+  );
+
+  // POSITIVE CONTROL for the ordering check itself: the two indices are genuinely
+  // different positions, so `disclosure < submit` cannot pass by both being -1.
+  assert.notEqual(
+    disclosure,
+    submit,
+    'the two markers must be distinct positions, or the ordering assertion above is vacuous',
+  );
+});
 test('the promises that must stay are still present', () => {
   const text = read('index.astro').toLowerCase();
   // Non-refundable, the 2-year expiry, and paying balances back at closure.
