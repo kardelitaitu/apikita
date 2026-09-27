@@ -30,9 +30,11 @@ It does **not** proxy LLM requests. That is [`server/`](../../server/README.md).
 
 ## Status
 
-**The website is built and builds green.** Measured for this revision:
+**The website is built and builds green.** Measured 2026-09-26:
 `cd website && npm run build` emits **17 static pages** and `npm test` passes
-**64 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 64`, `# pass 64`).
+**80 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 80`, `# pass 80`).
+Count them rather than recalling them — both numbers move whenever a page or a
+contract test lands.
 Every route in the spec's table
 (lines 9-21) now has a page. What follows separates what exists from what is
 designed-but-unbuilt; unbuilt items are marked, never deleted.

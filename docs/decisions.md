@@ -20,7 +20,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Backend | **Rust on Northflank** | I/O-bound proxy; one service does API + proxy |
 | Money store | **SQLite (embedded, WAL)** | Transactions, constraints, the ledger — on the same host as the API, so a ledger write is a local file write rather than a network round trip |
 | SQL driver | **`sqlx` with the `sqlite` feature** | Not `rusqlite`. The port is a 106-site dialect change, not an API rewrite; `sqlx migrate` is already settled below; and the bottleneck is the single writer, not the binding. Reasoning: [`plans/proxy-hot-path-audit.md`](plans/proxy-hot-path-audit.md) §3 |
-| Identity store | **Rust-owned** — the `accounts` + `identities` tables | Auth only — never money. No external auth service remains |
+| Identity store | **Rust-owned** — the `accounts` + `identities` tables (target) | Auth only — never money. **Status: PocketBase still authenticates at runtime** — the Rust session flow resolves a PocketBase token into a local session and the `identities` table is created but empty. Migration Phase 6 drops `pb_user_id` and retires PocketBase; until it lands the external service *does* remain, so `architecture/identity.md` is the operative description |
 | Payments | **Midtrans, QRIS only** | Card excluded: a flat fee is ~20% of a small top-up |
 | Relay | **nginx on a VPS, L7** | TLS + filtering; absorbs load before the backend |
 | CDN / edge | **Cloudflare** | Free tier; also where Pages lives |

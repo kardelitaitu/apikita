@@ -107,7 +107,7 @@ What exists today:
 
 | Surface | State |
 | --- | --- |
-| [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → **313 passed / 0 failed / 2 ignored** (measured 2026-09-27), against a temp SQLite file — no server to start. The 2 ignored need a live PocketBase. |
+| [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → **338 passed / 0 failed / 0 ignored** (measured 2026-09-27), against a temp SQLite file — no server to start. No test is `#[ignore]`d any more; identity is a loopback-stubbed exchange. |
 | [`website/`](website/README.md) | Astro site. `npm run build` → 17 pages; `npm test` → 80 passed (measured 2026-09-26). |
 | [`tools/`](tools/) | `reconcile`, `alert`, `fake-upstream`, `fake-midtrans`, and the SQLite probes — each with a documented exit-code contract. `backup`, `drill`, `alert` and the maintenance jobs all drive the `sqlite3` CLI against the embedded database. |
 | [`telegram/`](telegram/README.md) | Design only — no code yet. |

@@ -31,12 +31,13 @@ leaked session cannot spend money.
 
 ## Status
 
-**Implemented and green.** `cargo test --lib` → **297 passed / 0 failed / 2 ignored**
-(measured 2026-09-26 at commit 0488577),
+**Implemented and green.** `cargo test --lib` → **338 passed / 0 failed / 0 ignored**
+(measured 2026-09-27),
 against a migrated temp SQLite file per test (`src/test_support.rs`) — no database
-server to start and no `DATABASE_URL` needed. The 2 ignored tests drive a real
-PocketBase auth exchange and need a live `POCKETBASE_URL`; identity is still
-PocketBase until migration Phase 6.
+server to start and no `DATABASE_URL` needed. Nothing is `#[ignore]`d any more: the
+former live-PocketBase exchange test was replaced by a loopback stub, so the whole
+suite runs by default. Identity still enters through PocketBase at runtime, where a
+live `POCKETBASE_URL` is required (migration Phase 6 moves it into Rust).
 
 Migrations are applied by the `migrate` binary, never on boot:
 

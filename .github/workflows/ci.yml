@@ -94,23 +94,16 @@ jobs:
 
       # There is no second, `#[ignore]`d database tier any more. The database is a
       # file, so `server/src/test_support.rs` gives every database test its own
-      # migrated temp database and the money suite runs in the plain `cargo test`
-      # above — with no service container and no DATABASE_URL. Measured on
-      # `sqlite-port`: 134 passed / 0 failed / 0 ignored, without the old flag.
+      # migrated temp database and the whole suite runs with no service container
+      # and no DATABASE_URL.
       #
-      # This step runs the library suite explicitly — the invocation the port's own
-      # plan names — with the only two tests CI still cannot run named and skipped.
-      # They need a *configured* PocketBase (collections, not just a running
-      # container), which this workflow does not provide. Naming them keeps the
-      # exclusion explicit rather than leaving it to a bare `#[ignore]`:
-      #   - a_new_login_after_suspend_is_still_refused
-      #   - live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
+      # Nothing is skipped or `#[ignore]`d: the former live-PocketBase exchange
+      # test was replaced by a loopback stub, so the suite reports
+      # 338 passed / 0 failed / 0 ignored (measured 2026-09-27). Identity still
+      # enters through PocketBase at runtime, but no test needs it to run.
       - name: Integration tests (bundled SQLite)
         working-directory: server
-        run: >-
-          cargo test --lib
-          -- --skip a_new_login_after_suspend_is_still_refused
-          --skip live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
+        run: cargo test --lib
 
       # The deployable artifact must BUILD, and it must RUN.
       #

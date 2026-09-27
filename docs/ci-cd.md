@@ -142,26 +142,24 @@ So CI runs **bundled SQLite**, and the database is a file — no `services:`, no
 ```
 
 **There is no longer an ignored database tier.** `cargo test` is the whole suite:
-measured on the merged tree, `cargo test --lib` reports **289 passed / 0 failed /
-2 ignored**, where the previous arrangement reported 200 passed / 75 ignored and
-needed a live Postgres to run the difference. The 2 remaining ignores are **not**
-database tests — they need a *configured* PocketBase (collections, not just a
-running container), which CI does not provide. CI names them and skips them, so the
-exclusion is explicit rather than hidden behind a bare `#[ignore]`:
+measured on the merged tree, `cargo test --lib` reports **338 passed / 0 failed /
+0 ignored**, where the previous arrangement reported 200 passed / 75 ignored and
+needed a live Postgres to run the difference.
+
+**There is nothing left to skip.** Both former `#[ignore]`s are gone: the
+live-PocketBase exchange test was replaced by a loopback stub, so the whole library
+suite — including the auth path — runs by default with no service container. The CI
+step is a plain `cargo test --lib`:
 
 ```yaml
 - name: Integration tests (bundled SQLite)
   working-directory: server
-  run: >-
-    cargo test --lib
-    -- --skip a_new_login_after_suspend_is_still_refused
-    --skip live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
+  run: cargo test --lib
 ```
 
-**Why skipping by name is right and not a dodge:** both tests drive a real PocketBase
-auth exchange and have no seam to fake, and identity is still PocketBase — migration
-Phases 6 and 7 are not done. When Phase 6 lands, those two become ordinary tests and
-the skip flags come out.
+Identity still enters through PocketBase at runtime — migration Phases 6 and 7 are
+not done, so a deployed server requires a live `POCKETBASE_URL`. But no *test* needs
+one any more, which is why the exclusion flags could be deleted rather than named.
 
 ## Schema validation in CI
 
@@ -251,15 +249,19 @@ the worst-covered file in the crate was the **login handler**.
 cd server && cargo llvm-cov --lib --lcov --output-path coverage/lcov.info
 ```
 
-**Baseline, measured 2026-09-27 (`--lib`; branches were not captured by this run):**
+**Baseline, measured 2026-09-27 (`--lib`; this toolchain does not instrument
+branches, so the branch columns read 0/0):**
 
 | Metric | Value |
 | --- | --- |
-| Total line coverage | **95.48%** (14,522 / 15,209) |
-| `money.rs`, `error.rs`, `config.rs` | 100% / 100% / 97.5% |
-| `routes/auth.rs` | 98.2% (was 58.6%) |
+| Total line coverage | **95.94%** (14,697 / 15,319) |
+| `money.rs`, `error.rs`, `ip_tracking.rs` | 100% / 100% / 99.8% |
+| `routes/auth.rs` | 98.3% (was 58.6%) |
 | `routes/proxy.rs` | 91.8% (was 89.9%) |
-| Files still below 90% | `routes/events.rs` 86.2%, `routes/admin.rs` 86.6% |
+| Files still below 90% | `routes/events.rs` 86.2% |
+
+The two files that used to sit below 90% are now one: `routes/admin.rs` climbed to
+93.8%, leaving `routes/events.rs` alone.
 
 **The lesson from the first measurement, kept because it is the argument for
 measuring at all:** `routes/auth.rs` was at **58.6%**, by far the worst in the
@@ -276,8 +278,9 @@ entirely uncovered, including the client-hangup path whose own comment records
 that dropping the body unread "is exactly the defect this is fixing". That fix had
 no test. It does now, along with the usage-tail cap, which is `91.8%` and rising.
 
-**The two files still below 90% are the honest worklist**, in that order:
-`routes/events.rs` (the SSE resume/backpressure stream) and `routes/admin.rs`.
+**The one file still below 90% is the honest worklist**: `routes/events.rs`
+(the SSE resume/backpressure stream) at 86.2%. `routes/admin.rs` crossed the line
+at 93.8% and dropped off it.
 
 
 ## Rollback

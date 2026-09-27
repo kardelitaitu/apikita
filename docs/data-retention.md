@@ -30,7 +30,7 @@ size.
 > managed PostgreSQL service; it is now **embedded SQLite**, a file the API opens.
 > Every row, every retention period and every "never stored" claim above is
 > unchanged. **This table is restated on the customer-facing
-> [`/privacy`](../../website/src/pages/privacy.astro) page**, which must be updated
+> [`/privacy`](../website/src/pages/privacy.astro) page**, which must be updated
 > in the same change if any of it moves again.
 
 ## What is NOT stored
