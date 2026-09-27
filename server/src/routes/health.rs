@@ -72,6 +72,15 @@ pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
 /// So the counts sit behind the ONE operator guard, the same `cookie + operator
 /// flag` scheme every admin route uses (`api-spec.md:515`), not a new credential.
 ///
+/// **A MEASURED LIMITATION OF THE COUNTER, verified against a running server.** The
+/// counter is incremented inside `AppError::into_response`, so it sees every error the
+/// APPLICATION renders - and NOT the responses axum produces without reaching a
+/// handler, such as the 404 for an unmatched path. Measured live: four requests to a
+/// nonexistent path moved `responses` by ZERO, while two `/api/me` 401s moved it by
+/// two. So the rate is over HANDLED requests, which is the right denominator for "is
+/// my server failing" - an unmatched path is a scanner, not an outage - but it is not
+/// "all HTTP traffic", and a future reader should not assume otherwise.
+///
 /// **It reads no table.** The counter is in-process, and an operator investigating
 /// an incident wants these counts precisely when the database is ALSO unhealthy -
 /// tying the two together would blind them at the worst moment. The only database
