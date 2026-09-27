@@ -202,10 +202,29 @@ statement is false.**
 
 ## Gate 6 — Product surfaces
 
-- [ ] Signup shows the cross-border disclosure before the first request.
-- [ ] Top-up screen states the fee and the non-refundable policy before payment.
-- [ ] Deposit minimums enforced server-side (first vs re-top-up differ).
-- [ ] API key shown once, with an acknowledged warning.
+- [x] Signup shows the cross-border disclosure before the first request.
+      `website/src/pages/signup.astro:73-83` carries a "Where your prompts go" block
+      above the submit control, naming the mainland-China provider and the retention
+      that is outside our control. **Pinned by a test**:
+      `signup discloses where prompts are forwarded, and does so before the submit
+      control` (`website/tests/landing-claims.test.ts`) asserts presence, the named
+      jurisdiction, AND the ORDERING — because the claim is "before the first request",
+      not "exists somewhere" (`privacy.astro` alone would not satisfy it).
+- [x] Top-up screen states the fee and the non-refundable policy before payment.
+      `website/src/pages/dashboard/wallet.astro:27-31` states the non-refundable policy
+      and the 2-year expiry, and the header flags that first-deposit and top-up minimums
+      differ. **Pinned by a test** (`the wallet states the non-refundable policy and the
+      expiry before the top-up action`).
+- [x] Deposit minimums enforced server-side (first vs re-top-up differ).
+      `server/src/routes/account.rs:695-712` — `check_deposit_limit` selects
+      `min_first_deposit` when `settled_topups == 0`, else `min_topup`, and returns a 422
+      naming the limit. Covered by live tests in the same module.
+- [x] API key shown once, with an acknowledged warning.
+      Behaviour: `plaintextKeyOf` (`website/tests/dashboard-form.test.ts:139`) pins that
+      only a create response can reveal a key and a missing one is never invented.
+      Warning: `website/src/pages/dashboard/keys/new.astro:26-28` says the key is shown
+      **once** and that the server stores only its SHA-256 hash — **pinned by a test**,
+      because a copy edit can delete the warning while the code stays correct.
 - [x] Telegram `/link` flow works end to end **on the server side** — issue,
       redeem, unlink and re-link are implemented and covered by live tests. The
       Telegram *bot* itself is still design-only (`telegram/README.md` has no code),
