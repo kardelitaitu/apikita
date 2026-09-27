@@ -221,7 +221,22 @@ database only.
 ## Open items
 
 - [ ] Metrics backend (self-hosted Prometheus vs a hosted service — cost matters).
+- [x] Confirm the other five never-log classes are absent — **audited**, not assumed.
+      A sweep of every `info!`/`warn!`/`error!`/`debug!`/`trace!` call site in
+      `server/src` for `token`, `key` and `cookie` finds only `key_id` (a uuid),
+      `token_hash` and `api_key_id` — never a raw API key, a session token, or a
+      cookie value. The one place a raw key exists (`auth.rs` exchanges it) hashes
+      before any write. This is a point-in-time audit, so the TEST above is what
+      holds the line going forward.
 - [ ] Log retention period.
 - [ ] Alert delivery channel (Telegram is already in the stack).
 - [ ] Whether to expose a public status page.
-- [ ] Confirm prompts/completions are never logged, in code review.
+- [x] Confirm prompts/completions are never logged — **now enforced by a test, not a
+      review.** `a_customer_prompt_never_reaches_the_log` (`server/src/routes/proxy.rs`)
+      drives a real request carrying a sentinel prompt through the handler with a
+      capturing `tracing` subscriber installed, and asserts the sentinel NEVER
+      appears. It captures at **TRACE**, not info, because the promise breaks in
+      practice when someone adds a `debug!` while investigating a bug — which is
+      exactly what a one-off review cannot prevent. It carries a positive control
+      (the request must still be observable by model/account) so it cannot pass on a
+      server that logs nothing at all.
