@@ -5,11 +5,12 @@ pub mod events;
 pub mod health;
 pub mod keys;
 pub mod proxy;
+pub mod telegram;
 pub mod webhooks;
 
 use axum::{
     http::{header, HeaderMap},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use sha2::{Digest, Sha256};
@@ -194,6 +195,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/keys", get(keys::list_keys).post(keys::create_key))
         .route("/api/keys/{id}", patch(keys::update_key))
         .route("/api/keys/{id}/revoke", post(keys::revoke_key))
+        // Telegram
+        .route("/api/telegram/link-code", post(telegram::issue_link_code))
+        .route("/api/telegram", delete(telegram::unlink_telegram))
+        // The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN
+        .route("/api/bot/link", post(telegram::redeem_link_code))
         // Live updates (SSE)
         .route("/events", get(events::sse_events_handler))
         // Admin (cookie + operator flag)
@@ -973,6 +979,16 @@ mod tests {
             "",
         ),
         ("GET", "/events", ""),
+        // Telegram: cookie for issuing/unlinking, bot token for redemption. A
+        // credential-free request stops at the guard (401), which is not 404/405 -
+        // so the router matched, which is all this table asserts.
+        ("POST", "/api/telegram/link-code", ""),
+        ("DELETE", "/api/telegram", ""),
+        (
+            "POST",
+            "/api/bot/link",
+            r#"{"code":"000000","telegram_id":"1"}"#,
+        ),
         // Admin: cookie + operator flag. A credential-free request stops at the
         // guard (401), which is not 404/405 - so the router matched, which is all
         // this table asserts.
@@ -1017,6 +1033,9 @@ mod tests {
         ),
         ("GET", "/webhooks/midtrans"),
         ("GET", "/v1/chat/completions"),
+        ("GET", "/api/telegram/link-code"),
+        ("GET", "/api/telegram"),
+        ("GET", "/api/bot/link"),
     ];
 
     /// Near misses that MUST be 404: no route matches the path at all. Includes

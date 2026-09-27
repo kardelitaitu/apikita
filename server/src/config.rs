@@ -55,7 +55,51 @@ pub struct LimitsConfig {
     pub wallet_mutations_per_minute: u32,
     pub key_creation_per_day: u32,
     pub review_per_hour: u32,
+    /// How many link codes one account may have ISSUED within the hour.
+    ///
+    /// Bounds codes in flight per account. `0` disables, the project-wide
+    /// convention every other ceiling here follows.
+    ///
+    /// `serde(default)` because this key was added after the first deployments'
+    /// configs were written, and a config that predates it must still BOOT. The
+    /// default is the SAFE one - a missing key leaves the cap ON rather than
+    /// silently off, so forgetting it fails closed.
+    #[serde(default = "default_link_code_issuance_per_hour")]
+    pub link_code_issuance_per_hour: u32,
+    /// How many redemption ATTEMPTS one client IP may make within the hour.
+    ///
+    /// This is the cap that actually stops a brute-force: a 6-digit code is 10^6
+    /// possibilities and a guesser learns nothing from a refusal, so the endpoint's
+    /// safety is this number, not the code's secrecy
+    /// (docs/architecture/identity.md - "the highest-risk endpoint"). FAILED
+    /// attempts count, which is the only way it can ever fire. `0` disables, and
+    /// `serde(default)` applies the same reasoning as the field above: an older
+    /// config boots with the cap still ON.
+    #[serde(default = "default_link_redemption_per_hour")]
+    pub link_redemption_per_hour: u32,
     pub key_metadata_cache_seconds: u64,
+}
+
+/// Default for `LimitsConfig::link_code_issuance_per_hour` when a config file
+/// predates the key. Ten codes an hour is far more than a human needs and far
+/// less than a code farm wants.
+fn default_link_code_issuance_per_hour() -> u32 {
+    10
+}
+
+/// Default for `LimitsConfig::link_redemption_per_hour` when a config file
+/// predates the key.
+///
+/// Twenty attempts an hour, matching the shipped `config/apikita.toml`. It is a
+/// DELIBERATE, SMALL number, and the arithmetic is worth stating because it is easy
+/// to get wrong by three orders of magnitude: at 20/h a host gets ~1.7 guesses
+/// inside one 5-minute code window, so the expected time to hit a *specific*
+/// account's live code is ~5.7 years (1/(1.7e-6) windows), NOT 5,700 years. The
+/// reason it holds is the TTL plus the one-live-code-per-account rule: the code
+/// rotates, so the 10^6 space never shrinks and the search cannot be amortised.
+/// A real user mistyping a code hits a handful of these.
+fn default_link_redemption_per_hour() -> u32 {
+    20
 }
 
 #[derive(Debug, Clone, Deserialize)]

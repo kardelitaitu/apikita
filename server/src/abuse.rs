@@ -70,7 +70,7 @@ fn retry_after_secs(oldest: DateTime<Utc>, window: Duration, now: DateTime<Utc>)
 /// disables the cap, the convention every other configurable ceiling in this
 /// project follows (`min_monthly_tokens`, `rate_limit_rpm`, `spend_limit_idr`),
 /// so a value read from the config can turn the guard off without a code change.
-fn cap_outcome(
+pub(crate) fn cap_outcome(
     used: i64,
     limit: u32,
     oldest_in_window: Option<DateTime<Utc>>,

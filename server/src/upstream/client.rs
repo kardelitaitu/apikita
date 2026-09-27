@@ -670,6 +670,8 @@ mod tests {
                 idle_days: 7,
             },
             limits: LimitsConfig {
+                link_code_issuance_per_hour: 10,
+                link_redemption_per_hour: 20,
                 topup_per_hour: 5,
                 wallet_mutations_per_minute: 10,
                 key_creation_per_day: 10,

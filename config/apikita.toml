@@ -113,6 +113,19 @@ key_creation_per_day = 10
 # Review submissions. Edits are legitimate; flooding is not.
 review_per_hour = 3
 
+# Telegram link codes the account may have ISSUED in an hour. Bounds codes in
+# flight per account; it does NOT stop guessing (see the redemption cap below).
+link_code_issuance_per_hour = 10
+
+# Redemption ATTEMPTS one client IP may make in an hour. This is the cap that
+# makes the endpoint safe: a 6-digit code is 10^6 possibilities and the endpoint
+# refuses without saying whether the code existed, so the security here is how
+# few guesses are permitted - not how secret the code is
+# (docs/architecture/identity.md: the highest-risk endpoint in the Telegram
+# surface). FAILED attempts count, so 0 disables the cap entirely and should
+# never be set in production.
+link_redemption_per_hour = 20
+
 # How long the proxy caches API key metadata (limits, model allowlist,
 # revoked state) before re-reading from SQLite.
 #
