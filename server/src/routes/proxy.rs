@@ -174,6 +174,27 @@ struct RequestMeta {
 /// more than one usage chunk needs and stays a fixed, negligible allocation.
 const USAGE_TAIL_CAP: usize = 64 * 1024;
 
+/// Appends `chunk` to `tail`, keeping only the last `USAGE_TAIL_CAP` bytes.
+///
+/// ONE implementation, used by both the live tee (`MeteredStream::push`) and the
+/// hang-up drain (`drain_for_usage`). They were two identical copies of this
+/// arithmetic, which is one edit away from becoming two different answers about
+/// how much of the stream is retained — and the quantity at stake is the usage
+/// block that decides whether a customer is billed.
+///
+/// **The cap truncates the FRONT and never the end.** That asymmetry is the whole
+/// point: the usage block is the LAST thing in an SSE stream, so dropping the
+/// newest bytes would delete the very evidence the tail exists to preserve and
+/// silently under-bill every answer longer than the cap. Draining from the front
+/// (`drain(..excess)`) is therefore load-bearing, not an implementation detail.
+fn retain_usage_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    if tail.len() > USAGE_TAIL_CAP {
+        let excess = tail.len() - USAGE_TAIL_CAP;
+        tail.drain(..excess);
+    }
+}
+
 /// The upstream client, built exactly once per process: it owns the connection
 /// pool, the per-endpoint key pools and the circuit breakers, all of which are
 /// worthless unless they are shared across requests.
@@ -615,6 +636,13 @@ pub fn invalidate_key_cache(config: &AppConfig, key_hash: &str) {
         .remove(key_hash);
 }
 /// What the tee saw once the upstream stream ended.
+///
+/// `Debug` is derived so a test can report WHICH outcome arrived when an
+/// assertion fails. It is safe to derive here because `UpstreamStream`'s own
+/// manual `Debug` deliberately prints only the endpoint name and whether a lease
+/// is held — never the body — so a hangup outcome cannot spill streamed content
+/// into a log line (docs/error-model.md:159).
+#[derive(Debug)]
 enum StreamEnd {
     /// The stream completed and the tail parsed into a usage report.
     Settled(Usage),
@@ -658,11 +686,7 @@ impl MeteredStream {
     }
 
     fn push(&mut self, chunk: &[u8]) {
-        self.tail.extend_from_slice(chunk);
-        if self.tail.len() > USAGE_TAIL_CAP {
-            let excess = self.tail.len() - USAGE_TAIL_CAP;
-            self.tail.drain(..excess);
-        }
+        retain_usage_tail(&mut self.tail, chunk);
     }
 
     /// The upstream ended. `upstream_ok` is false when the end was a transport
@@ -875,13 +899,7 @@ async fn drain_for_usage(stream: Option<UpstreamStream>) -> Option<Usage> {
         futures_util::pin_mut!(bytes);
         while let Some(chunk) = bytes.next().await {
             match chunk {
-                Ok(chunk) => {
-                    tail.extend_from_slice(&chunk);
-                    if tail.len() > USAGE_TAIL_CAP {
-                        let excess = tail.len() - USAGE_TAIL_CAP;
-                        tail.drain(..excess);
-                    }
-                }
+                Ok(chunk) => retain_usage_tail(&mut tail, &chunk),
                 // The upstream died mid-answer. Whatever it reported before
                 // dying is all the evidence there is; a transport cut says
                 // nothing about the key, so it is not a rate-limit status.
@@ -1649,6 +1667,259 @@ async fn release_quietly(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // The usage tail: what decides whether a customer is billed at all.
+    // ---------------------------------------------------------------------
+
+    /// A usage block exactly as an upstream sends it, in the tail of an SSE
+    /// stream: this is the ONLY evidence that an answer completed.
+    fn usage_sse() -> &'static str {
+        r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":2}}}"#
+    }
+
+    #[test]
+    fn the_tail_keeps_the_whole_stream_when_it_is_under_the_cap() {
+        let mut tail = Vec::new();
+        retain_usage_tail(&mut tail, b"data: one\n\n");
+        retain_usage_tail(&mut tail, b"data: two\n\n");
+        assert_eq!(tail, b"data: one\n\ndata: two\n\n");
+    }
+
+    /// THE ASYMMETRY THAT MATTERS: the cap must drop the OLDEST bytes and keep the
+    /// NEWEST, because the usage block is the LAST thing in an SSE stream. A cap
+    /// that truncated the end would delete the evidence and silently under-bill
+    /// every answer longer than the cap.
+    #[test]
+    fn the_cap_truncates_the_front_and_so_preserves_a_trailing_usage_block() {
+        let mut tail = Vec::new();
+
+        // Far more than the cap, in NEWLINE-TERMINATED lines, as a real SSE
+        // stream is. The parser reads line by line and only inspects a line that
+        // BEGINS with "data:", so filler without a trailing newline would glue the
+        // usage block onto the end of a junk line and it would never be seen -
+        // correct parser behaviour, but it would make this fixture prove nothing.
+        let mut filler = vec![b'x'; 4095];
+        filler.push(b'\n');
+        for _ in 0..(USAGE_TAIL_CAP / 4096 + 8) {
+            retain_usage_tail(&mut tail, &filler);
+        }
+        retain_usage_tail(&mut tail, b"\n");
+        retain_usage_tail(&mut tail, usage_sse().as_bytes());
+
+        assert_eq!(
+            tail.len(),
+            USAGE_TAIL_CAP,
+            "the tail must be exactly capped"
+        );
+        assert!(
+            tail.ends_with(usage_sse().as_bytes()),
+            "the NEWEST bytes must survive: the usage block is last in the stream, so truncating the end would lose it"
+        );
+        // And the block is still parseable, which is the point of keeping it.
+        assert!(
+            parse_usage_from_sse(&tail).is_some(),
+            "the trailing usage block must still parse after capping - this is what decides whether the customer is billed"
+        );
+    }
+
+    #[test]
+    fn the_cap_never_truncates_a_stream_that_fits() {
+        let mut tail = Vec::new();
+        let exact = vec![b'y'; USAGE_TAIL_CAP];
+        retain_usage_tail(&mut tail, &exact);
+        assert_eq!(
+            tail.len(),
+            USAGE_TAIL_CAP,
+            "exactly at the cap is not over it"
+        );
+        assert_eq!(tail, exact, "and nothing is dropped at exactly the cap");
+    }
+
+    /// A single chunk LARGER than the cap must still leave a capped tail ending
+    /// in that chunk's final bytes - the case a per-chunk copy would get wrong by
+    /// retaining the chunk's head instead of its tail.
+    #[test]
+    fn one_oversized_chunk_still_keeps_its_trailing_bytes() {
+        let mut tail = Vec::new();
+        let mut huge = vec![b'z'; USAGE_TAIL_CAP * 2];
+        let usage = usage_sse().as_bytes();
+        huge.extend_from_slice(usage);
+
+        retain_usage_tail(&mut tail, &huge);
+
+        assert_eq!(tail.len(), USAGE_TAIL_CAP);
+        assert!(
+            tail.ends_with(usage),
+            "an oversized chunk must be trimmed from its head, keeping its tail"
+        );
+    }
+
+    /// The live tee and the hang-up drain must produce the SAME tail for the same
+    /// input. They were two identical copies of this arithmetic; this pins that
+    /// they still agree, because a divergence would mean the billed amount depends
+    /// on whether the client hung up.
+    #[test]
+    fn the_tee_and_the_drain_agree_byte_for_byte() {
+        let chunks: Vec<Vec<u8>> = vec![
+            b"data: a\n\n".to_vec(),
+            vec![b'q'; 5000],
+            usage_sse().as_bytes().to_vec(),
+            vec![b'r'; USAGE_TAIL_CAP],
+            b"data: last\n\n".to_vec(),
+        ];
+
+        // Path A: the live tee, through MeteredStream::push.
+        let (settle, _rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+        };
+        for chunk in &chunks {
+            metered.push(chunk);
+        }
+
+        // Path B: the drain, through the same shared function.
+        let mut drained = Vec::new();
+        for chunk in &chunks {
+            retain_usage_tail(&mut drained, chunk);
+        }
+
+        assert_eq!(
+            metered.tail, drained,
+            "the billed usage tail must not depend on whether the client hung up"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // MeteredStream: the decision that bills a customer and cools a key.
+    // ---------------------------------------------------------------------
+
+    /// A stream that ended cleanly WITH a usage block reports Settled, and returns
+    /// true (the answer completed).
+    #[test]
+    fn finish_with_usage_reports_settled() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+        };
+        metered.push(usage_sse().as_bytes());
+
+        assert!(
+            metered.finish(true),
+            "a stream carrying usage completed and must be reported as such"
+        );
+
+        match rx.try_recv() {
+            Ok(StreamEnd::Settled(_)) => {}
+            other => panic!("expected Settled, got {other:?}"),
+        }
+    }
+
+    /// A stream that ended WITHOUT usage is the washed case: reported NoUsage, and
+    /// `finish` returns false so the caller can tell the client the answer was cut.
+    #[test]
+    fn finish_without_usage_reports_no_usage_and_returns_false() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+        };
+        metered.push(b"data: partial\n\n");
+
+        assert!(
+            !metered.finish(true),
+            "no usage block means the answer was truncated, so this is not a success"
+        );
+
+        match rx.try_recv() {
+            Ok(StreamEnd::NoUsage) => {}
+            other => panic!("expected NoUsage, got {other:?}"),
+        }
+    }
+
+    /// `finish` is idempotent with respect to the settle channel: a second call
+    /// cannot send a second outcome, which would double-report the stream.
+    #[test]
+    fn finish_twice_sends_exactly_one_outcome() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+        };
+        metered.push(usage_sse().as_bytes());
+
+        assert!(metered.finish(true));
+        // The second call finds no settle sender: it cannot report again.
+        assert!(metered.finish(true));
+
+        assert!(
+            matches!(rx.try_recv(), Ok(StreamEnd::Settled(_))),
+            "the first outcome must be the one delivered"
+        );
+        assert!(rx.try_recv().is_err(), "no second outcome may be sent");
+    }
+
+    /// DROPPING a live stream HANDS THE BODY OVER as `Hangup` rather than ending it
+    /// silently: the upstream already generated the partial answer and will report
+    /// usage for it, so dropping the body unread would bill nothing while the
+    /// provider charges us. That is the documented defect this path exists to fix,
+    /// and it had no test.
+    #[test]
+    fn dropping_a_live_stream_hands_the_body_over_as_a_hangup() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+        };
+
+        drop(metered);
+
+        match rx.try_recv() {
+            Ok(StreamEnd::Hangup(_)) => {}
+            other => panic!(
+                "a dropped live stream must hand its body to the settlement task, got {other:?}"
+            ),
+        }
+    }
+
+    /// A stream that already finished is NOT re-reported by `Drop`: `finish` took
+    /// the lease and sent the outcome, so a second send would be lost at best and
+    /// a double-settle at worst.
+    #[test]
+    fn dropping_an_already_finished_stream_sends_nothing_more() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+        };
+        metered.push(usage_sse().as_bytes());
+        assert!(metered.finish(true));
+
+        drop(metered);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(StreamEnd::Settled(_))),
+            "the settle outcome must be the one finish sent"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "Drop must not send a second outcome"
+        );
+    }
 
     // ---------------------------------------------------------------------
     // The 503 Retry-After decision (docs/error-model.md:99-112)
