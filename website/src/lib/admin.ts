@@ -231,3 +231,87 @@ export function listSummary(list: AdminAccountList): string {
   if (n === 0) return 'No accounts match';
   return `${n} ${noun}${hasNextPage(list) ? ' (more available)' : ''}`;
 }
+
+/** One row of `GET /api/admin/accounts/:id/audit`. */
+export interface AdminAuditEntry {
+  id: number;
+  operator_id: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  detail: string | null;
+  created_at: string;
+}
+
+/** The audit page the server returns. */
+export interface AdminAuditList {
+  entries: AdminAuditEntry[];
+  limit: number;
+}
+
+/** The audit path for one account. */
+export function accountAuditPath(accountId: string, limit = 50): string {
+  return `/api/admin/accounts/${encodeURIComponent(accountId)}/audit?limit=${limit}`;
+}
+
+/**
+ * A plain-language label for an audit action.
+ *
+ * The action is a machine value stored in the DB; this is the operator-facing
+ * word for it. An unknown action is shown as-is rather than blanked — a new
+ * action type must still be visible in the trail, not hidden because the UI did
+ * not learn its label yet.
+ */
+export function auditActionLabel(action: string): string {
+  switch (action) {
+    case 'suspend':
+      return 'Suspended';
+    case 'resume':
+      return 'Resumed';
+    default:
+      return action;
+  }
+}
+
+/**
+ * A human summary of the audit row's `detail` JSON, or null when there is none.
+ *
+ * `detail` is free-form JSON text the handlers wrote (counts of what was
+ * revoked, the prior status). Parsed defensively: a value that is not JSON, or
+ * JSON of an unexpected shape, returns null rather than being rendered raw — the
+ * trail's readability must not depend on a field's format staying fixed.
+ */
+export function auditDetailSummary(detail: string | null): string | null {
+  if (detail === null || detail.trim() === '') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(detail);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+  const record = parsed as Record<string, unknown>;
+  const parts: string[] = [];
+  if (typeof record.status_from === 'string' && typeof record.status_to === 'string') {
+    parts.push(`${record.status_from} → ${record.status_to}`);
+  }
+  if (typeof record.sessions_revoked === 'number') {
+    parts.push(`${record.sessions_revoked} session(s) revoked`);
+  }
+  if (typeof record.keys_revoked === 'number') {
+    parts.push(`${record.keys_revoked} key(s) revoked`);
+  }
+  return parts.length === 0 ? null : parts.join(' · ');
+}
+
+/** A short, unambiguous timestamp for a trail row, in WIB. */
+export function formatAuditTime(iso: string): string {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return iso;
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Jakarta',
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(ms));
+}

@@ -155,6 +155,26 @@ import Skeleton from '../../components/Skeleton.astro';
           A closed account is terminal: it can be neither suspended nor resumed.
         </p>
       </div>
+
+      <!-- Audit trail -->
+      <div class="mt-6 border-t border-edge pt-5">
+        <h3 class="text-sm font-semibold">Audit trail</h3>
+        <p class="mt-1 text-xs text-ink-muted">
+          Every operator action on this account, newest first. The trail is the
+          record that makes a dispute resolvable, so it is shown, not hidden.
+        </p>
+
+        <div id="admin-audit-error" hidden role="alert"
+          class="mt-3 rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+
+        <p id="admin-audit-loading" class="mt-3 text-sm text-ink-muted">Loading trail&hellip;</p>
+
+        <p id="admin-audit-empty" hidden class="mt-3 text-xs text-ink-muted">
+          No operator action has been taken on this account.
+        </p>
+
+        <ul id="admin-audit-list" hidden class="mt-3 divide-y divide-edge rounded-md border border-edge"></ul>
+      </div>
     </div>
   </section>
 
@@ -182,14 +202,18 @@ import Skeleton from '../../components/Skeleton.astro';
   import { describeError } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
   import {
+    accountAuditPath,
     accountListPath,
     accountPath,
     actionableAccountIds,
     actionPath,
     adminErrorMessage,
+    auditActionLabel,
+    auditDetailSummary,
     canResume,
     canSuspend,
     describeAction,
+    formatAuditTime,
     hasNextPage,
     isAccountId,
     listSummary,
@@ -198,6 +222,7 @@ import Skeleton from '../../components/Skeleton.astro';
     type AdminAccountList,
     type AdminAccountSummary,
     type AdminActionResult,
+    type AdminAuditList,
   } from '../../lib/admin';
 
   let current: AdminAccount | null = null;
@@ -476,12 +501,82 @@ import Skeleton from '../../components/Skeleton.astro';
     result.hidden = false;
   }
 
+  // --- The audit trail -------------------------------------------------------
+  // Read GET /api/admin/accounts/:id/audit for the selected account. Loaded with
+  // the account lookup, so selecting an account always shows its trail; a failure
+  // here never blocks the account view itself.
+  const auditError = $('admin-audit-error');
+  const auditLoading = $('admin-audit-loading');
+  const auditEmpty = $('admin-audit-empty');
+  const auditList = $('admin-audit-list');
+
+  function auditRow(entry: AdminAuditList['entries'][number]): HTMLLIElement {
+    const li = document.createElement('li');
+    li.className = 'p-3 text-sm';
+
+    const head = document.createElement('div');
+    head.className = 'flex flex-wrap items-baseline justify-between gap-2';
+
+    const action = document.createElement('span');
+    action.className = 'font-medium';
+    action.textContent = auditActionLabel(entry.action);
+    head.append(action);
+
+    const when = document.createElement('span');
+    when.className = 'text-xs text-ink-muted';
+    when.textContent = formatAuditTime(entry.created_at);
+    head.append(when);
+    li.append(head);
+
+    const summary = auditDetailSummary(entry.detail);
+    if (summary !== null) {
+      const d = document.createElement('p');
+      d.className = 'mt-1 text-xs text-ink-muted';
+      d.textContent = summary;
+      li.append(d);
+    }
+
+    // The operator who acted, truncated for display but full in the title.
+    const who = document.createElement('p');
+    who.className = 'mt-1 font-mono text-[0.7rem] text-ink-subtle';
+    who.textContent = 'operator ' + entry.operator_id.slice(0, 8) + '…';
+    who.title = entry.operator_id;
+    li.append(who);
+
+    return li;
+  }
+
+  async function loadAudit(id: string): Promise<void> {
+    auditError.hidden = true;
+    auditEmpty.hidden = true;
+    auditList.hidden = true;
+    auditLoading.hidden = false;
+    try {
+      const page = await apiFetch<AdminAuditList>(accountAuditPath(id));
+      auditLoading.hidden = true;
+      if (page.entries.length === 0) {
+        auditEmpty.hidden = false;
+        return;
+      }
+      auditList.replaceChildren(...page.entries.map(auditRow));
+      auditList.hidden = false;
+    } catch (err) {
+      auditLoading.hidden = true;
+      const status = (err as { status?: number }).status ?? 0;
+      auditError.textContent = adminErrorMessage(status, describeError(err).message);
+      auditError.hidden = false;
+    }
+  }
+
   async function lookup(id: string): Promise<void> {
     clearError();
     doneBox.hidden = true;
     try {
       const account = await apiFetch<AdminAccount>(accountPath(id));
       render(account);
+      // Load the trail alongside the account. Deliberately NOT awaited into the
+      // same failure path: a trail that cannot load must not blank the account.
+      void loadAudit(id);
     } catch (err) {
       result.hidden = true;
       current = null;

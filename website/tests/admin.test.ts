@@ -16,8 +16,12 @@ import assert from 'node:assert/strict';
 
 import {
   accountListPath,
+  accountAuditPath,
   accountPath,
   actionableAccountIds,
+  auditActionLabel,
+  auditDetailSummary,
+  formatAuditTime,
   actionPath,
   adminErrorMessage,
   canResume,
@@ -180,4 +184,42 @@ test('the listing summary counts and flags more pages', () => {
   const full: AdminAccountList = { accounts: Array.from({ length: 25 }, () => summary()), limit: 25, offset: 0 };
   assert.match(listSummary(full), /25 accounts/);
   assert.match(listSummary(full), /more available/);
+});
+
+// --- The audit trail --------------------------------------------------------
+
+test('the audit path carries the limit', () => {
+  assert.equal(accountAuditPath('abc', 10), '/api/admin/accounts/abc/audit?limit=10');
+  assert.match(accountAuditPath('abc'), /limit=50/);
+});
+
+test('known actions get a readable label; an unknown one is shown as-is', () => {
+  assert.equal(auditActionLabel('suspend'), 'Suspended');
+  assert.equal(auditActionLabel('resume'), 'Resumed');
+  // A future action must remain visible, not blanked.
+  assert.equal(auditActionLabel('adjust'), 'adjust');
+});
+
+test('audit detail is summarised from the handler\'s JSON', () => {
+  const detail = JSON.stringify({ status_from: 'active', status_to: 'suspended', sessions_revoked: 2, keys_revoked: 3 });
+  const summary = auditDetailSummary(detail);
+  assert.ok(summary);
+  assert.match(summary, /active → suspended/);
+  assert.match(summary, /2 session/);
+  assert.match(summary, /3 key/);
+});
+
+test('audit detail that is missing, empty or malformed returns null, never raw text', () => {
+  assert.equal(auditDetailSummary(null), null);
+  assert.equal(auditDetailSummary(''), null);
+  assert.equal(auditDetailSummary('not json'), null);
+  assert.equal(auditDetailSummary('"a string"'), null);
+  assert.equal(auditDetailSummary('[1,2]'), null);
+  // JSON object with none of the known keys -> null, not a raw dump.
+  assert.equal(auditDetailSummary('{"other":1}'), null);
+});
+
+test('an audit time is shown in WIB', () => {
+  assert.match(formatAuditTime('2026-01-01T00:00:00Z'), /07:00/);
+  assert.equal(formatAuditTime('nonsense'), 'nonsense');
 });
