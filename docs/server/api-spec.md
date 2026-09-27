@@ -528,6 +528,7 @@ with the same session cookie and every guard is enforced here, server-side.
 | `GET /api/admin/accounts` | `admin::list_accounts` | Bounded listing. Query: `q` (matches account id / PocketBase id), `status`, `limit` (1–100, default 25), `offset`. Returns `{accounts, limit, offset}` |
 | `GET /api/admin/accounts/:id` | `admin::get_account` | Read-only: `status`, `is_operator`, `created_at`, `balance_idr`, live session count, live key count. Never a credential hash |
 | `GET /api/admin/accounts/:id/audit` | `admin::get_account_audit` | The account's `admin_audit` trail, newest first. Same operator + self-action guard as the read-only view. Query: `limit` (1–200, default 50) |
+| `GET /api/admin/audit` | `admin::list_recent_audit` | **Cross-account** recent operator actions, newest first. Served by `admin_audit_recent_idx`. Query: `limit` (1–200, default 50) |
 | `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'`; **revokes sessions and keys atomically**; one `admin_audit` row in the same transaction |
 | `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; audits it; does not restore keys |
 | `POST /api/admin/accounts/:id/restore` | `admin::resume_account` | **Alias of `/resume`** — same handler, same `action='resume'` audit row |

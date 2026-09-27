@@ -41,8 +41,8 @@ without a refresh, falling back to polling if the stream drops.
 ## Status
 
 **Built and building.** Measured 2026-09-27: `npm run build` emits **18 pages** and
-`npm test` passes **141 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 141`,
-`# pass 141`). Count them rather than recalling them — both numbers move every time a
+`npm test` passes **142 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 142`,
+`# pass 142`). Count them rather than recalling them — both numbers move every time a
 page or a contract test lands. What exists today:
 
 - **Public pages** — `/` (landing + pricing), `/login`, `/signup`, `/verify`,
@@ -55,7 +55,8 @@ page or a contract test lands. What exists today:
   the API and its database only, never upstream providers. `/dashboard/usage` adds
   a **dependency-free trend chart** (one metric at a time, per-series scale).
 - **Operator console** — `/admin`, the account browse/search + lookup + suspend/resume
-  UI over the admin routes, with each account's **audit trail** shown alongside it.
+  UI over the admin routes, with each account's **audit trail** shown alongside it
+  and a **cross-account recent-actions** overview.
   Gated on `is_operator` from `GET /api/me`; the server re-checks.
 - **Islands** — `islands/keys/KeyManagement.astro` (create, **edit**, revoke),
   `islands/usage/UsageAnalytics.astro`, `islands/wallet/TopUpForm.astro` and
