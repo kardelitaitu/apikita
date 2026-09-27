@@ -60,6 +60,8 @@ page or a contract test lands. What exists today:
   `islands/usage/UsageAnalytics.astro`, `islands/wallet/TopUpForm.astro` and
   `islands/admin/AccountAdmin.astro`, each mounted by its page.
 - **Shared layer** — `lib/{admin,api,auth-flow,dashboard-form,errors,format,live,login-error,midtrans-env,models,pocketbase,privacy,recent-usage,retry-wait,service-status,usage,usage-trend}.ts`.
+- **Components** — `components/{Nav,Skeleton}.astro`. The skeleton implements the
+  spec's "skeleton, not a spinner" loading rule (03-functional-spec.md:121).
 
 `/dashboard/keys/new` and `/dashboard/settings` are specified
 (`docs/website/03-functional-spec.md` lines 17, 20) and both have a page

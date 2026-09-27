@@ -22,7 +22,19 @@ const { title } = Astro.props;
           never shown as live (docs/realtime.md).
         -->
         <div class="flex items-center gap-3">
-          <span id="balance-value" class="font-mono text-sm font-medium tabular-nums text-accent" aria-live="polite">&mdash;</span>
+          <!--
+            data-loading drives a skeleton in the VALUE'S OWN SHAPE, per
+            docs/website/03-functional-spec.md:121 ("skeleton, not a spinner over
+            a number that later changes"). The JS clears the attribute when the
+            first real balance arrives; until then the pill pulses and shows no
+            number, so a placeholder is never read as a balance of zero.
+          -->
+          <span
+            id="balance-value"
+            data-loading="true"
+            class="font-mono text-sm font-medium tabular-nums text-accent data-[loading=true]:inline-block data-[loading=true]:h-4 data-[loading=true]:w-24 data-[loading=true]:animate-pulse data-[loading=true]:rounded data-[loading=true]:bg-edge data-[loading=true]:text-transparent data-[loading=true]:select-none"
+            aria-live="polite"
+          >&nbsp;</span>
           <span
             id="live-badge"
             data-status="connecting"
@@ -143,8 +155,15 @@ const { title } = Astro.props;
     badgeLabel.textContent = BADGE_LABEL[state.status] ?? state.status;
 
     // Loading is a placeholder, not a zero: a zeroed balance looks like the
-    // money is gone.
-    balanceValue.textContent = state.balanceIdr === null ? '—' : formatIdr(state.balanceIdr);
+    // money is gone. Until the first real value arrives the span is rendered as
+    // a skeleton (data-loading), so there is nothing to misread.
+    if (state.balanceIdr === null) {
+      balanceValue.dataset.loading = 'true';
+      balanceValue.textContent = '\u00a0';
+    } else {
+      balanceValue.dataset.loading = 'false';
+      balanceValue.textContent = formatIdr(state.balanceIdr);
+    }
 
     const usage = state.usage;
     if (usage) {

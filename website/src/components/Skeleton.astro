@@ -1,0 +1,45 @@
+---
+// A loading skeleton.
+//
+// Why this exists: docs/website/03-functional-spec.md:121 requires every data
+// view's loading state to be a "**skeleton, not a spinner** over a number that
+// later changes". The distinction is not cosmetic — a spinner on the balance
+// badge, then a value, reads as "the balance was unknown, then it was X"; a
+// skeleton in the VALUE'S OWN SHAPE reads as "the balance goes here", so the
+// number that appears is understood as the same fact finishing, not a change.
+//
+// It is deliberately inert: no data, no script, no aria-live. A skeleton is not
+// content and must never be announced as one by a screen reader; the region that
+// owns the real value carries the live semantics. Marked `aria-hidden` for that
+// reason.
+interface Props {
+  /** Tailwind width utility, e.g. "w-24". Defaults to a full-width line. */
+  width?: string;
+  /** Tailwind height utility. Defaults to a single text line. */
+  height?: string;
+  /** Render several stacked lines (a paragraph-shaped skeleton). */
+  lines?: number;
+  /** Extra classes for the wrapper (margins, alignment). */
+  class?: string;
+}
+const {
+  width = 'w-full',
+  height = 'h-4',
+  lines = 1,
+  class: className = '',
+} = Astro.props;
+---
+
+<span class:list={['inline-flex flex-col gap-2', className]} aria-hidden="true">
+  {Array.from({ length: lines }).map((_, i) => (
+    <span
+      class:list={[
+        'block animate-pulse rounded bg-edge',
+        // The last line of a multi-line skeleton is short, the way a real
+        // paragraph ends — a full-width final line reads as "still loading".
+        lines > 1 && i === lines - 1 ? 'w-2/3' : width,
+        height,
+      ]}
+    ></span>
+  ))}
+</span>

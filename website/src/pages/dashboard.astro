@@ -1,5 +1,6 @@
 ---
 import DashboardLayout from '../layouts/DashboardLayout.astro';
+import Skeleton from '../components/Skeleton.astro';
 ---
 
 <DashboardLayout title="Dashboard">
@@ -58,7 +59,9 @@ import DashboardLayout from '../layouts/DashboardLayout.astro';
     <div id="recent-error" hidden role="alert"
       class="mt-3 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
 
-    <p id="recent-loading" class="mt-3 text-sm text-ink-muted">Loading&hellip;</p>
+    <div id="recent-loading" class="mt-3 rounded-lg border border-edge bg-surface-raised p-4">
+      <Skeleton width="w-full" lines={3} />
+    </div>
 
     <p id="recent-empty" hidden class="mt-3 rounded-lg border border-edge bg-surface-raised p-4 text-sm text-ink-muted">
       No requests yet. Once your key calls

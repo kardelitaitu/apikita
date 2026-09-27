@@ -8,6 +8,7 @@
 //
 // Script-island (plain <script>), not a UI-framework component: astro.config and
 // package.json are owned by another worker and must not change.
+import Skeleton from '../../components/Skeleton.astro';
 ---
 
 <div id="usage-island" class="mt-6">
@@ -21,15 +22,15 @@
     <div id="usage-today-grid" class="mt-4 grid gap-4 sm:grid-cols-3">
       <div class="rounded-lg border border-edge bg-surface-raised p-4">
         <div class="text-xs uppercase tracking-wide text-ink-muted">Input tokens</div>
-        <div id="u-in" class="mt-1 font-mono text-lg tabular-nums">—</div>
+        <div id="u-in" class="mt-1 font-mono text-lg tabular-nums" data-loading="true"><Skeleton width="w-24" height="h-6" /></div>
       </div>
       <div class="rounded-lg border border-edge bg-surface-raised p-4">
         <div class="text-xs uppercase tracking-wide text-ink-muted">Cache-read tokens</div>
-        <div id="u-cache" class="mt-1 font-mono text-lg tabular-nums">—</div>
+        <div id="u-cache" class="mt-1 font-mono text-lg tabular-nums" data-loading="true"><Skeleton width="w-24" height="h-6" /></div>
       </div>
       <div class="rounded-lg border border-edge bg-surface-raised p-4">
         <div class="text-xs uppercase tracking-wide text-ink-muted">Output tokens</div>
-        <div id="u-out" class="mt-1 font-mono text-lg tabular-nums">—</div>
+        <div id="u-out" class="mt-1 font-mono text-lg tabular-nums" data-loading="true"><Skeleton width="w-24" height="h-6" /></div>
       </div>
     </div>
     <p class="mt-2 text-xs text-ink-muted">
@@ -134,9 +135,17 @@
   // Three counters, displayed separately. We never sum them. The only place a
   // single number appears is cost_idr, which is a money figure, not a token total.
   function renderToday(b: UsageBucket | null): void {
-    $('u-in').textContent = b ? formatCount(b.input_tokens) : '—';
-    $('u-cache').textContent = b ? formatCount(b.cache_read_tokens) : '—';
-    $('u-out').textContent = b ? formatCount(b.output_tokens) : '—';
+    // Once a real answer (even "no usage") arrives, the skeleton is replaced by
+    // the value or a dash. data-loading only ever marks "we do not know yet".
+    for (const [id, value] of [
+      ['u-in', b ? formatCount(b.input_tokens) : '—'],
+      ['u-cache', b ? formatCount(b.cache_read_tokens) : '—'],
+      ['u-out', b ? formatCount(b.output_tokens) : '—'],
+    ] as [string, string][]) {
+      const el = $(id);
+      el.dataset.loading = 'false';
+      el.textContent = value;
+    }
   }
 
   function renderRows(buckets: UsageBucket[]): void {
