@@ -22,6 +22,7 @@ size.
 | Payout destination (wind-down only) | Embedded SQLite | **Deleted 30 days after payout** — see §Wind-down |
 | Top-up history (amounts, dates) | Embedded SQLite (the database file) | **Financial** |
 | Token usage per day | Embedded SQLite (the database file) | Behavioural |
+| **Per-request usage** (`usage_events`: model, token counts, cost, time) | Embedded SQLite (the database file) | Behavioural. **Not prompts or completions** — see the "never stored" list. Added when the dashboard gained its recent-requests feed |
 | API keys | Embedded SQLite (the database file) | Credentials (hashed) — the plaintext is never stored |
 | Reviews + edit history | Embedded SQLite (the database file) | Opinion, published aggregate only |
 | Sessions | Embedded SQLite (the database file) | Contains IP hash and user agent |
@@ -61,6 +62,7 @@ relationship and becomes a liability the moment a breach occurs.
 | **Ledger** | **Forever** | Financial record; it is the authoritative audit trail |
 | **Top-ups** | **Forever** | Financial; matches the ledger |
 | **Usage daily** | 24 months | Billing disputes, then aggregate only |
+| **Per-request usage** (`usage_events`) | **90 days** | Outlasts the 30-day rolling spend window plus a dispute window. The plan settles this at 90 days ([plans/sqlite-migration.md](plans/sqlite-migration.md) §Decision 8); the purge job is **not yet built** — see the note below |
 | **Sessions (expired/revoked)** | 30 days | Tidy up, but keep recent for security review |
 | **Reviews** | Until deleted by user | Published aggregate; individual text is theirs |
 | **Review history** | Same as review | Needed to make an edit meaningful |
@@ -68,6 +70,13 @@ relationship and becomes a liability the moment a breach occurs.
 | **Link-redemption attempts** | **7 days** | Salted IP hashes, same class as `key_ip_seen`; enough to investigate a live credential attack, then gone |
 | **Logs** | 30-90 days | Debugging window; not a database |
 | **Accounts (closed)** | Keep record, drop personal data | See below |
+
+> **`usage_events` retention is a policy with no enforcement yet.** The table is
+> populated (the dashboard reads it) but no purge job deletes rows past 90 days.
+> Until one exists, per-request rows are kept indefinitely in practice. This is
+> recorded rather than glossed: a stated retention period the code does not keep
+> is worse than no stated period, the same standard `decisions.md` holds credit
+> expiry to.
 
 **The ledger is never deleted, even when a customer leaves.** It is the record of
 money that moved. That is normal accounting, not a retention violation — but it
