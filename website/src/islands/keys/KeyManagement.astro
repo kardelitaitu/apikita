@@ -262,12 +262,6 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     return isNaN(d.getTime()) ? '—' : d.toLocaleString();
   }
 
-  function escapeHtml(s: string): string {
-    return s.replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    }[c] as string));
-  }
-
   function render(keys: ApiKey[]): void {
     const hasAny = keys.length > 0;
     emptyEl.toggleAttribute('hidden', hasAny);
@@ -278,14 +272,41 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     for (const k of keys) {
       const li = document.createElement('li');
       li.className = 'flex flex-wrap items-center justify-between gap-4 p-4';
+
+      // Built with createElement + textContent, never innerHTML. The label is
+      // user-supplied and the prefix is server data: textContent has no escaping
+      // to forget, so a label containing "<script>" renders as text rather than
+      // being one missed case away from injection. Same rule as the usage and
+      // admin islands.
       const left = document.createElement('div');
-      left.innerHTML =
-        '<div class="flex items-center gap-2">' +
-          '<span class="font-medium">' + escapeHtml(k.label || '(unlabeled)') + '</span>' +
-          '<span class="rounded-full border border-edge-strong px-2 py-0.5 text-xs text-ink-muted ' + (k.revoked_at ? "border-danger-edge text-danger" : "border-ok-edge text-ok") + '">' + statusLabel(k) + '</span>' +
-        '</div>' +
-        '<div class="mt-1 font-mono text-sm text-ink-muted">' + escapeHtml(k.prefix) + '…</div>' +
-        '<div class="mt-1 text-xs text-ink-muted">Models: ' + modelsText(k) + ' · Spend: ' + spendText(k) + ' · Last used: ' + lastUsedText(k) + '</div>';
+
+      const head = document.createElement('div');
+      head.className = 'flex items-center gap-2';
+
+      const label = document.createElement('span');
+      label.className = 'font-medium';
+      label.textContent = k.label || '(unlabeled)';
+      head.append(label);
+
+      const badge = document.createElement('span');
+      badge.className =
+        'rounded-full border px-2 py-0.5 text-xs ' +
+        (k.revoked_at ? 'border-danger-edge text-danger' : 'border-ok-edge text-ok');
+      badge.textContent = statusLabel(k);
+      head.append(badge);
+
+      const prefix = document.createElement('div');
+      prefix.className = 'mt-1 font-mono text-sm text-ink-muted';
+      prefix.textContent = k.prefix + '…';
+
+      const summary = document.createElement('div');
+      summary.className = 'mt-1 text-xs text-ink-muted';
+      summary.textContent =
+        'Models: ' + modelsText(k) +
+        ' · Spend: ' + spendText(k) +
+        ' · Last used: ' + lastUsedText(k);
+
+      left.append(head, prefix, summary);
       const right = document.createElement('div');
       right.className = 'flex items-center gap-2';
       if (!k.revoked_at) {
