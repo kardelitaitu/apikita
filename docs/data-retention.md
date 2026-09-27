@@ -62,7 +62,7 @@ relationship and becomes a liability the moment a breach occurs.
 | **Ledger** | **Forever** | Financial record; it is the authoritative audit trail |
 | **Top-ups** | **Forever** | Financial; matches the ledger |
 | **Usage daily** | 24 months | Billing disputes, then aggregate only |
-| **Per-request usage** (`usage_events`) | **90 days** | Outlasts the 30-day rolling spend window plus a dispute window. The plan settles this at 90 days ([plans/sqlite-migration.md](plans/sqlite-migration.md) §Decision 8); the purge job is **not yet built** — see the note below |
+| **Per-request usage** (`usage_events`) | **90 days** | Outlasts the 30-day rolling spend window plus a dispute window. Swept nightly by `cargo run --bin usage-purge`; the boundary is inclusive, so the cutoff day is deleted and exactly 89 preceding days are kept |
 | **Sessions (expired/revoked)** | 30 days | Tidy up, but keep recent for security review |
 | **Reviews** | Until deleted by user | Published aggregate; individual text is theirs |
 | **Review history** | Same as review | Needed to make an edit meaningful |
@@ -71,12 +71,16 @@ relationship and becomes a liability the moment a breach occurs.
 | **Logs** | 30-90 days | Debugging window; not a database |
 | **Accounts (closed)** | Keep record, drop personal data | See below |
 
-> **`usage_events` retention is a policy with no enforcement yet.** The table is
-> populated (the dashboard reads it) but no purge job deletes rows past 90 days.
-> Until one exists, per-request rows are kept indefinitely in practice. This is
-> recorded rather than glossed: a stated retention period the code does not keep
-> is worse than no stated period, the same standard `decisions.md` holds credit
-> expiry to.
+> **`usage_events` retention is now enforced.** `server/src/bin/usage-purge.rs`
+> deletes rows past the 90-day window, run nightly alongside `ip-purge` by
+> whatever schedules the backup and reconciliation jobs. It is idempotent, and it
+> is deliberately NOT on the request path — the settlement already writes one row
+> per billed request, and a per-request delete would add a second write to the
+> money path to do work that has to happen once a day.
+>
+> It deletes **only** `usage_events`. `usage_daily` is the 24-month aggregate the
+> spend window and reconciliation read; `ledger` and `topups` are financial
+> records kept forever.
 
 **The ledger is never deleted, even when a customer leaves.** It is the record of
 money that moved. That is normal accounting, not a retention violation — but it

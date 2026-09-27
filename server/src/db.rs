@@ -392,6 +392,58 @@ pub async fn debit_usage_transaction(
     Ok(UsageSettlement::Settled { new_balance })
 }
 
+/// How long per-request usage (`usage_events`) is retained, in days.
+///
+/// `docs/data-retention.md` settles this at **90 days**: it must outlast the
+/// 30-day rolling spend window plus a dispute window. The constant is the
+/// contract and stays as documented; a boundary that looks wrong is fixed in the
+/// comparison, never by nudging this to compensate.
+pub const USAGE_EVENTS_RETENTION_DAYS: i64 = 90;
+
+/// Deletes `usage_events` rows past their retention window. Returns the count.
+///
+/// This is what makes the `data-retention.md` promise true rather than
+/// aspirational. Until this existed the table grew without bound while the doc
+/// stated a 90-day period — a stated period the code does not keep is worse than
+/// no stated period.
+///
+/// THE CUTOFF IS INCLUSIVE, and the window is "today plus the preceding 89". The
+/// doc promises 90 days RETAINED, so the days kept are
+/// `today - 89 ..= today` and every row at or before `today - 90` is deleted.
+/// The comparison is therefore `<=`, not `<`: with `<` the cutoff instant
+/// itself survived and the table quietly held 91 days against a statement saying
+/// 90 — a retention window longer than documented is a broken promise, not a
+/// rounding detail. This mirrors `ip_tracking::purge_expired` exactly.
+///
+/// `created_at` is TEXT in RFC3339 form, so the bound is an instant (midnight
+/// UTC of the cutoff day), not a bare date: binding `NaiveDate` would store
+/// `2026-09-27` and compare it as a string against `2026-09-27T03:04:05+00:00`,
+/// and the shorter string sorts FIRST — the DELETE would match nothing and rows
+/// would survive forever. That is the silent retention failure in the direction
+/// that keeps data, so the instant is explicit.
+///
+/// Run nightly. Nothing calls this on the request path: the settlement writes a
+/// row per request and a per-request delete would add a second write to the
+/// money path to do work that has to happen once a day.
+pub async fn purge_expired_usage_events(
+    pool: &SqlitePool,
+    today: chrono::NaiveDate,
+) -> Result<u64, AppError> {
+    let cutoff = today - chrono::Duration::days(USAGE_EVENTS_RETENTION_DAYS);
+    let cutoff_instant = cutoff
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+
+    let deleted = sqlx::query("DELETE FROM usage_events WHERE created_at <= ?")
+        .bind(cutoff_instant)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    Ok(deleted)
+}
+
 /// Writes the two rows a settlement owns, then commits: the append-only ledger
 /// debit and the `usage_daily` upsert.
 ///
@@ -2557,9 +2609,11 @@ mod tests {
 
         // Account-level usage, twice on the same day: no key.
         for _ in 0..2 {
-            debit_usage_transaction(&db.pool, account_id, None, "flash", 100, 10, 200, 5_000, None, 0)
-                .await
-                .expect("a settlement against a funded wallet");
+            debit_usage_transaction(
+                &db.pool, account_id, None, "flash", 100, 10, 200, 5_000, None, 0,
+            )
+            .await
+            .expect("a settlement against a funded wallet");
         }
 
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_daily WHERE account_id = ?")
@@ -2770,7 +2824,10 @@ mod tests {
         assert_eq!(model, "deepseek-v4-flash");
         assert_eq!((input, cache, output), (120, 30, 80));
         assert_eq!(cost, 4_242);
-        assert_eq!(key.as_deref(), Some(key_id.hyphenated().to_string().as_str()));
+        assert_eq!(
+            key.as_deref(),
+            Some(key_id.hyphenated().to_string().as_str())
+        );
         // The event is tied to the same reservation the ledger rows carry.
         assert_eq!(reference.as_deref(), Some("ref_usage_event"));
 
@@ -2791,4 +2848,81 @@ mod tests {
         assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
+
+    /// The 90-day boundary: a row at the cutoff instant is DELETED, one a second
+    /// later is KEPT. The inclusive comparison is the whole point — with `<` the
+    /// table silently retains 91 days against a 90-day promise.
+    #[tokio::test]
+    async fn usage_events_retention_deletes_the_boundary_day_and_keeps_89() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+
+        // Three rows at hand-chosen instants relative to a fixed "today".
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let cutoff = today - chrono::Duration::days(USAGE_EVENTS_RETENTION_DAYS);
+        let at_cutoff = cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let just_inside = at_cutoff + chrono::Duration::seconds(1);
+        let well_kept = today.and_hms_opt(12, 0, 0).unwrap().and_utc();
+
+        for (i, created) in [at_cutoff, just_inside, well_kept].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO usage_events (id, account_id, model, input_tokens, created_at)
+                 VALUES (?, ?, 'flash', ?, ?)",
+            )
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
+            .bind(i as i64)
+            .bind(created)
+            .execute(&db.pool)
+            .await
+            .expect("seed a usage event");
+        }
+
+        let deleted = purge_expired_usage_events(&db.pool, today).await.unwrap();
+        assert_eq!(deleted, 1, "only the row AT the cutoff day is deleted");
+
+        // The two survivors are the second-after-cutoff and the recent one.
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 2, "90 days are RETAINED, so the boundary day goes and 89 stay");
+
+        db.close().await;
+    }
+
+    /// Idempotent: a second sweep in the same day removes nothing.
+    #[tokio::test]
+    async fn usage_events_retention_is_idempotent() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        let old = (today - chrono::Duration::days(USAGE_EVENTS_RETENTION_DAYS + 5))
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        sqlx::query(
+            "INSERT INTO usage_events (id, account_id, model, created_at) VALUES (?, ?, 'flash', ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(old)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(purge_expired_usage_events(&db.pool, today).await.unwrap(), 1);
+        assert_eq!(purge_expired_usage_events(&db.pool, today).await.unwrap(), 0, "the second sweep removes nothing");
+
+        db.close().await;
+    }
+
+    /// The constant is the contract: 90 days, as docs/data-retention.md states.
+    #[test]
+    fn usage_events_retention_constant_is_documented() {
+        assert_eq!(USAGE_EVENTS_RETENTION_DAYS, 90);
+    }
+
 }
