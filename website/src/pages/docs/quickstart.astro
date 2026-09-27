@@ -1,0 +1,200 @@
+---
+import Base from '../../layouts/Base.astro';
+
+// Endpoints, request/response shapes and error codes are transcribed from
+// docs/server/api-spec.md and docs/error-model.md. No base URL is hardcoded:
+// the deployed host is not yet decided, so it is shown as $API_BASE.
+const authExchange = `curl -X POST "$API_BASE/auth/exchange" \\
+  -H "Content-Type: application/json" \\
+  -d '{"pb_token": "<pocketbase jwt from the login>"}' \\
+  -c cookies.txt`;
+
+const authResponse = `{
+  "account_id": "uuid",
+  "balance_idr": 50000
+}
+# and: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax`;
+
+const createKey = `curl -X POST "$API_BASE/api/keys" \\
+  -b cookies.txt \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "label": "prod",
+    "models": ["flash"],
+    "spend_limit_idr": 50000,
+    "token_limit": 0,
+    "rate_limit_rpm": 60,
+    "expires_at": null
+  }'`;
+
+const createKeyResponse = `{
+  "id": "uuid",
+  "key": "apk_live_<43 chars>",
+  "prefix": "apk_live_a1b2"
+}`;
+
+const streamCurl = `curl -N "$API_BASE/v1/chat/completions" \\
+  -H "Authorization: Bearer $APIKITA_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "flash",
+    "stream": true,
+    "messages": [
+      { "role": "user", "content": "Say hello in one sentence." }
+    ]
+  }'`;
+
+const plainCurl = `curl "$API_BASE/v1/chat/completions" \\
+  -H "Authorization: Bearer $APIKITA_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "flash",
+    "messages": [
+      { "role": "user", "content": "Say hello in one sentence." }
+    ]
+  }'`;
+
+const errorShape = `{
+  "error": {
+    "code": "insufficient_balance",
+    "message": "Balance too low for this request. Top up to continue.",
+    "request_id": "req_7f3a...",
+    "details": { "required_idr": 1200, "balance_idr": 400 }
+  }
+}`;
+
+const streamError = `event: error
+data: {"error":{"code":"upstream_failed","message":"...","request_id":"req_7f3a..."}}`;
+
+const errorCodes = [
+  { status: '400', code: 'invalid_request', meaning: 'Malformed body or params.', action: 'Fix the request.' },
+  { status: '401', code: 'unauthenticated', meaning: 'No or bad credential.', action: 'Check the key.' },
+  { status: '401', code: 'key_revoked', meaning: 'Key exists but was revoked.', action: 'Issue a new key.' },
+  { status: '401', code: 'key_expired', meaning: 'Key past its expiry.', action: 'Issue a new key.' },
+  { status: '402', code: 'insufficient_balance', meaning: 'Wallet cannot cover the request.', action: 'Top up. Do not retry.' },
+  { status: '402', code: 'key_limit_exceeded', meaning: "The key's own spend or token limit is hit.", action: 'Raise the limit or issue a new key. Do not retry.' },
+  { status: '403', code: 'model_not_allowed', meaning: "Model absent from the key's allowlist.", action: 'Use an allowed model.' },
+  { status: '403', code: 'wrong_credential_type', meaning: 'Cookie where an API key is required, or the reverse.', action: 'Use the right credential.' },
+  { status: '404', code: 'not_found', meaning: 'No such resource.', action: 'Check the id.' },
+  { status: '409', code: 'conflict', meaning: 'Duplicate (for example, Telegram already linked).', action: 'Reconcile state.' },
+  { status: '422', code: 'validation_failed', meaning: 'Well-formed but invalid.', action: 'Fix the value in details.field.' },
+  { status: '429', code: 'rate_limited', meaning: "The key's requests-per-minute limit was exceeded.", action: 'Back off; honour Retry-After.' },
+  { status: '500', code: 'internal_error', meaning: 'Our bug.', action: 'Retry once, then report the request_id.' },
+  { status: '503', code: 'no_upstream_available', meaning: 'Every upstream is unhealthy.', action: 'Back off; honour Retry-After.' },
+];
+---
+
+<Base
+  title="Quickstart — apikita"
+  description="Exchange a PocketBase token for a session, create an API key, and make your first streaming chat completion."
+>
+  <article class="space-y-12">
+    <header>
+      <h1 class="text-3xl font-semibold tracking-tight">Quickstart</h1>
+      <p class="mt-4 max-w-2xl text-ink-muted">
+        Three steps to a streaming completion: exchange your login for a session
+        cookie, create an API key, then call the OpenAI-compatible endpoint. The
+        examples below use <code class="font-mono text-sm">$API_BASE</code> for the
+        server origin; locally that is
+        <code class="font-mono text-sm">http://localhost:8080</code>.
+      </p>
+    </header>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">1. Exchange your login for a session</h2>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        Sign-in is handled by PocketBase. After a successful login the browser posts
+        the PocketBase token to the API exactly once; the server verifies it, creates
+        the account on first login, and returns an HttpOnly session cookie. The
+        PocketBase token itself is not stored.
+      </p>
+      <pre class="mt-4 overflow-x-auto rounded-lg bg-surface-sunken p-4 text-sm text-ink"><code>{authExchange}</code></pre>
+      <pre class="mt-3 overflow-x-auto rounded-lg border border-edge bg-surface-raised p-4 text-sm"><code>{authResponse}</code></pre>
+      <p class="mt-3 text-sm text-ink-muted">
+        Send this from the browser with <code class="font-mono">credentials: "include"</code>.
+        The session cookie is for the dashboard only — it is never accepted on
+        <code class="font-mono">/v1/*</code>.
+      </p>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">2. Create an API key</h2>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        Keys are scoped to a model allowlist and carry their own spend limit and
+        per-minute rate limit. Omitting <code class="font-mono text-sm">models</code>
+        grants every currently enabled model, resolved server-side to an explicit
+        list.
+      </p>
+      <pre class="mt-4 overflow-x-auto rounded-lg bg-surface-sunken p-4 text-sm text-ink"><code>{createKey}</code></pre>
+      <pre class="mt-3 overflow-x-auto rounded-lg border border-edge bg-surface-raised p-4 text-sm"><code>{createKeyResponse}</code></pre>
+      <p class="mt-3 max-w-2xl rounded-lg border border-warn-edge bg-warn-surface p-4 text-sm text-warn-ink">
+        The plaintext key is returned exactly once. The server stores only its
+        SHA-256 hash, so there is no way to recover it later — if you lose it, revoke
+        it and create another.
+      </p>
+      <p class="mt-3 text-sm text-ink-muted">
+        Raising a key's limits takes effect immediately. Lowering them is subject to
+        the proxy's metadata cache, so allow up to 60 seconds.
+      </p>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">3. Make a streaming request</h2>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        The proxy is OpenAI-compatible and authenticates with the key as a Bearer
+        token. With <code class="font-mono text-sm">stream: true</code> the response is
+        server-sent events, passed through unbuffered from upstream; token usage
+        arrives in the final chunk and is recorded when the stream completes.
+      </p>
+      <pre class="mt-4 overflow-x-auto rounded-lg bg-surface-sunken p-4 text-sm text-ink"><code>{streamCurl}</code></pre>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        Drop <code class="font-mono text-sm">stream</code> for a single JSON response:
+      </p>
+      <pre class="mt-3 overflow-x-auto rounded-lg bg-surface-sunken p-4 text-sm text-ink"><code>{plainCurl}</code></pre>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        If the upstream fails once the stream has started, the HTTP status can no
+        longer change. The stream ends with a terminal error event and closes
+        cleanly, so a truncated answer is never mistaken for a finished one:
+      </p>
+      <pre class="mt-3 overflow-x-auto rounded-lg border border-edge bg-surface-raised p-4 text-sm"><code>{streamError}</code></pre>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">Error codes</h2>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        Every error has the same shape, and
+        <code class="font-mono text-sm">code</code> is the stable part of the
+        contract — match on it, not on the message.
+      </p>
+      <pre class="mt-4 overflow-x-auto rounded-lg border border-edge bg-surface-raised p-4 text-sm"><code>{errorShape}</code></pre>
+      <div class="overflow-x-auto">
+        <table class="mt-6 w-full border-collapse text-left text-sm">
+        <thead>
+          <tr class="border-b border-edge-strong">
+            <th scope="col" class="py-3 pr-4 font-medium">Status</th>
+            <th scope="col" class="py-3 pr-4 font-medium">Code</th>
+            <th scope="col" class="py-3 pr-4 font-medium">Meaning</th>
+            <th scope="col" class="py-3 font-medium">What to do</th>
+          </tr>
+        </thead>
+        <tbody>
+          {errorCodes.map((row) => (
+            <tr class="border-b border-edge">
+              <td class="py-3 pr-4 font-mono">{row.status}</td>
+              <td class="py-3 pr-4 font-mono">{row.code}</td>
+              <td class="py-3 pr-4 text-ink-muted">{row.meaning}</td>
+              <td class="py-3 text-ink-muted">{row.action}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      </div>
+      <p class="mt-4 max-w-2xl text-sm text-ink-muted">
+        <code class="font-mono">Retry-After</code> is sent on 429 and 503 only, in
+        seconds. On a 429 it is the real time until your window frees; on a 503 it is
+        the shortest remaining upstream cooldown, which can be as long as 900 seconds.
+        A 402 is permanent until you top up — do not retry it.
+      </p>
+    </section>
+  </article>
+</Base>

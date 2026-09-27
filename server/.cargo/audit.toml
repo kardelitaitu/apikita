@@ -1,0 +1,62 @@
+# =============================================================================
+# cargo-audit configuration. Read by `cargo audit` from this directory.
+#
+# WHY THIS FILE EXISTS RATHER THAN AN `--ignore` FLAG IN CI
+#
+# `cargo audit` fails the build on a known advisory. That is the right default,
+# which is why this file is short: ONE advisory is excepted, it is named, and the
+# reasoning sits beside it. An `--ignore` on the command line would instead be
+# invisible to the next reader and would silently apply to every advisory with
+# that id forever — including a future one that IS reachable. An exception
+# belongs in the repository, where it can be reviewed, dated and re-opened.
+#
+# Deliberately not `cargo-deny`: deny.toml is the fuller policy engine (licences,
+# bans, sources) and is worth adding when there is a second reason to need it.
+# Adding a whole policy tool today to silence one unreachable advisory would be a
+# larger dependency than the problem.
+#
+# NOTE ON THE FORMAT: `advisories.ignore` is a list of ID STRINGS, not tables.
+# This was MEASURED — an inline table is rejected with "invalid type: map,
+# expected a string". The reasoning for each id is therefore the comment above it
+# rather than a field, which is why the explanation below is prose.
+# =============================================================================
+
+# The ONLY fields this version accepts are `ignore`, `informational_warnings` and
+# `severity_threshold` (measured — `deny = [...]` is rejected with "unknown
+# field `deny`"). So the policy is expressed through what IS available: nothing
+# is ignored except the one unreachable advisory below, and the audit's own
+# default (fail on a vulnerability) is left intact.
+[advisories]
+# Surface the informational classes so they appear in the output rather than
+# being silently dropped; they warn without failing the build, which is the right
+# severity for "this crate is unmaintained" as opposed to "this crate is
+# vulnerable".
+informational_warnings = ["unmaintained", "unsound"]
+
+# -----------------------------------------------------------------------------
+# RUSTSEC-2023-0071 — rsa 0.9.10, "Marvin Attack: potential key recovery through
+# timing sidechannels". Severity 5.9 (medium). Fixed in: NONE ("No fixed upgrade
+# is available!"), so this cannot be resolved by upgrading.
+#
+# WHY THIS IS SAFE TO EXCEPT, MEASURED RATHER THAN ASSUMED:
+#
+#   1. `cargo tree -i rsa` on the default target prints "nothing to print" —
+#      `rsa` is not in the normal dependency graph.
+#   2. Its owner in Cargo.lock is `sqlx-mysql 0.8.6`, a database driver THIS
+#      PROJECT DOES NOT USE. sqlx is an umbrella crate listing four drivers; this
+#      project enables only `sqlite`.
+#   3. `cargo tree` for the target actually built (x86_64-unknown-linux-gnu)
+#      lists `sqlx-sqlite` and never `sqlx-mysql`.
+#   4. The compiled binary contains no `sqlx_mysql` symbol — verified by reading
+#      the artefact, not by trusting the feature list.
+#
+#   The vulnerable code is therefore not linked into the service. The advisory is
+#   real but unreachable: a property of the LOCKFILE, not of the PROGRAM.
+#
+# WHEN THIS MUST BE RE-OPENED, so it does not become folklore:
+#   - `sqlx-mysql` (or any crate depending on `rsa`) becomes a real dependency, or
+#   - the feature set changes so a MySQL driver is compiled in, or
+#   - a fixed `rsa` ships (then upgrade and delete this entry).
+#   Any of those makes the reachability argument above FALSE.
+# -----------------------------------------------------------------------------
+ignore = ["RUSTSEC-2023-0071"]

@@ -99,7 +99,7 @@ looked the way it did. Without it, you have no defence.
 
 | Finding | Outcome |
 | --- | --- |
-| Violation clear and severe | Terminate. Do not refund (see the ToS section 3 exception — forfeiture is legally risky) |
+| Violation clear and severe | Terminate. The terms are non-refundable, but **forfeiture is still legally risky** — record the decision and the reason, do not simply keep the balance |
 | Violation minor | Warn, restore, monitor |
 | False positive | Restore immediately, and note why the signal fired |
 | **Uncertain** | **Do not terminate.** Restrict, monitor, gather more |
@@ -132,6 +132,9 @@ revoked; being told by you, with evidence, is what makes you a partner.
 **Signal:** many distinct IPs on one key; usage not matching the account's pattern.
 
 1. Check whether the IPs are plausible (mobile users roam; offices share egress).
+   **`distinct_ips` is now recorded per key per day** — see
+   [`ip-tracking.md`](ip-tracking.md). Read it before assuming: a mobile user can
+   legitimately show 10-50 in a day, so a raw count is not evidence on its own.
 2. If it looks like distribution: revoke the key, notify the account, monitor the
    replacement.
 3. **Consider whether this is worth policing.** It is a terms violation, but it may
@@ -144,8 +147,14 @@ revoked; being told by you, with evidence, is what makes you a partner.
 1. The limits are working as designed; this is a pricing conversation.
 2. **Consider whether the limits are simply too low** — customers work around limits
    that do not fit their legitimate use.
-3. Cap key creation per account per day (specified in
-   [`server/api-spec.md`](server/api-spec.md)) and leave the rest to pricing.
+3. Key creation is already capped per account per day
+   (`limits.key_creation_per_day`, counted from `api_keys` rows so revoking one to
+   mint another does not evade it). Leave the rest to pricing.
+
+**The cap is a hard cap of 10/day; more than 3 is the suspicion threshold**
+([`ip-tracking.md`](ip-tracking.md)). A customer creating 5 keys in a day after
+hitting a limit is a pricing conversation. Do not treat the hard cap being hit as
+proof of abuse on its own.
 
 ### Payment abuse
 
@@ -170,7 +179,7 @@ revoked; being told by you, with evidence, is what makes you a partner.
 | --- | --- |
 | Read customer prompts to investigate | Violates a stated promise; needs a policy change first |
 | Terminate without a written record | Indefensible if challenged |
-| Silently keep a suspended customer's money | The ToS refund exception applies |
+| Silently keep a suspended customer's money | The terms are non-refundable, but silently keeping it is still not defensible — record the forfeiture and tell the customer why |
 | Ignore an upstream complaint because it seems minor | The relationship is the business |
 
 ## Tooling needed
@@ -178,9 +187,10 @@ revoked; being told by you, with evidence, is what makes you a partner.
 | Capability | Status |
 | --- | --- |
 | Per-account usage with token class breakdown | In schema (`usage_daily`) |
-| Distinct IPs per key | **Not yet designed** |
-| Key creation rate per account | Needs a counter |
-| Account suspend/restore | Specified in [`admin-surface.md`](admin-surface.md) |
+| Distinct IPs per key | **Built** — `key_ip_daily`, salted daily hash; see [`ip-tracking.md`](ip-tracking.md) |
+| Key creation rate per account | **Enforced** — `limits.key_creation_per_day`, counted from `api_keys` rows |
+| Top-up rate per account | **Enforced** — `limits.topup_per_hour`, counted from `topups` rows |
+| Account suspend/restore | Specified in [`admin-surface.md`](admin-surface.md) — **endpoints not yet built** |
 | Incident log | **Not specified** |
 
 **The admin path is a real gap.** Suspending an account is a required capability with

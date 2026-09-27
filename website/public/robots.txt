@@ -1,0 +1,17 @@
+# apikita — crawler policy.
+
+User-agent: *
+Allow: /
+
+# No Sitemap line on purpose: this site ships no sitemap. Astro emits one only
+# with the @astrojs/sitemap integration, which is deliberately not a dependency
+# here, so a pointer at /sitemap-index.xml would advertise a 404. Add the line in
+# the same change that adds the integration.
+
+# The private surfaces (/dashboard, /login, /signup, /verify, /reset) are NOT
+# listed here. A Disallow rule stops a crawler reading a page but does not stop
+# the URL appearing in results — the page stays indexable-but-unreadable, which
+# is the outcome we are trying to avoid. They instead carry
+# <meta name="robots" content="noindex"> in the document head (see
+# src/layouts/Base.astro), which is the directive that actually removes them.
+# Crawling them therefore stays allowed so that directive can be seen.

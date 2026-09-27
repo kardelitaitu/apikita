@@ -28,17 +28,37 @@ that are now the live exposure:
    permission to resell at scale. Check whether volume triggers a different
    agreement.
 
-**The refund posture is narrower than "no refunds" implies.** Policy is
-non-refundable, which is enforceable against a customer who changes their mind.
-It is *not* enforceable where we take payment and deliver nothing — the upstream
-goes down, an account is closed, or a top-up never credits. In that case the
-customer paid and received no service.
+**The refund posture is "non-refundable during operation, no exception" — and that is narrower
+than the protection it looks like.** Policy is non-refundable, which is enforceable
+against a customer who changes their mind. Withdrawing the non-delivery carve-out
+([`decisions.md`](../decisions.md) §Money) does **not** make the platform immune to
+non-delivery exposure.
 
 That is not a hypothetical: **Midtrans is a domestic rail with a real merchant
 entity behind it.** A payer who does not receive service can dispute through the
 payment provider, and on non-delivery the payer generally prevails regardless of
 our stated policy. Non-refundable scopes liability to *unwanted* service, not to
 *undelivered* service.
+
+**The residual exposure, stated plainly:** if we take payment and deliver nothing —
+the upstream goes down, an account is closed, a top-up never credits — the customer
+paid and received no service. The system will not return the money (the refund code
+path is deleted and inbound refund notifications are refused), so the return happens
+**at the rail, out of band**, as a chargeback. That is negative float: the customer's
+money is gone from the merchant account while their wallet still shows the credit.
+No ledger-drift check fires, because the ledger never moved. **The only fast signal
+is the `error!` refusal log — unalerted, this is a silent loss.**
+
+**Mitigated at wind-down, not during operation:** if we close the service, balances
+above USD 2.00 are paid out ([`decisions.md`](../decisions.md) §Money,
+[`wind-down.md`](../wind-down.md)). That covers the *deliberate* shutdown case. It does
+**not** cover an upstream disappearing overnight, a chargeback, or a customer who never
+claims — those remain the exposures below.
+
+**Added risk of dropping the carve-out:** a clause that overreaches is more likely
+to be struck down *in its entirety* than a narrow one. Withdrawing the exception may
+therefore **reduce** the clause's protective value rather than increase it. This is a
+lawyer's call and remains a Gate 0 item.
 
 **What must happen before launch:**
 

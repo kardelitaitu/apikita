@@ -40,5 +40,26 @@ without a refresh, falling back to polling if the stream drops.
 
 ## Status
 
-Empty scaffolding. Nothing implemented. Full design in
+**Built and building.** Measured: `npm run build` emits 15 pages and `npm test`
+passes 52 tests (`node --test "tests/**/*.test.ts"` reports `# tests 52`, `# pass 52`).
+What exists today:
+
+- **Public pages** — `/` (landing + pricing), `/login`, `/signup`, `/verify`,
+  `/reset`, `/reset/confirm`, `/docs` and `/docs/quickstart`.
+- **Dashboard** — `/dashboard` plus `/dashboard/{keys,usage,wallet}`, and the
+  `/dashboard/keys/new` and `/dashboard/settings` pages.
+- **Islands** — `islands/keys/KeyManagement.astro`, `islands/usage/UsageAnalytics.astro`,
+  `islands/wallet/TopUpForm.astro`, each mounted by its page.
+- **Shared layer** — `lib/{api,errors,format,live,pocketbase,retry-wait,auth-flow}.ts`.
+
+`/dashboard/keys/new` and `/dashboard/settings` are specified
+(`docs/website/03-functional-spec.md` lines 17, 20) and both have a page
+(`src/pages/dashboard/keys/new.astro`, `src/pages/dashboard/settings.astro`).
+
+Design and the authoritative built-vs-planned inventory:
 [`docs/website/README.md`](../docs/website/README.md).
+
+> **Note on the identity description above.** `docs/decisions.md` settles identity as
+> **Rust-owned** (SQLite, no external auth service), but that migration is *decided, not
+> yet in the code* — see the register's "Migration in flight" marker. The running server
+> still calls PocketBase, so this folder still uses the PocketBase client.

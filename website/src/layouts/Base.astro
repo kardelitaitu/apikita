@@ -1,0 +1,102 @@
+---
+import '../styles/global.css';
+import Nav from '../components/Nav.astro';
+
+// Zero-JS base layout. No <script>, no client:* directives, ever.
+interface Props {
+  title: string;
+  description: string;
+  /** false = the caller supplies its own header/main/footer (dashboard shell). */
+  chrome?: boolean;
+}
+const { title, description, chrome = true } = Astro.props;
+const year = new Date().getFullYear();
+
+// Private surfaces are not for the index. Derived here from the path rather than
+// passed per page, so the rule cannot be forgotten on a new dashboard route:
+// one guard covers every caller (the auth pages arrive through AuthLayout, the
+// dashboard through DashboardLayout). A robots.txt Disallow would be the wrong
+// tool — it blocks the crawl, not the result, and a noindex that is never read
+// removes nothing.
+const path = Astro.url.pathname.replace(/\/+$/, "") || "/";
+const noindex = /^\/(dashboard|login|signup|verify|reset)(\/|$)/.test(path);
+
+// Absolute URL for the canonical link and og:url. Astro.site comes from the
+// `site` key in astro.config.mjs — currently a PLACEHOLDER origin, so this is a
+// placeholder URL until that is set. With no `site` at all there is no correct
+// absolute URL to emit, so fall back to the bare path rather than invent a host.
+const canonical = Astro.site
+  ? new URL(Astro.url.pathname, Astro.site).href
+  : Astro.url.pathname;
+
+// The footer’s link row. /privacy, /docs and /models exist for certain. /terms
+// does not: the Terms doc in this repo is a DRAFT OUTLINE pending legal review,
+// so the page may be withheld — and a link to a 404 is worse than no link. Vite
+// resolves this glob at build time, so adding src/pages/terms.astro turns the
+// entry on with no edit here. Add no other entry without the page to back it.
+const footerLinks = [
+  { href: '/privacy', label: 'Privacy' },
+  ...(Object.keys(import.meta.glob('../pages/terms.astro')).length
+    ? [{ href: '/terms', label: 'Terms' }]
+    : []),
+  { href: '/docs', label: 'Docs' },
+  { href: '/models', label: 'Models' },
+];
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    {noindex && <meta name="robots" content="noindex" />}
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="canonical" href={canonical} />
+    <!--
+      Social cards. No og:image on purpose: a card image needs a real file in
+      public/ to point at, and a tag aimed at a missing image is a broken card.
+      Title and description are the page’s own props — never new copy.
+    -->
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:site_name" content="apikita" />
+    <meta name="twitter:card" content="summary" />
+  </head>
+  <body class="min-h-screen bg-surface text-ink antialiased">
+    {chrome && (
+    <header class="border-b border-edge">
+      <div class="mx-auto max-w-4xl px-6 py-4">
+        <Nav />
+      </div>
+    </header>
+    )}
+
+    {chrome ? (
+      <main class="mx-auto max-w-4xl px-6 py-12">
+        <slot />
+      </main>
+    ) : (
+      <slot />
+    )}
+
+    {chrome && (
+    <footer class="border-t border-edge">
+      <div class="mx-auto max-w-4xl px-6 py-8 text-sm text-ink-muted">
+        <p>apikita &mdash; prepaid LLM API gateway. Prices in IDR.</p>
+        <p class="mt-1">&copy; {year}</p>
+        <ul class="mt-4 flex flex-wrap gap-x-4 gap-y-2">
+          {footerLinks.map(({ href, label }) => (
+            <li>
+              <a href={href} class="hover:text-brand">{label}</a>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </footer>
+    )}
+  </body>
+</html>

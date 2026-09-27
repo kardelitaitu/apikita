@@ -1,0 +1,152 @@
+---
+import Base from '../layouts/Base.astro';
+---
+
+<Base
+  title="Sign in — apikita"
+  description="Sign in to the apikita dashboard with Google or an email address and password."
+>
+  <section class="mx-auto max-w-sm py-8">
+    <h1 class="text-2xl font-semibold tracking-tight">Sign in</h1>
+    <p class="mt-3 text-sm text-ink-muted">
+      Identity is handled by PocketBase. After it authenticates you, the browser
+      exchanges that token once for a session cookie with the API — the PocketBase
+      token is never the API credential.
+    </p>
+
+    <div id="auth-error" hidden class="mt-6 rounded-lg border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+
+    <button
+      id="google-signin"
+      type="button"
+      class="mt-6 w-full rounded-md border border-edge-strong px-4 py-2.5 text-sm font-medium hover:border-brand disabled:cursor-not-allowed disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      Continue with Google
+    </button>
+
+    <div class="my-6 flex items-center gap-3 text-xs uppercase tracking-wide text-ink-subtle">
+      <span class="h-px flex-1 bg-edge-strong"></span>
+      or
+      <span class="h-px flex-1 bg-edge-strong"></span>
+    </div>
+
+    <form id="password-signin" class="space-y-4">
+      <div>
+        <label for="email" class="block text-sm font-medium">Email</label>
+        <input
+          id="email"
+          name="email"
+          type="email"
+          autocomplete="email"
+          required
+          class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm"
+        />
+      </div>
+      <div>
+        <label for="password" class="block text-sm font-medium">Password</label>
+        <input
+          id="password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+          class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm"
+        />
+      </div>
+      <button
+        id="password-submit"
+        type="submit"
+        class="w-full rounded-md bg-brand px-4 py-2.5 text-sm font-medium text-brand-ink hover:bg-brand-strong disabled:cursor-not-allowed disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        Sign in
+      </button>
+    </form>
+
+    <p class="mt-6 text-xs text-ink-muted">
+      Failed attempts are rate-limited by PocketBase. Signing in creates your
+      account on first use; the dashboard needs a verified email address before a
+      balance can be held.
+    </p>
+  </section>
+</Base>
+
+<script>
+  // The auth island. Marketing pages ship no JavaScript; this page is an
+  // interactive surface and is the only place this bundle loads.
+  import { pb, exchangeForSession } from '../lib/pocketbase';
+  import { renderLoginError } from '../lib/login-error';
+  import { apiFetch, ApiError, type Me } from '../lib/api';
+
+  const errorBox = document.getElementById('auth-error') as HTMLDivElement;
+  const googleButton = document.getElementById('google-signin') as HTMLButtonElement;
+  const form = document.getElementById('password-signin') as HTMLFormElement;
+  const submit = document.getElementById('password-submit') as HTMLButtonElement;
+  const emailInput = document.getElementById('email') as HTMLInputElement;
+  const passwordInput = document.getElementById('password') as HTMLInputElement;
+
+  /** Preserve the destination across the login round trip. */
+  const next = new URLSearchParams(window.location.search).get('next');
+  const destination = next && next.startsWith('/') && !next.startsWith('//') ? next : '/dashboard';
+
+  // Someone who already holds a valid session should never be shown the login
+  // form — send them straight on to the destination they came for.
+  //
+  // redirectOn401 MUST stay false. With the default (true) a signed-out visitor
+  // gets a 401, apiFetch calls redirectToLogin(), and the browser lands on
+  // /login?next=/login — a loop that looks like the page reloading forever.
+  // Probing from an auth page means owning the 401 yourself, exactly as
+  // /auth/exchange does (lib/pocketbase.ts).
+  void apiFetch<Me>('/api/me', { redirectOn401: false })
+    .then(() => window.location.replace(destination))
+    // 401 is the normal signed-out case, not an error: stay on the form and stay
+    // silent. Only a genuinely broken probe is worth the console.
+    .catch((err: unknown) => {
+      if (!(err instanceof ApiError) || err.status !== 401) console.warn(err);
+    });
+
+  function showError(err: unknown): void {
+    // A 422 that names a field moves focus to it; every other failure just writes
+    // the notice. The map is the page's own field names -> inputs.
+    renderLoginError(errorBox, err, { email: emailInput, password: passwordInput });
+    errorBox.hidden = false;
+  }
+
+  function clearError(): void {
+    errorBox.hidden = true;
+    errorBox.textContent = '';
+  }
+
+  function setBusy(busy: boolean): void {
+    googleButton.disabled = busy;
+    submit.disabled = busy;
+  }
+
+  /** PocketBase authenticates, then the API issues its own session cookie. */
+  async function finishLogin(): Promise<void> {
+    await exchangeForSession();
+    window.location.assign(destination);
+  }
+
+  googleButton.addEventListener('click', () => {
+    clearError();
+    setBusy(true);
+    void pb.collection('users').authWithOAuth2({ provider: 'google' })
+      .then(finishLogin)
+      .catch(showError)
+      .finally(() => setBusy(false));
+  });
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    clearError();
+    setBusy(true);
+    const data = new FormData(form);
+    void pb.collection('users').authWithPassword(
+      String(data.get('email') ?? ''),
+      String(data.get('password') ?? ''),
+    )
+      .then(finishLogin)
+      .catch(showError)
+      .finally(() => setBusy(false));
+  });
+</script>

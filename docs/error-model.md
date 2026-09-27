@@ -41,7 +41,8 @@ matching on its text is a bug waiting to happen.
 | 402 | `insufficient_balance` | Wallet cannot cover it | Top up |
 | 402 | `key_limit_exceeded` | Key's own spend/token limit hit | Raise the limit or new key |
 | 403 | `model_not_allowed` | Model absent from the key's allowlist | Use an allowed model |
-| 403 | `wrong_credential_type` | Cookie where a key is required (or vice versa) | Use the right credential |
+| 403 | `forbidden` | Authenticated, but not permitted — e.g. a non-operator calling an `/api/admin/*` route, or an operator acting on their own account | Do not retry; you do not have this permission |
+| 403 | `wrong_credential_type` | **Reserved, never emitted** — a cookie on `/v1/*`, or a key on a cookie endpoint, returns 401 `unauthenticated` | Treat as 401 |
 | 404 | `not_found` | No such resource | Check the id |
 | 409 | `conflict` | Duplicate (e.g. Telegram already linked) | Reconcile state |
 | 422 | `validation_failed` | Well-formed but invalid (rating out of range) | Fix the value |
@@ -55,11 +56,20 @@ matching on its text is a bug waiting to happen.
 | --- | --- | --- |
 | No credential | 401 | Who are you? |
 | Bad credential | 401 | We cannot identify you |
+| Wrong credential type — a cookie on `/v1/*`, or a key on a cookie endpoint | 401 | Same: it is not a credential we can use |
 | Valid credential, model denied | **403** | We know you; you may not do this |
 
 **Do not return 403 for a bad key.** A valid-but-unauthorized request and an
 unauthenticated one are different, and clients handle them differently (re-login vs
 change the request).
+
+**A wrong credential type on the two API auth schemes is a bad credential, and
+returns 401.** A cookie sent to `/v1/*`, or a key sent to a cookie endpoint, fails as
+`unauthenticated`. `wrong_credential_type` stays defined and reserved, but nothing
+emits it: a 403 here would confirm to the caller — including one holding a stolen
+cookie or key — that the credential is genuine and merely misapplied, while the
+caller's next step is the same either way. One 401 for every credential failure costs
+nothing operationally and tells an attacker nothing.
 
 ## 402 vs 429 for limit exhaustion
 
@@ -107,7 +117,7 @@ retry_after = min over endpoints of (cooldown_until - now)
 
 With one provider that is its current cooldown: 30s initially, doubling to a cap of
 900s (see `config/apikita.toml` `[circuit_breaker]`). So a 503 may carry
-NaNRetry-After: 900` — correct, and honest that the wait is long.
+`Retry-After: 900` — correct, and honest that the wait is long.
 
 **Floor it at 1 second.** A zero or negative value is a malformed header.
 
@@ -149,6 +159,19 @@ Emit a terminal error event in the stream:
 event: error
 data: {"error":{"code":"upstream_failed","message":"...","request_id":"..."}}
 ```
+
+**Two codes travel this way, and neither has a status in the table above.** The
+status line is long gone, so they exist only as this frame.
+
+| Code | Meaning | Client action |
+| --- | --- | --- |
+| `upstream_failed` | The upstream stream **failed** — a transport or protocol error mid-answer | The answer is lost. Do not retry blindly: a retry appends a second answer and bills for both |
+| `upstream_incomplete` | The upstream stream **ended cleanly but did not complete** — it closed before any usage block arrived, so the answer is truncated | Keep the partial text, but mark it incomplete. Never present it as a finished answer |
+
+**These are different conditions.** `upstream_failed` means the upstream stream
+died mid-answer; `upstream_incomplete` means it ended without error but stopped
+before the answer completed. A client that collapses them cannot tell a cut-off
+answer from a broken connection, and cannot say which one happened to support.
 
 **Then close cleanly.** Do not silently stop — a client cannot distinguish a
 finished answer from a truncated one, and will treat a partial response as

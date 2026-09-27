@@ -1,0 +1,175 @@
+@import "tailwindcss";
+
+/* ============================================================================
+   apikita — dark theme tokens.
+
+   One palette, defined once, in the token layer. Pages consume semantic
+   utilities (bg-surface-raised, text-ink-muted, border-danger-edge) instead of
+   raw hue+shade pairs, so the theme can move without a 200-class
+   find-and-replace — and, more importantly, so ERROR stays red and SUCCESS
+   stays green rather than being repainted into the brand colour.
+
+   LAYERING. Three surfaces, sunken < surface < raised, so cards, tables and
+   the modal read as raised off the page instead of flat-painted onto it.
+
+   ACCENTS (deliberate split — see the change report):
+     GREEN  --color-brand*   PRIMARY. Every action and every piece of
+                             interactive state: buttons, links, focus rings,
+                             active/selected, live indicator, success.
+     ORANGE --color-accent*  SECONDARY and sparse. It marks the money figure
+                             on a surface (balance, today's cost, token rate)
+                             and nothing else. Never an action, never a status,
+                             so the two accents cannot fight.
+
+   SEMANTIC FAMILIES are dark-appropriate variants of the SAME hue. An error
+   that looks like success is a bug:
+     danger (red)     errors, destructive actions, revoke
+     warn   (amber)   pending / not-yet-true / caution
+     ok     (emerald) confirmed success
+   ========================================================================== */
+@theme {
+  /* --- Surfaces: an almost-black green, never pure black ----------------- */
+  --color-surface: #040d09; /* the page itself */
+  --color-surface-raised: #0a1f16; /* cards, panels, tables, the modal */
+  --color-surface-sunken: #020806; /* wells: code blocks, inputs, secrets */
+
+  /* --- Dividers and control outlines ------------------------------------ */
+  --color-edge: #16301f; /* hairline between rows and sections — 1.38:1 on
+                                   surface: visible as a rule, not a line */
+  --color-edge-strong: #3d6d55; /* outline of a control / table head —
+                                  3.30:1 on surface, clears WCAG 3:1 UI */
+
+  /* --- Text ------------------------------------------------------------- */
+  --color-ink: #e8f4ee; /* 17.44:1 on surface — body and headings */
+  --color-ink-muted: #a9c0b3; /* 10.20:1 on surface — secondary copy */
+  --color-ink-subtle: #7f978a; /*  6.28:1 on surface — captions, still AA */
+
+  /* --- BRAND: green, the primary accent --------------------------------- */
+  --color-brand: #3fd97f; /* 10.73:1 on surface — links, rings, active */
+  --color-brand-strong: #5ee89a; /* hover on a filled brand control */
+  --color-brand-ink: #04170e; /* text on a brand fill — 10.09:1 */
+  --color-brand-soft: #0d3324; /* brand-tinted well (selected state) */
+
+  /* --- ACCENT: orange, the secondary accent ----------------------------- */
+  --color-accent: #ff8a3c; /*  8.39:1 on surface */
+  --color-accent-strong: #ffa361;
+  --color-accent-ink: #2a1004; /* text on an accent fill — 7.62:1 */
+
+  /* --- DANGER: red. Errors and destructive actions. --------------------- */
+  --color-danger: #ff6b6b; /*  7.09:1 on surface — inline error text */
+  --color-danger-edge: #a84a54; /* panel border — 3.18:1 on its own panel */
+  --color-danger-surface: #2b1013; /* panel background — reads darker than
+                                      the raised card, so it stays a panel */
+  --color-danger-ink: #ffc4c4; /* 11.76:1 on its own panel */
+
+  /* --- WARN: amber. Pending, unconfirmed, caution. ---------------------- */
+  --color-warn: #f5b544; /* 10.85:1 on surface */
+  --color-warn-edge: #8a6a24; /* 3.21:1 on its own panel */
+  --color-warn-surface: #2a1f08; /* panel background — as above */
+  --color-warn-ink: #ffdca8; /* 12.37:1 on its own panel */
+
+  /* --- OK: emerald. Confirmed success. ---------------------------------- */
+  --color-ok: #10b981; /*  7.76:1 on surface — a deeper green than the
+                                  brand, so "settled" never reads as a link */
+  --color-ok-edge: #2f7a55; /* 3.14:1 on its own panel */
+  --color-ok-surface: #06251a; /* panel background — as above */
+  --color-ok-ink: #8ff0c4; /* 11.99:1 on its own panel */
+
+  /* --- Motion: the hero rate ticker ------------------------------------- */
+  /* The ticker is pure CSS — no script, no island. It translates by exactly
+     half the track height, and the track holds exactly two identical copies of
+     the card list, so half the track IS one copy and the loop has no seam. */
+  --animate-ticker: ticker 40s linear infinite;
+
+  @keyframes ticker {
+    from { transform: translateY(0); }
+    to { transform: translateY(-50%); }
+  }
+}
+
+/* ============================================================================
+   Base
+   ========================================================================== */
+:root {
+  /* Native widgets — number spinners, checkboxes, scrollbars, the caret —
+     follow this instead of rendering a light control on a dark page. */
+  color-scheme: dark;
+  /* Native checkboxes (the model allowlist) pick up the brand green. */
+  accent-color: var(--color-brand);
+}
+
+::selection {
+  background-color: var(--color-brand);
+  color: var(--color-brand-ink);
+}
+
+/* ============================================================================
+   Hero rate ticker
+
+   SEAM RULES. The loop is only invisible if one period is exactly one copy of
+   the card list. Three things enforce that, and each one alone breaks it:
+     1. The track holds TWO byte-identical copies of the list.
+     2. Spacing between cards is each card's own margin-bottom, never a
+        container `gap` — with gap, one period is copy + gap while -50%
+        translates copy + gap/2, and the loop jumps by half a gap every cycle.
+     3. Every card has a fixed height and shrink-0, so the two copies cannot
+        measure differently and the halves stay equal.
+   The viewport clips with overflow: hidden at an explicit height. */
+.ticker {
+  height: 18.75rem;
+  overflow: hidden;
+  /* Cards must not be selectable-drag targets mid-translate; the content is
+     still read by assistive tech, which ignores the animation entirely. */
+  user-select: none;
+}
+
+.ticker__track {
+  animation: var(--animate-ticker);
+  will-change: transform;
+}
+
+/* Pause so a rate can actually be read. :focus-within is deliberately absent —
+   the cards hold no focusable elements, so it would be dead code. */
+.ticker:hover .ticker__track {
+  animation-play-state: paused;
+}
+
+.ticker__copy {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ticker__card {
+  height: 9rem;
+  margin-bottom: 0.75rem;
+}
+
+/* Reduced motion: the animation stops, so the clip and the duplicate must go
+   too. A bare `animation: none` would leave the list cut off mid-card behind
+   overflow: hidden — hiding content from exactly the users who asked for less
+   motion. Without the animation the duplicate is not needed to close a loop,
+   so it is removed rather than shown twice. */
+@media (prefers-reduced-motion: reduce) {
+  .ticker {
+    height: auto;
+    overflow: visible;
+  }
+
+  .ticker__track {
+    animation: none;
+  }
+
+  .ticker__copy[aria-hidden="true"] {
+    display: none;
+  }
+}
+
+/* One shared focus guard instead of a per-element class. Deliberately NOT in
+   an @layer: unlayered declarations outrank every Tailwind utility layer, so a
+   component's own `focus:outline-none` cannot silently delete keyboard focus.
+   Every focusable element on every page gets a visible brand ring. */
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}

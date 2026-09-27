@@ -73,35 +73,36 @@ trailing 30 days) unless a calendar period is explicitly needed:
 
 ## Data model
 
-Extend the `api_keys` collection from
-[02-data-model.md](02-data-model.md):
+The `api_keys` table lives in SQLite (see [02-data-model.md](02-data-model.md)):
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `id` | | |
-| `account` | relation → users | Keys belong to the ACCOUNT |
-| `key_hash` | text | **Hash only** |
-| `prefix` | text | Display + lookup, e.g. `apk_live_a1b2` |
-| `label` | text | User-supplied |
-| `models` | json | Array of allowed public model names |
-| `spend_limit_idr` | number | 0 = unlimited |
-| `token_limit` | number | 0 = unlimited |
-| `rate_limit_rpm` | number | 0 = unlimited |
-| `expires` | date | null = never |
-| `last_used` | date | Updated by proxy, throttled |
-| `created` / `revoked` | | `revoked` null = active |
+| `id` | UUID | PK, generated server-side |
+| `account_id` | UUID | FK → `accounts(id)` ON DELETE CASCADE |
+| `key_hash` | text | **SHA-256 hash only** (UNIQUE, indexed) |
+| `prefix` | text | Display, e.g. `apk_live_a1b2` |
+| `label` | text | User-supplied label |
+| `models` | jsonb | Array of allowed public model names |
+| `spend_limit_idr` | bigint | 0 = unlimited |
+| `token_limit` | bigint | 0 = unlimited |
+| `rate_limit_rpm` | integer | 0 = unlimited |
+| `expires_at` | timestamptz | null = never |
+| `last_used_at` | timestamptz | Updated lazily by proxy |
+| `revoked_at` | timestamptz | null = active |
+| `created_at` | timestamptz | Audit timestamp |
 
-### API rules
+### API endpoints (Rust backend)
 
-| Operation | Rule |
-| --- | --- |
-| List / View | `account = @request.auth.id` — **never select `key_hash`** |
-| Create | **BFF only** (key generation and hashing are server-side) |
-| Update | **BFF only** (limits must not be client-writable without validation) |
-| Delete | Forbidden — revoke instead, so the audit trail survives |
+Managed via cookie-authenticated endpoints in [`server/api-spec.md`](../server/api-spec.md):
 
-`key_hash` must never be returned. PocketBase can restrict this per-request
-with a fields/expand parameter; verify the response, do not assume.
+| Operation | Endpoint | Access & Rule |
+| --- | --- | --- |
+| List / View | `GET /api/keys` | Session cookie — **never returns `key_hash`** |
+| Create | `POST /api/keys` | Session cookie — returns plaintext key once |
+| Update | `PATCH /api/keys/:id` | Session cookie — validates limits & models |
+| Revoke | `POST /api/keys/:id/revoke` | Session cookie — sets `revoked_at = now()` |
+
+`key_hash` is never returned by the Rust API handler.
 
 ## Key format
 
@@ -132,7 +133,7 @@ This is the part the website cannot do for you.
 2. not found / revoked / expired    -> 401
 3. model not in key.models          -> 403
 4. rate_limit_rpm exceeded          -> 429 + Retry-After
-5. spend_limit_idr or token_limit   -> 402 (or 429); see note
+5. spend_limit_idr or token_limit   -> 402
    exceeded for the window
 6. wallet balance sufficient        -> else 402
 7. proxy the request
@@ -145,8 +146,11 @@ model exists to a key not permitted to use it.
 
 ### Caching
 
-The proxy must **not** query PocketBase on every request — that would make the
-database the bottleneck and add latency to every token.
+The proxy must **not** query the database on every request — that would put the
+database on every token's hot path. SQLite made the query itself far cheaper
+(there is no network hop), but it did not remove the reason: **SQLite has one
+writer at a time for the whole database**, so a read on every token is still
+serialising against the write lock.
 
 - Cache key metadata (limits, model list, revoked state) with a **short TTL**
   (e.g. 30–60 seconds).
@@ -228,7 +232,7 @@ relationship visible, not present them as unrelated numbers.
 
 ## Open items
 
-- [ ] Confirm PocketBase can exclude `key_hash` from list responses per request.
+- [x] Exclude `key_hash` from list responses — enforced server-side by Rust `GET /api/keys`.
 - [x] Cache TTL **60s** — see [`docs/decisions.md`](../decisions.md).
 - [x] Spend limit returns **402** — see [`docs/decisions.md`](../decisions.md).
 - [x] Rolling window **30 days** — `config/apikita.toml` `[limits]`.

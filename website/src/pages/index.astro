@@ -1,0 +1,222 @@
+---
+// CUSTOMER-FACING COPY RULE: this page states the price the customer pays and
+// the terms attached to it, and never where that price comes from — our cost
+// basis, the fixed multiplier applied to it, or that we buy capacity at a
+// discount. See docs/decisions.md.
+import Base from '../layouts/Base.astro';
+
+// Shared with /models so the two pages cannot disagree.
+import { models, rateClasses, rates, tickerCards } from '../lib/models';
+
+const steps = [
+  {
+    n: '1',
+    title: 'Sign in',
+    body: 'Google or email + password, handled by PocketBase. The browser exchanges that token once for a session cookie via POST /auth/exchange. Your API keys never touch the browser session.',
+  },
+  {
+    n: '2',
+    title: 'Top up the wallet',
+    body: 'Prepaid balance, paid by QRIS through Midtrans. First deposit is 50,000 IDR; later top-ups start at 10,000 IDR. Only the Midtrans webhook credits a balance — the browser never does.',
+  },
+  {
+    n: '3',
+    title: 'Create an API key',
+    body: 'Pick a label, an optional spend limit and a per-minute rate limit. The plaintext key is shown exactly once; the server stores only its SHA-256 hash.',
+  },
+  {
+    n: '4',
+    title: 'Call the API',
+    body: 'POST /v1/chat/completions, OpenAI-compatible, authenticated with the key as a Bearer token. Streaming works over SSE and is passed through unbuffered.',
+  },
+];
+
+const faq = [
+  {
+    q: 'How is usage billed?',
+    a: 'Per token, in IDR, at the rates shown above. Input, cache-read and output tokens are three separate classes with three separate rates. They are never summed into one number, because cache-read is priced roughly 200x below output and a merged total could not be reconciled against an invoice.',
+  },
+  {
+    q: 'Does the price depend on when I call?',
+    a: 'No. Every request is reserved and billed at the rates shown above, at any hour, so a request can never cost more than was reserved against your balance.',
+  },
+  {
+    q: 'What happens when my balance runs out?',
+    a: 'The next request is rejected before it starts with HTTP 402. A request already in flight is allowed to finish even if it briefly overdraws, rather than being cut mid-answer — a truncated answer on non-refundable funds is worse than a small overdraft.',
+  },
+  {
+    q: 'Do you store my prompts or completions?',
+    a: 'No. Prompts and completions are not stored. We do keep the token counts needed to bill you, and your wallet ledger. Be aware that prompts are forwarded to an upstream provider in mainland China, whose own retention policy applies and is outside our control.',
+  },
+  {
+    q: 'Are payments refundable?',
+    a: 'No. The wallet is prepaid and non-refundable, so unused funds stay available rather than being returned on request. Credit does expire — 2 years after each deposit. If we ever close the service, we pay remaining balances back, so you are not left with stranded funds.',
+  },
+  {
+    q: 'What rate limits apply?',
+    a: 'Each API key carries its own requests-per-minute limit, set when the key is created and editable afterwards. Exceeding it returns 429 with a Retry-After header giving the real seconds until your window frees. Raising a key limit applies immediately; lowering it takes effect within 60 seconds.',
+  },
+];
+---
+
+<Base
+  title="apikita — prepaid LLM API gateway"
+  description="One OpenAI-compatible endpoint, prepaid in IDR. Per-token rates with no subscription, no minimum spend and no per-request fee."
+>
+  <section class="grid gap-10 lg:grid-cols-[minmax(0,1fr)_19rem] lg:items-start">
+    <div>
+      <h1 class="text-4xl font-semibold tracking-tight sm:text-5xl">
+        One OpenAI-compatible endpoint, prepaid in IDR.
+      </h1>
+      <p class="mt-6 max-w-2xl text-lg text-ink-muted">
+        apikita is a prepaid gateway. You fund a wallet in IDR, issue a key, and call
+        a single OpenAI-compatible endpoint. You pay per token at the rates below —
+        no plan tiers, no subscription and no monthly fee.
+      </p>
+      <div class="mt-8 flex flex-wrap gap-4">
+        <a
+          href="/docs/quickstart"
+          class="rounded-md bg-brand px-5 py-2.5 text-sm font-medium text-brand-ink hover:bg-brand-strong"
+        >
+          Read the quickstart
+        </a>
+        <a
+          href="#pricing"
+          class="rounded-md border border-edge-strong px-5 py-2.5 text-sm font-medium hover:border-brand"
+        >
+          See pricing
+        </a>
+      </div>
+    </div>
+
+    {/*
+      Rate ticker. Zero JS: the movement is one CSS keyframe on the track, and
+      the whole thing is real static content. Two byte-identical copies of the
+      twelve cards sit in the track and it translates by exactly half its own
+      height, so the loop has no seam; only the duplicate is aria-hidden, and
+      no aria-live anywhere — a rate list that never stops moving must not
+      announce itself. Figures are plain text: they translate with their card,
+      they never count up or roll.
+    */}
+    <aside class="lg:mt-2" aria-labelledby="hero-rates-heading">
+      <h2 id="hero-rates-heading" class="sr-only">Per-token rates, IDR per 1M tokens</h2>
+      <div class="ticker bg-surface-sunken">
+        <div class="ticker__track">
+          {[false, true].map((duplicate) => (
+            <ul class="ticker__copy" aria-hidden={duplicate ? 'true' : undefined}>
+              {tickerCards.map((card) => (
+                <li class="ticker__card shrink-0 rounded-md border border-edge bg-surface-raised p-3">
+                  <div class="flex items-baseline justify-between gap-2">
+                    <span class="truncate font-mono text-sm font-medium">{card.name}</span>
+                    <span
+                      class:list={[
+                        'shrink-0 rounded border px-1.5 py-0.5 text-xs font-medium',
+                        card.billed ? 'border-edge-strong text-ink-subtle' : 'border-warn-edge text-warn',
+                      ]}
+                    >
+                      {card.mark}
+                    </span>
+                  </div>
+                  <p class="mt-0.5 truncate text-xs text-ink-subtle">{card.basis} &middot; {card.alias}</p>
+                  <dl class="mt-2 space-y-1 text-xs">
+                    {rateClasses.map((tokenClass, i) => (
+                      <div class="flex items-baseline justify-between gap-2">
+                        <dt class="text-ink-muted">{tokenClass}</dt>
+                        <dd
+                          class:list={[
+                            'font-mono tabular-nums',
+                            card.billed ? 'text-accent' : 'text-ink-subtle',
+                          ]}
+                        >
+                          IDR {card.prices[i]}/M
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                </li>
+              ))}
+            </ul>
+          ))}
+        </div>
+      </div>
+    </aside>
+  </section>
+
+  <section class="mt-20">
+    <h2 class="text-2xl font-semibold tracking-tight">How it works</h2>
+    <ol class="mt-6 grid gap-6 sm:grid-cols-2">
+      {steps.map((step) => (
+        <li class="rounded-lg border border-edge bg-surface-raised p-5">
+          <div class="text-sm font-mono text-ink-subtle">{step.n}</div>
+          <h3 class="mt-2 font-medium">{step.title}</h3>
+          <p class="mt-2 text-sm leading-relaxed text-ink-muted">{step.body}</p>
+        </li>
+      ))}
+    </ol>
+  </section>
+
+  <section id="pricing" class="mt-20 scroll-mt-8">
+    <h2 class="text-2xl font-semibold tracking-tight">Pricing</h2>
+    <p class="mt-3 max-w-2xl text-ink-muted">
+      IDR per 1,000,000 tokens, billed at the rates below. No subscription, no
+      minimum monthly spend, no per-request fee.
+    </p>
+
+    <div class="overflow-x-auto">
+        <table class="mt-6 w-full border-collapse text-left text-sm">
+      <thead>
+        <tr class="border-b border-edge-strong">
+          <th scope="col" class="py-3 pr-4 font-medium">Token class</th>
+          <th scope="col" class="py-3 pr-4 text-right font-medium">IDR / 1M tokens</th>
+          <th scope="col" class="py-3 font-medium">Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rates.map((rate) => (
+          <tr class="border-b border-edge">
+            <th scope="row" class="py-3 pr-4 font-normal">{rate.label}</th>
+            <td class="py-3 pr-4 text-right font-mono text-accent">{rate.price}</td>
+            <td class="py-3 text-ink-muted">{rate.note}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+      </div>
+
+    <p class="mt-4 text-sm text-ink-muted">
+      Available models: {models.join(', ')} — priced identically. Every request is
+      reserved and billed at the rates above.
+    </p>
+
+    <dl class="mt-8 grid gap-4 text-sm sm:grid-cols-3">
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <dt class="text-ink-muted">First deposit</dt>
+        <dd class="mt-1 font-mono">50,000 IDR</dd>
+      </div>
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <dt class="text-ink-muted">Later top-ups, minimum</dt>
+        <dd class="mt-1 font-mono">10,000 IDR</dd>
+      </div>
+      <div class="rounded-lg border border-edge bg-surface-raised p-4">
+        <dt class="text-ink-muted">Refunds</dt>
+        <dd class="mt-1">Prepaid, non-refundable</dd>
+        <dt class="mt-6 text-ink-muted">Credit expiry</dt>
+        <dd class="mt-1">2 years after each deposit</dd>
+        <dt class="mt-6 text-ink-muted">If we close</dt>
+        <dd class="mt-1">Remaining balance paid out</dd>
+      </div>
+    </dl>
+  </section>
+
+  <section class="mt-20">
+    <h2 class="text-2xl font-semibold tracking-tight">FAQ</h2>
+    <dl class="mt-6 divide-y divide-edge border-y border-edge">
+      {faq.map((item) => (
+        <div class="py-5">
+          <dt class="font-medium">{item.q}</dt>
+          <dd class="mt-2 text-sm leading-relaxed text-ink-muted">{item.a}</dd>
+        </div>
+      ))}
+    </dl>
+  </section>
+</Base>

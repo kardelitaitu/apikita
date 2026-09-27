@@ -21,7 +21,7 @@ That is the budget. Everything below is sized against it.
 | Component | Resource profile | Notes |
 | --- | --- | --- |
 | **Rust API + proxy** | CPU-light, memory-light, I/O-bound | Streams bytes; the work is waiting, not computing |
-| **PostgreSQL** | Small, but needs a **persistent volume** | The wallet ledger lives here |
+| **SQLite** (embedded) | **No instance, no extra CPU/RAM line item** | The wallet ledger is a file inside the API process; it needs the persistent volume below, not a server |
 | **PocketBase** | Tiny | One binary, SQLite, low traffic (logins only) |
 | **Frontend** | **Free** | Cloudflare Pages static hosting |
 | **Edge relay** | Cheap VPS, ~2 vCPU / 4 GB | Absorbs connection load so Northflank stays small |
@@ -53,8 +53,8 @@ upstream socket, not computing. That has direct sizing consequences:
   serve large completions.
 
 - **The database is off the hot path.** API key metadata is cached with a <=60s
-  TTL, so a request does not hit Postgres. Without that cache, the database would
-  be the bottleneck and the instance size would have to grow with traffic.
+  TTL, so a request does not touch the database. Without that cache, the database
+  would be the bottleneck and the instance size would have to grow with traffic.
 
 **The practical implication: one small instance handles far more than this
 business will ever throw at it.** Do not size for imagined scale.
@@ -64,9 +64,9 @@ business will ever throw at it.** Do not size for imagined scale.
 | Component | Baseline | Why |
 | --- | --- | --- |
 | API/proxy instance | **1 vCPU / 1 GB** | I/O-bound; start here and measure |
-| Postgres | **shared or 1 vCPU / 1 GB** | Tiny row counts: thousands of rows, not millions |
+| Database | **in-process — $0, no separate line item** | Embedded SQLite. Tiny row counts: thousands of rows, not millions, and no server to size |
 | PocketBase | **smallest offering** | Logins only |
-| Volume for Postgres | **10-20 GB** | Ledger + usage; usage dominates |
+| Volume for the database file | **10-20 GB** | Ledger + usage; usage dominates |
 
 **Start smaller than you think.** A single 1 vCPU box with 1 GB is plausibly enough
 for the entire break-even customer base. Measure before scaling, and let the
@@ -78,7 +78,7 @@ metrics decide.
 | --- | --- | --- |
 | Streaming buffers in flight | per-connection | The dominant variable cost |
 | Key metadata cache | small, fixed | Bounded by key count |
-| Connection pools | fixed | Postgres + upstream HTTP pools |
+| Connection pools | fixed | Database + upstream HTTP pools |
 | Runtime overhead | fixed | Tokio, allocator |
 
 **The only thing that grows with load is in-flight streaming buffers.** That is why
@@ -130,7 +130,7 @@ Do not scale on a hunch. Scale when one of these is true:
 | --- | --- | --- |
 | CPU sustained >70% | Unexpectedly CPU-bound (compression? hashing?) | Find out why before adding CPU |
 | Memory growth with traffic | Streaming buffers leaking or accumulating | Fix the leak, not the symptom |
-| Postgres CPU high | Key cache not working, or usage writes are synchronous | Re-check the cache and batch usage writes |
+| Database CPU high | Key cache not working, or usage writes are synchronous | Re-check the cache and batch usage writes |
 | Latency rising, CPU low | **Upstream**, not us — check the provider | Do not scale the server |
 
 **The last row is the trap.** A proxy's latency is usually the upstream's latency.
@@ -140,8 +140,9 @@ Adding server capacity fixes nothing and doubles the bill.
 
 - **Buffering whole responses** instead of streaming — memory scales with request
   size, and the instance size must grow with it.
-- **Querying Postgres per token** — the database becomes the bottleneck and
-  forces a larger instance.
+- **Querying the database per token** — it becomes the bottleneck and forces a
+  larger instance. (Embedded SQLite makes this *easier* to hit, not harder: the
+  ledger now shares the API process's CPU and disk.)
 - **Running the proxy and the API as separate services** before it is necessary —
   two instances, two deploys, no benefit at this scale.
 - **Writing `last_used_at` on every request** — turns a read path into a write
@@ -153,5 +154,7 @@ Adding server capacity fixes nothing and doubles the bill.
 - [ ] Actual prices from Northflank for the target instance sizes.
 - [ ] Confirm the Cloudflare Pages free tier covers this usage.
 - [ ] Measure real memory per concurrent stream once implemented.
-- [ ] Decide whether Postgres runs as a managed add-on or self-hosted.
+- [x] ~~Decide whether Postgres runs as a managed add-on or self-hosted.~~ **Moot** —
+  the port to embedded SQLite removed the decision along with the service
+  ([§Stack](../README.md#stack), [`plans/sqlite-migration.md`](plans/sqlite-migration.md)).
 - [ ] Establish the off-peak routing decision (async tier), which dominates cost.

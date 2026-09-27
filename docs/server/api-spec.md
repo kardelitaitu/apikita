@@ -21,7 +21,7 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 | Live | `GET /events` (SSE) | cookie |
 | Proxy | `POST /v1/chat/completions` | **API key** |
 | **Bot** | `POST /api/bot/link`, `GET /api/bot/account`, `GET /api/bot/reviews/mine`, `POST /api/bot/notify-topup` | **bot token** |
-| **Admin** | `POST /api/admin/*` (see below) | **cookie + operator flag** |
+| **Admin** | `GET /api/admin/accounts/:id`; `POST /api/admin/accounts/:id/suspend`; `POST /api/admin/accounts/:id/resume` (**alias `/restore`**) | **cookie + operator flag** |
 | Ops | `GET /health` | none |
 
 **Two authentication schemes, deliberately separate:**
@@ -31,6 +31,10 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 
 Keeping them distinct prevents a browser session from being usable as an API
 credential, which would let a leaked cookie spend money.
+
+**Presenting the wrong one is a bad credential, not an authorization failure:** a
+cookie on `/v1/*`, or a Bearer key on a cookie endpoint, returns 401
+`unauthenticated`. See [`docs/error-model.md`](../error-model.md).
 
 ---
 
@@ -95,6 +99,13 @@ Everything the dashboard needs on load.
 Daily buckets from `usage_daily`. **Three token classes returned separately** —
 never summed. Cache-read is priced ~200x below output; a merged total cannot be
 reconciled against an invoice.
+
+Both bounds are ISO `YYYY-MM-DD`; **anything else is a `422`** naming the field in
+`details.field`. **An absent or empty bound is unbounded** — it does not constrain the
+window. **Both ends are inclusive**, so `from == to` returns exactly that one day.
+Only when neither parameter is present is the window the last 30 buckets; a bounded
+range that matches nothing returns `[]`, never that default. **No maximum span is
+enforced.**
 
 ### `GET /api/topups?limit=`
 
@@ -174,8 +185,12 @@ Creates a top-up and returns a Midtrans Snap token.
 { "amount_idr": 50000 }
 
 // 200 response
-{ "topup_id": "uuid", "order_id": "topup_<uuid>", "snap_token": "..." }
+{ "topup_id": "uuid", "order_id": "topup_<uuid>", "snap_token": "...", "environment": "sandbox" }
 ```
+
+`environment` is the Midtrans environment the server used — exactly `sandbox` or
+`production` — so the browser can check that the Snap environment it was built
+for matches, since the two are configured on separate platforms.
 
 Server validates the amount against the configured minimums (**first deposit vs
 re-top-up differ** — see
@@ -192,15 +207,51 @@ inserts a `topups` row with status `pending`, and calls Midtrans.
 ### `POST /api/telegram/link-code`
 
 Issues a 6-digit code: single-use, 5-minute TTL, bound to the account. Invalidates
-any previous code for that account.
+any previous code for that account — the predecessor row is **deleted** in the same
+transaction as the insert, so at most ONE code is ever live per account (two live
+codes would double an attacker's chance per guess).
+
+Capped by `limits.link_code_issuance_per_hour` (default 10) over the codes the
+account has issued, so a farm cannot keep thousands in flight.
 
 ### `DELETE /api/telegram`
 
-Unlinks Telegram. **Removes one row — never the account or the wallet.**
+Unlinks Telegram. **Removes one row — never the account or the wallet.** The
+handler deletes from `telegram_links` only; the wallet and the ledger are asserted
+untouched by test.
 
-The bot calls a separate internal endpoint to redeem codes. **Redemption must be
-rate-limited per account and per IP**; a 6-digit code is brute-forceable and a
-guess attaches an attacker's Telegram to a funded wallet.
+### `POST /api/bot/link` — redemption (bot token)
+
+The bot calls this to redeem a code typed in chat. Body: `{code, telegram_id}`.
+
+**This is the highest-risk endpoint in the Telegram surface**, because a successful
+guess attaches an attacker's chat to a **funded wallet**. Its safety rests on three
+properties, each pinned by a test rather than by intent:
+
+| Property | Why it matters | Test |
+| --- | --- | --- |
+| **Every attempt counts, including failures** | The attack IS a stream of failures, so a counter that advanced only on success would never fire | `failed_guesses_are_counted_until_the_cap_refuses_even_a_correct_code` |
+| **Every refusal is byte-identical** | Distinguishing "expired" from "unknown" turns a blind 10^6 search into a walk over the few hundred codes live right now | `every_kind_of_bad_code_produces_the_same_refusal` |
+| **Single-use holds under concurrency** | One conditional `UPDATE … WHERE used_at IS NULL`, so two redemptions cannot both claim the row | `a_code_is_single_use` |
+
+Rate-limited **per IP** by `limits.link_redemption_per_hour` (default 20) over
+attempts, counted in `link_redemption_attempts` by **salted IP hash, never the raw
+address**. Computed, not asserted: at 20/hour a host gets ~1.7 guesses inside one
+5-minute code window, so the expected time to hit a *specific* account's live code
+is **~5.7 years**. The TTL is what makes the cap bite — only one code per account is
+live, and it rotates — while the cap is what makes the TTL survivable. A refused attempt is not recorded, so a throttled attacker cannot extend
+their own lockout or grow the table without bound. The per-account cap above does
+not cover this: an attacker cycling the code space touches no account at all.
+
+**Response: 200 with `{"status":"invalid_code"}` for every unsuccessful
+redemption** — wrong, expired, used, malformed and unknown alike. A 4xx would
+invite the bot's transport to retry a guess, which is the opposite of the cap's
+purpose. Success returns `{"status":"linked","account_id":…}`.
+
+The bot token is required and compared in **constant time**. **A missing
+`TELEGRAM_BOT_TOKEN` refuses rather than allows** — with no configured secret
+there is no way to distinguish the bot from an attacker, so the endpoint fails
+closed. A cookie is not a bot credential.
 
 ---
 
@@ -257,6 +308,7 @@ Errors: `403` if called with a cookie instead of a bot token.
 
 Bot token only. Sets `withdrawn_at` — **does not delete**. A deleted row would
 free the unique slot and let the user submit a second review.
+
 ## Webhooks
 
 ### `POST /webhooks/midtrans`
@@ -265,9 +317,9 @@ The only source of wallet credits.
 
 ```
 1. read body
-2. recompute the signature (**exact field order UNVERIFIED** — see
-   [docs/website/04-payments.md](../website/04-payments.md) before implementing)
-3. compare; mismatch -> 401, log, stop
+2. recompute signature: SHA512(order_id + status_code + gross_amount + server_key)
+   (see [docs/website/04-payments.md](../website/04-payments.md))
+3. compare in constant time; mismatch -> 401, log, stop
 4. look up topups by order_id; unknown -> 404, log, stop
 5. compare amount against the STORED row; mismatch -> reject, log
 6. if status already settled -> 200, do nothing   (idempotent)
@@ -281,13 +333,35 @@ The only source of wallet credits.
 **Non-negotiable:**
 
 - The amount comes from **our stored row**, never the payload.
-- `order_id` is unique in Postgres — the database enforces idempotency.
-- Handle `settlement`/`capture` as credit; `deny`/`cancel`/`expire` as terminal;
-  **`refund`/`partial_refund` as debit** even though the policy is
-  non-refundable — disputes arrive uninvited, and an unhandled status corrupts the
-  ledger.
+- `order_id` is unique in SQLite — the database enforces idempotency.
+- Handle `settlement`/`capture` as credit; `deny`/`cancel`/`expire` as terminal.
+- **`refund`/`partial_refund` are refused, never applied** — see below.
 - Respond 200 fast; slow responses get retried, compounding idempotency needs.
 - Signature verification is why the Midtrans server key is server-only.
+
+**`refund` / `partial_refund`: the platform does not do refunds.**
+
+These two statuses are acknowledged with **HTTP 200** and the explicit body:
+
+```json
+{"status": "refund_not_supported"}
+```
+
+and logged at `error!`. The notification changes **nothing**:
+
+- `topups.status` stays `settled` — it is not set to `refunded`.
+- **No `ledger` row is written**, so `wallets.balance_idr` cannot move.
+- **Nothing is published to the realtime stream** — no `balance` event is emitted,
+  because no balance changed.
+- `evaluate_payment_status` returns the named `PaymentAction::RefundRefused` for
+  these two statuses. That variant is **deliberately distinct from
+  `PaymentAction::Unrecognised`**: refusing a refund is a policy answer, not a
+  status we failed to parse. The wallet-debiting refund path is removed.
+
+200 is the right status even though we are refusing: a non-2xx makes Midtrans retry
+a notification that can never succeed. The exposure this creates is a business
+problem, not a code path — it is recorded in
+[docs/website/04-payments.md](../website/04-payments.md).
 
 ---
 
@@ -308,7 +382,7 @@ data: {"input_tokens": 1200, "cache_read_tokens": 8000, "output_tokens": 400, "c
 : heartbeat        (every 20-30s, keeps proxies from closing it)
 ```
 
-- PocketBase's realtime is useless here — our data is in Postgres. This is ours.
+- PocketBase's realtime is useless here — our data is in SQLite. This is ours.
 - Emit on: webhook settlement, usage settlement, key changes.
 - **Heartbeat is required.** Cloudflare and intermediaries close idle streams, and
   a silently dropped stream looks like "the balance stopped updating".
@@ -409,13 +483,96 @@ back door.** Full design and the safety rules: [`admin-surface.md`](../admin-sur
 Authorization is the `accounts.is_operator` flag, plus a normal session cookie.
 **Not a separate admin credential.**
 
+### Implemented routes
+
+These four exist in `server/src/routes/mod.rs` and are the whole admin surface
+today. There is **no admin UI** — routes only.
+
+| Endpoint | Handler | Effect |
+| --- | --- | --- |
+| `GET /api/admin/accounts/:id` | `admin::get_account` | Read-only: `status`, `is_operator`, `created_at`, `balance_idr`, live session count, live key count. Never a credential hash |
+| `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'`; **revokes sessions and keys atomically**; one `admin_audit` row in the same transaction |
+| `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; audits it; does not restore keys |
+| `POST /api/admin/accounts/:id/restore` | `admin::resume_account` | **Alias of `/resume`** — same handler, same `action='resume'` audit row |
+
+**`/resume` and `/restore` are two spellings of one action.** Both are mounted;
+neither is deprecated. Pick either.
+
+**Response shape.** The read-only route returns
+`{account_id, status, is_operator, created_at, balance_idr, live_sessions, live_keys}`.
+Suspend/resume return
+`{account_id, status, sessions_revoked, keys_revoked}`; resume reports both counts
+as `0` explicitly, so the caller can see that nothing was handed back.
+
+### Enforcement order
+
+Identical in every handler, and **steps 1–3 run before the target is read**:
+
+1. Resolve the actor from the **session cookie** via `resolve_account_from_cookie`.
+2. Require `accounts.is_operator = true`.
+3. Refuse self-action.
+4. Only then read the target.
+
+| Case | Status | Code |
+| --- | --- | --- |
+| Missing, unknown, revoked, expired or **idle** cookie | 401 | `unauthenticated` |
+| Authenticated, `is_operator = false` | 403 | `forbidden` |
+| Operator acting on their own account (including the read-only lookup) | 403 | `forbidden` |
+| Operator, target id absent | 404 | `not_found` |
+| Operator, target in the wrong state | 409 | `conflict` |
+
+Because steps 1–3 precede the target lookup, **a non-operator gets the same 403
+for an existing and an absent id** — the response cannot enumerate account ids.
+An operator gets an honest 404 for an absent target.
+
+### Session lifetime: 30 days absolute, 7 days idle
+
+Both halves are enforced ([decisions.md](../decisions.md), Gate 3):
+
+- **Absolute** — `sessions.expires_at`, seeded at login as `now + absolute_days`
+  (`config/apikita.toml`, `[sessions] absolute_days = 30`).
+- **Idle** — `sessions.last_seen_at`, the last time the credential was actually
+  **used**. Resolving a session cookie on any cookie-authenticated endpoint moves
+  it to now; a session idle for longer than `idle_days` (7) is refused as
+  unauthenticated, and a **refused** session does not move the timestamp.
+
+Three consequences worth stating rather than discovering:
+
+1. **The activity write is on the cookie endpoints only.** `/v1/*` authenticates
+   API keys, not cookies, so it never touches `sessions` — the proxy hot path is
+   unaffected.
+2. **A caller cannot tell "idle" from "dead".** Both are 401 `unauthenticated`,
+   the same rule already applied to revoked and expired sessions.
+3. **An `idle_days` at or above `absolute_days` is inert by construction**,
+   because `expires_at` is seeded from the same login instant. Only an idle bound
+   *below* the absolute lifetime — the shipped 7 against 30 — changes behaviour,
+   so a misconfiguration can never cut a session shorter than the register
+   promises.
+
+**403 is authorization, not authentication** — the caller is authenticated, we
+know who they are, and they may not do this ([error-model.md](../error-model.md),
+the 401-vs-403 table). **`forbidden` is a new stable code**, added under
+error-model rule 4 ("code values are permanent; adding is fine"). It is not
+`model_not_allowed` (a model allowlist) and not `wrong_credential_type` (reserved,
+never emitted).
+
+**Resume does not resurrect credentials** — deliberate, not an oversight. The
+credentials were revoked because the account was abusive or compromised; restoring
+the *status* says nothing about credentials already in the wild. The customer
+re-authenticates and reissues a key.
+
+**Known limitation:** `proxy::invalidate_key_cache` is **process-local**. An
+instance behind the load balancer keeps honouring a revoked key for up to
+`limits.key_metadata_cache_seconds` (60s default). That residual window is the
+documented cost of the key-metadata cache and is **not closed by these routes**.
+
+### Planned, not built
+
 | Endpoint | Effect |
 | --- | --- |
-| `POST /api/admin/accounts/:id/suspend` | `status='suspended'`; **revokes sessions and keys atomically** |
-| `POST /api/admin/accounts/:id/restore` | `status='active'`; does not restore keys |
 | `POST /api/admin/accounts/:id/adjust` | Money: ledger row, `reason='adjustment'` |
-| `POST /api/admin/topups/:id/refund` | Money: `status='refunded'` + ledger debit |
-| `POST /api/admin/keys/:id/revoke` | `revoked_at` |
+| ~~`POST /api/admin/topups/:id/refund`~~ | **Not planned.** The wallet-debiting refund machinery was removed — see [the webhook section](#post-webhooksmidtrans). A refund happens at the rail, never against the wallet |
+| `POST /api/admin/keys/:id/revoke` | `revoked_at` (the customer route `POST /api/keys/:id/revoke` exists today) |
 | `POST /api/admin/accounts/:id/logout-all` | Revoke all sessions |
 | `DELETE /api/admin/link-codes/:id` | Invalidate a pending code |
 | `POST /api/admin/reviews/:id/hide` | Hidden flag — **never deletes** |
@@ -432,8 +589,9 @@ Authorization is the `accounts.is_operator` flag, plus a normal session cookie.
    from theft during an audit.
 6. **Nothing here can read prompts or plaintext keys** — neither is stored.
 
-Rollout: **read-only, suspend/restore, and key revoke at launch.** Money actions
-arrive with the first revenue, not on day one.
+Rollout: **read-only and suspend/restore are built; the admin key-revoke route is
+still planned.** Money actions arrive with the first revenue, not on day one.
+There is no admin UI.
 
 ## Cross-cutting rules
 
@@ -447,6 +605,8 @@ arrive with the first revenue, not on day one.
 | Money is `BIGINT` IDR end to end | No floats, ever |
 | Log every wallet mutation with actor and reason | The `ledger` table is that record |
 | Admin endpoints require the operator flag | Not a separate credential, and never a shared secret |
+| Admin endpoints return 403 `forbidden`, not 401, for a non-operator | The caller is authenticated; this is authorization, not authentication |
+| Admin revocation is process-local | `invalidate_key_cache` cannot reach other instances; the cache TTL is the residual window |
 
 ## Open items
 

@@ -66,11 +66,58 @@ months.** The daily aggregate is what you keep.
 | Data | Keep | Why |
 | --- | --- | --- |
 | `key_ip_seen` hashes | **7 days** | Enough to investigate a live incident |
+| `link_redemption_attempts` hashes | **7 days** | Same class as `key_ip_seen`: a salted hash answering "who was this". Kept only so a live credential attack can be investigated — the `link_redemption_per_hour` cap is a rolling 1-hour window, so anything older than an hour is already inert for enforcement |
 | `key_ip_daily` counts | 90 days | Trend without history |
 | Daily salt | **deleted after the day** | Makes the hashes unlinkable forever |
 
 **Deleting the salt is what makes this honest.** Even with the hashes, nobody —
 including you — can recover the addresses after the salt is gone.
+
+Deleting the ROWS is a separate job and a separate guarantee: the salt going
+away stops yesterday's hashes being linkable, but the hashes would still sit in
+`key_ip_seen` indefinitely. Both halves are needed, and neither substitutes for
+the other.
+
+## Implementation
+
+`server/src/ip_tracking.rs`. The decisions that the design above left open, and
+what was settled:
+
+| Question | Answer |
+| --- | --- |
+| Where does the salt live? | **Process memory only.** 32 bytes from the OS RNG, replaced at the UTC day boundary, never written to disk or to the database |
+| Relay or backend computes the hash? | **The backend.** It owns the salt and the tables; the relay has neither |
+| How is the caller's address known? | `X-Forwarded-For`, but **only from a peer inside `network.trusted_proxy_cidrs`** |
+| What enforces retention? | `cargo run --bin ip-purge`, run nightly alongside the backup and reconciliation jobs |
+
+**The salt is never persisted, on purpose.** A salt derived from a stored server
+secret plus the date would behave identically in every test — stable within a
+day, different across days — while letting anyone holding the secret recompute
+last week's salt and brute-force the IPv4 space. So it is generated fresh and
+discarded on rotation, and there is deliberately no accessor for a past day's
+salt.
+
+**The cost: a restart mints a new salt,** so hashes from before it cannot be
+correlated with hashes after it, and one day can over-count a key's distinct
+IPs. That is the right direction to be wrong in. Over-counting makes a sharing
+signal fire on a legitimate mobile user, which is a human investigating and
+dismissing; under-counting is nobody investigating at all.
+
+**`X-Forwarded-For` is client-controlled, and that is the threat.** A caller who
+sets it on a directly-received request chooses what gets recorded. For this
+signal the dangerous direction is under-counting: an account reselling one key
+would pin a single forged address and sit at one distinct IP forever. So the
+header is consulted only when the TCP peer is a configured trusted proxy, and
+the chain is walked **right to left** — each hop appends the address it received
+the connection from, so the caller is the first address that is not itself a
+trusted proxy. Walking left to right would stop on the caller's own forged
+entry.
+
+**A threshold crossing logs; it does not refuse.** `SHARING_SUSPICION_IPS = 20`
+produces one warning at the crossing and nothing else, because a suspicion
+threshold is a flag for a human (see §Abuse signals). The server's own salt is
+never printed, including in `Debug` output — a salt in a log line is a salt on
+disk.
 
 ## Abuse signals
 
@@ -147,8 +194,12 @@ the kind of statements that become false through a well-intentioned feature addi
 ## Open items
 
 - [ ] Confirm the retention window against any Indonesian obligation.
-- [ ] Salt storage: where, and how it is guaranteed deleted.
+- [x] Salt storage: where, and how it is guaranteed deleted — process memory,
+      never persisted; rotated at the UTC day boundary. See §Implementation.
 - [ ] Whether to expose `distinct_ips` to the customer (they may want to see sharing)
 - [ ] Threshold tuning process.
-- [ ] Whether the edge relay or the backend computes the hash (relay sees the real
-      client IP behind Cloudflare; the backend sees the relay)
+- [x] Whether the edge relay or the backend computes the hash — the backend, with
+      the relay's `X-Forwarded-For` trusted only from a configured CIDR. See
+      §Implementation.
+- [ ] The purge is a binary with no scheduler behind it yet; it needs to be added
+      to whatever runs the nightly backup and reconciliation jobs.

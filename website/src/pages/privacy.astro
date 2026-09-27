@@ -1,0 +1,210 @@
+---
+// CUSTOMER-FACING COPY RULE: this page states what we hold and for how long, and
+// never where our cost comes from. Nothing on it may be invented.
+//
+// Source of truth: docs/data-retention.md. Every factual claim here — each data
+// category, each retention period, each "never stored" statement — is that
+// document's, restated in plain language. No claim was added, softened, or
+// dropped. Where the source states a policy whose wording matters, its wording
+// is kept.
+//
+// Last-updated date: the source document carries no date of its own, so this is
+// the date it last changed in git (git log -1 -- docs/data-retention.md).
+import Base from '../layouts/Base.astro';
+
+const lastUpdated = '25 September 2026';
+
+// docs/data-retention.md, "What is stored".
+const stored = [
+  { what: 'Email', where: 'PocketBase', sensitivity: 'Personal' },
+  { what: 'Password hash', where: 'PocketBase', sensitivity: 'Sensitive, but not usable if leaked (hashed)' },
+  { what: 'Google account link', where: 'PocketBase', sensitivity: 'Personal' },
+  { what: 'Telegram ID', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal, pseudonymous' },
+  { what: 'Wallet balance + ledger', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
+  { what: 'Top-up history (amounts, dates)', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
+  { what: 'Token usage per day', where: 'Embedded SQLite (the database file)', sensitivity: 'Behavioural' },
+  { what: 'API keys', where: 'Embedded SQLite (the database file)', sensitivity: 'Credentials (hashed) — the plaintext is never stored' },
+  { what: 'Reviews + edit history', where: 'Embedded SQLite (the database file)', sensitivity: 'Opinion, published aggregate only' },
+  { what: 'Sessions', where: 'Embedded SQLite (the database file)', sensitivity: 'Contains IP hash and user agent' },
+];
+
+// docs/data-retention.md, "What is NOT stored".
+const notStored = [
+  { what: 'Customer prompts', why: 'We are a proxy, not a data processor. Logging prompts makes us one without consent.' },
+  { what: 'Model completions', why: 'Same.' },
+  { what: 'Raw IP addresses', why: 'Only a hash, for abuse correlation.' },
+  { what: 'Card or payment credentials', why: 'Midtrans handles payment; we never see them.' },
+  { what: 'Plaintext API keys', why: 'Shown once, then only the hash.' },
+  { what: 'Midtrans server key', why: 'Not customer data, but never logged either.' },
+];
+
+// docs/data-retention.md, "Retention periods".
+const retention = [
+  { what: 'Ledger', keep: 'Forever', why: 'Financial record; it is the authoritative audit trail' },
+  { what: 'Top-ups', keep: 'Forever', why: 'Financial; matches the ledger' },
+  { what: 'Usage daily', keep: '24 months', why: 'Billing disputes, then aggregate only' },
+  { what: 'Sessions (expired/revoked)', keep: '30 days', why: 'Tidy up, but keep recent for security review' },
+  { what: 'Reviews', keep: 'Until deleted by user', why: 'Published aggregate; individual text is theirs' },
+  { what: 'Review history', keep: 'Same as review', why: 'Needed to make an edit meaningful' },
+  { what: 'link_codes', keep: 'Until used or expired + 24h', why: 'Then delete' },
+  { what: 'Link-redemption attempts', keep: '7 days', why: 'Hashed source of failed link-code attempts; used only to stop credential attacks, then deleted' },
+  { what: 'Logs', keep: '30-90 days', why: 'Debugging window; not a database' },
+  { what: 'Accounts (closed)', keep: 'Keep record, drop personal data', why: 'See below' },
+];
+
+// docs/data-retention.md, "Access and deletion requests".
+const requests = [
+  { request: 'See your data', how: 'Dashboard + bot: profile, balance, usage, keys' },
+  { request: 'Export it', how: 'A machine-readable export (not yet specified)' },
+  { request: 'Correct it', how: 'Edit profile; the ledger is immutable by design' },
+  { request: 'Delete your account', how: 'The closure flow below, anonymising where possible' },
+  { request: 'Delete a review', how: '/review withdraw — the bot path' },
+];
+---
+
+<Base
+  title="Privacy — apikita"
+  description="What apikita stores, for how long, what it never stores, and where your prompts go."
+>
+  <article class="space-y-12">
+    <header>
+      <h1 class="text-3xl font-semibold tracking-tight">Privacy</h1>
+      <p class="mt-4 max-w-2xl text-ink-muted">
+        This page is the factual record of what this service holds about you, how
+        long it holds it, and what it never holds. It is written to be read, not
+        to be skimmed: if something here is a commitment, it is a commitment we
+        enforce in code review.
+      </p>
+      <p class="mt-4 text-sm text-ink-muted">Last updated: {lastUpdated}.</p>
+    </header>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">What we store</h2>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        What we hold, where it lives, and how sensitive it is.
+      </p>
+      <ul class="mt-4 max-w-2xl space-y-3">
+        {stored.map((row) => (
+          <li class="text-ink-muted">
+            <strong class="text-ink">{row.what}</strong> — held in {row.where}.{' '}
+            {row.sensitivity}.
+          </li>
+        ))}
+      </ul>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">What we never store</h2>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        This is the most important list on the page.
+      </p>
+      <ul class="mt-4 max-w-2xl space-y-3">
+        {notStored.map((row) => (
+          <li class="text-ink-muted">
+            <strong class="text-ink">{row.what}</strong> — {row.why}
+          </li>
+        ))}
+      </ul>
+      <p class="mt-4 max-w-2xl text-ink-muted">
+        The prompts-and-completions rule is a product promise. Customers send
+        prompts through a proxy precisely because it should be a pipe. Storing
+        them changes the relationship and becomes a liability the moment a breach
+        occurs.
+      </p>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">How long we keep it</h2>
+      <ul class="mt-4 max-w-2xl space-y-3">
+        {retention.map((row) => (
+          <li class="text-ink-muted">
+            <strong class="text-ink">{row.what}</strong> — {row.keep}.{' '}
+            {row.why}.
+          </li>
+        ))}
+      </ul>
+      <p class="mt-4 max-w-2xl text-ink-muted">
+        The ledger is never deleted, even when a customer leaves. It is the
+        record of money that moved. That is normal accounting, not a retention
+        violation — but it means anonymisation, not deletion, is the right
+        mechanism for a departing customer.
+      </p>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">Closing your account</h2>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        There is no hard delete of an account. Anything holding money is
+        restricted from deletion at the database level, and accounts are never
+        hard-deleted. Closing an account means:
+      </p>
+      <ol class="mt-4 max-w-2xl list-decimal space-y-2 pl-5 text-ink-muted">
+        <li>Your account is marked closed.</li>
+        <li><strong class="text-ink">All sessions are revoked immediately</strong> — you are out.</li>
+        <li><strong class="text-ink">All API keys are revoked immediately</strong> — no further spend.</li>
+        <li><strong class="text-ink">The ledger and top-ups are retained</strong> (financial record).</li>
+        <li>
+          <strong class="text-ink">What can be anonymised is anonymised</strong> —
+          your email is replaced with a tombstone, the Telegram link is removed,
+          and a review body is cleared if you ask for it.
+        </li>
+        <li>
+          <strong class="text-ink">The balance row stays at zero.</strong> A
+          closed account with a balance is unresolved money, so we do not close
+          an account until the balance is zero.
+        </li>
+      </ol>
+      <p class="mt-4 max-w-2xl text-ink-muted">
+        Never close an account that still holds a balance. Our non-refundable
+        policy covers an unwanted service; it does not let us keep funds for a
+        service we are refusing to provide.
+      </p>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">Where your prompts go</h2>
+      <p class="mt-3 max-w-2xl text-ink-muted">
+        Every prompt is forwarded to a provider in mainland China. That is the
+        business model, and it is the single largest privacy obligation in the
+        system — so it is stated here plainly, before you use the service:
+      </p>
+      <ul class="mt-4 max-w-2xl list-disc space-y-2 pl-5 text-ink-muted">
+        <li>Prompts are forwarded to a mainland-China provider.</li>
+        <li>The provider's jurisdiction is mainland China.</li>
+        <li>We do not retain your prompts.</li>
+        <li>
+          <strong class="text-ink">The provider's own retention applies.</strong>{' '}
+          That is outside our control. We do not store prompts, but the upstream
+          may. A customer cannot be told "we do not keep your data" without also
+          being told that someone else might.
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">Requests about your data</h2>
+      <ul class="mt-4 max-w-2xl space-y-3">
+        {requests.map((row) => (
+          <li class="text-ink-muted">
+            <strong class="text-ink">{row.request}</strong> — {row.how}.
+          </li>
+        ))}
+      </ul>
+      <p class="mt-4 max-w-2xl text-ink-muted">
+        The ledger is the one thing that cannot be deleted on request. We say so
+        before you ask, because explaining it after the fact reads as evasive.
+      </p>
+    </section>
+
+    <section>
+      <h2 class="text-xl font-semibold tracking-tight">Security that follows from this</h2>
+      <ul class="mt-4 max-w-2xl list-disc space-y-2 pl-5 text-ink-muted">
+        <li>Passwords are hashed (bcrypt, via PocketBase).</li>
+        <li>API keys are hashed (SHA-256).</li>
+        <li>Session tokens are hashed and delivered in an HttpOnly cookie.</li>
+        <li>Backups are encrypted and held off-host.</li>
+        <li>No secrets appear in logs.</li>
+      </ul>
+    </section>
+  </article>
+</Base>

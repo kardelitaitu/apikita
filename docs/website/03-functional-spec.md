@@ -170,7 +170,7 @@ only handles five of them shows a raw error or a blank screen for the rest.
 | 402 | `insufficient_balance` | "Balance too low." Show current balance + **link to top-up** |
 | 402 | `key_limit_exceeded` | "This key hit its {spend/token} limit." Action: raise it or new key |
 | 403 | `model_not_allowed` | "This key cannot use {model}." Do **not** offer a retry |
-| 403 | `wrong_credential_type` | A bug if seen in the dashboard — report, do not improvise |
+| 403 | `wrong_credential_type` | **Reserved, never emitted** — a wrong-type credential arrives as 401 `unauthenticated`, handled above |
 | 404 | `not_found` | "Not found." Offer a route back to the dashboard |
 | 409 | `conflict` | "Already linked" / "already exists" — refresh and show current state |
 | 422 | `validation_failed` | **Highlight the offending field** using `details.field`, not a generic banner |

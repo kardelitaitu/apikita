@@ -1,0 +1,391 @@
+---
+// API Key Management island — key list + create-key modal.
+// Frontend contract: docs/server/api-spec.md (Keys), docs/error-model.md,
+// docs/website/06-api-keys-and-limits.md, docs/website/03-functional-spec.md.
+// This is a script-island (plain <script>), not a UI-framework component:
+// astro.config and package.json are owned by another worker and must not change.
+const MODELS = ['flash', 'deepseek-v4-flash'];
+---
+
+<div id="key-island" class="mt-6">
+  <!-- List ----------------------------------------------------------------- -->
+  <div class="flex items-center justify-between">
+    <div id="key-list-status" class="text-sm text-ink-muted" aria-live="polite">Loading keys…</div>
+    <button id="create-key-btn" type="button"
+      class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Create key</button>
+  </div>
+
+  <div id="key-error" hidden class="mt-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
+
+  <ul id="key-list" class="mt-4 divide-y divide-edge rounded-lg border border-edge"></ul>
+
+  <div id="key-empty" hidden class="mt-4 rounded-lg border border-edge bg-surface-raised p-6 text-sm text-ink-muted">
+    <p class="font-medium text-ink">No API keys yet</p>
+    <p class="mt-1">A key is the credential your program sends to
+      <code class="font-mono">POST /v1/chat/completions</code>. Create one, then call the API —
+      see the <a href="/docs/quickstart" class="underline">quickstart</a>.</p>
+    <button id="key-empty-create" type="button"
+      class="mt-4 rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Create your first key</button>
+  </div>
+
+  <!-- Create-key modal ------------------------------------------------------ -->
+  <div id="key-modal" hidden class="fixed inset-0 z-20 flex items-center justify-center bg-surface-sunken/80 p-4 backdrop-blur-sm"
+    role="dialog" aria-modal="true" aria-labelledby="key-modal-title">
+    <div class="w-full max-w-lg rounded-xl border border-edge-strong bg-surface-raised p-6 shadow-2xl shadow-black/60">
+      <!-- Step 1: the form -->
+      <div id="key-form-step">
+        <h2 id="key-modal-title" class="text-lg font-semibold tracking-tight">Create API key</h2>
+        <p class="mt-2 text-sm text-ink-muted">Only a label is required. Leave limits at 0 for unlimited.</p>
+
+        <form id="key-form" class="mt-4 space-y-4">
+          <div>
+            <label for="k-label" class="block text-sm font-medium">Label</label>
+            <input id="k-label" name="label" type="text" required autocomplete="off" placeholder="e.g. prod"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          </div>
+
+          <fieldset>
+            <legend class="text-sm font-medium">Models</legend>
+            <p class="text-xs text-ink-muted">Omitting models = all currently enabled models.</p>
+            <div class="mt-2 flex flex-wrap gap-3">
+              {MODELS.map((m) => (
+                <label class="inline-flex items-center gap-2 text-sm">
+                  <input type="checkbox" name="models" value={m} checked />
+                  <span class="font-mono">{m}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <div class="grid gap-4 sm:grid-cols-3">
+            <div>
+              <label for="k-spend" class="block text-sm font-medium">Spend limit (IDR)</label>
+              <input id="k-spend" name="spend_limit_idr" type="number" min="0" value="0"
+                class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label for="k-token" class="block text-sm font-medium">Token limit</label>
+              <input id="k-token" name="token_limit" type="number" min="0" value="0"
+                class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label for="k-rate" class="block text-sm font-medium">Rate (req/min)</label>
+              <input id="k-rate" name="rate_limit_rpm" type="number" min="0" value="0"
+                class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+            </div>
+          </div>
+
+          <div>
+            <label for="k-expires" class="block text-sm font-medium">Expires on</label>
+            <input id="k-expires" name="expires_on" type="date"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+            <p class="mt-1 text-xs text-ink-muted">Optional. The key works through the end of this day.
+              Leave blank for a key that never expires.</p>
+          </div>
+
+          <div id="key-form-error" hidden class="rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+
+          <div class="flex justify-end gap-3 pt-2">
+            <button id="key-cancel" type="button"
+              class="rounded-md border border-edge-strong px-4 py-2 text-sm font-medium hover:border-brand">Cancel</button>
+            <button id="key-submit" type="submit"
+              class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Create key</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Step 2: the plaintext key, shown exactly once -->
+      <div id="key-secret-step" hidden>
+        <h2 class="text-lg font-semibold tracking-tight">Your new API key</h2>
+        <div class="mt-3 rounded-md border border-warn-edge bg-warn-surface p-3 text-sm text-warn-ink">
+          <strong>You will not see this key again.</strong> Store it somewhere safe now.
+          The server keeps only its hash — if you lose it, revoke it and create a new one.
+        </div>
+
+        <div id="key-secret-missing" hidden class="mt-3 rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink">
+          The server created the key but did not return the plaintext value. This is unexpected —
+          the key cannot be retrieved later. Treat it as unusable and revoke it from the list.
+        </div>
+
+        <div id="key-secret-wrap" class="mt-3 flex items-center gap-2">
+          <code id="key-secret" class="block flex-1 break-all rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 font-mono text-sm"></code>
+          <button id="key-copy" type="button"
+            class="shrink-0 rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm font-medium hover:border-brand">Copy</button>
+        </div>
+
+        <div class="flex justify-end pt-4">
+          <button id="key-done" type="button"
+            class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">I've saved it</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  import { apiFetch, ApiError } from '../../lib/api';
+  import { describeError, inlineNotice, renderFieldError } from '../../lib/errors';
+  import { formatIdr } from '../../lib/format';
+  import { buildCreateKeyRequest, plaintextKeyOf } from '../../lib/dashboard-form';
+
+  const MODELS_ALL = ['flash', 'deepseek-v4-flash'];
+
+  interface ApiKey {
+    id: string;
+    prefix: string;
+    label: string;
+    models: string[];
+    spend_limit_idr: number;
+    spend_used_idr: number;
+    rate_limit_rpm: number;
+    expires_at: string | null;
+    last_used_at: string | null;
+    revoked_at: string | null;
+  }
+
+  const $ = (id: string) => document.getElementById(id) as HTMLElement;
+  const listEl = $('key-list');
+  const statusEl = $('key-list-status');
+  const errorEl = $('key-error');
+  const emptyEl = $('key-empty');
+  const modal = $('key-modal');
+
+  function showError(msg: string): void {
+    errorEl.textContent = msg;
+    errorEl.hidden = false;
+  }
+  function clearError(): void {
+    errorEl.hidden = true;
+    errorEl.textContent = '';
+  }
+
+  function statusLabel(k: ApiKey): string {
+    if (k.revoked_at) {
+      const d = new Date(k.revoked_at);
+      return 'Revoked' + (isNaN(d.getTime()) ? '' : ' · ' + d.toLocaleDateString());
+    }
+    if (k.expires_at) {
+      const d = new Date(k.expires_at);
+      if (!isNaN(d.getTime()) && d.getTime() <= Date.now()) return 'Expired';
+    }
+    return 'Active';
+  }
+
+  function spendText(k: ApiKey): string {
+    if (!k.spend_limit_idr || k.spend_limit_idr <= 0) return 'Unlimited';
+    return formatIdr(k.spend_used_idr) + ' / ' + formatIdr(k.spend_limit_idr) + ' (30d)';
+  }
+
+  function modelsText(k: ApiKey): string {
+    if (!k.models || k.models.length === 0) return 'None (deny by default)';
+    if (k.models.length >= MODELS_ALL.length) return 'All models';
+    return k.models.length + ' model' + (k.models.length === 1 ? '' : 's');
+  }
+
+  function lastUsedText(k: ApiKey): string {
+    if (!k.last_used_at) return 'Never';
+    const d = new Date(k.last_used_at);
+    return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  }
+
+  function escapeHtml(s: string): string {
+    return s.replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c] as string));
+  }
+
+  function render(keys: ApiKey[]): void {
+    const hasAny = keys.length > 0;
+    emptyEl.toggleAttribute('hidden', hasAny);
+    listEl.toggleAttribute('hidden', !hasAny);
+    statusEl.textContent = hasAny ? keys.length + ' key' + (keys.length === 1 ? '' : 's') : '';
+
+    listEl.replaceChildren();
+    for (const k of keys) {
+      const li = document.createElement('li');
+      li.className = 'flex flex-wrap items-center justify-between gap-4 p-4';
+      const left = document.createElement('div');
+      left.innerHTML =
+        '<div class="flex items-center gap-2">' +
+          '<span class="font-medium">' + escapeHtml(k.label || '(unlabeled)') + '</span>' +
+          '<span class="rounded-full border border-edge-strong px-2 py-0.5 text-xs text-ink-muted ' + (k.revoked_at ? "border-danger-edge text-danger" : "border-ok-edge text-ok") + '">' + statusLabel(k) + '</span>' +
+        '</div>' +
+        '<div class="mt-1 font-mono text-sm text-ink-muted">' + escapeHtml(k.prefix) + '…</div>' +
+        '<div class="mt-1 text-xs text-ink-muted">Models: ' + modelsText(k) + ' · Spend: ' + spendText(k) + ' · Last used: ' + lastUsedText(k) + '</div>';
+      const right = document.createElement('div');
+      if (!k.revoked_at) {
+        const revoke = document.createElement('button');
+        revoke.type = 'button';
+        revoke.className = 'rounded-md border border-danger-edge px-3 py-1.5 text-sm font-medium text-danger hover:bg-danger-surface';
+        revoke.textContent = 'Revoke';
+        revoke.addEventListener('click', () => confirmAndRevoke(k));
+        right.appendChild(revoke);
+      }
+      li.append(left, right);
+      listEl.appendChild(li);
+    }
+  }
+
+  async function loadKeys(): Promise<void> {
+    clearError();
+    statusEl.textContent = 'Loading keys…';
+    try {
+      const keys = await apiFetch<ApiKey[]>('/api/keys');
+      render(keys);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      const view = describeError(err);
+      showError(inlineNotice(view));
+      render([]);
+    }
+  }
+
+  // The plaintext key is held nowhere but the #key-secret node. Dismissing the
+  // secret step must RELEASE it, not merely hide it: a 52-char credential must not
+  // linger in a hidden DOM node for the lifetime of the page.
+  function clearSecret(): void {
+    ($('key-secret') as HTMLElement).textContent = '';
+    ($('key-copy') as HTMLButtonElement).textContent = 'Copy';
+  }
+
+  function openModal(): void {
+    clearError();
+    // Reset path — a previous plaintext must never survive into a reopened modal.
+    clearSecret();
+    ($('key-form-step') as HTMLElement).hidden = false;
+    ($('key-secret-step') as HTMLElement).hidden = true;
+    ($('key-secret-missing') as HTMLElement).hidden = true;
+    ($('key-secret-wrap') as HTMLElement).toggleAttribute('hidden', false);
+    (modal as HTMLElement).hidden = false;
+    ($('k-label') as HTMLInputElement).focus();
+  }
+  function closeModal(): void {
+    (modal as HTMLElement).hidden = true;
+    clearSecret();
+    ($('key-form') as HTMLFormElement).reset();
+    void loadKeys();
+  }
+
+  function openSecretStep(key: string | undefined): void {
+    ($('key-form-step') as HTMLElement).hidden = true;
+    ($('key-secret-step') as HTMLElement).hidden = false;
+    const missing = ($('key-secret-missing') as HTMLElement);
+    const wrap = ($('key-secret-wrap') as HTMLElement);
+    const secret = $('key-secret') as HTMLElement;
+    if (key) {
+      missing.hidden = true;
+      wrap.hidden = false;
+      secret.textContent = key;
+    } else {
+      // Requirement #3: never invent a key. Surface the missing field instead.
+      missing.hidden = false;
+      wrap.hidden = true;
+      secret.textContent = '';
+    }
+  }
+
+  async function submitCreate(e: Event): Promise<void> {
+    e.preventDefault();
+    clearError();
+    const form = e.currentTarget as HTMLFormElement;
+    const fd = new FormData(form);
+    const formErr = $('key-form-error') as HTMLElement;
+
+    // Every limit and the expiry go through the tested helpers in
+    // lib/dashboard-form.ts, so a bad value is refused here with a sentence the
+    // user can act on rather than sent on to earn a 402 or a 422.
+    const built = buildCreateKeyRequest({
+      label: String(fd.get('label') ?? ''),
+      models: Array.from(fd.getAll('models')).map(String),
+      spend_limit_idr: String(fd.get('spend_limit_idr') ?? ''),
+      token_limit: String(fd.get('token_limit') ?? ''),
+      rate_limit_rpm: String(fd.get('rate_limit_rpm') ?? ''),
+      expires_on: String(fd.get('expires_on') ?? ''),
+    });
+    if (!built.ok) {
+      formErr.textContent = built.error;
+      formErr.hidden = false;
+      return;
+    }
+
+    const submitBtn = $('key-submit') as HTMLButtonElement;
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Creating…';
+    try {
+      const res = await apiFetch<{ id: string; key: string; prefix: string }>('/api/keys', {
+        method: 'POST',
+        body: JSON.stringify(built.body),
+      });
+      // Only the create response can reveal a key, and a missing field is never
+      // invented — both rules live in plaintextKeyOf.
+      const plaintext = plaintextKeyOf(res);
+      if (plaintext === null) {
+        openSecretStep(undefined);
+        return;
+      }
+      openSecretStep(plaintext);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        // A 422 names the rejected input in details.field (docs/error-model.md),
+        // so move focus to it instead of only writing the sentence. An error with
+        // no field — or one this form does not know — still renders the notice.
+        renderFieldError(formErr, describeError(err), {
+          label: $('k-label'),
+          spend_limit_idr: $('k-spend'),
+          token_limit: $('k-token'),
+          rate_limit_rpm: $('k-rate'),
+          expires_on: $('k-expires'),
+        });
+      } else {
+        formErr.textContent = err instanceof Error ? err.message : 'Could not create the key.';
+      }
+      formErr.hidden = false;
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Create key';
+    }
+  }
+
+  async function confirmAndRevoke(k: ApiKey): Promise<void> {
+    const ok = window.confirm(
+      'Revoke "' + (k.label || k.prefix) + '"?' +
+      '\n\nRevocation takes effect within about a minute (the proxy cache TTL), not instantly. ' +
+      'This affects ALL surfaces — a key used via Telegram dies here too. This cannot be undone.'
+    );
+    if (!ok) return;
+    clearError();
+    try {
+      await apiFetch<void>('/api/keys/' + k.id + '/revoke', { method: 'POST' });
+      await loadKeys();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      const view = describeError(err);
+      showError(inlineNotice(view));
+    }
+  }
+
+  async function copyKey(): Promise<void> {
+    const secret = ($('key-secret') as HTMLElement).textContent ?? '';
+    const btn = $('key-copy') as HTMLButtonElement;
+    try {
+      await navigator.clipboard.writeText(secret);
+      btn.textContent = 'Copied';
+      window.setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    } catch {
+      btn.textContent = 'Copy failed';
+      window.setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    }
+  }
+
+  $('create-key-btn').addEventListener('click', openModal);
+  $('key-empty-create')?.addEventListener('click', openModal);
+  $('key-cancel').addEventListener('click', closeModal);
+  $('key-done').addEventListener('click', closeModal);
+  ($('key-form') as HTMLFormElement).addEventListener('submit', submitCreate);
+  $('key-copy').addEventListener('click', copyKey);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal && !($('key-secret-step') as HTMLElement).hidden) closeModal();
+  });
+
+  void loadKeys();
+</script>

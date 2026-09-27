@@ -14,11 +14,14 @@ surface, priced at a fixed margin over wholesale cost.
 | Document | Covers |
 | --- | --- |
 | [`docs/decisions.md`](docs/decisions.md) | **Settled decisions — the register.** Check here first |
+| [`docs/plan-audit.md`](docs/plan-audit.md) | **Plan review — what holds, what doesn't** |
+| [`docs/cache-pricing-options.md`](docs/cache-pricing-options.md) | **The open commercial decision — cache-heavy pricing** |
 | [`docs/launch-checklist.md`](docs/launch-checklist.md) | **Launch tasks, gated.** What must be true before taking money |
 | [`docs/architecture.md`](docs/architecture.md) | The system end to end — the authoritative stack |
+| [`docs/wind-down.md`](docs/wind-down.md) | Closing the service: the balance payout runbook |
 | [`docs/topology.md`](docs/topology.md) | The triangle: Cloudflare, relay, Northflank, failover |
 | [`docs/server/api-spec.md`](docs/server/api-spec.md) | Every endpoint, auth scheme, enforcement order |
-| [`docs/website/02-data-model.md`](docs/website/02-data-model.md) | PostgreSQL schema (parser-validated) |
+| [`server/migrations/20260925000000_initial_schema.sql`](server/migrations/20260925000000_initial_schema.sql) | The SQLite schema — source of truth |
 | [`docs/business/README.md`](docs/business/README.md) | Does the business work — pricing, model, risks |
 
 ### Building it
@@ -73,8 +76,8 @@ these disagree, `docs/architecture.md` and the business docs win.
 | Frontend | Cloudflare Pages | **Astro** + islands |
 | Edge relay | Linux VPS (2 vCPU / 4 GB) | nginx + Docker |
 | API + proxy | Northflank | Rust |
-| Money | Northflank | PostgreSQL |
-| Identity | Northflank | PocketBase |
+| Money | Northflank | SQLite (embedded — no separate service) |
+| Identity | Northflank | PocketBase, until Phase 6 replaces it in Rust |
 
 Push to `main` deploys. Reasoning and consequences:
 [`docs/architecture.md`](docs/architecture.md).
@@ -92,15 +95,26 @@ Push to `main` deploys. Reasoning and consequences:
 
 ## Status
 
-**Planning complete; implementation not started.** Nothing is deployed and no
-application code exists.
+**Built locally; nothing deployed.** The server and the website both exist and
+pass their test suites — but no environment is live and no customer has been served.
 
-Settled (41 documents): the stack and topology, the identity model, the PostgreSQL
+Settled (41 documents): the stack and topology, the identity model, the SQLite
 schema (validated with a SQL parser), the full HTTP API, payments, API keys and
 limits, realtime, failover, the relay, deployment, cost, observability, backup,
 abuse handling, data retention, and the Terms of Service outline.
 
-Not yet: any application code.
+What exists today:
+
+| Surface | State |
+| --- | --- |
+| [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → **313 passed / 0 failed / 2 ignored** (measured 2026-09-27), against a temp SQLite file — no server to start. The 2 ignored need a live PocketBase. |
+| [`website/`](website/README.md) | Astro site. `npm run build` → 17 pages; `npm test` → 80 passed (measured 2026-09-26). |
+| [`tools/`](tools/) | `reconcile`, `alert`, `fake-upstream`, `fake-midtrans`, and the SQLite probes — each with a documented exit-code contract. `backup`, `drill`, `alert` and the maintenance jobs all drive the `sqlite3` CLI against the embedded database. |
+| [`telegram/`](telegram/README.md) | Design only — no code yet. |
+
+Not yet: a deployment, a live Midtrans round-trip, and the operational gates in
+[`docs/launch-checklist.md`](docs/launch-checklist.md) — Gate 0 (legal) blocks the
+rest.
 
 ## Secrets
 

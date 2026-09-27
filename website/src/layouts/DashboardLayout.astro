@@ -1,0 +1,139 @@
+---
+import Base from './Base.astro';
+import Nav from '../components/Nav.astro';
+
+// The authenticated shell. One place owns the sticky header, the live-balance
+// badge and the error surface, so every dashboard page inherits them.
+interface Props {
+  title: string;
+}
+const { title } = Astro.props;
+---
+
+<Base title={`${title} — apikita`} description="apikita dashboard." chrome={false}>
+  <header class="sticky top-0 z-10 border-b border-edge bg-surface-raised/95 backdrop-blur">
+    <div class="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3 px-6 py-3">
+      <Nav variant="dashboard" class="w-full sm:w-auto" />
+
+      <div class="flex items-center gap-4">
+        <!--
+          The live balance. Values come from GET /events; on stream failure the
+          last value stays on screen and the badge goes stale — never blanked,
+          never shown as live (docs/realtime.md).
+        -->
+        <div class="flex items-center gap-3">
+          <span id="balance-value" class="font-mono text-sm font-medium tabular-nums text-accent" aria-live="polite">&mdash;</span>
+          <span
+            id="live-badge"
+            data-status="connecting"
+            class="inline-flex items-center gap-2 rounded-full border border-edge-strong px-2.5 py-1 text-xs font-medium text-ink-muted data-[status=live]:border-ok-edge data-[status=live]:text-ok data-[status=stale]:border-warn data-[status=stale]:bg-warn-surface data-[status=stale]:text-warn-ink"
+          >
+            <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
+            <span id="live-badge-label">Connecting&hellip;</span>
+          </span>
+        </div>
+
+        <form method="post" class="flex items-center gap-3 text-sm text-ink-muted">
+          <button id="logout" type="button" class="hover:text-brand">Log out</button>
+          <button id="logout-all" type="button" class="hover:text-brand">Sign out everywhere</button>
+        </form>
+      </div>
+    </div>
+  </header>
+
+  <div id="banner-error" hidden class="border-b border-danger-edge bg-danger-surface">
+    <div class="mx-auto flex max-w-4xl items-baseline justify-between gap-4 px-6 py-2 text-sm text-danger-ink">
+      <span id="banner-error-text"></span>
+      <span id="banner-error-id" class="font-mono text-xs text-danger"></span>
+    </div>
+  </div>
+
+  <main class="mx-auto max-w-4xl px-6 py-8">
+    <slot />
+  </main>
+</Base>
+
+<script>
+  // The dashboard island. Loads only on dashboard pages; marketing routes stay
+  // JavaScript-free.
+  import { getLiveStore } from '../lib/live';
+  import { apiFetch } from '../lib/api';
+  import { describeError, renderNotice } from '../lib/errors';
+  import { formatIdr, formatCount } from '../lib/format';
+  import { pb } from '../lib/pocketbase';
+
+  const badge = document.getElementById('live-badge') as HTMLElement;
+  const badgeLabel = document.getElementById('live-badge-label') as HTMLElement;
+  const balanceValue = document.getElementById('balance-value') as HTMLElement;
+  const banner = document.getElementById('banner-error') as HTMLElement;
+  const bannerText = document.getElementById('banner-error-text') as HTMLElement;
+  const bannerId = document.getElementById('banner-error-id') as HTMLElement;
+  // The banner is the message over the correlation line — the same two facts,
+  // and the same layout, the wallet notice shows. One renderer, tested, rather
+  // than a third hand-rolled copy of the format.
+  const bannerTarget = { message: bannerText, correlation: bannerId };
+
+  const BADGE_LABEL: Record<string, string> = {
+    connecting: 'Connecting…',
+    live: 'Live',
+    stale: 'Stale — last known balance',
+  };
+
+  const store = getLiveStore();
+
+  store.subscribe((state) => {
+    badge.dataset.status = state.status;
+    badgeLabel.textContent = BADGE_LABEL[state.status] ?? state.status;
+
+    // Loading is a placeholder, not a zero: a zeroed balance looks like the
+    // money is gone.
+    balanceValue.textContent = state.balanceIdr === null ? '—' : formatIdr(state.balanceIdr);
+
+    const usage = state.usage;
+    if (usage) {
+      (document.getElementById('usage-input') as HTMLElement).textContent = formatCount(usage.input_tokens);
+      (document.getElementById('usage-cache') as HTMLElement).textContent = formatCount(usage.cache_read_tokens);
+      (document.getElementById('usage-output') as HTMLElement).textContent = formatCount(usage.output_tokens);
+      (document.getElementById('usage-cost') as HTMLElement).textContent = formatIdr(usage.cost_idr);
+      const empty = document.getElementById('usage-empty') as HTMLElement | null;
+      const grid = document.getElementById('usage-grid') as HTMLElement | null;
+      const hasUsage = usage.input_tokens + usage.cache_read_tokens + usage.output_tokens > 0;
+      empty?.toggleAttribute('hidden', hasUsage);
+      grid?.toggleAttribute('hidden', !hasUsage);
+    }
+
+    if (state.error) {
+      renderNotice(bannerTarget, { message: state.error, requestId: state.requestId });
+      banner.hidden = false;
+    } else {
+      banner.hidden = true;
+    }
+  });
+
+  store.start();
+
+  function showError(err: unknown): void {
+    renderNotice(bannerTarget, describeError(err));
+    banner.hidden = false;
+  }
+
+  /** Log out of this device: revoke the session row, then drop the local token. */
+  document.getElementById('logout')?.addEventListener('click', () => {
+    void apiFetch<void>('/auth/logout', { method: 'POST', redirectOn401: false })
+      .catch(showError)
+      .finally(() => {
+        pb.authStore.clear();
+        window.location.assign('/login');
+      });
+  });
+
+  /** Real revocation: every session for the account ends, on all devices. */
+  document.getElementById('logout-all')?.addEventListener('click', () => {
+    void apiFetch<void>('/auth/logout-all', { method: 'POST', redirectOn401: false })
+      .catch(showError)
+      .finally(() => {
+        pb.authStore.clear();
+        window.location.assign('/login');
+      });
+  });
+</script>

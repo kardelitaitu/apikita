@@ -1,7 +1,7 @@
 # 01 — Architecture
 
 > **Superseded on stack — read [`docs/architecture.md`](../architecture.md) first.**
-> This document specified Cloudflare Pages Functions + PocketBase. The system now uses a Rust backend on Northflank with PostgreSQL. The frontend-internal sections below remain useful; the stack and backend sections are superseded.
+> This document specified Cloudflare Pages Functions + PocketBase. The system now uses a Rust backend on Northflank with embedded SQLite. The frontend-internal sections below remain useful; the stack and backend sections are superseded.
 
 ## Requirement that drives the design
 
@@ -21,16 +21,16 @@ document covers the frontend's internal structure.
 | Hosting | **Cloudflare Pages** | Static assets at the edge. |
 | Edge relay | **nginx on a VPS** | TLS, filtering, flood absorption before Northflank. See [`../edge-relay.md`](../edge-relay.md) |
 | Backend | **Rust on Northflank** | Auth orchestration, wallet, keys, limits, webhook, SSE, proxy. |
-| Money | **PostgreSQL** | Transactions, constraints, the ledger. |
+| Money | **SQLite** (embedded) | Transactions, constraints, the ledger. |
 | Identity | **PocketBase** | Google + password, verify, reset. Auth only. |
 | Payments | **Midtrans Snap** | QRIS top-ups. |
 
 > **This table previously named Pages Functions as a BFF and PocketBase as the
 > database.** Both are gone: the Rust server is the backend, and money lives in
-> Postgres. Superseded sections below are marked; the frontend internals remain
-> valid.
+> embedded SQLite. Superseded sections below are marked; the frontend internals
+> remain valid.
 
-Astro is a recommendation, not a hard requirement — see [Why Astro](#why-astro).
+**Astro is decided** — reasoning and rejected alternatives are below.
 
 ## Topology
 
@@ -44,7 +44,7 @@ Cloudflare  (DNS, TLS at edge, DDoS)
 Edge relay  (nginx on a VPS - TLS, rate limits, body caps)
   |
   v
-Northflank: Rust API + proxy  --->  PostgreSQL (money, sessions)
+Northflank: Rust API + proxy  --->  SQLite file (money, sessions)
                                 --->  PocketBase  (identity only)
 ```
 
@@ -68,42 +68,35 @@ hold a password flow, a database transaction, or a long-lived SSE connection. Th
 ### Realtime
 
 **SSE from the Rust API.** PocketBase's realtime cannot help — the wallet and usage
-data live in Postgres, which PocketBase does not stream. Contract:
+data live in SQLite, which PocketBase does not stream. Contract:
 [`docs/realtime.md`](../realtime.md).
 ## Auth token handling
 
-- PocketBase issues a stateless auth token; there are **no server-side sessions
-  and no logout endpoint**. "Logout" is discarding the token client-side.
-- **Tokens ARE revocable**, but not by logging out. Every auth record carries a
-  `tokenKey` mixed into the JWT signing key; rotating it invalidates all of that
-  user's tokens instantly. PocketBase rotates it automatically on password or
-  email change, and `RefreshTokenKey()` does it explicitly. See
-  [05-security-decisions.md](05-security-decisions.md) D2.
-- Store the token in an **HttpOnly, Secure, SameSite cookie** set by the Rust API
-  rather than localStorage, so XSS cannot read it.
-- Never put provider keys or the Midtrans server key in client-visible config.
+- PocketBase handles initial authentication (password, Google OAuth2) and issues a short-lived token.
+- The browser immediately exchanges this token with the Rust backend via `POST /auth/exchange`.
+- The Rust server verifies the token, resolves or registers `accounts.pb_user_id`, and issues an **opaque server-side session cookie** (`HttpOnly, Secure, SameSite=Lax`) backed by SQLite.
+- **Logout is explicit and immediate**: `POST /auth/logout` revokes the session row in SQLite; `POST /auth/logout-all` revokes all active sessions for the account.
+- Never put upstream provider keys, database URLs, or the Midtrans server key in client-visible config.
 
 ## Secrets
 
 | Secret | Where | Browser-visible? |
 | --- | --- | --- |
-| Midtrans server key | Pages env | **No** |
-| Midtrans client key | Pages env | Yes (by design) |
-| PocketBase superuser creds | Pages env | **No** |
-| Upstream provider keys | Northflank (server) | **No** |
-| Telegram bot token | Northflank (bot) | **No** |
+| Midtrans server key | Northflank (Rust env) | **No** |
+| Midtrans client key | Pages env (`PUBLIC_MIDTRANS_CLIENT_KEY`) | Yes (by design) |
+| PocketBase admin / internal URL | Northflank (Rust env) | **No** |
+| Upstream provider keys | Northflank (Rust env) | **No** |
+| Telegram bot token | Northflank (Rust / bot env) | **No** |
+| Database connection string | Northflank (Rust env) | **No** |
 
 Only `PUBLIC_*` variables may reach the client. See `.env.example`.
 
 ## Deployment
 
-- **Static assets + Functions** → Cloudflare Pages, built from the repo.
-- **PocketBase** → needs a persistent disk (SQLite). It cannot run on Pages.
-  Host it on a VPS or a container host with a volume, and **back it up** — the
-  wallet ledger lives there. See [02-data-model.md](02-data-model.md) on backups.
-- **Region:** keep PocketBase geographically close to the Midtrans webhook
-  receiver and to your customers. Webhooks arriving late is not a correctness
-  problem, but a slow dashboard is.
+- **Static assets (Astro)** → Cloudflare Pages, built from the repo.
+- **API + Proxy (Rust) + embedded SQLite** → Northflank with a persistent volume for the database file. The wallet ledger lives in SQLite.
+- **PocketBase** → Northflank or container host with persistent volume (SQLite for identity only).
+- **Region:** keep Northflank and database geographically close to the Midtrans webhook receiver and Indonesian users (e.g. Singapore region).
 
 ## Frontend choice — decided
 
@@ -164,7 +157,7 @@ is why it is safe to make now rather than continue deferring.
 
 - [x] Token revocation strategy — resolved, see
       [05-security-decisions.md](05-security-decisions.md) D2.
-- [ ] Decide `AuthToken.Duration` (token lifetime).
-- [ ] Does the dashboard read usage from the API or subscribe to the SSE stream?  (SSE is the design — confirm the aggregate endpoint is not polled in parallel)
+- [x] Session/token lifetime: **30d absolute / 7d idle** — [`decisions.md`](../decisions.md).
+- [x] Dashboard reads usage from the SSE stream (`GET /events`); polls `GET /api/me` as fallback only when SSE drops.
 - [ ] Backup and restore procedure for PocketBase.
 - [x] Wallet mutations: **10/min per account** (`decisions.md`).

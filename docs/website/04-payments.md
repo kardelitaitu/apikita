@@ -9,7 +9,7 @@ sensitive document in the set.
 | --- | --- |
 | Rail | **QRIS only**, via Midtrans Snap |
 | Card | **Disabled deliberately** — a flat per-transaction fee is ~20% of a 10k top-up |
-| Refunds | **Non-refundable** by policy; see the caveat below |
+| Refunds | **Non-refundable** by policy; an inbound `refund` notification is **refused, never applied**. See the caveat below |
 | Crediting | **Server webhook only** |
 | Idempotency | By `order_id` |
 | Settlement | To a bank account, T+1/T+2 |
@@ -33,24 +33,19 @@ nothing — a client can claim anything. Only step 6 creates money.
 
 ## Webhook verification
 
-Midtrans sends a `signature_key` field with each notification, computed as a
-**SHA-512 hash of concatenated fields including the server key**.
+Midtrans sends a `signature_key` field with each notification payload, computed as a
+**SHA-512 hash of concatenated string fields including the server key**:
 
-> **UNVERIFIED — confirm against Midtrans documentation before implementing.**
-0
-> The formula is commonly documented as:
->
-> `signature_key = SHA512(order_id + status_code + gross_amount + server_key)`
->
-> This could not be verified against the official docs from this environment
-> (Midtrans' documentation is a JavaScript-rendered SPA and the web search tool is
-> unavailable). The **shape** is certainly right — a SHA-512 over order fields plus
-> the server key — but the exact **field set and order** must be checked, because
-> a wrong order produces a hash that never matches.
->
-> **How to verify:** the Midtrans dashboard shows a sample notification, or send a
-> test transaction in sandbox and log the raw payload. Confirm the concatenation
-> order from their docs, then update this line and remove this notice.
+```
+signature_key = SHA512(order_id + status_code + gross_amount + server_key)
+```
+
+**Implementation notes for signature calculation:**
+- `order_id`: The exact merchant order ID string (e.g. `"topup_d7e4d049-..."`).
+- `status_code`: The status code string from the notification body (e.g. `"200"` for successful settlement).
+- `gross_amount`: The raw string value of `gross_amount` as serialized in the Midtrans notification JSON payload (Midtrans typically formats this with two decimal places, e.g. `"50000.00"`). Do not parse as a float before string concatenation; use the raw payload string or format as `format!("{:.2}", amount)`.
+- `server_key`: The secret Midtrans Server Key from the backend environment.
+- Compare signatures using **constant-time equality** (`subtle::ConstantTimeEq` in Rust) to prevent timing attacks.
 
 ### The rules hold regardless of the exact formula
 
@@ -61,11 +56,21 @@ These do not depend on the field order and are safe to implement now:
 2. **Compare `gross_amount` against your own stored `topups` row.** Never credit
    the amount from the payload.
 3. Match on `order_id`. Unknown → reject and log.
-4. Treat `settlement` (and `capture`) as credit events. `deny`, `cancel`,
-   `expire`, `refund`, `partial_refund` are terminal non-credit (or debit) events.
-5. **Idempotent:** if the `topups` row is already `settled`, return 200 and do
+4. Treat `settlement` (and `capture`) as credit events. `deny`, `cancel` and
+   `expire` are terminal non-credit events.
+5. **`refund` and `partial_refund` are refused — the platform does not do
+   refunds.** Acknowledge with **HTTP 200** and
+   `{"status": "refund_not_supported"}`, log it at `error!`, and change
+   **nothing**: the topup stays `settled`, **no ledger row is written**, the
+   wallet cannot move, and **nothing is published to the realtime stream**.
+   `evaluate_payment_status` returns the named `PaymentAction::RefundRefused`
+   for these statuses — deliberately distinct from `PaymentAction::Unrecognised`,
+   because refusing a refund is a policy answer, not an unparsed status. The
+   wallet-debiting refund path is **removed**. 200 is still correct: a non-2xx
+   makes Midtrans retry a notification that can never succeed.
+6. **Idempotent:** if the `topups` row is already `settled`, return 200 and do
    nothing. Midtrans retries; a double credit is real money.
-6. Respond **200 quickly**. Slow webhooks get retried, which compounds the
+7. Respond **200 quickly**. Slow webhooks get retried, which compounds the
    idempotency requirement.
 
 ## Amounts and fee handling
@@ -79,7 +84,8 @@ These do not depend on the field order and are safe to implement now:
 
 ## The non-refundable caveat
 
-Policy is non-refundable. That scopes liability to *unwanted* service — it does
+Policy is non-refundable **during operation**. That scopes liability to *unwanted*
+service — it does
 **not** cover *undelivered* service. If payment succeeds and the service cannot be
 delivered, the customer paid for nothing, and a QRIS dispute through the payment
 provider generally favours the payer on non-delivery.
@@ -88,9 +94,24 @@ Practical consequences:
 
 - Keep a reserve covering outstanding wallet liabilities. Non-refundable reduces
   expected payouts; it does not make them zero.
-- Handle `refund` and `partial_refund` webhook statuses even though the policy
-  says no refunds — they may arrive from a dispute, and an unhandled status
-  leaves the ledger inconsistent.
+- **A refund or chargeback returns the customer's money AT THE RAIL while their
+  wallet keeps the credit. That is negative float, and it is the deliberate
+  operational cost of this policy — not a harmless no-op.**
+  - The webhook for `refund`/`partial_refund` is answered **200
+    `{"status": "refund_not_supported"}`** and changes nothing: the topup stays
+    `settled`, no ledger row is written, the wallet cannot move, and nothing is
+    pushed to the realtime stream. See
+    [`docs/server/api-spec.md`](../server/api-spec.md) §`POST /webhooks/midtrans`.
+  - Because the ledger does not move, **no ledger-drift check fires** — the wallet
+    still equals the sum of its ledger, and `topups` still says `settled`. The
+    **fast** signal is the `error!` log line and nothing else; the monthly
+    Midtrans-vs-`topups` reconciliation below is where it eventually surfaces, up
+    to a month later.
+  - **Mitigation: alert on that refusal.** The `error!` line is the only fast
+    signal this policy has, so it must page — a `refund_not_supported` sitting in
+    a log file is the failure mode. And hold a **reserve** sized to the refunds
+    the rail could force back, so wallet liabilities stay covered when one lands.
+    Unalerted, the refusal is invisible until the bank account is short.
 - Record the policy in the terms of service the user accepts at top-up.
 
 ## Settlement lag

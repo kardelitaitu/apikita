@@ -17,13 +17,21 @@ size.
 | Email | PocketBase | **Personal** |
 | Password hash | PocketBase | Sensitive, but not usable if leaked (hashed) |
 | Google account link | PocketBase | Personal |
-| Telegram ID | Postgres | Personal, pseudonymous |
-| Wallet balance + ledger | Postgres | **Financial** |
-| Top-up history (amounts, dates) | Postgres | **Financial** |
-| Token usage per day | Postgres | Behavioural |
-| API keys | Postgres | Credentials (hashed) — the plaintext is never stored |
-| Reviews + edit history | Postgres | Opinion, published aggregate only |
-| Sessions | Postgres | Contains IP hash and user agent |
+| Telegram ID | Embedded SQLite (the database file) | Personal, pseudonymous |
+| Wallet balance + ledger | Embedded SQLite (the database file) | **Financial** |
+| Payout destination (wind-down only) | Embedded SQLite | **Deleted 30 days after payout** — see §Wind-down |
+| Top-up history (amounts, dates) | Embedded SQLite (the database file) | **Financial** |
+| Token usage per day | Embedded SQLite (the database file) | Behavioural |
+| API keys | Embedded SQLite (the database file) | Credentials (hashed) — the plaintext is never stored |
+| Reviews + edit history | Embedded SQLite (the database file) | Opinion, published aggregate only |
+| Sessions | Embedded SQLite (the database file) | Contains IP hash and user agent |
+
+> **Wording change only — no retention fact moved.** The money store used to be a
+> managed PostgreSQL service; it is now **embedded SQLite**, a file the API opens.
+> Every row, every retention period and every "never stored" claim above is
+> unchanged. **This table is restated on the customer-facing
+> [`/privacy`](../../website/src/pages/privacy.astro) page**, which must be updated
+> in the same change if any of it moves again.
 
 ## What is NOT stored
 
@@ -57,6 +65,7 @@ relationship and becomes a liability the moment a breach occurs.
 | **Reviews** | Until deleted by user | Published aggregate; individual text is theirs |
 | **Review history** | Same as review | Needed to make an edit meaningful |
 | **link_codes** | Until used or expired + 24h | Then delete |
+| **Link-redemption attempts** | **7 days** | Salted IP hashes, same class as `key_ip_seen`; enough to investigate a live credential attack, then gone |
 | **Logs** | 30-90 days | Debugging window; not a database |
 | **Accounts (closed)** | Keep record, drop personal data | See below |
 
@@ -72,9 +81,8 @@ anything holding money, and PocketBase users are never hard-deleted.
 
 Closure means:
 
-1. `accounts.status = 'closed'`.
-2. **Revoke all sessions** immediately — the user is out.
-3. **Revoke all API keys** immediately — no further spend.
+1. `accounts.status = 'closed'` — set **only once the balance is zero** (step 6).
+2. **Revoke all sessions** — the user is out.
 4. **Retain the ledger and top-ups** (financial record).
 5. **Anonymise what can be anonymised** — email replaced with a tombstone in
    PocketBase, Telegram link removed, review body cleared if requested.
@@ -84,6 +92,28 @@ Closure means:
 **Never close an account that still holds a balance.** Non-refundable policy
 covers an unwanted service; it does not let you keep funds for a service you are
 refusing to provide.
+
+### Wind-down
+
+If **we** stop operating the service, the balance is not merely left zero — it is
+**paid back**. That is a different event from a customer closing their own account:
+platform-initiated, and it discharges the obligation rather than declining it. The
+threshold, classification and rounding are settled in
+[`decisions.md`](decisions.md) §Money; the procedure is
+[`wind-down.md`](wind-down.md).
+
+Two consequences for retention:
+
+| Data | Retention |
+| --- | --- |
+| **Payout destination** (bank code, account number, holder name, or wallet address) | Collected on request and re-confirmed inside the notice window. **Deleted 30 days after the payout completes** — it is PII with a short life |
+| **The payout reference** (`ledger.ref`, e.g. `closure_<run_id>`) | **Kept indefinitely** — it is a financial record, and the ledger is the business |
+
+The **re-confirmation requirement** is not optional. Closure revokes the only contact
+channel (step 2), and bank details older than the closure window are stale — merged
+banks, closed accounts. Pay only to a destination confirmed inside the window, and only
+to an account in the customer's own name: a bounced transfer is recoverable, a
+wrong-account transfer is not.
 
 ## The cross-border question
 

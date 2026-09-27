@@ -27,7 +27,7 @@ Two corrections, and the second is serious:
    break-even figure in those versions is void.
 
 **Corrected again in v4** — the earlier corrections used whitepaper rates that were
-~2.4x too low at peak. With the verified rates and the decided **M = 2.00**:
+~2.4x too low at peak. With the rates at **M = 2.00** (historical; operative margin is M = 1.50 — see `decisions.md`):
 
 | Workload at 20M tokens/month | Contribution @ M=2.00 |
 | --- | ---: |
@@ -57,13 +57,14 @@ Treat every number in this folder as a placeholder until it is not.
 | --- | --- |
 | Upstream permits resale? | **Resolved — permitted** (re-check per provider) |
 | Payment rail | **Decided — Midtrans, dynamic QRIS, Snap + server webhook** |
-| Refund policy | **Decided — prepaid, non-refundable** |
+| Refund policy | **Decided — prepaid, non-refundable during operation, no exception**; enforced in code (inbound refunds refused, nothing written). **At wind-down we pay balances above USD 2.00 back** — see `decisions.md` §Money and `docs/wind-down.md`. Legal review remains a Gate 0 item |
 | Deposit floor | Decided — 10,000 IDR; first-deposit minimum still open |
+| Credit expiry | **Decided — 2 years (24 months) from each deposit's own date.** Legal review of the interaction with the non-refundable clause remains open |
 | Entity (personal vs. PT) | **Open** — affects dispute posture and volume ceiling |
 | Upstream rates verified | **Open** — every rate-card figure is `[UNVERIFIED]` |
-| Region margin ceiling | **Open** — competitor pricing vs. M=2.00 unmeasured |
+| Region margin ceiling | **Open** — competitor pricing vs. M=1.50 unmeasured |
 | **Support cost per customer** | **Open — the decisive input.** A 5× error moves break-even from ~260 customers to unreachable |
-| Margin: M=1.50 vs 2.00 | **Open — now a viability question**, not positioning |
+| Margin | **Decided — M = 1.50** — see `decisions.md` |
 
 Remaining open items are in [`05-risk.md`](05-risk.md) R1 and
 [`01-market.md`](01-market.md), not blocking in the way resale terms were.

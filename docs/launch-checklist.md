@@ -18,7 +18,18 @@ business can operate at all.
 - [ ] Record the outcome in [`config/provider1.md`](../config/provider1.md).
 - [ ] Decide the contracting entity (personal or PT) — affects dispute posture,
       volume ceiling, and tax.
-- [ ] Legal review of [`terms-of-service.md`](terms-of-service.md).
+> **Gate 0 partial — owner-deferred.** The legal review below is **deferred by decision**
+> until turnover approaches 4.8 billion IDR/year (the PP 55/2022 UMKM ceiling). The owner
+> is operating personally for now. **The residual risk is accepted knowingly**: no lawyer
+> review, no corporate bank account, and no limited liability at launch. The crypto rail
+> is parked entirely, which removes the largest compliance surface; everything else about
+> the money path is settled in [`decisions.md`](decisions.md).
+
+- [ ] Legal review of [`terms-of-service.md`](terms-of-service.md) — **including the
+      wind-down clause**. Explicitly deferred until the 4.8b IDR trigger; re-open then.
+      Questions for that review are listed in [`decisions.md`](decisions.md)
+      §"Genuinely open": outbound transfers without a PT, PP 55/2022 on refunded
+      revenue, KYC/AML on a payee identified by email, and unclaimed balances.
 - [ ] Publish the Terms of Service, including the cross-border forwarding disclosure.
 - [ ] Publish a privacy policy matching [`data-retention.md`](data-retention.md).
 
@@ -28,7 +39,8 @@ recoverable.
 
 ## Gate 1 — Infrastructure
 
-- [ ] Postgres provisioned with a persistent volume.
+- [ ] A persistent volume provisioned for the SQLite database file (no database
+      instance to provision), and a backup of it tested by restore.
 - [ ] PocketBase deployed and reachable.
 - [ ] Edge relay deployed; nginx configured with `proxy_buffering off` on `/events`.
 - [ ] Automatic certificate renewal on the relay **and** on the backend.
@@ -49,34 +61,60 @@ opinion.
 - [ ] Amount validated against the **stored** `topups` row, never the payload.
 - [ ] Crediting is idempotent by `order_id`.
 - [ ] Crediting is atomic with the `topups` status update and the ledger row.
-- [ ] `refund` and `partial_refund` statuses handled (debit), even though the
-      policy is non-refundable.
+- [ ] `refund` and `partial_refund` statuses **refused, not handled**: a signed
+      refund notification returns 200 with `{"status":"refund_not_supported"}`,
+      logs at `error!`, and writes nothing — the topup stays `settled`, no ledger
+      row is appended, the wallet cannot move. **Alerting on that refusal is what
+      makes it visible** — unalerted, a refusal is indistinguishable from a bug.
 
 ### Ledger and balance
 
 - [ ] **No client-reachable path can write `balance_idr`.**
-- [ ] `ledger` is append-only; no UPDATE or DELETE exists in the codebase.
-- [ ] The reconciliation query returns **zero rows** on production data.
+- [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase.
+- [x] The reconciliation query returns **zero rows** on production data.
 - [ ] `CHECK (balance_idr >= 0)` present and exercised.
-- [ ] Money is `BIGINT` end to end; no float appears in any billing path.
+- [x] Money is `BIGINT` end to end; no float appears in any billing path.
 
 ### Billing accuracy
 
 - [ ] **Cache-read tokens are never counted as input tokens** — test with a payload
       containing cache hits.
-- [ ] Three token classes stored separately in `usage_daily`.
+- [x] Three token classes stored separately in `usage_daily`.
 - [ ] Peak/off-peak basis applied consistently between reservation and settlement.
 
 ## Gate 3 — Access control
 
-- [ ] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
+- [x] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
       dashboard endpoints.
-- [ ] Logout revokes the session row; "sign out everywhere" revokes all of them.
-- [ ] Suspension revokes sessions **and** keys atomically.
-- [ ] Admin endpoints require the operator flag; an operator cannot act on
+- [x] Logout revokes the session row; "sign out everywhere" revokes all of them.
+- [x] Suspension revokes sessions **and** keys atomically.
+- [x] Admin endpoints require the operator flag; an operator cannot act on
       themselves.
-- [ ] Every admin action writes an `admin_audit` row in the same transaction.
-- [ ] Link-code redemption is rate-limited per account and per IP.
+- [x] Every admin action writes an `admin_audit` row in the same transaction.
+- [x] Session lifetime is **30 days absolute and 7 days idle**, both enforced.
+      The idle half is measured from `sessions.last_seen_at`, which moves when a
+      session cookie resolves on a dashboard endpoint and is **not** touched by
+      `/v1/*` (that path authenticates API keys, not cookies).
+- [x] Link-code redemption is rate-limited per account and per IP.
+
+> **The three admin items above were implemented in `server/src/routes/admin.rs`
+> and covered by live tests, but the boxes stayed unchecked** — the checklist had
+> drifted *behind* the code. `require_operator` runs before any target lookup (so
+> a non-operator gets an identical 403 for a present and an absent id), one
+> `BEGIN IMMEDIATE` transaction does the status change, the session revocations,
+> the key revocations and the single `admin_audit` insert, and a failed suspend
+> writes no audit row.
+>
+> **Link-code redemption was the one item genuinely unbuilt when this note was
+> written**, and it is now built (`server/src/routes/telegram.rs`). Both caps the
+> docs demand are enforced and independently tested: **per account** by
+> `limits.link_code_issuance_per_hour` over issued codes, and **per IP** by
+> `limits.link_redemption_per_hour` over recorded attempts. The property that
+> matters is that **failed guesses count** — the attack on a 6-digit code IS the
+> failure stream, so a counter that advanced only on success would never fire.
+> Refusing a *correct* code once the budget is spent is what proves it. Every
+> refusal (wrong, expired, used, malformed, unknown) is **byte-identical**, so the
+> endpoint cannot be used as an oracle for which codes are live.
 
 ## Gate 4 — Data promises that must be true
 
@@ -107,7 +145,10 @@ statement is false.**
 - [ ] Top-up screen states the fee and the non-refundable policy before payment.
 - [ ] Deposit minimums enforced server-side (first vs re-top-up differ).
 - [ ] API key shown once, with an acknowledged warning.
-- [ ] Telegram `/link` flow works end to end.
+- [x] Telegram `/link` flow works end to end **on the server side** — issue,
+      redeem, unlink and re-link are implemented and covered by live tests. The
+      Telegram *bot* itself is still design-only (`telegram/README.md` has no code),
+      so the flow has not been exercised against the Bot API.
 - [ ] Review flow creates once and edits thereafter; withdrawal is a flag.
 - [ ] Telegram top-up feed posts on settlement only, never on creation.
 
@@ -147,7 +188,8 @@ That said, the ones that block *launch* specifically are:
 | **Legal review of the Terms of Service** | Gate 0 — cannot take money without it |
 | **Abuse-report contact** | Gate 5 — required to publish the terms |
 | **Support cost per customer** | Commercial model; not a launch blocker but the decisive business input |
-| **Credit expiry policy** | Must be stated in the terms before publishing |
+| **Credit expiry implementation** | Policy settled (2 years per deposit); the code is not written — no per-deposit expiry column, no sweep job, no refusal of a spend against aged credit |
+| **Wind-down runbook exercised** | Policy settled (balances above USD 2.00 paid out) and the runbook is written, but the payout is manual and has never been executed. It touches money and there is no treasury — so it is **not** a launch blocker on the same footing as a deployment, but it must be walked through against a scratch database before it is ever needed |
 
 The rest — Northflank prices, a second provider, a staging environment, review
 moderation policy, the second-operator threshold, the bot runtime — are open but

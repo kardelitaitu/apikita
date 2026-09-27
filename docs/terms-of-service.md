@@ -18,6 +18,8 @@ Three things the business does that customers must be told **before** they pay:
 | --- | --- |
 | **Prompts are forwarded to a provider in mainland China** | Materially affects the customer's data |
 | **Deposits are non-refundable** | A payment term; cannot be introduced after the fact |
+| **Credit expires 2 years after deposit** | A term that extinguishes value; must be disclosed before it can be relied on |
+| **Unused credit is paid out if the service closes** | A commitment on our side; stating it builds trust and reduces dispute exposure |
 | **Prompts are not logged by us, but the upstream's retention applies** | Otherwise "we do not store your data" is misleading |
 
 **The third is the one operators most want to skip, and the one that causes the
@@ -56,27 +58,73 @@ This is the most commercially important section.
 | Rate changes | We may change prices with notice |
 | Minimums | A first-deposit minimum and a re-top-up minimum apply |
 
-### The refund clause must be precise
+### The refund clause — settled: non-refundable during operation, no exception
 
-**Non-refundable is enforceable against a customer who changes their mind. It is
-NOT enforceable against non-delivery.** If we take payment and provide no service —
-or cannot provide it — the customer is entitled to their money back regardless of
-what this document says, and a QRIS dispute will generally favour the payer.
+**Decided: deposits and unused credit are non-refundable, with no non-delivery
+carve-out.** The earlier draft carried an exception returning unused credit where
+service could not be provided. That exception is **withdrawn** — see
+[`decisions.md`](decisions.md) §Money.
 
 Draft language:
 
-> Unused credit is non-refundable except where required by law or where we are
-> unable to provide the service for which the credit was purchased. Where service
-> cannot be provided, unused credit will be returned.
+> All deposits and unused credit are non-refundable. No refund is provided for
+> change of mind, for unused credit, or for any other reason, except as provided
+> in the wind-down clause below.
 
-**Do not write "non-refundable" without the exception.** A clause that overreaches
-is more likely to be struck down entirely than a narrow one.
+The system matches this: there is **no code path that returns money in response to a
+customer request**, and no self-serve refund. An inbound Midtrans
+`refund`/`partial_refund` notification is refused and changes nothing (see
+[`server/api-spec.md`](server/api-spec.md) §`POST /webhooks/midtrans`).
 
-### Expiry
+**Scope — this clause governs normal operation, not wind-down.** If *we* decide to
+stop operating the service, we pay balances back. That is a different thing: the
+customer did not ask, and we are not declining. See §Wind-down below.
 
-**Open decision:** do credits expire? If they do, it must be stated and the period
-must be reasonable. An expiring balance that is never refunded is a consumer-
-protection problem.
+> ⚠️ **Open legal risk — flagged, not resolved.** Withdrawing the carve-out was a
+> deliberate business decision, and the legal consequence is **not settled**:
+>
+> - A clause that overreaches is more likely to be **struck down in its entirety**
+>   than a narrow one — so this may reduce, not increase, the clause's protective
+>   value.
+> - `business/05-risk.md` records that on non-delivery **the payer generally
+>   prevails at the dispute stage regardless of the stated policy**, because
+>   Midtrans is a domestic rail with a real merchant entity behind it.
+> - "Non-refundable" therefore scopes liability to *unwanted* service, not to
+>   *undelivered* service. A chargeback returns the money at the rail whether or
+>   not these terms permit it.
+>
+> This is a **lawyer's call and remains a Gate 0 item**. The text above records the
+> decision; it does not certify it is enforceable.
+
+### Expiry — settled: credit expires 2 years after deposit
+
+**Decided: unused credit expires 2 years (24 months) from the date it was
+deposited.** Settled in [`decisions.md`](decisions.md) §Money; the period is stated
+here because it must be disclosed before it is relied on.
+
+Draft language:
+
+> Credit expires 2 years (24 months) after the date of the deposit that created it.
+> Expiry is calculated per deposit, not from the account's most recent activity.
+> Credit that has expired is no longer usable and is not refundable — except at
+> wind-down, where expiry is waived (§Wind-down).
+
+**Per deposit, not per account.** A wallet that receives top-ups over time holds
+credit of several ages; the clock runs on each deposit from its own date. The
+alternative — expiry from last activity — would silently extend the life of old
+credit, which is not what was decided.
+
+> ⚠️ **Open legal risk — flagged, not resolved.** An expiring balance that is never
+> refunded is a consumer-protection concern in Indonesia; 2 years is a defensible
+> period but the interaction with the non-refundable clause is **not settled**. This
+> remains part of the Gate 0 legal review.
+
+**⚠️ Not implemented.** Nothing in the system currently expires credit. There is no
+`expires_at` on `wallets`, no sweep job, and no code that would refuse a spend
+against aged credit. **This section is a promise the system does not yet keep**, and
+per the warning at the end of this document a policy claiming something the code does
+not do is worse than no policy. Implementing it — schema, sweep job, and the
+disclosure on the top-up screen — is a build task, not a decision.
 
 ## 4. Acceptable use
 
@@ -128,6 +176,27 @@ policy.** A summary at signup and before the first top-up.
 for the tokens actually produced. See [`failover.md`](failover.md) — a mid-stream
 upstream failure is billed per actual usage, not per customer expectation.
 
+### Billing when the client disconnects mid-answer
+
+**If the client disconnects before the answer finishes, the customer is still billed
+for the tokens the provider generated up to that point.**
+
+This follows from the same basis as the point above: billing is for what was produced,
+not for what was received. By the time a connection drops, the provider has already
+generated tokens for that request, and it reports that usage to us. We read the usage
+report and bill against it, rather than discarding it — the work was done and the
+provider has charged us for it.
+
+The charge is for tokens **actually generated**, at the rates in section 3. It is not a
+charge for the full answer, and it is not a minimum. A disconnect does not create a
+refund entitlement.
+
+Draft language:
+
+> Charges are based on the tokens the provider generates for a request. If your
+> connection ends before the response is complete, the tokens generated up to that
+> point are still billed.
+
 ## 7. Suspension and termination
 
 | Trigger | Action |
@@ -135,12 +204,68 @@ upstream failure is billed per actual usage, not per customer expectation.
 | Acceptable-use violation | Suspend, investigate, then terminate or restore |
 | Non-payment | Not applicable — prepaid |
 | Suspected fraud or account takeover | Immediate suspension |
-| Upstream terminates our access | Service ends; see the refund clause for unused credit |
+| Upstream terminates our access | Service ends — see §Wind-down |
+| We cease operating the service | See §Wind-down |
 
-**The last row is a real scenario.** The entire supply side could end without notice
-(see [`business/05-risk.md`](business/05-risk.md) R1). The terms must say what happens to
-unused credit in that case — and the honest answer is that it is returned, because
-there would be nothing to deliver.
+**The last two rows are real scenarios.** The entire supply side could end without
+notice (see [`business/05-risk.md`](business/05-risk.md) R1), or we may wind the
+service down ourselves. Both end up in the same place, and the honest answer is that
+unused credit is **paid back** — there would be nothing left to deliver. That is what
+§Wind-down specifies.
+
+### Wind-down — balances are paid out on closure
+
+**Decided: when the service closes, every balance above USD 2.00 is paid out.**
+Settled in [`decisions.md`](decisions.md) §Money; the procedure is
+[`wind-down.md`](wind-down.md). This is the one thing that overrides the
+non-refundable clause above.
+
+Draft language:
+
+> If we decide to stop operating the service, we will give at least **30 days'
+> notice**. On the wind-down date every balance is frozen, and we will pay out the
+> remaining balance of every account holding **more than USD 2.00**.
+>
+> - Customers who paid through Midtrans (QRIS) are paid by **bank transfer**, to an
+>   account in the customer's own name.
+> - Customers whose deposits settled in a stablecoin are paid in **USD stablecoin**.
+>
+> The USD/IDR rate is the Bank Indonesia **JISDOR** rate on the wind-down date,
+> fixed once for all payouts, and each payout is **rounded down** to the nearest
+> cent. **Every remaining balance is paid, including balances of USD 2.00 or less** —
+> we cover the transfer fee. Section 3 does not limit this section.
+
+**Three things to be precise about:**
+
+- **Why there is no floor in practice.** USD 2.00 names the point above which a payout
+  is automatic, but balances at or below it are **discharged on request, with us
+  covering the transfer fee** — so no reachable balance is ever stranded. A customer
+  who deposits 50,000 IDR and spends down below the threshold has done nothing wrong,
+  and "we already gave you nothing" is not a defensible answer. Making this
+  unconditional was a deliberate choice: it removes the consumer-protection exposure
+  from stacking a payout floor on top of expiry and non-refundability.
+- **Which rail decides the payout.** The rail a customer paid on. Anyone who used
+  Midtrans is treated as Indonesian and paid by bank transfer. This can never be
+  applied retroactively, and it never pays crypto to an Indonesian.
+- **Expiry is waived.** Credit that would have expired is paid anyway. The schema
+  holds one un-aged balance, so expired and live credit are not distinguishable —
+  and clawing credit back at the moment we stop serving would be forfeiture wearing
+  a policy's clothes.
+
+> ⚠️ **Legal review deferred — a decision, not an oversight.** The owner has decided to
+> operate personally and to defer legal review until turnover approaches **4.8 billion
+> IDR/year** (the PP 55/2022 UMKM ceiling, above which a PT and normal corporate tax
+> follow). Consequence accepted: at launch there is **no lawyer review, no corporate
+> bank account, and no limited liability**. This clause nonetheless **reduces** exposure
+> and is the one clause that should not be weakened — re-open the review the moment the
+> trigger is in sight. The specific questions are listed in
+> [`decisions.md`](decisions.md) §"Genuinely open".
+
+**⚠️ Not implemented.** There is no treasury, no disbursement integration and no
+payout code. Closing the service today is a **manual procedure** documented in
+[`wind-down.md`](wind-down.md) — deliberately, because a payout path with no traffic
+is the same hazard the codebase already removed every callerless money-moving
+function for.
 
 ## 8. Changes to these terms
 
@@ -165,7 +290,8 @@ there would be nothing to deliver.
 | Requirement | Where enforced |
 | --- | --- |
 | Cross-border forwarding disclosed before first use | Signup + pre-topup notice |
-| Non-refundable stated with the non-delivery exception | Terms + top-up screen |
+| Non-refundable stated (no exception during operation) | Terms + top-up screen |
+| Wind-down payout stated | Terms + top-up screen |
 | Acceptable use published and linked | Terms + an abuse contact |
 | Prompts genuinely not stored | Code review; see [`data-retention.md`](data-retention.md) |
 | Retention periods stated accurately | Matches the schema |
@@ -175,9 +301,17 @@ not do is worse than no policy, because it is a demonstrable false statement.
 
 ## Open items
 
-- [ ] Legal review — **required before launch**.
-- [ ] Credit expiry: yes or no, and for how long.
-- [ ] Liability cap figure.
+- [ ] Legal review — **required before launch**, and it must include the wind-down
+      clause (see §Wind-down and `decisions.md` §"Genuinely open" for the specific
+      legal and tax questions).
+- [x] ~~Wind-down payout threshold, classification and rate basis.~~ **Settled:
+      above USD 2.00, rail decides the payout, JISDOR rate frozen once.** The
+      *runbook* is written; the code is not, and there is no disbursement rail.
+- [x] ~~Credit expiry: yes or no, and for how long.~~ **Settled: 2 years from
+deposit date, per deposit** (see §Expiry). The *implementation* below is still open.
+- [ ] Credit expiry **implementation**: a schema field for per-deposit expiry, a
+      sweep job, and refusal of a spend against expired credit. The policy is settled;
+      the code is not written.
 - [ ] Whether an entity (PT) exists to contract with, or a personal account — see
       [`business/05-risk.md`](business/05-risk.md) R1.
 - [ ] Complaint handling process, and who owns it.

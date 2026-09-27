@@ -1,0 +1,167 @@
+# apikita — local development stack.
+#
+#   cp .env.example .env && docker compose up -d
+#
+# nginx is the edge relay; it proxies to the Rust API running on the HOST.
+# Ports and the fake-provider strategy: docs/local-development.md.
+# Relay behaviour: docs/edge-relay.md.
+#
+# There is no database container. The API uses embedded SQLite at the path in
+# DATABASE_URL (default sqlite://data/server.db) — a file on this host, not a
+# service. The Postgres container was removed when the schema moved to embedded
+# SQLite (docs/plans/sqlite-migration.md); that migration only changed the
+# database engine, not identity.
+#
+# PocketBase is a SEPARATE concern and is NOT part of the SQLite migration. It is
+# still the identity provider until Phase 6 replaces it with a Rust
+# implementation (todo.md:133); the server still calls it at POCKETBASE_URL for
+# every login (server/src/routes/auth.rs), so removing this file's PocketBase
+# service did not remove the dependency. It is run here as a standalone binary in
+# local dev (docs/local-development.md) rather than a container, and Phase 6's
+# Rust replacement will also be process-local — never a container.
+#
+# Resetting the local database is a file operation, not a volume one, and the
+# instructions live with the rest of the dev loop in docs/local-development.md —
+# `docker compose down -v` no longer touches any data, so there is nothing here to
+# reset.
+#
+# No top-level `version:` key — obsolete in Compose v2+.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Edge relay. Serves the STATIC SITE and proxies the API, both on :8000, so the
+  # browser sees ONE origin and the session cookie is actually sent. Production
+  # splits them (Cloudflare Pages + Northflank); locally they must not be split or
+  # the dashboard cannot authenticate. See .docker/nginx/relay.conf.
+  #
+  # The API upstream is host.docker.internal:8080 rather than a service name
+  # because the Rust API runs on the HOST (cargo run --bin apikita-server), not here.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: apikita-nginx
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./.docker/nginx/relay.conf:/etc/nginx/conf.d/default.conf:ro
+      # The site is the BUILD OUTPUT itself, mounted read-only, never copied
+      # into an image: a baked-in copy silently serves yesterday's JS after a
+      # rebuild, which is the failure this mount exists to prevent. Build it
+      # first (PUBLIC_API_BASE_URL= makes the JS call this same origin):
+      #   cd website && PUBLIC_API_BASE_URL= npm run build
+      # An empty source directory is harmless — nginx serves 404 until the
+      # build exists, which is honest rather than a stale 200.
+      - ./website/dist:/srv/www:ro
+    # Linux hosts need the gateway alias for host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # No depends_on: there is no database service left to wait for. The API runs
+    # on the host, so this healthcheck reports unhealthy until it is started.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Maintenance scheduler. The jobs below were written and then never run by
+  # anything (docs/observability.md:161, docs/ip-tracking.md:203) — this is the
+  # service that ends that. Read .docker/maintenance/README.md before trusting a
+  # green run; it states exactly what is wired and what is not.
+  #
+  #   retention  RUNS HERE, for real. The sqlite3 CLI plus the exact SQL of
+  #              server/src/bin/ip-purge.rs (server/src/ip_tracking.rs:298-316):
+  #              key_ip_seen > 7d, key_ip_daily > 90d. This is the
+  #              docs/ip-tracking.md retention promise actually being kept.
+  #   reconcile  RUNS HERE, for real. tools/reconcile/reconcile.sh, exit code
+  #              preserved verbatim (1=drift 2=no DATABASE_URL 3=no sqlite3
+  #              4=sqlite3 failed 5=stranded hold 6=no such database file).
+  #              No `|| true` anywhere near it.
+  #   ip-purge, hold-sweep
+  #              NOT WIRED HERE. Both are Rust binaries, and this service's image
+  #              (.docker/maintenance) deliberately contains only the sqlite3 CLI
+  #              — it is not the server image and must not become one. A server
+  #              image DOES now exist (server/Dockerfile, W17) and it ships
+  #              apikita-server and migrate; ip-purge and hold-sweep are still not
+  #              copied into it, because neither has been scheduled. This service
+  #              logs that on startup and never pretends to have run them — a
+  #              scheduler that looks like it works and does nothing is the same
+  #              failure class as a money check that returns 0 while the money is
+  #              wrong. Run them on the host, on the same cadence, until they are
+  #              wired into a scheduled container.
+  #
+  # PORTED TO SQLITE. The image is built from .docker/maintenance/Dockerfile,
+  # which exists only to put the sqlite3 CLI on PATH; both DSNs are sqlite://
+  # URLs, and the API's data directory is mounted so the jobs open the same file
+  # the API writes. There is no database service to depend on, so there is
+  # deliberately no depends_on.
+  #
+  # The image is NOT postgres:16 and must not be put back: there is no Postgres,
+  # and psql cannot open a SQLite file. See .docker/maintenance/README.md.
+  # ---------------------------------------------------------------------------
+  scheduler:
+    build:
+      # The one-reason image: sqlite3 on PATH, no Postgres client. The base is
+      # pinned there (alpine, matching nginx:1.27-alpine above) rather than
+      # :latest, so a base bump is a commit.
+      context: .
+      dockerfile: .docker/maintenance/Dockerfile
+    container_name: apikita-scheduler
+    entrypoint: ["/bin/sh", "/usr/local/bin/maintenance-entrypoint.sh"]
+    # The API's own working directory, and it is load-bearing: a relative
+    # sqlite:// path must resolve to the SAME file for both jobs. The entrypoint
+    # resolves ${APP_DIR}/server/data/server.db itself, but reconcile.sh gets the
+    # raw DSN and resolves a relative path against its CWD (reconcile.sh:93). Run
+    # from / — the image default — reconciliation looks for /data/server.db,
+    # reports exit 6 "no such database file", and the Gate 2 money check silently
+    # never runs against the real database. This is the directory server/ is
+    # mounted at, and the one the API runs in.
+    working_dir: /srv/apikita/server
+    # schedule = nightly loop. one-shot verbs for operators/CI: once, retention, reconcile.
+    command: ["schedule"]
+    environment:
+      # The retention job's database. A FILE, not a service: there is no
+      # Postgres and no host/port to name. The relative path resolves against
+      # ${APP_DIR}/server/ (entrypoint.sh, db_file_from_url), so it lands on the
+      # mount below — the same file the API writes.
+      DATABASE_URL: sqlite://data/server.db
+      # reconcile.sh reads this. Deliberately a SEPARATE variable, not a copy of
+      # DATABASE_URL: it is what lets a bad DSN disarm the reconciliation job
+      # alone without taking the retention sweep down with it. Do not collapse
+      # the two into one.
+      RECONCILE_DATABASE_URL: sqlite://data/server.db
+      # Where the repo is mounted, so a relative sqlite:// path resolves onto the
+      # mounts below. Pinned explicitly rather than left to the entrypoint's
+      # default: the resolution of both DSNs depends on it, and a silent default
+      # is not something a database path should rest on.
+      APP_DIR: /srv/apikita
+      # Nightly run time, UTC hour 0-23. 03:00 UTC is a quiet hour for the stack.
+      SCHEDULE_HOUR_UTC: ${SCHEDULE_HOUR_UTC:-3}
+    volumes:
+      - ./.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro
+      # Read-only: reconcile.sh + reconcile.sql, unmodified and unowned by this job.
+      - ./tools/reconcile:/usr/local/share/reconcile:ro
+      # The API's data directory — the file the API writes, the same file these
+      # jobs must open. Without this mount the container cannot see the database
+      # at all, which is what made this service permanently unable to succeed.
+      #
+      # NOT :ro, unlike the two mounts above, and that is not an oversight: the
+      # retention job is a DELETE (key_ip_seen/key_ip_daily, entrypoint.sh
+      # run_retention), and a DELETE against a read-only mount fails on every
+      # host — "attempt to write a readonly database". The promise this service
+      # exists to keep would then never be kept. The two repo mounts above stay
+      # :ro: what this service must never write is the repo's source, not the
+      # data directory. (reconcile.sh opens the file -readonly by itself; the
+      # write privilege is the retention sweep's alone.)
+      #
+      # The directory is gitignored (server/data/) and may not exist yet; an
+      # empty source is harmless — the jobs report "no such database file"
+      # rather than a clean sheet.
+      - ./server/data:/srv/apikita/server/data
+    # No healthcheck on purpose: this container serves nothing and listens on
+    # nothing, so any probe would be theatre. Its liveness signal is the nightly
+    # job log line, and a failed job is a non-zero exit, not a silent success.
+    # Nightly cadence needs it back after a reboot, and `unless-stopped` matches
+    # every other service here.
+    restart: unless-stopped

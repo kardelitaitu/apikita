@@ -1,0 +1,43 @@
+# Line endings, pinned per file type - never left to core.autocrlf.
+#
+# WHY THIS FILE EXISTS: every shell and SQL file in this repo is EXECUTED inside a
+# Linux container (`/bin/sh` for the maintenance jobs, the `sqlite3` CLI for the
+# reconcile query). With a Windows checkout and `core.autocrlf=true` those files
+# land with CRLF endings, and `/bin/sh` dies on the first line with
+#   set: line 86: illegal option -
+# BEFORE any job runs - so the nightly retention sweep and the Gate 2 money check
+# never execute, while `docker compose config` still looks perfectly valid.
+#
+# FORCING LF IS THE FIX, NOT A PREFERENCE. These are not text files to be edited
+# on Windows; they are programs the container runs.
+
+# Shell scripts: runnable inside the container. LF is mandatory.
+*.sh            text eol=lf
+*.bash          text eol=lf
+*.mjs           text eol=lf
+*.py            text eol=lf
+
+# SQL: applied by the sqlite3 CLI. A trailing CR becomes part of the statement.
+*.sql           text eol=lf
+
+# Container files: Dockerfiles, compose, nginx config. The image is Linux.
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.conf          text eol=lf
+
+# Never text-normalise binaries or lock files: git would corrupt them.
+*.png           binary
+*.jpg           binary
+*.ico           binary
+*.svg           text eol=lf
+*.woff          binary
+*.woff2         binary
+*.lock          binary
+*.db            binary
+*.zst           binary
+
+# Generated artifacts are not source; leave their bytes alone.
+website/dist/** binary
+server/target/** binary

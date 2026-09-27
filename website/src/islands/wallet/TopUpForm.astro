@@ -1,0 +1,492 @@
+---
+// Wallet top-up island. Interactive surface: ships JavaScript, unlike the
+// marketing pages.
+//
+// Flow and rules are transcribed from docs/website/04-payments.md and
+// docs/server/api-spec.md. The one that matters most: the browser is never
+// trusted to say "I paid". A successful Snap callback creates nothing — only the
+// Midtrans webhook, server-side, credits the wallet.
+//
+// PUBLIC_* values are INLINED INTO BROWSER JAVASCRIPT AND ARE NOT SECRET. The
+// Midtrans server key is server-only and must never appear here.
+
+// Which Snap host the page loads follows PUBLIC_MIDTRANS_ENV — the browser-side
+// mirror of the server's MIDTRANS_ENV (see .env.example). The rule is copied
+// from the server rather than invented: ONLY an explicit "production" selects
+// the live host, so an unset value or a typo stays on sandbox and a bad value
+// can never move real money (server/src/routes/account.rs `is_production`).
+// Sandbox is therefore the default for local dev, where the variable is unset.
+const MIDTRANS_ENV = (import.meta.env.PUBLIC_MIDTRANS_ENV ?? '').trim().toLowerCase();
+const SNAP_JS_URL =
+  MIDTRANS_ENV === 'production'
+    ? 'https://app.midtrans.com/snap/snap.js'
+    : 'https://app.sandbox.midtrans.com/snap/snap.js';
+// Public by design and environment-specific: the sandbox and production client
+// keys differ, so this must be set at build time alongside the host above. An
+// empty value means no payment can be opened — the submit handler says so
+// rather than calling snap.pay() with no key.
+const SNAP_CLIENT_KEY = import.meta.env.PUBLIC_MIDTRANS_CLIENT_KEY ?? '';
+// The host rule above, applied to the same value: anything but an explicit
+// "production" is sandbox. This is the browser-side value the script compares
+// against the environment the server reports on the create-topup response, and
+// normalising it here is what makes the two comparable — an unset Pages variable
+// IS sandbox, exactly as an unset MIDTRANS_ENV is server-side, so a local dev
+// build does not read as a mismatch. It is also published as
+// `data-midtrans-env` for operators and tests.
+const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbox';
+---
+
+<div
+  id="topup-island"
+  data-midtrans-env={MIDTRANS_HOST_ENV}
+  data-midtrans-key-missing={SNAP_CLIENT_KEY.trim() === '' ? 'true' : 'false'}
+>
+  <form id="topup-form" class="max-w-md space-y-4" novalidate>
+    <div>
+      <label for="topup-amount" class="block text-sm font-medium">Amount (IDR)</label>
+      <input
+        id="topup-amount"
+        name="amount"
+        type="number"
+        inputmode="numeric"
+        step="1000"
+        min="0"
+        required
+        class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm tabular-nums"
+        aria-describedby="topup-hint"
+      />
+      <p id="topup-hint" class="mt-1 text-xs text-ink-muted">
+        Checking your deposit minimum&hellip;
+      </p>
+      <p id="topup-error" hidden class="mt-1 text-xs text-danger"></p>
+    </div>
+
+    <button
+      id="topup-submit"
+      type="submit"
+      class="rounded-md bg-brand px-4 py-2.5 text-sm font-medium text-brand-ink hover:bg-brand-strong disabled:cursor-not-allowed disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      Top up
+    </button>
+  </form>
+
+  <!--
+    Fee disclosure. docs/website/04-payments.md:70 requires the fee be shown before
+    payment. There is no fee to show: the amount model is GROSS and the server
+    credits the entered amount unchanged (server/src/db.rs credit_topup_transaction
+    adds amount_idr with no deduction), and neither the API response nor
+    config/apikita.toml exposes a customer-facing fee. So this states what actually
+    happens, filled in below from the amount the user is about to pay, rather than
+    inventing a rate.
+  -->
+  <p id="topup-fee" class="mt-3 max-w-md text-xs text-ink-muted">
+    QRIS is the only enabled rail — card payments are deliberately disabled. The
+    amount you enter is gross: you pay it and the full amount is credited to your
+    balance.
+  </p>
+
+  <!--
+    The pending panel. Shown after Snap reports success or a pending payment, and
+    it deliberately shows NO balance change: the money is not real until the
+    webhook confirms it.
+  -->
+  <div
+    id="topup-pending"
+    hidden
+    class="mt-6 max-w-md rounded-lg border border-warn-edge bg-warn-surface p-4 text-sm text-warn-ink"
+    aria-live="polite"
+  >
+    <p class="font-medium">Waiting for payment confirmation</p>
+    <p class="mt-2">
+      Your payment has been submitted. Your balance is credited only when Midtrans
+      confirms it to our server — this page is not allowed to do that, so nothing
+      has been added yet.
+    </p>
+    <dl class="mt-3 space-y-1 text-xs">
+      <div class="flex gap-2">
+        <dt class="text-warn">Amount</dt>
+        <dd id="topup-pending-amount" class="font-mono"></dd>
+      </div>
+      <div class="flex gap-2">
+        <dt class="text-warn">Order</dt>
+        <dd id="topup-pending-order" class="font-mono break-all"></dd>
+      </div>
+    </dl>
+    <p class="mt-3 text-xs text-warn-ink">
+      This panel clears by itself when the confirmation arrives and the live
+      balance updates.
+    </p>
+  </div>
+
+  <div id="topup-notice" hidden class="mt-6 max-w-md rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink" aria-live="polite">
+    <p id="topup-notice-text"></p>
+    <p id="topup-notice-id" class="mt-1 font-mono text-xs text-danger"></p>
+  </div>
+
+  <section class="mt-10">
+    <h3 class="text-lg font-semibold tracking-tight">Top-up history</h3>
+    <p id="topup-history-empty" hidden class="mt-3 text-sm text-ink-muted">
+      No top-ups yet. Your first deposit has a higher minimum than later ones.
+    </p>
+    <div class="overflow-x-auto">
+      <table id="topup-history" hidden class="mt-4 w-full border-collapse text-left text-sm">
+      <thead>
+        <tr class="border-b border-edge-strong">
+          <th scope="col" class="py-3 pr-4 font-medium">Date</th>
+          <th scope="col" class="py-3 pr-4 font-medium">Order</th>
+          <th scope="col" class="py-3 pr-4 text-right font-medium">Amount</th>
+          <th scope="col" class="py-3 font-medium">Status</th>
+        </tr>
+      </thead>
+      <tbody id="topup-history-rows"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script
+  is:inline
+  src={SNAP_JS_URL}
+  data-client-key={SNAP_CLIENT_KEY}
+  defer
+></script>
+
+<script>
+  import { apiFetch } from '../../lib/api';
+  import { describeError, fieldInput, renderNotice } from '../../lib/errors';
+  import type { Noticeable } from '../../lib/errors';
+  import { formatIdr } from '../../lib/format';
+  import { getLiveStore } from '../../lib/live';
+  import { midtransEnvMismatch } from '../../lib/midtrans-env.ts';
+
+  // Mirrors the server's own rule in server/src/routes/account.rs create_topup:
+  // the minimum depends on whether the account has ever SETTLED a top-up. A
+  // pending one does not count, on either side.
+  const FIRST_DEPOSIT_MIN_IDR = 50_000;
+  const RETOPUP_MIN_IDR = 10_000;
+
+  interface Topup {
+    id: string;
+    amount_idr: number;
+    order_id: string;
+    status: string;
+    created_at: string;
+    settled_at: string | null;
+  }
+
+  interface CreateTopupResponse {
+    topup_id: string;
+    order_id: string;
+    snap_token: string | null;
+    /**
+     * Which Midtrans environment the server created this session against:
+     * exactly "sandbox" or "production" (server/src/routes/account.rs,
+     * `CreateTopupResponse`). Absent on an older server or when Pages is
+     * deployed ahead of the API — see `midtransEnvMismatch`, which fails open
+     * on that rather than blocking every top-up.
+     */
+    environment?: string;
+  }
+
+  /** Subset of the Snap.js global that this island uses. */
+  interface SnapGlobal {
+    pay(
+      token: string,
+      options: {
+        onSuccess?: (result: unknown) => void;
+        onPending?: (result: unknown) => void;
+        onError?: (result: unknown) => void;
+        onClose?: () => void;
+      },
+    ): void;
+  }
+
+  const form = document.getElementById('topup-form') as HTMLFormElement;
+  const amountInput = document.getElementById('topup-amount') as HTMLInputElement;
+  const hint = document.getElementById('topup-hint') as HTMLElement;
+  const errorLine = document.getElementById('topup-error') as HTMLElement;
+  const feeLine = document.getElementById('topup-fee') as HTMLElement;
+  const submit = document.getElementById('topup-submit') as HTMLButtonElement;
+  const pending = document.getElementById('topup-pending') as HTMLElement;
+  const pendingAmount = document.getElementById('topup-pending-amount') as HTMLElement;
+  const pendingOrder = document.getElementById('topup-pending-order') as HTMLElement;
+  const notice = document.getElementById('topup-notice') as HTMLElement;
+  const noticeText = document.getElementById('topup-notice-text') as HTMLElement;
+  const noticeId = document.getElementById('topup-notice-id') as HTMLElement;
+  const history = document.getElementById('topup-history') as HTMLElement;
+  const historyRows = document.getElementById('topup-history-rows') as HTMLElement;
+  const historyEmpty = document.getElementById('topup-history-empty') as HTMLElement;
+
+  // Read from the island root, not re-derived here: Astro gives the <script> no
+  // access to the frontmatter constants, and re-reading import.meta.env in the
+  // browser would be undefined. The root is the single source these two values
+  // cross the boundary on.
+  const island = document.getElementById('topup-island') as HTMLElement;
+  const midtransEnv = island.dataset.midtransEnv ?? 'sandbox';
+  const midtransKeyMissing = island.dataset.midtransKeyMissing === 'true';
+
+  /**
+   * The one environment fault this side can see on its own: a build with no
+   * public client key cannot open Snap at all, whatever the server does.
+   *
+   * That is a fact about this bundle, not a guess, so it is checked before the
+   * request and a misconfigured deployment creates no top-up row. The other
+   * direction — this build's environment against the server's — needs the
+   * server's answer and is checked after the create-topup call resolves, before
+   * `snap.pay()` (see the submit handler and lib/midtrans-env.ts). The key's
+   * PREFIX is never consulted: Midtrans documents no environment prefix for
+   * client keys, and the key is not what picks the host.
+   */
+  function clientKeyProblem(): Noticeable | null {
+    if (midtransKeyMissing) {
+      return {
+        message:
+          `Payment is unavailable: this site was built without PUBLIC_MIDTRANS_CLIENT_KEY, so Snap ` +
+          `cannot open. Nothing was charged and no top-up was created. The site operator must set it ` +
+          `and rebuild (see docs/deployment.md).`,
+        requestId: null,
+      };
+    }
+    return null;
+  }
+
+  let minimumIdr = RETOPUP_MIN_IDR;
+  let historyLoaded = false;
+
+  function setError(message: string | null): void {
+    errorLine.textContent = message ?? '';
+    errorLine.hidden = message === null;
+  }
+
+  /**
+   * The fee line, recomputed from the amount actually entered.
+   *
+   * The amount model is GROSS (docs/website/04-payments.md:122) and the server
+   * credits the entered amount with no deduction (server/src/db.rs
+   * credit_topup_transaction), so the customer-facing fee is a real, computed
+   * zero — not an unknown, and not a rate invented here. Both figures come from
+   * the amount the user typed, so the "what lands in the balance" half of the
+   * disclosure (docs/website/03-functional-spec.md:143) is shown before payment.
+   */
+  function renderFee(amountIdr: number | null): void {
+    feeLine.textContent =
+      amountIdr === null
+        ? 'QRIS is the only enabled rail — card payments are deliberately disabled. ' +
+          'The amount you enter is gross: you pay it and the full amount is credited to your balance.'
+        : `QRIS is the only enabled rail — card payments are deliberately disabled. ` +
+          `You pay ${formatIdr(amountIdr)} gross and ${formatIdr(amountIdr)} is credited to your ` +
+          `balance — there is no top-up fee.`;
+  }
+
+  // Takes the whole notice, not a message plus an id: there is no second
+  // argument for a caller to drop, so the request id cannot go missing on an
+  // error path. The two elements here are the layout; the contract lives in
+  // lib/errors.ts and is what the test suite drives.
+  function showNotice(shown: Noticeable): void {
+    renderNotice({ message: noticeText, correlation: noticeId }, shown);
+    notice.hidden = false;
+  }
+
+  function clearNotice(): void {
+    notice.hidden = true;
+  }
+
+  /** Pre-validate so the user is never sent into a transaction the server will reject. */
+  function validate(): number | null {
+    const raw = amountInput.value.trim();
+    if (raw === '') {
+      setError('Enter an amount.');
+      return null;
+    }
+    const amount = Number(raw);
+    if (!Number.isFinite(amount) || !Number.isInteger(amount)) {
+      setError('Enter a whole number of rupiah — no decimals.');
+      return null;
+    }
+    if (amount < minimumIdr) {
+      setError(`The minimum is ${formatIdr(minimumIdr)}.`);
+      return null;
+    }
+    setError(null);
+    renderFee(amount);
+    return amount;
+  }
+
+  function renderHistory(topups: Topup[]): void {
+    historyRows.replaceChildren();
+
+    if (topups.length === 0) {
+      history.hidden = true;
+      historyEmpty.hidden = false;
+      return;
+    }
+    historyEmpty.hidden = true;
+    history.hidden = false;
+
+    for (const topup of topups) {
+      const row = document.createElement('tr');
+      row.className = 'border-b border-edge';
+
+      const cells = [
+        new Date(topup.created_at).toLocaleString(),
+        topup.order_id,
+        formatIdr(topup.amount_idr),
+        topup.status,
+      ];
+      cells.forEach((value, index) => {
+        const cell = document.createElement('td');
+        cell.textContent = value;
+        cell.className = index === 2 ? 'py-3 pr-4 text-right font-mono tabular-nums' : 'py-3 pr-4';
+        if (index === 1 || index === 3) cell.classList.add('font-mono');
+        if (index === 3 && topup.status === 'settled') cell.classList.add('text-ok');
+        row.append(cell);
+      });
+
+      historyRows.append(row);
+    }
+  }
+
+  async function loadHistory(): Promise<void> {
+    try {
+      const topups = await apiFetch<Topup[]>('/api/topups?limit=20');
+      historyLoaded = true;
+
+      // The server decides the minimum from the count of SETTLED top-ups.
+      const hasSettled = topups.some((t) => t.status === 'settled');
+      minimumIdr = hasSettled ? RETOPUP_MIN_IDR : FIRST_DEPOSIT_MIN_IDR;
+      amountInput.min = String(minimumIdr);
+      hint.textContent = hasSettled
+        ? `Minimum top-up: ${formatIdr(RETOPUP_MIN_IDR)}.`
+        : `First deposit minimum: ${formatIdr(FIRST_DEPOSIT_MIN_IDR)}. Later top-ups start at ${formatIdr(RETOPUP_MIN_IDR)}.`;
+
+      renderHistory(topups);
+
+      // The webhook settled the order: drop the pending panel. The balance badge
+      // has already been updated by the stream, not by anything here.
+      const settledOrder = pendingOrder.textContent;
+      if (!pending.hidden && settledOrder) {
+        const match = topups.find((t) => t.order_id === settledOrder);
+        if (match && match.status === 'settled') pending.hidden = true;
+      }
+    } catch (err) {
+      const view = describeError(err);
+      if (historyLoaded) showNotice(view);
+      else hint.textContent = 'Deposit minimum unavailable — retry by reloading.';
+    }
+  }
+
+  function markPending(orderId: string, amountIdr: number): void {
+    pendingAmount.textContent = formatIdr(amountIdr);
+    pendingOrder.textContent = orderId;
+    pending.hidden = false;
+  }
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    clearNotice();
+
+    const amount = validate();
+    if (amount === null) return;
+
+    // Checked BEFORE the request: no client key means Snap cannot open, and a
+    // top-up row that can never be paid helps nobody.
+    const unpayable = clientKeyProblem();
+    if (unpayable) {
+      showNotice(unpayable);
+      return;
+    }
+
+    submit.disabled = true;
+    void (async () => {
+      try {
+        // Creates the order and returns the Snap token. The server writes a
+        // topups row with status=pending; no money moves here.
+        const created = await apiFetch<CreateTopupResponse>('/api/topups', {
+          method: 'POST',
+          body: JSON.stringify({ amount_idr: amount }),
+        });
+
+        // The server has answered, so this build's Midtrans environment can now
+        // be compared against the one the session was REALLY created against —
+        // the fact the old client-key-prefix guess was standing in for. Checked
+        // here, before `snap.pay()`: a token minted against the other
+        // environment can never be paid, so prevention saves the customer a
+        // payment that would certainly fail. An absent `environment` (older
+        // server, Pages deployed first) is "cannot check" and proceeds.
+        if (midtransEnvMismatch(midtransEnv, created.environment) === 'mismatch') {
+          // The order exists server-side and stays pending; there is no expiry
+          // sweep for `topups`, so it is reported rather than silently dropped.
+          markPending(created.order_id, amount);
+          showNotice({
+            message:
+              `Payment is unavailable: this site is built for Midtrans '${midtransEnv}', but the ` +
+              `server created this order against '${created.environment}'. Nothing was charged. The ` +
+              `order is recorded as pending and will stay pending until it is paid. The site operator ` +
+              `must set PUBLIC_MIDTRANS_ENV (Cloudflare Pages) and MIDTRANS_ENV (server) to the same ` +
+              `environment and redeploy both (see docs/deployment.md).`,
+            requestId: null,
+          });
+          void loadHistory();
+          return;
+        }
+
+        const snap = (window as unknown as { snap?: SnapGlobal }).snap;
+        if (!created.snap_token || !snap) {
+          // The order exists server-side, so it is honest to show it as pending
+          // rather than to pretend the payment started. The environments agree
+          // (checked above) or the server did not say, so the cause is this
+          // browser or this build, not a cross-environment misconfiguration.
+          markPending(created.order_id, amount);
+          showNotice({
+            message:
+              'Payment could not be opened in this browser, so nothing was charged. The order is recorded as pending and will stay pending until it is paid. If this happens on every attempt, the Snap script may be blocked or failed to load — check the browser console and any content blocker.',
+            requestId: null,
+          });
+          void loadHistory();
+          return;
+        }
+
+        snap.pay(created.snap_token, {
+          // Success here means Snap accepted the payment. It is NOT a credit:
+          // only the server-side webhook creates money.
+          onSuccess: () => markPending(created.order_id, amount),
+          onPending: () => markPending(created.order_id, amount),
+          onError: () => {
+            markPending(created.order_id, amount);
+            showNotice({ message: 'The payment did not complete. The order is still pending.', requestId: null });
+          },
+          onClose: () => {
+            // Closed without paying: the order remains pending server-side.
+            void loadHistory();
+          },
+        });
+      } catch (err) {
+        const view = describeError(err);
+        showNotice(view);
+        // The API calls the amount field `amount_idr`; a 422 that names it moves
+        // focus to the input. A failure with no field keeps the notice alone.
+        fieldInput(view.field, { amount_idr: amountInput, amount: amountInput })?.focus();
+      } finally {
+        submit.disabled = false;
+      }
+    })();
+  });
+
+  amountInput.addEventListener('input', () => {
+    setError(null);
+    // A stale fee for the previous amount is the surprise this line exists to
+    // prevent, so it goes back to the general statement until the next validate.
+    renderFee(null);
+  });
+
+  // A settlement pushes a `balance` event, so the history and the pending panel
+  // follow the stream instead of polling for the webhook.
+  let lastBalance: number | null = null;
+  getLiveStore().subscribe((state) => {
+    if (state.balanceIdr === lastBalance) return;
+    lastBalance = state.balanceIdr;
+    if (historyLoaded) void loadHistory();
+  });
+
+  void loadHistory();
+</script>

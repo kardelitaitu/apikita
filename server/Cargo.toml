@@ -1,0 +1,96 @@
+[package]
+name = "apikita-server"
+version = "0.0.1"
+edition = "2021"
+# The oldest toolchain the source compiles with, and it is MEASURED, not
+# declared: the lockfile's icu_* crates (via idna) require 1.88, which the image
+# build failed at 1.85 with "icu_collections@2.3.0 requires rustc 1.88". CI uses
+# `stable`, always newer, so this is the FLOOR a contributor may rely on rather
+# than what CI pins. Cargo enforces it and fails loudly below it.
+rust-version = "1.88"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "migrate"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+subtle = "2.6"
+time = "0.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+cookie = "0.18"
+thiserror = "2.0"
+dotenvy = "0.15"
+
+[dev-dependencies]
+tokio-test = "0.4"
+# Phase 5: the money tests need a migrated database, and SQLite makes one a temp
+# file rather than a server. This is what lets them run in CI by default instead
+# of behind `#[ignore = "requires live Postgres"]`.
+tempfile = "3"
+
+[lib]
+name = "apikita_server"
+path = "src/lib.rs"
+
+[profile.dev]
+# Dev-loop builds: keep file/line in backtraces, drop full DWARF.
+# Measured from fresh target dirs: cold build 64.2s -> 28.8s, target size
+# 1.9G -> 994M. Incremental edits were already frontend-bound, so the ~2s
+# edit loop is unchanged; the win is cold builds, CI and disk.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies are not stepped through; their debug info is pure build cost.
+debug = false
+
+[profile.release]
+# What the deployed image is built with. Every setting below is either a pure
+# size/speed win with no observable behaviour change, or it is not here at all.
+#
+#   lto = "thin"          cross-crate inlining at link time. "thin" rather than
+#                         "fat" because fat LTO roughly doubles link time for a
+#                         saving this service does not need (it is not a
+#                         tight-loop numeric workload); thin captures most of it.
+#   codegen-units = 1     one codegen unit so LLVM optimises the whole crate
+#                         together. Costs compile time, buys throughput on the
+#                         proxy hot path, which is the whole product.
+#   strip = "symbols"     drop the symbol table from the shipped binary.
+#                         MEASURED CAVEAT: on the `x86_64-pc-windows-msvc` target
+#                         this is a NO-OP for the .exe - with and without it the
+#                         binary is byte-for-byte 8.60 MB, because MSVC keeps
+#                         symbols in a separate .pdb. It is set for the LINUX
+#                         target the image actually builds for, where strip does
+#                         take effect; that effect has NOT been measured from this
+#                         Windows host. It is harmless either way, which is why it
+#                         stays - but do not cite it as a size win on MSVC.
+#
+# DELIBERATELY ABSENT: `panic = "abort"`.
+# It would shrink the binary further and remove the unwind tables, and on a
+# stateless batch job that is usually free. Here it is not: a panic inside one
+# tokio task is caught at the task boundary and the process survives, so an
+# `abort` panic policy converts "one request died" into "every in-flight request
+# died". This service holds wallets and streams answers, so that trade buys a
+# smaller image with availability, and it is not a trade to make without
+# measuring it under load. If it is ever taken, it must come with a measurement.
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# The minimum supported toolchain, stated so it is a contract rather than a
+# README claim. CI installs `stable`; this pins what the source actually needs.
+# Kept in step with `rust-version` in [package] below.
