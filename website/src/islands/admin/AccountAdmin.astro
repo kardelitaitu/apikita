@@ -1,0 +1,310 @@
+---
+// The operator account console: look up one account by id, read its
+// state, and suspend or resume it.
+//
+// A script-island (plain <script>), not a UI-framework component — the same
+// choice KeyManagement.astro documents: astro.config and package.json are not
+// this file's to change.
+//
+// Gate: the page renders this only for an operator (the server re-checks
+// anyway). Everything an operator sees here is a rendering decision; the
+// authorization lives in server/src/routes/admin.rs.
+//
+// Contract: docs/admin-surface.md, docs/server/api-spec.md (Admin routes).
+---
+
+<!--
+  The gate. Shown while /api/me is in flight and for a non-operator. The console
+  below is revealed only for an operator. This is presentation, NOT security:
+  every admin route answers 403 to a non-operator regardless of what is on
+  screen (server/src/routes/admin.rs::require_operator).
+-->
+<div id="admin-gate" class="mt-6 rounded-lg border border-edge bg-surface-raised p-6 text-sm text-ink-muted">
+  <p id="admin-gate-text">Checking operator access&hellip;</p>
+  <p class="mt-3"><a href="/dashboard" class="underline">Back to your dashboard</a></p>
+</div>
+
+<div id="admin-island" hidden class="mt-6">
+  <!-- Lookup ---------------------------------------------------------------- -->
+  <form id="admin-lookup" class="flex flex-wrap items-end gap-3">
+    <div class="min-w-[22rem] flex-1">
+      <label for="admin-account-id" class="block text-sm font-medium">Account id</label>
+      <input id="admin-account-id" name="account_id" type="text" required autocomplete="off"
+        spellcheck="false" placeholder="00000000-0000-0000-0000-000000000000"
+        class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 font-mono text-sm" />
+    </div>
+    <button id="admin-lookup-btn" type="submit"
+      class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Look up</button>
+  </form>
+
+  <div id="admin-error" hidden class="mt-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
+
+  <!-- Result ---------------------------------------------------------------- -->
+  <section id="admin-result" hidden class="mt-6">
+    <div class="rounded-lg border border-edge bg-surface-raised p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 class="text-lg font-semibold tracking-tight">Account</h2>
+        <span id="admin-status" class="rounded border px-2 py-0.5 text-xs font-medium"></span>
+      </div>
+
+      <dl class="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div>
+          <dt class="text-xs uppercase tracking-wide text-ink-muted">Balance</dt>
+          <dd id="admin-balance" class="mt-1 font-mono tabular-nums text-accent">&mdash;</dd>
+        </div>
+        <div>
+          <dt class="text-xs uppercase tracking-wide text-ink-muted">Live sessions</dt>
+          <dd id="admin-sessions" class="mt-1 font-mono tabular-nums">0</dd>
+        </div>
+        <div>
+          <dt class="text-xs uppercase tracking-wide text-ink-muted">Live keys</dt>
+          <dd id="admin-keys" class="mt-1 font-mono tabular-nums">0</dd>
+        </div>
+        <div>
+          <dt class="text-xs uppercase tracking-wide text-ink-muted">Created</dt>
+          <dd id="admin-created" class="mt-1 font-mono text-sm">&mdash;</dd>
+        </div>
+      </dl>
+
+      <p id="admin-operator-note" hidden class="mt-4 rounded-md border border-edge-strong bg-surface-sunken p-3 text-xs text-ink-muted">
+        This account is an operator. Operator accounts cannot act on each other
+        through this surface, and an operator cannot act on their own account.
+      </p>
+
+      <!-- Actions -->
+      <div class="mt-6 border-t border-edge pt-5">
+        <h3 class="text-sm font-semibold">Actions</h3>
+        <p id="admin-action-hint" class="mt-1 text-xs text-ink-muted"></p>
+
+        <div id="admin-actions" class="mt-3 flex flex-wrap gap-3">
+          <button id="admin-suspend" type="button" hidden
+            class="rounded-md border border-danger-edge bg-danger-surface px-4 py-2 text-sm font-medium text-danger-ink hover:border-danger">Suspend account</button>
+          <button id="admin-resume" type="button" hidden
+            class="rounded-md border border-ok-edge bg-ok-surface px-4 py-2 text-sm font-medium text-ok-ink hover:border-ok">Resume account</button>
+        </div>
+
+        <p id="admin-terminal-note" hidden class="mt-3 text-xs text-ink-muted">
+          A closed account is terminal: it can be neither suspended nor resumed.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Confirmation dialog ---------------------------------------------------- -->
+  <div id="admin-confirm" hidden class="fixed inset-0 z-20 flex items-center justify-center bg-surface-sunken/80 p-4 backdrop-blur-sm"
+    role="dialog" aria-modal="true" aria-labelledby="admin-confirm-title">
+    <div class="w-full max-w-lg rounded-xl border border-edge-strong bg-surface-raised p-6 shadow-2xl shadow-black/60">
+      <h2 id="admin-confirm-title" class="text-lg font-semibold tracking-tight"></h2>
+      <p id="admin-confirm-body" class="mt-3 text-sm text-ink-muted"></p>
+      <div class="mt-6 flex justify-end gap-3">
+        <button id="admin-confirm-cancel" type="button"
+          class="rounded-md border border-edge-strong px-4 py-2 text-sm font-medium hover:border-brand">Cancel</button>
+        <button id="admin-confirm-go" type="button"
+          class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Success notice --------------------------------------------------------- -->
+  <div id="admin-done" hidden class="mt-4 rounded-lg border border-ok-edge bg-ok-surface p-4 text-sm text-ok-ink" role="status" aria-live="polite"></div>
+</div>
+
+<script>
+  import { apiFetch } from '../../lib/api';
+  import { describeError } from '../../lib/errors';
+  import { formatIdr } from '../../lib/format';
+  import {
+    accountPath,
+    actionPath,
+    adminErrorMessage,
+    canResume,
+    canSuspend,
+    describeAction,
+    isAccountId,
+    type AccountStatus,
+    type AdminAccount,
+    type AdminActionResult,
+  } from '../../lib/admin';
+
+  let current: AdminAccount | null = null;
+
+  // --- The operator gate ------------------------------------------------------
+  // Read the operator flag from GET /api/me and reveal the console only for an
+  // operator. A 401 is handled by apiFetch (redirect to /login); the gate just
+  // stops rendering the console for everyone else, so no 403 is ever provoked
+  // by a person who was never an operator.
+  interface Me {
+    is_operator?: boolean;
+  }
+  const gate = document.getElementById('admin-gate') as HTMLElement;
+  const gateText = document.getElementById('admin-gate-text') as HTMLElement;
+  const islandRoot = document.getElementById('admin-island') as HTMLElement;
+
+  async function checkOperator(): Promise<void> {
+    try {
+      const me = await apiFetch<Me>('/api/me');
+      if (me.is_operator === true) {
+        gate.hidden = true;
+        islandRoot.hidden = false;
+      } else {
+        gateText.textContent = 'Operator access is required. This page is for operators only.';
+      }
+    } catch (err) {
+      gateText.textContent = describeError(err).message;
+    }
+  }
+
+  void checkOperator();
+
+  const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+
+  const form = $<HTMLFormElement>('admin-lookup');
+  const input = $<HTMLInputElement>('admin-account-id');
+  const errorBox = $('admin-error');
+  const result = $('admin-result');
+  const statusEl = $('admin-status');
+  const balanceEl = $('admin-balance');
+  const sessionsEl = $('admin-sessions');
+  const keysEl = $('admin-keys');
+  const createdEl = $('admin-created');
+  const operatorNote = $('admin-operator-note');
+  const hintEl = $('admin-action-hint');
+  const suspendBtn = $<HTMLButtonElement>('admin-suspend');
+  const resumeBtn = $<HTMLButtonElement>('admin-resume');
+  const terminalNote = $('admin-terminal-note');
+  const confirmBox = $('admin-confirm');
+  const confirmTitle = $('admin-confirm-title');
+  const confirmBody = $('admin-confirm-body');
+  const doneBox = $('admin-done');
+
+  // The banner is one element here, so it shows the message and the request id
+  // on one line — the same shape the keys modal uses for its single-element
+  // error surface (inlineNotice).
+  function showNotice(err: unknown, override?: string): void {
+    const view = describeError(err);
+    const message = override ?? view.message;
+    errorBox.textContent = view.requestId ? `${message} (${view.requestId})` : message;
+    errorBox.hidden = false;
+  }
+
+  function clearError(): void {
+    errorBox.hidden = true;
+    errorBox.textContent = '';
+  }
+
+  function statusClasses(status: AccountStatus): string {
+    switch (status) {
+      case 'active':
+        return 'border-ok-edge bg-ok-surface text-ok-ink';
+      case 'suspended':
+        return 'border-danger-edge bg-danger-surface text-danger-ink';
+      case 'closed':
+        return 'border-edge-strong bg-surface-sunken text-ink-muted';
+    }
+  }
+
+  function render(account: AdminAccount): void {
+    current = account;
+
+    statusEl.textContent = account.status;
+    statusEl.className = `rounded border px-2 py-0.5 text-xs font-medium ${statusClasses(account.status)}`;
+
+    balanceEl.textContent = formatIdr(account.balance_idr);
+    sessionsEl.textContent = String(account.live_sessions);
+    keysEl.textContent = String(account.live_keys);
+    createdEl.textContent = account.created_at;
+
+    operatorNote.hidden = !account.is_operator;
+
+    // The controls, gated by the state the server will accept. A button is
+    // shown only when the action can succeed; the reason it is absent is the
+    // hint, so "nothing happened" is never a mystery.
+    const maySuspend = canSuspend(account.status) && !account.is_operator;
+    const mayResume = canResume(account.status) && !account.is_operator;
+    suspendBtn.hidden = !maySuspend;
+    resumeBtn.hidden = !mayResume;
+
+    terminalNote.hidden = account.status !== 'closed';
+    hintEl.hidden = maySuspend || mayResume;
+    if (account.is_operator) {
+      hintEl.textContent = 'Operator accounts cannot be acted on through this surface.';
+      hintEl.hidden = false;
+    } else if (account.status === 'closed') {
+      hintEl.textContent = 'This account is closed and cannot be suspended or resumed.';
+      hintEl.hidden = false;
+    }
+
+    result.hidden = false;
+  }
+
+  async function lookup(id: string): Promise<void> {
+    clearError();
+    doneBox.hidden = true;
+    try {
+      const account = await apiFetch<AdminAccount>(accountPath(id));
+      render(account);
+    } catch (err) {
+      result.hidden = true;
+      current = null;
+      // adminErrorMessage upgrades the operator-specific cases (403 -> "operator
+      // access required"); anything else keeps the shared mapper's words.
+      const status = (err as { status?: number }).status ?? 0;
+      showNotice(err, adminErrorMessage(status, describeError(err).message));
+    }
+  }
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const id = input.value.trim();
+    if (!isAccountId(id)) {
+      errorBox.textContent = 'That is not a valid account id (expected a UUID).';
+      errorBox.hidden = false;
+      result.hidden = true;
+      return;
+    }
+    void lookup(id);
+  });
+
+  // --- The confirmation flow ------------------------------------------------
+  let pending: { action: 'suspend' | 'resume'; id: string } | null = null;
+
+  function askConfirm(action: 'suspend' | 'resume'): void {
+    if (!current) return;
+    pending = { action, id: current.account_id };
+    confirmTitle.textContent = action === 'suspend' ? 'Suspend this account?' : 'Resume this account?';
+    confirmBody.textContent = describeAction(action);
+    confirmBox.hidden = false;
+  }
+
+  suspendBtn.addEventListener('click', () => askConfirm('suspend'));
+  resumeBtn.addEventListener('click', () => askConfirm('resume'));
+
+  $('admin-confirm-cancel').addEventListener('click', () => {
+    pending = null;
+    confirmBox.hidden = true;
+  });
+
+  $('admin-confirm-go').addEventListener('click', () => {
+    if (!pending) return;
+    const { action, id } = pending;
+    pending = null;
+    confirmBox.hidden = true;
+    void apply(action, id);
+  });
+
+  async function apply(action: 'suspend' | 'resume', id: string): Promise<void> {
+    clearError();
+    doneBox.hidden = true;
+    try {
+      const outcome = await apiFetch<AdminActionResult>(actionPath(id, action), { method: 'POST' });
+      doneBox.textContent = action === 'suspend'
+        ? `Account suspended. Revoked ${outcome.sessions_revoked} session(s) and ${outcome.keys_revoked} key(s).`
+        : 'Account resumed. The customer must sign in again and create a new key.';
+      doneBox.hidden = false;
+      await lookup(id);
+    } catch (err) {
+      const status = (err as { status?: number }).status ?? 0;
+      showNotice(err, adminErrorMessage(status, describeError(err).message));
+    }
+  }
+</script>

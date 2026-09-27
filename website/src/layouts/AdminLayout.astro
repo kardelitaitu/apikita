@@ -1,0 +1,61 @@
+---
+import Base from './Base.astro';
+import Nav from '../components/Nav.astro';
+
+// The operator shell. A sibling of DashboardLayout, not a variant of it: the
+// admin surface has a different nav, a different (deliberately louder) framing,
+// and — importantly — it must NOT mount the live-balance SSE island. An
+// operator looking up an arbitrary account has no balance of their own to watch,
+// and the customer island's /events subscription would be a second, pointless
+// stream. One place owns the operator header and the error banner.
+interface Props {
+  title: string;
+}
+const { title } = Astro.props;
+---
+
+<Base title={`${title} — apikita admin`} description="apikita operator surface." chrome={false}>
+  <header class="sticky top-0 z-10 border-b border-warn-edge bg-surface-raised/95 backdrop-blur">
+    <div class="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3 px-6 py-3">
+      <Nav variant="admin" class="w-full sm:w-auto" />
+      <form method="post" class="flex items-center gap-3 text-sm text-ink-muted">
+        <button id="logout" type="button" class="hover:text-brand">Log out</button>
+      </form>
+    </div>
+  </header>
+
+  <div id="banner-error" hidden class="border-b border-danger-edge bg-danger-surface">
+    <div class="mx-auto flex max-w-5xl items-baseline justify-between gap-4 px-6 py-2 text-sm text-danger-ink">
+      <span id="banner-error-text"></span>
+      <span id="banner-error-id" class="font-mono text-xs text-danger"></span>
+    </div>
+  </div>
+
+  <main class="mx-auto max-w-5xl px-6 py-8">
+    <slot />
+  </main>
+</Base>
+
+<script>
+  import { apiFetch } from '../lib/api';
+  import { describeError, renderNotice } from '../lib/errors';
+  import { pb } from '../lib/pocketbase';
+
+  const banner = document.getElementById('banner-error') as HTMLElement;
+  const bannerText = document.getElementById('banner-error-text') as HTMLElement;
+  const bannerId = document.getElementById('banner-error-id') as HTMLElement;
+
+  // Log out: revoke the session row, then drop the local token — the same two
+  // steps DashboardLayout performs, so the operator leaves the same way.
+  document.getElementById('logout')?.addEventListener('click', () => {
+    void apiFetch<void>('/auth/logout', { method: 'POST', redirectOn401: false })
+      .catch((err) => {
+        renderNotice({ message: bannerText, correlation: bannerId }, describeError(err));
+        banner.hidden = false;
+      })
+      .finally(() => {
+        pb.authStore.clear();
+        window.location.assign('/login');
+      });
+  });
+</script>
