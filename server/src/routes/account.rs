@@ -561,12 +561,16 @@ pub async fn export_account_data(
 
     let mut keys_json = Vec::with_capacity(keys.len());
     for r in keys {
+        // models is stored as JSON text. Parse it to a real array so the export is
+        // machine-readable; a value that does not parse is passed through as text
+        // rather than dropped — losing a key's allowlist would misstate the account.
+        let models_raw: String = r.try_get("models")?;
+        let models_value: serde_json::Value = serde_json::from_str(&models_raw)
+            .unwrap_or(serde_json::Value::String(models_raw));
         keys_json.push(json!({
             "prefix": r.try_get::<String, _>("prefix")?,
             "label": r.try_get::<Option<String>, _>("label")?,
-            // models is stored as JSON text; pass it through as text rather than
-            // silently dropping an unparseable value.
-            "models": r.try_get::<String, _>("models")?,
+            "models": models_value,
             "spend_limit_idr": r.try_get::<i64, _>("spend_limit_idr")?,
             "token_limit": r.try_get::<i64, _>("token_limit")?,
             "rate_limit_rpm": r.try_get::<i64, _>("rate_limit_rpm")?,
@@ -3174,6 +3178,14 @@ mod tests {
         // The ledger carries the matching rows, so the export can reconcile.
         assert!(!body["ledger"].as_array().unwrap().is_empty(), "the ledger must be exported");
         assert_eq!(body["usage_events"].as_array().unwrap().len(), 1, "the request must be exported");
+
+        // A key's `models` is emitted as a real JSON array, not a string that
+        // contains JSON — the export must be machine-readable.
+        assert!(
+            body["api_keys"][0]["models"].is_array(),
+            "models must be an array, not a string: {}",
+            body["api_keys"][0]["models"]
+        );
 
         // No secret or internal identifier anywhere in the document, by name.
         let text = body.to_string();
