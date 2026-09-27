@@ -28,6 +28,12 @@ pub struct MeResponse {
     pub usage_today: UsageTodayDto,
     pub telegram_linked: bool,
     pub status: String,
+    /// Whether this account may use the operator surface. Sent so the browser
+    /// can decide whether to render the admin entry points at all, rather than
+    /// showing links that answer 403. It is a rendering hint, NOT the
+    /// authorization: every admin route re-checks `accounts.is_operator` server
+    /// side (admin.rs::require_operator), so a forged value here buys nothing.
+    pub is_operator: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,12 +133,13 @@ pub async fn get_me(
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
 
-    let account = sqlx::query("SELECT status FROM accounts WHERE id = ?")
+    let account = sqlx::query("SELECT status, is_operator FROM accounts WHERE id = ?")
         .bind(account_id.hyphenated())
         .fetch_one(&pool)
         .await?;
 
     let status: String = account.try_get("status")?;
+    let is_operator: bool = account.try_get("is_operator")?;
 
     let wallet = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = ?")
         .bind(account_id.hyphenated())
@@ -177,6 +184,7 @@ pub async fn get_me(
         },
         telegram_linked: tg_link.is_some(),
         status,
+        is_operator,
     }))
 }
 
@@ -1173,6 +1181,7 @@ mod tests {
             [
                 "account_id",
                 "balance_idr",
+                "is_operator",
                 "status",
                 "telegram_linked",
                 "usage_today"
@@ -1182,6 +1191,15 @@ mod tests {
         assert_eq!(body["account_id"], json!(account_id));
         assert_eq!(body["status"], json!("active"));
         assert_eq!(body["telegram_linked"], json!(false));
+        // The fixture accounts are ordinary customers, so the operator flag the
+        // admin UI gates on must read false. Cross-checked against the row.
+        let stored_operator: bool =
+            sqlx::query_scalar("SELECT is_operator FROM accounts WHERE id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("read the account row");
+        assert_eq!(body["is_operator"], json!(stored_operator));
 
         let usage = body["usage_today"]
             .as_object()
