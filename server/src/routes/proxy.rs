@@ -3056,6 +3056,117 @@ mod tests {
     /// close() is awaited rather than trusted to drop order, for the reason
     /// documented in test_support - dropping the pool only signals the close, so
     /// the removal would race it.
+    // -----------------------------------------------------------------------
+    // THE LOG-PRIVACY PROMISE, AS A TEST RATHER THAN A REVIEW.
+    // -----------------------------------------------------------------------
+    //
+    // docs/observability.md:227 used to ask a human to "confirm prompts/completions
+    // are never logged, in code review". A review that happened once cannot stop a
+    // debug! printing a body from being added next month, so the promise is pinned
+    // here instead. The doc is explicit that this is a PRODUCT promise, not hygiene
+    // (:57-59): logging prompts "turns you into a data processor in a way they did
+    // not agree to".
+    //
+    // The technique is the one webhooks.rs already uses for the OPPOSITE assertion
+    // (that an expected event name APPEARS): a tracing subscriber writing into an
+    // in-memory sink. Nobody had used it to assert that something NEVER appears,
+    // which is what a privacy promise needs.
+
+    /// An io::Write sink that captures the lines the process would emit.
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log sink lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Installs a capturing subscriber for the current thread. The guard must be held
+    /// while the code under test runs.
+    fn capture_logs() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_sink = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            // EVERYTHING, including DEBUG and TRACE: the promise is about what the
+            // server is CAPABLE of emitting at any level, and a test that filtered to
+            // info! would miss exactly the debug! a developer adds while investigating
+            // a bug. That is how this promise breaks in practice.
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || LogSink(writer_sink.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (guard, sink)
+    }
+
+    fn captured(sink: &std::sync::Mutex<Vec<u8>>) -> String {
+        String::from_utf8(sink.lock().expect("log sink lock").clone())
+            .expect("log lines are utf-8")
+    }
+
+    /// A sentinel prompt sent through the REAL handler must never reach the log.
+    ///
+    /// The sentinel is deliberately unmistakeable and cannot collide with a token
+    /// count, a uuid, a model name or a timestamp, so a contains match is decisive
+    /// rather than a heuristic.
+    #[tokio::test]
+    async fn a_customer_prompt_never_reaches_the_log() {
+        const SENTINEL: &str = "SENTINEL_PROMPT_9f3a_do_not_log_me";
+
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        let body = format!(
+            r#"{{"model":"flash","stream":true,"messages":[{{"role":"user","content":"{SENTINEL}"}}]}}"#
+        );
+
+        let assertions = tokio::spawn(async move {
+            let (_guard, sink) = capture_logs();
+
+            // Driven through the REAL handler. This request cannot reach a provider
+            // (no key is configured for the endpoint in this fixture), so it exercises
+            // the failure paths - which is where a body is most tempting to log while
+            // debugging. The prompt is in the request regardless of the outcome.
+            let _ = call_chat_completions(&state, &key, &body).await;
+            let logged = captured(&sink);
+
+            assert!(
+                !logged.contains(SENTINEL),
+                "docs/observability.md:46-59 - a customer prompt must NEVER be logged. It appeared in:\n{logged}"
+            );
+            // Nor may the raw request body appear, which would leak the prompt through
+            // a different door (the whole request rather than the field).
+            assert!(
+                !logged.contains("messages"),
+                "the request body must not be logged; the promise covers the prompt INSIDE it. Logged:\n{logged}"
+            );
+
+            // POSITIVE CONTROL. Without this the test passes on a server that logs
+            // NOTHING - including one accidentally silenced, which is a different bug
+            // that would also hide an incident. Something about THIS request must be
+            // logged, or the assertion above proves nothing.
+            assert!(
+                logged.contains("model") || logged.contains("account_id"),
+                "the request must still be OBSERVABLE (model, account, or a token count), or the privacy assertion is vacuous:\n{logged}"
+            );
+        });
+        with_fixture(db, async move {
+            assertions.await.expect("the privacy assertions panicked");
+        })
+        .await;
+    }
     async fn with_fixture<F>(db: TestDb, assertions: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
