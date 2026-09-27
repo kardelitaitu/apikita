@@ -203,6 +203,7 @@ pub fn create_router(state: AppState) -> Router {
         // Live updates (SSE)
         .route("/events", get(events::sse_events_handler))
         // Admin (cookie + operator flag)
+        .route("/api/admin/accounts", get(admin::list_accounts))
         .route("/api/admin/accounts/{id}", get(admin::get_account))
         .route(
             "/api/admin/accounts/{id}/suspend",

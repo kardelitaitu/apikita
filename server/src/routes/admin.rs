@@ -27,13 +27,13 @@
 //! money actions are deliberately absent.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
@@ -262,6 +262,153 @@ pub async fn get_account(
         live_sessions: row.try_get("live_sessions")?,
         live_keys: row.try_get("live_keys")?,
     })
+    .into_response())
+}
+
+/// Query parameters for `GET /api/admin/accounts`.
+///
+/// Deliberately raw strings rather than a typed int: a malformed value must
+/// produce a JSON 422 naming the field, not axum's plain-text extractor
+/// rejection (docs/error-model.md requires every response to be JSON), which is
+/// the same reasoning `account.rs`'s UsageQuery documents.
+#[derive(Debug, Deserialize)]
+pub struct AdminListQuery {
+    /// Free-text filter, matched case-insensitively against the account id and
+    /// the PocketBase id. Nothing else is searchable: email lives in PocketBase,
+    /// not here, and the admin surface must not become a second identity store.
+    pub q: Option<String>,
+    /// Optional status filter. A value outside the schema's vocabulary simply
+    /// matches nothing rather than erroring: a filter with no rows is a normal
+    /// outcome, not a bad request.
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// The listing row. Carries the same counts as the single-account view and
+/// NOTHING that could read a credential - no token, no key hash, no email
+/// (docs/admin-surface.md:158-166).
+#[derive(Debug, Serialize)]
+pub struct AdminAccountSummary {
+    pub account_id: Uuid,
+    pub status: String,
+    pub is_operator: bool,
+    pub created_at: DateTime<Utc>,
+    pub balance_idr: i64,
+    pub live_sessions: i64,
+    pub live_keys: i64,
+}
+
+/// `GET /api/admin/accounts` - a bounded, filterable account listing.
+///
+/// Why this exists: the single-account route requires the caller to already know
+/// a UUID, so an operator had no way to FIND an account. That made the console
+/// usable only for accounts whose id had been captured elsewhere, which is not
+/// what "administer accounts" means. This is the index that lookup-by-id assumes.
+///
+/// Safety, in the same order as every sibling handler:
+///
+/// 1. `require_operator` runs FIRST, before any row is read, so a non-operator
+///    gets a 403 that reveals nothing about whether any account exists.
+/// 2. `refuse_self_action` deliberately does NOT apply. Reading a LIST is not
+///    acting on one account, and the operator's own row is legitimately one row
+///    among many - excluding it would make the total count out by one and hide
+///    the operator from their own inventory. The self-action rule protects
+///    against ACTING on oneself; there is no action here.
+/// 3. Only then does the query run, bounded by `limit` so a large table cannot
+///    be pulled in one request.
+pub async fn list_accounts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminListQuery>,
+) -> Result<Response, AdminError> {
+    // Step 1: authorize before touching the account space, like every sibling.
+    require_operator(&state, &headers).await?;
+
+    let limit = query.limit.unwrap_or(25).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0).max(0);
+
+    // An absent or empty filter is "no filter". A non-empty one becomes a LIKE
+    // pattern; '%' and '_' are escaped with an explicit ESCAPE clause so a
+    // literal percent sign in the input does not silently become a wildcard.
+    let needle = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let pattern = needle.map(|s| {
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("%{escaped}%")
+    });
+    let status = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // Every placeholder is positional and bound in order. The two NULL tests let
+    // one statement serve the filtered and unfiltered cases, so there is no
+    // second query to drift from this one.
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            a.id,
+            a.status,
+            a.is_operator,
+            a.created_at,
+            COALESCE(w.balance_idr, 0) AS balance_idr,
+            (SELECT COUNT(*) FROM sessions s
+              WHERE s.account_id = a.id AND s.revoked_at IS NULL AND s.expires_at > ?)
+                AS live_sessions,
+            (SELECT COUNT(*) FROM api_keys k
+              WHERE k.account_id = a.id AND k.revoked_at IS NULL)
+                AS live_keys
+        FROM accounts a
+        LEFT JOIN wallets w ON w.account_id = a.id
+        WHERE (? IS NULL OR a.id LIKE ? ESCAPE '\' OR a.pb_user_id LIKE ? ESCAPE '\')
+          AND (? IS NULL OR a.status = ?)
+        ORDER BY a.created_at DESC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    // The session-expiry bound is BOUND FROM RUST, never SQLite's now(): its
+    // space-separated output sorts before the RFC3339 values every timestamp
+    // column holds, so a SQL now() here would count expired sessions as live.
+    .bind(Utc::now())
+    .bind(pattern.as_deref())
+    .bind(pattern.as_deref())
+    .bind(pattern.as_deref())
+    .bind(status)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut accounts: Vec<AdminAccountSummary> = Vec::with_capacity(rows.len());
+    for row in rows {
+        // id is TEXT in the schema; decode it the way the rest of the crate does.
+        let id_raw: String = row.try_get("id")?;
+        let account_id = Uuid::parse_str(&id_raw).map_err(|e| {
+            AdminError::App(AppError::Internal(format!(
+                "accounts.id is not a uuid: {e}"
+            )))
+        })?;
+        accounts.push(AdminAccountSummary {
+            account_id,
+            status: row.try_get("status")?,
+            is_operator: row.try_get("is_operator")?,
+            created_at: row.try_get("created_at")?,
+            balance_idr: row.try_get("balance_idr")?,
+            live_sessions: row.try_get("live_sessions")?,
+            live_keys: row.try_get("live_keys")?,
+        });
+    }
+
+    Ok(Json(json!({
+        "accounts": accounts,
+        "limit": limit,
+        "offset": offset,
+    }))
     .into_response())
 }
 
@@ -1735,4 +1882,318 @@ mod tests {
     // DELETED with the test that needed them: the loopback stub above replaces the
     // approach, and a fixture that creates REAL PocketBase records would now imply
     // this suite still needs an external service.
+
+    // -----------------------------------------------------------------------
+    // GET /api/admin/accounts - the listing.
+    //
+    // Why these matter: the listing is the ONE admin route that returns many
+    // accounts at once, so it is the only place a bad WHERE clause could leak the
+    // whole account space to a non-operator, and the only place a filter bug
+    // could return a page that looks complete but is not. Each test attacks one
+    // of those two.
+    // -----------------------------------------------------------------------
+
+    /// A non-operator must not be able to list. The 403 is the same answer an
+    /// unknown id gets, so the listing cannot be used to probe the account space.
+    #[tokio::test]
+    async fn listing_requires_an_operator() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let outsider = create_account(&pool).await;
+
+        // No cookie at all -> 401, before anything is read.
+        let (status, _) = render(list_accounts(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AdminListQuery { q: None, status: None, limit: None, offset: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A real, live session on a NON-operator account -> 403.
+        let outsider_headers = cookie_headers(&issue_session(&pool, outsider).await);
+        let (status, body) = render(list_accounts(
+            State(state.clone()),
+            outsider_headers,
+            Query(AdminListQuery { q: None, status: None, limit: None, offset: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+        assert_eq!(body["error"]["code"], json!("forbidden"));
+
+        // And the operator's own listing works, proving the same call succeeds
+        // for the right caller - the 403 above is authorization, not a broken route.
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let (status, _) = render(list_accounts(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminListQuery { q: None, status: None, limit: None, offset: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_no_drift(&pool, &[operator, outsider]).await;
+        db.close().await;
+    }
+
+    /// The listing carries the same safe fields as the single view and NOTHING
+    /// that could read a credential.
+    #[tokio::test]
+    async fn listing_rows_never_expose_a_credential() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let customer = create_account(&pool).await;
+        open_wallet(&pool, customer, 7_000).await;
+
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let (status, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminListQuery { q: Some(customer.hyphenated().to_string()), status: None, limit: None, offset: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let accounts = body["accounts"].as_array().expect("accounts is an array");
+        assert_eq!(accounts.len(), 1, "the id filter must select exactly one row");
+        let row = &accounts[0];
+
+        // The exact field set. A new field here would have to be justified
+        // against docs/admin-surface.md:158-166.
+        let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "account_id",
+                "balance_idr",
+                "created_at",
+                "is_operator",
+                "live_keys",
+                "live_sessions",
+                "status",
+            ],
+        );
+        assert_eq!(row["account_id"], json!(customer));
+        assert_eq!(row["balance_idr"], json!(7_000));
+
+        // Belt and braces: the rendered body contains none of the secret column
+        // names, so a future SELECT * could not sneak one through unnoticed.
+        let text = body.to_string();
+        for forbidden in ["token_hash", "key_hash", "pb_user_id", "snap_token"] {
+            assert!(!text.contains(forbidden), "the listing leaked {forbidden}: {text}");
+        }
+
+        assert_no_drift(&pool, &[operator, customer]).await;
+        db.close().await;
+    }
+
+    /// The filter narrows to matching accounts and excludes the rest, and the
+    /// status filter composes with it.
+    #[tokio::test]
+    async fn listing_filters_by_text_and_status() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        // Two customers; one will be suspended, so the status filter has a
+        // difference to find. A filter that returned everything would still
+        // satisfy a count of "at least one", which is why the count is exact.
+        let active = create_account(&pool).await;
+        let suspended = create_account(&pool).await;
+
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        // Suspend one through the real handler so its status is genuine.
+        let (status, _) = render(suspend_account(
+            State(state.clone()),
+            Path(suspended),
+            operator_headers.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // No filter: every account, including the operator, appears.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery { q: None, status: None, limit: Some(100), offset: None }),
+        ))
+        .await;
+        let all = body["accounts"].as_array().unwrap();
+        assert_eq!(all.len(), 3, "operator + two customers: {body}");
+
+        // status=suspended selects exactly the suspended one.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery { q: None, status: Some("suspended".into()), limit: None, offset: None }),
+        ))
+        .await;
+        let only = body["accounts"].as_array().unwrap();
+        assert_eq!(only.len(), 1, "only one account is suspended: {body}");
+        assert_eq!(only[0]["account_id"], json!(suspended));
+
+        // A text filter on the active account's id selects just it - proving the
+        // LIKE clause narrows rather than matching all.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery { q: Some(active.hyphenated().to_string()), status: None, limit: None, offset: None }),
+        ))
+        .await;
+        let matched = body["accounts"].as_array().unwrap();
+        assert_eq!(matched.len(), 1, "the id filter selects one account: {body}");
+        assert_eq!(matched[0]["account_id"], json!(active));
+
+        // A status value outside the vocabulary matches nothing, and is not an
+        // error: an empty page is a valid answer.
+        let (status, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery { q: None, status: Some("nonsense".into()), limit: None, offset: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 0);
+
+        assert_no_drift(&pool, &[operator, active, suspended]).await;
+        db.close().await;
+    }
+
+    /// A literal '%' in the search box must not become a wildcard. Without the
+    /// ESCAPE clause it would match every account, turning a narrow search into a
+    /// full dump.
+    #[tokio::test]
+    async fn listing_treats_a_percent_sign_literally() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let customer = create_account(&pool).await;
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminListQuery { q: Some("%".into()), status: None, limit: None, offset: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["accounts"].as_array().unwrap().len(),
+            0,
+            "a literal '%' must match nothing here, not every account: {body}"
+        );
+
+        assert_no_drift(&pool, &[operator, customer]).await;
+        db.close().await;
+    }
+
+    /// The page size is bounded and echoed, so a caller can page deterministically.
+    #[tokio::test]
+    async fn listing_bounds_and_echoes_the_page() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        for _ in 0..3 {
+            create_account(&pool).await;
+        }
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        // limit=0 is raised to the minimum (1), never left at 0 (which SQLite
+        // reads as "no limit").
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery { q: None, status: None, limit: Some(0), offset: None }),
+        ))
+        .await;
+        assert_eq!(body["limit"], json!(1), "limit is clamped up: {body}");
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 1);
+
+        // A request for more than the cap is clamped to the cap.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery { q: None, status: None, limit: Some(10_000), offset: None }),
+        ))
+        .await;
+        assert_eq!(body["limit"], json!(100), "limit is clamped down: {body}");
+
+        // offset is echoed and skips rows.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery { q: None, status: None, limit: Some(100), offset: Some(1) }),
+        ))
+        .await;
+        assert_eq!(body["offset"], json!(1));
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 3);
+
+        // A negative offset is treated as zero, not passed to SQLite as-is.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminListQuery { q: None, status: None, limit: Some(100), offset: Some(-5) }),
+        ))
+        .await;
+        assert_eq!(body["offset"], json!(0));
+
+        assert_no_drift(&pool, &[operator]).await;
+        db.close().await;
+    }
+
+    /// The router mounts the listing at `GET /api/admin/accounts`, and it is
+    /// reached through the production stack - not only by calling the handler.
+    #[tokio::test]
+    async fn listing_route_is_mounted_and_requires_a_cookie() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        create_account(&pool).await;
+        let app = app(state.clone());
+
+        // No cookie -> 401 through the router.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/admin/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // With the operator cookie -> 200 and a JSON body with the documented keys.
+        let token = issue_session(&pool, operator).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/admin/accounts?limit=5")
+                    .header(header::COOKIE, format!("session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_body(res).await;
+        assert!(body["accounts"].is_array(), "body: {body}");
+        assert_eq!(body["limit"], json!(5));
+
+        assert_no_drift(&pool, &[operator]).await;
+        db.close().await;
+    }
 }
