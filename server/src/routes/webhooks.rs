@@ -266,7 +266,22 @@ pub async fn handle_midtrans_webhook(
         // never assumed to be in progress. The refusal is enumerated explicitly in
         // `money::REFUND_STATUSES`.
         PaymentAction::RefundRefused => {
+            // The event field is the machine-readable marker an operator's probe greps
+            // for, exactly as the two rejections above set topup.rejected
+            // (webhooks.rs:133, :208). Without it this refusal is INVISIBLE to alerting,
+            // which is the gap docs/launch-checklist.md:68 names.
+            //
+            // A DISTINCT name, deliberately, not topup.rejected. They look similar and
+            // mean opposite things: a rejection is a payment that failed to land and may
+            // owe someone money, while a refusal is a refund DECLINED BY POLICY, which is
+            // the system working. Sharing the name would page on routine enforcement and
+            // would let a refusal spike hide inside a rejection count.
+            //
+            // Alerting matters even though the behaviour is correct, because a refusal is
+            // the ONE webhook outcome where nothing moves - and a status-mapping
+            // regression routing real events into this arm would look identical.
             error!(
+                event = "refund.refused",
                 order_id = %payload.order_id,
                 midtrans_status = %payload.transaction_status,
                 "Refund refused: this platform does not do refunds; no money moved"
@@ -1516,6 +1531,83 @@ mod tests {
         }
 
         assert_reconciled(&db.pool, account_id, "after the rejection logging").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // THE REFUND-REFUSAL EVENT. docs/launch-checklist.md:68 names this as the one
+    // outstanding code-shaped item in Gate 2: "unalerted, a refusal is
+    // indistinguishable from a bug".
+    //
+    // WHY IT NEEDS ITS OWN EVENT RATHER THAN REUSING `topup.rejected`: they look
+    // similar and mean opposite things. A `topup.rejected` is a payment that FAILED to
+    // land - someone may be owed money and the registry says "investigate
+    // immediately". A refund refusal is a refund REQUESTED AND DECLINED BY POLICY, which
+    // is the system working. Folding them together would page on routine policy
+    // enforcement, and - worse - would let a refund-refusal spike hide inside a
+    // rejection count.
+    //
+    // WHY IT NEEDS ALERTING AT ALL, since the behaviour is correct: a refusal is the
+    // ONE webhook outcome where NOTHING MOVES - the topup stays `settled`, no ledger
+    // row is appended, the balance is untouched. That is also exactly what a
+    // status-mapping regression routing real events into this arm would look like. Both
+    // cases are "no visible change", so without a distinct log marker they are
+    // indistinguishable to an operator.
+    // -----------------------------------------------------------------------
+
+    /// The refusal carries a stable, greppable event name - the thing `probe.sh`
+    /// greps for. RED FIRST: the log line has a MESSAGE and two fields but no `event`,
+    /// so the one alert path that could see it cannot.
+    #[tokio::test]
+    async fn a_refund_refusal_is_logged_under_its_own_documented_event() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let order_id = pending_topup(&db.pool, account_id, 50_000).await;
+        let refund = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "refund",
+            LIVE_TEST_SERVER_KEY,
+        );
+
+        let (status, body) = {
+            let (_guard, sink) = capture_logs();
+            let (status, body) = post(&state, refund).await;
+            let logged = captured_lines(&sink);
+
+            // The event name an operator's probe keys on. Without it the refusal is
+            // invisible to alerting, which is the whole finding.
+            assert!(
+                logged.contains("refund.refused"),
+                "a refund refusal must carry the documented event `refund.refused`, or the probe cannot see it and an unalerted refusal stays indistinguishable from a bug (docs/launch-checklist.md:68). Logged:\n{logged}"
+            );
+            // The order id must travel with it, or an operator who sees the page cannot
+            // find which top-up to look at.
+            assert!(
+                logged.contains(&order_id),
+                "the refusal must name the order so it can be investigated. Logged:\n{logged}"
+            );
+            // POSITIVE CONTROL: a refusal must NOT also raise the REJECTION event, or
+            // the two would be conflated and a policy decision would page as a failed
+            // payment.
+            assert!(
+                !logged.contains("topup.rejected"),
+                "a refund refusal is a POLICY decision, not a failed payment: raising topup.rejected would page on routine enforcement. Logged:\n{logged}"
+            );
+            (status, body)
+        };
+
+        // The behaviour is unchanged and still correct: 200 with the explicit refusal
+        // body, and NO money moved.
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["status"], json!("refund_not_supported"));
+        assert_reconciled(&db.pool, account_id, "after the refusal logging").await;
+
         db.close().await;
     }
 }
