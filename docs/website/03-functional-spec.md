@@ -103,7 +103,7 @@ Live-updating by default (see [01-architecture.md](01-architecture.md)).
 | Balance | `wallets.balance_idr` | Realtime; polling fallback |
 | Today's usage | `usage_daily` | Realtime |
 | Token breakdown | input / cache-read / output | Same |
-| Recent requests | last N metered calls | Poll or realtime |
+| Recent requests | last N metered calls (`GET /api/usage/recent`, source `usage_events`) | On load |
 | Status | upstream health | Poll |
 
 ### Required states

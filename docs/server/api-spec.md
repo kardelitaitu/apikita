@@ -12,7 +12,7 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 | Group | Endpoints | Auth |
 | --- | --- | --- |
 | Auth | `POST /auth/exchange`, `POST /auth/logout`, `POST /auth/logout-all` | cookie / none |
-| Account | `GET /api/me`, `GET /api/usage`, `GET /api/topups` | cookie |
+| Account | `GET /api/me`, `GET /api/usage`, `GET /api/usage/recent`, `GET /api/topups` | cookie |
 | Keys | `GET/POST /api/keys`, `PATCH /api/keys/:id`, `POST /api/keys/:id/revoke` | cookie |
 | Wallet | `POST /api/topups` | cookie |
 | Telegram | `POST /api/telegram/link-code`, `DELETE /api/telegram` | cookie |
@@ -113,6 +113,20 @@ window. **Both ends are inclusive**, so `from == to` returns exactly that one da
 Only when neither parameter is present is the window the last 30 buckets; a bounded
 range that matches nothing returns `[]`, never that default. **No maximum span is
 enforced.**
+
+### `GET /api/usage/recent?limit=`
+
+The last N **metered requests** for the account, newest first — the detail behind
+the dashboard's "Recent requests" panel. Source is **`usage_events`**, one row per
+billed request, written by the settlement transaction. `usage_daily` cannot serve
+this: it is an aggregate with no model and no per-request rows.
+
+`limit` defaults to 20 and is clamped to 1–100. Each row is
+`{id, api_key_id, model, input_tokens, cache_read_tokens, output_tokens, cost_idr, created_at}`.
+The three token classes are returned **separately**, never as one total, because
+each is priced differently. `api_key_id` is null when the key was deleted after
+the request (`ON DELETE SET NULL`). **Only this account's rows are ever returned**;
+nothing exposes a prompt, a completion or a key's plaintext.
 
 ### `GET /api/topups?limit=`
 
