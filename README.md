@@ -1,120 +1,149 @@
 # apikita
 
-A high-throughput LLM arbitrage proxy gateway.
+**A multi-provider LLM gateway that runs the whole business on one small box.**
 
-Wholesale LLM API capacity is fragmented and cheap; retail access to it is
-neither. This project sits in between: a reverse-proxy gateway that unifies
-volatile multi-endpoint upstream suppliers behind one reliable, prepaid API
-surface, priced at a fixed margin over wholesale cost.
+Wholesale LLM capacity is cheap, fragmented, and unreliable. Getting it at retail,
+as one dependable API, from Indonesia is not. apikita sits in the middle: a
+reverse-proxy gateway in **Rust** that unifies **multiple upstream providers** behind
+one reliable, prepaid API surface — and does it on a footprint so small the entire
+infrastructure bill is a rounding error against the token spend.
 
-## Documentation
+This README is for the people deciding whether the idea is interesting. The
+engineering detail lives in [`docs/`](docs/).
 
-### Start here
+---
 
-| Document | Covers |
-| --- | --- |
-| [`docs/decisions.md`](docs/decisions.md) | **Settled decisions — the register.** Check here first |
-| [`docs/plan-audit.md`](docs/plan-audit.md) | **Plan review — what holds, what doesn't** |
-| [`docs/cache-pricing-options.md`](docs/cache-pricing-options.md) | **The open commercial decision — cache-heavy pricing** |
-| [`docs/launch-checklist.md`](docs/launch-checklist.md) | **Launch tasks, gated.** What must be true before taking money |
-| [`docs/architecture.md`](docs/architecture.md) | The system end to end — the authoritative stack |
-| [`docs/wind-down.md`](docs/wind-down.md) | Closing the service: the balance payout runbook |
-| [`docs/topology.md`](docs/topology.md) | The triangle: Cloudflare, relay, Northflank, failover |
-| [`docs/server/api-spec.md`](docs/server/api-spec.md) | Every endpoint, auth scheme, enforcement order |
-| [`server/migrations/20260925000000_initial_schema.sql`](server/migrations/20260925000000_initial_schema.sql) | The SQLite schema — source of truth |
-| [`docs/business/README.md`](docs/business/README.md) | Does the business work — pricing, model, risks |
+## Why it is worth a look
 
-### Building it
+### Multi-provider by design — one API in front of many suppliers
 
-| Document | Covers |
-| --- | --- |
-| [`docs/local-development.md`](docs/local-development.md) | Running the stack locally, fakes, testing money |
-| [`docs/deployment.md`](docs/deployment.md) | Deploy pipeline, migrations, rollback |
-| [`docs/ci-cd.md`](docs/ci-cd.md) | CI stages, the money tests, migration gate |
-| [`docs/error-model.md`](docs/error-model.md) | Error codes and responses |
-| [`docs/realtime.md`](docs/realtime.md) | SSE contract for live balance/usage |
-| [`docs/website/README.md`](docs/website/README.md) | Website pages, flows, states |
-| [`docs/website/06-api-keys-and-limits.md`](docs/website/06-api-keys-and-limits.md) | API keys, model access, limits |
+The gateway is built to sit in front of **many upstream providers at once**, not to
+resell one of them. Every upstream is modelled as a `(url + model)` endpoint with its
+own key pool, price record, and health, so adding a provider is configuration — not a
+rewrite:
 
-### Running it
+- **Provider-agnostic routing** — the router sees endpoints, not vendors. A second,
+  third, or fourth supplier slots in beside the first.
+- **Per-provider health and failover** — when one supplier degrades, traffic shifts to
+  a healthy one; a bad provider stops taking requests without taking the service down.
+- **Per-provider price records** — each supplier's rates live in their own file; the
+  billing config is compiled from them, so cost basis tracks reality
+  ([`config/`](config/README.md)).
 
-| Document | Covers |
-| --- | --- |
-| [`docs/observability.md`](docs/observability.md) | Logging, metrics, alerts, reconciliation |
-| [`docs/backup-and-restore.md`](docs/backup-and-restore.md) | Backup strategy and the restore drill |
-| [`docs/failover.md`](docs/failover.md) | Circuit breaking, key pools, mid-stream failure |
-| [`docs/abuse-runbook.md`](docs/abuse-runbook.md) | What to do when someone abuses the platform |
-| [`docs/admin-surface.md`](docs/admin-surface.md) | Operator capabilities, audit trail, money actions |
-| [`docs/ip-tracking.md`](docs/ip-tracking.md) | Abuse signals without storing IPs |
-| [`docs/edge-relay.md`](docs/edge-relay.md) | The relay itself: TLS, SSE passthrough, hardening |
-| [`docs/cost-and-sizing.md`](docs/cost-and-sizing.md) | What it costs; where the money actually goes |
+The failover slots are provisioned for suppliers 2, 3 and 4 today; they activate as
+each is verified. [`docs/failover.md`](docs/failover.md).
 
-### Policy and legal
+### Reliable when upstream is not
 
-| Document | Covers |
-| --- | --- |
-| [`docs/terms-of-service.md`](docs/terms-of-service.md) | ToS draft — disclosure, refunds, acceptable use |
-| [`docs/data-retention.md`](docs/data-retention.md) | What is stored, for how long, what is never stored |
-| [`docs/architecture/identity.md`](docs/architecture/identity.md) | Accounts, linking, sessions |
-| [`docs/website/04-payments.md`](docs/website/04-payments.md) | Midtrans QRIS end to end |
+Wholesale routes are unstable — timeouts, throttling, and mid-stream drops are
+normal. The gateway is built around that, at two levels:
 
-### Surfaces
+- **Across providers** — an unhealthy supplier is taken out of rotation and traffic
+  fails over to a healthy one.
+- **Within a provider** — key-pool rotation; a throttled (HTTP 429) key gets a
+  per-key cooldown and the pool routes around it, instead of failing the request.
+- **Circuit breaking per endpoint** — 3 consecutive failures open the endpoint, a
+  half-open probe recovers it, and the cooldown backs off exponentially.
 
-| Document | Covers |
-| --- | --- |
-| [`docs/telegram/README.md`](docs/telegram/README.md) | Channel rooms, top-up feed, review bot |
-| [`docs/website/03-functional-spec.md`](docs/website/03-functional-spec.md) | Login, logout, reset, dashboard states |
-| [`docs/whitepaper.md`](docs/whitepaper.md) | The **original** design — partly superseded |
-The whitepaper is the **original** design. Parts have since been corrected —
-notably its pricing figures were ~2.5x too low, and the stack changed. Where
-these disagree, `docs/architecture.md` and the business docs win.
+Current honest caveat: **the failover path is architected and wired but not yet
+activated** — one supplier is verified and live, so there is nothing to fail over
+*to* in production yet. The in-provider resilience above works now.
+[`docs/failover.md`](docs/failover.md).
 
-## Stack
+### Fast by construction, not by hardware
 
-| Component | Where | Language |
-| --- | --- | --- |
-| Frontend | Cloudflare Pages | **Astro** + islands |
-| Edge relay | Linux VPS (2 vCPU / 4 GB) | nginx + Docker |
-| API + proxy | Northflank | Rust |
-| Money | Northflank | SQLite (embedded — no separate service) |
-| Identity | Northflank | PocketBase, until Phase 6 replaces it in Rust |
+The proxy is **I/O-bound, not CPU-bound**. A request spends its life waiting on an
+upstream socket, not computing, so a single small instance handles far more traffic
+than the business will realistically throw at it. Concurrency is cheap (Tokio green
+threads); responses are **streamed, never buffered**, so **memory does not grow with
+response size** the way it does in a buffering proxy.
 
-Push to `main` deploys. Reasoning and consequences:
-[`docs/architecture.md`](docs/architecture.md).
+See [`docs/benchmark.md`](docs/benchmark.md) and
+[`docs/cost-and-sizing.md`](docs/cost-and-sizing.md).
 
-## Layout
+### Cheap to run on purpose
 
-| Folder | Function |
-| --- | --- |
-| [`server/`](server/README.md) | Rust API + proxy: auth exchange, wallet, keys, limits, webhook, SSE |
-| [`website/`](website/README.md) | Signup, API keys, wallet top-up, usage dashboards |
-| [`telegram/`](telegram/README.md) | Telegram channel (4 rooms) + bot |
-| [`config/`](config/README.md) | Routing and pricing config; provider price records |
-| [`docs/`](docs/) | Architecture, business plan, website design, whitepaper |
-| [`.agents/skills/`](.agents/skills/) | Agent skill definitions |
+The cost shape is a design decision, not an accident:
+
+- **Embedded SQLite** — the money ledger is a *file inside the API process*. No
+  database server, no network hop, no extra line item.
+- **Cloudflare Pages** for the frontend — free at this scale.
+- **A cheap edge relay** absorbs TLS, connection churn and floods so the **billed
+  backend instance stays at its smallest size**.
+- **One instance, not a fleet** — no load balancer, no orchestration.
+
+The baseline is **1 vCPU / 1 GB**, deliberately chosen to start smaller than you
+think. [`docs/cost-and-sizing.md`](docs/cost-and-sizing.md).
+
+### Money correctness as a structural property
+
+The wallet is an **append-only ledger**; the balance is derivable
+(`wallet = SUM(delta_idr)`) and a negative balance is refused by the database
+itself via `CHECK (balance_idr >= 0)`. Reconciliation is a gate, not a hope: the
+check must return **zero rows** on production data before launch.
+See [`docs/decisions.md`](docs/decisions.md) and
+[`docs/launch-checklist.md`](docs/launch-checklist.md).
+
+### Privacy is architecture, not policy
+
+**Prompt and completion content is never logged.** The data model is designed so
+there is nowhere for it to land. [`docs/data-retention.md`](docs/data-retention.md).
+
+## The economics in one line
+
+Buy wholesale across providers, resell at a fixed multiplier over *actual* upstream
+cost — **`GM% = M − 1`, uniform at any workload mix**. Buying from several
+suppliers is what makes the cost basis durable and the moat real.
+[`docs/business/00-overview.md`](docs/business/00-overview.md).
 
 ## Status
 
-**Built locally; nothing deployed.** The server and the website both exist and
-pass their test suites — but no environment is live and no customer has been served.
+**Built locally; nothing deployed.** The server and website exist and pass their
+suites (server: **338 tests** — website: **80 tests**), but no environment is live
+and no customer has been served. The operational gates in
+[`docs/launch-checklist.md`](docs/launch-checklist.md) — Gate 0 (legal) first —
+must clear before taking money.
 
-Settled (41 documents): the stack and topology, the identity model, the SQLite
-schema (validated with a SQL parser), the full HTTP API, payments, API keys and
-limits, realtime, failover, the relay, deployment, cost, observability, backup,
-abuse handling, data retention, and the Terms of Service outline.
+## How it is put together
 
-What exists today:
+| Layer | Runs on | Built with |
+| --- | --- | --- |
+| Customer site | Cloudflare Pages | **Astro** + islands |
+| Edge relay | Cheap Linux VPS | nginx + Docker |
+| API + proxy | Northflank | **Rust** |
+| Upstreams | Multiple providers | Provider-agnostic endpoint routing |
+| Money | *inside the API process* | **SQLite** (embedded — no separate service) |
+| Identity | Northflank | PocketBase, until Phase 6 folds it into Rust |
 
-| Surface | State |
+Push to `main` deploys. The reasoning and the tradeoffs:
+[`docs/architecture.md`](docs/architecture.md).
+
+## Repository layout
+
+| Folder | Function |
 | --- | --- |
-| [`server/`](server/README.md) | Rust API + proxy. `cargo test --lib` → **338 passed / 0 failed / 0 ignored** (measured 2026-09-27), against a temp SQLite file — no server to start. No test is `#[ignore]`d any more; identity is a loopback-stubbed exchange. |
-| [`website/`](website/README.md) | Astro site. `npm run build` → 17 pages; `npm test` → 80 passed (measured 2026-09-26). |
-| [`tools/`](tools/) | `reconcile`, `alert`, `fake-upstream`, `fake-midtrans`, and the SQLite probes — each with a documented exit-code contract. `backup`, `drill`, `alert` and the maintenance jobs all drive the `sqlite3` CLI against the embedded database. |
-| [`telegram/`](telegram/README.md) | Design only — no code yet. |
+| [`server/`](server/README.md) | The Rust API + proxy: auth exchange, wallet, keys, limits, webhook, SSE |
+| [`website/`](website/README.md) | Signup, API keys, wallet top-up, usage dashboards |
+| [`telegram/`](telegram/README.md) | Telegram channel (4 rooms) + bot — design only |
+| [`config/`](config/README.md) | Routing and pricing config; per-provider price records |
+| [`docs/`](docs/) | Architecture, business plan, website design, whitepaper |
 
-Not yet: a deployment, a live Midtrans round-trip, and the operational gates in
-[`docs/launch-checklist.md`](docs/launch-checklist.md) — Gate 0 (legal) blocks the
-rest.
+## Start with the docs
+
+| Document | Covers |
+| --- | --- |
+| [`docs/business/README.md`](docs/business/README.md) | **Does the business work** — pricing, model, risks |
+| [`docs/architecture.md`](docs/architecture.md) | The system end to end — the authoritative stack |
+| [`docs/decisions.md`](docs/decisions.md) | **The settled-decisions register.** Check here first |
+| [`docs/launch-checklist.md`](docs/launch-checklist.md) | **What must be true before taking money** |
+| [`docs/cost-and-sizing.md`](docs/cost-and-sizing.md) | What it costs; where the money actually goes |
+| [`docs/failover.md`](docs/failover.md) | Multi-provider failover, circuit breaking, key pools |
+| [`docs/server/api-spec.md`](docs/server/api-spec.md) | Every endpoint, auth scheme, enforcement order |
+| [`docs/whitepaper.md`](docs/whitepaper.md) | The **original** design — partly superseded |
+
+The whitepaper is the original design; parts have since been corrected (notably its
+pricing figures were ~2.5x too low, and the stack changed). Where it disagrees with
+[`docs/architecture.md`](docs/architecture.md) and the business docs, they win.
 
 ## Secrets
 
