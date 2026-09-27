@@ -519,6 +519,24 @@ mod tests {
         }
     }
 
+    /// The same config with a stream deadline of ZERO seconds.
+    ///
+    /// Used by the tests that read the handler's FRAMES: `take_until(deadline)`
+    /// is what makes the stream finite, so a zero deadline lets the whole body be
+    /// collected while still emitting every opening frame first. It also means
+    /// those tests incidentally exercise the deadline - the mechanism
+    /// `docs/realtime.md` names as how a session revoked mid-stream is dropped.
+    fn finite_stream_config(
+        replay_buffer_events: usize,
+        max_connections_per_account: usize,
+    ) -> RealtimeConfig {
+        RealtimeConfig {
+            replay_buffer_events,
+            max_connections_per_account,
+            max_stream_seconds: 0,
+        }
+    }
+
     fn test_usage(input: i64, cache: i64, output: i64, cost: i64) -> UsageDelta {
         UsageDelta {
             input_tokens: input,
@@ -762,6 +780,289 @@ mod tests {
     ///
     /// The schema's GLOB CHECK now makes the mixed format unrepresentable. This is
     /// the behavioural half: the real cookie path, against the real schema.
+
+    // -----------------------------------------------------------------------
+    // The SSE handler itself.
+    //
+    // `sse_events_handler` was the single largest uncovered block left in the
+    // crate (55 lines, the whole function), which matters because the four
+    // guarantees it carries are all enforced HERE and nowhere else: the
+    // per-account connection cap, cross-account isolation on BOTH the live and
+    // replay paths, the replay-versus-snapshot choice, and the stream deadline.
+    // -----------------------------------------------------------------------
+
+    /// A session for the account, returning the Cookie header that carries it.
+    async fn cookie_for(pool: &SqlitePool, account_id: Uuid) -> HeaderMap {
+        let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(hash_string(&token))
+        .bind(now + chrono::Duration::hours(2))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("create a session");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("session={token}")).expect("a valid cookie header"),
+        );
+        headers
+    }
+
+    /// The application state the handler runs on, built the way main.rs builds it.
+    fn state_for(pool: SqlitePool, config: &RealtimeConfig) -> AppState {
+        let app_config = std::sync::Arc::new(
+            crate::config::AppConfig::load_from_file("../config/apikita.toml")
+                .expect("the shipped config parses"),
+        );
+        AppState {
+            pool,
+            config: app_config,
+            http_client: reqwest::Client::new(),
+            events: Arc::new(RealtimeHub::new(config)),
+            ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
+            trusted_proxies: Arc::from(Vec::new().into_boxed_slice()),
+        }
+    }
+
+    /// The OPENING frames of an SSE response, as text.
+    ///
+    /// NOT `to_bytes` on the response body: the stream is opening frames CHAINED
+    /// into the live subscription, which never ends, so collecting the whole body
+    /// waits forever. (Written the wrong way first and it timed out, which is the
+    /// honest symptom of a test that asks an endless stream to finish.) So this
+    /// drives the stream directly and stops at the first `Pending`, which is after
+    /// every buffered opening frame has been yielded.
+    async fn opening_frames<S>(sse: Sse<S>) -> String
+    where
+        S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+    {
+        use axum::response::IntoResponse;
+
+        // `to_bytes` collects the WHOLE body, so it only returns once the stream
+        // ENDS. The live subscription never ends on its own, but the handler
+        // chains it through `take_until(deadline)` - so a config with
+        // `max_stream_seconds = 0` terminates the stream promptly while still
+        // producing every opening frame first. That is why this helper reads the
+        // complete body rather than polling frames: the deadline makes it finite,
+        // and the read then also exercises the deadline itself.
+        let response = sse.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body is finite once the stream deadline applies");
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    /// An unauthenticated request never reaches a stream.
+    #[tokio::test]
+    async fn the_handler_refuses_without_a_session_cookie() {
+        let db = TestDb::new().await;
+        let config = hub_config(10, 2);
+        let state = state_for(db.pool.clone(), &config);
+
+        let result = sse_events_handler(State(state.clone()), HeaderMap::new()).await;
+        assert!(
+            matches!(result, Err(AppError::Unauthenticated)),
+            "no cookie must be refused before any stream is constructed"
+        );
+
+        // And an unknown token is refused the same way.
+        let mut unknown = HeaderMap::new();
+        unknown.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=apk_sess_not_a_real_token"),
+        );
+        let result = sse_events_handler(State(state.clone()), unknown).await;
+        assert!(matches!(result, Err(AppError::Unauthenticated)));
+
+        db.close().await;
+    }
+
+    /// The SNAPSHOT path: a client with no resume id gets the CURRENT balance and
+    /// today's usage, so even a client that cannot be replayed sees correct
+    /// absolute state rather than a stale or empty view.
+    #[tokio::test]
+    async fn the_snapshot_carries_the_real_balance_and_todays_usage() {
+        let db = TestDb::new().await;
+        let config = finite_stream_config(10, 2);
+        let state = state_for(db.pool.clone(), &config);
+
+        let account = test_support::account_with_wallet(&db.pool).await;
+        // Funded through the REAL money path: seeding balance_idr directly would
+        // manufacture the drift the reconcile gate exists to catch.
+        test_support::fund(&db.pool, account, 42_000).await;
+
+        let headers = cookie_for(&db.pool, account).await;
+        let sse = sse_events_handler(State(state.clone()), headers)
+            .await
+            .expect("a live session opens a stream");
+
+        let frames = opening_frames(sse).await;
+
+        assert!(
+            frames.contains("42000"),
+            "the snapshot must carry the account's real balance, got: {frames}"
+        );
+        // The session row was created by the fixture, so the account is linked.
+        assert!(
+            frames.contains("heartbeat") || frames.contains("event:"),
+            "the stream must emit at least one frame or keep-alive, got: {frames}"
+        );
+
+        db.close().await;
+    }
+
+    /// CROSS-ACCOUNT ISOLATION ON THE REPLAY PATH.
+    ///
+    /// The broadcast is process-wide, so a replay buffer holds events for every
+    /// account. The handler filters twice - once on the live arm and once on the
+    /// replay arm - and this journal records a real cross-account leak being fixed
+    /// here. This is the regression that matters most.
+    #[tokio::test]
+    async fn a_replayed_buffer_never_leaks_another_accounts_events() {
+        let db = TestDb::new().await;
+        let config = finite_stream_config(50, 5);
+        let state = state_for(db.pool.clone(), &config);
+
+        let alice = test_support::account_with_wallet(&db.pool).await;
+        let bob = test_support::account_with_wallet(&db.pool).await;
+
+        // Distinctive balances so a leak is unmistakable in the payload.
+        test_support::fund(&db.pool, alice, 11_111).await;
+        test_support::fund(&db.pool, bob, 99_999).await;
+
+        // Seed the buffer with events for BOTH accounts.
+        let id_before = state.events.current_id();
+        publish_balance(&state.events, alice, 11_111);
+        publish_balance(&state.events, bob, 99_999);
+        publish_usage(&state.events, bob, test_usage(7, 0, 3, 5));
+        publish_balance(&state.events, alice, 11_111);
+
+        // Resume as ALICE from before the events, so the replay arm runs.
+        let mut headers = cookie_for(&db.pool, alice).await;
+        headers.insert(
+            header::HeaderName::from_static("last-event-id"),
+            HeaderValue::from_str(&id_before.to_string()).expect("a numeric id"),
+        );
+
+        let sse = sse_events_handler(State(state.clone()), headers)
+            .await
+            .expect("a live session opens a stream");
+        let frames = opening_frames(sse).await;
+
+        assert!(
+            !frames.contains("99999"),
+            "ALICE must never receive BOB's balance - a cross-account leak is the defect this filter exists for. Frames: {frames}"
+        );
+        assert!(
+            !frames.contains("\"input_tokens\":7"),
+            "ALICE must never receive BOB's usage. Frames: {frames}"
+        );
+
+        db.close().await;
+    }
+
+    /// CROSS-ACCOUNT ISOLATION ON THE LIVE ARM.
+    ///
+    /// The test above publishes BEFORE the stream opens, so it exercises the
+    /// REPLAY filter only. This one publishes AFTER subscribing, which is the only
+    /// way the live arm is reached - and when that arm was mutated to forward
+    /// every event regardless of owner, the replay test alone did NOT catch it
+    /// (measured: 16 passed with the live filter removed). Two filters, two
+    /// tests, because one test on one path leaves the other unguarded.
+    #[tokio::test]
+    async fn the_live_stream_never_forwards_another_accounts_events() {
+        let db = TestDb::new().await;
+        let config = finite_stream_config(50, 5);
+        let state = state_for(db.pool.clone(), &config);
+
+        let alice = test_support::account_with_wallet(&db.pool).await;
+        let bob = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, alice, 11_111).await;
+        test_support::fund(&db.pool, bob, 99_999).await;
+
+        // Subscribe as Alice with NO resume id, so the opening frames are a
+        // snapshot and the live arm is what delivers anything published next.
+        let headers = cookie_for(&db.pool, alice).await;
+        let sse = sse_events_handler(State(state.clone()), headers)
+            .await
+            .expect("a live session opens a stream");
+
+        // Publish to BOB only. Alice must never see it.
+        publish_balance(&state.events, bob, 99_999);
+        publish_usage(&state.events, bob, test_usage(7, 0, 3, 5));
+        // And one for Alice, so the test proves the stream is ALIVE rather than
+        // merely silent - a stream that forwards nothing would also pass the
+        // negative assertion above.
+        publish_balance(&state.events, alice, 11_111);
+
+        let frames = opening_frames(sse).await;
+
+        assert!(
+            !frames.contains("99999"),
+            "ALICE must never receive BOB's balance on the LIVE arm. Frames: {frames}"
+        );
+        assert!(
+            !frames.contains("\"input_tokens\":7"),
+            "ALICE must never receive BOB's usage on the LIVE arm. Frames: {frames}"
+        );
+        assert!(
+            frames.contains("11111"),
+            "Alice's own event must still arrive - otherwise this test passes on a stream that forwards nothing. Frames: {frames}"
+        );
+
+        db.close().await;
+    }
+    /// THE CONNECTION CAP, THROUGH THE HANDLER.
+    ///
+    /// The hub-level cap is unit-tested, but the handler is the ONLY place it can
+    /// be enforced - once a stream has started the status line is already sent. So
+    /// this asserts the refusal reaches the caller, and that dropping a stream
+    /// frees the slot.
+    #[tokio::test]
+    async fn the_handler_refuses_more_streams_than_the_account_may_hold() {
+        let db = TestDb::new().await;
+        let config = hub_config(10, 2);
+        let state = state_for(db.pool.clone(), &config);
+
+        let account = test_support::account_with_wallet(&db.pool).await;
+        let headers = cookie_for(&db.pool, account).await;
+
+        // Two streams, which is the cap.
+        let first = sse_events_handler(State(state.clone()), headers.clone())
+            .await
+            .expect("the first stream is allowed");
+        let second = sse_events_handler(State(state.clone()), headers.clone())
+            .await
+            .expect("the second stream is allowed");
+
+        // The third exceeds it.
+        let third = sse_events_handler(State(state.clone()), headers.clone()).await;
+        assert!(
+            third.is_err(),
+            "a third concurrent stream must be REFUSED - unbounded SSE connections are a resource-exhaustion vector"
+        );
+
+        // Dropping one frees the slot: that is what the guard is for.
+        drop(second);
+        let after_drop = sse_events_handler(State(state.clone()), headers).await;
+        assert!(
+            after_drop.is_ok(),
+            "dropping a stream must release its slot, or a reconnecting client is locked out forever"
+        );
+
+        drop(first);
+        drop(after_drop);
+        db.close().await;
+    }
     #[tokio::test]
     async fn an_expired_session_is_refused_and_a_live_one_is_accepted() {
         let db = TestDb::new().await;
