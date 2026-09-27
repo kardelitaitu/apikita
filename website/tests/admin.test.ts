@@ -22,6 +22,7 @@ import {
   auditActionLabel,
   auditDetailSummary,
   formatAuditTime,
+  recentAuditPath,
   actionPath,
   adminErrorMessage,
   canResume,
@@ -222,4 +223,9 @@ test('audit detail that is missing, empty or malformed returns null, never raw t
 test('an audit time is shown in WIB', () => {
   assert.match(formatAuditTime('2026-01-01T00:00:00Z'), /07:00/);
   assert.equal(formatAuditTime('nonsense'), 'nonsense');
+});
+
+test('the recent-actions path carries the limit', () => {
+  assert.equal(recentAuditPath(10), '/api/admin/audit?limit=10');
+  assert.match(recentAuditPath(), /limit=50/);
 });

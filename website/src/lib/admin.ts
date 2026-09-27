@@ -315,3 +315,8 @@ export function formatAuditTime(iso: string): string {
     timeStyle: 'short',
   }).format(new Date(ms));
 }
+
+/** The cross-account recent-actions path. */
+export function recentAuditPath(limit = 50): string {
+  return `/api/admin/audit?limit=${limit}`;
+}
