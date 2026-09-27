@@ -166,7 +166,90 @@ jobs:
           docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/health \
             | grep -q '"database":"connected"'
           docker rm -f apikita-ci-api
-          docker volume rm apikita-ci-data
+          # Cleanup is BEST-EFFORT and must never fail the step: the volume is
+          # scratch and a leftover one on a fresh CI runner is harmless. The
+          # `--rm` containers can hold it for a moment after they exit, so the
+          # final removal is allowed to fail.
+          docker volume rm apikita-ci-data >/dev/null 2>&1 || true
+
+
+      # The maintenance scheduler must actually RUN.
+      #
+      # This step exists because it did not, and nothing said so. `next_run_epoch`
+      # called GNU `date -u -d "today 3:00"`; the image is Alpine, so `date` is
+      # BUSYBOX date, which rejects that form with
+      #   date: invalid date 'today 3:00'
+      # The nightly loop therefore exited 2 on its FIRST iteration and Compose
+      # restart-looped it forever - the retention sweep and the Gate 2 money check
+      # could never have run. Every existing test used a ONE-SHOT verb
+      # (retention/reconcile/once), which skips `next_run_epoch` entirely, so a
+      # loop that could never execute looked exercised.
+      #
+      # So this checks BOTH halves: the loop can COMPUTE a next run (the actual
+      # bug), and the wired verbs still DO their work.
+      - name: Smoke the maintenance scheduler image
+        run: |
+          set -euo pipefail
+          docker build -f .docker/maintenance/Dockerfile -t apikita-scheduler:ci .
+
+          # The entrypoint is MOUNTED at runtime, exactly as docker-compose.yml
+          # does it - it is NOT baked into the image, so running the image without
+          # this mount would exercise nothing.
+          RUN="docker run --rm"
+          MOUNT="-v $PWD/.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro"
+          REC="-v $PWD/tools/reconcile:/usr/local/share/reconcile:ro"
+          ENV="-e DATABASE_URL=sqlite://data/server.db -e RECONCILE_DATABASE_URL=sqlite://data/server.db -e APP_DIR=/srv/apikita"
+          EP=/usr/local/bin/maintenance-entrypoint.sh
+
+          docker volume create apikita-ci-data
+
+          # 1: the loop must compute a next run. `schedule` is a 24h loop, so run
+          # it under a timeout and require the next-run line rather than waiting.
+          timeout 20 $RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP schedule > /tmp/schedule.log 2>&1 || true
+          cat /tmp/schedule.log
+          if grep -q "could not compute the next run time" /tmp/schedule.log; then
+            echo "::error::the nightly loop cannot compute a next run time"
+            exit 1
+          fi
+          grep -q "next run in" /tmp/schedule.log || {
+            echo "::error::the nightly loop never reached its first wait"
+            exit 1
+          }
+
+          # 2: the wired verbs must still do their work. Seed the minimum schema
+          # the sweep touches plus one row PAST the window, then require the sweep
+          # to report success AND to have actually deleted it - a query that
+          # silently matches nothing (the failure mode a bare-date cutoff vs an
+          # RFC3339 timestamp would cause) is caught by the row count, not by the
+          # exit code alone.
+          $RUN -v $PWD/.docker/maintenance/ci/scheduler-smoke-seed.sql:/seed.sql:ro \
+            -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db < /seed.sql'
+
+          before=$($RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "SELECT COUNT(*) FROM usage_events;"')
+          out=$($RUN $MOUNT $REC $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP retention)
+          echo "$out"
+          echo "$out" | grep -q "job retention: OK" || {
+            echo "::error::the retention sweep did not report success"
+            exit 1
+          }
+          after=$($RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "SELECT COUNT(*) FROM usage_events;"')
+          if [ "$before" = "$after" ]; then
+            echo "::error::the sweep reported OK but deleted nothing ($before -> $after)"
+            exit 1
+          fi
+
+          # Cleanup is BEST-EFFORT and must NEVER fail the step. The volume is
+          # scratch, and the daemon can still hold it for a moment after the
+          # `--rm` containers exit, so the removal is allowed to fail.
+          docker volume rm apikita-ci-data >/dev/null 2>&1 || true
 
       - name: Install website dependencies
         working-directory: website
