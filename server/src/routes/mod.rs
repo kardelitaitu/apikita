@@ -364,8 +364,7 @@ pub mod test_env {
 
             assert!(
                 std::env::var_os(REMOVED).is_none(),
-                "a variable that was UNSET before the guard must be unset again, not left holding the test value: {:?}",
-                std::env::var_os(REMOVED)
+                "a variable that was UNSET before the guard must be unset again, not left holding the test value"
             );
         }
 
