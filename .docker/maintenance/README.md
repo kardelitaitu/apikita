@@ -78,7 +78,7 @@ for the service itself to commit it.
 | --- | --- | --- |
 | **`ip-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/ip-purge.rs` is a **Rust binary**. A server image **does** exist (`server/Dockerfile`), but it ships only `apikita-server` and `migrate`, so no image in *this* compose file contains it. The **retention window IS enforced** — `run_retention` applies the same two `DELETE`s through sqlite3. It is the *binary* that does not run here. |
 | **`usage-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/usage-purge.rs`, same shape. `run_retention` applies all three of its sweeps — `usage_events` (90d), `usage_daily` (730d), expired/revoked `sessions` (30d) — so `docs/data-retention.md` is enforced here. |
-| **`hold-sweep`** | **NOT WIRED** | `server/src/bin/hold-sweep.rs`, same shipping gap, and **no inline equivalent**: nothing sweeps stranded reservation holds in this topology. This one matters most: a stranded hold is **invisible money** - the ledger still balances and reconciliation returns *nothing* - which is exactly why a detector with a 900s bound was written. The gap is loud, not silent. |
+| **`hold-sweep`** | **WIRED — REPORT-ONLY** | `server/src/bin/hold-sweep.rs` still is not shipped, but `run_hold_sweep` applies its **detector** inline through `sqlite3`: the same predicate as the binary, the same 900s bound. It counts, names the accounts and refs, and exits non-zero. It **never moves money** — the binary's `--release` is the deliberate operator action. This matters most because a stranded hold is **invisible money**: the ledger still balances and reconciliation returns *nothing*. |
 | **`benchmark`** | **NOT WIRED** | `server/src/bin/benchmark.rs`. Not a maintenance promise; it is a measurement tool and has no business running on a timer. |
 
 ### The interim answer for the Rust jobs: run them on the host
@@ -93,14 +93,18 @@ DATABASE_URL='sqlite://data/server.db' \
 DATABASE_URL='sqlite://data/server.db' \
   cargo run --manifest-path server/Cargo.toml --bin usage-purge
 
+# Detection now runs in-container too (run_hold_sweep, report-only). This host
+# form is what actually CREDITS the holds back, which stays a deliberate action:
 DATABASE_URL='sqlite://data/server.db' \
-  cargo run --manifest-path server/Cargo.toml --bin hold-sweep
+  cargo run --manifest-path server/Cargo.toml --bin hold-sweep -- --release
 ```
 
-**Two of these three are already covered in-container.** `ip-purge` and
-`usage-purge` encode SQL the entrypoint applies itself, so their *retention
-promises* are kept here even though the binaries do not run. `hold-sweep` has no
-inline equivalent and is a genuine gap.
+**All three are now covered in-container.** `ip-purge` and `usage-purge` encode SQL
+the entrypoint applies itself, so their *retention promises* are kept here even
+though the binaries do not run. `hold-sweep` is covered too, as its **report-only**
+half: `run_hold_sweep` detects, names and exits non-zero. What stays on the host is
+the **money-moving** half (`--release`), and that is deliberate — silently crediting
+a hold is the same invisible-money anti-pattern the sweep exists to catch.
 
 The honest future change is to ship the three binaries in the server image and add
 a service that runs them - then delete the `NOT WIRED` lines from the banner in
@@ -318,9 +322,11 @@ after**.
   `next run in ...s` and computes the correct instant (checked for 02:00, 04:00
   and exactly 03:00, including the roll-over to the next day).
   `docker compose up -d scheduler` now reaches `Up`, not `Restarting`.
-- **The three Rust binaries.** `ip-purge`, `usage-purge` and `hold-sweep` are
-  BINARIES NOT WIRED, by construction. The first two have their work done inline
-  by `run_retention`; `hold-sweep` has no equivalent.
+- **The three Rust binaries.** `ip-purge`, `usage-purge` and `hold-sweep` are still
+  BINARIES NOT WIRED, by construction, but **all three jobs' work now runs inline**:
+  the first two by `run_retention`, and `hold-sweep` by `run_hold_sweep` (report-only).
+  For `hold-sweep` the only thing left on the host is the money-moving `--release`
+  flag, which is an operator decision rather than a scheduled job.
 - **`docker compose run scheduler once` on a host whose checkout has LF working-tree
   files.** The two script mounts (`entrypoint.sh`, `reconcile.sh`/`.sql`) are shell
   and SQL files executed **inside** the container. This machine's checkout has them

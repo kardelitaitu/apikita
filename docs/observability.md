@@ -195,10 +195,14 @@ non-zero count means a release failed to land — most often the fire-and-forget
 `ReservationGuard::drop` (`server/src/routes/proxy.rs`) never reached the database, or
 the process died between the response and the settlement commit.
 
-**Run the sweep on a schedule, alongside `ip-purge`.** Both are maintenance jobs that
-enforce a money or retention promise, and neither has a scheduler behind it yet
-([`docs/ip-tracking.md`](ip-tracking.md)); schedule them together, on the same cadence
-as the reconciliation query.
+**The sweep now RUNS on a schedule.** The maintenance scheduler
+(`.docker/maintenance/`) runs `run_hold_sweep` every night, alongside the retention
+sweeps — and its CI smoke seeds a stranded hold and a HEALTHY paired reservation, then
+asserts the detector fires on the first and stays silent on the second. It is
+**report-only**, matching the binary's default: the scheduler detects, names the
+accounts and refs, and exits non-zero, while crediting a hold back stays a deliberate
+operator action (`hold-sweep --release`). Silently correcting a stranded hold is the
+same invisible-money anti-pattern this whole section describes.
 
 **The bound.** A hold may legitimately be unpaired at the moment of a sweep — the
 request is still streaming, and the upstream timeout is deliberately **per read rather
