@@ -194,8 +194,20 @@ statement is false.**
       **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`, 9 of 10
       entries `covered` — but "configured" also means a delivery channel and a schedule,
       which are deployment decisions. The code half is done.
-- [ ] **A restore drill has been run**, with the reconciliation query passing.
-- [ ] Drill log records the measured restore time — that is the real RTO.
+- [ ] **A restore drill has been run**, with the reconciliation query passing. **The TOOL
+      is verified; the PRODUCTION run is not.** I exercised `tools/drill/drill.sh` end to
+      end against a synthetic migrated source: a full drill PASSED (exit 0) with
+      `reconcile.sh` reporting zero drifting rows and the spot-check comparing a real
+      wallet across source and restored copy. I also proved it DETECTS bad backups rather
+      than only ever passing — a corrupted artifact and a plausible-looking TRUNCATED one
+      both FAIL with exit 6. **What remains is running it against production data**, which
+      needs a deployed database and is why this box stays unticked:
+      `docs/backup-and-restore.md:190-192` records that the only measured RTO so far is
+      "**dev-sized**... the production number is unmeasured until the drill runs there."
+- [ ] Drill log records the measured restore time — that is the real RTO. **The log DOES
+      record it** (verified: `restore_ms 304` and `118` on my runs, alongside the result and
+      the artifact SHA-256), so the mechanism works. The number to record is a PRODUCTION
+      one; a dev-sized figure would be a claim we cannot stand behind.
 - [x] Error responses match [`error-model.md`](error-model.md), including `request_id`.
       `server/src/error.rs:233` mints `req_<uuid>` per failure and `:273` puts it in the
       body; `error.rs:607` asserts the exact documented shape
