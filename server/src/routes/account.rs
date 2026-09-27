@@ -336,6 +336,73 @@ pub async fn get_topups(
     Ok(Json(result))
 }
 
+
+/// Rows returned when the caller asks for no explicit limit. Matches the
+/// dashboard's "last N metered calls" and keeps the response small enough to
+/// render without paging.
+const RECENT_USAGE_DEFAULT_LIMIT: i64 = 20;
+
+/// `GET /api/usage/recent?limit=` — the last N metered requests for this account.
+///
+/// docs/website/03-functional-spec.md, Dashboard table: "Recent requests — last N
+/// metered calls". `usage_daily` is an aggregate with no per-request rows and no
+/// model, so it cannot answer this; the source is `usage_events`, which the
+/// settlement transaction writes one row to per billed request.
+///
+/// Only THIS account's rows are ever returned: the cookie is resolved first and
+/// every query is bound to that account id, so a second account's requests are
+/// unreachable even with a guessed id. Nothing here exposes a prompt, a
+/// completion, or a key's plaintext — `usage_events` stores none of them.
+pub async fn get_recent_usage(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+    Query(query): Query<LimitQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+    let limit = query.limit.unwrap_or(RECENT_USAGE_DEFAULT_LIMIT).clamp(1, 100);
+
+    // Newest first. The index `usage_events_account_idx (account_id, created_at
+    // DESC)` serves exactly this ordering, so the sort is not a table scan.
+    let rows = sqlx::query(
+        r#"
+        SELECT id, api_key_id, model,
+               input_tokens, cache_read_tokens, output_tokens, cost_idr, created_at
+        FROM usage_events
+        WHERE account_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(account_id.hyphenated())
+    .bind(limit)
+    .fetch_all(&pool)
+    .await?;
+
+    let events: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| -> Result<serde_json::Value, AppError> {
+            let id: Uuid = r.try_get::<Hyphenated, _>("id")?.into_uuid();
+            // A key deleted later nulls the column (ON DELETE SET NULL), so this
+            // is genuinely optional; the UI shows the request without a key name.
+            let api_key_id: Option<Uuid> = r
+                .try_get::<Option<Hyphenated>, _>("api_key_id")?
+                .map(Hyphenated::into_uuid);
+            Ok(json!({
+                "id": id,
+                "api_key_id": api_key_id,
+                "model": r.try_get::<String, _>("model")?,
+                "input_tokens": r.try_get::<i64, _>("input_tokens")?,
+                "cache_read_tokens": r.try_get::<i64, _>("cache_read_tokens")?,
+                "output_tokens": r.try_get::<i64, _>("output_tokens")?,
+                "cost_idr": r.try_get::<i64, _>("cost_idr")?,
+                "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(events))
+}
+
 // ---------------------------------------------------------------------------
 // Midtrans Snap client
 // ---------------------------------------------------------------------------
@@ -944,7 +1011,7 @@ mod tests {
     //     cargo test --lib -- --ignored
     // -----------------------------------------------------------------------
 
-    use crate::db::credit_topup_transaction;
+    use crate::db::{credit_topup_transaction, debit_usage_transaction};
     use crate::routes::events::RealtimeHub;
     use crate::routes::test_env::{EnvGuard, EnvLock};
     use crate::test_support::{self, TestDb};
@@ -1868,6 +1935,111 @@ mod tests {
             json!(settled_id),
             "created_at DESC: the newest top-up comes first"
         );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // 3b. get_recent_usage - the per-request history (usage_events)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_get_recent_usage_returns_only_this_accounts_requests() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let primary = live_account(&pool).await;
+        let other = live_account(&pool).await;
+
+        let primary_key = test_support::api_key(&pool, primary.account_id).await;
+        let other_key = test_support::api_key(&pool, other.account_id).await;
+
+        let outcome = tokio::spawn(get_recent_usage_assertions(
+            pool.clone(),
+            primary.account_id,
+            primary.token.clone(),
+            primary_key,
+            other.account_id,
+            other_key,
+        ));
+
+        let outcome = outcome.await;
+        db.close().await;
+        outcome.expect("the get_recent_usage assertions panicked");
+    }
+
+    async fn get_recent_usage_assertions(
+        pool: SqlitePool,
+        account_id: Uuid,
+        token: String,
+        key_id: Uuid,
+        other_account_id: Uuid,
+        other_key_id: Uuid,
+    ) {
+        // The requests are written through the REAL settlement path, so
+        // `usage_events` is populated the way production populates it.
+        test_support::fund(&pool, account_id, 1_000_000).await;
+        debit_usage_transaction(
+            &pool, account_id, Some(key_id), "flash", 100, 10, 50, 111, Some("r1"), 0,
+        )
+        .await
+        .expect("first settlement");
+
+        // A second request by the OTHER account must never appear in this list.
+        test_support::fund(&pool, other_account_id, 1_000_000).await;
+        debit_usage_transaction(
+            &pool, other_account_id, Some(other_key_id), "flash", 999, 0, 999, 222, Some("r2"), 0,
+        )
+        .await
+        .expect("other account settlement");
+
+        let (status, body) = respond(get_recent_usage(
+            State(pool.clone()),
+            cookie_header(&token),
+            Query(LimitQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let rows = body.as_array().expect("a recent-usage list is an array");
+        assert_eq!(rows.len(), 1, "only this account's requests: {body}");
+        let row = &rows[0];
+
+        // The documented shape, exactly - no prompt, no completion, no key hash.
+        let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "api_key_id",
+                "cache_read_tokens",
+                "cost_idr",
+                "created_at",
+                "id",
+                "input_tokens",
+                "model",
+                "output_tokens",
+            ],
+            "docs/server/api-spec.md GET /api/usage/recent: {body}"
+        );
+        assert_eq!(row["model"], json!("flash"));
+        assert_eq!(row["input_tokens"], json!(100));
+        assert_eq!(row["cache_read_tokens"], json!(10));
+        assert_eq!(row["output_tokens"], json!(50));
+        assert_eq!(row["cost_idr"], json!(111));
+        assert_eq!(row["api_key_id"], json!(key_id));
+        // The event is tied to the reservation the ledger rows carry.
+        let text = body.to_string();
+        for forbidden in ["token_hash", "key_hash", "apk_live", "prompt", "completion"] {
+            assert!(!text.contains(forbidden), "the history leaked {forbidden}: {text}");
+        }
+
+        // An unauthenticated call is refused before any row is read.
+        let (status, _) = respond(get_recent_usage(
+            State(pool.clone()),
+            HeaderMap::new(),
+            Query(LimitQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     // -----------------------------------------------------------------------

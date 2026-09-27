@@ -291,6 +291,10 @@ pub async fn debit_usage_transaction(
     pool: &SqlitePool,
     account_id: Uuid,
     api_key_id: Option<Uuid>,
+    // The model the request was routed to. Written to `usage_events` so the
+    // dashboard's per-request history can name it; the aggregate tables do not
+    // carry a model.
+    model: &str,
     input_tokens: i64,
     cache_read_tokens: i64,
     output_tokens: i64,
@@ -352,6 +356,7 @@ pub async fn debit_usage_transaction(
                 tx,
                 account_id,
                 api_key_id,
+                model,
                 input_tokens,
                 cache_read_tokens,
                 output_tokens,
@@ -372,6 +377,7 @@ pub async fn debit_usage_transaction(
         tx,
         account_id,
         api_key_id,
+        model,
         input_tokens,
         cache_read_tokens,
         output_tokens,
@@ -408,6 +414,7 @@ async fn record_usage(
     mut tx: Transaction<'_, Sqlite>,
     account_id: Uuid,
     api_key_id: Option<Uuid>,
+    model: &str,
     input_tokens: i64,
     cache_read_tokens: i64,
     output_tokens: i64,
@@ -468,6 +475,43 @@ async fn record_usage(
     .bind(cache_read_tokens)
     .bind(output_tokens)
     .bind(usage_cost_idr)
+    .execute(&mut *tx)
+    .await?;
+
+    // Append the per-request row, in the SAME transaction as the counters it
+    // summarises. `usage_daily` is an aggregate with no model and no ordering;
+    // `usage_events` is the detail behind the dashboard's "recent requests", and
+    // writing it here is what makes the two sum to the same tokens. A row written
+    // in a separate transaction could commit while the aggregate rolled back (or
+    // the reverse), and the per-request view would then disagree with the totals.
+    //
+    // The id is a fresh UUID rather than a natural key: two identical requests in
+    // the same second are legitimately two rows, and nothing needs to dedupe them.
+    // `ref` is the same reservation ref the ledger rows carry, so one request's
+    // ledger movement and its usage event can be tied together by hand.
+    sqlx::query(
+        r#"
+        INSERT INTO usage_events (
+            id, account_id, api_key_id, model,
+            input_tokens, cache_read_tokens, output_tokens, cost_idr, ref, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(Uuid::new_v4().hyphenated())
+    .bind(account_id.hyphenated())
+    .bind(api_key_id.map(|k| k.hyphenated()))
+    .bind(model)
+    .bind(input_tokens)
+    .bind(cache_read_tokens)
+    .bind(output_tokens)
+    // The event records the REAL cost of the request, matching what usage_daily
+    // accumulated (`usage_cost_idr`), not `charged_idr`. When the wallet could
+    // not cover the cost in full the two differ, and the dashboard must show what
+    // the request cost, with the ledger already recording what was collected.
+    .bind(usage_cost_idr)
+    .bind(ref_batch)
+    .bind(Utc::now())
     .execute(&mut *tx)
     .await?;
 
@@ -681,6 +725,7 @@ async fn settle_partial_usage(
     mut tx: Transaction<'_, Sqlite>,
     account_id: Uuid,
     api_key_id: Option<Uuid>,
+    model: &str,
     input_tokens: i64,
     cache_read_tokens: i64,
     output_tokens: i64,
@@ -721,6 +766,7 @@ async fn settle_partial_usage(
         tx,
         account_id,
         api_key_id,
+        model,
         input_tokens,
         cache_read_tokens,
         output_tokens,
@@ -942,6 +988,7 @@ mod tests {
             &pool,
             account_id,
             Some(key_id),
+            "flash",
             200,
             0,
             150,
@@ -1023,6 +1070,7 @@ mod tests {
             &pool,
             account_id,
             Some(key_id),
+            "flash",
             200,
             0,
             150,
@@ -1165,6 +1213,7 @@ mod tests {
             &pool,
             account_id,
             Some(key_id),
+            "flash",
             200,
             0,
             150,
@@ -1226,6 +1275,7 @@ mod tests {
                 &pool,
                 account_id,
                 Some(key_id),
+                "flash",
                 10,
                 0,
                 5,
@@ -1509,6 +1559,7 @@ mod tests {
             &pool,
             account_id,
             Some(key_id),
+            "flash",
             200,
             0,
             150,
@@ -2506,7 +2557,7 @@ mod tests {
 
         // Account-level usage, twice on the same day: no key.
         for _ in 0..2 {
-            debit_usage_transaction(&db.pool, account_id, None, 100, 10, 200, 5_000, None, 0)
+            debit_usage_transaction(&db.pool, account_id, None, "flash", 100, 10, 200, 5_000, None, 0)
                 .await
                 .expect("a settlement against a funded wallet");
         }
@@ -2543,6 +2594,7 @@ mod tests {
             &db.pool,
             account_id,
             Some(key_id),
+            "flash",
             100,
             10,
             200,
@@ -2665,6 +2717,78 @@ mod tests {
             "the replay must not flip the row back to settled"
         );
 
+        db.close().await;
+    }
+
+    /// A settlement writes exactly one `usage_events` row, and its counters match
+    /// what the request cost. This is the per-request detail behind the
+    /// dashboard's "recent requests"; before it was written, `usage_events` was a
+    /// table nothing populated.
+    ///
+    /// The two properties that matter: the event carries the SAME token split as
+    /// `usage_daily` (so the detail cannot disagree with the aggregate), and it
+    /// names the model (which no aggregate does).
+    #[tokio::test]
+    async fn a_settlement_writes_one_usage_event_with_the_real_tokens() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account_id, 100_000).await;
+        let key_id = test_support::api_key(&db.pool, account_id).await;
+
+        debit_usage_transaction(
+            &db.pool,
+            account_id,
+            Some(key_id),
+            "deepseek-v4-flash",
+            120,
+            30,
+            80,
+            4_242,
+            Some("ref_usage_event"),
+            0,
+        )
+        .await
+        .expect("a settlement");
+
+        let row = sqlx::query(
+            "SELECT api_key_id, model, input_tokens, cache_read_tokens, output_tokens, cost_idr, ref
+             FROM usage_events WHERE account_id = ?",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_one(&db.pool)
+        .await
+        .expect("the settlement wrote one usage event");
+
+        let model: String = row.try_get("model").unwrap();
+        let input: i64 = row.try_get("input_tokens").unwrap();
+        let cache: i64 = row.try_get("cache_read_tokens").unwrap();
+        let output: i64 = row.try_get("output_tokens").unwrap();
+        let cost: i64 = row.try_get("cost_idr").unwrap();
+        let key: Option<String> = row.try_get("api_key_id").unwrap();
+        let reference: Option<String> = row.try_get("ref").unwrap();
+
+        assert_eq!(model, "deepseek-v4-flash");
+        assert_eq!((input, cache, output), (120, 30, 80));
+        assert_eq!(cost, 4_242);
+        assert_eq!(key.as_deref(), Some(key_id.hyphenated().to_string().as_str()));
+        // The event is tied to the same reservation the ledger rows carry.
+        assert_eq!(reference.as_deref(), Some("ref_usage_event"));
+
+        // The aggregate holds the identical token split, so the two cannot drift.
+        let agg = sqlx::query(
+            "SELECT input_tokens, cache_read_tokens, output_tokens, cost_idr
+             FROM usage_daily WHERE account_id = ?",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_one(&db.pool)
+        .await
+        .expect("the aggregate row");
+        assert_eq!(agg.try_get::<i64, _>("input_tokens").unwrap(), input);
+        assert_eq!(agg.try_get::<i64, _>("cache_read_tokens").unwrap(), cache);
+        assert_eq!(agg.try_get::<i64, _>("output_tokens").unwrap(), output);
+        assert_eq!(agg.try_get::<i64, _>("cost_idr").unwrap(), cost);
+
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
 }

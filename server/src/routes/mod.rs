@@ -187,6 +187,7 @@ pub fn create_router(state: AppState) -> Router {
         // Account & Wallet
         .route("/api/me", get(account::get_me))
         .route("/api/usage", get(account::get_usage))
+        .route("/api/usage/recent", get(account::get_recent_usage))
         .route(
             "/api/topups",
             get(account::get_topups).post(account::create_topup),
