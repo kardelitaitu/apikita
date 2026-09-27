@@ -373,6 +373,48 @@ impl UpstreamClient {
     /// collapsed into a number here: the caller decides what to emit and logs
     /// the cause, so the header is never an unexplained guess
     /// (docs/error-model.md:96). Also `None` when the model is unknown.
+    /// Whether EVERY routed endpoint of `model` currently has its breaker OPEN, i.e.
+    /// nothing in the pool can serve the model.
+    ///
+    /// **This is NOT `shortest_cooldown_secs`, and the difference is the whole point.**
+    /// That accessor answers "when could a retry succeed" and returns `Some` as soon as
+    /// ONE endpoint is cooling. The alert condition
+    /// (`docs/observability.md:104`, "circuit open on every endpoint") is the opposite
+    /// extreme: ONE open endpoint means failover is WORKING, which is normal operation,
+    /// while EVERY endpoint open means the model cannot be served at all. Reusing the
+    /// cooldown accessor would page an operator during healthy failover - worse than no
+    /// alert, because it teaches them to ignore it.
+    ///
+    /// **Unknown model -> `false`.** A model that does not exist is ABSENT, not down,
+    /// so collapsing the two would fire the alert on a typo.
+    ///
+    /// **Only ROUTED endpoints count** (`weight > 0.0`), matching the failover loop's
+    /// own filter. A weight-0 endpoint is registered but never selected, so its breaker
+    /// cannot represent a provider that is down - and letting it count would mean an
+    /// unrouted placeholder could both cause a false alarm and, worse, mask a real
+    /// outage on the one endpoint that IS routed.
+    ///
+    /// An EMPTY routed pool gives `false` too: with nothing routed there is no outage
+    /// to report, and a vacuously-true "all zero endpoints are open" would fire an
+    /// alert for a model that was never served.
+    pub fn all_endpoints_unhealthy(&self, model: &str) -> bool {
+        let Some(entry) = self.model(model) else {
+            return false;
+        };
+
+        let mut routed = 0usize;
+        for endpoint in entry.endpoints.iter().filter(|e| e.weight > 0.0) {
+            routed += 1;
+            if endpoint.breaker.allow_request() {
+                // At least one routed endpoint can still serve, so the model is up.
+                return false;
+            }
+        }
+
+        // Every routed endpoint refused. `routed > 0` guards the vacuous case: an
+        // empty pool must not report an outage.
+        routed > 0
+    }
     pub fn shortest_cooldown_secs(&self, model: &str) -> Option<u64> {
         let entry = self.model(model)?;
         entry
@@ -911,6 +953,113 @@ mod tests {
         assert_eq!(breaker.state(), BreakerState::Open);
     }
 
+    // ---------------------------------------------------------------------
+    // all_endpoints_unhealthy: the `all_providers_unhealthy` alert condition
+    // ---------------------------------------------------------------------
+    //
+    // This is DELIBERATELY NOT `shortest_cooldown_secs`. That accessor answers "when
+    // could a retry succeed" and returns Some when ANY endpoint is cooling, which is
+    // the OPPOSITE question: one open endpoint means failover is WORKING. An alert
+    // built on it would page on healthy failover, and an alert that fires during
+    // normal operation is worse than none, because it trains the operator to ignore
+    // it. The condition here is EVERY endpoint open, i.e. nothing can serve the
+    // model.
+
+    /// Only ONE endpoint open is NOT unhealthy: failover is doing its job.
+    #[test]
+    fn one_open_endpoint_is_not_all_providers_unhealthy() {
+        let client = client(vec![model(
+            "flash",
+            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
+        )]);
+        trip_endpoint(&client, 0);
+
+        assert!(
+            !client.all_endpoints_unhealthy("flash"),
+            "a single open endpoint means failover is WORKING - alerting here would page on normal operation"
+        );
+
+        // POSITIVE CONTROL for the fixture: the tripped breaker really is open, so the
+        // assertion above is about the OTHER endpoint being usable and not about a
+        // fixture that never tripped anything.
+        assert!(
+            !client.models[0].endpoints[0].breaker.allow_request(),
+            "the fixture must actually have tripped endpoint 0"
+        );
+        assert_eq!(
+            client.shortest_cooldown_secs("flash"),
+            Some(30),
+            "and the OLD accessor still reports a cooldown - which is exactly why it cannot be reused for this alert"
+        );
+    }
+
+    /// EVERY endpoint open IS unhealthy: nothing can serve this model.
+    #[test]
+    fn every_open_endpoint_is_all_providers_unhealthy() {
+        let client = client(vec![model(
+            "flash",
+            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
+        )]);
+        trip_endpoint(&client, 0);
+        trip_endpoint(&client, 1);
+
+        assert!(
+            client.all_endpoints_unhealthy("flash"),
+            "with every endpoint open the model cannot be served, which is the alert condition"
+        );
+    }
+
+    /// A HEALTHY pool is not unhealthy, so the accessor is not a constant.
+    #[test]
+    fn a_healthy_pool_is_not_all_providers_unhealthy() {
+        let client = client(vec![model(
+            "flash",
+            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
+        )]);
+
+        assert!(!client.all_endpoints_unhealthy("flash"));
+    }
+
+    /// An UNKNOWN model is not "unhealthy" - it is ABSENT, which is a different thing.
+    ///
+    /// Collapsing the two would make the alert fire for a typo in a model name, and
+    /// more importantly a model that does not exist cannot be "down".
+    #[test]
+    fn an_unknown_model_is_not_reported_as_unhealthy() {
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+
+        assert!(!client.all_endpoints_unhealthy("ghost"));
+    }
+
+    /// A WEIGHT-0-only pool is not unhealthy either: it is not routed at all.
+    ///
+    /// A weight-0 endpoint is registered but never selected (the failover loop
+    /// filters on `weight > 0.0`). Counting its breaker as "an endpoint that is
+    /// down" would let an unrouted placeholder make the alert fire.
+    #[test]
+    fn a_weightless_only_pool_is_not_all_providers_unhealthy() {
+        let client = client(vec![model("flash", vec![endpoint("ghost", 0.0)])]);
+
+        assert!(
+            !client.all_endpoints_unhealthy("flash"),
+            "an endpoint with weight 0 is never routed, so it cannot be a provider that is down"
+        );
+    }
+
+    /// A weight-0 endpoint does NOT mask a real outage on a routed one.
+    #[test]
+    fn a_weightless_endpoint_does_not_mask_a_routed_outage() {
+        let client = client(vec![model(
+            "flash",
+            vec![endpoint("ghost", 0.0), endpoint("primary", 1.0)],
+        )]);
+        trip_endpoint(&client, 1);
+
+        assert!(
+            client.all_endpoints_unhealthy("flash"),
+            "the only ROUTED endpoint is open, so the model cannot be served - the unrouted placeholder must not hide it"
+        );
+    }
     #[test]
     fn no_open_breaker_reports_none_not_a_guessed_number() {
         // The whole point of the Option: "nothing is open" is a real, distinct

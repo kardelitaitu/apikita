@@ -92,7 +92,10 @@ pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
 /// a mutation that reported `0.0` for an empty window SURVIVED - the test was
 /// asserting its own copy of the logic, not the route. A function the handler calls
 /// closes that gap: the two cannot drift.
-pub(crate) fn metrics_payload(counter: &crate::error::ServerErrorCounter) -> serde_json::Value {
+pub(crate) fn metrics_payload(
+    counter: &crate::error::ServerErrorCounter,
+    unhealthy_models: &[String],
+) -> serde_json::Value {
     let server_errors = counter.server_errors();
     let responses = counter.responses();
 
@@ -110,6 +113,10 @@ pub(crate) fn metrics_payload(counter: &crate::error::ServerErrorCounter) -> ser
         "server_errors": server_errors,
         "responses": responses,
         "error_rate": error_rate,
+        // The all_providers_unhealthy condition (docs/observability.md:104). A LIST,
+        // empty when every model has at least one usable endpoint. Named rather than a
+        // boolean so an operator learns WHICH model is down without a second lookup.
+        "unhealthy_models": unhealthy_models,
     })
 }
 
@@ -121,7 +128,11 @@ pub async fn operator_metrics(
     // cannot learn anything from this route.
     crate::routes::admin::require_operator(&state, &headers).await?;
 
-    Ok(Json(metrics_payload(crate::error::server_error_counter())).into_response())
+    Ok(Json(metrics_payload(
+        crate::error::server_error_counter(),
+        &crate::routes::proxy::models_with_no_healthy_endpoint(),
+    ))
+    .into_response())
 }
 #[cfg(test)]
 mod tests {
@@ -622,10 +633,34 @@ mod tests {
     /// this test re-stated the mapping instead of exercising it, and a mutation that
     /// reported `0.0` for an empty window **survived**: every other test records
     /// responses first, so the process-wide counter is never empty by then.
+
+    /// The payload REPORTS the unhealthy models by NAME, and an empty list when all
+    /// are healthy. This is the `all_providers_unhealthy` condition.
+    ///
+    /// Named rather than a boolean on purpose: an alert saying "a provider is down"
+    /// without saying WHICH costs a second investigation, and the operator already has
+    /// the route open.
+    #[test]
+    fn the_payload_names_every_model_with_no_usable_endpoint() {
+        let counter = crate::error::ServerErrorCounter::default();
+
+        // Healthy: an EMPTY list, not a missing key, so a consumer can always index it.
+        let payload = metrics_payload(&counter, &[]);
+        assert_eq!(
+            payload["unhealthy_models"],
+            json!([]),
+            "an all-healthy service reports an EMPTY list, never a missing key"
+        );
+
+        // Down: the names are carried through verbatim.
+        let down = vec!["deepseek-v4-flash".to_string(), "deepseek-v4-pro".to_string()];
+        let payload = metrics_payload(&counter, &down);
+        assert_eq!(payload["unhealthy_models"], json!(down));
+    }
     #[test]
     fn the_routes_payload_reports_unknown_rather_than_a_healthy_zero() {
         // An EMPTY counter: the fresh-deploy case.
-        let payload = metrics_payload(&crate::error::ServerErrorCounter::default());
+        let payload = metrics_payload(&crate::error::ServerErrorCounter::default(), &[]);
 
         assert_eq!(
             payload["server_errors"],
@@ -643,7 +678,7 @@ mod tests {
         // so the two cases are different payloads and the alert can tell them apart.
         let clean = crate::error::ServerErrorCounter::default();
         clean.record_response();
-        let payload = metrics_payload(&clean);
+        let payload = metrics_payload(&clean, &[]);
         assert_eq!(
             payload["error_rate"],
             json!(0.0),
@@ -661,7 +696,7 @@ mod tests {
             mixed.record_response();
         }
         mixed.record_error();
-        let payload = metrics_payload(&mixed);
+        let payload = metrics_payload(&mixed, &[]);
         assert_eq!(payload["server_errors"], json!(1));
         assert_eq!(payload["responses"], json!(4));
         assert_eq!(payload["error_rate"], json!(0.25));

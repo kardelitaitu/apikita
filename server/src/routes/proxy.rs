@@ -200,6 +200,32 @@ fn retain_usage_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
 /// worthless unless they are shared across requests.
 static UPSTREAM: OnceLock<UpstreamClient> = OnceLock::new();
 
+/// The models whose EVERY routed endpoint currently has an open circuit, i.e. the
+/// `all_providers_unhealthy` alert condition (`docs/observability.md:104`).
+///
+/// Returns the model NAMES rather than a boolean so the operator reading the metrics
+/// route learns WHICH models are down, not merely that something is. An alert that
+/// says "a provider is unhealthy" without naming it costs a second investigation.
+///
+/// This is the accessor the metrics payload uses; `UpstreamClient::all_endpoints_unhealthy`
+/// is the per-model predicate behind it. Deliberately NOT built on
+/// `shortest_cooldown_secs`, which answers the opposite question - see that method.
+///
+/// Empty when nothing is registered yet: the client is initialised lazily on the first
+/// proxied request, so before then there is no pool to be unhealthy.
+pub fn models_with_no_healthy_endpoint() -> Vec<String> {
+    let Some(upstream) = UPSTREAM.get() else {
+        return Vec::new();
+    };
+    upstream
+        .allowed_models()
+        .into_iter()
+        .filter(|name| upstream.all_endpoints_unhealthy(name))
+        .map(str::to_string)
+        .collect()
+}
+
+
 fn hash_string(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
