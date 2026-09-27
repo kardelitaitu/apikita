@@ -32,7 +32,7 @@ It does **not** proxy LLM requests. That is [`server/`](../../server/README.md).
 
 **The website is built and builds green.** Measured 2026-09-27:
 `cd website && npm run build` emits **18 static pages** and `npm test` passes
-**118 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 118`, `# pass 118`).
+**122 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 122`, `# pass 122`).
 Count them rather than recalling them — both numbers move whenever a page or a
 contract test lands.
 Every route in the spec's table
@@ -137,6 +137,7 @@ state, checked against the tree rather than assumed:
 | Top up via dynamic QRIS (Midtrans) | [04-payments.md](04-payments.md) | **Page + island built** (`/dashboard/wallet`, `TopUpForm`). A real Midtrans round-trip was not verified |
 | Check balance (live, no refresh) | [01-architecture.md](01-architecture.md), [02-data-model.md](02-data-model.md) | **Built** — `lib/live.ts` SSE + polling fallback, `GET /events` mounted |
 | Create API keys, all models | [06-api-keys-and-limits.md](06-api-keys-and-limits.md) | **Built** — `KeyManagement` island over `/api/keys` |
+| Edit a key's limits / models / label | [06-api-keys-and-limits.md](06-api-keys-and-limits.md) | **Built** — the island's Edit modal issues `PATCH /api/keys/:id`. A limit *reduction* shows the ≤60s cache-TTL warning |
 | Usage limits (spend / token / rate / expiry) | [06-api-keys-and-limits.md](06-api-keys-and-limits.md) | **UI built** (limit fields in the island). Server-side enforcement in `server/src/routes/proxy.rs` not verified here |
 | Google + email/password login | [03-functional-spec.md](03-functional-spec.md), [../architecture/identity.md](../architecture/identity.md) | **Pages built** (`/login`, `/signup`). The Google round-trip was not exercised |
 | Logout + sign out everywhere | [03-functional-spec.md](03-functional-spec.md), [05-security-decisions.md](05-security-decisions.md) | **Built** — header controls in `layouts/DashboardLayout.astro` call `POST /auth/logout` and `POST /auth/logout-all` |
