@@ -2196,4 +2196,15 @@ mod tests {
         assert_no_drift(&pool, &[operator]).await;
         db.close().await;
     }
+
+    #[test]
+    fn a_sqlx_error_maps_to_the_app_database_variant() {
+        // The `?` operator on every admin query funnels sqlx failures through
+        // this conversion; if it ever wrapped the wrong variant, operators
+        // would see a misleading error code for a database outage.
+        assert!(matches!(
+            AdminError::from(sqlx::Error::RowNotFound),
+            AdminError::App(AppError::Database(_))
+        ));
+    }
 }

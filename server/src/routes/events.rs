@@ -654,6 +654,17 @@ mod tests {
     }
 
     #[test]
+    fn resume_snapshots_when_the_buffer_is_empty() {
+        // A client reconnecting with a Last-Event-ID against a hub that has
+        // NEVER published anything: there is no history to prove continuity
+        // against, so the safe answer is a snapshot - not an empty replay,
+        // which would read to the client as "nothing happened while you were
+        // gone" no matter how long the hub has actually been running.
+        let hub = RealtimeHub::new(&hub_config(10, 5));
+        assert!(matches!(hub.resume(Some(1)), Resume::Snapshot));
+    }
+
+    #[test]
     fn event_ids_are_monotonic_and_snapshots_carry_the_latest() {
         let hub = RealtimeHub::new(&hub_config(10, 5));
         let owner = Uuid::new_v4();

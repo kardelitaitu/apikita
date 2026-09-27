@@ -304,6 +304,24 @@ pub mod test_env {
             self.previous.push((key, std::env::var_os(key)));
             std::env::set_var(key, value);
         }
+
+        /// Removes a variable for the duration of the guard, putting the
+        /// PREVIOUS value - or its absence - back on Drop. This is how a test
+        /// exercises the "required configuration is MISSING" path rather than
+        /// merely an invalid value.
+        pub fn remove(key: &'static str) -> Self {
+            let mut guard = Self {
+                previous: Vec::new(),
+            };
+            guard.also_remove(key);
+            guard
+        }
+
+        /// Removes another variable under the same guard.
+        pub fn also_remove(&mut self, key: &'static str) {
+            self.previous.push((key, std::env::var_os(key)));
+            std::env::remove_var(key);
+        }
     }
 
     impl Drop for EnvGuard {
@@ -328,6 +346,7 @@ pub mod test_env {
         const RESTORED: &str = "APK_TEST_ENV_GUARD_PROBE_RESTORED";
         const REMOVED: &str = "APK_TEST_ENV_GUARD_PROBE_REMOVED";
         const PANICKED: &str = "APK_TEST_ENV_GUARD_PROBE_PANICKED";
+        const SET_FOR_REMOVAL: &str = "APK_TEST_ENV_GUARD_PROBE_REMOVAL";
         const SERIALISED: &str = "APK_TEST_ENV_GUARD_PROBE_SERIALISED";
 
         #[test]
@@ -366,6 +385,22 @@ pub mod test_env {
                 std::env::var_os(REMOVED).is_none(),
                 "a variable that was UNSET before the guard must be unset again, not left holding the test value"
             );
+        }
+
+        #[test]
+        fn remove_hides_a_variable_and_restores_its_previous_state_on_drop() {
+            let _lock = EnvLock::acquire();
+            std::env::set_var(SET_FOR_REMOVAL, "the-original-value");
+            {
+                let _guard = EnvGuard::remove(SET_FOR_REMOVAL);
+                assert!(std::env::var_os(SET_FOR_REMOVAL).is_none());
+            }
+            assert_eq!(
+                std::env::var(SET_FOR_REMOVAL).as_deref(),
+                Ok("the-original-value"),
+                "a removed variable must come back with its previous value"
+            );
+            std::env::remove_var(SET_FOR_REMOVAL);
         }
 
         /// The classic bug this type exists to prevent: a guard that restores on

@@ -2074,6 +2074,54 @@ mod tests {
         outcome.expect("the create_topup assertions panicked");
     }
 
+    #[tokio::test]
+    async fn live_create_topup_without_a_server_key_is_an_internal_failure_persisting_nothing() {
+        // Held for the WHOLE test body: the spawned task REMOVES
+        // MIDTRANS_SERVER_KEY, and this lock keeps that write from interleaving
+        // with another test's - in this module or in routes::webhooks, which
+        // installs its own key.
+        let _env = EnvLock::acquire();
+
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let primary = live_account(&pool).await;
+
+        // The same contract as an unreachable Snap, reached a different way:
+        // the configuration itself is MISSING, which in production is a deploy
+        // defect. The handler must still answer 500 internal_error, persist
+        // nothing, and never leak the missing variable's name to the client.
+        let outcome = tokio::spawn(async move {
+            let _guard = EnvGuard::remove("MIDTRANS_SERVER_KEY");
+            let state = live_app_state(pool.clone());
+            let (status, body) = respond(create_topup(
+                State(state),
+                cookie_header(&primary.token),
+                Json(CreateTopupRequest {
+                    amount_idr: configured_wallet().min_first_deposit as i64,
+                }),
+            ))
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a top-up that cannot even find its server key is an internal \
+                 failure, not a created top-up. body: {body}"
+            );
+            assert_eq!(body["error"]["code"], json!("internal_error"), "{body}");
+            assert!(
+                !serde_json::to_string(&body)
+                    .expect("the body is json")
+                    .contains("MIDTRANS_SERVER_KEY"),
+                "the missing-variable name must not reach the client: {body}"
+            );
+        });
+
+        let outcome = outcome.await;
+        db.close().await;
+        outcome.expect("the missing-server-key assertions panicked");
+    }
+
     async fn create_topup_failure_assertions(pool: SqlitePool, account_id: Uuid, token: String) {
         let wallet = configured_wallet();
         let amount = wallet.min_first_deposit as i64;
