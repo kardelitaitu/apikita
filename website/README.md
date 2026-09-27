@@ -41,8 +41,8 @@ without a refresh, falling back to polling if the stream drops.
 ## Status
 
 **Built and building.** Measured 2026-09-27: `npm run build` emits **18 pages** and
-`npm test` passes **102 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 102`,
-`# pass 102`). Count them rather than recalling them — both numbers move every time a
+`npm test` passes **109 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 109`,
+`# pass 109`). Count them rather than recalling them — both numbers move every time a
 page or a contract test lands. What exists today:
 
 - **Public pages** — `/` (landing + pricing), `/login`, `/signup`, `/verify`,
@@ -50,13 +50,15 @@ page or a contract test lands. What exists today:
   and the `/404` fallback.
 - **Dashboard** — `/dashboard` (balance, today's usage, **recent requests** from
   `GET /api/usage/recent`) plus `/dashboard/{keys,usage,wallet}`, and the
-  `/dashboard/keys/new` and `/dashboard/settings` pages.
+  `/dashboard/keys/new` and `/dashboard/settings` pages. Every dashboard page
+  carries a **service-status badge** polled from `GET /health` — reachability of
+  the API and its database only, never upstream providers.
 - **Operator console** — `/admin`, the account lookup + suspend/resume UI over the
   admin routes. Gated on `is_operator` from `GET /api/me`; the server re-checks.
 - **Islands** — `islands/keys/KeyManagement.astro`, `islands/usage/UsageAnalytics.astro`,
   `islands/wallet/TopUpForm.astro` and `islands/admin/AccountAdmin.astro`, each
   mounted by its page.
-- **Shared layer** — `lib/{admin,api,auth-flow,dashboard-form,errors,format,live,login-error,midtrans-env,models,pocketbase,recent-usage,retry-wait,usage}.ts`.
+- **Shared layer** — `lib/{admin,api,auth-flow,dashboard-form,errors,format,live,login-error,midtrans-env,models,pocketbase,recent-usage,retry-wait,service-status,usage}.ts`.
 
 `/dashboard/keys/new` and `/dashboard/settings` are specified
 (`docs/website/03-functional-spec.md` lines 17, 20) and both have a page

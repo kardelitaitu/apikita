@@ -113,21 +113,34 @@
 
     rowsEl.replaceChildren();
     for (const b of buckets) {
+      // Built with createElement + textContent, never innerHTML: every value here
+      // is server data, and the one interpolated string (the day) is the exact
+      // shape a hand-rolled escaper gets subtly wrong. textContent has no escaping
+      // to forget — the same rule the admin console and the recent-requests table
+      // follow.
       const tr = document.createElement('tr');
-      tr.innerHTML =
-        '<th scope="row" class="py-2 pr-4 font-normal">' + escapeHtml(bucketDay(b) ?? '—') + '</th>' +
-        '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.input_tokens) + '</td>' +
-        '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.cache_read_tokens) + '</td>' +
-        '<td class="py-2 pr-4 text-right font-mono tabular-nums">' + formatCount(b.output_tokens) + '</td>' +
-        '<td class="py-2 text-right font-mono tabular-nums">' + formatIdr(b.cost_idr) + '</td>';
+
+      const th = document.createElement('th');
+      th.scope = 'row';
+      th.className = 'py-2 pr-4 font-normal';
+      th.textContent = bucketDay(b) ?? '—';
+      tr.append(th);
+
+      const cells: [string, string][] = [
+        [formatCount(b.input_tokens), 'py-2 pr-4 text-right font-mono tabular-nums'],
+        [formatCount(b.cache_read_tokens), 'py-2 pr-4 text-right font-mono tabular-nums'],
+        [formatCount(b.output_tokens), 'py-2 pr-4 text-right font-mono tabular-nums'],
+        [formatIdr(b.cost_idr), 'py-2 text-right font-mono tabular-nums'],
+      ];
+      for (const [text, className] of cells) {
+        const td = document.createElement('td');
+        td.className = className;
+        td.textContent = text;
+        tr.append(td);
+      }
+
       rowsEl.appendChild(tr);
     }
-  }
-
-  function escapeHtml(s: string): string {
-    return s.replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    }[c] as string));
   }
 
   // GET /api/usage returns daily buckets. Accept either a bare array or an

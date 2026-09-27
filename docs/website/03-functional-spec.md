@@ -104,7 +104,14 @@ Live-updating by default (see [01-architecture.md](01-architecture.md)).
 | Today's usage | `usage_daily` | Realtime |
 | Token breakdown | input / cache-read / output | Same |
 | Recent requests | last N metered calls (`GET /api/usage/recent`, source `usage_events`) | On load |
-| Status | upstream health | Poll |
+| Status | `GET /health` — the API and its database only | Poll (60s) |
+
+> **Status limited by design.** `docs/observability.md:193` forbids `/health` from
+> probing upstream providers ("an upstream outage would then look like a dead
+> server and trigger a restart loop"). So this indicator reports whether the
+> platform is **reachable**, not whether a model provider is healthy, and its copy
+> must never claim otherwise. A true upstream-health view needs the operator
+> surface (see `docs/admin-surface.md` open items), not the customer dashboard.
 
 ### Required states
 
