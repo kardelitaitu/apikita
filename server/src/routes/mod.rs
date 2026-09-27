@@ -206,6 +206,7 @@ pub fn create_router(state: AppState) -> Router {
         // Admin (cookie + operator flag)
         .route("/api/admin/accounts", get(admin::list_accounts))
         .route("/api/admin/accounts/{id}", get(admin::get_account))
+        .route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit))
         .route(
             "/api/admin/accounts/{id}/suspend",
             post(admin::suspend_account),

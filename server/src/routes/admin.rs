@@ -412,6 +412,99 @@ pub async fn list_accounts(
     .into_response())
 }
 
+/// Query parameters for the audit read. A single optional limit, kept local
+/// rather than shared with `account.rs`'s LimitQuery, which is that module's
+/// own type.
+#[derive(Debug, Deserialize)]
+pub struct AdminAuditQuery {
+    pub limit: Option<i64>,
+}
+
+/// The audit row the operator surface reveals. Never a credential; `detail` is
+/// whatever the action recorded (counts, prior status), and is free-form text the
+/// handlers wrote.
+#[derive(Debug, Serialize)]
+pub struct AdminAuditEntry {
+    pub id: i64,
+    pub operator_id: Uuid,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// `GET /api/admin/accounts/{id}/audit` - what operators have done to an account.
+///
+/// Why this exists: every admin action writes an `admin_audit` row
+/// (docs/admin-surface.md:288), but **nothing read them back**, so the trail the
+/// doc calls "the record that makes disputes resolvable" was invisible to the very
+/// operator meant to consult it. This is the read side of a table that was
+/// write-only.
+///
+/// Safety, same order as every sibling:
+///
+/// 1. `require_operator` runs first, before any row is read.
+/// 2. `refuse_self_action`: an operator may not read the audit of their **own**
+///    account through the admin surface. This is the same rule the read-only
+///    `get_account` enforces, and it matters more here: the trail names the
+///    OPERATOR on each row, so reading one's own would expose the audit of
+///    actions taken against oneself - which the self-action rule exists to keep
+///    out of this surface. An operator can still see their own account at
+///    `GET /api/me`.
+/// 3. Only then the query, newest first, bounded.
+pub async fn get_account_audit(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Query(query): Query<AdminAuditQuery>,
+) -> Result<Response, AdminError> {
+    let operator_id = require_operator(&state, &headers).await?;
+    refuse_self_action(operator_id, id)?;
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    // The index `admin_audit_target_idx (target_type, target_id)` serves the
+    // WHERE; the ORDER BY is a small sort over one account's rows.
+    let rows = sqlx::query(
+        r#"
+        SELECT id, operator_id, action, target_type, target_id, detail, created_at
+        FROM admin_audit
+        WHERE target_type = ? AND target_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(TARGET_TYPE_ACCOUNT)
+    .bind(id.hyphenated())
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut entries: Vec<AdminAuditEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let operator_raw: String = row.try_get("operator_id")?;
+        let operator_uuid = Uuid::parse_str(&operator_raw).map_err(|e| {
+            AdminError::App(AppError::Internal(format!(
+                "admin_audit.operator_id is not a uuid: {e}"
+            )))
+        })?;
+        entries.push(AdminAuditEntry {
+            id: row.try_get("id")?,
+            operator_id: operator_uuid,
+            action: row.try_get("action")?,
+            target_type: row.try_get("target_type")?,
+            target_id: row.try_get("target_id")?,
+            detail: row.try_get("detail")?,
+            created_at: row.try_get("created_at")?,
+        });
+    }
+
+    Ok(Json(json!({ "entries": entries, "limit": limit })).into_response())
+}
+
+
+
 /// POST /api/admin/accounts/{id}/suspend - the security-critical action.
 ///
 /// ONE transaction does all three things, and the audit row is written inside it
@@ -2207,4 +2300,176 @@ mod tests {
             AdminError::App(AppError::Database(_))
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // GET /api/admin/accounts/{id}/audit - the read side of admin_audit.
+    //
+    // The table was write-only until this route: the doc calls the trail "the
+    // record that makes disputes resolvable", but nothing read it back. These
+    // tests prove the read works AND keeps the two rules that matter: only an
+    // operator may read it, and an operator may not read their OWN account's
+    // trail through this surface (which get_account also refuses).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn account_audit_requires_an_operator_and_refuses_self() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let outsider = create_account(&pool).await;
+        let victim = create_account(&pool).await;
+
+        // No cookie -> 401, before any row is read.
+        let (status, _) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            HeaderMap::new(),
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A live NON-operator session -> 403.
+        let outsider_headers = cookie_headers(&issue_session(&pool, outsider).await);
+        let (status, body) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            outsider_headers,
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+        assert_eq!(body["error"]["code"], json!("forbidden"));
+
+        // The operator reading their OWN trail -> 403 (refuse_self_action).
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let (status, _) = render(get_account_audit(
+            State(state.clone()),
+            Path(operator),
+            operator_headers.clone(),
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "an operator may not read their own audit here");
+
+        assert_no_drift(&pool, &[operator, outsider, victim]).await;
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn account_audit_returns_the_actions_in_order_with_their_details() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let victim = create_account(&pool).await;
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        // Before any action: an empty trail, not an error.
+        let (status, body) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["entries"].as_array().unwrap().len(), 0, "a fresh account has no trail");
+
+        // Suspend then resume through the real handlers, so the rows are the
+        // ones production writes.
+        let (status, _) = render(suspend_account(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = render(resume_account(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let entries = body["entries"].as_array().expect("entries is an array");
+        assert_eq!(entries.len(), 2, "two actions, two rows: {body}");
+
+        // Newest first: resume then suspend.
+        assert_eq!(entries[0]["action"], json!("resume"));
+        assert_eq!(entries[0]["target_type"], json!("account"));
+        assert_eq!(entries[0]["target_id"], json!(victim.hyphenated().to_string()));
+        assert_eq!(entries[1]["action"], json!("suspend"));
+
+        // The exact field set - never a credential.
+        let mut keys: Vec<&str> = entries[0].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["action", "created_at", "detail", "id", "operator_id", "target_id", "target_type"],
+            "docs/server/api-spec.md: {body}"
+        );
+        assert_eq!(entries[0]["operator_id"], json!(operator));
+        let text = body.to_string();
+        for forbidden in ["token_hash", "key_hash", "snap_token"] {
+            assert!(!text.contains(forbidden), "the audit leaked {forbidden}: {text}");
+        }
+
+        // The limit is bounded.
+        let (_, body) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+            Query(AdminAuditQuery { limit: Some(1) }),
+        ))
+        .await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["limit"], json!(1));
+
+        assert_no_drift(&pool, &[operator, victim]).await;
+        db.close().await;
+    }
+
+    /// The route is reachable through the router, not only by calling the handler.
+    #[tokio::test]
+    async fn account_audit_route_is_mounted() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let victim = create_account(&pool).await;
+        let app = app(state.clone());
+
+        let token = issue_session(&pool, operator).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/admin/accounts/{}/audit", victim.hyphenated()))
+                    .header(header::COOKIE, format!("session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_body(res).await;
+        assert!(body["entries"].is_array(), "body: {body}");
+
+        assert_no_drift(&pool, &[operator, victim]).await;
+        db.close().await;
+    }
+
 }
