@@ -37,6 +37,33 @@
     </p>
   </section>
 
+  <section class="mt-10" aria-labelledby="usage-trend-h">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <h2 id="usage-trend-h" class="text-lg font-semibold tracking-tight">Trend</h2>
+      <div class="flex flex-wrap gap-2" role="group" aria-label="Trend metric">
+        <button type="button" data-metric="input_tokens" class="trend-metric rounded-md border border-edge-strong px-3 py-1 text-xs font-medium">Input tokens</button>
+        <button type="button" data-metric="output_tokens" class="trend-metric rounded-md border border-edge-strong px-3 py-1 text-xs font-medium">Output tokens</button>
+        <button type="button" data-metric="cost_idr" class="trend-metric rounded-md border border-edge-strong px-3 py-1 text-xs font-medium">Cost</button>
+      </div>
+    </div>
+    <p class="mt-1 text-sm text-ink-muted">
+      One series at a time, on its own scale. The three token classes are not
+      stacked: cache-read is priced ~200x below output, so a shared axis would
+      imply a comparability that does not exist.
+    </p>
+
+    <p id="usage-trend-empty" hidden class="mt-4 rounded-lg border border-edge bg-surface-raised p-4 text-sm text-ink-muted">
+      No usage in this period, so there is nothing to plot yet.
+    </p>
+
+    <div id="usage-trend-wrap" hidden class="mt-4 rounded-lg border border-edge bg-surface-raised p-4">
+      <p id="usage-trend-caption" class="text-xs text-ink-muted"></p>
+      <div class="mt-3 overflow-x-auto">
+        <div id="usage-trend" class="flex h-40 min-w-full items-end gap-1"></div>
+      </div>
+    </div>
+  </section>
+
   <section class="mt-10" aria-labelledby="usage-daily-h">
     <div class="flex items-center justify-between">
       <h2 id="usage-daily-h" class="text-lg font-semibold tracking-tight">Daily breakdown</h2>
@@ -78,6 +105,14 @@
   // <script> block: astro does not type-check it and node --test cannot load it,
   // which is how `?from=-30d` (a 422 every load) shipped green.
   import { bucketDay, newestBucket, usageWindowQuery, type UsageBucket } from '../../lib/usage.ts';
+  // The trend geometry is pure maths, pinned by tests/usage-trend.test.ts.
+  import {
+    buildTrend,
+    metricLabel,
+    shortDayLabel,
+    trendHasData,
+    type TrendMetric,
+  } from '../../lib/usage-trend.ts';
 
   const $ = (id: string) => document.getElementById(id) as HTMLElement;
   const errorEl = $('usage-error');
@@ -143,6 +178,71 @@
     }
   }
 
+  // --- Trend ----------------------------------------------------------------
+  // One series at a time, drawn as CSS-height bars (no chart dependency, no SVG
+  // maths in the DOM). The last-loaded buckets are kept so switching the metric
+  // redraws without a second request.
+  let lastBuckets: UsageBucket[] = [];
+  let metric: TrendMetric = 'input_tokens';
+  const trendWrap = $('usage-trend-wrap');
+  const trendEl = $('usage-trend');
+  const trendEmpty = $('usage-trend-empty');
+  const trendCaption = $('usage-trend-caption');
+
+  function renderTrend(): void {
+    const bars = buildTrend(lastBuckets, metric);
+    const hasData = trendHasData(bars);
+    trendEmpty.toggleAttribute('hidden', hasData);
+    trendWrap.toggleAttribute('hidden', !hasData);
+    if (!hasData) {
+      trendEl.replaceChildren();
+      return;
+    }
+
+    // The caption states the window and the metric, so the picture is never
+    // ambiguous about either.
+    const first = bars[0].day;
+    const last = bars[bars.length - 1].day;
+    trendCaption.textContent = `${metricLabel(metric)} — ${shortDayLabel(first)} to ${shortDayLabel(last)}, tallest day = 100%`;
+
+    trendEl.replaceChildren();
+
+    for (const bar of bars) {
+      const col = document.createElement('div');
+      col.className = 'flex h-full min-w-[6px] flex-1 flex-col justify-end';
+      col.title = `${bar.day}: ${formatCount(rawValue(bar))}`;
+
+      const fill = document.createElement('div');
+      // A zero-height day still gets a hairline so the day is visible on the axis.
+      fill.className = 'w-full rounded-t bg-brand';
+      fill.style.height = bar.height === 0 ? '1px' : `${Math.round(bar.height * 100)}%`;
+      if (bar.height === 0) fill.classList.add('opacity-30');
+      col.append(fill);
+      trendEl.append(col);
+    }
+  }
+
+  function rawValue(bar: { input_tokens: number; output_tokens: number; cost_idr: number }): number {
+    return metric === 'cost_idr' ? bar.cost_idr : metric === 'output_tokens' ? bar.output_tokens : bar.input_tokens;
+  }
+
+  for (const btn of Array.from(document.querySelectorAll<HTMLButtonElement>('.trend-metric'))) {
+    btn.addEventListener('click', () => {
+      metric = (btn.dataset.metric as TrendMetric) ?? 'input_tokens';
+      renderTrend();
+      syncMetricButtons();
+    });
+  }
+
+  function syncMetricButtons(): void {
+    for (const btn of Array.from(document.querySelectorAll<HTMLButtonElement>('.trend-metric'))) {
+      const active = btn.dataset.metric === metric;
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+      btn.classList.toggle('bg-brand', active);
+      btn.classList.toggle('text-brand-ink', active);
+    }
+  }
+
   // GET /api/usage returns daily buckets. Accept either a bare array or an
   // envelope ({ buckets | days | data }), and a trailing "today" snapshot if present.
   function parseUsage(payload: unknown): { buckets: UsageBucket[]; today: UsageBucket | null } {
@@ -169,13 +269,18 @@
     try {
       const payload = await apiFetch<unknown>('/api/usage' + usageWindowQuery());
       const { buckets, today } = parseUsage(payload);
+      lastBuckets = buckets;
       renderToday(today);
+      renderTrend();
+      syncMetricButtons();
       renderRows(buckets);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
       const view = describeError(err);
       showError(inlineNotice(view));
+      lastBuckets = [];
       renderToday(null);
+      renderTrend();
       renderRows([]);
       statusEl.textContent = '';
     }
