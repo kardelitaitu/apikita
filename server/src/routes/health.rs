@@ -95,6 +95,8 @@ pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
 pub(crate) fn metrics_payload(
     counter: &crate::error::ServerErrorCounter,
     unhealthy_models: &[String],
+    retention: &crate::db::RetentionLag,
+    today: chrono::NaiveDate,
 ) -> serde_json::Value {
     let server_errors = counter.server_errors();
     let responses = counter.responses();
@@ -116,7 +118,51 @@ pub(crate) fn metrics_payload(
         // The all_providers_unhealthy condition (docs/observability.md:104). A LIST,
         // empty when every model has at least one usable endpoint. Named rather than a
         // boolean so an operator learns WHICH model is down without a second lookup.
+        // The all_providers_unhealthy condition (docs/observability.md:104). A LIST,
+        // empty when every model has at least one usable endpoint. Named rather than a
+        // boolean so an operator learns WHICH model is down without a second lookup.
         "unhealthy_models": unhealthy_models,
+        // The db_disk alert's REAL question (docs/observability.md:106): its condition
+        // column says "volume usage" but its ACTION says "check retention". This is the
+        // age of the oldest row per age-based table, present ONLY when a row is past
+        // that table's window. An empty object means retention is keeping up.
+        //
+        // Deliberately NOT a disk percentage: 80% full is normal for a working
+        // database, while a sweep that stopped is an incident at any size, because it
+        // breaks a published retention promise.
+        "retention": retention_report(retention, today),
+    })
+}
+
+/// The retention half of the metrics payload.
+///
+/// Split out so the JSON shape is testable without a database, the same reasoning that
+/// produced `metrics_payload`. The window each table is measured against is included,
+/// so a reader can see the promise without opening the source.
+fn retention_report(
+    retention: &crate::db::RetentionLag,
+    today: chrono::NaiveDate,
+) -> serde_json::Value {
+    let windows = json!({
+        "usage_events": crate::db::USAGE_EVENTS_RETENTION_DAYS,
+        "usage_daily": crate::db::USAGE_DAILY_RETENTION_DAYS,
+        "sessions": crate::db::SESSION_RETENTION_DAYS,
+    });
+
+    // ONLY the tables that are behind, so an empty object reads as "retention is
+    // keeping up" and a non-empty one names exactly what is overdue.
+    let mut oldest_behind = serde_json::Map::new();
+    for (table, age) in retention.oldest_days_by_table() {
+        if let Some(days) = age {
+            oldest_behind.insert(table.to_string(), json!(days));
+        }
+    }
+
+    json!({
+        "behind": retention.anything_behind(),
+        "oldest_days": serde_json::Value::Object(oldest_behind),
+        "windows_days": windows,
+        "checked_on": today.to_string(),
     })
 }
 
@@ -128,9 +174,34 @@ pub async fn operator_metrics(
     // cannot learn anything from this route.
     crate::routes::admin::require_operator(&state, &headers).await?;
 
+    // The retention read is the one part of this route that touches the database, and
+    // it is deliberately NOT allowed to fail the whole response: an operator asking for
+    // the counters during an incident should still get them if the retention query
+    // errors. A failed read is reported as a distinct field, never as "no lag".
+    let today = chrono::Utc::now().date_naive();
+    let retention = match crate::db::retention_lag(&state.pool, today).await {
+        Ok(lag) => lag,
+        Err(err) => {
+            tracing::error!(error = %err, "metrics: the retention-lag read failed");
+            let counter = crate::error::server_error_counter();
+            // Sentinel: "behind" is NULL rather than false, so a consumer can tell
+            // "retention is fine" from "we could not tell".
+            return Ok(Json(json!({
+                "server_errors": counter.server_errors(),
+                "responses": counter.responses(),
+                "error_rate": counter.error_rate(),
+                "unhealthy_models": crate::routes::proxy::models_with_no_healthy_endpoint(),
+                "retention": { "behind": null, "error": "the retention read failed" },
+            }))
+            .into_response());
+        }
+    };
+
     Ok(Json(metrics_payload(
         crate::error::server_error_counter(),
         &crate::routes::proxy::models_with_no_healthy_endpoint(),
+        &retention,
+        today,
     ))
     .into_response())
 }
@@ -640,12 +711,51 @@ mod tests {
     /// Named rather than a boolean on purpose: an alert saying "a provider is down"
     /// without saying WHICH costs a second investigation, and the operator already has
     /// the route open.
+
+    /// The retention half of the payload: empty when healthy, NAMED when behind.
+    ///
+    /// `db_disk`'s action is "check retention", so an operator needs to know WHICH
+    /// table is overdue and by how long - a bare boolean would send them to the
+    /// database to find out.
+    #[test]
+    fn the_retention_report_names_the_tables_that_are_behind() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        // Healthy: behind is false and the named list is EMPTY, not missing, so a
+        // consumer can always index it.
+        let healthy = crate::db::RetentionLag::default();
+        let report = retention_report(&healthy, today);
+        assert_eq!(report["behind"], json!(false));
+        assert_eq!(report["oldest_days"], json!({}));
+        assert_eq!(report["checked_on"], json!("2026-06-01"));
+
+        // Behind on ONE table: only that table is named, with its real age.
+        let behind = crate::db::RetentionLag {
+            usage_events: Some(200),
+            usage_daily: None,
+            sessions: None,
+        };
+        let report = retention_report(&behind, today);
+        assert_eq!(report["behind"], json!(true));
+        assert_eq!(
+            report["oldest_days"],
+            json!({ "usage_events": 200 }),
+            "only the LAGGING table is named: listing a healthy table would suggest it is overdue"
+        );
+
+        // The window each table is measured against is visible, so the promise is not
+        // a mystery number in the payload.
+        assert_eq!(
+            report["windows_days"]["usage_events"],
+            json!(crate::db::USAGE_EVENTS_RETENTION_DAYS)
+        );
+    }
     #[test]
     fn the_payload_names_every_model_with_no_usable_endpoint() {
         let counter = crate::error::ServerErrorCounter::default();
 
         // Healthy: an EMPTY list, not a missing key, so a consumer can always index it.
-        let payload = metrics_payload(&counter, &[]);
+        let payload = metrics_payload(&counter, &[], &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
         assert_eq!(
             payload["unhealthy_models"],
             json!([]),
@@ -657,13 +767,13 @@ mod tests {
             "deepseek-v4-flash".to_string(),
             "deepseek-v4-pro".to_string(),
         ];
-        let payload = metrics_payload(&counter, &down);
+        let payload = metrics_payload(&counter, &down, &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
         assert_eq!(payload["unhealthy_models"], json!(down));
     }
     #[test]
     fn the_routes_payload_reports_unknown_rather_than_a_healthy_zero() {
         // An EMPTY counter: the fresh-deploy case.
-        let payload = metrics_payload(&crate::error::ServerErrorCounter::default(), &[]);
+        let payload = metrics_payload(&crate::error::ServerErrorCounter::default(), &[], &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
 
         assert_eq!(
             payload["server_errors"],
@@ -681,7 +791,7 @@ mod tests {
         // so the two cases are different payloads and the alert can tell them apart.
         let clean = crate::error::ServerErrorCounter::default();
         clean.record_response();
-        let payload = metrics_payload(&clean, &[]);
+        let payload = metrics_payload(&clean, &[], &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
         assert_eq!(
             payload["error_rate"],
             json!(0.0),
@@ -699,7 +809,7 @@ mod tests {
             mixed.record_response();
         }
         mixed.record_error();
-        let payload = metrics_payload(&mixed, &[]);
+        let payload = metrics_payload(&mixed, &[], &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
         assert_eq!(payload["server_errors"], json!(1));
         assert_eq!(payload["responses"], json!(4));
         assert_eq!(payload["error_rate"], json!(0.25));

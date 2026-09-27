@@ -445,6 +445,146 @@ pub struct PurgedUsage {
 /// Every cutoff is the same inclusive `<=` at midnight UTC of the cutoff day, for
 /// the reason documented on `purge_expired_usage`: an exclusive comparison
 /// silently retains N+1 days against an N-day promise.
+/// How far a table has drifted past its own retention window, in days.
+///
+/// `Some(days)` is the AGE of the table's oldest row when that age EXCEEDS the
+/// window - i.e. the sweep has left a row it promised to delete. `None` is "inside
+/// the window", including the empty table.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RetentionLag {
+    /// Age of the oldest `usage_events` row, when past the 90-day window.
+    pub usage_events: Option<i64>,
+    /// Age of the oldest `usage_daily` row, when past the 730-day window.
+    pub usage_daily: Option<i64>,
+    /// Age of the oldest expired/revoked `sessions` row, when past the 30-day window.
+    pub sessions: Option<i64>,
+}
+
+impl RetentionLag {
+    /// Whether ANY age-based table is holding a row past its retention period.
+    pub fn anything_behind(&self) -> bool {
+        self.usage_events.is_some() || self.usage_daily.is_some() || self.sessions.is_some()
+    }
+
+    /// Each table with the age of its oldest row, in the order the docs list them.
+    ///
+    /// The NAME is carried alongside the value so a caller cannot swap two tables in
+    /// a log line, the same reasoning as `PurgedUsage`'s named fields.
+    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 3] {
+        [
+            ("usage_events", self.usage_events),
+            ("usage_daily", self.usage_daily),
+            ("sessions", self.sessions),
+        ]
+    }
+}
+
+/// Whether the age-based tables still hold rows older than their retention windows.
+///
+/// WHY THIS EXISTS, and why it is not a disk percentage. `docs/observability.md:106`
+/// states the `db_disk` alert with the condition "volume usage" but the ACTION
+/// "Usage rows growing; check retention" - so the operator's real question is whether
+/// RETENTION IS WORKING. A volume figure cannot answer that: 80% full is normal for a
+/// database doing its job, and a sweep that silently STOPPED is an incident at any
+/// size, because it means a published data-retention promise is being broken.
+///
+/// That is not hypothetical here. `purge_expired_usage`'s own doc-comment records
+/// that these tables once "shipped populated with NO purge at all", because the
+/// policy lived in a document and nothing connected it to the code. Nothing could
+/// detect a REPEAT of that either - a sweep that ran yesterday and not since looks
+/// identical to a healthy one - and this query is what closes that gap.
+///
+/// ONE query per table rather than a UNION, because each table has its own window and
+/// its own timestamp column, and a UNION would need the cutoff expression three times
+/// in one statement with three different bound values. (SQLite binds positionally.)
+///
+/// The comparison mirrors `purge_expired_usage`'s inclusive `<=` at midnight UTC. If
+/// the two disagreed, a row could be simultaneously "old enough to delete" and "not
+/// lagging", and nothing would catch the drift.
+///
+/// NO aggregation over the whole table, deliberately: `MIN(created_at)` on an indexed
+/// column is a single index seek, so this is cheap enough to serve from the metrics
+/// route that a operator polls. A COUNT of stale rows would be a full scan and is not
+/// needed to answer "is retention working".
+/// The age of the OLDEST row in one age-based table, when that age exceeds the
+/// table's retention window. `None` when the table is empty or every row is inside
+/// the window.
+///
+/// A free function rather than a closure: it needs its own `async` body and an
+/// explicit error type, and a closure carrying a lifetime-bound `pool` reference
+/// fights the borrow checker for no benefit.
+async fn oldest_row_past_window(
+    pool: &SqlitePool,
+    table: &'static str,
+    column: &'static str,
+    days: i64,
+    today: chrono::NaiveDate,
+) -> Result<Option<i64>, AppError> {
+    // The cutoff at midnight UTC of the cutoff day, matching the purge exactly.
+    let cutoff = (today - chrono::Duration::days(days))
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+
+    // The oldest row overall. `MIN` over an empty table is NULL, which decodes to
+    // `None` - the "no rows" case, distinct from "an old row".
+    let oldest: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar(&format!("SELECT MIN({column}) FROM {table}"))
+            .fetch_one(pool)
+            .await?;
+
+    // INSIDE the window (or empty) -> not lagging. The boundary is the same `<=` the
+    // purge uses, so a row AT the cutoff is lagging in both and they cannot drift.
+    match oldest {
+        Some(at) if at <= cutoff => {
+            // Age in days, measured to the SAME midnight the cutoff uses, so a row
+            // exactly on the boundary reports exactly the window length.
+            let midnight_today = today
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is a valid time")
+                .and_utc();
+            Ok(Some((midnight_today - at).num_days()))
+        }
+        _ => Ok(None),
+    }
+}
+pub async fn retention_lag(
+    pool: &SqlitePool,
+    today: chrono::NaiveDate,
+) -> Result<RetentionLag, AppError> {
+    let usage_events = oldest_row_past_window(
+        pool,
+        "usage_events",
+        "created_at",
+        USAGE_EVENTS_RETENTION_DAYS,
+        today,
+    )
+    .await?;
+    // `usage_daily` is keyed by DAY, not an instant, so its column is `day`.
+    let usage_daily = oldest_row_past_window(
+        pool,
+        "usage_daily",
+        "day",
+        USAGE_DAILY_RETENTION_DAYS,
+        today,
+    )
+    .await?;
+    // Sessions age from `expires_at`, matching the purge.
+    let sessions = oldest_row_past_window(
+        pool,
+        "sessions",
+        "expires_at",
+        SESSION_RETENTION_DAYS,
+        today,
+    )
+    .await?;
+
+    Ok(RetentionLag {
+        usage_events,
+        usage_daily,
+        sessions,
+    })
+}
 pub async fn purge_expired_usage(
     pool: &SqlitePool,
     today: chrono::NaiveDate,
@@ -2904,6 +3044,171 @@ mod tests {
     }
 
     /// The 90-day boundary: a row at the cutoff instant is DELETED, one a second
+    // ---------------------------------------------------------------------
+    // retention_lag: whether a retention PROMISE is being broken
+    // ---------------------------------------------------------------------
+    //
+    // `docs/observability.md:106` states the db_disk alert as "volume usage" but its
+    // ACTION is "Usage rows growing; check retention" - the operator's real question
+    // is whether RETENTION IS WORKING. A volume percentage cannot answer that (80% is
+    // normal for a working database), while a sweep that silently stopped is an
+    // incident regardless of free space. `purge_expired_usage`'s own doc records that
+    // the tables once "shipped populated with NO purge at all"; this is the same class
+    // of defect, one step later - nothing can tell you the sweep stopped.
+    //
+    // The model is a LAG IN DAYS, not a boolean alone: "retention is behind" without an
+    // age is an alert an operator cannot act on.
+
+    /// An EMPTY database is not lagging, and reports no oldest row.
+    #[tokio::test]
+    async fn an_empty_database_has_no_retention_lag() {
+        let db = TestDb::new().await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        let lag = retention_lag(&db.pool, today).await.unwrap();
+
+        assert!(
+            !lag.anything_behind(),
+            "a database with no rows cannot be behind its retention"
+        );
+        // No rows means NO oldest row: distinct from "an old row", and the distinction
+        // matters because `None` must not be rendered as an age of 0.
+        for (table, oldest) in lag.oldest_days_by_table() {
+            assert_eq!(oldest, None, "{table} has no rows, so it has no oldest row");
+        }
+
+        db.close().await;
+    }
+
+    /// A row INSIDE its window is not lagging.
+    #[tokio::test]
+    async fn a_row_inside_its_window_is_not_behind() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        // One day old: comfortably inside a 90-day window.
+        let recent = today.and_hms_opt(12, 0, 0).unwrap().and_utc() - chrono::Duration::days(1);
+        sqlx::query(
+            "INSERT INTO usage_events (id, account_id, model, input_tokens, created_at)
+             VALUES (?, ?, 'flash', 1, ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(recent)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let lag = retention_lag(&db.pool, today).await.unwrap();
+        assert!(lag.usage_events.is_none(), "a row inside the window is not lagging");
+        assert!(!lag.anything_behind());
+
+        db.close().await;
+    }
+
+    /// A row PAST its window IS lagging, and its AGE is reported.
+    #[tokio::test]
+    async fn a_row_past_its_window_is_reported_as_behind() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        // 200 days old against a 90-day promise: the sweep has not run for a long time,
+        // or it is broken. Either way the PROMISE is being broken right now.
+        let stale = today.and_hms_opt(12, 0, 0).unwrap().and_utc() - chrono::Duration::days(200);
+        sqlx::query(
+            "INSERT INTO usage_events (id, account_id, model, input_tokens, created_at)
+             VALUES (?, ?, 'flash', 1, ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(stale)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let lag = retention_lag(&db.pool, today).await.unwrap();
+        assert!(lag.anything_behind(), "a 200-day-old row breaks a 90-day promise");
+        let days_old = lag
+            .usage_events
+            .expect("usage_events is the lagging table and must be named");
+        assert!(
+            days_old >= 199,
+            "the reported age must be the row's real age in days, got {days_old}"
+        );
+
+        db.close().await;
+    }
+
+    /// The boundary AGREES with the purge, so the two cannot disagree about one row.
+    ///
+    /// The subtle one. `purge_expired_usage` deletes at an inclusive `<=` on midnight
+    /// UTC of the cutoff day, and its doc explains why: "an exclusive comparison
+    /// silently retains N+1 days against an N-day promise". If the lag query drew the
+    /// boundary elsewhere, a row could be at once "old enough to delete" and "not
+    /// lagging", and the two would drift with nothing to catch it.
+    ///
+    /// The purge boundary is midnight of `today - 90`. A row one second AFTER that
+    /// instant is older than 90 days by every reasonable reading, so it IS behind -
+    /// and the test asserts exactly that, because getting it backwards here would
+    /// make the alert silent for a whole extra day.
+    #[tokio::test]
+    async fn a_row_past_the_purge_cutoff_is_reported_as_behind() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        let cutoff = (today - chrono::Duration::days(USAGE_EVENTS_RETENTION_DAYS))
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+
+        // TWO rows, one on each side of the purge boundary, asserted together so the
+        // lag query and the purge CANNOT disagree about the boundary:
+        //
+        //   * AT the cutoff (midnight, 90 days ago): the purge DELETES this row
+        //     (asserted by `usage_events_retention_deletes_the_boundary_day_and_keeps_89`),
+        //     so a surviving copy means the sweep did not run - BEHIND.
+        //   * ONE SECOND LATER: this row is 89d 23:59:59 old, INSIDE the 90-day
+        //     window, and the purge correctly KEEPS it. Reporting it as behind would
+        //     be a false alarm on a database whose retention is working perfectly.
+        for created in [cutoff, cutoff + chrono::Duration::seconds(1)] {
+            sqlx::query(
+                "INSERT INTO usage_events (id, account_id, model, input_tokens, created_at)
+                 VALUES (?, ?, 'flash', 1, ?)",
+            )
+            .bind(Uuid::new_v4().hyphenated())
+            .bind(account_id.hyphenated())
+            .bind(created)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // The OLDEST row decides, and the oldest is AT the cutoff, so this is behind.
+        let lag = retention_lag(&db.pool, today).await.unwrap();
+        assert_eq!(
+            lag.usage_events,
+            Some(USAGE_EVENTS_RETENTION_DAYS),
+            "a row exactly ON the cutoff day is one the purge would have deleted, so it is behind by the full window"
+        );
+
+        // Now prove the SECOND row alone is NOT behind, which is the half that would
+        // otherwise be untested: delete the boundary row and the answer must flip.
+        sqlx::query("DELETE FROM usage_events WHERE created_at <= ?")
+            .bind(cutoff)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let lag = retention_lag(&db.pool, today).await.unwrap();
+        assert_eq!(
+            lag.usage_events, None,
+            "an instant just INSIDE the window is not behind: treating it as behind would fire the alert on a database whose retention is working"
+        );
+
+        db.close().await;
+    }
     /// later is KEPT. The inclusive comparison is the whole point — with `<` the
     /// table silently retains 91 days against a 90-day promise.
     #[tokio::test]
