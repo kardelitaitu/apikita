@@ -3085,29 +3085,62 @@ mod tests {
         }
     }
 
-    /// Installs a capturing subscriber for the current thread. The guard must be held
-    /// while the code under test runs.
-    fn capture_logs() -> (
-        tracing::subscriber::DefaultGuard,
-        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    ) {
-        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer_sink = sink.clone();
+    /// The process-wide log sink every capturing test reads.
+    ///
+    /// A `static` rather than a per-test value, because the subscriber that writes here
+    /// must be GLOBAL (see `install_global_capture`). Callers hold the crate's EnvLock
+    /// and call `clear()` before the code under test runs, so each test sees only its
+    /// own lines.
+    static CAPTURED_LOGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    /// Installs a GLOBAL capturing subscriber, once per process.
+    ///
+    /// GLOBAL, not thread-local, and that distinction is a bug this test had. The proxy
+    /// handler SPAWNS work (settlement runs on its own task), so `set_default` - which
+    /// is thread-local - captured only what was emitted on the test's own thread. The
+    /// first version used it and **passed when run alone, then FAILED in the full suite
+    /// with an empty capture**, because under load the spawn landed on a worker thread
+    /// whose subscriber was the global (absent) one. The test's own positive control -
+    /// "the request must still be observable" - is what caught it, which is the case for
+    /// writing controls that can fail.
+    ///
+    /// `set_global_default` errors when one is already installed (other tests in this
+    /// module run in the same process), and that is harmless: the first call wins and
+    /// keeps writing into CAPTURED_LOGS, which every test reads.
+    fn install_global_capture() {
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             // EVERYTHING, including DEBUG and TRACE: the promise is about what the
-            // server is CAPABLE of emitting at any level, and a test that filtered to
-            // info! would miss exactly the debug! a developer adds while investigating
-            // a bug. That is how this promise breaks in practice.
+            // server is CAPABLE of emitting at any level, and a test filtered to
+            // `info!` would miss exactly the `debug!` a developer adds while
+            // investigating a bug. That is how this promise breaks in practice.
             .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || LogSink(writer_sink.clone()))
+            .with_writer(|| LogSinkShared)
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (guard, sink)
+        let _ = tracing::subscriber::set_global_default(subscriber);
     }
 
-    fn captured(sink: &std::sync::Mutex<Vec<u8>>) -> String {
-        String::from_utf8(sink.lock().expect("log sink lock").clone())
+    /// A writer that appends into the shared static sink.
+    struct LogSinkShared;
+
+    impl std::io::Write for LogSinkShared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut sink) = CAPTURED_LOGS.lock() {
+                sink.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn clear_captured() {
+        CAPTURED_LOGS.lock().expect("log sink lock").clear();
+    }
+
+    fn captured() -> String {
+        String::from_utf8(CAPTURED_LOGS.lock().expect("log sink lock").clone())
             .expect("log lines are utf-8")
     }
 
@@ -3132,40 +3165,42 @@ mod tests {
             r#"{{"model":"flash","stream":true,"messages":[{{"role":"user","content":"{SENTINEL}"}}]}}"#
         );
 
-        let assertions = tokio::spawn(async move {
-            let (_guard, sink) = capture_logs();
+        // The global subscriber is installed BEFORE the work is spawned, so lines from
+        // the spawned settlement task are captured too. The EnvLock is held for the
+        // whole test because the sink is process-wide.
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        install_global_capture();
+        clear_captured();
 
-            // Driven through the REAL handler. This request cannot reach a provider
-            // (no key is configured for the endpoint in this fixture), so it exercises
-            // the failure paths - which is where a body is most tempting to log while
-            // debugging. The prompt is in the request regardless of the outcome.
-            let _ = call_chat_completions(&state, &key, &body).await;
-            let logged = captured(&sink);
+        // Driven through the REAL handler. This request cannot reach a provider
+        // (no key is configured for the endpoint in this fixture), so it exercises
+        // the failure paths - which is where a body is most tempting to log while
+        // debugging. The prompt is in the request regardless of the outcome.
+        let result = call_chat_completions(&state, &key, &body).await;
+        drop(result);
+        let logged = captured();
 
-            assert!(
-                !logged.contains(SENTINEL),
-                "docs/observability.md:46-59 - a customer prompt must NEVER be logged. It appeared in:\n{logged}"
-            );
-            // Nor may the raw request body appear, which would leak the prompt through
-            // a different door (the whole request rather than the field).
-            assert!(
-                !logged.contains("messages"),
-                "the request body must not be logged; the promise covers the prompt INSIDE it. Logged:\n{logged}"
-            );
+        assert!(
+            !logged.contains(SENTINEL),
+            "docs/observability.md:46-59 - a customer prompt must NEVER be logged. It appeared in:\n{logged}"
+        );
+        // Nor may the raw request body appear, which would leak the prompt through a
+        // different door (the whole request rather than the field).
+        assert!(
+            !logged.contains("messages"),
+            "the request body must not be logged; the promise covers the prompt INSIDE it. Logged:\n{logged}"
+        );
 
-            // POSITIVE CONTROL. Without this the test passes on a server that logs
-            // NOTHING - including one accidentally silenced, which is a different bug
-            // that would also hide an incident. Something about THIS request must be
-            // logged, or the assertion above proves nothing.
-            assert!(
-                logged.contains("model") || logged.contains("account_id"),
-                "the request must still be OBSERVABLE (model, account, or a token count), or the privacy assertion is vacuous:\n{logged}"
-            );
-        });
-        with_fixture(db, async move {
-            assertions.await.expect("the privacy assertions panicked");
-        })
-        .await;
+        // POSITIVE CONTROL, and it EARNED ITS PLACE: when this test ran under the full
+        // suite with a thread-local subscriber, the capture was EMPTY and the two
+        // assertions above passed VACUOUSLY. This is the assertion that failed instead,
+        // which is exactly why a privacy test needs a control that can fail.
+        assert!(
+            logged.contains("model") || logged.contains("account_id"),
+            "the request must still be OBSERVABLE (model, account, or a token count), or the privacy assertion is vacuous:\n{logged}"
+        );
+
+        db.close().await;
     }
     async fn with_fixture<F>(db: TestDb, assertions: F)
     where
