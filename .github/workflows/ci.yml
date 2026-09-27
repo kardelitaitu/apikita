@@ -314,6 +314,18 @@ jobs:
           sh tools/relay-check/check.sh
           sh tools/relay-check/behaviour.sh
 
+      # The deployment definition must parse AND hold its documented invariants.
+      #
+      # docker-compose.yml is the file a new operator reads first and `docker compose
+      # up -d` obeys, and nothing validated it before this step. Its comments state
+      # several invariants as LOAD-BEARING - the scheduler working_dir (any other value
+      # makes the Gate 2 money check silently run against nothing), two DSNs that must
+      # stay separate, a data mount that must NOT be read-only, the relay config mounted
+      # where nginx actually reads it. A config that parses can still be wrong in ways
+      # that fail at 03:00 rather than at review time.
+      - name: Check the compose deployment definition
+        run: sh tools/compose-check/check.sh
+
       - name: Install website dependencies
         working-directory: website
         run: npm ci
