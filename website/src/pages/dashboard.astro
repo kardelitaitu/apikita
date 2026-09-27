@@ -45,6 +45,45 @@ import DashboardLayout from '../layouts/DashboardLayout.astro';
   </section>
 
   <section class="mt-10">
+    <div class="flex flex-wrap items-baseline justify-between gap-3">
+      <h2 class="text-lg font-semibold tracking-tight">Recent requests</h2>
+      <span id="recent-count" class="text-xs text-ink-muted"></span>
+    </div>
+    <p class="mt-2 text-sm text-ink-muted">
+      The most recent metered calls, newest first. Each row is one billed request;
+      the three token classes are shown separately because they are priced
+      separately.
+    </p>
+
+    <div id="recent-error" hidden role="alert"
+      class="mt-3 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
+
+    <p id="recent-loading" class="mt-3 text-sm text-ink-muted">Loading&hellip;</p>
+
+    <p id="recent-empty" hidden class="mt-3 rounded-lg border border-edge bg-surface-raised p-4 text-sm text-ink-muted">
+      No requests yet. Once your key calls
+      <code class="font-mono">POST /v1/chat/completions</code>, each billed request
+      appears here.
+    </p>
+
+    <div id="recent-wrap" hidden class="mt-3 overflow-x-auto rounded-lg border border-edge">
+      <table class="w-full border-collapse text-left text-sm">
+        <thead>
+          <tr class="border-b border-edge-strong bg-surface-sunken">
+            <th scope="col" class="px-4 py-2 font-medium">When</th>
+            <th scope="col" class="px-4 py-2 font-medium">Model</th>
+            <th scope="col" class="px-4 py-2 text-right font-medium">Input</th>
+            <th scope="col" class="px-4 py-2 text-right font-medium">Cache</th>
+            <th scope="col" class="px-4 py-2 text-right font-medium">Output</th>
+            <th scope="col" class="px-4 py-2 text-right font-medium">Cost</th>
+          </tr>
+        </thead>
+        <tbody id="recent-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="mt-10">
     <h2 class="text-lg font-semibold tracking-tight">API keys</h2>
     <p class="mt-3 text-sm text-ink-muted">
       Keys are managed on their own page: prefix, label, model access, spend against
@@ -55,3 +94,68 @@ import DashboardLayout from '../layouts/DashboardLayout.astro';
     </a>
   </section>
 </DashboardLayout>
+
+<script>
+  import { apiFetch } from '../lib/api';
+  import { describeError } from '../lib/errors';
+  import { formatIdr, formatCount } from '../lib/format';
+  import {
+    formatRequestTime,
+    mayHaveMore,
+    recentUsageHeading,
+    recentUsagePath,
+    type RecentUsage,
+  } from '../lib/recent-usage';
+
+  const errorBox = document.getElementById('recent-error') as HTMLElement;
+  const loading = document.getElementById('recent-loading') as HTMLElement;
+  const empty = document.getElementById('recent-empty') as HTMLElement;
+  const wrap = document.getElementById('recent-wrap') as HTMLElement;
+  const rows = document.getElementById('recent-rows') as HTMLElement;
+  const count = document.getElementById('recent-count') as HTMLElement;
+
+  /** One table row. textContent only — the model and ids are server data. */
+  function rowFor(request: RecentUsage): HTMLTableRowElement {
+    const tr = document.createElement('tr');
+    tr.className = 'border-b border-edge last:border-0';
+
+    const cells: [string, string][] = [
+      [formatRequestTime(request.created_at), 'px-4 py-2 text-ink-muted whitespace-nowrap'],
+      [request.model, 'px-4 py-2 font-mono text-xs'],
+      [formatCount(request.input_tokens), 'px-4 py-2 text-right font-mono tabular-nums'],
+      [formatCount(request.cache_read_tokens), 'px-4 py-2 text-right font-mono tabular-nums text-ink-muted'],
+      [formatCount(request.output_tokens), 'px-4 py-2 text-right font-mono tabular-nums'],
+      [formatIdr(request.cost_idr), 'px-4 py-2 text-right font-mono tabular-nums text-accent'],
+    ];
+    for (const [text, className] of cells) {
+      const td = document.createElement('td');
+      td.className = className;
+      td.textContent = text;
+      tr.append(td);
+    }
+    return tr;
+  }
+
+  async function loadRecent(): Promise<void> {
+    try {
+      const list = await apiFetch<RecentUsage[]>(recentUsagePath());
+      loading.hidden = true;
+      count.textContent = mayHaveMore(list.length)
+        ? recentUsageHeading(list.length) + ' (most recent)'
+        : recentUsageHeading(list.length);
+      if (list.length === 0) {
+        count.textContent = '';
+        empty.hidden = false;
+        return;
+      }
+      rows.replaceChildren(...list.map(rowFor));
+      wrap.hidden = false;
+    } catch (err) {
+      loading.hidden = true;
+      errorBox.textContent = describeError(err).message;
+      errorBox.hidden = false;
+    }
+  }
+
+  void loadRecent();
+</script>
