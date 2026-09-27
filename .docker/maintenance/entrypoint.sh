@@ -313,11 +313,41 @@ run_wired_jobs() {
 # -----------------------------------------------------------------------------
 # Schedule
 # -----------------------------------------------------------------------------
+# Midnight UTC of "today", as an epoch. $1 = the epoch to take the day of.
+#
+# WHY THIS IS ARITHMETIC AND NOT `date -d`. The image is Alpine, so `date` is
+# BUSYBOX date, which does NOT accept GNU's `-d` relative forms. The original
+# implementation called `date -u -d "today 3:00" +%s`, and BusyBox answers
+# `date: invalid date 'today 3:00'` - so the nightly loop exited 2 on its FIRST
+# iteration, Compose restarted it, and it restarted forever. The one-shot verbs
+# (retention/reconcile/once) never touch this function, which is exactly why the
+# bug survived: every test used a verb that skipped the loop.
+#
+# `%s` is seconds since the epoch, always UTC, and `days * 86400` is exact because
+# epoch seconds ignore leap seconds. So floor-divide to the day, then add the
+# scheduled hour. No timezone handling is needed or wanted: every value here is
+# already UTC by definition.
+utc_midnight() {
+    printf '%s' "$(( $1 - ($1 % 86400) ))"
+}
+
 next_run_epoch() {
-    now=$(date -u +%s)
-    target=$(date -u -d "today ${SCHEDULE_HOUR_UTC}:00" +%s) || return 1
+    now=$(date -u +%s) || return 1
+    # Guard the one input that would make the arithmetic silently wrong: an hour
+    # outside 0-23. The entry block checks this too, but this function is the one
+    # whose output a caller sleeps on, so it refuses rather than returning a
+    # plausible-looking wrong instant.
+    case "${SCHEDULE_HOUR_UTC}" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    if [ "$SCHEDULE_HOUR_UTC" -gt 23 ]; then
+        return 1
+    fi
+
+    today=$(utc_midnight "$now")
+    target=$((today + SCHEDULE_HOUR_UTC * 3600))
     if [ "$target" -le "$now" ]; then
-        target=$(date -u -d "tomorrow ${SCHEDULE_HOUR_UTC}:00" +%s) || return 1
+        target=$((target + 86400))
     fi
     printf '%s' "$target"
 }
@@ -330,7 +360,7 @@ schedule_loop() {
         }
         now=$(date -u +%s)
         wait_for=$((next - now))
-        log "next run in ${wait_for}s at $(date -u -d "$$next" '+%Y-%m-%dT%H:%M:%SZ')"
+        log "next run in ${wait_for}s (at UTC epoch $next; nightly ${SCHEDULE_HOUR_UTC}:00 UTC)"
         sleep "$wait_for"
         run_wired_jobs || log "nightly run finished with failures - see the job lines above; retrying at the next scheduled time"
     done

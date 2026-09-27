@@ -186,6 +186,11 @@ docker compose run --rm scheduler reconcile
 The one-shot verbs exist so the nightly work is testable and so CI can gate on it
 without waiting for 03:00.
 
+**Verified against a real run.** `docker compose up -d scheduler` reaches
+`Up` (not `Restarting`) and logs its next run; `run retention` deleted an
+expired row and reported all five counts; `run reconcile` reported drift as
+exit 1. What a full 24h cycle still does not prove is listed under "Not verified".
+
 ## Exit codes
 
 `once` and the individual verbs exit **non-zero if any wired job failed**, so this
@@ -300,10 +305,19 @@ after**.
 
 ### Not verified
 
-- **A full nightly cycle at 03:00 UTC.** The `schedule` loop was not waited out -
-  that is a 24h wait, and the one-shot verbs exist precisely so the same jobs are
-  testable without it. The loop itself (`next_run_epoch` + `sleep`) is unchanged by
-  this port and unexercised here.
+- **A full nightly cycle was never waited out** (a 24h wait). That is what the
+  one-shot verbs are for — and it is exactly why the loop hid a fatal bug: every
+  test used a verb that skips `next_run_epoch`, so a loop that could never run
+  looked tested.
+- **The loop was fixed and IS now exercised.** `next_run_epoch` used GNU
+  `date -u -d "today 3:00"`, which BusyBox `date` rejects with
+  `date: invalid date 'today 3:00'`. The nightly loop therefore exited 2 on its
+  FIRST iteration and Compose restart-looped it forever — the scheduler could
+  never have run a single job. It is now pure arithmetic
+  (`utc_midnight` + the scheduled hour), verified in the container: it reports
+  `next run in ...s` and computes the correct instant (checked for 02:00, 04:00
+  and exactly 03:00, including the roll-over to the next day).
+  `docker compose up -d scheduler` now reaches `Up`, not `Restarting`.
 - **The three Rust binaries.** `ip-purge`, `usage-purge` and `hold-sweep` are
   BINARIES NOT WIRED, by construction. The first two have their work done inline
   by `run_retention`; `hold-sweep` has no equivalent.
