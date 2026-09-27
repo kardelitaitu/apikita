@@ -106,6 +106,54 @@ test('signup discloses where prompts are forwarded, and does so before the submi
     'the two markers must be distinct positions, or the ordering assertion above is vacuous',
   );
 });
+// ---------------------------------------------------------------------------
+// THE MONEY-TERMS SURFACES — Gate 6 claims 206 and 208.
+//
+// 206: "Top-up screen states the fee and the non-refundable policy before
+//       payment."  The wallet page carries the terms at lines 27-31, ABOVE the
+//       top-up action, and the first-deposit minimum is stated in the header.
+//
+// 208: "API key shown once, with an acknowledged warning." The BEHAVIOUR is
+//       already covered (`plaintextKeyOf` in dashboard-form.test.ts, which pins
+//       that only a create response can reveal a key). What was not covered is the
+//       WARNING a customer is shown, which is the part a copy edit can quietly
+//       delete while the code stays correct.
+//
+// Both are read as TEXT, for the reason this suite documents: the guard is about
+// what the file SAYS.
+// ---------------------------------------------------------------------------
+
+test('the wallet states the non-refundable policy and the expiry before the top-up action', () => {
+  const text = read('dashboard/wallet.astro').toLowerCase();
+
+  assert.ok(
+    text.includes('non-refundable'),
+    'the wallet must state that balances are non-refundable',
+  );
+  assert.ok(
+    text.includes('expires 2 years'),
+    'the wallet must state the credit expiry term, or a customer learns it only after losing credit',
+  );
+  // The minimums differ by deposit, so the page must say so rather than showing one
+  // number that is wrong for a first top-up.
+  assert.ok(
+    text.includes('minimums differ'),
+    'the wallet must flag that the first deposit and later top-ups have different minimums',
+  );
+});
+
+test('the new-key screen warns that the plaintext key is shown only once', () => {
+  const text = read('dashboard/keys/new.astro').toLowerCase();
+
+  assert.ok(
+    text.includes('shown <strong>once</strong>') || text.includes('shown once'),
+    'the new-key screen must warn that the plaintext key is shown only once',
+  );
+  assert.ok(
+    text.includes('sha-256') || text.includes('only its hash') || text.includes('stores only'),
+    'the warning must explain WHY it cannot be shown again: the server stores only a hash',
+  );
+});
 test('the promises that must stay are still present', () => {
   const text = read('index.astro').toLowerCase();
   // Non-refundable, the 2-year expiry, and paying balances back at closure.
