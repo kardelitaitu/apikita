@@ -141,7 +141,15 @@ fn forbidden_response(message: &str) -> Response {
 /// ids. An operator - already trusted with every account - gets an honest 404
 /// for an absent target, because hiding it from them would only make the surface
 /// harder to use.
-async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Uuid, AdminError> {
+///
+/// `pub(crate)` so the ops metrics route (`routes/health.rs`) can reuse it rather
+/// than re-implementing the check. Duplicating the guard would let the two copies
+/// drift, and the whole point of this function is that the ORDER of the checks is
+/// defined once.
+pub(crate) async fn require_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Uuid, AdminError> {
     let actor = resolve_account_from_cookie(&state.pool, headers).await?;
 
     let is_operator: Option<bool> =
