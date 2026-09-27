@@ -273,7 +273,18 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("read the sqlx migrations table");
-        assert_eq!(applied, 20_260_925_000_000, "the fixture migration ran");
+
+        // Derived from the embedded migration list, not hard-coded: a pinned
+        // constant here rotted the moment a second migration was added (the
+        // 20260926000000 redemption-attempts file). Whatever migrations exist,
+        // the database must have applied the newest of them.
+        let expected: i64 = MIGRATOR
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("the migration list is never empty");
+        assert_eq!(applied, expected, "the fixture migration ran");
 
         assert_eq!(
             applied_schema_version(&pool).await,
