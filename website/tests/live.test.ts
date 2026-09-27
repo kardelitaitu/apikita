@@ -165,6 +165,102 @@ test('the store keeps the last value and reacts to every stream event', async ()
   }
 });
 
+// ---------------------------------------------------------------------------
+// THE STALE PROMISE: a dropped stream KEEPS the last balance and marks it old.
+//
+// docs/launch-checklist.md Gate 5 states this as a customer-facing claim: "a
+// dropped stream surfaces as a stale indicator, not a silently frozen balance."
+// The existing store test asserts the STATUS becomes stale, but not the half that
+// makes the claim true: the last KNOWN value must still be there, and the poll
+// fallback must refresh it WITHOUT claiming it is live.
+//
+// The distinction is the whole point. A blanked balance looks like a bug; a live-
+// looking frozen balance is worse, because the customer trusts a number that
+// stopped updating and may act on it.
+// ---------------------------------------------------------------------------
+test('a dropped stream keeps the last balance, marks it stale, and polls without calling it live', async () => {
+  FakeEventSource.instances = [];
+  const originalFetch = globalThis.fetch;
+  // The poll fallback fetches /api/me. Serve a NEWER balance than the stream sent, so
+  // a refreshed value is distinguishable from the last streamed one.
+  // A FIXED polled balance, deliberately. It must differ from the streamed 777 so a
+  // refresh is observable, but it must NOT vary per call: `start()` calls loadMe()
+  // BEFORE connect(), so a value that changed on every fetch would already have
+  // overwritten the balance before the streamed frame arrived, and the assertion
+  // below would be measuring the wrong writer. (The first version of this test did
+  // exactly that and failed with 777 vs 901.)
+  let polls = 0;
+  globalThis.fetch = async () => {
+    polls += 1;
+    return new Response(JSON.stringify({ ...ME, balance_idr: 4242 }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    FakeEventSource.instances = [];
+    const store = createLiveStore();
+    store.start();
+    // Drain a few ticks: `start()` awaits loadMe() before it calls connect().
+    for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r));
+
+    assert.ok(
+      FakeEventSource.instances.length > 0,
+      'connect() must have created an EventSource by now',
+    );
+    // THE FIRST instance of THIS test, not the last: a previous test's store may still
+    // be settling its retry chain under the shared shim, and a later socket would then
+    // belong to a DIFFERENT store - dispatching on it would silently do nothing to the
+    // state under assertion.
+    const es = FakeEventSource.instances[0];
+    // DIAGNOSTIC: the listener map must be populated, or the dispatch below is a no-op
+    // and the test would be asserting on nothing.
+    assert.ok(
+      Object.keys(es.listeners).length > 0,
+      `connect() must have attached listeners; got ${JSON.stringify(Object.keys(es.listeners))}`,
+    );
+    es.dispatch('open');
+    es.dispatch('balance', JSON.stringify({ balance_idr: 777 }));
+    assert.equal(store.getState().status, 'live');
+    assert.equal(store.getState().balanceIdr, 777);
+
+    // The stream dies with real error data, as a mid-answer failure would.
+    es.dispatch(
+      'error',
+      JSON.stringify({ error: { message: 'upstream died', request_id: 'req-x' } }),
+    );
+
+    const afterError = store.getState();
+    assert.equal(afterError.status, 'stale', 'a dropped stream must be marked stale');
+    assert.equal(
+      afterError.balanceIdr,
+      777,
+      'the last KNOWN balance must be KEPT, not blanked: a vanished number reads as a bug, and the customer loses their place',
+    );
+    assert.equal(afterError.error, 'upstream died');
+    assert.equal(afterError.requestId, 'req-x');
+
+    // The poll fallback must bring a FRESH value while the badge stays stale: the
+    // data is last-known, so it must never be presented as live.
+    await new Promise((r) => setImmediate(r));
+
+    assert.ok(polls > 0, 'the error path must start the poll fallback');
+    assert.equal(
+      store.getState().status,
+      'stale',
+      'polled data is LAST KNOWN, not live: showing it as live would be the silently frozen balance this claim rules out',
+    );
+    assert.equal(
+      store.getState().balanceIdr,
+      4242,
+      'the fallback must actually refresh the balance, or the stale badge shows an indefinitely old number',
+    );
+
+    store.stop();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 test('loadMe returns null on 401 without setting an error', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>
