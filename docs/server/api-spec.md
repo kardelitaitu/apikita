@@ -16,13 +16,29 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 | Keys | `GET/POST /api/keys`, `PATCH /api/keys/:id`, `POST /api/keys/:id/revoke` | cookie |
 | Wallet | `POST /api/topups` | cookie |
 | Telegram | `POST /api/telegram/link-code`, `DELETE /api/telegram` | cookie |
-| Reviews | `GET /api/reviews` (read), `POST /api/reviews` (**bot token only**) | cookie / bot |
+| Reviews ⚠ | `GET /api/reviews` (read), `POST /api/reviews` (**bot token only**) | cookie / bot |
 | Webhooks | `POST /webhooks/midtrans` | **signature** |
 | Live | `GET /events` (SSE) | cookie |
 | Proxy | `POST /v1/chat/completions` | **API key** |
-| **Bot** | `POST /api/bot/link`, `GET /api/bot/account`, `GET /api/bot/reviews/mine`, `POST /api/bot/notify-topup` | **bot token** |
+| **Bot** | `POST /api/bot/link` ✅, `GET /api/bot/account` ⚠, `GET /api/bot/reviews/mine` ⚠, `POST /api/bot/notify-topup` ⚠ | **bot token** |
 | **Admin** | `GET /api/admin/accounts/:id`; `POST /api/admin/accounts/:id/suspend`; `POST /api/admin/accounts/:id/resume` (**alias `/restore`**) | **cookie + operator flag** |
 | Ops | `GET /health` | none |
+
+**⚠ MARKED ROUTES ARE DESIGNED, NOT BUILT.** Four endpoints in the table above have a
+schema, a documented contract, and **no handler**: `GET`/`POST /api/reviews`,
+`GET /api/bot/account`, `GET /api/bot/reviews/mine` and `POST /api/bot/notify-topup`.
+They are not missing by accident — the whole reviews and top-up-feed flow is driven by
+the Telegram **bot**, and `docs/launch-checklist.md:211` records that the bot itself is
+still design-only, so their HTTP halves have nothing to exercise them. The tables they
+need have existed since the initial migration (`reviews`, `review_history`,
+`review_sessions`).
+
+They are marked because this table describes the CURRENT surface, and an integrator who
+reads it would call `/api/reviews`, get a 404, and conclude the **server** was broken.
+The distinction is enforced by a test
+(`the_spec_marks_exactly_the_designed_but_unbuilt_routes_as_designed` in
+`server/src/routes/mod.rs`), so an endpoint cannot be mounted without this document
+being updated with it.
 
 **Two authentication schemes, deliberately separate:**
 

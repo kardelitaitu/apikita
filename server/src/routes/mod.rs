@@ -1114,6 +1114,56 @@ mod tests {
     /// wrong method, 404 for a path that is not mounted. Delete a route, rename a
     /// path, or move a handler to another method and this fails naming the exact
     /// pair.
+    // -----------------------------------------------------------------------
+    // THE SPEC MUST NOT PROMISE A ROUTE THE SERVER DOES NOT SERVE.
+    // -----------------------------------------------------------------------
+    //
+    // `docs/server/api-spec.md:14-25` is presented as the CURRENT surface. W30 found
+    // FOUR rows in it with no handler and no mount at all - GET/POST /api/reviews,
+    // GET /api/bot/account, GET /api/bot/reviews/mine, POST /api/bot/notify-topup -
+    // while the tables they need have existed since the initial migration.
+    //
+    // They are not bugs to fix (the whole reviews/feed flow is Telegram-BOT driven,
+    // and `docs/launch-checklist.md:211` records that the bot is still design-only),
+    // but an integrator reading that table would call /api/reviews, get a 404, and
+    // conclude the SERVER was broken. So the spec now marks them DESIGNED-NOT-BUILT,
+    // and this test keeps the two documents from drifting apart again.
+    //
+    // It cannot parse free-form prose, so it pins the CONTRACT instead: every route
+    // the spec calls implemented must appear in MOUNTED. When a new endpoint is
+    // documented, either it is mounted (and added to MOUNTED) or it is marked
+    // designed-only - and the list below is the mechanical record of which is which.
+    #[test]
+    fn the_spec_marks_exactly_the_designed_but_unbuilt_routes_as_designed() {
+        // Routes the api-spec table mentions that are NOT mounted, each of which must
+        // therefore carry a designed-not-built marker in the spec. If one of these is
+        // ever mounted, this test fails and forces the spec to be updated with it -
+        // which is the point.
+        const SPEC_ONLY: &[&str] = &[
+            "/api/reviews",
+            "/api/bot/account",
+            "/api/bot/reviews/mine",
+            "/api/bot/notify-topup",
+        ];
+
+        let mounted_paths: Vec<&str> = MOUNTED.iter().map(|(_, path, _)| *path).collect();
+
+        for path in SPEC_ONLY {
+            assert!(
+                !mounted_paths.contains(path),
+                "{path} is mounted now, so it is no longer designed-only: remove it from SPEC_ONLY AND from the designed-not-built marker in docs/server/api-spec.md",
+            );
+        }
+
+        // POSITIVE CONTROL: the list above is only meaningful if MOUNTED is the real
+        // set. A path that IS mounted must be found, or `contains` is answering the
+        // wrong question.
+        assert!(
+            mounted_paths.contains(&"/api/bot/link"),
+            "the mounted table must contain a route that really exists, or the check above is vacuous"
+        );
+    }
+
     #[tokio::test]
     async fn every_mounted_route_dispatches_and_every_near_miss_is_refused() {
         let app = table_app();
