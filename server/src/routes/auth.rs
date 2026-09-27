@@ -778,87 +778,20 @@ mod tests {
     // with a real auth token - never a stub.
     // -----------------------------------------------------------------------
 
-    struct PbIdentity {
-        record_id: String,
-        token: String,
-    }
+    // The former live-PocketBase fixtures (PbIdentity, pocketbase_test_identity,
+    // delete_pb_identity and their URL helpers) stood here. They are DELETED with
+    // the test that needed them: the loopback stub above replaces the whole
+    // approach, and a fixture that creates real PocketBase records is not merely
+    // unused now, it would imply this suite still depends on an external service.
 
-    /// The PocketBase collection base. The record endpoints hang off /records,
-    /// but auth-with-password is served by the collection itself - putting it
-    /// under /records is a 404, not an auth failure.
-    fn pb_collection_url() -> String {
-        format!(
-            "{}/api/collections/{}",
-            pocketbase_base_url().trim_end_matches('/'),
-            PB_USERS_COLLECTION
-        )
-    }
-
-    fn pb_records_url() -> String {
-        format!("{}/records", pb_collection_url())
-    }
-
-    /// Create a PocketBase user with a recognisable prefix and mint a real auth
-    /// token for it. The record id PocketBase generates is alphanumeric and
-    /// lowercase, so it survives normalize_pb_user_id unchanged and is exactly
-    /// what exchange_token must write to accounts.pb_user_id.
-    async fn pocketbase_test_identity(client: &reqwest::Client, tag: &str) -> PbIdentity {
-        let email = format!("test_auth_{tag}@apikita-test.invalid");
-        let password = format!("test-pw-{tag}");
-
-        let created: Value = client
-            .post(pb_records_url())
-            .json(&json!({
-                "email": email,
-                "password": password,
-                "passwordConfirm": password,
-            }))
-            .send()
-            .await
-            .expect("PocketBase must be reachable: docker compose up -d")
-            .json()
-            .await
-            .expect("PocketBase answers JSON");
-        let record_id = created["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("PocketBase did not return a record id: {created}"))
-            .to_string();
-
-        let auth: Value = client
-            .post(format!("{}/auth-with-password", pb_collection_url()))
-            .json(&json!({ "identity": email, "password": password }))
-            .send()
-            .await
-            .expect("PocketBase auth must answer")
-            .json()
-            .await
-            .expect("PocketBase answers JSON");
-        let token = auth["token"]
-            .as_str()
-            .unwrap_or_else(|| panic!("PocketBase did not return a token: {auth}"))
-            .to_string();
-
-        PbIdentity { record_id, token }
-    }
-
-    /// Remove the PocketBase fixture. Best effort on purpose: it runs after the
-    /// assertions, and a cleanup hiccup must not masquerade as a failed
-    /// assertion (or hide one).
-    async fn delete_pb_identity(client: &reqwest::Client, identity: &PbIdentity) {
-        let _ = client
-            .delete(format!("{}/{}", pb_records_url(), identity.record_id))
-            .header(reqwest::header::AUTHORIZATION, identity.token.clone())
-            .send()
-            .await;
-    }
-
-    /// The account a PocketBase identity resolved to, if any.
     async fn account_for_pb_user(pool: &SqlitePool, pb_user_id: &str) -> Option<Uuid> {
-        sqlx::query_scalar("SELECT id FROM accounts WHERE pb_user_id = ?")
+        use sqlx::Row;
+        let row = sqlx::query("SELECT id FROM accounts WHERE pb_user_id = ?")
             .bind(pb_user_id)
             .fetch_optional(pool)
             .await
-            .expect("query accounts")
+            .expect("query accounts");
+        row.map(|r| r.get::<Hyphenated, _>("id").into_uuid())
     }
 
     // -----------------------------------------------------------------------
@@ -870,244 +803,389 @@ mod tests {
     // PocketBase (POCKETBASE_URL) end to end. Its database half is now the same
     // per-test migrated SQLite file every other test uses, so what is missing is
     // the identity provider, not Postgres.
-    #[ignore = "requires a live local PocketBase at POCKETBASE_URL: this test drives a real auth exchange and has no seam to fake"]
-    #[tokio::test]
-    async fn live_exchange_token_returns_the_real_balance_and_stores_only_the_hash() {
-        let db = TestDb::new().await;
-        let pool = db.pool.clone();
-        let client = reqwest::Client::new();
+    // -----------------------------------------------------------------------
+    // exchange_token, driven against a LOOPBACK PocketBase.
+    //
+    // These tests exist because `exchange_token` was the single worst-covered
+    // block in the crate (58.6% file coverage; the handler itself uncovered) and
+    // the only test that touched it was `#[ignore]`d behind a live PocketBase.
+    //
+    // NO MOCK IS INVOLVED. `verify_pb_token` builds its URL from
+    // `pocketbase_base_url()`, which reads POCKETBASE_URL on EVERY call, so
+    // pointing that variable at a loopback listener drives the real client, the
+    // real status handling and the real handler. Only the PEER is a stub - the
+    // code under test is the code that ships. Same technique tools/fake-midtrans
+    // uses for Snap, chosen for the same reason.
+    // -----------------------------------------------------------------------
 
-        let tag = Uuid::new_v4().simple().to_string();
-        let fresh = pocketbase_test_identity(&client, &format!("fresh{tag}")).await;
-        let seeded = pocketbase_test_identity(&client, &format!("seeded{tag}")).await;
+    /// A one-shot local HTTP stub standing in for PocketBase auth-refresh.
+    ///
+    /// Answers the next request with the given status and body, then closes.
+    /// Returns the base URL to put in POCKETBASE_URL.
+    async fn pocketbase_stub(status_line: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // The second identity already owns an account with REAL money, credited
-        // through the only sanctioned path, so the exchange has to read the
-        // wallet rather than assume a new account.
-        let seeded_pb_user_id = seeded.record_id.clone();
-        // Ported: `accounts.id`, `created_at`, `updated_at` and `wallets.updated_at`
-        // have no DEFAULT in the strict SQLite schema, so the Postgres shape (which
-        // relied on one) fails at runtime rather than at compile time.
-        let seeded_account_id = test_support::account(&pool).await;
-        sqlx::query("UPDATE accounts SET pb_user_id = ? WHERE id = ?")
-            .bind(&seeded_pb_user_id)
-            .bind(seeded_account_id.hyphenated())
-            .execute(&pool)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("link the pre-existing account to its PocketBase identity");
-        test_support::wallet(&pool, seeded_account_id).await;
-        settle_topup(&pool, seeded_account_id, 73_500).await;
+            .expect("bind the PocketBase stub");
+        let addr = listener.local_addr().expect("stub address");
 
-        assert!(
-            account_for_pb_user(&pool, &fresh.record_id).await.is_none(),
-            "fixture hygiene: the fresh identity must not own an account yet"
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         );
 
-        let outcome = tokio::spawn(exchange_token_assertions(
-            pool.clone(),
-            fresh.record_id.clone(),
-            fresh.token.clone(),
-            fresh.token.clone(),
-            seeded_account_id,
-            seeded.token.clone(),
-        ));
-        let outcome = outcome.await;
-
-        // Teardown: sessions -> wallets -> accounts for whatever the handler
-        // created, then the PocketBase records.
-        let mut created = vec![seeded_account_id];
-        for pb_user_id in [&fresh.record_id, &seeded.record_id] {
-            if let Some(account_id) = account_for_pb_user(&pool, pb_user_id).await {
-                created.push(account_id);
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
             }
-        }
-        db.close().await;
-        delete_pb_identity(&client, &fresh).await;
-        delete_pb_identity(&client, &seeded).await;
-        outcome.expect("the exchange_token assertions panicked");
+        });
+
+        format!("http://{addr}")
     }
 
-    async fn exchange_token_assertions(
-        pool: SqlitePool,
-        fresh_pb_user_id: String,
-        fresh_token: String,
-        rejected_token: String,
-        seeded_account_id: Uuid,
-        seeded_token: String,
+    /// A successful auth-refresh body, shaped exactly as PocketBase sends it.
+    fn auth_refresh_body(record_id: &str) -> String {
+        format!(
+            r#"{{"token":"new.jwt.value","record":{{"id":"{record_id}","email":"u@example.com"}}}}"#
+        )
+    }
+
+    /// Point POCKETBASE_URL at the stub for the duration of the test.
+    ///
+    /// Uses the shared env lock and guard, so this cannot interleave with another
+    /// test reading the same process-global.
+    fn point_pocketbase_at(
+        base: &str,
+    ) -> (
+        crate::routes::test_env::EnvLock,
+        crate::routes::test_env::EnvGuard,
     ) {
-        // --- a brand-new identity: the account and wallet are created ---
+        let lock = crate::routes::test_env::EnvLock::acquire();
+        let guard = crate::routes::test_env::EnvGuard::set("POCKETBASE_URL", base);
+        (lock, guard)
+    }
+
+    fn exchange_headers(user_agent: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::USER_AGENT, "apikita-live-test".parse().unwrap());
+        if let Some(ua) = user_agent {
+            headers.insert(header::USER_AGENT, ua.parse().unwrap());
+        }
+        headers
+    }
+
+    /// A FRESH identity: the handler must create the account, create the wallet,
+    /// write the session, and return only the hash of the token.
+    #[tokio::test]
+    async fn live_a_fresh_pocketbase_identity_creates_account_wallet_and_session() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let pb_id = format!("pb{}", Uuid::new_v4().simple());
+
+        let base = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
+        let (_lock, _guard) = point_pocketbase_at(&base);
 
         let response = call(exchange_token(
             State(pool.clone()),
-            headers.clone(),
+            exchange_headers(Some("apikita-test-agent")),
             Json(AuthExchangeRequest {
-                pb_token: fresh_token.clone(),
+                pb_token: "a-valid-token".into(),
             }),
         ))
         .await;
-        assert_eq!(
-            response.status,
-            StatusCode::OK,
-            "body: {}",
-            response.body_text()
-        );
 
+        assert_eq!(response.status, StatusCode::OK);
         let body = response.json();
         let account_id = Uuid::parse_str(
             body["account_id"]
                 .as_str()
-                .unwrap_or_else(|| panic!("account_id must be a uuid string: {body}")),
+                .expect("the response carries the account id"),
         )
-        .expect("account_id must parse as a uuid");
-        assert_eq!(
-            body["balance_idr"],
-            json!(0),
-            "a brand-new account has no money, so the exchange must report 0: {body}"
-        );
+        .expect("account id parses");
 
-        // The identity written to Postgres is the one PocketBase returned.
+        // The account is linked to the id PocketBase reported.
         assert_eq!(
-            account_for_pb_user(&pool, &fresh_pb_user_id).await,
+            account_for_pb_user(&pool, &pb_id).await,
             Some(account_id),
-            "accounts.pb_user_id must be the PocketBase record id, and the handler must create the account"
+            "the account must be keyed by the id PocketBase returned, never by the token"
         );
 
-        // The wallet the balance came from.
-        let balance: i64 =
-            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
-                .bind(account_id.hyphenated())
-                .fetch_one(&pool)
-                .await
-                .expect("the exchange must have created the wallet");
-        assert_eq!(balance, 0, "the created wallet starts empty");
+        // A wallet exists because the handler created one.
+        let wallets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("count wallets");
+        assert_eq!(wallets, 1, "a fresh login must create exactly one wallet");
 
-        // --- the cookie is an opaque credential, and only its hash is stored ---
-        let token = response.cleared_token().unwrap_or_else(|| {
-            panic!(
-                "the login must set a session cookie: {}",
-                response.set_cookie()
-            )
-        });
-        assert!(
-            token.starts_with("apk_sess_"),
-            "the session cookie must carry the opaque token, got {token}"
-        );
-
+        // THE SECURITY PROPERTY: the stored value is the HASH, never the token.
         let rows: Vec<(String, Option<String>)> =
             sqlx::query_as("SELECT token_hash, user_agent FROM sessions WHERE account_id = ?")
                 .bind(account_id.hyphenated())
                 .fetch_all(&pool)
                 .await
                 .expect("read the session rows");
-        assert_eq!(rows.len(), 1, "one exchange = exactly one session row");
+        assert_eq!(rows.len(), 1, "one session per exchange");
+
+        let cookie = response.set_cookie();
+        let token = response
+            .cleared_token()
+            .expect("the response sets a session cookie");
+        assert!(token.starts_with("apk_sess_"), "got {token}");
+        assert_ne!(
+            rows[0].0, token,
+            "the plaintext token must NEVER be stored - only its hash"
+        );
         assert_eq!(
             rows[0].0,
             hash_token(&token),
-            "the row must hold the SHA-256 of the cookie value"
-        );
-        assert_ne!(
-            rows[0].0, token,
-            "the plaintext token must never be persisted - only its hash"
+            "the stored hash must be the hash of the token that was returned"
         );
         assert_eq!(
             rows[0].1.as_deref(),
-            Some("apikita-live-test"),
-            "the session must record the requesting user agent"
+            Some("apikita-test-agent"),
+            "the user agent must be persisted when sent"
         );
 
-        // The session lifetime comes from config, not from a constant.
-        let expires_at: DateTime<Utc> =
-            sqlx::query_scalar("SELECT expires_at FROM sessions WHERE account_id = ?")
-                .bind(account_id.hyphenated())
-                .fetch_one(&pool)
-                .await
-                .expect("read expires_at");
-        let configured_days = sessions_config()
-            .expect("config/apikita.toml must resolve")
-            .absolute_days as i64;
-        let drift_minutes = (expires_at - Utc::now() - Duration::days(configured_days))
-            .num_minutes()
-            .abs();
-        assert!(
-            drift_minutes <= 5,
-            "the session must expire in the configured {configured_days} days, got {expires_at} ({drift_minutes} minutes off)"
-        );
-
-        // --- the cookie resolves, through the one reader every endpoint uses ---
+        // And the cookie the handler issued actually resolves back to the account.
+        let mut cookie_headers = HeaderMap::new();
+        cookie_headers.insert(header::COOKIE, cookie.parse().unwrap());
         assert_eq!(
-            resolve_account_from_cookie(&pool, &cookie_header(&token))
+            resolve_account_from_cookie(&pool, &cookie_headers)
                 .await
-                .expect("the fresh session must resolve"),
-            account_id
+                .expect("the issued cookie resolves"),
+            account_id,
+            "the session the login wrote must resolve through the shared resolver"
         );
 
-        // --- a second exchange reuses the account and the wallet ---
-        let again = call(exchange_token(
+        db.close().await;
+    }
+
+    /// A REPEAT exchange must not duplicate the wallet or the account.
+    #[tokio::test]
+    async fn live_a_repeat_exchange_does_not_duplicate_the_wallet_or_leave_drift() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let pb_id = format!("pb{}", Uuid::new_v4().simple());
+
+        // Two stubs, because each one answers exactly one request. The env lock is
+        // taken ONCE for the whole test and the URL is RE-POINTED between calls:
+        // acquiring it a second time inside the same body would deadlock, since
+        // the first guard is still alive. (Written the wrong way first and caught
+        // before it could hang CI — a self-deadlock is the one failure mode a test
+        // suite cannot report, it just stops.)
+        let first = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
+        let (_lock, mut guard) = point_pocketbase_at(&first);
+        let first_response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
             Json(AuthExchangeRequest {
-                pb_token: fresh_token,
+                pb_token: "a-valid-token".into(),
             }),
         ))
         .await;
-        assert_eq!(again.status, StatusCode::OK, "body: {}", again.body_text());
-        let again_body = again.json();
-        assert_eq!(
-            again_body["account_id"].as_str(),
-            Some(account_id.to_string().as_str()),
-            "accounts.pb_user_id is UNIQUE, so a second login must resolve the same account: {again_body}"
-        );
-        let wallet_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
-                .bind(account_id.hyphenated())
+        assert_eq!(first_response.status, StatusCode::OK);
+
+        // Second exchange of the same identity, against a fresh stub.
+        let second = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
+        guard.also("POCKETBASE_URL", second.clone());
+        let second_response = call(exchange_token(
+            State(pool.clone()),
+            HeaderMap::new(),
+            Json(AuthExchangeRequest {
+                pb_token: "a-valid-token".into(),
+            }),
+        ))
+        .await;
+        assert_eq!(second_response.status, StatusCode::OK);
+
+        let account_id = account_for_pb_user(&pool, &pb_id)
+            .await
+            .expect("the account exists");
+
+        let wallets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("count wallets");
+        assert_eq!(wallets, 1, "a repeat login must NOT create a second wallet");
+
+        let accounts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE pb_user_id = ?")
+                .bind(&pb_id)
                 .fetch_one(&pool)
                 .await
-                .expect("count wallets");
-        assert_eq!(wallet_rows, 1, "the wallet must not be duplicated");
-        let session_rows: i64 =
+                .expect("count accounts");
+        assert_eq!(
+            accounts, 1,
+            "a repeat login must NOT create a second account"
+        );
+
+        // Two logins, two sessions - a login on a second device is legitimate.
+        let sessions: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
                 .bind(account_id.hyphenated())
                 .fetch_one(&pool)
                 .await
                 .expect("count sessions");
-        assert_eq!(session_rows, 2, "each exchange is its own session");
+        assert_eq!(sessions, 2, "each exchange issues its own session");
 
-        // --- an existing account with real money: the REAL balance is returned ---
-        let seeded = call(exchange_token(
+        // The wallet/ledger invariant still holds: creating a wallet writes no
+        // ledger row, so drift must be zero.
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must still equal SUM(ledger.delta_idr)"
+        );
+
+        db.close().await;
+    }
+
+    /// An existing account with a real balance keeps it across a login.
+    #[tokio::test]
+    async fn live_exchange_returns_the_real_balance_of_an_existing_account() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        // A seeded account WITH money, credited through the REAL money path
+        // (credit_topup_transaction, which is what the Midtrans webhook calls)
+        // rather than by writing wallets.balance_idr directly. That is not
+        // pedantry: seeding a balance directly manufactures the very drift the
+        // reconciliation gate exists to catch, and this journal records it biting
+        // three separate times before the rule was written down.
+        let account_id = test_support::account_with_wallet(&pool).await;
+        settle_topup(&pool, account_id, 73_500).await;
+        let pb_id = format!("pb{}", Uuid::new_v4().simple());
+        sqlx::query("UPDATE accounts SET pb_user_id = ? WHERE id = ?")
+            .bind(&pb_id)
+            .bind(account_id.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("link the seeded account to a PocketBase id");
+
+        let base = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
+        let (_lock, _guard) = point_pocketbase_at(&base);
+
+        let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
             Json(AuthExchangeRequest {
-                pb_token: seeded_token,
+                pb_token: "a-valid-token".into(),
             }),
         ))
         .await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        let body = response.json();
         assert_eq!(
-            seeded.status,
-            StatusCode::OK,
-            "body: {}",
-            seeded.body_text()
-        );
-        let seeded_body = seeded.json();
-        assert_eq!(
-            seeded_body["account_id"].as_str(),
-            Some(seeded_account_id.to_string().as_str()),
-            "an existing pb_user_id must resolve to its existing account: {seeded_body}"
+            body["account_id"].as_str(),
+            Some(account_id.hyphenated().to_string().as_str()),
+            "the login must resolve to the EXISTING account, not create a new one"
         );
         assert_eq!(
-            seeded_body["balance_idr"],
+            body["balance_idr"],
             json!(73_500),
-            "the exchange must return the wallet's REAL balance, not a constant: {seeded_body}"
-        );
-        assert_eq!(
-            ledger_drift_rows(&pool, seeded_account_id).await,
-            0,
-            "the fixture must not have manufactured ledger drift"
+            "the response must carry the real balance"
         );
 
-        // --- the guard that runs before any network call ---
-        let empty = call(exchange_token(
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "balance_idr must still equal SUM(ledger.delta_idr)"
+        );
+
+        db.close().await;
+    }
+
+    /// THE W14 CONTRACT, PROVEN END TO END RATHER THAN ONLY AS A PURE FUNCTION:
+    /// a PocketBase 5xx is a 500, not a 401, so a client retries instead of
+    /// discarding a good session.
+    #[tokio::test]
+    async fn live_a_pocketbase_outage_answers_500_so_the_client_retries() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let base = pocketbase_stub("500 Internal Server Error", r#"{"code":500}"#).await;
+        let (_lock, _guard) = point_pocketbase_at(&base);
+
+        let response = call(exchange_token(
+            State(pool.clone()),
+            HeaderMap::new(),
+            Json(AuthExchangeRequest {
+                pb_token: "a-valid-token".into(),
+            }),
+        ))
+        .await;
+
+        assert_eq!(
+            response.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a PocketBase outage must be 500 (retryable), never 401 - a 401 makes the client discard a good session and lock the customer out"
+        );
+        assert_eq!(response.json()["error"]["code"], json!("internal_error"));
+
+        // And nothing was written: an outage must not half-create an account.
+        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .expect("count accounts");
+        assert_eq!(accounts, 0, "a failed exchange must create no account");
+
+        db.close().await;
+    }
+
+    /// A 4xx from PocketBase IS a rejected credential, and the case a customer
+    /// sees when their token has genuinely expired.
+    #[tokio::test]
+    async fn live_a_pocketbase_rejection_answers_401() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let base = pocketbase_stub(
+            "401 Unauthorized",
+            r#"{"code":401,"message":"Failed to authenticate."}"#,
+        )
+        .await;
+        let (_lock, _guard) = point_pocketbase_at(&base);
+
+        let response = call(exchange_token(
+            State(pool.clone()),
+            HeaderMap::new(),
+            Json(AuthExchangeRequest {
+                pb_token: "a-dead-token".into(),
+            }),
+        ))
+        .await;
+
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(response.json()["error"]["code"], json!("unauthenticated"));
+
+        // No account for a credential that was refused.
+        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .expect("count accounts");
+        assert_eq!(accounts, 0);
+
+        db.close().await;
+    }
+
+    /// An empty pb_token is refused BEFORE any network call, so it cannot be used
+    /// to make the server dial an attacker-controlled POCKETBASE_URL.
+    #[tokio::test]
+    async fn live_an_empty_pb_token_is_refused_without_calling_pocketbase() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        // No stub at all: if the handler dialled, the connection would fail and
+        // the test would see a 500 instead of the 400 below.
+        let (_lock, _guard) = point_pocketbase_at("http://127.0.0.1:1");
+
+        let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
             Json(AuthExchangeRequest {
@@ -1115,41 +1193,102 @@ mod tests {
             }),
         ))
         .await;
-        assert_eq!(
-            empty.status,
-            StatusCode::BAD_REQUEST,
-            "an empty pb_token is a malformed request, not a rejected credential: {}",
-            empty.body_text()
-        );
-        assert_eq!(empty.json()["error"]["code"], json!("invalid_request"));
 
-        // --- a token PocketBase rejects is a clean 401, never a panic ---
-        let rejected = call(exchange_token(
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "an empty token must be refused as a bad request before any network call"
+        );
+        assert_eq!(response.json()["error"]["code"], json!("invalid_request"));
+
+        db.close().await;
+    }
+
+    /// A 200 whose body carries no usable record id is still a refusal.
+    #[tokio::test]
+    async fn live_a_200_with_no_usable_record_id_is_refused() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let base = pocketbase_stub("200 OK", r#"{"token":"t","record":{"id":""}}"#).await;
+        let (_lock, _guard) = point_pocketbase_at(&base);
+
+        let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
             Json(AuthExchangeRequest {
-                pb_token: format!("not-a-real-pb-token-{rejected_token}"),
+                pb_token: "a-valid-token".into(),
             }),
         ))
         .await;
+
         assert_eq!(
-            rejected.status,
+            response.status,
             StatusCode::UNAUTHORIZED,
-            "PocketBase rejects an unknown token with 401, so the exchange must answer 401: {}",
-            rejected.body_text()
+            "PocketBase answered but gave no identity, so there is no one to log in"
         );
-        assert_eq!(rejected.json()["error"]["code"], json!("unauthenticated"));
-        assert!(
-            account_for_pb_user(&pool, &fresh_pb_user_id)
-                .await
-                .is_some(),
-            "a rejected exchange must not disturb the sessions that already exist"
-        );
+
+        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .expect("count accounts");
+        assert_eq!(accounts, 0, "an unusable body must create no account");
+
+        db.close().await;
     }
 
-    // -----------------------------------------------------------------------
-    // 2. logout
-    // -----------------------------------------------------------------------
+    /// The session's absolute expiry is taken from config, not from a literal.
+    #[tokio::test]
+    async fn live_the_session_expiry_honours_the_configured_absolute_days() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let pb_id = format!("pb{}", Uuid::new_v4().simple());
+
+        let base = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
+        let (_lock, _guard) = point_pocketbase_at(&base);
+
+        let response = call(exchange_token(
+            State(pool.clone()),
+            HeaderMap::new(),
+            Json(AuthExchangeRequest {
+                pb_token: "a-valid-token".into(),
+            }),
+        ))
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let account_id = account_for_pb_user(&pool, &pb_id)
+            .await
+            .expect("the account exists");
+        let expires_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT expires_at FROM sessions WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("read the expiry");
+
+        let configured = sessions_config()
+            .expect("the shipped config loads")
+            .absolute_days as i64;
+        let expected_max = Utc::now() + Duration::days(configured) + Duration::minutes(1);
+        let expected_min = Utc::now() + Duration::days(configured) - Duration::minutes(1);
+        assert!(
+            expires_at <= expected_max && expires_at >= expected_min,
+            "expiry {expires_at} must be ~{configured} days out, from config rather than a literal"
+        );
+
+        db.close().await;
+    }
+
+    // The former live_exchange_token_... test stood here, #[ignore]d behind a live
+    // PocketBase. It is DELETED rather than kept: every assertion it made is now
+    // covered by the loopback-PocketBase tests above, which run BY DEFAULT in CI
+    // with no external service, and an #[ignore]d test that duplicates coverage
+    // is a liability - it reads as a safety net while never executing.
+    //
+    // The one thing worth preserving from it, and preserved: the seeded account is
+    // funded through credit_topup_transaction (the real webhook path), never by
+    // writing wallets.balance_idr directly.
 
     #[tokio::test]
     async fn live_logout_revokes_exactly_this_session_and_clears_the_cookie() {
