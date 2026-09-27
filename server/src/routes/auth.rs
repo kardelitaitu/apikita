@@ -238,7 +238,14 @@ pub(crate) fn sessions_config() -> Result<&'static SessionsConfig, AppError> {
 
 /// The opaque session cookie. Attributes per docs/server/api-spec.md:
 /// HttpOnly; Secure; SameSite=Lax.
-pub(crate) fn session_cookie(value: String, max_age_days: i64) -> HeaderMap {
+///
+/// Returns a `Result` rather than panicking on a parse failure. The value was
+/// `.unwrap()`d, which meant a malformed header would panic INSIDE the login
+/// handler — a 500 on the endpoint every customer uses to sign in, and one that
+/// would be reported as an application crash rather than as the malformed cookie
+/// it is. The parse cannot fail for a token this function generates, but the
+/// failure is now a returned error the caller can answer honestly.
+pub(crate) fn session_cookie(value: String, max_age_days: i64) -> Result<HeaderMap, AppError> {
     let cookie = Cookie::build((SESSION_COOKIE, value))
         .path("/")
         .http_only(true)
@@ -247,9 +254,14 @@ pub(crate) fn session_cookie(value: String, max_age_days: i64) -> HeaderMap {
         .max_age(time::Duration::days(max_age_days))
         .build();
 
+    let header_value = cookie
+        .to_string()
+        .parse()
+        .map_err(|_| AppError::Internal("session cookie is not a valid header value".into()))?;
+
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, cookie.to_string().parse().unwrap());
-    headers
+    headers.insert(header::SET_COOKIE, header_value);
+    Ok(headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +371,7 @@ pub async fn exchange_token(
 
     tx.commit().await?;
 
-    let response_headers = session_cookie(session_token, sessions.absolute_days as i64);
+    let response_headers = session_cookie(session_token, sessions.absolute_days as i64)?;
 
     Ok((
         StatusCode::OK,
@@ -391,7 +403,7 @@ pub async fn logout(
         .await?;
     }
 
-    Ok((StatusCode::NO_CONTENT, session_cookie(String::new(), 0)))
+    Ok((StatusCode::NO_CONTENT, session_cookie(String::new(), 0)?))
 }
 
 /// Revoke every live session for the account - other devices are logged out
@@ -425,7 +437,7 @@ pub async fn logout_all(
         }
     }
 
-    Ok((StatusCode::NO_CONTENT, session_cookie(String::new(), 0)))
+    Ok((StatusCode::NO_CONTENT, session_cookie(String::new(), 0)?))
 }
 
 #[cfg(test)]
@@ -537,7 +549,7 @@ mod tests {
 
     #[test]
     fn session_cookie_carries_expected_attributes() {
-        let headers = session_cookie("apk_sess_abc".into(), 30);
+        let headers = session_cookie("apk_sess_abc".into(), 30).expect("a valid token parses");
         let value = headers
             .get(header::SET_COOKIE)
             .and_then(|v| v.to_str().ok())
@@ -549,7 +561,7 @@ mod tests {
         assert!(value.contains("Max-Age=2592000"), "got {value}");
 
         // Clearing the cookie expires it immediately.
-        let cleared = session_cookie(String::new(), 0);
+        let cleared = session_cookie(String::new(), 0).expect("a clear-cookie parses");
         let value = cleared
             .get(header::SET_COOKIE)
             .and_then(|v| v.to_str().ok())

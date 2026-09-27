@@ -24,12 +24,37 @@ pipeline itself.
 | --- | --- | --- |
 | Format check | `cargo fmt --check` | Yes |
 | Lint | `cargo clippy -- -D warnings` | Yes |
+| **Dependency audit** | Known CVEs in the lockfile | **Yes** |
 | Build | `cargo build` | Yes |
 | Unit tests | Pure logic | Yes |
 | **Integration tests** | A real database (bundled SQLite), real schema, fake upstream | **Yes** |
 | Schema check | Migrations apply cleanly to an empty database | Yes |
+| **Server image build + smoke** | The deployable artifact builds AND serves | **Yes** |
 | Website typecheck / tests / build | The frontend toolchain | Yes |
 | Secret scan | No key or token committed | Yes |
+
+**The dependency audit is the only stage that looks outside the repository.** Every
+other check can pass unchanged while a crate this project depends on is found to
+be vulnerable, because nothing in the source changes when an advisory is
+published. It runs `cargo audit`, which reads
+[`server/.cargo/audit.toml`](../server/.cargo/audit.toml).
+
+**Exactly one advisory is excepted today, and the exception lives in that file
+rather than in this pipeline.** `RUSTSEC-2023-0071` (`rsa` 0.9.10, the Marvin
+timing attack) has **no fixed version** — it cannot be resolved by upgrading — and
+the crate is not linked into the service: it enters the lockfile through
+`sqlx-mysql`, a driver this project does not enable, and is absent from both the
+built dependency graph and the binary. The file records that reachability
+evidence, plus the conditions under which the exception must be re-opened.
+
+**Why in the repository and not an `--ignore` flag here:** a flag in this file is
+invisible to a reader looking at the code, and applies to every future advisory
+with the same id — including one that *is* reachable. An exception that requires
+a commit is an exception somebody has to justify.
+
+**Why the audit is not run with `--deny warnings`:** "unmaintained" is a warning
+class, not a vulnerability, and a gate that fails on it gets muted. A muted gate
+is worse than no gate.
 
 **There is no service container and no `DATABASE_URL` in CI.** SQLite is bundled, so
 the database is a file and the test suite needs no environment at all — see

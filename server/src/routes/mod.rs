@@ -533,7 +533,8 @@ mod tests {
     #[test]
     fn the_set_cookie_login_writes_is_the_one_the_parser_reads() {
         for token in ["apk_sess_deadbeef", "apk_sess_a=b", "x"] {
-            let headers = crate::routes::auth::session_cookie(token.to_string(), 30);
+            let headers = crate::routes::auth::session_cookie(token.to_string(), 30)
+                .expect("login sets a cookie");
             let set_cookie = headers
                 .get(header::SET_COOKIE)
                 .and_then(|v| v.to_str().ok())

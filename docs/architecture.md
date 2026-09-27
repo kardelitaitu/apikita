@@ -355,6 +355,40 @@ Documents that must be revised:
 | Database schema | [`website/02-data-model.md`](website/02-data-model.md) |
 | Identity and sessions | [`architecture/identity.md`](architecture/identity.md) |
 
+## Memory safety, enforced by the compiler
+
+**The server crate contains no `unsafe` code, and that is a build-enforced fact
+rather than a claim.** `server/src/lib.rs` opens with `#![forbid(unsafe_code)]`.
+
+The distinction that matters: `deny` can be lifted by a single inner
+`#[allow(unsafe_code)]`, so it documents an intention any one line can override.
+`forbid` cannot be overridden at all — a future `unsafe` block does not warn, it
+fails to compile until somebody deliberately edits that line and says why.
+
+This is a service that holds wallet balances, verifies payment signatures and
+serves customer credentials, so "no unsafe in the API crate" is a meaningful
+security property to be able to state. It is only worth stating if the compiler
+is the one enforcing it.
+
+**Two panic-shaped lints are also denied on production code** —
+`clippy::unwrap_used` and `clippy::indexing_slicing` — because a panic on the
+request path is an availability incident rather than a style choice, and those two
+catch the common accidental forms (indexing that can go out of bounds, and a
+`Result`/deviation unwrapped where a caller could be told). Both were applied
+without a single `#[allow]`: the three sites they flagged in production code were
+each a genuine latent panic, and all three are now fixed rather than muted —
+
+| Site | Was | Why it mattered |
+| --- | --- | --- |
+| `routes/auth.rs` `session_cookie` | `.unwrap()` on the header parse | A panic inside the login handler: a 500 on the endpoint every customer uses, reported as a crash rather than the malformed cookie it is. Now returns `Result` |
+| `routes/keys.rs` key generation | `alphabet[idx]` | Provably in bounds (`% 62` over a 62-byte array), but the proof depends on two literals staying in step. Now `get()` with an unreachable fallback |
+| `routes/keys.rs` key update | `serde_json::to_value(..).unwrap()` | A 500 on a money-adjacent endpoint. Now falls back, matching the create path |
+
+**Test modules are deliberately out of scope.** `cargo clippy` (what CI runs)
+covers the library and binaries; tests `unwrap` freely because that is how a test
+asserts a precondition, and rewriting ~300 assertions would be churn with no
+production benefit.
+
 ## Open items
 
 - [x] Frontend language/framework on Pages: **Astro + islands** — decided, see [`website/01-architecture.md`](website/01-architecture.md).

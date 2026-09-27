@@ -361,15 +361,30 @@ pub async fn create_key(
     )
     .await?;
 
+    // The alphabet indexing is provably in bounds: `% 62` yields 0..=61 and the
+    // array is exactly 62 bytes, so this can never panic. That is precisely why it
+    // is written with `get()` and a fallback anyway — the proof depends on two
+    // literals staying in step, and a future edit that adds or removes one
+    // alphabet character would turn a panic-free line into a panic WITHOUT any
+    // visible change here. The fallback is unreachable and is the point.
+    const KEY_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let random_bytes: String = (0..43)
         .map(|_| {
-            let idx = (rand_core::OsRng.next_u32() % 62) as usize;
-            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[idx] as char
+            let idx = (rand_core::OsRng.next_u32() % KEY_ALPHABET.len() as u32) as usize;
+            KEY_ALPHABET.get(idx).copied().unwrap_or(b'0') as char
         })
         .collect();
 
     let full_key = format!("apk_live_{}", random_bytes);
-    let prefix = format!("apk_live_{}", &random_bytes[..4]);
+    // The display prefix is the first 4 characters, and this is a RANGE slice
+    // rather than an index — the same "the proof depends on a literal" argument
+    // as the alphabet above. `random_bytes` is 43 characters by construction, so
+    // this cannot panic today; `get(..4)` keeps it that way if the length ever
+    // changes, at the cost of a fallback that is unreachable and therefore free.
+    let prefix = format!(
+        "apk_live_{}",
+        random_bytes.get(..4).unwrap_or(random_bytes.as_str())
+    );
     let key_hash = hash_token(&full_key);
 
     let models_json = serde_json::to_value(&payload.models).unwrap_or(json!([]));
@@ -451,7 +466,15 @@ pub async fn update_key(
         check_rate_limit(requested)?;
     }
 
-    let models_json = payload.models.map(|m| serde_json::to_value(m).unwrap());
+    // NOT `.unwrap()`: this is the key-UPDATE handler, and a panic here is a 500
+    // on a money-adjacent endpoint rather than a refused request. Serialising a
+    // `Vec<String>` cannot realistically fail, but "cannot realistically fail" is
+    // exactly the reasoning that makes an unwrap survive review and then fire in
+    // production. The create path above (line ~375) already uses the safe form;
+    // this now matches it.
+    let models_json = payload
+        .models
+        .map(|m| serde_json::to_value(m).unwrap_or_else(|_| json!([])));
 
     let res: Option<String> = sqlx::query_scalar(
         r#"

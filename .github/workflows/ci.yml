@@ -44,6 +44,32 @@ jobs:
         working-directory: server
         run: cargo clippy -- -D warnings
 
+      # Dependency audit: known CVEs in the LOCKFILE.
+      #
+      # This is the one gate that looks OUTSIDE the repository — every other check
+      # here can pass while a dependency is found to be vulnerable, because
+      # nothing in the source changes when an advisory is published. It caught a
+      # real one the first time it ran (RUSTSEC-2023-0071, rsa 0.9.10).
+      #
+      # It reads `server/.cargo/audit.toml`, so the single exception this repo
+      # carries is COMMITTED and REVIEWABLE rather than an `--ignore` flag buried
+      # in this file. Adding an exception therefore requires a commit with its
+      # reasoning, which is the point.
+      #
+      # `--deny warnings` is deliberately NOT passed: the audit's own default
+      # already fails on a vulnerability, and "unmaintained" is surfaced through
+      # `informational_warnings` in the config as a warning, not a build break.
+      # A gate that fails on a crate merely being unmaintained gets muted, and a
+      # muted gate is worse than none.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Dependency audit
+        working-directory: server
+        run: cargo audit
+
       - name: Build
         working-directory: server
         run: cargo build
