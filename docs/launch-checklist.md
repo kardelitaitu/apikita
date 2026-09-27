@@ -57,30 +57,53 @@ opinion.
 
 ### Webhook
 
-- [ ] Signature verified on every request; mismatches rejected and logged.
-- [ ] Amount validated against the **stored** `topups` row, never the payload.
-- [ ] Crediting is idempotent by `order_id`.
-- [ ] Crediting is atomic with the `topups` status update and the ledger row.
-- [ ] `refund` and `partial_refund` statuses **refused, not handled**: a signed
+- [x] Signature verified on every request; mismatches rejected and logged.
+- [x] Amount validated against the **stored** `topups` row, never the payload.
+- [x] Crediting is idempotent by `order_id`.
+- [x] Crediting is atomic with the `topups` status update and the ledger row.
+- [x] `refund` and `partial_refund` statuses **refused, not handled**: a signed
       refund notification returns 200 with `{"status":"refund_not_supported"}`,
       logs at `error!`, and writes nothing — the topup stays `settled`, no ledger
-      row is appended, the wallet cannot move. **Alerting on that refusal is what
-      makes it visible** — unalerted, a refusal is indistinguishable from a bug.
+      row is appended, the wallet cannot move.
+- [ ] **Alerting on that refusal** — unalerted, a refusal is indistinguishable from
+      a bug. The code logs the documented event; nothing schedules or alerts on it
+      yet. This is the ONE part of this group that is genuinely outstanding, and it
+      is an ops task rather than a code defect.
 
 ### Ledger and balance
 
-- [ ] **No client-reachable path can write `balance_idr`.**
+- [x] **No client-reachable path can write `balance_idr`.**
 - [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase.
 - [x] The reconciliation query returns **zero rows** on production data.
-- [ ] `CHECK (balance_idr >= 0)` present and exercised.
+- [x] `CHECK (balance_idr >= 0)` present and exercised.
 - [x] Money is `INTEGER` IDR end to end; no float appears in any billing path. (Was `BIGINT` under Postgres; `STRICT` SQLite tables reject `BIGINT`, so the type is now `INTEGER` — see `decisions.md` §Money.)
 
 ### Billing accuracy
 
-- [ ] **Cache-read tokens are never counted as input tokens** — test with a payload
+- [x] **Cache-read tokens are never counted as input tokens** — test with a payload
       containing cache hits.
 - [x] Three token classes stored separately in `usage_daily`.
-- [ ] Peak/off-peak basis applied consistently between reservation and settlement.
+- [x] Peak/off-peak basis applied consistently between reservation and settlement.
+
+> **These boxes were UNCHECKED while the work was already done and tested** — the
+> same drift this file has been corrected for before. Each was verified against the
+> code and its tests before being ticked, not inferred from the fact that the suite
+> is green:
+>
+> | Item | Evidence |
+> | --- | --- |
+> | Signature verified | `money.rs:73` `ct_eq` over SHA-512, pinned by known-vector tests |
+> | Stored-amount validation | `db.rs:140` matches `order_id AND status AND amount_idr`; `AmountMismatch` handled at `webhooks.rs:205` |
+> | Idempotent crediting | the conditional UPDATE above is the claim; replay test asserts exactly one credit |
+> | Atomic credit | one `BEGIN IMMEDIATE` covers the status change, the wallet and the ledger row |
+> | Refunds refused | `money.rs:126` `PaymentAction::RefundRefused`; two live tests, incl. an inflated amount |
+> | No route writes `balance_idr` | all 7 UPDATE sites are in `db.rs` (transactional) or `bin/hold-sweep.rs` (operator tool) |
+> | `CHECK (balance_idr >= 0)` | `migrations/20260925000000_initial_schema.sql:66` |
+> | Cache-read not counted as input | `upstream/client.rs:120` clamps with `cached.min(prompt)` so a malformed report cannot push the split negative; `money.rs:344` `a_cached_token_is_never_also_billed_as_an_input_token` asserts the arithmetic |
+>
+> **The refund-alerting box is explicitly OUTSIDE this group and left unticked**,
+> because it is the one part that is genuinely outstanding: the event is logged but
+> nothing watches it, and it is an ops task rather than a code defect.
 
 ## Gate 3 — Access control
 
