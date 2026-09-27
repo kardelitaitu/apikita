@@ -507,6 +507,67 @@ mod tests {
     use sqlx::SqlitePool;
 
     // -----------------------------------------------------------------------
+    // A loopback PocketBase, for the login-after-suspend test.
+    //
+    // The test this replaces was `#[ignore]`d with the note "faking that would
+    // test the fake". That is true of faking the LOGIC, but the PEER can be a
+    // stub: `verify_pb_token` builds its URL from `pocketbase_base_url()`, which
+    // reads `POCKETBASE_URL` on every call. Pointing that variable at a loopback
+    // listener drives the REAL client, the REAL status handling and the REAL
+    // `exchange_token` handler - no mock, no trait object, no production change.
+    //
+    // This is the same technique that took `routes/auth.rs` from 58.6% to 98.2%,
+    // applied to the last remaining `#[ignore]` in the crate.
+    // -----------------------------------------------------------------------
+
+    /// A one-shot local HTTP stub standing in for PocketBase auth-refresh.
+    async fn pocketbase_stub(status_line: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the PocketBase stub");
+        let addr = listener.local_addr().expect("stub address");
+
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// A successful auth-refresh body, shaped as PocketBase sends it.
+    fn auth_refresh_body(record_id: &str) -> String {
+        format!(
+            r#"{{"token":"new.jwt.value","record":{{"id":"{record_id}","email":"u@example.com"}}}}"#
+        )
+    }
+
+    /// Point POCKETBASE_URL at the stub for the duration of the test. Takes the
+    /// shared env lock, so it cannot interleave with another test reading the
+    /// same process-global.
+    fn point_pocketbase_at(
+        base: &str,
+    ) -> (
+        crate::routes::test_env::EnvLock,
+        crate::routes::test_env::EnvGuard,
+    ) {
+        let lock = crate::routes::test_env::EnvLock::acquire();
+        let guard = crate::routes::test_env::EnvGuard::set("POCKETBASE_URL", base);
+        (lock, guard)
+    }
+    // -----------------------------------------------------------------------
     // Fixtures. Same style as keys.rs/account.rs: a real, migrated database, the
     // real handlers, and the real money path - never a hand-written balance.
     // Each test builds its OWN SQLite database in a temp directory (TestDb), so
@@ -1471,7 +1532,132 @@ mod tests {
     // real PocketBase over the network, and faking that would test the fake. So
     // this is the one test here that still needs a live external service
     // (POCKETBASE_URL); nothing about it needs Postgres.
-    #[ignore = "requires the local PocketBase: POCKETBASE_URL"]
+    /// THE LAST `#[ignore]` IN THE CRATE, now running by default.
+    ///
+    /// It proves the second half of Gate 3's suspension requirement: after an
+    /// operator suspends an account, that account cannot log back in, the refusal
+    /// is a 401 `unauthenticated`, and the refused login MINTS NOTHING (no session
+    /// row) and leaves no ledger drift. `auth.rs` refuses a non-active status at
+    /// exchange time; this is the test that proves the refusal holds through the
+    /// real handler end to end - and until now it had never run in CI.
+    ///
+    /// The identity is served by a loopback stub rather than a live PocketBase,
+    /// which is what makes it runnable. The code under test is unchanged.
+    // -----------------------------------------------------------------------
+    // The documented status contract for suspend/resume.
+    //
+    // docs/server/api-spec.md fixes these responses and nothing asserted them:
+    // an absent target is 404 `not_found`, and a target in the wrong state is 409
+    // `conflict`. They are user-visible contract, not internals - an operator
+    // tooling against this API branches on them.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn suspending_an_absent_account_is_404_not_found() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(suspend_account(
+            State(state.clone()),
+            Path(Uuid::new_v4()),
+            headers,
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn resuming_an_absent_account_is_404_not_found() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(resume_account(
+            State(state.clone()),
+            Path(Uuid::new_v4()),
+            headers,
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+
+        db.close().await;
+    }
+
+    /// Resuming an account that is NOT suspended is a 409, not a silent success.
+    ///
+    /// The distinction matters: a resume that quietly "succeeded" on an active
+    /// account would write an `admin_audit` row for a state change that never
+    /// happened, and the audit trail is only worth having if it records what
+    /// actually occurred.
+    #[tokio::test]
+    async fn resuming_an_active_account_is_409_conflict_and_writes_no_audit_row() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        // A fresh, ACTIVE account that was never suspended.
+        let victim = test_support::account(&pool).await;
+
+        let (status, body) =
+            render(resume_account(State(state.clone()), Path(victim), headers)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], json!("conflict"));
+
+        // No audit row for a state change that did not happen.
+        let audits: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit WHERE target_id = ?")
+                .bind(victim.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("count audit rows");
+        assert_eq!(
+            audits, 0,
+            "a refused resume must write no audit row - an audit trail that records non-events is worse than none"
+        );
+
+        db.close().await;
+    }
+
+    /// Suspending an account that is ALREADY suspended is a 409 too, and changes
+    /// nothing.
+    #[tokio::test]
+    async fn suspending_an_already_suspended_account_is_409_conflict() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        let victim = test_support::account(&pool).await;
+        sqlx::query("UPDATE accounts SET status = 'suspended' WHERE id = ?")
+            .bind(victim.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("park the account in the suspended state");
+
+        let (status, body) =
+            render(suspend_account(State(state.clone()), Path(victim), headers)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], json!("conflict"));
+
+        db.close().await;
+    }
+
     #[tokio::test]
     async fn a_new_login_after_suspend_is_still_refused() {
         let db = TestDb::new().await;
@@ -1480,9 +1666,12 @@ mod tests {
         let operator = create_operator(&pool).await;
         let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
 
-        let client = reqwest::Client::new();
-        let tag = Uuid::new_v4().simple().to_string();
-        let (record_id, pb_token) = pocketbase_identity(&client, &tag).await;
+        let record_id = format!("pb{}", Uuid::new_v4().simple());
+        let base = pocketbase_stub("200 OK", &auth_refresh_body(&record_id)).await;
+        let (_lock, _guard) = point_pocketbase_at(&base);
+        // The stub answers ANY token with this record, so the token value is not
+        // what is under test here - the ACCOUNT STATUS is.
+        let pb_token = "a-valid-token".to_string();
 
         // Every NOT NULL column is bound from Rust: the SQLite schema has no
         // DEFAULT for id, created_at or updated_at.
@@ -1539,77 +1728,11 @@ mod tests {
 
         assert_no_drift(&pool, &[operator, victim]).await;
         db.close().await;
-        delete_pocketbase_identity(&client, &record_id, &pb_token).await;
     }
 
-    // -----------------------------------------------------------------------
-    // PocketBase identity fixture. exchange_token verifies its token against
-    // PocketBase over the network, so the fixture is a REAL PocketBase record
-    // with a real auth token - never a stub, and never a faked POCKETBASE_URL
-    // (which would race the live auth.rs tests in the same process).
-    // -----------------------------------------------------------------------
-
-    const PB_USERS_COLLECTION: &str = "users";
-
-    fn pocketbase_base_url() -> String {
-        std::env::var("POCKETBASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string())
-    }
-
-    fn pb_collection_url() -> String {
-        format!(
-            "{}/api/collections/{}",
-            pocketbase_base_url().trim_end_matches('/'),
-            PB_USERS_COLLECTION
-        )
-    }
-
-    /// (record_id, auth_token)
-    async fn pocketbase_identity(client: &reqwest::Client, tag: &str) -> (String, String) {
-        let email = format!("test_admin_{tag}@apikita-test.invalid");
-        let password = format!("test-pw-{tag}");
-
-        let created: Value = client
-            .post(format!("{}/records", pb_collection_url()))
-            .json(&json!({
-                "email": email,
-                "password": password,
-                "passwordConfirm": password,
-            }))
-            .send()
-            .await
-            .expect("PocketBase must be reachable: docker compose up -d")
-            .json()
-            .await
-            .expect("PocketBase answers JSON");
-        let record_id = created["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("PocketBase did not return a record id: {created}"))
-            .to_string();
-
-        let auth: Value = client
-            .post(format!("{}/auth-with-password", pb_collection_url()))
-            .json(&json!({ "identity": email, "password": password }))
-            .send()
-            .await
-            .expect("PocketBase auth must answer")
-            .json()
-            .await
-            .expect("PocketBase answers JSON");
-        let token = auth["token"]
-            .as_str()
-            .unwrap_or_else(|| panic!("PocketBase did not return a token: {auth}"))
-            .to_string();
-
-        (record_id, token)
-    }
-
-    /// Best effort: it runs after the assertions, and a cleanup hiccup must not
-    /// masquerade as a failed assertion.
-    async fn delete_pocketbase_identity(client: &reqwest::Client, record_id: &str, token: &str) {
-        let _ = client
-            .delete(format!("{}/records/{}", pb_collection_url(), record_id))
-            .header(reqwest::header::AUTHORIZATION, token.to_string())
-            .send()
-            .await;
-    }
+    // The live-PocketBase fixtures (pb_collection_url, pocketbase_identity,
+    // delete_pocketbase_identity and their base-url helper) stood here. They are
+    // DELETED with the test that needed them: the loopback stub above replaces the
+    // approach, and a fixture that creates REAL PocketBase records would now imply
+    // this suite still needs an external service.
 }
