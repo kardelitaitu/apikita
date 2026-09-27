@@ -412,6 +412,72 @@ pub async fn list_accounts(
     .into_response())
 }
 
+
+/// Query parameters for the global recent-actions read.
+#[derive(Debug, Deserialize)]
+pub struct AdminRecentAuditQuery {
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/admin/audit` - the most recent operator actions across ALL accounts.
+///
+/// The per-account trail answers "what happened to THIS account". This answers
+/// the other question an operator asks: "what has been happening at all" - the
+/// overview that catches an action taken on the wrong account, or a burst of
+/// suspensions during an incident, without already knowing which account to look
+/// at. It is the same table, read newest-first without a target filter.
+///
+/// Served by `admin_audit_recent_idx (created_at DESC, id DESC)` (migration
+/// 20260927000000), so the ordered read is index-served rather than a sort per
+/// load. The index is small and grows with actions, not with traffic.
+///
+/// Safety: `require_operator` first, before any row is read. No target filter
+/// means `refuse_self_action` cannot apply - there is no single target - and the
+/// operator's OWN past actions are legitimately part of the global history, so
+/// they appear here (this is a LIST of actions, not an action on one account).
+pub async fn list_recent_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminRecentAuditQuery>,
+) -> Result<Response, AdminError> {
+    require_operator(&state, &headers).await?;
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, operator_id, action, target_type, target_id, detail, created_at
+        FROM admin_audit
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut entries: Vec<AdminAuditEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let operator_raw: String = row.try_get("operator_id")?;
+        let operator_uuid = Uuid::parse_str(&operator_raw).map_err(|e| {
+            AdminError::App(AppError::Internal(format!(
+                "admin_audit.operator_id is not a uuid: {e}"
+            )))
+        })?;
+        entries.push(AdminAuditEntry {
+            id: row.try_get("id")?,
+            operator_id: operator_uuid,
+            action: row.try_get("action")?,
+            target_type: row.try_get("target_type")?,
+            target_id: row.try_get("target_id")?,
+            detail: row.try_get("detail")?,
+            created_at: row.try_get("created_at")?,
+        });
+    }
+
+    Ok(Json(json!({ "entries": entries, "limit": limit })).into_response())
+}
+
 /// Query parameters for the audit read. A single optional limit, kept local
 /// rather than shared with `account.rs`'s LimitQuery, which is that module's
 /// own type.
@@ -2469,6 +2535,95 @@ mod tests {
         assert!(body["entries"].is_array(), "body: {body}");
 
         assert_no_drift(&pool, &[operator, victim]).await;
+        db.close().await;
+    }
+
+
+    // -----------------------------------------------------------------------
+    // GET /api/admin/audit - the global recent-actions read.
+    //
+    // Unlike the per-account trail, this spans every account and has no target
+    // filter, so it is the one place a missing guard would expose all operator
+    // activity to a non-operator. These tests pin the guard and the ordering.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recent_audit_requires_an_operator() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let outsider = create_account(&pool).await;
+
+        // No cookie -> 401.
+        let (status, _) = render(list_recent_audit(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AdminRecentAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A non-operator session -> 403, before any row is read.
+        let outsider_headers = cookie_headers(&issue_session(&pool, outsider).await);
+        let (status, body) = render(list_recent_audit(
+            State(state.clone()),
+            outsider_headers,
+            Query(AdminRecentAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+
+        assert_no_drift(&pool, &[operator, outsider]).await;
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn recent_audit_spans_accounts_newest_first() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let a = create_account(&pool).await;
+        let b = create_account(&pool).await;
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        // Two actions on two DIFFERENT accounts, so a target-filtered read would
+        // miss one and this test would catch it.
+        let (s, _) = render(suspend_account(State(state.clone()), Path(a), operator_headers.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = render(suspend_account(State(state.clone()), Path(b), operator_headers.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+
+        let (status, body) = render(list_recent_audit(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminRecentAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let entries = body["entries"].as_array().expect("entries is an array");
+        let targets: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["action"] == json!("suspend"))
+            .map(|e| e["target_id"].as_str().unwrap())
+            .collect();
+        // Both accounts appear; the later suspend (b) is first.
+        assert_eq!(targets.first().copied(), Some(b.hyphenated().to_string().as_str()));
+        assert!(targets.contains(&a.hyphenated().to_string().as_str()), "both accounts must appear: {body}");
+
+        // The limit is bounded and echoed.
+        let (_, body) = render(list_recent_audit(
+            State(state.clone()),
+            cookie_headers(&issue_session(&pool, operator).await),
+            Query(AdminRecentAuditQuery { limit: Some(1) }),
+        ))
+        .await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["limit"], json!(1));
+
+        assert_no_drift(&pool, &[operator, a, b]).await;
         db.close().await;
     }
 

@@ -205,6 +205,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/events", get(events::sse_events_handler))
         // Admin (cookie + operator flag)
         .route("/api/admin/accounts", get(admin::list_accounts))
+        .route("/api/admin/audit", get(admin::list_recent_audit))
         .route("/api/admin/accounts/{id}", get(admin::get_account))
         .route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit))
         .route(
