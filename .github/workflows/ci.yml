@@ -86,6 +86,69 @@ jobs:
           -- --skip a_new_login_after_suspend_is_still_refused
           --skip live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
 
+      # The deployable artifact must BUILD, and it must RUN.
+      #
+      # This step exists because the Dockerfile did not, until W17: deployment
+      # step [3] named a server image that had no definition anywhere in the
+      # repository, so nothing could have caught its absence. A Dockerfile that
+      # is never built is the same class of defect as a money check that is never
+      # run - it looks like coverage and is not.
+      #
+      # It BUILDS rather than only linting the syntax, because the failures that
+      # actually happened here were build failures: a COPY of a path that does
+      # not exist, and a pinned Rust version older than the lockfile's icu_*
+      # crates demand. Neither is visible to a linter.
+      #
+      # WINDOWS CONTRIBUTORS: the smoke step below passes container paths to
+      # \`--entrypoint\`, and Git Bash rewrites \`/usr/local/bin/...\` into a
+      # \`C:/Program Files/Git/...\` path, which fails with "no such file or
+      # directory". That is a local-shell artifact and does not affect this
+      # workflow (ubuntu-latest). To run it by hand on Windows, set
+      # \`MSYS_NO_PATHCONV=1\` first.
+      - name: Build the server image
+        run: docker build -f server/Dockerfile -t apikita-server:ci .
+
+      # And it must actually SERVE. "The image built" is not "the service runs":
+      # the build above would pass with a binary that panics on boot, a config
+      # it cannot read, or a database path it cannot open. So this starts the
+      # container against a migrated volume and requires the documented health
+      # contract - the same one deployment step [4] gates the release on.
+      - name: Smoke the server image against a migrated database
+        run: |
+          set -euo pipefail
+          docker volume create apikita-ci-data
+          # Step [2] of the deploy pipeline, run through the shipped binary.
+          docker run --rm -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /usr/local/bin/apikita-migrate apikita-server:ci
+          docker run -d --name apikita-ci-api -p 18080:8080 \
+            -v apikita-ci-data:/srv/apikita/server/data apikita-server:ci
+          # The container's own HEALTHCHECK must go green. Polling the platform's
+          # health status rather than curl-ing the port proves the probe that
+          # ships is the probe that works - an unverified healthcheck reports
+          # unhealthy on every container and looks like an application fault.
+          for i in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' apikita-ci-api)
+            if [ "$status" = "healthy" ]; then break; fi
+            if [ "$status" = "unhealthy" ]; then
+              docker logs apikita-ci-api
+              echo "::error::the container reported unhealthy"
+              exit 1
+            fi
+            sleep 2
+          done
+          status=$(docker inspect --format '{{.State.Health.Status}}' apikita-ci-api)
+          if [ "$status" != "healthy" ]; then
+            docker logs apikita-ci-api
+            echo "::error::container never became healthy (last status: $status)"
+            exit 1
+          fi
+          # And independently confirm the documented body, so a probe that
+          # returns 200 for the wrong reason cannot pass.
+          docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/health \
+            | grep -q '"database":"connected"'
+          docker rm -f apikita-ci-api
+          docker volume rm apikita-ci-data
+
       - name: Install website dependencies
         working-directory: website
         run: npm ci

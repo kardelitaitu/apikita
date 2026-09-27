@@ -122,6 +122,57 @@ new server may need the new column; the new frontend may need the new endpoint.
 **Never roll back a migration by hand in production.** Write a new forward
 migration that undoes it. Down-migrations on live data are how you lose rows.
 
+## The server image
+
+Step [3] ships **one image** containing **two binaries**, both built from
+`server/Dockerfile`:
+
+| Binary | In the image as | Used by |
+| --- | --- | --- |
+| `apikita-server` | `/usr/local/bin/apikita-server` (the entrypoint) | Step [3] — the service itself |
+| `migrate` | `/usr/local/bin/apikita-migrate` | Step [2] — `sqlite migrate`, **never on server boot** |
+
+**Build it from the REPOSITORY ROOT**, not from `server/`:
+
+```bash
+docker build -f server/Dockerfile -t apikita-server .
+```
+
+The context must include `config/`, which is at the repo root and is **baked
+into the image** on purpose: it is versioned source, and a deployment mounting a
+different one is a deployment running different prices. `APIKITA_CONFIG_PATH`
+still overrides it.
+
+**The pipeline, as commands:**
+
+```bash
+# [2] migrate FIRST, against the volume the API will use. The old binary is
+#     still running and still writing, which is why R1 (additive migrations)
+#     exists — and why this is a separate process rather than a boot step.
+docker run --rm -v apikita-data:/srv/apikita/server/data \
+  --entrypoint /usr/local/bin/apikita-migrate apikita-server:latest
+
+# [3] then the new server
+docker run -d --name apikita-api -p 8080:8080 \
+  -v apikita-data:/srv/apikita/server/data apikita-server:latest
+```
+
+**What the image guarantees, and how each is verified in CI:**
+
+| Property | Why | Verified by |
+| --- | --- | --- |
+| Runs as **uid 10001, non-root** | It holds a writable database and provider credentials in its environment | `docker run … --entrypoint id` |
+| **No toolchain or package manager** | A compiler in the runtime image is attack surface with no operational use | the runtime stage copies only the two binaries |
+| `/srv/apikita/server/data` exists and is **writable by the runtime user** | A fresh volume with a root-owned directory fails on first start with "unable to open database file" | the probe in the smoke step |
+| A **working `HEALTHCHECK`** | An always-red probe turns a healthy deploy into a restart loop | the smoke step requires the container to *report healthy* |
+| The container's shutdown is **graceful** | `tini` reaps and forwards signals to the whole process group | `ENTRYPOINT` exec form |
+
+**One entrypoint, two verbs.** The image's `ENTRYPOINT` is `tini -- apikita-server`;
+running the migration means overriding it with `--entrypoint`. There is no
+`migrate` subcommand on the server binary, deliberately: `local-development.md`
+is explicit that migration never happens on server boot, and a subcommand would
+make that one flag away.
+
 ## Health checks
 
 The Rust server needs a `/health` endpoint that:
@@ -133,6 +184,14 @@ The Rust server needs a `/health` endpoint that:
 
 Deploy step [4] gates on this. Without it, a bad release takes down auth for
 everyone.
+
+**The image carries a `HEALTHCHECK` that probes the same endpoint** every 30s
+(`--start-period=10s`, three retries). It is the platform's liveness signal and
+is deliberately the same contract as step [4] — because `/health` already
+reports the database and never touches a provider, a provider outage cannot make
+a healthy gateway look dead. CI asserts the container *becomes healthy* rather
+than just that it started, since a probe that always fails is indistinguishable
+from an application that always crashes.
 
 ## Configuration
 

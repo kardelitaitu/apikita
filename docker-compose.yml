@@ -79,13 +79,17 @@ services:
   #              4=sqlite3 failed 5=stranded hold 6=no such database file).
   #              No `|| true` anywhere near it.
   #   ip-purge, hold-sweep
-  #              NOT WIRED. Both are Rust binaries and this compose file has no
-  #              server image and no Rust build stage, so no container in it can
-  #              contain them. This service logs that on startup and never
-  #              pretends to have run them — a scheduler that looks like it works
-  #              and does nothing is the same failure class as a money check that
-  #              returns 0 while the money is wrong. Run them on the host, on the
-  #              same cadence, until a server image exists.
+  #              NOT WIRED HERE. Both are Rust binaries, and this service's image
+  #              (.docker/maintenance) deliberately contains only the sqlite3 CLI
+  #              — it is not the server image and must not become one. A server
+  #              image DOES now exist (server/Dockerfile, W17) and it ships
+  #              apikita-server and migrate; ip-purge and hold-sweep are still not
+  #              copied into it, because neither has been scheduled. This service
+  #              logs that on startup and never pretends to have run them — a
+  #              scheduler that looks like it works and does nothing is the same
+  #              failure class as a money check that returns 0 while the money is
+  #              wrong. Run them on the host, on the same cadence, until they are
+  #              wired into a scheduled container.
   #
   # PORTED TO SQLITE. The image is built from .docker/maintenance/Dockerfile,
   # which exists only to put the sqlite3 CLI on PATH; both DSNs are sqlite://

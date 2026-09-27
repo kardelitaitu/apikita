@@ -1,0 +1,33 @@
+# Build context exclusions for the server image.
+#
+# WHY THIS FILE EXISTS. `server/Dockerfile`'s build context is this directory,
+# and Docker uploads the whole context to the daemon before building. Without
+# these lines that includes `target/` - measured at ~1 GB on this repo - plus any
+# stray database file, which turns a 5-second context transfer into a minute and
+# can push a hosted builder over its context limit. Nothing here is needed to
+# compile the binary.
+
+# Build artefacts. Rebuilt inside the builder stage from the lockfile.
+target/
+
+# A local SQLite database and its WAL sidecars are STATE, not source. Copying one
+# into an image would bake a developer's ledger into the deployed artefact - the
+# single worst thing this file prevents.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets and local overrides. `.env` is gitignored for the same reason; an
+# image must never contain one, and a context that carries it is a context that
+# could land in a layer.
+.env
+.env.*
+
+# Editor and OS noise.
+**/.DS_Store
+**/*.swp
+
+# Documentation is not needed to build, and the config it might describe is
+# copied explicitly and deliberately rather than swept in.
+*.md
