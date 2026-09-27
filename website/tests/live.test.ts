@@ -28,7 +28,11 @@ class FakeEventSource {
   close(): void {
     this.readyState = FakeEventSource.CLOSED;
   }
-  dispatch(type: string, data: unknown): void {
+  // `data` is optional because a real EventSource event does not always carry
+  // one: 'open' and 'error' fire with no payload, and the tests dispatch exactly
+  // those. The parameter was required in the first version, which made `tsc`
+  // reject the two 1-argument calls below — the signature was wrong, not the call.
+  dispatch(type: string, data?: unknown): void {
     for (const cb of this.listeners[type] ?? []) cb({ data });
   }
   static instances: FakeEventSource[] = [];
