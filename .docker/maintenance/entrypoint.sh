@@ -50,12 +50,21 @@
 #               sessions (30d) - through sqlite3, so
 #               docs/data-retention.md is enforced here.
 #
-#   hold-sweep  NOT WIRED, and NOT covered by an inline equivalent. Nothing sweeps
-#               stranded reservation holds in this topology. That matters: a
-#               stranded hold is invisible money - the ledger still balances and
-#               reconciliation returns nothing - which is exactly why the 900s
-#               bound exists. This gap is LOUD, not silent: the banner below names
-#               it on every start.
+#   hold-sweep  RUNS HERE, FOR REAL - report-only, and that is the point. A
+#               stranded reservation hold is INVISIBLE MONEY: the ledger still
+#               balances and reconcile.sh is STRUCTURALLY BLIND to it (its own
+#               output says so). The predicate here is deliberately the SAME as
+#               server/src/bin/hold-sweep.rs and db::unpaired_hold_rows - the
+#               binary warns that a different one "would make the binary and the
+#               library disagree about what 'stranded' means, which is how a
+#               detector stops being trusted". It uses that binary's default bound
+#               (900s = 15 min, ~7.5x the request timeout).
+#
+#               It NEVER moves money. The binary's --release flag is the
+#               deliberate operator action, and the binary explains why it is not
+#               the default: "silently correcting a stranded hold is the same
+#               invisible-money anti-pattern this sweep exists to catch." So this
+#               job counts, names the accounts and refs, and exits non-zero.
 #
 # Run the three Rust jobs on the HOST, on the same nightly cadence, until they are
 # wired into a scheduled container. Their WORK is already done in-container for
@@ -153,8 +162,8 @@ banner() {
     log "WIRED     reconcile  - tools/reconcile/reconcile.sh, exit code preserved (1=drift 2=no DATABASE_URL 3=no sqlite3 4=sqlite3 failed 5=stranded hold 6=no such database file)"
     log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary NOT shipped in the server image; it does NOT run here. Its retention window IS enforced inline (see retention above)."
     log "NOT WIRED usage-purge - server/src/bin/usage-purge.rs, same: not shipped, does NOT run here. Its three sweeps ARE enforced inline (see retention above)."
-    log "NOT WIRED hold-sweep - server/src/bin/hold-sweep.rs is a Rust binary NOT shipped in the server image; it does NOT run here, and nothing inline replaces it. Nothing sweeps stranded holds in this topology."
-    log "NOT WIRED these three are report-only gaps, not silent ones. Run them on the host on the same cadence: DATABASE_URL=... cargo run --manifest-path server/Cargo.toml --bin ip-purge (or --bin usage-purge, --bin hold-sweep)"
+    log "WIRED     hold-sweep - REPORT-ONLY, SQL inline in this entrypoint, using the SAME predicate as server/src/bin/hold-sweep.rs (which warns that a different predicate would make the binary and the library disagree about what 'stranded' means). Bound ${HOLD_SWEEP_BOUND_SECONDS}s. It counts, names and exits non-zero; it NEVER moves money, because silently crediting a hold is the same invisible-money anti-pattern the sweep exists to catch. --release stays a deliberate host action."
+    log "NOT WIRED two report-only gaps, not silent ones. Run them on the host on the same cadence: DATABASE_URL=... cargo run --manifest-path server/Cargo.toml --bin ip-purge (or --bin usage-purge)"
     log "DATABASE_URL=${DATABASE_URL:-<unset>}"
     log "RECONCILE_DATABASE_URL=${RECONCILE_DATABASE_URL:-<unset>}"
     if [ -n "${DATABASE_URL:-}" ]; then
@@ -294,11 +303,79 @@ run_reconcile() {
 }
 
 # -----------------------------------------------------------------------------
-# Job 3 - hold-sweep. Cannot run here. Says so, every night.
+# Job 3 - hold-sweep. REPORT-ONLY, by design.
 # -----------------------------------------------------------------------------
-run_hold_sweep_not_wired() {
-    log "job hold-sweep: NOT RUN - server/src/bin/hold-sweep.rs is a Rust binary and this image contains no Rust build or binary. A stranded reservation hold is invisible money, so this gap is announced, never silently skipped."
-    log "job hold-sweep: run it on the host: DATABASE_URL=... cargo run --manifest-path server/Cargo.toml --bin hold-sweep"
+# THE PREDICATE IS THE BINARY'S, deliberately. server/src/bin/hold-sweep.rs:157-160
+# states the constraint: "The predicate is deliberately the one db::unpaired_hold_rows
+# documents... A different predicate here would make the binary and the library
+# DISAGREE about what stranded means, which is how a detector stops being trusted."
+# So this is the same SQL, and the smoke test asserts agreement with reconcile.sh
+# rather than trusting two statements to match by eye.
+#
+# REPORT-ONLY, matching the binary's default. The binary describes why:
+# "silently correcting a stranded hold is the same invisible-money anti-pattern this
+# sweep exists to catch." Crediting a hold writes a positive ledger row and is an
+# OPERATOR action (--release); it does not belong on a nightly schedule. So this job
+# counts, names and exits non-zero, and the money-moving half stays in the tested
+# Rust binary.
+#
+# WHY THE BOUND IS 900s. Same as the binary's DEFAULT_MAX_HOLD_AGE_SECONDS: a hold
+# lives as long as one request, so anything under ~7.5x the request timeout is a
+# release that is merely late, and alerting on it would be noise.
+HOLD_SWEEP_BOUND_SECONDS="${HOLD_SWEEP_BOUND_SECONDS:-900}"
+
+# The stranded-hold predicate, in ONE place so the count and the detail listing
+# cannot drift apart. $1 = the bound in seconds.
+hold_sweep_query() {
+    cat <<SQL
+SELECT l.account_id, l.ref, CAST(SUM(l.delta_idr) AS INTEGER) AS amount_idr
+FROM ledger l
+WHERE l.ref LIKE 'reserve_%' AND l.delta_idr < 0
+GROUP BY l.account_id, l.ref
+HAVING NOT EXISTS (
+    SELECT 1 FROM ledger m
+    WHERE m.account_id = l.account_id AND m.ref = l.ref AND m.delta_idr > 0
+)
+  AND CAST(strftime('%s', 'now') - strftime('%s', MIN(l.created_at)) AS INTEGER) > $1
+SQL
+}
+
+run_hold_sweep() {
+    log "job hold-sweep: start (report-only; a stranded hold is invisible money)"
+    if [ -z "${DATABASE_URL:-}" ]; then
+        log "job hold-sweep: FAILED - DATABASE_URL is not set (refusing to report a sweep that did not run)"
+        return 1
+    fi
+    if ! have_sqlite3; then
+        log "job hold-sweep: FAILED - sqlite3 is not installed in this image"
+        return 1
+    fi
+    if ! DB_FILE=$(db_file_from_url "$DATABASE_URL"); then
+        log "job hold-sweep: FAILED - DATABASE_URL is not a sqlite:// URL: $DATABASE_URL"
+        return 1
+    fi
+    if [ ! -f "$DB_FILE" ]; then
+        log "job hold-sweep: FAILED - no such database file: $DB_FILE (nothing was swept)"
+        return 1
+    fi
+
+    ROWS=$(sqlite3 -bail -noheader -separator '|' "$DB_FILE" "$(hold_sweep_query "$HOLD_SWEEP_BOUND_SECONDS")" 2>"$SQL_ERR") || {
+        log "job hold-sweep: FAILED - the stranded-hold query did not run (sqlite3 error above)"
+        [ -s "$SQL_ERR" ] && while IFS= read -r l; do log "job hold-sweep:   $l"; done < "$SQL_ERR"
+        return 1
+    }
+
+    if [ -n "$ROWS" ]; then
+        N=$(printf '%s\n' "$ROWS" | grep -c .)
+        log "job hold-sweep: ALERT - $N stranded reservation hold(s) older than ${HOLD_SWEEP_BOUND_SECONDS}s in $DB_FILE"
+        printf '%s\n' "$ROWS" | while IFS='|' read -r acct ref amt; do
+            log "job hold-sweep:   account=$acct ref=$ref amount_idr=$amt"
+        done
+        log "job hold-sweep: this is INVISIBLE MONEY - the ledger balances and reconcile.sh is structurally blind to it. Correct it deliberately, never silently: cargo run --bin hold-sweep -- --release"
+        return 1
+    fi
+
+    log "job hold-sweep: OK - 0 stranded holds older than ${HOLD_SWEEP_BOUND_SECONDS}s ($DB_FILE)"
     return 0
 }
 
@@ -306,7 +383,7 @@ run_wired_jobs() {
     rc=0
     run_retention || rc=1
     run_reconcile || rc=1
-    run_hold_sweep_not_wired
+    run_hold_sweep || rc=1
     return "$rc"
 }
 
@@ -398,8 +475,12 @@ case "${1:-schedule}" in
         run_reconcile
         exit $?
         ;;
+    hold-sweep)
+        run_hold_sweep
+        exit $?
+        ;;
     *)
-        echo "usage: maintenance-entrypoint.sh [schedule|once|retention|reconcile]" >&2
+        echo "usage: maintenance-entrypoint.sh [schedule|once|retention|reconcile|hold-sweep]" >&2
         exit 2
         ;;
 esac

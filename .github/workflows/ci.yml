@@ -246,6 +246,52 @@ jobs:
             exit 1
           fi
 
+          # 3: hold-sweep. THE gap this step exists for: a stranded reservation hold
+          # is INVISIBLE MONEY - the ledger balances and reconcile.sh is structurally
+          # blind to it - so the scheduler must actually detect one, not merely claim to.
+          #
+          # The fixture seeds BOTH a stranded hold and a HEALTHY (paired) reservation.
+          # The distinction is the test: a detector that fires on both is noise, and one
+          # that fires on neither is absent.
+          $RUN -v $PWD/.docker/maintenance/ci/hold-sweep-smoke-seed.sql:/seed.sql:ro \
+            -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c "sqlite3 /srv/apikita/server/data/server.db < /seed.sql"
+
+          out=$($RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP hold-sweep 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "job hold-sweep: ALERT" || {
+            echo "::error::hold-sweep did not detect the seeded stranded hold"
+            exit 1
+          }
+          echo "$out" | grep -q "reserve_stranded" || {
+            echo "::error::hold-sweep did not NAME the stranded ref; a count nobody can act on is half an alert"
+            exit 1
+          }
+          # The HEALTHY reservation must NOT be reported, or the detector fires on
+          # normal operation.
+          if echo "$out" | grep -q "reserve_healthy"; then
+            echo "::error::hold-sweep reported a HEALTHY paired reservation as stranded"
+            exit 1
+          fi
+          # Exit non-zero when it found something: the scheduler must FAIL, not
+          # report a clean sheet over unaccounted money.
+          rc=0
+          $RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP hold-sweep >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::hold-sweep exited 0 while a stranded hold was present"
+            exit 1
+          fi
+          # And the banner must say it is WIRED - a stale banner is how the previous
+          # gap survived: the loop was broken and every test used a verb that skipped it.
+          $RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP hold-sweep 2>&1 \
+            | grep -q "WIRED     hold-sweep" || {
+            echo "::error::the startup banner does not report hold-sweep as WIRED"
+            exit 1
+          }
           # Cleanup is BEST-EFFORT and must NEVER fail the step. The volume is
           # scratch, and the daemon can still hold it for a moment after the
           # `--rm` containers exit, so the removal is allowed to fail.
