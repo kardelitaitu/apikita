@@ -4,6 +4,7 @@
 // docs/website/06-api-keys-and-limits.md, docs/website/03-functional-spec.md.
 // This is a script-island (plain <script>), not a UI-framework component:
 // astro.config and package.json are owned by another worker and must not change.
+import Skeleton from '../../components/Skeleton.astro';
 const MODELS = ['flash', 'deepseek-v4-flash'];
 ---
 
@@ -16,6 +17,10 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   </div>
 
   <div id="key-error" hidden class="mt-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
+
+  <div id="key-list-loading" class="mt-4 rounded-lg border border-edge bg-surface-raised p-4">
+    <Skeleton width="w-full" lines={3} />
+  </div>
 
   <ul id="key-list" class="mt-4 divide-y divide-edge rounded-lg border border-edge"></ul>
 
@@ -263,6 +268,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   }
 
   function render(keys: ApiKey[]): void {
+    ($('key-list-loading') as HTMLElement).hidden = true;
     const hasAny = keys.length > 0;
     emptyEl.toggleAttribute('hidden', hasAny);
     listEl.toggleAttribute('hidden', !hasAny);
@@ -333,6 +339,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   async function loadKeys(): Promise<void> {
     clearError();
     statusEl.textContent = 'Loading keys…';
+    ($('key-list-loading') as HTMLElement).hidden = false;
     try {
       const keys = await apiFetch<ApiKey[]>('/api/keys');
       render(keys);

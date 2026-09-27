@@ -11,6 +11,7 @@
 // authorization lives in server/src/routes/admin.rs.
 //
 // Contract: docs/admin-surface.md, docs/server/api-spec.md (Admin routes).
+import Skeleton from '../../components/Skeleton.astro';
 ---
 
 <!--
@@ -60,6 +61,10 @@
       class="mt-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
 
     <p id="admin-list-status" class="mt-4 text-sm text-ink-muted" aria-live="polite">Loading accounts&hellip;</p>
+
+    <div id="admin-list-loading" class="mt-2 rounded-lg border border-edge bg-surface-raised p-4">
+      <Skeleton width="w-full" lines={4} />
+    </div>
 
     <div id="admin-list-wrap" hidden class="mt-2 overflow-x-auto rounded-lg border border-edge">
       <table class="w-full border-collapse text-left text-sm">
@@ -337,6 +342,7 @@
 
   function renderList(list: AdminAccountList): void {
     lastList = list;
+    ($('admin-list-loading') as HTMLElement).hidden = true;
     listStatus.textContent = listSummary(list);
     listRows.replaceChildren(...list.accounts.map(rowFor));
 
@@ -354,6 +360,7 @@
     listError.hidden = true;
     listStatus.hidden = false;
     listStatus.textContent = 'Loading accounts…';
+    ($('admin-list-loading') as HTMLElement).hidden = false;
     try {
       const list = await apiFetch<AdminAccountList>(
         accountListPath({ q: query.q, status: query.status, offset: query.offset }),
@@ -362,6 +369,7 @@
     } catch (err) {
       const status = (err as { status?: number }).status ?? 0;
       listStatus.hidden = true;
+      ($('admin-list-loading') as HTMLElement).hidden = true;
       listError.textContent = adminErrorMessage(status, describeError(err).message);
       listError.hidden = false;
     }
