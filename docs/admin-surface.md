@@ -33,6 +33,7 @@ built** — the status of each item is marked where it appears.
 | --- | --- | --- |
 | `GET /api/admin/accounts` | `admin::list_accounts` | Bounded listing with `q`/`status` filters. Same fields as the single view, per row. Never a credential |
 | `GET /api/admin/accounts/:id` | `admin::get_account` | Read-only: `status`, `is_operator`, `created_at`, `balance_idr`, live session count, live key count |
+| `GET /api/admin/accounts/:id/audit` | `admin::get_account_audit` | The account's `admin_audit` trail, newest first. **The read side of a table that was write-only** — the trail the console now shows |
 | `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'` + revoke every live session and API key, in one transaction |
 | `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; does not restore credentials |
 | `POST /api/admin/accounts/:id/restore` | `admin::resume_account` | **Alias of `/resume`** — same handler, same behaviour, two spellings |
