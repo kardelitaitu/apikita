@@ -337,3 +337,70 @@ export function isPlausibleLinkCode(candidate: string): boolean {
 export function linkCodeInstruction(code: string, ttlMinutes: number): string {
   return `Send /link ${formatLinkCode(code)} to the apikita bot in Telegram. The code works once and expires in ${ttlMinutes} minute${ttlMinutes === 1 ? '' : 's'}.`;
 }
+
+/**
+ * Which stored limit a field is being compared against, for the TTL warning.
+ *
+ * The create form has no previous value; an EDIT does, and the difference drives
+ * a real user-facing consequence (see `describeLimitChange`).
+ */
+export interface ExistingKeyLimits {
+  spend_limit_idr: number;
+  token_limit: number;
+  rate_limit_rpm: number;
+}
+
+/** The edit form's raw fields — the same shape as create, so one parser serves both. */
+export type UpdateKeyFields = CreateKeyFields;
+
+/**
+ * The `PATCH /api/keys/:id` body, or the first reason it must not be sent.
+ *
+ * Every field the API accepts is optional (server/src/routes/keys.rs:56-63), and
+ * this always sends the full set the form shows rather than a diff: the form is
+ * the source of truth for what the key should be, and sending only changed fields
+ * would silently preserve a value the user deliberately cleared. It reuses
+ * `buildCreateKeyRequest`'s validation verbatim — same limits, same expiry rules,
+ * same "impossible date is refused" behaviour — so create and edit cannot drift.
+ */
+export function buildUpdateKeyRequest(fields: UpdateKeyFields): CreateKeyBuild {
+  return buildCreateKeyRequest(fields);
+}
+
+/**
+ * Whether an edit LOWERS any limit, and therefore takes up to the metadata cache
+ * TTL to apply.
+ *
+ * docs/server/api-spec.md:187 — "Raising takes effect immediately; lowering is
+ * subject to the proxy's metadata cache TTL (≤60s). The response should say so,
+ * so the UI can warn honestly." This is that warning's trigger.
+ *
+ * Only a STRICT decrease counts. Raising, or leaving a limit unchanged, is not a
+ * reduction and must not raise the warning — a warning shown when nothing was
+ * lowered is noise the user learns to ignore.
+ */
+export function lowersAnyLimit(
+  before: ExistingKeyLimits,
+  after: ExistingKeyLimits,
+): boolean {
+  return (
+    after.spend_limit_idr < before.spend_limit_idr ||
+    after.token_limit < before.token_limit ||
+    after.rate_limit_rpm < before.rate_limit_rpm
+  );
+}
+
+/**
+ * The warning to show when an edit lowers a limit, or null when it does not.
+ *
+ * The sentence is deliberately specific about the window rather than saying
+ * "shortly": the whole point of telling the user is that a reduction is NOT
+ * instant, and a vague promise would defeat it.
+ */
+export function limitReductionWarning(
+  before: ExistingKeyLimits,
+  after: ExistingKeyLimits,
+): string | null {
+  if (!lowersAnyLimit(before, after)) return null;
+  return 'You lowered a limit. The proxy applies a reduction within its metadata cache TTL, up to 60 seconds — until then, requests a reduced limit would refuse can still pass. A RAISE takes effect immediately.';
+}

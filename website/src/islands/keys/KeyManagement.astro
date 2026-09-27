@@ -120,13 +120,87 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       </div>
     </div>
   </div>
+
+  <!-- Edit modal ------------------------------------------------------------- -->
+  <div id="key-edit-modal" hidden class="fixed inset-0 z-20 flex items-center justify-center bg-surface-sunken/80 p-4 backdrop-blur-sm"
+    role="dialog" aria-modal="true" aria-labelledby="key-edit-title">
+    <div class="w-full max-w-lg rounded-xl border border-edge-strong bg-surface-raised p-6 shadow-2xl shadow-black/60">
+      <h2 id="key-edit-title" class="text-lg font-semibold tracking-tight">Edit API key</h2>
+      <p class="mt-2 text-sm text-ink-muted">
+        Change the label, model access, limits or expiry. The key itself never
+        changes — its value stays the same.
+      </p>
+
+      <form id="key-edit-form" class="mt-4 space-y-4">
+        <div>
+          <label for="e-label" class="block text-sm font-medium">Label</label>
+          <input id="e-label" name="label" type="text" required autocomplete="off"
+            class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+        </div>
+
+        <fieldset>
+          <legend class="text-sm font-medium">Models</legend>
+          <p class="text-xs text-ink-muted">An empty selection permits nothing — the allowlist is deny by default.</p>
+          <div class="mt-2 flex flex-wrap gap-3">
+            <label class="inline-flex items-center gap-2 text-sm">
+              <input type="checkbox" name="models" value="flash" /> <span class="font-mono">flash</span>
+            </label>
+            <label class="inline-flex items-center gap-2 text-sm">
+              <input type="checkbox" name="models" value="deepseek-v4-flash" /> <span class="font-mono">deepseek-v4-flash</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="grid gap-4 sm:grid-cols-3">
+          <div>
+            <label for="e-spend" class="block text-sm font-medium">Spend limit (IDR)</label>
+            <input id="e-spend" name="spend_limit_idr" type="number" min="0"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label for="e-token" class="block text-sm font-medium">Token limit</label>
+            <input id="e-token" name="token_limit" type="number" min="0"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label for="e-rate" class="block text-sm font-medium">Rate (req/min)</label>
+            <input id="e-rate" name="rate_limit_rpm" type="number" min="0"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          </div>
+        </div>
+
+        <div>
+          <label for="e-expires" class="block text-sm font-medium">Expires on</label>
+          <input id="e-expires" name="expires_on" type="date"
+            class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          <p class="mt-1 text-xs text-ink-muted">Blank = never expires.</p>
+        </div>
+
+        <div id="key-edit-warning" hidden class="rounded-md border border-warn-edge bg-warn-surface p-3 text-sm text-warn-ink"></div>
+        <div id="key-edit-error" hidden class="rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+
+        <div class="flex justify-end gap-3 pt-2">
+          <button id="key-edit-cancel" type="button"
+            class="rounded-md border border-edge-strong px-4 py-2 text-sm font-medium hover:border-brand">Cancel</button>
+          <button id="key-edit-submit" type="submit"
+            class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Save changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
 </div>
 
 <script>
   import { apiFetch, ApiError } from '../../lib/api';
   import { describeError, inlineNotice, renderFieldError } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
-  import { buildCreateKeyRequest, plaintextKeyOf } from '../../lib/dashboard-form';
+  import {
+    buildCreateKeyRequest,
+    buildUpdateKeyRequest,
+    limitReductionWarning,
+    plaintextKeyOf,
+    type ExistingKeyLimits,
+  } from '../../lib/dashboard-form';
 
   const MODELS_ALL = ['flash', 'deepseek-v4-flash'];
 
@@ -213,7 +287,16 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
         '<div class="mt-1 font-mono text-sm text-ink-muted">' + escapeHtml(k.prefix) + '…</div>' +
         '<div class="mt-1 text-xs text-ink-muted">Models: ' + modelsText(k) + ' · Spend: ' + spendText(k) + ' · Last used: ' + lastUsedText(k) + '</div>';
       const right = document.createElement('div');
+      right.className = 'flex items-center gap-2';
       if (!k.revoked_at) {
+        // Edit first: changing limits is the common action, revoking is not.
+        const edit = document.createElement('button');
+        edit.type = 'button';
+        edit.className = 'rounded-md border border-edge-strong px-3 py-1.5 text-sm font-medium hover:border-brand';
+        edit.textContent = 'Edit';
+        edit.addEventListener('click', () => openEdit(k));
+        right.appendChild(edit);
+
         const revoke = document.createElement('button');
         revoke.type = 'button';
         revoke.className = 'rounded-md border border-danger-edge px-3 py-1.5 text-sm font-medium text-danger hover:bg-danger-surface';
@@ -265,6 +348,106 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     ($('key-form') as HTMLFormElement).reset();
     void loadKeys();
   }
+
+  // --- Edit (PATCH /api/keys/:id) ------------------------------------------
+  // The create form and the edit form share ONE request builder
+  // (buildUpdateKeyRequest delegates to buildCreateKeyRequest), so the two cannot
+  // disagree about which values are acceptable.
+  const editModal = $('key-edit-modal');
+  const editForm = $('key-edit-form') as HTMLFormElement;
+  const editWarning = $('key-edit-warning');
+  const editError = $('key-edit-error');
+  /** The key being edited, and its stored limits (for the TTL warning). */
+  let editing: { id: string; before: ExistingKeyLimits } | null = null;
+
+  function openEdit(k: ApiKey): void {
+    editing = {
+      id: k.id,
+      before: {
+        spend_limit_idr: k.spend_limit_idr ?? 0,
+        token_limit: 0,
+        rate_limit_rpm: k.rate_limit_rpm ?? 0,
+      },
+    };
+    ($('e-label') as HTMLInputElement).value = k.label ?? '';
+    ($('e-spend') as HTMLInputElement).value = String(k.spend_limit_idr ?? 0);
+    ($('e-rate') as HTMLInputElement).value = String(k.rate_limit_rpm ?? 0);
+    ($('e-expires') as HTMLInputElement).value = k.expires_at ? k.expires_at.slice(0, 10) : '';
+    // Preselect the key's existing allowlist. Reading it back is what keeps an
+    // edit from silently widening access: an unchecked box means "not granted".
+    const granted = new Set(k.models ?? []);
+    for (const box of Array.from(editForm.querySelectorAll<HTMLInputElement>('input[name="models"]'))) {
+      box.checked = granted.has(box.value);
+    }
+    editWarning.hidden = true;
+    editError.hidden = true;
+    editModal.hidden = false;
+    ($('e-label') as HTMLInputElement).focus();
+  }
+
+  function closeEdit(): void {
+    editModal.hidden = true;
+    editing = null;
+    editForm.reset();
+  }
+
+  $('key-edit-cancel').addEventListener('click', closeEdit);
+
+  editForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!editing) return;
+    editError.hidden = true;
+
+    const data = new FormData(editForm);
+    const built = buildUpdateKeyRequest({
+      label: String(data.get('label') ?? ''),
+      models: data.getAll('models').map(String),
+      spend_limit_idr: String(data.get('spend_limit_idr') ?? ''),
+      token_limit: String(data.get('token_limit') ?? ''),
+      rate_limit_rpm: String(data.get('rate_limit_rpm') ?? ''),
+      expires_on: String(data.get('expires_on') ?? ''),
+    });
+    if (!built.ok) {
+      editError.textContent = built.error;
+      editError.hidden = false;
+      return;
+    }
+
+    const submit = $('key-edit-submit') as HTMLButtonElement;
+    submit.disabled = true;
+    submit.textContent = 'Saving…';
+    const targetId = editing.id;
+    const before = editing.before;
+    void apiFetch<ApiKey>('/api/keys/' + encodeURIComponent(targetId), {
+      method: 'PATCH',
+      body: JSON.stringify(built.body),
+    })
+      .then(() => {
+        const warning = limitReductionWarning(before, {
+          spend_limit_idr: built.body.spend_limit_idr,
+          token_limit: built.body.token_limit,
+          rate_limit_rpm: built.body.rate_limit_rpm,
+        });
+        if (warning) {
+          // Keep the modal open and SHOW the warning rather than closing
+          // silently: docs/server/api-spec.md:187 requires the honest note that a
+          // reduction is not instant.
+          editWarning.textContent = warning + ' Your change has been saved.';
+          editWarning.hidden = false;
+          return;
+        }
+        closeEdit();
+        void loadKeys();
+      })
+      .catch((err: unknown) => {
+        editError.textContent = describeError(err).message;
+        editError.hidden = false;
+      })
+      .finally(() => {
+        submit.disabled = false;
+        submit.textContent = 'Save changes';
+      });
+  });
 
   function openSecretStep(key: string | undefined): void {
     ($('key-form-step') as HTMLElement).hidden = true;

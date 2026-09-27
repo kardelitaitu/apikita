@@ -29,7 +29,11 @@ import {
   linkCodeInstruction,
   passwordChangeError,
   plaintextKeyOf,
+  buildUpdateKeyRequest,
+  limitReductionWarning,
+  lowersAnyLimit,
   type CreateKeyFields,
+  type ExistingKeyLimits,
 } from '../src/lib/dashboard-form.ts';
 
 /** The create-key form as the island reads it, with one field overridden. */
@@ -312,4 +316,48 @@ test('the instruction names the command and the server-stated TTL', () => {
   // Singular at 1, so the copy never reads "1 minutes".
   assert.match(linkCodeInstruction('123456', 1), /1 minute\b/);
   assert.doesNotMatch(linkCodeInstruction('123456', 1), /1 minutes/);
+});
+
+// --- Editing a key's limits (PATCH /api/keys/:id) ---------------------------
+// docs/server/api-spec.md:187: "Raising takes effect immediately; lowering is
+// subject to the proxy's metadata cache TTL (<=60s). The response should say so,
+// so the UI can warn honestly." These tests pin the trigger and the copy.
+
+const BEFORE: ExistingKeyLimits = { spend_limit_idr: 50000, token_limit: 1000, rate_limit_rpm: 60 };
+
+test('the edit request reuses the create validation', () => {
+  const built = buildUpdateKeyRequest(fields({ spend_limit_idr: '1000' }));
+  // Narrow explicitly rather than reading through the union: the type-stripped
+  // runner does not narrow on assert.ok, and this keeps the test honest anyway.
+  if (!built.ok) {
+    assert.fail('an edit with a valid limit must build: ' + built.error);
+  }
+  assert.equal(built.body.spend_limit_idr, 1000);
+
+  // The same refusals apply: a negative limit is rejected, not silently zeroed.
+  const bad = buildUpdateKeyRequest(fields({ spend_limit_idr: '-5' }));
+  assert.equal(bad.ok, false);
+});
+
+test('lowering any one limit triggers the warning', () => {
+  assert.equal(lowersAnyLimit(BEFORE, { ...BEFORE, spend_limit_idr: 40000 }), true);
+  assert.equal(lowersAnyLimit(BEFORE, { ...BEFORE, token_limit: 500 }), true);
+  assert.equal(lowersAnyLimit(BEFORE, { ...BEFORE, rate_limit_rpm: 30 }), true);
+});
+
+test('raising, or leaving limits unchanged, does NOT warn', () => {
+  assert.equal(lowersAnyLimit(BEFORE, BEFORE), false);
+  assert.equal(lowersAnyLimit(BEFORE, { ...BEFORE, spend_limit_idr: 90000 }), false);
+  assert.equal(lowersAnyLimit(BEFORE, { ...BEFORE, token_limit: 5000 }), false);
+  assert.equal(lowersAnyLimit(BEFORE, { ...BEFORE, rate_limit_rpm: 120 }), false);
+  assert.equal(limitReductionWarning(BEFORE, { ...BEFORE, rate_limit_rpm: 120 }), null);
+});
+
+test('the warning names the TTL and the asymmetry', () => {
+  const warning = limitReductionWarning(BEFORE, { ...BEFORE, spend_limit_idr: 1000 });
+  assert.ok(warning !== null);
+  // The window is stated in seconds, not as a vague "shortly".
+  assert.match(warning, /60 seconds/);
+  // It says a raise is immediate, so the user knows the difference.
+  assert.match(warning.toLowerCase(), /raise/);
 });
