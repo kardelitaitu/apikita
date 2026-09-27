@@ -30,9 +30,9 @@ It does **not** proxy LLM requests. That is [`server/`](../../server/README.md).
 
 ## Status
 
-**The website is built and builds green.** Measured 2026-09-26:
-`cd website && npm run build` emits **17 static pages** and `npm test` passes
-**80 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 80`, `# pass 80`).
+**The website is built and builds green.** Measured 2026-09-27:
+`cd website && npm run build` emits **18 static pages** and `npm test` passes
+**91 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 91`, `# pass 91`).
 Count them rather than recalling them — both numbers move whenever a page or a
 contract test lands.
 Every route in the spec's table
@@ -56,18 +56,23 @@ Every route below has a file under `website/src/pages/` and is emitted by the bu
 | `/dashboard/usage` | `src/pages/dashboard/usage.astro` | Mounts the `UsageAnalytics` island |
 | `/dashboard/wallet` | `src/pages/dashboard/wallet.astro` | Mounts the `TopUpForm` island |
 | `/dashboard/keys/new` | `src/pages/dashboard/keys/new.astro` | Create-key page: mounts the island, explains allowlist semantics |
-| `/dashboard/settings` | `src/pages/dashboard/settings.astro` | Profile, password change, linked accounts (read-only) |
+| `/dashboard/settings` | `src/pages/dashboard/settings.astro` | Profile, password change, linked accounts (Telegram link/unlink live) |
 | `/docs` | `src/pages/docs/index.astro` | Index over the docs pages |
 | `/docs/quickstart` | `src/pages/docs/quickstart.astro` | The integration guide itself |
+| `/models` | `src/pages/models/index.astro` | The model catalogue and per-token rates |
+| `/privacy` | `src/pages/privacy.astro` | The data-retention table, customer-facing |
+| `/admin` | `src/pages/admin/index.astro` | **Operator console** — account lookup + suspend/resume. Gated on `is_operator` |
+| `/404` | `src/pages/404.astro` | Not-found fallback |
 
-**Three islands exist, each mounted by exactly one page** (grep for
-`src/islands/` under `src/pages/` returns three hits):
+**Four islands exist, each mounted by exactly one page** (grep for
+`src/islands/` under `src/pages/` returns four hits):
 
 | Island | Lines | Mounted by |
 | --- | --- | --- |
 | `src/islands/keys/KeyManagement.astro` | 369 | `/dashboard/keys` |
 | `src/islands/wallet/TopUpForm.astro` | 351 | `/dashboard/wallet` |
 | `src/islands/usage/UsageAnalytics.astro` | 170 | `/dashboard/usage` |
+| `src/islands/admin/AccountAdmin.astro` | 311 | `/admin` |
 
 They are plain `<script>` islands, not UI-framework components —
 `astro.config` has no integration and `package.json` has no framework dependency.
@@ -101,17 +106,20 @@ respectively; each clears the local token and redirects to `/login`. "Sign out
 everywhere" lives only in the header — `/dashboard/settings` links to it rather than
 repeating it.
 
-> **Status: NOT IMPLEMENTED.** Telegram link/unlink is read-only.
-> `docs/server/api-spec.md` specifies `POST /api/telegram/link-code` and
-> `DELETE /api/telegram`, but `server/src/routes/mod.rs` mounts **zero** telegram
-> routes. `/dashboard/settings` therefore shows the linked state and explains the flow
-> without shipping a control that could not work.
+> **Status: IMPLEMENTED.** Telegram link/unlink is a live control.
+> `server/src/routes/mod.rs` mounts `POST /api/telegram/link-code` (lines 199) and
+> `DELETE /api/telegram` (lines 200), and `/dashboard/settings` now drives both:
+> "Link Telegram" issues a single-use 5-minute code and shows the exact
+> `/link <code>` command, and "Unlink Telegram" removes the link while leaving the
+> account and balance untouched. The page previously described the flow read-only
+> on the false premise that no routes were mounted; that premise was stale.
 
 **Identity is still PocketBase — this is not an inconsistency.** `src/lib/pocketbase.ts`,
 `login.astro`, `signup.astro` and `verify.astro` speak to PocketBase, and so does the
-server: migration **Phases 6 (identity) and 7 (admin) are not done**, `auth.rs` still
-reads `POCKETBASE_URL`, and two tests remain ignored because they need a live
-PocketBase. `docs/decisions.md` records the **target** — identity Rust-owned — but the
+server: migration **Phases 6 (identity) and 7 (admin) are not done** and `auth.rs` still
+reads `POCKETBASE_URL`. (No test is `#[ignore]`d any more — the former
+live-PocketBase exchange test now runs against a loopback stub — but the runtime
+identity path still calls PocketBase, so nothing is deployed without it.) `docs/decisions.md` records the **target** — identity Rust-owned — but the
 shipped system is the PocketBase split. What the pages need is rework when Phase 6
 lands, not a fix now.
 
