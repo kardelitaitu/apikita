@@ -653,7 +653,10 @@ mod tests {
         );
 
         // Down: the names are carried through verbatim.
-        let down = vec!["deepseek-v4-flash".to_string(), "deepseek-v4-pro".to_string()];
+        let down = vec![
+            "deepseek-v4-flash".to_string(),
+            "deepseek-v4-pro".to_string(),
+        ];
         let payload = metrics_payload(&counter, &down);
         assert_eq!(payload["unhealthy_models"], json!(down));
     }

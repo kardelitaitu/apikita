@@ -225,7 +225,6 @@ pub fn models_with_no_healthy_endpoint() -> Vec<String> {
         .collect()
 }
 
-
 fn hash_string(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
