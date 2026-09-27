@@ -147,13 +147,40 @@ Users should be able to:
 | Request | Mechanism |
 | --- | --- |
 | See their data | Dashboard + bot: profile, balance, usage, keys |
-| Export it | A machine-readable export (not yet specified) |
+| Export it | `GET /api/export` — a JSON download of the customer's own data. **Specified below** |
 | Correct it | Edit profile; the ledger is immutable by design |
 | Delete account | Closure flow above, anonymising where possible |
 | Delete a review | `/review withdraw` — the bot path |
 
 **The ledger is the one thing that cannot be deleted on request**, and the terms
 must say so before someone asks. Explaining it after the fact reads as evasive.
+
+### The export — what is IN and what is OUT
+
+Returned by `GET /api/export` (session cookie, the account's own data only).
+**The scope is exactly the data the customer can already see or act on**, so the
+export makes no new disclosure and needs no new policy decision:
+
+| Included | Why it is the customer's to export |
+| --- | --- |
+| Account: id, status, created_at | Their account |
+| Wallet: balance_idr | Their money |
+| Ledger rows (`delta_idr`, reason, ref, balance_after, created_at) | Their transaction history |
+| Top-ups: amount, status, order id, created/settled | Their payments |
+| Usage: `usage_daily` and `usage_events` rows | Their consumption |
+| API key **metadata**: prefix, label, models, limits, expiry, revoked/last-used | Their configuration |
+| Telegram link state (linked: true/false) | Their linked surface |
+
+| **Excluded** | **Why** |
+| --- | --- |
+| `key_hash`, `token_hash`, `pb_user_id` | Credentials/internal ids. **Hashes are not the customer's data to hold** — handing them out is an attack surface for no user benefit |
+| Session rows and IP hashes | Security records; `docs/ip-tracking.md` keeps IPs as salted hashes precisely so they are not exported |
+| `admin_audit` rows | Whether these reach the customer is a **separate open decision** (see [admin-surface.md](admin-surface.md) Open items). The export does not pre-empt it |
+| Password, Google identity | Held by the identity provider, not us (see §Security obligations) |
+
+**"Metadata, not secrets" is the rule.** The export is for the customer's own
+records (tax, accounting, migration); it is never a channel that reveals a
+credential or a security signal that was deliberately hashed.
 
 ## Security obligations that follow
 

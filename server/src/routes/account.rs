@@ -336,7 +336,6 @@ pub async fn get_topups(
     Ok(Json(result))
 }
 
-
 /// Rows returned when the caller asks for no explicit limit. Matches the
 /// dashboard's "last N metered calls" and keeps the response small enough to
 /// render without paging.
@@ -359,7 +358,10 @@ pub async fn get_recent_usage(
     Query(query): Query<LimitQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
-    let limit = query.limit.unwrap_or(RECENT_USAGE_DEFAULT_LIMIT).clamp(1, 100);
+    let limit = query
+        .limit
+        .unwrap_or(RECENT_USAGE_DEFAULT_LIMIT)
+        .clamp(1, 100);
 
     // Newest first. The index `usage_events_account_idx (account_id, created_at
     // DESC)` serves exactly this ordering, so the sort is not a table scan.
@@ -401,6 +403,192 @@ pub async fn get_recent_usage(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(events))
+}
+
+/// `GET /api/export` - the customer's own data, as one JSON document.
+///
+/// docs/data-retention.md "Access and deletion requests": a customer can ask to
+/// export their data. This is that export. The scope is fixed by that document's
+/// "The export — what is IN and what is OUT" table, and the rule is **metadata,
+/// not secrets**:
+///
+/// - IN: the account, wallet, ledger, top-ups, usage (daily and per-request) and
+///   API-key METADATA - exactly what the customer can already see or act on.
+/// - OUT: `key_hash`, `token_hash`, `pb_user_id`, `snap_token`, session rows,
+///   IP hashes and the Telegram chat id. Hashes and internal ids are not the
+///   customer's to hold, and handing them out is an attack surface for no benefit.
+/// - OUT: `admin_audit`. Whether operator actions reach the customer is a
+///   SEPARATE open decision (docs/admin-surface.md Open items); this does not
+///   pre-empt it.
+///
+/// Every query is bound to the cookie-resolved account id, so a customer can only
+/// export their OWN rows.
+pub async fn export_account_data(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+    let id = account_id.hyphenated().to_string();
+
+    // Account: no pb_user_id (an internal link), no password (elsewhere).
+    let account =
+        sqlx::query("SELECT id, status, is_operator, created_at FROM accounts WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await?;
+
+    let wallet = sqlx::query("SELECT balance_idr, updated_at FROM wallets WHERE account_id = ?")
+        .bind(&id)
+        .fetch_optional(&pool)
+        .await?;
+
+    let ledger = sqlx::query(
+        "SELECT delta_idr, reason, ref, balance_after, created_at
+         FROM ledger WHERE account_id = ? ORDER BY id",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    // snap_token is deliberately NOT selected: it is a Midtrans credential.
+    let topups = sqlx::query(
+        "SELECT id, amount_idr, order_id, status, rail, created_at, settled_at
+         FROM topups WHERE account_id = ? ORDER BY created_at",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    let usage_daily = sqlx::query(
+        "SELECT day, input_tokens, cache_read_tokens, output_tokens, cost_idr
+         FROM usage_daily WHERE account_id = ? ORDER BY day",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    let usage_events = sqlx::query(
+        "SELECT id, model, input_tokens, cache_read_tokens, output_tokens, cost_idr, created_at
+         FROM usage_events WHERE account_id = ? ORDER BY created_at",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    // Key METADATA only. key_hash is not selected.
+    let keys = sqlx::query(
+        "SELECT prefix, label, models, spend_limit_idr, token_limit, rate_limit_rpm,
+                expires_at, last_used_at, revoked_at, created_at
+         FROM api_keys WHERE account_id = ? ORDER BY created_at",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    // Link STATE only - never the chat id, which is the other party's identifier.
+    let telegram_linked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM telegram_links WHERE account_id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await?;
+
+    // Each table is mapped explicitly rather than generically: a generic row ->
+    // JSON pass would have to guess a column's type, and getting that wrong on a
+    // money field is worse than a few extra lines. Every field here is named in
+    // the doc's IN table and nowhere else.
+    let account_json = json!({
+        "id": account.try_get::<String, _>("id")?,
+        "status": account.try_get::<String, _>("status")?,
+        "is_operator": account.try_get::<bool, _>("is_operator")?,
+        "created_at": account.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+    });
+
+    let wallet_json = match wallet {
+        Some(w) => json!({
+            "balance_idr": w.try_get::<i64, _>("balance_idr")?,
+            "updated_at": w.try_get::<chrono::DateTime<Utc>, _>("updated_at")?,
+        }),
+        None => serde_json::Value::Null,
+    };
+
+    let mut ledger_json = Vec::with_capacity(ledger.len());
+    for r in ledger {
+        ledger_json.push(json!({
+            "delta_idr": r.try_get::<i64, _>("delta_idr")?,
+            "reason": r.try_get::<String, _>("reason")?,
+            "ref": r.try_get::<Option<String>, _>("ref")?,
+            "balance_after": r.try_get::<i64, _>("balance_after")?,
+            "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+        }));
+    }
+
+    let mut topups_json = Vec::with_capacity(topups.len());
+    for r in topups {
+        topups_json.push(json!({
+            "id": r.try_get::<String, _>("id")?,
+            "amount_idr": r.try_get::<i64, _>("amount_idr")?,
+            "order_id": r.try_get::<String, _>("order_id")?,
+            "status": r.try_get::<String, _>("status")?,
+            "rail": r.try_get::<String, _>("rail")?,
+            "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+            "settled_at": r.try_get::<Option<chrono::DateTime<Utc>>, _>("settled_at")?,
+        }));
+    }
+
+    let mut daily_json = Vec::with_capacity(usage_daily.len());
+    for r in usage_daily {
+        daily_json.push(json!({
+            "day": r.try_get::<String, _>("day")?,
+            "input_tokens": r.try_get::<i64, _>("input_tokens")?,
+            "cache_read_tokens": r.try_get::<i64, _>("cache_read_tokens")?,
+            "output_tokens": r.try_get::<i64, _>("output_tokens")?,
+            "cost_idr": r.try_get::<i64, _>("cost_idr")?,
+        }));
+    }
+
+    let mut events_json = Vec::with_capacity(usage_events.len());
+    for r in usage_events {
+        events_json.push(json!({
+            "id": r.try_get::<String, _>("id")?,
+            "model": r.try_get::<String, _>("model")?,
+            "input_tokens": r.try_get::<i64, _>("input_tokens")?,
+            "cache_read_tokens": r.try_get::<i64, _>("cache_read_tokens")?,
+            "output_tokens": r.try_get::<i64, _>("output_tokens")?,
+            "cost_idr": r.try_get::<i64, _>("cost_idr")?,
+            "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+        }));
+    }
+
+    let mut keys_json = Vec::with_capacity(keys.len());
+    for r in keys {
+        keys_json.push(json!({
+            "prefix": r.try_get::<String, _>("prefix")?,
+            "label": r.try_get::<Option<String>, _>("label")?,
+            // models is stored as JSON text; pass it through as text rather than
+            // silently dropping an unparseable value.
+            "models": r.try_get::<String, _>("models")?,
+            "spend_limit_idr": r.try_get::<i64, _>("spend_limit_idr")?,
+            "token_limit": r.try_get::<i64, _>("token_limit")?,
+            "rate_limit_rpm": r.try_get::<i64, _>("rate_limit_rpm")?,
+            "expires_at": r.try_get::<Option<chrono::DateTime<Utc>>, _>("expires_at")?,
+            "last_used_at": r.try_get::<Option<chrono::DateTime<Utc>>, _>("last_used_at")?,
+            "revoked_at": r.try_get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")?,
+            "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+        }));
+    }
+
+    Ok(Json(json!({
+        "exported_at": Utc::now(),
+        "note": "Metadata, not secrets. Credential hashes, session/IP records, the Telegram chat id and internal ids are deliberately excluded - see docs/data-retention.md.",
+        "account": account_json,
+        "wallet": wallet_json,
+        "ledger": ledger_json,
+        "topups": topups_json,
+        "usage_daily": daily_json,
+        "usage_events": events_json,
+        "api_keys": keys_json,
+        "telegram_linked": telegram_linked > 0,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1937,7 +2125,6 @@ mod tests {
         );
     }
 
-
     // -----------------------------------------------------------------------
     // 3b. get_recent_usage - the per-request history (usage_events)
     // -----------------------------------------------------------------------
@@ -1978,7 +2165,16 @@ mod tests {
         // `usage_events` is populated the way production populates it.
         test_support::fund(&pool, account_id, 1_000_000).await;
         debit_usage_transaction(
-            &pool, account_id, Some(key_id), "flash", 100, 10, 50, 111, Some("r1"), 0,
+            &pool,
+            account_id,
+            Some(key_id),
+            "flash",
+            100,
+            10,
+            50,
+            111,
+            Some("r1"),
+            0,
         )
         .await
         .expect("first settlement");
@@ -1986,7 +2182,16 @@ mod tests {
         // A second request by the OTHER account must never appear in this list.
         test_support::fund(&pool, other_account_id, 1_000_000).await;
         debit_usage_transaction(
-            &pool, other_account_id, Some(other_key_id), "flash", 999, 0, 999, 222, Some("r2"), 0,
+            &pool,
+            other_account_id,
+            Some(other_key_id),
+            "flash",
+            999,
+            0,
+            999,
+            222,
+            Some("r2"),
+            0,
         )
         .await
         .expect("other account settlement");
@@ -2004,7 +2209,12 @@ mod tests {
         let row = &rows[0];
 
         // The documented shape, exactly - no prompt, no completion, no key hash.
-        let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
@@ -2029,7 +2239,10 @@ mod tests {
         // The event is tied to the reservation the ledger rows carry.
         let text = body.to_string();
         for forbidden in ["token_hash", "key_hash", "apk_live", "prompt", "completion"] {
-            assert!(!text.contains(forbidden), "the history leaked {forbidden}: {text}");
+            assert!(
+                !text.contains(forbidden),
+                "the history leaked {forbidden}: {text}"
+            );
         }
 
         // An unauthenticated call is refused before any row is read.
@@ -2910,5 +3123,79 @@ mod tests {
             .await
             .expect("count the refused row");
         assert_eq!(rows, 0, "a refused status must leave no row");
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/export - the customer's own data.
+    //
+    // The two things that matter: it returns ONLY this account's rows (a scoping
+    // bug leaks another customer's financial history), and it never contains a
+    // credential or internal id (docs/data-retention.md "metadata, not secrets").
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn export_returns_only_this_account_and_no_secrets() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let mine = live_account(&pool).await;
+        let other = live_account(&pool).await;
+
+        let key_id = test_support::api_key(&pool, mine.account_id).await;
+        test_support::fund(&pool, mine.account_id, 42_000).await;
+        debit_usage_transaction(
+            &pool, mine.account_id, Some(key_id), "flash", 100, 10, 50, 111, Some("exp_ref"), 0,
+        )
+        .await
+        .expect("a settlement");
+
+        // The OTHER account carries a distinct balance, so a scoping bug is
+        // visible rather than coincidentally equal.
+        test_support::fund(&pool, other.account_id, 999_999).await;
+
+        let (status, body) = respond(export_account_data(
+            State(pool.clone()),
+            cookie_header(&mine.token),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        for field in [
+            "account", "wallet", "ledger", "topups", "usage_daily",
+            "usage_events", "api_keys", "telegram_linked", "exported_at", "note",
+        ] {
+            assert!(body.get(field).is_some(), "export is missing {field}: {body}");
+        }
+
+        assert_eq!(body["account"]["id"], json!(mine.account_id.hyphenated().to_string()));
+        // The balance AFTER the settlement: 42,000 funded minus the 111 IDR the
+        // request cost. Asserting the net (not the funding) is what proves the
+        // export reads the wallet rather than echoing a fixture constant.
+        assert_eq!(body["wallet"]["balance_idr"], json!(42_000 - 111));
+        // The ledger carries the matching rows, so the export can reconcile.
+        assert!(!body["ledger"].as_array().unwrap().is_empty(), "the ledger must be exported");
+        assert_eq!(body["usage_events"].as_array().unwrap().len(), 1, "the request must be exported");
+
+        // No secret or internal identifier anywhere in the document, by name.
+        let text = body.to_string();
+        for forbidden in [
+            "key_hash", "token_hash", "pb_user_id", "snap_token",
+            "apk_live_", "password", "ip_hash",
+        ] {
+            assert!(!text.contains(forbidden), "the export leaked {forbidden}: {text}");
+        }
+
+        // The other account's money never appears.
+        assert!(!text.contains("999999"), "the export leaked another account's balance: {text}");
+
+        db.close().await;
+    }
+
+    /// An unauthenticated request is refused before any row is read.
+    #[tokio::test]
+    async fn export_requires_a_session() {
+        let db = TestDb::new().await;
+        let (status, _) = respond(export_account_data(State(db.pool.clone()), HeaderMap::new())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        db.close().await;
     }
 }

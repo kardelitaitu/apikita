@@ -180,6 +180,10 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         // Ops
         .route("/health", get(health::health_check))
+        // Operator-only operational counts. NOT on /health: that body is pinned
+        // because the deploy gate parses it, and a leak test forbids ANY digit in an
+        // unauthenticated health body. See health::operator_metrics.
+        .route("/api/admin/metrics", get(health::operator_metrics))
         // Auth
         .route("/auth/exchange", post(auth::exchange_token))
         .route("/auth/logout", post(auth::logout))
@@ -188,6 +192,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/me", get(account::get_me))
         .route("/api/usage", get(account::get_usage))
         .route("/api/usage/recent", get(account::get_recent_usage))
+        .route("/api/export", get(account::export_account_data))
         .route(
             "/api/topups",
             get(account::get_topups).post(account::create_topup),
@@ -207,7 +212,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/admin/accounts", get(admin::list_accounts))
         .route("/api/admin/audit", get(admin::list_recent_audit))
         .route("/api/admin/accounts/{id}", get(admin::get_account))
-        .route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit))
+        .route(
+            "/api/admin/accounts/{id}/audit",
+            get(admin::get_account_audit),
+        )
         .route(
             "/api/admin/accounts/{id}/suspend",
             post(admin::suspend_account),
