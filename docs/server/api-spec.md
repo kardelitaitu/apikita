@@ -440,9 +440,20 @@ the wallet before the allowlist leaks the existence of models a key may not use.
 
 **On balance exhaustion, prefer rejecting at pre-flight over cutting mid-stream.**
 With non-refundable funds, a truncated answer is the most likely source of a
-delivery dispute. Let an in-flight request finish even if it briefly overdraws;
-refuse the next one. (This contradicts the whitepaper's Phase 2 — the whitepaper
-is wrong here, see [`docs/business/05-risk.md`](../business/05-risk.md) R1.)
+delivery dispute. Let an in-flight request finish, then refuse the next one.
+(This contradicts the whitepaper's Phase 2 — the whitepaper is wrong here, see
+[`docs/business/05-risk.md`](../business/05-risk.md) R1.)
+
+**The balance never goes negative — "let it finish" does NOT mean overdraft.**
+`docs/decisions.md` §Money settles overdraft as **not permitted** (the
+`CHECK (balance_idr >= 0)` on `wallets` is the backstop), and the stale
+`allow_negative_balance_overdraft` flag that used to suggest otherwise was
+**removed** — see [plans/proxy-hot-path-audit.md §5.2 F2](../plans/proxy-hot-path-audit.md).
+What actually happens at settlement when the real cost exceeds what was reserved:
+`settle_partial_usage` (`db.rs`) clamps the debit to the balance available
+(`clamp_debit(cost_idr, available_idr)`), so the wallet is charged only what it
+holds and the shortfall is logged at `error!` as a company loss. The earlier
+"briefly overdraws" phrasing described a behaviour the code does not have.
 
 **Usage is recorded on stream completion.** A crash mid-stream loses the record and
 the customer got free tokens — so reconcile against upstream usage on a schedule as

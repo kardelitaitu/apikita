@@ -42,7 +42,7 @@ const faq = [
   },
   {
     q: 'What happens when my balance runs out?',
-    a: 'The next request is rejected before it starts with HTTP 402. A request already in flight is allowed to finish even if it briefly overdraws, rather than being cut mid-answer — a truncated answer on non-refundable funds is worse than a small overdraft.',
+    a: 'The next request is rejected before it starts with HTTP 402. A request already in flight is allowed to finish rather than being cut mid-answer. Your balance never goes below zero: the cost of that request is charged against whatever remains, and the small shortfall is ours, not yours. A truncated answer on non-refundable funds would be worse.',
   },
   {
     q: 'Do you store my prompts or completions?',
