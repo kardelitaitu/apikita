@@ -73,7 +73,7 @@ MODE="run"
 
 usage() {
     echo "probe: usage: probe.sh [--check <id>]... | --list | --help" >&2
-    echo "probe: checks: api_down, relay_down, webhook_rejection, error_rate (no database access at all)" >&2
+    echo "probe: checks: api_down, relay_down, webhook_rejection, error_rate, all_providers_unhealthy (no database access at all)" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -110,7 +110,14 @@ if [ "$MODE" = "list" ]; then
         printf 'probe: %-20s %-8s %s\n' "error_rate" "skipped" \
             "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
     fi
-    echo "probe: not checked by anything in tools/alert yet: relay_5xx, all_providers_unhealthy, db_disk"
+    if [ -n "$OPERATOR_COOKIE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "all_providers_unhealthy" "covered" \
+            "GET $API_URL/api/admin/metrics as an operator; alerts when a model has NO usable endpoint"
+    else
+        printf 'probe: %-20s %-8s %s\n' "all_providers_unhealthy" "skipped" \
+            "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+    fi
+    echo "probe: not checked by anything in tools/alert yet: relay_5xx, db_disk"
     exit 0
 fi
 
@@ -132,9 +139,9 @@ esac
 if [ -n "$CHECKS" ]; then
     for id in $CHECKS; do
         case "$id" in
-            api_down|relay_down|webhook_rejection|error_rate) ;;
+            api_down|relay_down|webhook_rejection|error_rate|all_providers_unhealthy) ;;
             *) echo "probe: unknown check: $id" >&2
-               echo "probe: known checks: api_down, relay_down, webhook_rejection, error_rate" >&2
+               echo "probe: known checks: api_down, relay_down, webhook_rejection, error_rate, all_providers_unhealthy" >&2
                exit 2 ;;
         esac
     done
@@ -215,6 +222,56 @@ check_api_down() {
     done
 }
 
+# --- check: all_providers_unhealthy -------------------------------------------
+# Threshold from alerts.tsv: "every endpoint open". The metrics route reports
+# `unhealthy_models` - the models whose EVERY routed endpoint has an open circuit -
+# so this check reads the same payload error_rate does and fires once per model.
+#
+# The server deliberately does NOT reuse its cooldown accessor for this: one open
+# endpoint means failover is WORKING, and alerting on that would page an operator
+# during normal operation. See UpstreamClient::all_endpoints_unhealthy.
+check_all_providers_unhealthy() {
+    if [ -z "$OPERATOR_COOKIE" ]; then
+        echo "probe: skipped all_providers_unhealthy: PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+        return 0
+    fi
+
+    BODY_FILE="$TMP/probe-unhealthy.$$.json"
+    CODE=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+        --connect-timeout "$HTTP_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -H "Cookie: $OPERATOR_COOKIE" \
+        "$API_URL/api/admin/metrics" 2>"$CURL_ERR")
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        REASON=$(first_err "curl exit $RC")
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED all_providers_unhealthy: the metrics route did not answer ($REASON)" >&2
+        fail_with 4
+        return 0
+    fi
+    if [ "$CODE" != "200" ]; then
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED all_providers_unhealthy: /api/admin/metrics returned HTTP $CODE (401 = bad or expired cookie, 403 = not an operator)" >&2
+        fail_with 4
+        return 0
+    fi
+
+    # `unhealthy_models` is a JSON array of names, possibly empty. Pull the array
+    # body and strip the brackets rather than parse JSON: the payload is flat.
+    MODELS=$(sed -n 's/.*"unhealthy_models":[[:space:]]*\[\([^]]*\)\].*/\1/p' "$BODY_FILE" | head -n 1)
+    rm -f "$BODY_FILE"
+
+    # Trim whitespace and quotes to get bare names, one per line.
+    NAMES=$(printf '%s' "$MODELS" | tr ',' '\n' | tr -d '"' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$')
+    if [ -z "$NAMES" ]; then
+        echo "probe: OK  all_providers_unhealthy: every model has at least one usable endpoint"
+        return 0
+    fi
+
+    N=$(printf '%s\n' "$NAMES" | wc -l | tr -d ' ')
+    echo "probe: ALERT all_providers_unhealthy: $N model(s) with NO usable endpoint: $(printf '%s' "$NAMES" | tr '\n' ' ')"
+    fire all_providers_unhealthy "$N model(s) have every endpoint circuit-open: $(printf '%s' "$NAMES" | tr '\n' ' ')"
+}
 # --- check: error_rate --------------------------------------------------------
 # Threshold from alerts.tsv: "5% over 5 min". The server counts 5xx responses and
 # total responses in process (`error.rs`), and serves them at
@@ -389,6 +446,7 @@ run_check() {
         api_down) check_api_down ;;
         relay_down) check_relay_down ;;
         error_rate) check_error_rate ;;
+        all_providers_unhealthy) check_all_providers_unhealthy ;;
         webhook_rejection) check_webhook_rejection ;;
     esac
     return 0
@@ -403,18 +461,19 @@ else
 fi
 
 # --- what still is not checked, on EVERY run ----------------------------------
-# Four checks are covered now. These THREE are not, and saying so every run is the
-# whole point of this directory: a check that is silently absent is the failure mode,
-# and three silent absences would be three.
+# Five checks are covered now. These TWO are not, and saying so every run is the whole
+# point of this directory: a check that is silently absent is the failure mode, and two
+# silent absences would be two.
+#
+# all_providers_unhealthy MOVED OUT of this list: the breaker state is in-process and
 #
 # error_rate MOVED OUT of this list: the counters are in-process (server/src/error.rs)
 # and served at GET /api/admin/metrics, so it is a real check now. The line that used
 # to sit here said it needed "HTTP counters over a 5-minute window (same access logs)",
 # which was true before the counter existed and is now stale.
 cat >&2 <<'NOTCHECKED'
-probe: NOT CHECKED - 3 of the doc's 10 alerts still need a surface this cannot reach:
+probe: NOT CHECKED - 2 of the doc's 10 alerts still need a surface this cannot reach:
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off)
-probe:   all_providers_unhealthy - upstream circuit-breaker state, in-process under server/
 probe:   db_disk                 - volume usage, not visible to any client
 probe: Full table and the reasons: tools/alert/README.md. Every definition: alert.sh --list
 NOTCHECKED

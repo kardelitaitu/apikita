@@ -106,6 +106,13 @@ Each has a threshold and an action. If you would not act, do not alert.
 | **DB disk >80%** | volume usage | Usage rows growing; check retention |
 | **Error rate >5%** | 5 min window | Investigate |
 
+**The all-providers-unhealthy alert is SERVED too.** `GET /api/admin/metrics` also
+reports `unhealthy_models`: the models whose EVERY routed endpoint has an open
+circuit. Note what this deliberately is NOT — one open endpoint means failover is
+WORKING, so the server does not reuse its cooldown accessor for this. It counts only
+ROUTED endpoints (weight > 0), so an unrouted placeholder can neither cause a false
+alarm nor mask a real outage on the endpoint that is actually serving.
+
 **The error-rate alert is SERVED.** `error.rs` counts 5xx responses and total
 responses in process, and `GET /api/admin/metrics` (operator-only) reports them, so
 `tools/alert/probe.sh --check error_rate` measures a real number instead of declaring

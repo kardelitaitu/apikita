@@ -550,7 +550,7 @@ with the same session cookie and every guard is enforced here, server-side.
 | `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'`; **revokes sessions and keys atomically**; one `admin_audit` row in the same transaction |
 | `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; audits it; does not restore keys |
 | `POST /api/admin/accounts/:id/restore` | `admin::resume_account` | **Alias of `/resume`** — same handler, same `action='resume'` audit row |
-| `GET /api/admin/metrics` | `health::operator_metrics` | Operational counts: `server_errors`, `responses`, and `error_rate` (null when nothing has been served). In-process; reads no table. Backs the `error_rate` alert |
+| `GET /api/admin/metrics` | `health::operator_metrics` | Operational counts: `server_errors`, `responses`, `error_rate` (null when nothing has been served), and `unhealthy_models` (models with no usable endpoint). In-process; reads no table. Backs the `error_rate` and `all_providers_unhealthy` alerts |
 
 **`/resume` and `/restore` are two spellings of one action.** Both are mounted;
 neither is deprecated. Pick either.
