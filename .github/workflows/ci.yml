@@ -337,6 +337,18 @@ jobs:
       - name: Check the backup contract
         run: sh tools/backup-check/check.sh
 
+      # The Gate 2 money check must actually RUN and actually FAIL on drift.
+      #
+      # docs/launch-checklist.md:277 calls tools/reconcile/reconcile.sh "the single best
+      # guard against silently wrong money". It was MOUNTED into the scheduler smoke and
+      # thus reachable - which is why a path grep found it and it looked covered - but no
+      # step ever RAN it. A mounted tool is not a run tool.
+      #
+      # The check proves the direction that matters: a drifted wallet/ledger fails AND
+      # names the account, while a consistent one passes. Mutation-tested against the SQL.
+      - name: Check the reconciliation gate
+        run: sh tools/reconcile-check/check.sh
+
       - name: Install website dependencies
         working-directory: website
         run: npm ci
