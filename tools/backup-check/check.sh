@@ -124,6 +124,60 @@ out=$(run_backup "k" "false" "$OUT"); rc=$?
 [ "$rc" -eq 8 ] || fail "a failing offsite hook should exit 8, got $rc"
 [ "$(find "$OUT" -name '*.enc' | wc -l)" -ge 1 ] || fail "a failed hook must KEEP the local artifact"
 
+
+# ---------------------------------------------------------------------------
+# A documented retention promise must match what actually enforces it.
+# ---------------------------------------------------------------------------
+# WHY THIS IS HERE, and why in a BACKUP guard. docs/ip-tracking.md is a PRIVACY
+# document, and its Open items list carried:
+#
+#   "The purge is a binary with no scheduler behind it yet; it needs to be added to
+#    whatever runs the nightly backup and reconciliation jobs."
+#
+# Read plainly that says an IP retention promise is NOT YET ENFORCED - the most
+# alarming reading available for the key_ip_* tables, and the one an auditor would
+# act on. The truth was the opposite: run_retention in the maintenance entrypoint
+# had been applying both windows nightly for several waves. Only the standalone
+# binary is absent, which is a convenience and not a retention gap.
+#
+# The document even PREDICTS this failure six lines above the item: "If any of these
+# stops being true, the policy must change the same day. These are the kind of
+# statements that become false through a well-intentioned feature addition." The
+# item went false through exactly that.
+#
+# So the two sides are held together: if the entrypoint deletes from key_ip_seen,
+# no document may say the purge still needs to be added, and vice versa. The
+# assertion is that they AGREE, so it survives a change in either direction.
+ENTRYPOINT="$REPO/.docker/maintenance/entrypoint.sh"
+IPDOC="$REPO/docs/ip-tracking.md"
+if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$IPDOC" ]; then
+    fail "cannot read $ENTRYPOINT and $IPDOC, so the IP retention claim was not compared"
+else
+    # THE INVOCATION, not a mention of it. A grep for the table name over the whole
+    # file passes on a COMMENT or a banner line - which is exactly how my first
+    # mutation of this guard escaped: renaming the EXECUTING line left key_ip_seen in
+    # the header block and in the OK log line, so the check stayed green while the
+    # delete no longer ran. So this looks for the call that actually executes.
+    ENFORCED=no
+    grep -q 'retention_delete "$DB_FILE" key_ip_seen' "$ENTRYPOINT" && ENFORCED=yes
+
+    CLAIMS_PENDING=no
+    grep -q 'needs to be added' "$IPDOC" && CLAIMS_PENDING=yes
+
+    if [ "$ENFORCED" = yes ] && [ "$CLAIMS_PENDING" = yes ]; then
+        fail "the entrypoint INVOKES the key_ip_seen retention delete, but docs/ip-tracking.md still tells the reader the purge needs to be added to the nightly jobs - a privacy document must not describe an enforced retention window as pending"
+    fi
+    if [ "$ENFORCED" = no ] && [ "$CLAIMS_PENDING" = no ]; then
+        fail "the entrypoint no longer INVOKES the key_ip_seen retention delete, yet docs/ip-tracking.md no longer says the purge is pending - a reader would believe the IP retention window is enforced when nothing runs it"
+    fi
+
+    # Guard the fixture with the SAME precision: run_retention must exist AND the
+    # invocation must sit inside it, or the comparison above read the wrong region.
+    if ! sed -n '/^run_retention()/,/^}/p' "$ENTRYPOINT" | grep -q 'retention_delete'; then
+        fail "run_retention does not invoke retention_delete in $ENTRYPOINT - the retention comparison did not actually happen"
+    fi
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "backup-check: the backup contract is BROKEN (see above)" >&2
     exit 1

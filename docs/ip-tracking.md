@@ -201,5 +201,18 @@ the kind of statements that become false through a well-intentioned feature addi
 - [x] Whether the edge relay or the backend computes the hash — the backend, with
       the relay's `X-Forwarded-For` trusted only from a configured CIDR. See
       §Implementation.
-- [ ] The purge is a binary with no scheduler behind it yet; it needs to be added
-      to whatever runs the nightly backup and reconciliation jobs.
+- [ ] The purge BINARY has no scheduler behind it; its WORK runs nightly. These are two
+      different statements and only the second is a privacy property.
+      **ENFORCED TODAY.** `run_retention` in `.docker/maintenance/entrypoint.sh` applies
+      both windows through `sqlite3` on every scheduled run:
+      `DELETE FROM key_ip_seen WHERE day <= today - 7` and
+      `DELETE FROM key_ip_daily WHERE day <= today - 90`. A delete that does not run is
+      reported as `job retention: FAILED`, so a missed sweep is loud rather than silent.
+      **NOT ENFORCED.** The standalone `server/src/bin/ip-purge.rs` is not shipped in the
+      server image, so an operator cannot trigger a one-off purge on demand without a Rust
+      toolchain. That is a convenience, not a retention gap - the windows above hold.
+      *(Correction: this item once stated that no nightly job ran the purge and that it
+      was still pending. That was true when written and went false when the retention
+      sweep took the work inline - the "well-intentioned feature addition" the paragraph
+      above this list warns about. It is corrected rather than deleted because the
+      distinction it now draws is the one a reader of a privacy document actually needs.)*
