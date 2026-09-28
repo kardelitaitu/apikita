@@ -4103,4 +4103,215 @@ mod tests {
         })
         .await;
     }
+
+    // -----------------------------------------------------------------------
+    // THE PURE HELPERS that decide billing and the client-facing error, reached
+    // on every request but never on the happy path: each is pinned without a
+    // database or an upstream so a regression in the rule shows up as a red test.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_event_carries_the_code_message_and_a_request_id() {
+        let event = error_event("upstream_incomplete", "the stream ended early");
+        assert!(event.starts_with("event: error\ndata: "));
+        let data: Value = serde_json::from_str(event.trim_start_matches("event: error\ndata: ").trim())
+            .expect("the error event payload is JSON");
+        assert_eq!(data["error"]["code"], "upstream_incomplete");
+        assert_eq!(data["error"]["message"], "the stream ended early");
+        assert!(data["error"]["request_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("req_"));
+    }
+
+    #[test]
+    fn requested_stream_flag_reads_only_an_explicit_bool() {
+        assert_eq!(requested_stream_flag(&json!({"stream": true})), Some(true));
+        assert_eq!(requested_stream_flag(&json!({"stream": false})), Some(false));
+        // absent, null and a non-bool value all fall through to "unset", never to false.
+        assert_eq!(requested_stream_flag(&json!({})), None);
+        assert_eq!(requested_stream_flag(&json!({"stream": null})), None);
+        assert_eq!(requested_stream_flag(&json!({"stream": "yes"})), None);
+    }
+
+    #[test]
+    fn stream_flag_allowed_refuses_an_explicit_false_and_accepts_everything_else() {
+        // DEFECT 3: an explicit stream:false used to be silently answered with SSE.
+        assert!(matches!(
+            stream_flag_allowed(Some(false)),
+            Err(AppError::ValidationFailed { .. })
+        ));
+        assert!(stream_flag_allowed(Some(true)).is_ok());
+        assert!(stream_flag_allowed(None).is_ok());
+    }
+
+    #[test]
+    fn estimated_input_tokens_counts_multi_byte_bytes_whole_and_floors_at_one() {
+        // ASCII: ~4 bytes per token, integer-divided.
+        assert_eq!(estimated_input_tokens(b"hello"), 1);
+        assert_eq!(estimated_input_tokens(b"a".repeat(40).as_slice()), 10);
+        // A multi-byte CJK character is held as a whole token per byte, never a fraction.
+        assert_eq!(estimated_input_tokens("日本語".as_bytes()), 9);
+        // An empty body cannot reserve zero and slip past the balance guard.
+        assert_eq!(estimated_input_tokens(b""), 1);
+    }
+
+    #[test]
+    fn force_streaming_inserts_stream_true_and_refuses_a_non_object() {
+        let value = json!({"model": "flash"});
+        let out = force_streaming(value).expect("an object body is valid");
+        assert_eq!(out["stream"], true);
+        assert_eq!(out["model"], "flash");
+
+        let err = force_streaming(Value::String("not an object".into()))
+            .expect_err("a non-object body is refused before any money moves");
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn no_upstream_retry_after_reports_the_cooldown_or_the_documented_floor() {
+        let account_id = Uuid::new_v4();
+        // A real breaker cooldown is reported verbatim.
+        assert_eq!(
+            no_upstream_retry_after(Some(42), "flash", "every endpoint unhealthy", account_id),
+            42
+        );
+        // No open breaker: the documented 1-second floor, with the cause logged.
+        assert_eq!(
+            no_upstream_retry_after(None, "flash", "transport error", account_id),
+            1
+        );
+    }
+
+    #[test]
+    fn upstream_error_maps_every_variant_without_leaking_provider_detail() {
+        let account_id = Uuid::new_v4();
+        let client = UpstreamClient::new(live_config());
+
+        // An unknown model is an allowlist error, not an upstream outage.
+        assert!(matches!(
+            upstream_error(UpstreamError::NoModel("flash".into()), "flash", account_id, &client),
+            AppError::ModelNotAllowed(_)
+        ));
+
+        // Every endpoint open: a 503 carrying the cooldown (or the 1s floor).
+        let AppError::NoUpstreamAvailable { retry_after_secs } =
+            upstream_error(UpstreamError::NoHealthyUpstream("flash".into()), "flash", account_id, &client)
+        else {
+            panic!("NoHealthyUpstream must become NoUpstreamAvailable");
+        };
+        assert!(retry_after_secs >= 1);
+
+        // A transport error is withheld from the client and surfaced as a 503.
+        let AppError::NoUpstreamAvailable { retry_after_secs } =
+            upstream_error(UpstreamError::Transport("tls alert".into()), "flash", account_id, &client)
+        else {
+            panic!("Transport must become NoUpstreamAvailable");
+        };
+        assert!(retry_after_secs >= 1);
+
+        // Rate-limited / server-error carry no provider URL, so they become a
+        // generic internal error rather than a 503 that would invite a retry.
+        assert!(matches!(
+            upstream_error(UpstreamError::RateLimited, "flash", account_id, &client),
+            AppError::Internal(_)
+        ));
+        assert!(matches!(
+            upstream_error(UpstreamError::ServerError(400), "flash", account_id, &client),
+            AppError::Internal(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // THE EARLY REFUSALS of the real handler, each reached BEFORE any upstream
+    // call so they cost nothing and need no provider: the money-shaped gates.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_expired_key_is_refused_before_any_money_moves() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+        sqlx::query("UPDATE api_keys SET expires_at = ? WHERE key_hash = ?")
+            .bind(chrono::Utc::now() - chrono::Duration::hours(2))
+            .bind(hash_string(&key))
+            .execute(&pool)
+            .await
+            .expect("expire the key");
+
+        let err = call_chat_completions(&test_state(pool.clone()), &key, r#"{"model":"flash","stream":true}"#)
+            .await
+            .expect_err("an expired key must not authenticate");
+        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.code(), "key_expired");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_key_over_its_rate_limit_is_refused_with_a_retry_after() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+        sqlx::query("UPDATE api_keys SET rate_limit_rpm = 1 WHERE key_hash = ?")
+            .bind(hash_string(&key))
+            .execute(&pool)
+            .await
+            .expect("cap the key at one request per minute");
+
+        let state = test_state(pool.clone());
+        // Admitted once (count -> 1); it fails downstream at the upstream, which
+        // is irrelevant to the rate-limit decision.
+        let _ = call_chat_completions(&state, &key, r#"{"model":"flash","stream":true}"#).await;
+        // A second request in the same minute is refused by the limiter.
+        let err = call_chat_completions(&state, &key, r#"{"model":"flash","stream":true}"#)
+            .await
+            .expect_err("the second request must hit the rate limit");
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.code(), "rate_limited");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_key_over_its_token_limit_is_refused_before_any_money_moves() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+        sqlx::query("UPDATE api_keys SET token_limit = 1 WHERE key_hash = ?")
+            .bind(hash_string(&key))
+            .execute(&pool)
+            .await
+            .expect("cap the key at one token");
+
+        let today: String = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens, output_tokens)
+             VALUES (?, ?, ?, 5, 5)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(key_id.hyphenated())
+        .bind(&today)
+        .execute(&pool)
+        .await
+        .expect("record prior token usage");
+
+        let err = call_chat_completions(&test_state(pool.clone()), &key, r#"{"model":"flash","stream":true}"#)
+            .await
+            .expect_err("a key at its token ceiling must be refused");
+        assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(err.code(), "key_limit_exceeded");
+        assert_eq!(
+            err.details().and_then(|d| d["reason"].as_str().map(str::to_string)),
+            Some("token_limit_reached".to_string())
+        );
+        db.close().await;
+    }
 }

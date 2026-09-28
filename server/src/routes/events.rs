@@ -1121,9 +1121,35 @@ mod tests {
                 .await
                 .expect("a live session must authenticate"),
             account_id,
-            "a live session must resolve to its own account"
-        );
+        "a live session must resolve to its own account"
+    );
 
-        db.close().await;
-    }
+    db.close().await;
+}
+
+#[test]
+fn a_zero_replay_capacity_hub_keeps_no_history_and_snapshots_on_reconnect() {
+    // replay_capacity 0 means the `if capacity > 0` guard is skipped, so a
+    // published event is dropped and a reconnecting client must be snapshotted.
+    let hub = RealtimeHub::new(&hub_config(0, 5));
+    let owner = Uuid::new_v4();
+    hub.publish(RealtimeEvent::balance(owner, 100));
+    assert!(matches!(hub.resume(Some(1)), Resume::Snapshot));
+}
+
+#[tokio::test]
+async fn a_session_cookie_with_no_matching_row_falls_through_to_unauthenticated() {
+    let db = TestDb::new().await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_static("session=no-such-token"),
+    );
+    let result = resolve_account_from_cookie(&db.pool, &headers).await;
+    assert!(
+        matches!(result, Err(AppError::Unauthenticated)),
+        "a cookie with no session row must fall through to Unauthenticated"
+    );
+    db.close().await;
+}
 }
