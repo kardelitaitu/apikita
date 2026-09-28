@@ -3414,4 +3414,77 @@ mod tests {
         db.close().await;
     }
 
+    /// A reservation of zero (or less) holds nothing and writes nothing: the
+    /// guard short-circuits before any transaction is opened. Covers db.rs:900.
+    #[tokio::test]
+    async fn a_zero_reservation_holds_nothing_and_writes_nothing() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
+
+        for requested in [0, -1] {
+            let outcome = reserve_balance_transaction(
+                &db.pool,
+                account_id,
+                requested,
+                Some("zero_ref"),
+            )
+            .await
+            .expect("a zero reservation is not an error");
+            assert_eq!(outcome, ReservationResult::Zero, "requested {requested}");
+        }
+
+        // Nothing was written: no ledger row exists for the account.
+        let ledger: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count ledger rows");
+        assert_eq!(ledger, 0, "a zero reservation must write no ledger rows");
+        db.close().await;
+    }
+
+    /// A settlement whose reported hold was reserved against a wallet that does
+    /// not exist releases NOTHING and still records the usage: crediting a hold
+    /// the ledger never took would create money. This is the guard at
+    /// db.rs:314-324, and it also drives the re-clamp retry inside
+    /// settle_partial_usage (db.rs:995-999) the honest way - with no wallet row,
+    /// the clamped debit matches no row and the retry floors the debit at zero.
+    #[tokio::test]
+    async fn a_settlement_whose_hold_matched_no_wallet_releases_nothing() {
+        let db = TestDb::new().await;
+        // No wallets row at all: the hold could never have been taken, yet the
+        // caller reports one - the exact state the guard must not "make whole".
+        let account_id = test_support::account(&db.pool).await;
+        let key_id = test_support::api_key(&db.pool, account_id).await;
+
+        let outcome = debit_usage_transaction(
+            &db.pool,
+            account_id,
+            Some(key_id),
+            "flash",
+            200,
+            0,
+            150,
+            1_000,
+            Some("no_wallet_ref"),
+            500, // a hold the (missing) wallet row cannot back
+        )
+        .await
+        .expect("a settlement against a missing wallet is a recorded outcome, not an error");
+
+        // The usage is recorded (the answer was already streamed), the release is
+        // zero, and the debit floors at zero with the whole cost a shortfall.
+        match &outcome {
+            UsageSettlement::Partial {
+                debited_idr,
+                shortfall_idr,
+                ..
+            } => {
+                assert_eq!(*debited_idr, 0, "no wallet means nothing could be debited");
+                assert_eq!(*shortfall_idr, 1_000, "the whole cost is a visible shortfall");
+            }
+            other => panic!("expected a partial settlement, got {other:?}"),
+        }
+        db.close().await;
+    }
 }

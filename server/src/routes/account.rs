@@ -2659,6 +2659,180 @@ mod tests {
         );
     }
 
+    /// A rejection whose body carries `status_message` (and no `error_messages`)
+    /// must surface that detail, and a 2xx whose body is not JSON must be its
+    /// own error rather than a parse panic. Covers account.rs:803-806 and
+    /// account.rs:815-817 - the two arms the 401 test above never reaches.
+    #[tokio::test]
+    async fn snap_client_surfaces_status_message_and_refuses_a_non_json_success() {
+        let payload = build_snap_payload("topup_x", 50_000, None);
+
+        // status_message is the documented fallback when error_messages is absent.
+        let endpoint = snap_stub(http_response(
+            "402 Payment Required",
+            r#"{"status_message": "declined by the fraud engine"}"#,
+        ))
+        .await;
+        let err = create_snap_transaction(&snap_client(), "key", &endpoint, &payload)
+            .await
+            .expect_err("a 402 is not a token");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declined by the fraud engine"),
+            "the status_message detail must surface in the error: {msg}"
+        );
+
+        // A 2xx whose body is not JSON is refused with its own message, never
+        // turned into a token and never a panic.
+        let endpoint = snap_stub(http_response("200 OK", "<html>not json</html>")).await;
+        let err = create_snap_transaction(&snap_client(), "key", &endpoint, &payload)
+            .await
+            .expect_err("a non-JSON 2xx is not a token");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not valid JSON"),
+            "a non-JSON 2xx must be its own error: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // account_email: best-effort BY CONTRACT, so every PocketBase failure mode
+    // must degrade to None and a real address must come back trimmed. The stub
+    // is the same one-shot listener the Snap tests use; account_email only ever
+    // reads the ORIGIN, so the path suffix is stripped.
+    // -----------------------------------------------------------------------
+
+    /// A loopback PocketBase origin, derived from a `snap_stub` endpoint.
+    async fn pb_stub(response: String) -> String {
+        snap_stub(response)
+            .await
+            .trim_end_matches("/snap/v1/transactions")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn account_email_reads_the_address_from_pocketbase_and_trims_it() {
+        let _env = EnvLock::acquire();
+        let origin =
+            pb_stub(http_response("200 OK", r#"{"email":"  ada@example.com  "}"#)).await;
+        let _guard = EnvGuard::set("POCKETBASE_URL", &origin);
+
+        let email = account_email(&snap_client(), "pb_user_1").await;
+        assert_eq!(
+            email.as_deref(),
+            Some("ada@example.com"),
+            "the address must be the trimmed value PocketBase returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_email_degrades_to_none_on_every_pocketbase_failure_mode() {
+        let _env = EnvLock::acquire();
+        let client = snap_client();
+
+        let refused = pb_stub(http_response("404 Not Found", r#"{"status":404}"#)).await;
+        let not_json = pb_stub(http_response("200 OK", "<html>not json</html>")).await;
+        let no_email_field = pb_stub(http_response("200 OK", r#"{"username":"ada"}"#)).await;
+
+        let mut env_vars = EnvGuard::set("POCKETBASE_URL", &refused);
+        assert_eq!(
+            account_email(&client, "pb_user_1").await,
+            None,
+            "a non-2xx record response carries no address"
+        );
+
+        env_vars.also("POCKETBASE_URL", &not_json);
+        assert_eq!(
+            account_email(&client, "pb_user_1").await,
+            None,
+            "a non-JSON record response carries no address"
+        );
+
+        env_vars.also("POCKETBASE_URL", &no_email_field);
+        assert_eq!(
+            account_email(&client, "pb_user_1").await,
+            None,
+            "a record without an email field carries no address"
+        );
+    }
+
+    /// An account with no wallets row yet exports its wallet as JSON null rather
+    /// than failing: the export describes what EXISTS. Covers account.rs:511.
+    #[tokio::test]
+    async fn the_export_of_an_account_with_no_wallet_is_null_not_an_error() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        // The accounts row + a live session, WITHOUT the wallets row that
+        // `live_account` adds - the whole point of this test.
+        let account_id = test_support::account(&pool).await;
+        let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(crate::routes::hash_token(&token))
+        .bind(now + chrono::Duration::days(30))
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("create session");
+
+        let (status, body) =
+            respond(export_account_data(State(pool.clone()), cookie_header(&token))).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            body["wallet"].is_null(),
+            "a missing wallets row must export as null, not an error: {body}"
+        );
+        db.close().await;
+    }
+
+    /// The success path when Snap answers a token but NO redirect_url: the row
+    /// is still created and the 201 still carries the token. A subscriber is
+    /// installed so the `info!` field expressions (account.rs:936) are actually
+    /// evaluated - tracing skips them when no subscriber is active, which left
+    /// that line uncovered even though the success path itself ran.
+    #[tokio::test]
+    async fn live_create_topup_success_without_a_redirect_url_still_creates_the_row() {
+        let _env = EnvLock::acquire();
+        let _capture =
+            tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false).finish());
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = live_account(&pool).await;
+
+        let endpoint = snap_stub(http_response("200 OK", r#"{"token":"snap-token-no-redirect"}"#))
+            .await;
+
+        let mut env_vars = EnvGuard::set("MIDTRANS_ENV", "sandbox");
+        env_vars.also("MIDTRANS_SNAP_URL", &endpoint);
+        env_vars.also("MIDTRANS_SERVER_KEY", "SB-Mid-server-LIVE-TEST-SUCCESS");
+
+        let state = live_app_state(pool.clone());
+        let amount = configured_wallet().min_first_deposit as i64;
+
+        let (status, body) = respond(create_topup(
+            State(state),
+            cookie_header(&account.token),
+            Json(CreateTopupRequest { amount_idr: amount }),
+        ))
+        .await;
+
+        drop(env_vars);
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a token without a redirect_url is still a created top-up: {body}"
+        );
+        assert_eq!(body["snap_token"], json!("snap-token-no-redirect"), "{body}");
+        db.close().await;
+    }
+
     // -----------------------------------------------------------------------
     // 7. create_topup: the in-handler 429, and the SUCCESS path
     //
