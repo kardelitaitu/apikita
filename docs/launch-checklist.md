@@ -177,7 +177,13 @@ statement is false.**
 - [x] `PUBLIC_*` variables contain nothing secret.
       No `PUBLIC_*` key is defined in `server/` or `config/`; the single mention
       (`server/src/routes/account.rs:60`) is a comment about the browser cross-checking
-      its own value.
+      its own value. **Enforced for the case that actually leaks** by
+      `website/tests/public-secrets.test.ts`: it pins the set of `PUBLIC_` variables the
+      build can inline (only ones the source references are substituted) and fails if any
+      of them is named like a secret. That gap was real — the CI Secret scan checks
+      SOURCE files, while this mistake only exists in the BUILT output. Measured: a value
+      planted in `PUBLIC_API_BASE_URL` appears verbatim in `dist/_astro/errors.*.js`
+      with the build exiting 0.
 - [ ] Backup encryption keys are held separately from the backups. **Not ticked, and
       different in kind from the five above.** `tools/backup/backup.sh` does its half
       (refuses to write a plaintext dump, exit 6; AES-256-CBC with PBKDF2 200k
