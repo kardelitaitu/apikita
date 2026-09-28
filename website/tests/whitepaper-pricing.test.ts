@@ -83,3 +83,25 @@ test('the whitepaper no longer publishes the disowned wholesale figures', () => 
     );
   }
 });
+
+test('the whitepaper states the understatement against the PEAK basis, not off-peak', () => {
+  // The prose factor drifted independently of the figures, and in the direction
+  // that flatters the business: the note first said the old card was "~18% below"
+  // the real price list, computed against OFF-PEAK. But the system BILLS at peak
+  // (billing_basis = "peak"), where the gap is 2.43x. "18% too low" and "2.43x
+  // too low" describe the same numbers, and only one of them is honest about what
+  // it means for the margin - so the factor is pinned here, against peak.
+  const input = flashRate('input_peak');
+  const staleInput = 1100; // the figure the old card published
+  const factor = input / staleInput;
+  const stated = factor.toFixed(2); // "2.43"
+  assert.ok(
+    whitepaper.includes(stated + 'x'),
+    `the note must state the real peak-basis factor "${stated}x" (peak ${input} / old ${staleInput})`,
+  );
+  // And it must NOT restate the flattering off-peak percentage.
+  assert.ok(
+    !whitepaper.includes('~18% below'),
+    'the note must not describe the gap against off-peak, which understates it',
+  );
+});
