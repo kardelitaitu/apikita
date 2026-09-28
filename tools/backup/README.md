@@ -22,9 +22,22 @@ Both are exit-code gates here, never warnings.
 ```sh
 export DATABASE_URL='sqlite://data/server.db'                    # local dev only
 export BACKUP_ENCRYPTION_KEY='<key from your secret manager>'    # REQUIRED
-export OFFSITE_CMD='rclone copy "$1" remote:apikita-backups'
+
+# Either shape works. Both are tested by tools/backup-check/.
+export OFFSITE_CMD='rclone copy "$1" remote:apikita-backups'                 # inline
+export OFFSITE_CMD='sh /usr/local/bin/upload-offsite.sh'                     # a script
+
 sh tools/backup/backup.sh
 ```
+
+**Both hook shapes are supported, and that is now enforced.** The artifact is appended
+to `OFFSITE_CMD` before it runs, so an INLINE command sees it as `$1` and a SCRIPT
+receives it as its own first argument. This was **broken for the script shape**: the
+hook was invoked as `sh -c "$OFFSITE_CMD" apikita-offsite "$ARTIFACT"`, where the
+`name` argument becomes `$0` *inside* the command - so a script got **nothing**,
+while the backup printed *"offsite hook succeeded"* and exited 0. The one outcome this
+tool exists to prevent, a backup that never left the machine, was reachable through
+the ordinary hook. `tools/backup-check/check.sh` now runs both shapes in CI.
 
 ### Environment
 

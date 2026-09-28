@@ -277,7 +277,44 @@ if [ -z "${OFFSITE_CMD:-}" ]; then
     fail "  (docs/backup-and-restore.md, 'Offsite is not a detail') - exit 1"
     EXIT_CODE=1
 else
-    if sh -c "$OFFSITE_CMD" apikita-offsite "$ARTIFACT"; then
+    # THE ARTIFACT IS APPENDED AS AN ARGUMENT, and it is dispatched through "$@".
+    #
+    # WHY THIS IS NOT `sh -c "$OFFSITE_CMD" apikita-offsite "$ARTIFACT"`, which is what
+    # it used to be: with `sh -c CMD name arg`, `name` becomes $0 INSIDE CMD. That
+    # works for an INLINE command ("rclone copy $1 remote:") and SILENTLY FAILS for a
+    # SCRIPT hook ("sh /usr/local/bin/upload.sh"), because the artifact lands in the
+    # outer sh's $0 while the script itself receives nothing. Measured both forms:
+    #
+    #   inline -> $1 is the artifact
+    #   script -> $1 is EMPTY
+    #
+    # A script hook is the NATURAL shape for any real provider (rclone, aws-cli, a
+    # wrapper that reads credentials), so the silent form was the common one - and the
+    # script still printed "hook succeeded" and exited 0, while the offsite copy had
+    # NOT been made. That is precisely the outcome this tool exists to prevent: exit 1
+    # is documented to mean "no offsite copy", and here there was none with exit 0.
+    #
+    # The artifact is SINGLE-QUOTED into the command string, which satisfies both
+    # shapes with no duplication:
+    #   inline -> "rclone copy $1 remote:" becomes "...copy '/path/x.enc' remote:",
+    #             so $1 is the artifact (the inner shell expands it).
+    #   script -> "sh hook.sh" becomes "sh hook.sh '/path/x.enc'", so the hook
+    #             receives it as its own $1.
+    # An earlier attempt used `"$OFFSITE_CMD \"$@\"" _ "$ARTIFACT"`, which fixed the
+    # script form but gave an INLINE hook the artifact TWICE - once from $@ and once
+    # from the $1 it already referenced. Caught by running it, not by reading it.
+    #
+    # The path is single-quoted, so a path containing a single quote would break the
+    # command. BACKUP_DIR is operator-controlled and a quote in it is pathological,
+    # but the failure would be a confusing syntax error rather than a clear refusal,
+    # so it is rejected up front instead.
+    case "$ARTIFACT" in
+        *"'"*)
+            fail "the artifact path contains a single quote, which cannot be passed to the offsite hook safely: $ARTIFACT"
+            exit 9
+            ;;
+    esac
+    if sh -c "$OFFSITE_CMD '$ARTIFACT'"; then
         echo "backup: offsite hook succeeded: $OFFSITE_CMD"
     else
         fail "offsite hook FAILED: $OFFSITE_CMD $ARTIFACT"
