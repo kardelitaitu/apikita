@@ -645,4 +645,99 @@ mod tests {
     fn an_empty_list_is_allowed() {
         assert!(validate_trusted_proxy_width(&[]).is_ok());
     }
+    /// Every API-key variable the config names must be DOCUMENTED, unless its endpoint
+    /// can never be routed.
+    ///
+    /// `.env.example` states the contract: "Names must match the `api_key_envs` arrays in
+    /// config/apikita.toml." Nothing enforced it. Measured when this test was added: the
+    /// config names 12 key variables and the file documents 8. The four omissions are all
+    /// CORRECT - three are the `APK_DUMMY_*` names on the placeholder models and the
+    /// fourth is on an endpoint carrying `weight = 0.0` - so the test allows exactly that
+    /// exemption and requires everything else to be documented.
+    ///
+    /// WHY IT MATTERS EVEN THOUGH THE CURRENT FILE IS RIGHT. An operator copies
+    /// `.env.example` and nothing tells them a key is missing: `keys_from_env`
+    /// (upstream/client.rs:608) filters an unset variable out without a word, and the
+    /// startup line reports `models_count`, which counts MODELS, not usable KEYS. A real
+    /// endpoint whose variable nobody documented would therefore fail SILENTLY - the
+    /// model simply never routes - leaving the operator no signal to work from.
+    ///
+    /// The endpoint weight is what separates the two cases, so the exemption is keyed on
+    /// it rather than on a list of names: a name list would rot the moment someone added
+    /// a placeholder, and weight is the SAME condition the router filters on
+    /// (upstream/client.rs:462).
+    #[test]
+    fn every_routable_endpoint_key_is_documented_in_the_env_example() {
+        let config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("the shipped config must parse");
+        let env = fs::read_to_string("../.env.example")
+            .or_else(|_| fs::read_to_string(".env.example"))
+            .expect("the committed .env.example must be readable");
+
+        // Guard the FIXTURE before the assertions: a config with no endpoints, or an
+        // .env.example the reader got nothing from, would make both sides empty and the
+        // comparison pass vacuously.
+        let mut named = 0usize;
+        let mut routable_named = 0usize;
+        for model in &config.models {
+            for endpoint in &model.endpoints {
+                named += endpoint.api_key_envs.len();
+                if endpoint.weight > 0.0 {
+                    routable_named += endpoint.api_key_envs.len();
+                }
+            }
+        }
+        assert!(
+            named >= 10,
+            "the config named only {named} key variables - the fixture read nothing"
+        );
+        assert!(
+            routable_named >= 5,
+            "only {routable_named} key variables belong to a ROUTED endpoint, so this test \
+             could not tell an exemption from a gap"
+        );
+        assert!(
+            env.matches('=').count() >= 10,
+            "the .env.example fixture looks empty"
+        );
+
+        let documented: Vec<&str> = env
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim()))
+            .collect();
+
+        let mut missing = Vec::new();
+        let mut exempt = Vec::new();
+        for model in &config.models {
+            for endpoint in &model.endpoints {
+                for key in &endpoint.api_key_envs {
+                    if documented.contains(&key.as_str()) {
+                        continue;
+                    }
+                    if endpoint.weight <= 0.0 {
+                        exempt.push(format!("{key} (endpoint {} is weight 0)", endpoint.name));
+                    } else {
+                        missing.push(format!("{key} (endpoint {})", endpoint.name));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            ".env.example does not document {missing:#?}, and those keys belong to ROUTED \
+             endpoints - an operator copying the file would get a model that silently never \
+             routes, because an unset variable is filtered out without a warning. Document \
+             them, or set the endpoint weight to 0 if it is truly unroutable. Exemptions \
+             already taken: {exempt:#?}"
+        );
+
+        // The exemption must be REAL, not a loophole: if every endpoint were weight 0 the
+        // assertion above would pass on a config with nothing routable in it.
+        assert!(
+            !exempt.is_empty() && exempt.len() < named,
+            "the exemption is degenerate, so this test has no power: {exempt:#?}"
+        );
+    }
 }
