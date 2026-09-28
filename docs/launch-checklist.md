@@ -201,9 +201,14 @@ statement is false.**
       not look like a dead server and trigger a restart loop). Tested, including the
       unauthenticated-body leak rules.
 - [ ] Alerts configured: webhook rejection, ledger drift, API down, circuit open.
-      **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`, 9 of 10
-      entries `covered` — but "configured" also means a delivery channel and a schedule,
-      which are deployment decisions. The code half is done.
+      **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`: **10 of its 11
+alerts are `covered`**, and the one exception is `relay_5xx`, which is `needs-metrics` because
+it cannot be derived from the database or `/health` alone. (This line said "9 of 10" until it
+was measured: the table has grown since, and nothing tied the sentence to the file — see
+`todo.md`, which now cites the same numbers.) "Configured" also means a delivery channel and
+a schedule, which are deployment decisions. **The code half is done; the coupling is not** —
+the `scheduler` service runs retention, reconcile and hold-sweep, but nothing invokes the
+alert checks on a schedule and no channel is set.
 - [ ] **A restore drill has been run**, with the reconciliation query passing. **The TOOL
       is verified; the PRODUCTION run is not.** I exercised `tools/drill/drill.sh` end to
       end against a synthetic migrated source: a full drill PASSED (exit 0) with

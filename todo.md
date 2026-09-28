@@ -163,5 +163,20 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
           reconcile check, spot-checks a balance, measures the restore time, writes a drill log, and
           tears the scratch DB down. A refusal guard makes it impossible to point at the live database.
     - [ ] Run it against the **production** database once provisioned; that is the real RTO measurement.
-    - [ ] Alerts (webhook rejection, ledger drift, API down, circuit open) — the sweep scripts exist
-          but nothing schedules or alerts yet.
+    - [ ] Alerts (webhook rejection, ledger drift, API down, circuit open) — **the code half is done**;
+          what remains is a deployment decision. **10 of its 11 alerts are `covered`** in
+          [`tools/alert/alerts.tsv`](tools/alert/alerts.tsv) — the exception is `relay_5xx`,
+          `needs-metrics` because it cannot be derived from the database or `/health` alone — and the
+          four named above are checked by
+          [`tools/alert/probe.sh`](tools/alert/probe.sh) (`api_down`, `webhook_rejection`,
+          `all_providers_unhealthy` — the "circuit open" one) and
+          [`tools/alert/check-alerts.sh`](tools/alert/check-alerts.sh) (`ledger_drift`, which needs
+          database access). [`tools/alert/alert.sh`](tools/alert/alert.sh) is the transport that
+          delivers one alert over a configured channel, with a cooldown so one incident pages once
+          rather than once per run. What is missing is the **coupling**: the `scheduler` service in
+          [`docker-compose.yml`](docker-compose.yml) runs retention, reconcile and hold-sweep, but
+          **nothing currently invokes the alert checks on a schedule**, and there is no channel
+          configured. So this needs a schedule an operator chooses and a delivery channel — the same
+          reason
+          [`docs/launch-checklist.md`](docs/launch-checklist.md) keeps its own copy of this line
+          unticked. "The code half is done."
