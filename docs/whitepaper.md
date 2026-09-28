@@ -48,14 +48,16 @@ our platform capitalizes on deep-wholesale pricing inefficiencies:
   * Wholesale Cost (Peak):     53.54 IDR / 1M
   * Consumer Price (+50%, at peak): 80 IDR / 1M
 
-> **Corrected.** These figures previously read ~1,100 / ~4,400 / ~22 IDR per 1M,
-> a single off-peak-vintage number that was uniformly ~18% below the provider's
-> real price list and ignored the peak/off-peak split entirely. There is no single
-> wholesale number: **peak is exactly double off-peak**, and peak covers
-> 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri (~21% of the week). The system bills on
-> the PEAK rate so a request can never lose money
-> (`config/apikita.toml`, `billing_basis = "peak"`); the margin above is stated at
-> that conservative basis. Source: [business/02-pricing.md](business/02-pricing.md).
+> **Corrected.** These figures previously read ~1,100 / ~4,400 / ~22 IDR per 1M —
+> a single price vintage **2.43x below** the rate the system actually bills on, and
+> blind to the peak/off-peak split entirely. There is no single wholesale number:
+> **peak is exactly double off-peak**, and peak covers 01:00-04:00 and
+> 06:00-10:00 UTC, Mon-Fri (~21% of the week). The system bills on the PEAK rate so
+> a request can never lose money (`config/apikita.toml`, `billing_basis = "peak"`),
+> which is the basis the margin above is stated at. Measured against that basis the
+> old card understated cost by 2.43x on every token class — and a cost understated
+> by 2.43x is a margin that does not exist. Source:
+> [business/02-pricing.md](business/02-pricing.md).
 
 At the launch margin of 50% on every model, the consumer rate remains highly
 competitive relative to standard retail API entry points, providing a dual value
