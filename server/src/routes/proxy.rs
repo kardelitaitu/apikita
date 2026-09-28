@@ -4314,4 +4314,642 @@ mod tests {
         );
         db.close().await;
     }
+
+    // -----------------------------------------------------------------------
+    // THE STREAMING PATH, DRIVEN DIRECTLY.
+    //
+    // The handler's streaming half is exercised one layer down: a private
+    // UpstreamClient (NOT the process-wide UPSTREAM static, which other tests
+    // already initialise against the shipped config) points at a loopback SSE
+    // stub, its UpstreamStream is wrapped in MeteredStream, and
+    // settle_after_stream is AWAITED rather than spawned - so every settlement
+    // assertion is deterministic instead of a race against a detached task.
+    // -----------------------------------------------------------------------
+
+    use crate::config::{ModelConfig, ModelEndpoint, ModelRates};
+
+    /// The model name every streaming test routes.
+    const STREAM_MODEL: &str = "mock-stream-model";
+    /// The env var the mock endpoint's key pool reads at client construction.
+    const STREAM_KEY_ENV: &str = "APK_TEST_STREAM_MOCK_KEY";
+
+    /// A one-shot loopback SSE upstream: it answers the next request with the
+    /// given raw HTTP response and closes. `content_length_pad` lets a test
+    /// declare MORE bytes than it sends, which is how a mid-answer transport
+    /// cut is produced.
+    async fn streaming_upstream(http: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the streaming upstream");
+        let addr = listener.local_addr().expect("stub address");
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(http.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}/v1")
+    }
+
+    fn sse_http(status_line: &str, body: &str, content_length_pad: usize) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len() + content_length_pad
+        )
+    }
+
+    /// Headers carrying the FULL body length but whose written body is only
+    /// part 1 - so the connection stays open until part 2 arrives.
+    fn sse_http_first_part(status_line: &str, part1: &str, part2: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{part1}",
+            part1.len() + part2.len()
+        )
+    }
+
+    /// A loopback SSE upstream delivered in TWO parts, the second after a
+    /// delay: a client that polls part 1 and hangs up is genuinely hanging up
+    /// mid-answer, with the usage block still in flight. This is what makes the
+    /// drain-what-the-client-abandoned contract observable.
+    async fn streaming_upstream_in_two_parts(
+        headers_with_part1: String,
+        part2: String,
+        delay_ms: u64,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the streaming upstream");
+        let addr = listener.local_addr().expect("stub address");
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(headers_with_part1.as_bytes()).await;
+                let _ = socket.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let _ = socket.write_all(part2.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}/v1")
+    }
+
+    /// A config identical to the shipped one except that it carries exactly one
+    /// model, routed to the loopback stub, with rates small enough that a
+    /// hand-checkable cost comes out of a 10/5-token usage report.
+    fn streaming_config(endpoint_url: String) -> Arc<AppConfig> {
+        let mut config =
+            AppConfig::load_from_file("../config/apikita.toml").expect("parse apikita.toml");
+        config.models = vec![ModelConfig {
+            name: STREAM_MODEL.to_string(),
+            description: String::new(),
+            price: 1.5,
+            max_context_tokens: 1_000_000,
+            max_output_tokens: 100,
+            supports_vision: false,
+            supports_thinking: false,
+            billing_basis: "peak".to_string(),
+            rates: ModelRates {
+                cache_read_offpeak: 13.0,
+                cache_read_peak: 26.0,
+                input_offpeak: 600.0,
+                input_peak: 1200.0,
+                output_offpeak: 2400.0,
+                output_peak: 4800.0,
+            },
+            endpoints: vec![ModelEndpoint {
+                name: "mock".to_string(),
+                url: endpoint_url,
+                upstream_model: "mock-upstream-model".to_string(),
+                api_key_envs: vec![STREAM_KEY_ENV.to_string()],
+                concurrency_per_key: 0,
+                weight: 1.0,
+                supports_stream_options: true,
+                input_peak: None,
+                output_peak: None,
+            }],
+        }];
+        Arc::new(config)
+    }
+
+    /// The reservation the HANDLER would take for `body`, computed through the
+    /// same helpers the handler calls.
+    fn reservation_for(config: &AppConfig, body: &str) -> i64 {
+        let model_cfg = &config.models[0];
+        let estimated_input = estimated_input_tokens(body.as_bytes());
+        let max_output = 50u64
+            .max(model_cfg.max_output_tokens)
+            .min(config.streaming.hard_max_output_tokens);
+        model_cfg.worst_case_reservation_idr(estimated_input, max_output)
+    }
+
+    /// An SSE body that streams one content chunk and then the usage block.
+    fn happy_sse() -> String {
+        "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+         data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+         data: [DONE]\n\n"
+            .to_string()
+    }
+
+    /// The full streaming fixture: funded wallet, key, client, config. The
+    /// caller owns the TestDb and closes it.
+    async fn stream_fixture(
+        db: &TestDb,
+        endpoint_url: String,
+    ) -> (Uuid, Uuid, UpstreamClient, Arc<AppConfig>, String) {
+        let config = streaming_config(endpoint_url);
+        let account_id = create_account(&db.pool).await;
+        open_wallet(&db.pool, account_id, 1_000_000).await;
+        let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
+
+        let client = UpstreamClient::new(config.clone());
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        (account_id, key_id, client, config, reservation_ref)
+    }
+
+    /// The happy path: every chunk is forwarded in order, the trailing usage
+    /// block is billed, the hold is released inside the settlement transaction,
+    /// and the ledger nets to exactly -cost. Covers MeteredStream's forwarding
+    /// (815-818), its end-of-stream finish (801-814, 723-747), the Settled arm
+    /// of settle_after_stream (1429, 1551-1591) and the bill path through
+    /// debit_usage_transaction.
+    #[tokio::test]
+    async fn a_completed_stream_bills_exactly_what_the_upstream_reported() {
+        let _env = crate::routes::test_env::EnvLock::acquire();
+        let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
+        let db = TestDb::new().await;
+
+        let endpoint = streaming_upstream(sse_http("200 OK", &happy_sse(), 0)).await;
+        let (account_id, key_id, client, config, reservation_ref) =
+            stream_fixture(&db, endpoint).await;
+
+        let body = format!(
+            r#"{{"model":"{STREAM_MODEL}","stream":true,"max_tokens":50,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let reservation = reservation_for(&config, &body);
+        assert!(reservation > 0, "the fixture's hold must be a real hold");
+
+        let held = reserve_balance_transaction(
+            &db.pool,
+            account_id,
+            reservation,
+            Some(&reservation_ref),
+        )
+        .await
+        .expect("the funded wallet covers the worst case");
+        assert!(
+            matches!(held, ReservationResult::Held { .. }),
+            "the fixture wallet must be able to hold: {held:?}"
+        );
+
+        let upstream_body = serde_json::from_str::<Value>(&body).expect("fixture body parses");
+        let upstream_stream = client
+            .stream_chat(STREAM_MODEL, upstream_body)
+            .await
+            .expect("the mock upstream is healthy");
+
+        // The Debug contract (client.rs:218-223): names the endpoint and whether
+        // a lease is held - never the body.
+        let debugged = format!("{upstream_stream:?}");
+        assert!(debugged.contains("mock"), "names the endpoint: {debugged}");
+        assert!(
+            debugged.contains("lease_held"),
+            "reports the lease state: {debugged}"
+        );
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream::new(upstream_stream, settle_tx);
+
+        let mut forwarded = String::new();
+        use futures_util::StreamExt;
+        while let Some(item) = metered.next().await {
+            forwarded.push_str(
+                std::str::from_utf8(&item.expect("no transport error on the happy path"))
+                    .expect("chunks are utf-8"),
+            );
+        }
+
+        assert!(
+            forwarded.contains("Hi"),
+            "the client sees the upstream's own chunk: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("error"),
+            "a completed stream announces no in-band error: {forwarded}"
+        );
+
+        // The stream ended, so the outcome is already on the channel. Settle it
+        // deterministically - no detached task, no sleep.
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config.clone(),
+            Arc::new(RealtimeHub::new(&config.realtime)),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+        )
+        .await;
+
+        // Billed exactly the upstream's own report: 10 in, 0 cached, 5 out.
+        let (input, cached, output, cost) =
+            usage_today(&db.pool, account_id).await.expect("usage recorded");
+        assert_eq!((input, cached, output), (10, 0, 5));
+        assert!(cost > 0, "a reported answer must cost something");
+
+        // The hold came back inside the settlement transaction, so the wallet
+        // ends at funded - cost and the ledger explains every rupiah.
+        assert_eq!(
+            wallet_balance(&db.pool, account_id).await,
+            1_000_000 - cost,
+            "balance must be funded minus the true cost"
+        );
+        let deltas = ledger_deltas(&db.pool, account_id).await;
+        // Scope to THIS reservation: the fixture's funding top-up also has a
+        // ledger row, and it is not the settlement's business.
+        let reservation_rows: Vec<i64> = deltas
+            .iter()
+            .filter(|(_, r)| r.as_deref() == Some(reservation_ref.as_str()))
+            .map(|(d, _)| *d)
+            .collect();
+        assert_eq!(
+            reservation_rows.len(),
+            3,
+            "hold, release, charge: {deltas:?}"
+        );
+        assert_eq!(
+            reservation_rows.iter().sum::<i64>(),
+            -cost,
+            "the reservation nets to exactly -cost"
+        );
+        assert_eq!(
+            deltas.iter().map(|(d, _)| d).sum::<i64>(),
+            1_000_000 - cost,
+            "the whole ledger (funding included) nets to the balance"
+        );
+        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A stream that ends WITHOUT a usage block is the documented washed case:
+    /// nothing is billed, the whole hold comes back, and the client is told the
+    /// answer was incomplete. Covers the no-usage branch of poll_next
+    /// (801-814) and the Wash arm of settle_after_stream (1480-1493).
+    #[tokio::test]
+    async fn a_stream_that_reports_no_usage_washes_and_returns_the_hold() {
+        let _env = crate::routes::test_env::EnvLock::acquire();
+        let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
+        let db = TestDb::new().await;
+
+        let truncated_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        let endpoint = streaming_upstream(sse_http("200 OK", truncated_sse, 0)).await;
+        let (account_id, key_id, client, config, reservation_ref) =
+            stream_fixture(&db, endpoint).await;
+
+        let body = format!(
+            r#"{{"model":"{STREAM_MODEL}","stream":true,"max_tokens":50,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let reservation = reservation_for(&config, &body);
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("the funded wallet covers the worst case");
+
+        let upstream_stream = client
+            .stream_chat(STREAM_MODEL, serde_json::from_str(&body).unwrap())
+            .await
+            .expect("the mock upstream is healthy");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream::new(upstream_stream, settle_tx);
+
+        use futures_util::StreamExt;
+        let mut forwarded = String::new();
+        while let Some(item) = metered.next().await {
+            forwarded.push_str(
+                std::str::from_utf8(&item.expect("no transport error here"))
+                    .expect("chunks are utf-8"),
+            );
+        }
+
+        assert!(
+            forwarded.contains("upstream_incomplete"),
+            "a stream that never reported usage says so in band: {forwarded}"
+        );
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config.clone(),
+            Arc::new(RealtimeHub::new(&config.realtime)),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+        )
+        .await;
+
+        // Washed: nothing billed, the hold back in full. The reservation's own
+        // rows (hold + release) net to zero; the funding row is the fixture's.
+        assert!(
+            usage_today(&db.pool, account_id).await.is_none(),
+            "token counts are never invented for a washed stream"
+        );
+        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
+        let reservation_rows: Vec<i64> = ledger_deltas(&db.pool, account_id)
+            .await
+            .into_iter()
+            .filter(|(_, r)| r.as_deref() == Some(reservation_ref.as_str()))
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(reservation_rows, vec![-reservation, reservation]);
+        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A client hangup mid-answer must NOT make the answer free: the abandoned
+    /// upstream body is drained to its end and billed from the usage the
+    /// upstream still reports. Covers MeteredStream's Drop (759-782), the
+    /// Hangup arm (1440-1463) and drain_for_usage (917-949).
+    #[tokio::test]
+    async fn a_hungup_stream_is_drained_and_billed_from_the_upstreams_own_report() {
+        let _env = crate::routes::test_env::EnvLock::acquire();
+        let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
+        let db = TestDb::new().await;
+
+        let content_part = "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        let usage_part =
+            "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n";
+        let endpoint = streaming_upstream_in_two_parts(
+            sse_http_first_part("200 OK", content_part, usage_part),
+            usage_part.to_string(),
+            400,
+        )
+        .await;
+        let (account_id, key_id, client, config, reservation_ref) =
+            stream_fixture(&db, endpoint).await;
+
+        let body = format!(
+            r#"{{"model":"{STREAM_MODEL}","stream":true,"max_tokens":50,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let reservation = reservation_for(&config, &body);
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("the funded wallet covers the worst case");
+
+        let upstream_stream = client
+            .stream_chat(STREAM_MODEL, serde_json::from_str(&body).unwrap())
+            .await
+            .expect("the mock upstream is healthy");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream::new(upstream_stream, settle_tx);
+
+        // The client reads ONE chunk and then hangs up: the tee is dropped with
+        // `done == false`, which is the hangup contract. The usage block is
+        // still in flight, so this is a real mid-answer hangup.
+        use futures_util::StreamExt;
+        let _first = metered.next().await.expect("at least one chunk");
+        drop(metered);
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config.clone(),
+            Arc::new(RealtimeHub::new(&config.realtime)),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+        )
+        .await;
+
+        // The drained body still carried the usage block, so the tokens the
+        // upstream generated are on the books.
+        let (input, cached, output, cost) =
+            usage_today(&db.pool, account_id).await.expect("drained usage is billed");
+        assert_eq!((input, cached, output), (10, 0, 5));
+        assert!(cost > 0);
+        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000 - cost);
+        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A transport cut MID-answer is announced in band (never retried, never a
+    /// provider name), reports no usage, and washes. Covers the error branch of
+    /// poll_next (819-832), `finish(false)` and UpstreamStream::finish_status
+    /// (client.rs:253-255).
+    #[tokio::test]
+    async fn a_stream_that_dies_mid_answer_announces_the_failure_in_band_and_washes() {
+        let _env = crate::routes::test_env::EnvLock::acquire();
+        let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
+        let db = TestDb::new().await;
+
+        // Content-Length promises 500 more bytes than are sent, then the
+        // connection closes: hyper reports a transport error mid-body.
+        let endpoint =
+            streaming_upstream(sse_http("200 OK", "data: {\"ch", 500)).await;
+        let (account_id, key_id, client, config, reservation_ref) =
+            stream_fixture(&db, endpoint).await;
+
+        let body = format!(
+            r#"{{"model":"{STREAM_MODEL}","stream":true,"max_tokens":50,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let reservation = reservation_for(&config, &body);
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("the funded wallet covers the worst case");
+
+        let upstream_stream = client
+            .stream_chat(STREAM_MODEL, serde_json::from_str(&body).unwrap())
+            .await
+            .expect("the mock upstream accepted the connection");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream::new(upstream_stream, settle_tx);
+
+        use futures_util::StreamExt;
+        let mut forwarded = String::new();
+        while let Some(item) = metered.next().await {
+            forwarded.push_str(&String::from_utf8_lossy(&item.expect("the tee yields Ok chunks")));
+        }
+
+        assert!(
+            forwarded.contains("upstream_failed"),
+            "a mid-answer cut is announced in band: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("127.0.0.1"),
+            "the provider location must never reach the client: {forwarded}"
+        );
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config.clone(),
+            Arc::new(RealtimeHub::new(&config.realtime)),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+        )
+        .await;
+
+        assert!(usage_today(&db.pool, account_id).await.is_none());
+        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
+        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// The settlement channel closing with no outcome at all still releases the
+    /// hold - the safety net for a lost tee. Covers the Err arm (1464-1475).
+    #[tokio::test]
+    async fn a_settlement_channel_closed_without_an_outcome_still_releases_the_hold() {
+        let db = TestDb::new().await;
+        let config = streaming_config("http://127.0.0.1:1/v1".to_string());
+        let account_id = create_account(&db.pool).await;
+        open_wallet(&db.pool, account_id, 1_000_000).await;
+        let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        let reservation = 500;
+
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("hold the reservation");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        drop(settle_tx); // the tee died without ever reporting
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config,
+            Arc::new(RealtimeHub::new(
+                &AppConfig::load_from_file("../config/apikita.toml")
+                    .expect("parse apikita.toml")
+                    .realtime,
+            )),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+        )
+        .await;
+
+        assert!(usage_today(&db.pool, account_id).await.is_none());
+        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
+        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A model that was routed but is no longer configured at settlement time
+    /// (a config reload mid-request) must not strand the hold. Covers
+    /// 1495-1517 - the arm that cannot happen without a reload, driven by
+    /// sending the outcome DIRECTLY through the channel.
+    #[tokio::test]
+    async fn a_settlement_for_a_model_no_longer_configured_releases_the_hold() {
+        let db = TestDb::new().await;
+        let config = streaming_config("http://127.0.0.1:1/v1".to_string());
+        let account_id = create_account(&db.pool).await;
+        open_wallet(&db.pool, account_id, 1_000_000).await;
+        let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        let reservation = 500;
+
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("hold the reservation");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        settle_tx
+            .send(StreamEnd::Settled(Usage {
+                input_tokens: 10,
+                cache_read_tokens: 0,
+                output_tokens: 5,
+            }))
+            .expect("the tee reported a usage block");
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config,
+            Arc::new(RealtimeHub::new(
+                &AppConfig::load_from_file("../config/apikita.toml")
+                    .expect("parse apikita.toml")
+                    .realtime,
+            )),
+            account_id,
+            key_id,
+            "ghost-model".to_string(), // routed moments ago, gone at settlement
+            reservation,
+            guard,
+        )
+        .await;
+
+        // The usage the upstream reported is NOT billed (its model's rates are
+        // gone), but the customer's hold must come back either way.
+        assert!(usage_today(&db.pool, account_id).await.is_none());
+        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
+        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
 }
