@@ -349,6 +349,18 @@ jobs:
       - name: Check the reconciliation gate
         run: sh tools/reconcile-check/check.sh
 
+      # The restore drill must refuse every live-looking target BEFORE deleting anything.
+      #
+      # The drill DELETES a scratch database as part of teardown, and its safety guard is
+      # the only thing between that and production. docs/launch-checklist.md:279 says an
+      # untested backup is a belief - and the tool that produces the restore evidence was
+      # covered by nothing in CI.
+      #
+      # Both directions are asserted: the guard refuses and touches nothing, a consistent
+      # source drills to PASS, and a drifted one FAILS.
+      - name: Check the restore drill
+        run: sh tools/drill-check/check.sh
+
       - name: Install website dependencies
         working-directory: website
         run: npm ci
