@@ -34,23 +34,37 @@ By targeting models like DeepSeek-V4-Flash during optimized compute windows,
 our platform capitalizes on deep-wholesale pricing inefficiencies:
 
 - Standard Input Tokens:
-  * Wholesale Cost (Base): ~1,100 IDR / 1M
-  * Consumer Price (+50%): 1,650 IDR / 1M
-  * Net Arbitrage Margin:  +550 IDR / 1M
+  * Wholesale Cost (Off-peak): 1,338.39 IDR / 1M
+  * Wholesale Cost (Peak):     2,676.78 IDR / 1M
+  * Consumer Price (+50%, at peak): 4,015 IDR / 1M
 
 - Model Output Tokens:
-  * Wholesale Cost (Base): ~4,400 IDR / 1M
-  * Consumer Price (+50%): 6,600 IDR / 1M
-  * Net Arbitrage Margin:  +2,200 IDR / 1M
+  * Wholesale Cost (Off-peak): 5,353.56 IDR / 1M
+  * Wholesale Cost (Peak):     10,707.12 IDR / 1M
+  * Consumer Price (+50%, at peak): 16,061 IDR / 1M
 
 - Cache Read (KV Hit) Tokens:
-  * Wholesale Cost (Base): ~22 IDR / 1M
-  * Consumer Price (+50%): 33 IDR / 1M
-  * Net Arbitrage Margin:  +11 IDR / 1M
+  * Wholesale Cost (Off-peak): 26.77 IDR / 1M
+  * Wholesale Cost (Peak):     53.54 IDR / 1M
+  * Consumer Price (+50%, at peak): 80 IDR / 1M
 
-Even with a uniform 50% markup, the consumer rate remains highly competitive 
-relative to standard retail API entry points, providing a dual value proposition: 
-deep cost savings for the customer and guaranteed profitability for the operator.
+> **Corrected.** These figures previously read ~1,100 / ~4,400 / ~22 IDR per 1M,
+> a single off-peak-vintage number that was uniformly ~18% below the provider's
+> real price list and ignored the peak/off-peak split entirely. There is no single
+> wholesale number: **peak is exactly double off-peak**, and peak covers
+> 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri (~21% of the week). The system bills on
+> the PEAK rate so a request can never lose money
+> (`config/apikita.toml`, `billing_basis = "peak"`); the margin above is stated at
+> that conservative basis. Source: [business/02-pricing.md](business/02-pricing.md).
+
+At the launch margin of 50% on every model, the consumer rate remains highly
+competitive relative to standard retail API entry points, providing a dual value
+proposition: deep cost savings for the customer and guaranteed profitability for
+the operator. The margin is set **per model** rather than as one global number —
+pro-tier output costs several times flash, so a single rate would make one
+unsellable and the other unprofitable — and every model must declare its price,
+so a missing value fails at startup instead of silently applying a wrong margin
+(`config/apikita.toml`).
 
 2.2 Risk Elimination Matrix
 To safely offer variable, post-request token billing under a prepaid architecture, 
