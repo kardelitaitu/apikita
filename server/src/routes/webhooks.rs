@@ -1373,6 +1373,10 @@ mod tests {
     #[tokio::test]
     async fn live_webhook_answers_a_malformed_body_with_json_not_plain_text() {
         run_live(|pool, _account_id, state| async move {
+            // Install a capturing subscriber so the extractor-rejection
+            // `warn!` field expressions (webhooks.rs:85-86) are evaluated and
+            // counted as covered - they are skipped when no subscriber is active.
+            let _capture = capture_logs();
             // (a) Valid JSON that is not a MidtransNotification: required
             //     fields are missing.
             let (status, content_type, body) = post_raw(&state, r#"{"order_id":"x"}"#).await;
@@ -1609,5 +1613,236 @@ mod tests {
         assert_reconciled(&db.pool, account_id, "after the refusal logging").await;
 
         db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // SHARED HELPER. `post` does not install a subscriber, so the handler's
+    // `warn!`/`error!`/`info!` field expressions are skipped (and left
+    // uncovered) when no subscriber is active. This variant installs a capturing
+    // subscriber for the duration of the call so those arms are fully exercised.
+    // -----------------------------------------------------------------------
+    async fn post_logged(
+        state: &AppState,
+        payload: MidtransNotification,
+    ) -> (StatusCode, serde_json::Value) {
+        let (_guard, _sink) = capture_logs();
+        post(state, payload).await
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. SERVER MISCONFIGURATION: the signing secret is absent or empty.
+    // -----------------------------------------------------------------------
+
+    /// An EMPTY/whitespace secret is refused as `server misconfigured`, NOT a
+    /// forged-signature 401: an empty key makes the published formula compute a
+    /// matchable signature, so it must never be used. The env is mutated here
+    /// under the shared lock, with the previous value restored on drop.
+    #[tokio::test]
+    async fn live_webhook_refuses_an_empty_or_whitespace_server_key() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", "   ");
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        // The signature is computed with the same (refused) key, so it would be
+        // valid - but the handler refuses BEFORE verifying, which is the point.
+        let payload = notification("order_x", "200", "50000.00", "settlement", "   ");
+        let (status, body) = post_logged(&state, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an empty/whitespace key must refuse verification, not attempt it: {body}"
+        );
+        assert_eq!(body["error"], json!("server misconfigured"), "{body}");
+        assert_reconciled(&db.pool, account_id, "after a misconfigured empty key").await;
+        db.close().await;
+    }
+
+    /// The secret is entirely ABSENT (not merely empty). Distinct from the empty
+    /// case so an operator can tell the two misconfigurations apart.
+    #[tokio::test]
+    async fn live_webhook_refuses_a_missing_server_key() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::remove("MIDTRANS_SERVER_KEY");
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let payload = notification("order_x", "200", "50000.00", "settlement", "whatever");
+        let (status, body) = post_logged(&state, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a missing key must refuse verification: {body}"
+        );
+        assert_eq!(body["error"], json!("server misconfigured"), "{body}");
+        assert_reconciled(&db.pool, account_id, "after a missing key").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. A BAD gross_amount format is rejected before any money moves.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_rejects_an_unparseable_gross_amount() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        // A valid signature over a non-numeric amount: the amount parse runs
+        // AFTER the signature check, so this exercises the parse failure arm
+        // specifically, not the rejection arm.
+        let payload =
+            notification("order_x", "200", "not-a-number", "settlement", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post(&state, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unparseable gross_amount is a 400: {body}"
+        );
+        assert_eq!(body["error"], json!("invalid gross_amount format"), "{body}");
+        assert_reconciled(&db.pool, account_id, "after a bad gross_amount").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. A settlement for an UNKNOWN order is NotFound, not a credit.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_rejects_a_settlement_for_an_unknown_order() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let order_id = "no-such-order-00000000";
+        let payload = notification(&order_id, "200", "50000.00", "settlement", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post_logged(&state, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a settlement for an order that does not exist is 404: {body}"
+        );
+        assert_eq!(body["error"], json!("order not found"), "{body}");
+        assert_eq!(balance_of(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_count(&db.pool, account_id).await, 0);
+        assert_reconciled(&db.pool, account_id, "after an unknown-order settlement").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. A settlement for a row that is NOT settleable (denied/expire/cancel)
+    //     is refused with 200 + not_settleable; NO money moves.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_refuses_a_settlement_for_a_non_settleable_order() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        const AMOUNT: i64 = 50_000;
+        let order_id = pending_topup(&db.pool, account_id, AMOUNT).await;
+        // First move the row out of `pending` via a real terminal status, so the
+        // later settlement finds a non-settleable row.
+        let deny = notification(&order_id, "200", "50000.00", "deny", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post(&state, deny).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(topup_status_of(&db.pool, &order_id).await, "denied");
+
+        let settle = notification(&order_id, "200", "50000.00", "settlement", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post_logged(&state, settle).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["status"],
+            json!("not_settleable"),
+            "a settlement for a denied order must be refused as not_settleable: {body}"
+        );
+        assert_eq!(body["order_status"], json!("denied"), "{body}");
+        assert_eq!(balance_of(&db.pool, account_id).await, 0, "no money moved");
+        assert_eq!(ledger_count(&db.pool, account_id).await, 0);
+        assert_reconciled(&db.pool, account_id, "after a not_settleable settlement").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. A terminal status for a row that is ALREADY past pending records
+    //     nothing and answers terminal_not_applicable.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_terminal_status_for_a_non_pending_row_is_not_applicable() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        const AMOUNT: i64 = 50_000;
+        let order_id = pending_topup(&db.pool, account_id, AMOUNT).await;
+        // Settle it first; the row is now `settled`, not `pending`.
+        let settle = notification(&order_id, "200", "50000.00", "settlement", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post(&state, settle).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(topup_status_of(&db.pool, &order_id).await, "settled");
+
+        // Now a terminal status (expire -> expired). The UPDATE WHERE status =
+        // 'pending' affects 0 rows, so it records nothing.
+        let expire = notification(&order_id, "200", "50000.00", "expire", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post_logged(&state, expire).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["status"],
+            json!("terminal_not_applicable"),
+            "a terminal status for a non-pending row must be not_applicable: {body}"
+        );
+        assert_eq!(
+            topup_status_of(&db.pool, &order_id).await,
+            "settled",
+            "the row must be left untouched"
+        );
+        assert_reconciled(&db.pool, account_id, "after a not_applicable terminal").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. A legitimate in-progress status answers 200 pending and writes nothing.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_an_in_progress_status_is_pending_and_writes_nothing() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let order_id = pending_topup(&db.pool, account_id, 50_000).await;
+        let payload = notification(&order_id, "201", "50000.00", "pending", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post(&state, payload).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["status"], json!("pending"), "{body}");
+        assert_eq!(balance_of(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_count(&db.pool, account_id).await, 0);
+        assert_eq!(topup_status_of(&db.pool, &order_id).await, "pending");
+        assert_reconciled(&db.pool, account_id, "after a pending status").await;
+        db.close().await;
+    }
+
+    /// The flat refusal body shape the handler shares with the rest of the
+    /// endpoint. Pure, so it is pinned directly.
+    #[test]
+    fn error_body_produces_the_flat_error_and_message_shape() {
+        let body = error_body("internal_processing_error", "internal processing error");
+        assert_eq!(body.0["error"], json!("internal_processing_error"));
+        assert_eq!(body.0["message"], json!("internal processing error"));
     }
 }

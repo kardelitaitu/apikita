@@ -522,6 +522,28 @@ mod tests {
         }
     }
 
+    /// `record_and_check_attempt` with limit 0 is the DISABLED ceiling: it records
+    /// the attempt (the audit signal) but never refuses, whatever the prior
+    /// volume. This is the `limit == 0` arm at telegram.rs:192-196, which the live
+    /// handler tests never reach because the deployed config sets a positive cap.
+    #[tokio::test]
+    async fn a_disabled_link_attempt_ceiling_records_but_never_refuses() {
+        let db = TestDb::new().await;
+        let now = chrono::Utc::now();
+        let result = record_and_check_attempt(&db.pool, "ip-test-disabled", 0, now).await;
+        assert!(result.is_ok(), "limit 0 must never refuse: {result:?}");
+        // The attempt was recorded despite the refusal being disabled.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM link_redemption_attempts WHERE ip_hash = ?",
+        )
+        .bind("ip-test-disabled")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count attempts");
+        assert_eq!(count, 1, "the attempt must be recorded even when disabled");
+        db.close().await;
+    }
+
     // -----------------------------------------------------------------------
     // Live tests: the properties that make this endpoint safe.
     //

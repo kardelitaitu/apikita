@@ -2050,4 +2050,24 @@ mod tests {
         );
         db.close().await;
     }
+
+    /// The cookie path that falls through every `session=` piece without a match
+    /// (wrong token, revoked, or expired) must resolve to `Unauthenticated`, never
+    /// to a panic or a default account. Covers the final `Err` arm at keys.rs:253
+    /// and the inner `if let Some(s)` fall-through at keys.rs:249.
+    #[tokio::test]
+    async fn a_session_cookie_with_no_matching_row_falls_through_to_unauthenticated() {
+        let db = TestDb::new().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("session=no-such-token"),
+        );
+        let result = resolve_account_from_cookie(&db.pool, &headers).await;
+        assert!(
+            matches!(result, Err(AppError::Unauthenticated)),
+            "an unmatched session cookie must be refused as unauthenticated: {result:?}"
+        );
+        db.close().await;
+    }
 }
