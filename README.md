@@ -140,6 +140,7 @@ Push to `main` deploys. The reasoning and the tradeoffs:
 | [`docs/failover.md`](docs/failover.md) | Multi-provider failover, circuit breaking, key pools |
 | [`docs/server/api-spec.md`](docs/server/api-spec.md) | Every endpoint, auth scheme, enforcement order |
 | [`docs/whitepaper.md`](docs/whitepaper.md) | The **original** design — partly superseded |
+| [`tools/README.md`](tools/README.md) | **The verification tools** — what checks the money, the data and the delivery |
 
 The whitepaper is the original design; parts have since been corrected (notably its
 pricing figures were ~2.5x too low, and the stack changed). Where it disagrees with

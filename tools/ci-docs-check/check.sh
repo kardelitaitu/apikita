@@ -82,5 +82,56 @@ for claimed in \
     }
 done
 
-echo "ci-docs-check: OK - all $COUNT workflow steps are named in docs/ci-cd.md, and every check it advertises exists"
+# --- the tools INDEX ---------------------------------------------------------
+# tools/README.md is the only page that says what the tools ARE, and an unchecked index is
+# the next thing to drift - the same argument as the stage table above. Every directory
+# under tools/ must be listed, and every `tools/<name>/` link it contains must exist.
+TOOLS_DIR="$REPO/tools"
+INDEX="$TOOLS_DIR/README.md"
+[ -f "$INDEX" ] || { echo "ci-docs-check: missing $INDEX" >&2; exit 3; }
+
+# The real directory listing, excluding README.md itself and any hidden entries.
+REAL_TOOLS=$(find "$TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)
+
+REAL_COUNT=$(printf '%s\n' "$REAL_TOOLS" | grep -c .)
+if [ "$REAL_COUNT" -lt 8 ]; then
+    echo "ci-docs-check: only $REAL_COUNT tool directories found; the listing was not read" >&2
+    echo "ci-docs-check:   correctly, so the index assertions would pass vacuously" >&2
+    exit 3
+fi
+
+# The index links RELATIVELY from inside tools/ (`[reconcile/](reconcile/README.md)`),
+# which is what markdown requires of a file in that directory. So match the directory
+# NAME inside a link target, not the literal string "tools/name/" - an index that only
+# passed because it prefixed every link would be a worse index.
+TOOL_MISSING="${TMPDIR:-/tmp}/apikita-tools-missing.$$"
+printf '%s\n' "$REAL_TOOLS" | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    grep -qE "\]\($name/README\.md\)" "$INDEX" || echo "$name"
+done > "$TOOL_MISSING"
+
+if [ -s "$TOOL_MISSING" ]; then
+    while IFS= read -r name; do
+        echo "ci-docs-check: FAIL - tools/$name/ exists but is not indexed in tools/README.md" >&2
+    done < "$TOOL_MISSING"
+    rm -f "$TOOL_MISSING"
+    echo "ci-docs-check: the index must list every tool, or the tools are undiscoverable." >&2
+    exit 1
+fi
+rm -f "$TOOL_MISSING"
+
+# The other direction: a link to a tool that does not exist.
+for linked in $(grep -oE '\]\([a-z0-9-]+/README\.md\)' "$INDEX" | sed 's/^](//; s|/README.md)$||'); do
+    [ -d "$TOOLS_DIR/$linked" ] || {
+        echo "ci-docs-check: FAIL - tools/README.md links to tools/$linked/, which does not exist" >&2
+        exit 1
+    }
+    [ -f "$TOOLS_DIR/$linked/README.md" ] || {
+        echo "ci-docs-check: FAIL - tools/$linked/ is indexed but has no README" >&2
+        exit 1
+    }
+done
+
+echo "ci-docs-check: OK - all $COUNT workflow steps are named in docs/ci-cd.md, every check it advertises exists,"
+echo "ci-docs-check:      and all $REAL_COUNT tool directories are indexed in tools/README.md"
 exit 0
