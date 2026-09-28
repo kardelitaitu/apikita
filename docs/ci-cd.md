@@ -58,7 +58,7 @@ anyway, so the check below can demand an exact match:
 | Stage | Purpose |
 | --- | --- |
 | Build the server image | The deployable artifact builds |
-| Smoke the server image against a migrated database | It serves a real request against a real schema, **and** the booted binary answers its whole route table as documented — every protected route refusing anonymously, the DESIGNED-NOT-BUILT routes 404ing, the bot-token endpoint refusing **identically** for well-formed and malformed input, and **every other mounted route** answering its documented status — including the two `logout` verbs, which are *intentionally* anonymous and idempotent |
+| Smoke the server image against a migrated database | It serves a real request against a real schema, **and** the booted binary answers its whole route table as documented — every protected route refusing anonymously, the DESIGNED-NOT-BUILT routes 404ing, the bot-token endpoint refusing **identically** for well-formed and malformed input, and **every other mounted route** answering its documented status — including the two `logout` verbs, which are *intentionally* anonymous and idempotent. It also asserts the **error SHAPE** on 404/400/401 paths, because `error-model.md:10` promises JSON with `code` + `request_id` — and the router-level 404s and body-parse failures are exactly where a framework default breaks that |
 | Smoke the maintenance scheduler image | The nightly jobs run for real in the image that ships |
 | Typecheck (website) | `tsc --noEmit` |
 | Website contract tests | The frontend's own suites |

@@ -9,6 +9,18 @@ status. Clients code against this, so it is a contract.
 
 **Every error returns the same JSON.** No bare HTML error pages, no empty bodies.
 
+This is **enforced against the running binary** by the CI smoke step, not merely asserted
+here. It was not always true: until recently an unrouted path returned an **empty body**
+(axum's default, because the router had no fallback) and a malformed body on
+`POST /auth/exchange` returned axum's **plain text** — on the one auth verb with no
+credential guard, and therefore the one where a malformed body actually reaches the
+extractor. Both now route through `AppError`, so the shape, the `code` vocabulary and the
+`request_id` come from the one place that defines them.
+
+The extractor's own detail text is deliberately **not** echoed into `message`: on
+`/auth/exchange` the body being parsed is a PocketBase token, and `InvalidRequest` sends
+its string to the client verbatim.
+
 ```json
 {
   "error": {

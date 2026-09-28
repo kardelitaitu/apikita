@@ -420,7 +420,6 @@ pub async fn list_accounts(
     .into_response())
 }
 
-
 /// Query parameters for the global recent-actions read.
 #[derive(Debug, Deserialize)]
 pub struct AdminRecentAuditQuery {
@@ -576,8 +575,6 @@ pub async fn get_account_audit(
 
     Ok(Json(json!({ "entries": entries, "limit": limit })).into_response())
 }
-
-
 
 /// POST /api/admin/accounts/{id}/suspend - the security-critical action.
 ///
@@ -2014,9 +2011,9 @@ mod tests {
             exchange_token(
                 State(pool.clone()),
                 HeaderMap::new(),
-                Json(AuthExchangeRequest {
+                Ok(Json(AuthExchangeRequest {
                     pb_token: pb_token.clone(),
-                }),
+                })),
             )
             .await,
         )
@@ -2074,7 +2071,12 @@ mod tests {
         let (status, _) = render(list_accounts(
             State(state.clone()),
             HeaderMap::new(),
-            Query(AdminListQuery { q: None, status: None, limit: None, offset: None }),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: None,
+                offset: None,
+            }),
         ))
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -2084,7 +2086,12 @@ mod tests {
         let (status, body) = render(list_accounts(
             State(state.clone()),
             outsider_headers,
-            Query(AdminListQuery { q: None, status: None, limit: None, offset: None }),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: None,
+                offset: None,
+            }),
         ))
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
@@ -2096,7 +2103,12 @@ mod tests {
         let (status, _) = render(list_accounts(
             State(state.clone()),
             operator_headers,
-            Query(AdminListQuery { q: None, status: None, limit: None, offset: None }),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: None,
+                offset: None,
+            }),
         ))
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -2120,18 +2132,32 @@ mod tests {
         let (status, body) = render(list_accounts(
             State(state.clone()),
             operator_headers,
-            Query(AdminListQuery { q: Some(customer.hyphenated().to_string()), status: None, limit: None, offset: None }),
+            Query(AdminListQuery {
+                q: Some(customer.hyphenated().to_string()),
+                status: None,
+                limit: None,
+                offset: None,
+            }),
         ))
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         let accounts = body["accounts"].as_array().expect("accounts is an array");
-        assert_eq!(accounts.len(), 1, "the id filter must select exactly one row");
+        assert_eq!(
+            accounts.len(),
+            1,
+            "the id filter must select exactly one row"
+        );
         let row = &accounts[0];
 
         // The exact field set. A new field here would have to be justified
         // against docs/admin-surface.md:158-166.
-        let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
@@ -2152,7 +2178,10 @@ mod tests {
         // names, so a future SELECT * could not sneak one through unnoticed.
         let text = body.to_string();
         for forbidden in ["token_hash", "key_hash", "pb_user_id", "snap_token"] {
-            assert!(!text.contains(forbidden), "the listing leaked {forbidden}: {text}");
+            assert!(
+                !text.contains(forbidden),
+                "the listing leaked {forbidden}: {text}"
+            );
         }
 
         assert_no_drift(&pool, &[operator, customer]).await;
@@ -2188,7 +2217,12 @@ mod tests {
         let (_, body) = render(list_accounts(
             State(state.clone()),
             operator_headers.clone(),
-            Query(AdminListQuery { q: None, status: None, limit: Some(100), offset: None }),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(100),
+                offset: None,
+            }),
         ))
         .await;
         let all = body["accounts"].as_array().unwrap();
@@ -2198,7 +2232,12 @@ mod tests {
         let (_, body) = render(list_accounts(
             State(state.clone()),
             operator_headers.clone(),
-            Query(AdminListQuery { q: None, status: Some("suspended".into()), limit: None, offset: None }),
+            Query(AdminListQuery {
+                q: None,
+                status: Some("suspended".into()),
+                limit: None,
+                offset: None,
+            }),
         ))
         .await;
         let only = body["accounts"].as_array().unwrap();
@@ -2210,11 +2249,20 @@ mod tests {
         let (_, body) = render(list_accounts(
             State(state.clone()),
             operator_headers.clone(),
-            Query(AdminListQuery { q: Some(active.hyphenated().to_string()), status: None, limit: None, offset: None }),
+            Query(AdminListQuery {
+                q: Some(active.hyphenated().to_string()),
+                status: None,
+                limit: None,
+                offset: None,
+            }),
         ))
         .await;
         let matched = body["accounts"].as_array().unwrap();
-        assert_eq!(matched.len(), 1, "the id filter selects one account: {body}");
+        assert_eq!(
+            matched.len(),
+            1,
+            "the id filter selects one account: {body}"
+        );
         assert_eq!(matched[0]["account_id"], json!(active));
 
         // A status value outside the vocabulary matches nothing, and is not an
@@ -2222,7 +2270,12 @@ mod tests {
         let (status, body) = render(list_accounts(
             State(state.clone()),
             operator_headers.clone(),
-            Query(AdminListQuery { q: None, status: Some("nonsense".into()), limit: None, offset: None }),
+            Query(AdminListQuery {
+                q: None,
+                status: Some("nonsense".into()),
+                limit: None,
+                offset: None,
+            }),
         ))
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -2247,7 +2300,12 @@ mod tests {
         let (status, body) = render(list_accounts(
             State(state.clone()),
             operator_headers,
-            Query(AdminListQuery { q: Some("%".into()), status: None, limit: None, offset: None }),
+            Query(AdminListQuery {
+                q: Some("%".into()),
+                status: None,
+                limit: None,
+                offset: None,
+            }),
         ))
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -2278,7 +2336,12 @@ mod tests {
         let (_, body) = render(list_accounts(
             State(state.clone()),
             operator_headers.clone(),
-            Query(AdminListQuery { q: None, status: None, limit: Some(0), offset: None }),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(0),
+                offset: None,
+            }),
         ))
         .await;
         assert_eq!(body["limit"], json!(1), "limit is clamped up: {body}");
@@ -2288,7 +2351,12 @@ mod tests {
         let (_, body) = render(list_accounts(
             State(state.clone()),
             operator_headers.clone(),
-            Query(AdminListQuery { q: None, status: None, limit: Some(10_000), offset: None }),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(10_000),
+                offset: None,
+            }),
         ))
         .await;
         assert_eq!(body["limit"], json!(100), "limit is clamped down: {body}");
@@ -2297,7 +2365,12 @@ mod tests {
         let (_, body) = render(list_accounts(
             State(state.clone()),
             operator_headers.clone(),
-            Query(AdminListQuery { q: None, status: None, limit: Some(100), offset: Some(1) }),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(100),
+                offset: Some(1),
+            }),
         ))
         .await;
         assert_eq!(body["offset"], json!(1));
@@ -2307,7 +2380,12 @@ mod tests {
         let (_, body) = render(list_accounts(
             State(state.clone()),
             operator_headers,
-            Query(AdminListQuery { q: None, status: None, limit: Some(100), offset: Some(-5) }),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(100),
+                offset: Some(-5),
+            }),
         ))
         .await;
         assert_eq!(body["offset"], json!(0));
@@ -2425,7 +2503,11 @@ mod tests {
             Query(AdminAuditQuery { limit: None }),
         ))
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "an operator may not read their own audit here");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an operator may not read their own audit here"
+        );
 
         assert_no_drift(&pool, &[operator, outsider, victim]).await;
         db.close().await;
@@ -2449,7 +2531,11 @@ mod tests {
         ))
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert_eq!(body["entries"].as_array().unwrap().len(), 0, "a fresh account has no trail");
+        assert_eq!(
+            body["entries"].as_array().unwrap().len(),
+            0,
+            "a fresh account has no trail"
+        );
 
         // Suspend then resume through the real handlers, so the rows are the
         // ones production writes.
@@ -2483,21 +2569,40 @@ mod tests {
         // Newest first: resume then suspend.
         assert_eq!(entries[0]["action"], json!("resume"));
         assert_eq!(entries[0]["target_type"], json!("account"));
-        assert_eq!(entries[0]["target_id"], json!(victim.hyphenated().to_string()));
+        assert_eq!(
+            entries[0]["target_id"],
+            json!(victim.hyphenated().to_string())
+        );
         assert_eq!(entries[1]["action"], json!("suspend"));
 
         // The exact field set - never a credential.
-        let mut keys: Vec<&str> = entries[0].as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = entries[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["action", "created_at", "detail", "id", "operator_id", "target_id", "target_type"],
+            [
+                "action",
+                "created_at",
+                "detail",
+                "id",
+                "operator_id",
+                "target_id",
+                "target_type"
+            ],
             "docs/server/api-spec.md: {body}"
         );
         assert_eq!(entries[0]["operator_id"], json!(operator));
         let text = body.to_string();
         for forbidden in ["token_hash", "key_hash", "snap_token"] {
-            assert!(!text.contains(forbidden), "the audit leaked {forbidden}: {text}");
+            assert!(
+                !text.contains(forbidden),
+                "the audit leaked {forbidden}: {text}"
+            );
         }
 
         // The limit is bounded.
@@ -2545,7 +2650,6 @@ mod tests {
         assert_no_drift(&pool, &[operator, victim]).await;
         db.close().await;
     }
-
 
     // -----------------------------------------------------------------------
     // GET /api/admin/audit - the global recent-actions read.
@@ -2598,9 +2702,19 @@ mod tests {
 
         // Two actions on two DIFFERENT accounts, so a target-filtered read would
         // miss one and this test would catch it.
-        let (s, _) = render(suspend_account(State(state.clone()), Path(a), operator_headers.clone())).await;
+        let (s, _) = render(suspend_account(
+            State(state.clone()),
+            Path(a),
+            operator_headers.clone(),
+        ))
+        .await;
         assert_eq!(s, StatusCode::OK);
-        let (s, _) = render(suspend_account(State(state.clone()), Path(b), operator_headers.clone())).await;
+        let (s, _) = render(suspend_account(
+            State(state.clone()),
+            Path(b),
+            operator_headers.clone(),
+        ))
+        .await;
         assert_eq!(s, StatusCode::OK);
 
         let (status, body) = render(list_recent_audit(
@@ -2618,8 +2732,14 @@ mod tests {
             .map(|e| e["target_id"].as_str().unwrap())
             .collect();
         // Both accounts appear; the later suspend (b) is first.
-        assert_eq!(targets.first().copied(), Some(b.hyphenated().to_string().as_str()));
-        assert!(targets.contains(&a.hyphenated().to_string().as_str()), "both accounts must appear: {body}");
+        assert_eq!(
+            targets.first().copied(),
+            Some(b.hyphenated().to_string().as_str())
+        );
+        assert!(
+            targets.contains(&a.hyphenated().to_string().as_str()),
+            "both accounts must appear: {body}"
+        );
 
         // The limit is bounded and echoed.
         let (_, body) = render(list_recent_audit(

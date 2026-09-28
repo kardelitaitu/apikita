@@ -296,6 +296,48 @@ jobs:
           # asserted here: CI has no identity provider, and fixing that status in a test
           # would pin a behaviour the spec does not yet promise.
           check_route 422 POST /auth/exchange
+
+          # EVERY error must be the documented JSON - not just "it refused".
+          #
+          # docs/error-model.md:10 promises "Every error returns the same JSON. No bare HTML
+          # error pages, no empty bodies", with a shape of error.code/message/request_id.
+          # Measured before this step existed, THREE paths returned something else: an
+          # unrouted 404 and the two DESIGNED-NOT-BUILT 404s had EMPTY bodies (axum's default,
+          # because the router had no fallback), and a malformed body on /auth/exchange
+          # returned axum's PLAIN TEXT - on the one auth verb with no credential guard, so the
+          # one where a malformed body actually reaches the extractor.
+          #
+          # The check asserts the SHAPE, which is what the contract is about. The `message`
+          # text may change freely; `code` and `request_id` may not.
+          # CURL FROM THE HOST, not wget from inside the container. BusyBox wget DISCARDS the
+          # body of a non-2xx response and prints "wget: server returned error: HTTP/1.1 404",
+          # so a shape check built on it sees its own client message and can never read an error
+          # body at all - it would fail on every run and report nothing useful. Measured before
+          # choosing: the same requests through curl return the JSON. The port is published
+          # below and curl is preinstalled on ubuntu-latest.
+          err_shape_ok() {
+            # $1 = method, $2 = path, $3 = optional body
+            if [ "$1" = "POST" ]; then
+              out=$(curl -s -X POST -H 'Content-Type: application/json' -d "$3" \
+                "http://127.0.0.1:18080$2" 2>&1)
+            else
+              out=$(curl -s "http://127.0.0.1:18080$2" 2>&1)
+            fi
+            case "$out" in
+              *'"code"'*) ;;
+              *) echo "::error::$1 $2 did not return the documented error shape (no code): $out"; fail=1 ;;
+            esac
+            case "$out" in
+              *'"request_id"'*) ;;
+              *) echo "::error::$1 $2 did not return a request_id: $out"; fail=1 ;;
+            esac
+          }
+          err_shape_ok GET  /definitely-not-a-route ""
+          err_shape_ok GET  /api/reviews ""
+          err_shape_ok GET  /api/me ""
+          err_shape_ok GET  /api/admin/accounts ""
+          err_shape_ok POST /auth/exchange '{}'
+          err_shape_ok POST /auth/exchange '{,}'
           check_route 404 GET  /api/reviews
           check_route 404 POST /api/bot/account
           check_route 404 POST /api/bot/notify-topup

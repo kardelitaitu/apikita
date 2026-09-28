@@ -271,8 +271,28 @@ pub(crate) fn session_cookie(value: String, max_age_days: i64) -> Result<HeaderM
 pub async fn exchange_token(
     State(pool): State<SqlitePool>,
     headers: HeaderMap,
-    Json(payload): Json<AuthExchangeRequest>,
+    // Taken as a Result so a malformed body becomes OUR JSON, not axum's plain-text
+    // extractor rejection. docs/error-model.md:10 promises "every error returns the same
+    // JSON. No bare HTML error pages, no empty bodies", and the codebase already applies
+    // that rule per-handler (account.rs:74-78, admin.rs:280) - this route was the one that
+    // did not, and being the only auth verb with NO credential guard it is the route where
+    // a malformed body actually reaches the extractor. Measured before the fix: a body of
+    // `{}` returned `422 Failed to deserialize the JSON body into the target type: missing
+    // field ...`, which is both the wrong shape AND axum's internal text echoed to a client
+    // that cannot parse it.
+    payload: Result<Json<AuthExchangeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, AppError> {
+    // A FIXED message, deliberately. axum's rejection carries `body_text()`, which for a
+    // deserialization failure names the offending field and value - and on THIS endpoint the
+    // body is a PocketBase token. `AppError::InvalidRequest` sends its string to the client
+    // verbatim (error.rs `client_message`), so echoing the rejection would trade a shape
+    // violation for a credential leak in a response body and in the log. The detail is not
+    // needed: the client learns their JSON was malformed, and the request_id ties the rest to
+    // the server log.
+    let Json(payload) = payload.map_err(|_rejection| {
+        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
+    })?;
+
     if payload.pb_token.trim().is_empty() {
         return Err(AppError::InvalidRequest("pb_token is required".into()));
     }
@@ -892,9 +912,9 @@ mod tests {
         let response = call(exchange_token(
             State(pool.clone()),
             exchange_headers(Some("apikita-test-agent")),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
-            }),
+            })),
         ))
         .await;
 
@@ -983,9 +1003,9 @@ mod tests {
         let first_response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
-            }),
+            })),
         ))
         .await;
         assert_eq!(first_response.status, StatusCode::OK);
@@ -996,9 +1016,9 @@ mod tests {
         let second_response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
-            }),
+            })),
         ))
         .await;
         assert_eq!(second_response.status, StatusCode::OK);
@@ -1073,9 +1093,9 @@ mod tests {
         let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
-            }),
+            })),
         ))
         .await;
 
@@ -1115,9 +1135,9 @@ mod tests {
         let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
-            }),
+            })),
         ))
         .await;
 
@@ -1155,9 +1175,9 @@ mod tests {
         let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "a-dead-token".into(),
-            }),
+            })),
         ))
         .await;
 
@@ -1188,9 +1208,9 @@ mod tests {
         let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "   ".into(),
-            }),
+            })),
         ))
         .await;
 
@@ -1216,9 +1236,9 @@ mod tests {
         let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
-            }),
+            })),
         ))
         .await;
 
@@ -1250,9 +1270,9 @@ mod tests {
         let response = call(exchange_token(
             State(pool.clone()),
             HeaderMap::new(),
-            Json(AuthExchangeRequest {
+            Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
-            }),
+            })),
         ))
         .await;
         assert_eq!(response.status, StatusCode::OK);
