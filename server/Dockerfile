@@ -9,6 +9,13 @@
 # are pure attack surface with no operational benefit - and the image is also
 # ~40x smaller, which is what makes a rollback fast.
 #
+# THE PACKAGE MANAGER HAS TO BE REMOVED EXPLICITLY, which is not obvious from the
+# paragraph above: multi-stage keeps the BUILDER's toolchain out, but it cannot
+# remove what the RUNTIME base itself ships, and debian:bookworm-slim ships apt
+# and dpkg. They were present in this image until W48, so the sentence above was
+# two-thirds true for as long as it existed. There is now a RUN that deletes them
+# and a CI step that fails if they come back - see the comment at that RUN.
+#
 # WHICH BASE, AND WHY BOTH ENDS ARE PINNED. The builder is the official
 # `rust` image at an explicit minor version; the runtime is
 # `debian:bookworm-slim`. Both are pinned rather than `:latest` for the reason
@@ -97,6 +104,32 @@ RUN apt-get update \
 # written by an earlier container is still writable by the next one.
 RUN groupadd --system --gid 10001 apikita \
     && useradd --system --uid 10001 --gid apikita --create-home apikita
+
+
+# THE PACKAGE MANAGER IS REMOVED, because the comment at the top of this file says it
+# should be and it was not.
+#
+# The header claims "a compiler, a package manager and a shell in the final image are pure
+# attack surface with no operational benefit". Measured against the built image, the
+# compilers WERE gone (the multi-stage COPY does that) but `apt`, `apt-get` and `dpkg` were
+# PRESENT - they arrive with `debian:bookworm-slim`, and the only apt-get in this file
+# uses them at BUILD time, after which nothing needs them again.
+#
+# WHY IT MATTERS FOR THIS IMAGE SPECIFICALLY. The container holds provider credentials and
+# the money database. A package manager is post-exploitation convenience that needs no
+# network - `dpkg -i` a local payload - and it is also what lets the image be modified from
+# INSIDE. docs/security notes the non-root user below is the primary control; this removes
+# the tooling that would make the next step after a compromise easier.
+#
+# VERIFIED, not assumed: the variant was BUILT AND BOOTED before this line was added. It
+# reaches `healthy`, serves the full route table (200 /health, 401 on every protected route,
+# 404 on unknown and DESIGNED-NOT-BUILT paths), the busybox HEALTHCHECK still works, the CA
+# bundle (3697 lines) and tini both survive, and `apikita-migrate` still runs. Only these
+# binaries are removed, and the image does NOT shrink measurably - 149MB either way.
+# THE BENEFIT IS ATTACK SURFACE, NOT SIZE; claiming both would be dishonest.
+RUN rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache /usr/bin/apt-key \
+    /usr/bin/apt-mark /usr/bin/dpkg /usr/bin/dpkg-deb /usr/bin/dpkg-divert \
+    /usr/bin/dpkg-query /usr/bin/dpkg-split /usr/bin/dpkg-statoverride
 
 # /srv/apikita is the same root .docker/maintenance uses (APP_DIR), so the two
 # images agree about where the repo and the data directory live:

@@ -181,6 +181,24 @@ jobs:
           docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/health \
             | grep -q '"database":"connected"'
 
+          # The runtime image must not carry a PACKAGE MANAGER.
+          #
+          # server/Dockerfile states the rule in its header - "a compiler, a package
+          # manager and a shell in the final image are pure attack surface with no
+          # operational benefit" - and for a long time it was only two-thirds true: the
+          # compilers were gone, but apt/apt-get/dpkg arrive with debian:bookworm-slim and
+          # nothing removed them. The container holds provider credentials and the money
+          # database, and a local `dpkg -i` needs no network.
+          #
+          # This is a REGRESSION GUARD, not a hardening step: the removal is in the
+          # Dockerfile, and this fails if a future base change or apt-get brings them back.
+          for banned in apt apt-get dpkg; do
+            if docker exec apikita-ci-api sh -c "command -v $banned" >/dev/null 2>&1; then
+              echo "::error::the runtime image contains $banned; the Dockerfile header calls a package manager pure attack surface"
+              exit 1
+            fi
+          done
+
           # And it must stay HEALTHY when the upstream providers are unreachable.
           #
           # docs/server/api-spec.md:466-470 states the rule and why: an upstream outage
