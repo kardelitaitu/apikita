@@ -230,12 +230,13 @@ if [ "$HOLDS" -gt 0 ]; then
     printf '%s\n' "$HOLD_ROWS"
 fi
 echo "reconcile: HOLD SWEEP REQUIRED - the drift query above is structurally blind to a stranded"
-echo "reconcile:   hold (debit and missing release are both out of the sum). The authoritative"
-echo "reconcile:   sweep is server/src/bin/hold-sweep.rs; it needs DATABASE_URL, is report-only"
-echo "reconcile:   (never moves money unless --release is passed) and defaults to a 900s bound:"
-echo "reconcile:     DATABASE_URL='<dsn>' cargo run --manifest-path server/Cargo.toml --bin hold-sweep"
-echo "reconcile:   Nothing schedules it yet (no CI workflow, no compose service). Run it, and"
-echo "reconcile:   treat a hold unpaired at two consecutive sweeps as an incident."
+echo "reconcile:   hold (debit and missing release are both out of the sum)."
+echo "reconcile:   This detector RUNS ON A SCHEDULE: the scheduler's run_hold_sweep applies the"
+echo "reconcile:   SAME predicate as server/src/bin/hold-sweep.rs nightly with a 900s bound, and"
+echo "reconcile:   is report-only. Treat a hold unpaired at TWO CONSECUTIVE sweeps as an incident."
+echo "reconcile:   What is NOT automated is the RELEASE - returning money to an account stays a"
+echo "reconcile:   deliberate operator action, never a timer:"
+echo "reconcile:     DATABASE_URL='<dsn>' cargo run --manifest-path server/Cargo.toml --bin hold-sweep --release"
 
 # --- Verdict ----------------------------------------------------------------
 if [ "$ROWS" -gt 0 ]; then

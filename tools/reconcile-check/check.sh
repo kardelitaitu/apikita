@@ -157,6 +157,61 @@ out=$(env DATABASE_URL="sqlite://$WORK/absent.db" RECONCILE_DATABASE_URL="sqlite
     sh "$REPO/tools/reconcile/reconcile.sh" 2>&1); rc=$?
 [ "$rc" -eq 6 ] || fail "a missing database file must exit 6, got $rc"
 
+
+# ---------------------------------------------------------------------------
+# The printed scheduling claim must match what the scheduler actually does.
+# ---------------------------------------------------------------------------
+# WHY THIS IS HERE. reconcile.sh prints a HOLD SWEEP block on EVERY run, and that
+# block used to say "Nothing schedules it yet (no CI workflow, no compose service)".
+# That had been FALSE since the detector was wired, and -- the reason this is a
+# guard and not a one-off fix -- THE CLAIM IS EMITTED BY THE SCHEDULED RUN ITSELF.
+# The nightly log therefore contained, a few lines apart:
+#
+#   maintenance: job hold-sweep: OK - 0 stranded holds older than 900s
+#   reconcile:   Nothing schedules it yet (no CI workflow, no compose service).
+#
+# An operator reading that is told to run by hand a job that just ran, or concludes
+# the automation is broken and stops trusting the lines around it. docs/ and
+# tools/reconcile/README.md both repeated the claim, so code and doc agreed with
+# each other and disagreed with the system.
+#
+# The claim is MECHANICAL, so a check can hold the two together: if the entrypoint
+# wires run_hold_sweep into the nightly job list, no tool may tell the operator it
+# is unscheduled, and vice versa. Neither side is asserted alone -- the assertion is
+# that they AGREE, so it stays true whichever way someone changes it.
+ENTRYPOINT="${ENTRYPOINT:-$REPO/.docker/maintenance/entrypoint.sh}"
+if [ ! -f "$ENTRYPOINT" ]; then
+    fail "cannot find the maintenance entrypoint at $ENTRYPOINT, so the scheduling claim cannot be checked"
+else
+    # What the scheduler does. run_wired_jobs is the nightly sequence.
+    if sed -n '/^run_wired_jobs()/,/^}/p' "$ENTRYPOINT" | grep -q 'run_hold_sweep'; then
+        SCHEDULED=yes
+    else
+        SCHEDULED=no
+    fi
+
+    # What the tool says. Both the script's printed text and its README.
+    CLAIMS_UNSCHEDULED=no
+    for f in "$REPO/tools/reconcile/reconcile.sh" "$REPO/tools/reconcile/README.md"; do
+        if [ -f "$f" ] && grep -qi 'nothing schedules it' "$f"; then
+            CLAIMS_UNSCHEDULED=yes
+        fi
+    done
+
+    if [ "$SCHEDULED" = yes ] && [ "$CLAIMS_UNSCHEDULED" = yes ]; then
+        fail "run_wired_jobs schedules run_hold_sweep, but reconcile.sh/README still tell the operator \"nothing schedules it\" - and that text is printed BY the scheduled run, next to the job's own success line"
+    fi
+    if [ "$SCHEDULED" = no ] && [ "$CLAIMS_UNSCHEDULED" = no ]; then
+        fail "run_wired_jobs does NOT schedule run_hold_sweep, yet reconcile.sh/README no longer say so - the operator would be told the sweep is automatic when it is not"
+    fi
+
+    # Guard the fixture: if the entrypoint were not read at all, SCHEDULED would be
+    # "no" and the second branch above would be the only live one.
+    if ! grep -q 'run_wired_jobs()' "$ENTRYPOINT"; then
+        fail "run_wired_jobs was not found in $ENTRYPOINT - the scheduling claim was not actually compared"
+    fi
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "reconcile-check: the reconciliation gate is BROKEN (see above)" >&2
     exit 1

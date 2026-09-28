@@ -85,12 +85,25 @@ DATABASE_URL='<dsn>' cargo run --manifest-path server/Cargo.toml --bin hold-swee
 
 `hold-sweep` needs `DATABASE_URL` and is **report-only**: it never moves money
 unless you pass `--release`, which is an opt-in operator action with an audit
-trail. Nothing schedules it yet - no CI workflow, no compose service, no reference
-anywhere in `.github/`, `docker-compose.yml` or `server/Dockerfile` (only a
-"NOT WIRED" log line in `.docker/maintenance/entrypoint.sh`). Until it is wired,
-running it is a manual step of this gate, and **a hold still unpaired at two
-consecutive sweeps is an incident**: investigate the release path and credit the
-account if the hold is lost.
+trail.
+
+**The DETECTOR is scheduled; the RELEASE is not, and that split is deliberate.**
+`run_hold_sweep` in `.docker/maintenance/entrypoint.sh` applies the SAME predicate
+as `server/src/bin/hold-sweep.rs` nightly through `sqlite3`, with the same 900s
+bound, and exits non-zero when a hold is over it. `docker-compose.yml` says so
+("hold-sweep RUNS HERE, for real, REPORT-ONLY") and it is reachable as a one-shot
+`hold-sweep` verb. What stays manual is crediting an account back - **silently
+returning money on a timer is the invisible-money anti-pattern this whole gate
+exists to catch.**
+
+So **a hold still unpaired at two consecutive sweeps is an incident**: investigate
+the release path and credit the account if the hold is lost.
+
+*(Correction: this paragraph used to assert the sweep was unscheduled and that the
+entrypoint carried only a "NOT WIRED" line for it. Both were false once the detector
+was wired - and the assertion was PRINTED BY `reconcile.sh` on every scheduled run,
+so the nightly log carried the job's own OK line and the denial a few lines apart.
+Kept as a note rather than deleted so the next reader knows the claim was checked.)*
 
 The bound is `HOLD_MAX_AGE_SECONDS` (default `900`, matching hold-sweep's
 `DEFAULT_MAX_HOLD_AGE_SECONDS`). A younger hold may be a request still in flight,
