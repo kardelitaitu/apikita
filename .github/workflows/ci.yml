@@ -326,6 +326,17 @@ jobs:
       - name: Check the compose deployment definition
         run: sh tools/compose-check/check.sh
 
+      # The backup tool must actually deliver the artifact OFFSITE.
+      #
+      # It had no CI coverage, and running it found a real defect: the offsite hook was
+      # invoked so that a SCRIPT hook received NOTHING while the backup reported
+      # success and exited 0. The one outcome the tool exists to prevent - a backup
+      # that never left the machine - was reachable through the ordinary hook shape.
+      #
+      # It was invisible because the README example used the INLINE form, which worked.
+      - name: Check the backup contract
+        run: sh tools/backup-check/check.sh
+
       - name: Install website dependencies
         working-directory: website
         run: npm ci

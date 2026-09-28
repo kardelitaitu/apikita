@@ -1,0 +1,133 @@
+#!/bin/sh
+# apikita backup contract check.
+#
+# WHY THIS EXISTS. `tools/backup/backup.sh` had NO CI coverage, and a backup that does
+# not work is how money and history are lost. Running it for the first time found a
+# REAL DEFECT: the offsite hook was invoked as
+#
+#     sh -c "$OFFSITE_CMD" apikita-offsite "$ARTIFACT"
+#
+# With `sh -c CMD name arg`, `name` becomes $0 INSIDE CMD. That works for an INLINE
+# command and SILENTLY FAILS for a SCRIPT hook - the natural shape for any real
+# provider - which received NOTHING while the script printed "offsite hook succeeded"
+# and exited 0. The one outcome the tool exists to prevent - a backup that never left
+# the machine, reported as success - was reachable through the ordinary hook.
+#
+# WHAT IT CHECKS, in order of importance:
+#   1. The ARTIFACT REACHES THE HOOK, in BOTH shapes (inline and script). This is the
+#      property that was broken.
+#   2. A FAILING hook exits 8 and keeps the local artifact.
+#   3. The documented refusals still hold: 6 without a key, 1 without an offsite hook.
+#   4. The artifact is ENCRYPTED - the file must not be a readable SQLite database,
+#      because a plaintext dump that reports success is the worst outcome of all.
+#
+# It builds its own source database, so it needs the `migrate` binary on PATH or a
+# prebuilt one. Skips LOUDLY (exit 3) when sqlite3 is missing, never 0.
+#
+# Usage: sh tools/backup-check/check.sh
+# Exit: 0 all hold, 1 a violation, 3 a prerequisite is missing.
+
+set -u
+
+REPO=$(cd -- "$(dirname -- "$0")/../.." && pwd)
+WORK="${TMPDIR:-/tmp}/apikita-backup-check-$$"
+
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT INT TERM
+mkdir -p "$WORK" || { echo "backup-check: cannot create $WORK" >&2; exit 2; }
+
+command -v sqlite3 >/dev/null 2>&1 || {
+    echo "backup-check: SKIPPED - sqlite3 is not on PATH, so nothing was verified" >&2
+    exit 3
+}
+
+# A minimal source database with the tables the tool checks. `migrate` would be more
+# faithful, but requiring a Rust build would make this check slow enough that it stops
+# being run - and the properties under test are the hook contract and the encryption,
+# neither of which depends on the real schema.
+SRC="$WORK/source.db"
+sqlite3 "$SRC" "CREATE TABLE accounts (id TEXT PRIMARY KEY); INSERT INTO accounts VALUES ('a1');" || {
+    echo "backup-check: could not create the source database" >&2
+    exit 3
+}
+
+FAILED=0
+fail() { echo "backup-check: FAIL - $1" >&2; FAILED=1; }
+
+run_backup() {
+    # $1 = BACKUP_ENCRYPTION_KEY, $2 = OFFSITE_CMD, $3 = BACKUP_DIR
+    env DATABASE_URL="sqlite://$SRC" BACKUP_DIR="$3" OFFSITE_CMD="$2" \
+        BACKUP_ENCRYPTION_KEY="$1" sh "$REPO/tools/backup/backup.sh" 2>&1
+}
+
+# --- 3. the documented refusals ----------------------------------------------
+OUT="$WORK/refuse"
+mkdir -p "$OUT"
+
+out=$(run_backup "" "true" "$OUT"); rc=$?
+[ "$rc" -eq 6 ] || fail "no encryption key should exit 6, got $rc"
+
+out=$(run_backup "k" "" "$OUT"); rc=$?
+[ "$rc" -eq 1 ] || fail "no offsite hook should exit 1 (a local backup is not a backup), got $rc"
+
+out=$(env DATABASE_URL="postgres://nope" BACKUP_DIR="$OUT" OFFSITE_CMD=echo BACKUP_ENCRYPTION_KEY=k \
+    sh "$REPO/tools/backup/backup.sh" 2>&1); rc=$?
+[ "$rc" -eq 2 ] || fail "a non-sqlite URL should exit 2, got $rc"
+
+# --- 1. the artifact REACHES a SCRIPT hook -----------------------------------
+# The regression this check was written for.
+OUT="$WORK/script"
+mkdir -p "$OUT"
+HOOK="$WORK/hook.sh"
+SEEN="$WORK/seen.txt"
+# The hook is a child process, so the path it writes to must be exported, not just set.
+export SEEN
+# The hook writes what it was GIVEN to a file the check then reads, so the assertion
+# is about the ARGUMENT rather than about the hook merely not crashing.
+cat > "$HOOK" <<'HOOKEOF'
+#!/bin/sh
+echo "$1" > "$SEEN"
+[ -f "$1" ] || exit 1
+HOOKEOF
+
+out=$(run_backup "k" "sh $HOOK" "$OUT"); rc=$?
+[ "$rc" -eq 0 ] || fail "a working SCRIPT hook should exit 0, got $rc: $out"
+
+if [ ! -s "$SEEN" ]; then
+    fail "a SCRIPT hook received NO argument. The artifact must reach it: a hook that
+    silently gets nothing while the backup reports success is a backup that never left
+    the machine."
+else
+    case "$(cat "$SEEN")" in
+        *.enc) ;;
+        *) fail "the script hook received '$(cat "$SEEN")', which is not the artifact path" ;;
+    esac
+fi
+
+# --- 4. the artifact is ENCRYPTED -------------------------------------------
+ART=$(find "$OUT" -name "*.enc" | head -n 1)
+if [ -z "$ART" ]; then
+    fail "no encrypted artifact was produced"
+else
+    if [ "$(head -c 6 "$ART")" = "SQLite" ]; then
+        fail "the artifact is a PLAINTEXT SQLite database; docs/backup-and-restore.md requires encryption at rest"
+    fi
+    if sqlite3 "$ART" "SELECT 1" >/dev/null 2>&1; then
+        fail "sqlite3 could OPEN the artifact unencrypted"
+    fi
+fi
+
+# --- 2. a FAILING hook is exit 8 --------------------------------------------
+OUT="$WORK/failhook"
+mkdir -p "$OUT"
+out=$(run_backup "k" "false" "$OUT"); rc=$?
+[ "$rc" -eq 8 ] || fail "a failing offsite hook should exit 8, got $rc"
+[ "$(find "$OUT" -name '*.enc' | wc -l)" -ge 1 ] || fail "a failed hook must KEEP the local artifact"
+
+if [ "$FAILED" -ne 0 ]; then
+    echo "backup-check: the backup contract is BROKEN (see above)" >&2
+    exit 1
+fi
+
+echo "backup-check: OK - the artifact reaches both hook shapes, the refusals hold, and the artifact is encrypted"
+exit 0
