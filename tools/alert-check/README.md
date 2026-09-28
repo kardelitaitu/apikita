@@ -47,6 +47,34 @@ The positive direction is asserted too: a *successful* delivery **must** record 
 cooldown. Without it, "no state file was written" would pass on a tool that never writes
 state — a throttle that never engages and pages on every run.
 
+## A cooldown that could not be recorded must not be CLAIMED
+
+The state write was guarded with `|| true`. A state directory that existed while the
+**file** could not be written therefore produced the worst possible report:
+
+```
+alert: DELIVERED 'ledger_drift' via file (key 'ledger_drift', cooldown 900s)
+```
+
+…with nothing on disk. The throttle never engages, so **every run of the check pages
+again** — the exact outcome `ALERT_COOLDOWN_SECONDS` exists to prevent — and the log tells
+an operator the opposite. The `else` branch already warned when the *directory* was
+unwritable; the *file* case was silent, and it is the same fact.
+
+The tool now says so:
+
+```
+alert: warning: cooldown is NOT effective: NOT RECORDED - could not write <path>
+alert:   the alert WAS delivered, but the next run will page again: throttling is OFF
+alert: DELIVERED 'ledger_drift' via file (key 'ledger_drift', cooldown 900s REQUESTED BUT NOT RECORDED)
+```
+
+Exit stays **0**: the alert *was* delivered, so reporting a failure would be wrong. What
+changes is that the run states plainly that throttling is off — an operational condition
+someone has to fix before the next run pages repeatedly.
+
+**A silent absence is debuggable; a false attestation is not.**
+
 ## Mutation-tested
 
 | Mutation | Caught by |
@@ -55,3 +83,4 @@ state — a throttle that never engages and pages on every run.
 | The cooldown recorded **before** delivery | the two-attempt ordering test |
 | The throttle check deleted | the throttled assertion |
 | An unknown alert id no longer rejected | the usage assertion |
+| A failed state write no longer sets the status | the not-recorded assertions |

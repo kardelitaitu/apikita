@@ -107,6 +107,57 @@ else
     [ -f "$ORDER/ledger_drift.last" ] || fail "a SUCCESSFUL delivery did not record a cooldown, so the throttle would never engage and every run would page"
 fi
 
+
+# --- a cooldown that could not be recorded must not be CLAIMED -----------------
+# The state file is written AFTER a successful delivery, and the write was guarded with
+# `|| true`. A state directory that exists while the file cannot be written therefore
+# produced the worst possible report: "DELIVERED ... cooldown 900s" with NO cooldown on
+# disk, so the throttle never engages and every run of the check pages again - the exact
+# outcome ALERT_COOLDOWN_SECONDS exists to prevent, attested to as working.
+#
+# The directory is made WRITABLE and a directory is placed where the FILE belongs, which
+# is the case the else branch at alert.sh:286 cannot see (it only checks the directory).
+BADSTATE="$WORK/badstate"
+rm -rf "$BADSTATE"
+mkdir -p "$BADSTATE/ledger_drift.last"
+out=$(ALERT_COOLDOWN_SECONDS=900 ALERT_STATE_DIR="$BADSTATE" ALERT_SINK_FILE="$WORK/bad.sink" \
+    sh "$REPO/tools/alert/alert.sh" --alert ledger_drift --observed "x" 2>&1)
+rc=$?
+
+# The alert WAS delivered, so this must not become a failure exit. The defect is the MESSAGE.
+if [ "$rc" -ne 0 ]; then
+    fail "a state-write failure must not turn a delivered alert into an error (got exit $rc); the alert reached the channel"
+fi
+
+# The claim to catch is the cooldown being reported as RECORDED. The fixed tool still
+# names the cooldown, because it was REQUESTED - it says so and marks it NOT RECORDED. So
+# matching the bare phrase would fail the honest message too; match the claim instead.
+case "$out" in
+    *"cooldown 900s)"*)
+        fail "the tool claimed a 900s cooldown while the state file was NOT written - the throttle never engages, so every run pages again, and the message tells an operator the opposite" ;;
+esac
+
+# Case-insensitive, because the message capitalises for emphasis ("cooldown is NOT
+# effective") and a pattern that only matched lowercase would fail the very message it is
+# checking for - which is what happened on the first run of this assertion.
+case "$out" in
+    *[Nn][Oo][Tt]" effective"*|*"cooldown is NOT effective"*)
+    : # it said so
+    ;;
+    *)
+        fail "a cooldown that could not be recorded was not reported at all; the run must say the throttle is OFF. Output was: $out" ;;
+esac
+
+# And the honest counterpart: with a WORKING state dir the claim must STILL be made, so the
+# assertions above cannot be satisfied by a tool that never mentions the cooldown at all.
+mkdir -p "$WORK/goodstate"
+out=$(ALERT_COOLDOWN_SECONDS=900 ALERT_STATE_DIR="$WORK/goodstate" ALERT_SINK_FILE="$WORK/good.sink" \
+    sh "$REPO/tools/alert/alert.sh" --alert ledger_drift --observed "x" 2>&1)
+case "$out" in
+    *"cooldown 900s"*) : ;;
+    *) fail "with a writable state dir the tool must still report the cooldown; got: $out" ;;
+esac
+
 if [ "$FAILED" -ne 0 ]; then
     echo "alert-check: the alert delivery contract is BROKEN (see above)" >&2
     exit 1

@@ -280,13 +280,31 @@ fi
 
 # The cooldown is recorded ONLY after the channel accepted the alert. Recording it
 # before would let a failed delivery suppress its own retry for the whole window.
+#
+# A COOLDOWN THAT COULD NOT BE WRITTEN MUST NOT BE CLAIMED. This used to read
+# `date -u +%s > "$STATE_FILE" 2>/dev/null || true`, which swallowed the failure - so a
+# state directory that existed while the FILE could not be written produced
+# "DELIVERED ... cooldown 900s" with nothing on disk. The throttle would never engage,
+# every run of the check would page again, and the log told an operator the opposite. The
+# directory case was already warned about; the file case was not, and it is the same fact.
+#
+# The alert WAS delivered, so this stays exit 0: reporting an undelivered alert would be
+# wrong. What changes is that the run says plainly that throttling is off, because that is
+# an operational condition someone has to fix before the next run pages repeatedly.
+COOLDOWN_STATUS=""
 if [ "$COOLDOWN" -gt 0 ]; then
-    if mkdir -p "$STATE_DIR" 2>/dev/null; then
-        date -u +%s > "$STATE_FILE" 2>/dev/null || true
-    else
-        echo "alert: warning: state dir not writable ($STATE_DIR); cooldown is not effective" >&2
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+        COOLDOWN_STATUS="NOT RECORDED - state dir is not writable ($STATE_DIR)"
+    elif ! date -u +%s > "$STATE_FILE" 2>/dev/null; then
+        COOLDOWN_STATUS="NOT RECORDED - could not write $STATE_FILE"
     fi
 fi
 
-echo "alert: DELIVERED '$ALERT_ID' via $CHANNEL (key '$DEDUP_KEY', cooldown ${COOLDOWN}s)"
+if [ -n "$COOLDOWN_STATUS" ]; then
+    echo "alert: warning: cooldown is NOT effective: $COOLDOWN_STATUS" >&2
+    echo "alert:   the alert WAS delivered, but the next run will page again: throttling is OFF" >&2
+    echo "alert: DELIVERED '$ALERT_ID' via $CHANNEL (key '$DEDUP_KEY', cooldown ${COOLDOWN}s REQUESTED BUT NOT RECORDED)"
+else
+    echo "alert: DELIVERED '$ALERT_ID' via $CHANNEL (key '$DEDUP_KEY', cooldown ${COOLDOWN}s)"
+fi
 exit 0
