@@ -3,14 +3,24 @@
 
 Two jobs, in this order:
 
-  1. DRIFT CHECK. Apply the plan's Appendix A and the shipped migration to separate
-     in-memory databases and compare the objects each creates (tables, indexes, and
-     their SQL normalised for comments and whitespace). If the plan and the schema
-     disagree, the plan is a lie about the database, which is worse than no plan.
+  1. DRIFT CHECK, scoped to the INITIAL migration. Apply the plan's Appendix A and
+     `20260925000000_initial_schema.sql` to separate in-memory databases and compare the
+     objects each creates (tables, indexes, and their SQL normalised for comments and
+     whitespace). If the plan and the schema disagree, the plan is a lie about the
+     database, which is worse than no plan.
 
-  2. INVARIANTS. Apply the shipped migration for real and exercise every claim the
-     schema is supposed to enforce: STRICT type rejection, the money floor, the
-     timestamp format CHECK, the usage_daily NULL-key upsert, and RESTRICT.
+     The scope is deliberate: Appendix A documents the BASE schema, so asserting the
+     additive migrations against it would be wrong. They are covered by job 2 instead.
+
+  2. INVARIANTS, against the result of EVERY migration in order. The claims below -
+     every table STRICT, no REAL/FLOAT/NUMERIC column anywhere, the money floor, the
+     timestamp format CHECK, the usage_daily NULL-key upsert, RESTRICT - are claims about
+     the shipped SCHEMA, and that schema is what all the migrations produce together.
+
+     THIS USED TO READ ONE FILE. The script named `20260925000000_initial_schema.sql`, so
+     the two additive migrations were outside every check in this repository: a new
+     migration could add a non-STRICT table or a float column and pass CI silently. A
+     mutation that did exactly that now fails two checks, where before it failed none.
 
 Tracked rather than scratch: the plan cites these results as evidence, and a probe
 nobody can run proves nothing (AGENTS.md rule 1 allows `.agents/` scratch, but that
@@ -130,9 +140,37 @@ print("\n  no drift: the plan's Appendix A and the shipped migration are equival
 # 2. Invariants, against the shipped migration
 # ---------------------------------------------------------------------------
 
+# ALL MIGRATIONS, IN ORDER - not just the first.
+#
+# The drift check above is deliberately scoped to the INITIAL schema: the plan's Appendix A
+# documents the base schema, and asserting the additive migrations against it would be wrong.
+# The INVARIANTS below are not scoped that way - "every table is STRICT" and "no REAL/FLOAT
+# column anywhere" are claims about the shipped SCHEMA, and that schema is the result of
+# every migration in sequence.
+#
+# This was a real gap: the file named ONE migration, so `20260926000000_link_redemption_attempts`
+# and `20260927000000_admin_audit_recent_index` were outside every check this repository runs.
+# A new migration could add a non-STRICT table or a float column and pass CI silently.
+MIGRATIONS = sorted(
+    os.path.join(ROOT, "server", "migrations", f)
+    for f in os.listdir(os.path.join(ROOT, "server", "migrations"))
+    if f.endswith(".sql")
+)
+if not MIGRATIONS:
+    sys.exit("FAIL: no migrations found")
+
 con = sqlite3.connect(":memory:")
 con.execute("PRAGMA foreign_keys = ON")
-con.executescript(migration_sql)
+for path in MIGRATIONS:
+    try:
+        con.executescript(io.open(path, encoding="utf-8").read())
+    except sqlite3.Error as exc:
+        sys.exit(f"FAIL: {os.path.basename(path)} did not apply: {exc}")
+
+print()
+print(f"applied {len(MIGRATIONS)} migration(s) in order:")
+for path in MIGRATIONS:
+    print(f"  {os.path.basename(path)}")
 
 tables = [r[0] for r in con.execute(
     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
@@ -159,9 +197,18 @@ def expect(name, sql, args, should_pass):
     results.append((ok, name, detail))
 
 
-results.append((len(tables) == 17, "the schema has 17 tables", f"{len(tables)}: {', '.join(tables)}"))
+# A FLOOR, not an exact count. The count used to be pinned at 17, which was the
+# number of tables in the FIRST migration - so extending this script to apply every
+# migration made the assertion fail on the correct schema (18). Pinning the total
+# again would mean every additive migration has to edit this line, and the point of
+# the check is to catch a migration that skips the CONVENTIONS, not to ratify a number.
+#
+# What matters is that the schema was read at all: a floor stops the probes below
+# passing over an empty or truncated schema, which is the W38/W41/W43 failure.
+results.append((len(tables) >= 17, "the schema has at least 17 tables",
+                f"{len(tables)}: {', '.join(tables)}"))
 results.append((not not_strict, "every table is declared STRICT",
-                "all 17" if not not_strict else f"missing on: {not_strict}"))
+                f"all {len(tables)}" if not not_strict else f"missing on: {not_strict}"))
 
 # No money or token column may be REAL — STRICT would reject the type name, but
 # assert the *intent* too so a future non-STRICT table cannot slip through.
