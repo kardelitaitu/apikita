@@ -49,8 +49,9 @@ upstream socket, not computing. That has direct sizing consequences:
   streaming connections cost kilobytes each, not megabytes.
 
 - **Memory does not scale with request size.** Responses are streamed, not
-  buffered. The whitepaper's zero-copy passthrough is the reason a small box can
-  serve large completions.
+  buffered (`server/src/upstream/client.rs`: the body is "never buffered whole").
+  That passthrough is the reason a small box can serve large completions — the
+  retired whitepaper proposed it, the code is what guarantees it.
 
 - **The database is off the hot path.** API key metadata is cached with a <=60s
   TTL, so a request does not touch the database. Without that cache, the database

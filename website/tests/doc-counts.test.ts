@@ -31,10 +31,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const read = (p: string) => readFileSync(join(root, p), 'utf8');
 
 /** The website suite's own count, as the runner just reported it. */
-const WEBSITE_TESTS = 163;
+const WEBSITE_TESTS = 162;
 
 /** The measured server count. Update WITH the run that changes it. */
-const SERVER_TESTS = 443;
+const SERVER_TESTS = 444;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -73,7 +73,7 @@ test('no doc still claims a superseded count', () => {
   // reappear only by someone updating the constants above AND the docs - which is
   // the deliberate two-file change this is meant to force.
   const superseded = [
-    '391 tests', '161 tests', '160 tests', '157 tests', '146 tests',
+    '391 tests', '163 tests', '161 tests', '160 tests', '157 tests', '146 tests',
     '338 passed', '134 passed',
   ];
   for (const stale of superseded) {

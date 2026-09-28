@@ -3,9 +3,10 @@
 The Rust API and routing proxy. **This is the entire backend.**
 
 **Responsibility:** auth exchange, wallet, API keys and limits, Midtrans webhook,
-SSE live updates, and the LLM proxy — plus the reverse-proxy behaviour from the
-whitepaper (endpoint resolution, streaming passthrough, wallet reservation,
-usage settlement).
+SSE live updates, and the LLM proxy — plus the reverse-proxy behaviour the retired
+whitepaper first sketched (endpoint resolution, streaming passthrough, wallet
+reservation, usage settlement). The code, not that document, defines what they do
+now: see [`docs/architecture.md`](../docs/architecture.md).
 
 **Not this folder:** the customer-facing UI (see [`website/`](../website/README.md))
 and operator alerts (see [`telegram/`](../telegram/README.md)).
@@ -31,7 +32,7 @@ leaked session cannot spend money.
 
 ## Status
 
-**Implemented and green.** `cargo test --lib` → **443 passed / 0 failed / 0 ignored**
+**Implemented and green.** `cargo test --lib` → **444 passed / 0 failed / 0 ignored**
 (measured 2026-09-27),
 against a migrated temp SQLite file per test (`src/test_support.rs`) — no database
 server to start and no `DATABASE_URL` needed. Nothing is `#[ignore]`d any more: the

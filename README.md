@@ -99,7 +99,7 @@ suppliers is what makes the cost basis durable and the moat real.
 ## Status
 
 **Built locally; nothing deployed.** The server and website exist and pass their
-suites (server: **443 tests** — website: **163 tests**), but no environment is live
+suites (server: **444 tests** — website: **162 tests**), but no environment is live
 and no customer has been served. The operational gates in
 [`docs/launch-checklist.md`](docs/launch-checklist.md) — Gate 0 (legal) first —
 must clear before taking money.
@@ -139,12 +139,15 @@ Push to `main` deploys. The reasoning and the tradeoffs:
 | [`docs/cost-and-sizing.md`](docs/cost-and-sizing.md) | What it costs; where the money actually goes |
 | [`docs/failover.md`](docs/failover.md) | Multi-provider failover, circuit breaking, key pools |
 | [`docs/server/api-spec.md`](docs/server/api-spec.md) | Every endpoint, auth scheme, enforcement order |
-| [`docs/whitepaper.md`](docs/whitepaper.md) | The **original** design — partly superseded |
+| [`docs/whitepaper.md`](docs/whitepaper.md) | The original whitepaper — **retired**, kept as a record of what it got wrong |
 | [`tools/README.md`](tools/README.md) | **The verification tools** — what checks the money, the data and the delivery |
 
-The whitepaper is the original design; parts have since been corrected (notably its
-pricing figures were ~2.5x too low, and the stack changed). Where it disagrees with
-[`docs/architecture.md`](docs/architecture.md) and the business docs, they win.
+**The whitepaper is retired, not authoritative.** It described an architecture that
+was never built (Redis, a Postgres document store, hot-reloaded config, weighted
+load balancing, mid-stream cuts) and its prices were 2.43x too low. It is kept only
+as a record of the founding thesis and of what it got wrong. For anything current,
+read [`docs/architecture.md`](docs/architecture.md) and
+[`docs/business/`](docs/business/README.md) — they win.
 
 ## Secrets
 

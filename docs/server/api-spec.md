@@ -485,7 +485,8 @@ the wallet before the allowlist leaks the existence of models a key may not use.
 **On balance exhaustion, prefer rejecting at pre-flight over cutting mid-stream.**
 With non-refundable funds, a truncated answer is the most likely source of a
 delivery dispute. Let an in-flight request finish, then refuse the next one.
-(This contradicts the whitepaper's Phase 2 — the whitepaper is wrong here, see
+(This contradicts the **retired** whitepaper's Phase 2, which cut streams
+mid-answer — the whitepaper was wrong here, see
 [`docs/business/05-risk.md`](../business/05-risk.md) R1.)
 
 **The balance never goes negative — "let it finish" does NOT mean overdraft.**

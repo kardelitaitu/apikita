@@ -1,17 +1,19 @@
 # Upstream Failover & Circuit Breaking
 
-How the proxy behaves when an upstream provider degrades. The whitepaper promises
-"traffic seamlessly shifts to secondary fallback channels instantly" but does not
-specify it — **and that promise is not currently achievable** (see
-[The problem with the whitepaper's promise](#the-problem-with-the-whitepapers-promise)).
+How the proxy behaves when an upstream provider degrades. The retired whitepaper
+promised "traffic seamlessly shifts to secondary fallback channels instantly" but
+never specified it — **and that promise is not achievable today** (see
+[What failover actually is](#what-failover-actually-is)).
 
 > Config: [`config/apikita.toml`](../config/apikita.toml)
 > API surface: [`docs/server/api-spec.md`](server/api-spec.md)
 
-## The problem with the whitepaper's promise
+## What failover actually is
 
-The whitepaper (section 4.3) describes automatic failover across endpoints after
->3 consecutive 5xx errors. Two realities break the simple version:
+The retired whitepaper (§4.3) described automatic failover across endpoints after
+">3" consecutive 5xx errors — wrong twice over: it trips **at 3**
+(`failure_threshold = 3`, compared `>=`), and endpoint order is **config order**,
+not a weighted or randomized choice. Two realities still break the simple version:
 
 1. **There is currently one permitted provider.** Every endpoint in the config
    shares the same upstream company, so there is nothing to fail over *to*. Three
