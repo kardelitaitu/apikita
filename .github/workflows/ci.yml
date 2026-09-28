@@ -92,6 +92,21 @@ jobs:
           rm -f ci-schema-check.db ci-schema-check.db-wal ci-schema-check.db-shm
           cargo run --bin migrate
 
+# Schema DRIFT, not just applicability. The step above proves the migrations APPLY;
+      # this proves the shipped schema still matches the plan's Appendix A - "the plan is a
+      # lie about the database, which is worse than no plan" - and then runs 32 INVARIANT
+      # probes against the shipped migration: every table STRICT, no REAL/FLOAT column, the
+      # CHECK constraints actually refusing bad rows, FK and RESTRICT behaviour.
+      #
+      # It had never run in CI. docs/ci-cd.md:372 asked the question outright - "Whether the
+      # schema-drift check runs as a CI step or stays a local probe ... no workflow step
+      # invokes it yet". Answering it found the file had been FAILING: the plan was missing
+      # the `topups.rail` column, and because the drift check exits before the invariants,
+      # those 32 probes had never run anywhere. A red first half was hiding a whole second
+      # half.
+      - name: Validate the schema against the plan
+        run: python3 tools/sqlite-probes/validate-migration-schema.py
+
       # There is no second, `#[ignore]`d database tier any more. The database is a
       # file, so `server/src/test_support.rs` gives every database test its own
       # migrated temp database and the whole suite runs with no service container

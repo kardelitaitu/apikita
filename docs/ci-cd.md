@@ -369,7 +369,13 @@ Keep the free tier in mind when choosing a provider — see
 - [x] CI provider: **GitHub Actions** — [`decisions.md`](decisions.md).
 - [ ] Whether a staging environment exists, or CI deploys straight to production.
 - [x] Migration tooling: **sqlx migrate** — [`decisions.md`](decisions.md).
-- [ ] Whether the schema-drift check runs as a CI step or stays a local probe —
-  `tools/sqlite-probes/validate-migration-schema.py` exists and parses the
-  migration, but no workflow step invokes it yet.
+- [x] Whether the schema-drift check runs as a CI step or stays a local probe —
+  **it runs as a CI step** (`Validate the schema against the plan`, immediately after
+  the migrations-applied step). The answer for a money system is yes: the checker
+  compares the plan's Appendix A with the shipped migration AND runs 32 invariant
+  probes (every table STRICT, no REAL/FLOAT column, the CHECK constraints actually
+  refusing bad rows, FK and RESTRICT behaviour). Answering the question was worth it
+  on its own: the file had been **failing**, the plan was missing `topups.rail`, and
+  because the drift check exits before the invariants, those 32 probes had never run
+  anywhere — a red first half was hiding a whole second half.
 - [ ] Cache configuration for build times.

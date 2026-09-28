@@ -90,6 +90,30 @@ for kind in sorted(set(a_objs) | set(m_objs)):
         drift.append(f"{kind} {n}: in the migration but not in the plan")
     for n in differs:
         drift.append(f"{kind} {n}: definitions differ")
+        # SHOW THE DIFFERENCE. "definitions differ" alone says something is wrong and nothing
+        # about what, leaving the operator to reverse-engineer it by hand - which is what I did
+        # to find a missing `rail` column, and it is not work a checker should export.
+        #
+        # The SQL is NORMALISED to one line before comparison, so line numbers would be
+        # meaningless (every difference reports as "line 1"). Report the first differing
+        # TOKEN instead, with a little context either side: that is readable whether the
+        # normalised or the original form is in front of you.
+        a_tokens, m_tokens = a[n].split(), m[n].split()
+        for i in range(min(len(a_tokens), len(m_tokens))):
+            if a_tokens[i] != m_tokens[i]:
+                context = 6
+                a_ctx = " ".join(a_tokens[max(0, i - context):i + context])
+                m_ctx = " ".join(m_tokens[max(0, i - context):i + context])
+                drift.append(f"    first difference at token {i} (column {i + 1}):")
+                drift.append(f"      plan      ... {a_ctx} ...")
+                drift.append(f"      migration ... {m_ctx} ...")
+                break
+        else:
+            # One is a prefix of the other: the extra tail is the difference.
+            longer, label = ((a_tokens, "plan"), (m_tokens, "migration"))[
+                len(m_tokens) > len(a_tokens)]
+            i = min(len(a_tokens), len(m_tokens))
+            drift.append(f"    only in the {label}: {' '.join(longer[i:])}")
     print(f"  {kind:6} plan={len(a):2}  migration={len(m):2}  "
           f"{'OK' if not (only_a or only_m or differs) else 'DRIFT'}")
 
@@ -257,12 +281,20 @@ expect("FK: a key referencing a ghost account is refused",
        ("k9", "ghost", "h9", "apk_y", TS), False)
 expect("RESTRICT: hard-deleting a funded account is refused",
        "DELETE FROM accounts WHERE id = ?", ("a1",), False)
+# `rail` is supplied on BOTH inserts, and that is load-bearing rather than tidiness.
+# These two checks are a PAIR: the first proves a top-up can be written, the second proves a
+# duplicate order_id cannot. Omit `rail` and the column's NOT NULL refuses BOTH rows - so the
+# first check fails, and the second PASSES FOR THE WRONG REASON, on a constraint that has
+# nothing to do with uniqueness. It would still pass with the UNIQUE on order_id deleted.
+# That is the shape of a vacuous test: green because something else failed first.
 expect("topups order_id uniqueness enforced",
-       "INSERT INTO topups (id, account_id, amount_idr, order_id, created_at) VALUES (?,?,?,?,?)",
-       ("t1", "a1", 50000, "ORD-1", TS), True)
+       "INSERT INTO topups (id, account_id, amount_idr, order_id, rail, created_at) "
+       "VALUES (?,?,?,?,?,?)",
+       ("t1", "a1", 50000, "ORD-1", "midtrans", TS), True)
 expect("topups duplicate order_id refused",
-       "INSERT INTO topups (id, account_id, amount_idr, order_id, created_at) VALUES (?,?,?,?,?)",
-       ("t2", "a1", 50000, "ORD-1", TS), False)
+       "INSERT INTO topups (id, account_id, amount_idr, order_id, rail, created_at) "
+       "VALUES (?,?,?,?,?,?)",
+       ("t2", "a1", 50000, "ORD-1", "midtrans", TS), False)
 
 # RESTRICT: a key with billing history cannot be hard-deleted (section 4.10).
 expect("RESTRICT: deleting a key with usage_daily history is refused",
