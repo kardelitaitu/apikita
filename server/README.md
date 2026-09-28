@@ -31,7 +31,7 @@ leaked session cannot spend money.
 
 ## Status
 
-**Implemented and green.** `cargo test --lib` → **338 passed / 0 failed / 0 ignored**
+**Implemented and green.** `cargo test --lib` → **427 passed / 0 failed / 0 ignored**
 (measured 2026-09-27),
 against a migrated temp SQLite file per test (`src/test_support.rs`) — no database
 server to start and no `DATABASE_URL` needed. Nothing is `#[ignore]`d any more: the
