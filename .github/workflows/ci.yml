@@ -389,6 +389,15 @@ jobs:
       - name: Check the alert delivery contract
         run: sh tools/alert-check/check.sh
 
+      # The CI document must describe the pipeline that actually runs.
+      #
+      # docs/ci-cd.md listed TEN stages while the workflow ran TWENTY-SIX: the seven
+      # tool-contract checks above were absent from the one document a reader consults to
+      # answer "what will stop my PR?". An understated pipeline teaches people to work
+      # around CI, so the table is checked rather than trusted.
+      - name: Check the CI documentation
+        run: sh tools/ci-docs-check/check.sh
+
       - name: Install website dependencies
         working-directory: website
         run: npm ci

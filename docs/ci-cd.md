@@ -20,18 +20,70 @@ pipeline itself.
 
 ### On every pull request
 
-| Stage | Purpose | Blocks merge |
+**Every stage below blocks the merge.** The workflow is the source of truth, and a
+test (`tools/ci-docs-check/`) fails if a step exists that this document does not name
+— which is what keeps it true. The list was a third short before that check existed.
+
+Four steps **prepare a toolchain and assert nothing**, so they are not stages: a
+failure in one is a broken runner rather than a defect in the change. They are listed
+anyway, so the check below can demand an exact match:
+
+| Setup step | Provides |
+| --- | --- |
+| Install Rust (rustfmt + clippy) | The toolchain the format and lint stages need |
+| Install Node | The toolchain the website stages need |
+| Install cargo-audit | The dependency-audit binary |
+| Install website dependencies | `node_modules` |
+
+#### Correctness of the code
+
+| Stage | Purpose |
+| --- | --- |
+| Format check | `cargo fmt --check` |
+| Lint | `cargo clippy -- -D warnings` |
+| **Dependency audit** | Known CVEs in the lockfile |
+| Build | `cargo build` |
+| Unit tests | Pure logic |
+| **Integration tests** | A real database (bundled SQLite), real schema, fake upstream |
+
+#### Correctness of the DATABASE
+
+| Stage | Purpose |
+| --- | --- |
+| Apply migrations to an empty database | Migrations apply cleanly, in order, to a database that is empty *literally* (deleted first) |
+| Validate the schema against the plan | The shipped schema still matches the plan's Appendix A, **and** 32 invariant probes pass against it |
+
+#### The deployable artifacts actually work
+
+| Stage | Purpose |
+| --- | --- |
+| Build the server image | The deployable artifact builds |
+| Smoke the server image against a migrated database | It serves a real request against a real schema |
+| Smoke the maintenance scheduler image | The nightly jobs run for real in the image that ships |
+| Typecheck (website) | `tsc --noEmit` |
+| Website contract tests | The frontend's own suites |
+| Build website | Every page builds |
+
+#### The contracts that fail SILENTLY
+
+These seven are CI stages rather than local scripts because each guards a failure that
+produces **no error**: the thing looks like it works and does not. A local script only
+helps someone who already suspects a problem.
+
+| Stage | Guards against | Silently wrong because |
 | --- | --- | --- |
-| Format check | `cargo fmt --check` | Yes |
-| Lint | `cargo clippy -- -D warnings` | Yes |
-| **Dependency audit** | Known CVEs in the lockfile | **Yes** |
-| Build | `cargo build` | Yes |
-| Unit tests | Pure logic | Yes |
-| **Integration tests** | A real database (bundled SQLite), real schema, fake upstream | **Yes** |
-| Schema check | Migrations apply cleanly to an empty database | Yes |
-| **Server image build + smoke** | The deployable artifact builds AND serves | **Yes** |
-| Website typecheck / tests / build | The frontend toolchain | Yes |
-| Secret scan | No key or token committed | Yes |
+| Check the edge relay streams SSE | A buffering relay | The UI answers 200 and stops updating |
+| Check the compose deployment definition | A definition that parses but is wrong | `working_dir` silently misresolves the money gate's DSN |
+| Check the backup contract | An offsite hook that copies nothing | The script prints "hook succeeded" and exits 0 |
+| Check the reconciliation gate | A money gate that cannot fail | A drift check that never runs still looks like a green tick |
+| Check the restore drill | Deletion of a live-looking target | Teardown deletes whatever it was pointed at |
+| Check the alert delivery contract | A failed delivery that silences its own retry | Alerts stop arriving and nothing says so |
+| **Check the CI documentation** | This table going stale | An understated pipeline sends people around CI |
+| Secret scan | A committed key, and an inlined `PUBLIC_*` secret | The value ships to every visitor |
+
+Each has a README beside it in `tools/` explaining what it asserts and which mutations it
+was tested against.
+
 
 **The dependency audit is the only stage that looks outside the repository.** Every
 other check can pass unchanged while a crate this project depends on is found to
