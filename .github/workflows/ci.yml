@@ -181,6 +181,21 @@ jobs:
           docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/health \
             | grep -q '"database":"connected"'
 
+          # And it must stay HEALTHY when the upstream providers are unreachable.
+          #
+          # docs/server/api-spec.md:466-470 states the rule and why: an upstream outage
+          # must not look like a dead server and trigger a restart loop. The CI container
+          # has no route to any provider either, so this is the real condition rather than
+          # a simulation - and the assertion is that a green health is the CORRECT answer
+          # here, not a symptom.
+          #
+          # The opposite direction (a broken database must report degraded) is covered by
+          # a unit test with an unreachable pool, health.rs:266, including a leak list.
+          # This step is the container-level half that a unit test cannot reach.
+          docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/health \
+            | grep -q '"status":"healthy"' \
+            || { echo "::error::health is not healthy with no upstream reachable - an upstream outage must not read as a dead server"; exit 1; }
+
           # And the route table it serves must be the one we documented.
           #
           # The health poll above proves ONE endpoint. This proves the rest: every
