@@ -755,7 +755,12 @@ mod tests {
         let counter = crate::error::ServerErrorCounter::default();
 
         // Healthy: an EMPTY list, not a missing key, so a consumer can always index it.
-        let payload = metrics_payload(&counter, &[], &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+        let payload = metrics_payload(
+            &counter,
+            &[],
+            &Default::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        );
         assert_eq!(
             payload["unhealthy_models"],
             json!([]),
@@ -767,13 +772,23 @@ mod tests {
             "deepseek-v4-flash".to_string(),
             "deepseek-v4-pro".to_string(),
         ];
-        let payload = metrics_payload(&counter, &down, &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+        let payload = metrics_payload(
+            &counter,
+            &down,
+            &Default::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        );
         assert_eq!(payload["unhealthy_models"], json!(down));
     }
     #[test]
     fn the_routes_payload_reports_unknown_rather_than_a_healthy_zero() {
         // An EMPTY counter: the fresh-deploy case.
-        let payload = metrics_payload(&crate::error::ServerErrorCounter::default(), &[], &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+        let payload = metrics_payload(
+            &crate::error::ServerErrorCounter::default(),
+            &[],
+            &Default::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        );
 
         assert_eq!(
             payload["server_errors"],
@@ -791,7 +806,12 @@ mod tests {
         // so the two cases are different payloads and the alert can tell them apart.
         let clean = crate::error::ServerErrorCounter::default();
         clean.record_response();
-        let payload = metrics_payload(&clean, &[], &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+        let payload = metrics_payload(
+            &clean,
+            &[],
+            &Default::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        );
         assert_eq!(
             payload["error_rate"],
             json!(0.0),
@@ -809,9 +829,81 @@ mod tests {
             mixed.record_response();
         }
         mixed.record_error();
-        let payload = metrics_payload(&mixed, &[], &Default::default(), chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+        let payload = metrics_payload(
+            &mixed,
+            &[],
+            &Default::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        );
         assert_eq!(payload["server_errors"], json!(1));
         assert_eq!(payload["responses"], json!(4));
         assert_eq!(payload["error_rate"], json!(0.25));
+    }
+    /// A FAILED RETENTION READ IS NOT "RETENTION IS FINE".
+    ///
+    /// The handler deliberately does not fail the whole response when the retention
+    /// query errors - "an operator asking for the counters during an incident should
+    /// still get them". What it returns instead is a SENTINEL (health.rs:187-195):
+    ///
+    ///   "behind" is NULL rather than false, so a consumer can tell retention-is-fine
+    ///   from we-could-not-tell."
+    ///
+    /// NOTHING PINNED THAT DISTINCTION. The healthy path is tested
+    /// (the_retention_report_names_the_tables_that_are_behind) and the failure path
+    /// was not, so a refactor could collapse null to false and every test would stay
+    /// green. That collapse is the dangerous direction: false means fine and null
+    /// means unknown, so a monitoring consumer treating a falsy value the same either
+    /// way would read a BROKEN retention query as a HEALTHY one - a blind spot
+    /// reported as an all-clear, the same shape as the alert cooldown that claimed to
+    /// be in force (W52) and the gate whose failure could not fire (W43).
+    #[tokio::test]
+    async fn a_failed_retention_read_reports_unknown_not_fine() {
+        let db = TestDb::new().await;
+        let token = account_with_session(&db.pool, true).await;
+        let state = metrics_state(db.pool.clone());
+
+        // Force the retention read to fail the way it would in production - a broken
+        // or half-migrated database - rather than by mocking it: retention_lag reads
+        // these tables, so dropping one is the real error.
+        sqlx::query("DROP TABLE usage_events")
+            .execute(&db.pool)
+            .await
+            .expect("the fixture must be able to drop the table the lag query reads");
+
+        let (status, body) = metrics(state, session_cookie(&token)).await;
+
+        // Still a 200: the operator asked for counters during an incident and gets
+        // them. Failing the request would hide the counters exactly when they matter.
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a failed retention read must not fail the whole metrics response: {body}"
+        );
+
+        // THE SENTINEL. null and not false: the first says we could not tell, the
+        // second says retention is fine, and only one of those is true here.
+        assert!(
+            body["retention"]["behind"].is_null(),
+            "a failed retention read must report behind as null (unknown), NOT false (fine) - got {:?} in {body}",
+            body["retention"]["behind"]
+        );
+        assert_ne!(
+            body["retention"]["behind"],
+            serde_json::json!(false),
+            "false would read as retention-is-fine to a monitoring consumer, which is the opposite of what a failed read means: {body}"
+        );
+
+        // And the failure is NAMED, so an operator can see why the field is unknown.
+        assert!(
+            body["retention"]["error"].is_string(),
+            "the failure must be reported in its own field, not left for an operator to infer from a null: {body}"
+        );
+
+        // The other half of the stated intent: the counters still arrive. Without this,
+        // the assertions above would pass on a handler returning ONLY the sentinel.
+        assert!(
+            body["server_errors"].is_u64() && body["responses"].is_u64(),
+            "the counters must still be present when the retention read fails - that is the whole reason the read is not allowed to fail the response: {body}"
+        );
     }
 }
