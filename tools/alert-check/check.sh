@@ -227,6 +227,46 @@ else
     fi
 fi
 
+
+# ---------------------------------------------------------------------------
+# The documented scheduling status must match what the scheduler does.
+# ---------------------------------------------------------------------------
+# WHY THIS IS HERE, and it is the third time this class has appeared. The
+# launch checklist told a reader "nothing invokes the alert checks on a schedule"
+# - which was TRUE when written and was invalidated by the two rounds that wired
+# them. The sentence existed to state precisely what remained, and it was not
+# revisited when the remaining thing got done. A reader deciding whether alerting
+# is finished was misled in the direction that wastes effort.
+#
+# The claim is mechanical - is run_alert_checks in run_wired_jobs? - so the two
+# sides can be held together. NEITHER SIDE IS ASSERTED ALONE: the assertion is
+# that they AGREE, so it stays true whichever way someone changes it, and it fails
+# in EITHER direction rather than pinning today's state.
+ENTRYPOINT="$REPO/.docker/maintenance/entrypoint.sh"
+CHECKLIST="$REPO/docs/launch-checklist.md"
+if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$CHECKLIST" ]; then
+    fail "cannot read $ENTRYPOINT and $CHECKLIST, so the documented scheduling status was not compared"
+else
+    WIRED=no
+    sed -n '/^run_wired_jobs()/,/^}/p' "$ENTRYPOINT" | grep -q 'run_alert_checks' && WIRED=yes
+
+    CLAIMS_UNSCHEDULED=no
+    grep -q 'nothing invokes the alert checks' "$CHECKLIST" && CLAIMS_UNSCHEDULED=yes
+
+    if [ "$WIRED" = yes ] && [ "$CLAIMS_UNSCHEDULED" = yes ]; then
+        fail "run_wired_jobs schedules run_alert_checks, but docs/launch-checklist.md still tells the reader nothing invokes the alert checks on a schedule"
+    fi
+    if [ "$WIRED" = no ] && [ "$CLAIMS_UNSCHEDULED" = no ]; then
+        fail "run_wired_jobs does NOT schedule run_alert_checks, yet the launch checklist no longer says so - a reader would believe the alerts run themselves"
+    fi
+
+    # Guard the fixture: if the nightly job list could not be read, WIRED would be
+    # "no", and only the second branch above would be live.
+    sed -n '/^run_wired_jobs()/,/^}/p' "$ENTRYPOINT" | grep -q 'run_retention' || {
+        fail "could not read the run_wired_jobs job list from $ENTRYPOINT - the comparison above did not actually happen"
+    }
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "alert-check: the alert delivery contract is BROKEN (see above)" >&2
     exit 1

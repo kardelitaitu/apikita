@@ -206,9 +206,19 @@ alerts are `covered`**, and the one exception is `relay_5xx`, which is `needs-me
 it cannot be derived from the database or `/health` alone. (This line said "9 of 10" until it
 was measured: the table has grown since, and nothing tied the sentence to the file — see
 `todo.md`, which now cites the same numbers.) "Configured" also means a delivery channel and
-a schedule, which are deployment decisions. **The code half is done; the coupling is not** —
-the `scheduler` service runs retention, reconcile and hold-sweep, but nothing invokes the
-alert checks on a schedule and no channel is set.
+a schedule, which are deployment decisions. **The code half is done AND THE COUPLING IS NOW IN PLACE** —
+`run_wired_jobs` invokes BOTH alert jobs every night alongside retention, reconcile and
+hold-sweep: `run_alert_checks` evaluates the database-backed alerts and `run_alert_probes`
+the HTTP ones, with the relay addressed by service name because `127.0.0.1` inside the
+container is its own loopback. **What still keeps this box unticked is the CHANNEL**: no
+delivery channel is configured, so a breach is reported as UNMONITORED rather than
+delivered — which is a deployment decision, and the run says so out loud rather than
+reporting an unmonitored night as clean.
+
+*(Correction: this line once asserted that NO SCHEDULE ran the alert checks. That was
+true when written and was invalidated by the two rounds that wired the jobs - the note
+existed to state what remained, and it was not revisited when the remaining thing got
+done. Kept as a note so the next reader knows the claim was checked, not paraphrased.)*
 - [ ] **A restore drill has been run**, with the reconciliation query passing. **The TOOL
       is verified; the PRODUCTION run is not.** I exercised `tools/drill/drill.sh` end to
       end against a synthetic migrated source: a full drill PASSED (exit 0) with
