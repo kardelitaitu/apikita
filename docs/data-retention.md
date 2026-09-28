@@ -143,10 +143,20 @@ model, and it is the single largest privacy obligation in the system.
 
 | Obligation | Status |
 | --- | --- |
-| Disclose forwarding in the terms | **Required, not yet written** |
-| State the provider jurisdiction | **Required, not yet written** |
+| Disclose forwarding in the terms | **WRITTEN, not yet reviewed or published** |
+| State the provider jurisdiction | **WRITTEN, not yet reviewed or published** |
 | State that prompts are not retained by us | Required, and true |
 | Note that the provider's own retention applies | Required — out of our control |
+
+**"Written" and "in force" are different, and the two rows above are the first.** The
+text exists in [`terms-of-service.md`](terms-of-service.md): "Prompts are forwarded to a
+provider in mainland China" (:19), the jurisdiction requirement named (:156), and the
+disclosure promised before first use (:292). What is still open is the legal REVIEW -
+explicitly deferred until the 4.8b IDR trigger - and PUBLICATION; both are tracked in
+[`launch-checklist.md`](launch-checklist.md):28 and :33. *(Correction: this table once marked
+both rows as unwritten, which was the one status that was untrue - a reader tracking
+privacy readiness was told a disclosure did not exist when it did. It was measured, not
+recalled: the ToS lines cited above are the evidence.)*
 
 **The last row is the uncomfortable one.** We do not store prompts, but the
 upstream may. A customer cannot be told "we do not keep your data" without also

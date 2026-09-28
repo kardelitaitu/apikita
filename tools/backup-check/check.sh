@@ -178,6 +178,53 @@ else
     fi
 fi
 
+
+# ---------------------------------------------------------------------------
+# A privacy obligation marked "not written" must match whether the text exists.
+# ---------------------------------------------------------------------------
+# WHY THIS IS HERE, beside the IP-retention check: it is the same defect class in
+# the same document family. docs/data-retention.md is where a reader learns what
+# personal data is held and whether the obligations around it are discharged, and
+# its cross-border table said of TWO rows:
+#
+#   | Disclose forwarding in the terms | **Required, not yet written** |
+#   | State the provider jurisdiction  | **Required, not yet written** |
+#
+# MEASURED: both were false. docs/terms-of-service.md contains the forwarding
+# disclosure (:19, naming mainland China), the jurisdiction requirement (:156) and
+# the before-first-use promise (:292). What is genuinely open is the legal REVIEW
+# (deferred until a revenue trigger) and PUBLICATION - three different statuses
+# that the doc collapsed into the one that was untrue.
+#
+# So the two files are held together: if the ToS contains the disclosure, no
+# retention doc may describe it as unwritten, and vice versa. Asserting AGREEMENT
+# rather than a fact means it stays true whichever side someone edits.
+TOS="$REPO/docs/terms-of-service.md"
+RETDOC="$REPO/docs/data-retention.md"
+if [ ! -f "$TOS" ] || [ ! -f "$RETDOC" ]; then
+    fail "cannot read $TOS and $RETDOC, so the disclosure status was not compared"
+else
+    # The DISCLOSURE existing is the corpus of the claim; look for the substance,
+    # not a heading - "mainland China" is the fact a reader needs.
+    DISCLOSED=no
+    grep -q 'mainland China' "$TOS" && DISCLOSED=yes
+
+    CLAIMS_UNWRITTEN=no
+    grep -q 'not yet written' "$RETDOC" && CLAIMS_UNWRITTEN=yes
+
+    if [ "$DISCLOSED" = yes ] && [ "$CLAIMS_UNWRITTEN" = yes ]; then
+        fail "docs/terms-of-service.md DOES contain the cross-border forwarding disclosure, but docs/data-retention.md still marks it 'not yet written' - a reader tracking privacy readiness is told a disclosure does not exist when it does"
+    fi
+    if [ "$DISCLOSED" = no ] && [ "$CLAIMS_UNWRITTEN" = no ]; then
+        fail "docs/terms-of-service.md no longer contains the forwarding disclosure, yet docs/data-retention.md no longer says it is unwritten - a reader would believe the disclosure exists when it does not"
+    fi
+
+    # Guard the fixture: both sides must have been read from a real document.
+    grep -q 'cross-border' "$TOS" && grep -q 'Obligation' "$RETDOC" || {
+        fail "the disclosure table or the ToS could not be located, so the comparison above did not actually happen"
+    }
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "backup-check: the backup contract is BROKEN (see above)" >&2
     exit 1
