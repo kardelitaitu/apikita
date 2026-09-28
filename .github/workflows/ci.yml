@@ -361,6 +361,19 @@ jobs:
       - name: Check the restore drill
         run: sh tools/drill-check/check.sh
 
+      # The alert tool must DELIVER, and must not silence its own retry.
+      #
+      # Every other gate detects a problem; this one has to tell someone. It had no CI
+      # coverage, and its contract has deliberate distinctions a tidy-up can collapse:
+      # a throttled alert is exit 1 NOT 0, and the cooldown is recorded only AFTER the
+      # channel accepted - otherwise a failed delivery silences that incident for the
+      # whole window and nothing says so.
+      #
+      # The ordering property is tested by attempting twice against a failing channel and
+      # asserting BOTH attempts were made. Hermetic: the file channel, no network.
+      - name: Check the alert delivery contract
+        run: sh tools/alert-check/check.sh
+
       - name: Install website dependencies
         working-directory: website
         run: npm ci
