@@ -1,12 +1,12 @@
 id	title	condition	threshold	action	coverage	source
-webhook_rejection	Webhook rejection	any `topup.rejected`	any (>=1 in the window)	Investigate immediately - either an attack or a config error breaking payments	covered	docs/observability.md:99
-refund_refusal	Refund refused by policy	any `refund.refused`	any (>=1 in the window)	A refund was requested and declined. Correct behaviour - but SHOULD NOT HAPPEN in normal operation, and nothing else moves on this path, so a spike means a status-mapping regression or a customer-facing dispute	covered	docs/observability.md:99
-ledger_drift	Ledger drift	`ledger_balance_drift_idr != 0`	0 (must equal 0)	Money is wrong. Freeze changes, investigate	covered	docs/observability.md:100
-api_down	API down	`/health` failing 2 min	120s of failed /health checks	Restart/investigate; auth is down	covered	docs/observability.md:101
-relay_5xx	Relay 5xx	relay returns 502/504	any 502/504 in the window	The relay is up but the backend is not	needs-metrics	docs/observability.md:102
-relay_down	Relay down	external check fails	1 failed external check	Total outage - single point of failure	covered	docs/observability.md:103
-all_providers_unhealthy	All providers unhealthy	circuit open on every endpoint	every endpoint open	Requests failing; check upstream	covered	docs/observability.md:104
-balance_negative	Balance negative	`balance_idr < 0`	0 (must equal 0)	Should be impossible (CHECK constraint). A bug	covered	docs/observability.md:105
-db_disk	DB disk >80%	any age-based table holding a row past its retention window	0 (must be 0)	Usage rows growing; check retention	covered	docs/observability.md:106
-error_rate	Error rate >5%	5 min window	5% over 5 min	Investigate	covered	docs/observability.md:107
-stranded_hold	Stranded reservation hold	`reserve_*` negative ledger row with no positive row under the same ref	0 (must equal 0); incident at two consecutive sweeps	Investigate the release path and credit the account if the hold is lost	covered	docs/observability.md:141-175
+webhook_rejection	Webhook rejection	any `topup.rejected`	any (>=1 in the window)	Investigate immediately - either an attack or a config error breaking payments	covered	docs/observability.md (the "Webhook rejection" row of the Alerts table)
+refund_refusal	Refund refused by policy	any `refund.refused`	any (>=1 in the window)	A refund was requested and declined. Correct behaviour - but SHOULD NOT HAPPEN in normal operation, and nothing else moves on this path, so a spike means a status-mapping regression or a customer-facing dispute	covered	docs/observability.md (the "Refund refused by policy" row of the Alerts table)
+ledger_drift	Ledger drift	`ledger_balance_drift_idr != 0`	0 (must equal 0)	Money is wrong. Freeze changes, investigate	covered	docs/observability.md (the "Ledger drift" row of the Alerts table)
+api_down	API down	`/health` failing 2 min	120s of failed /health checks	Restart/investigate; auth is down	covered	docs/observability.md (the "API down" row of the Alerts table)
+relay_5xx	Relay 5xx	relay returns 502/504	any 502/504 in the window	The relay is up but the backend is not	needs-metrics	docs/observability.md (the "Relay 5xx" row of the Alerts table)
+relay_down	Relay down	external check fails	1 failed external check	Total outage - single point of failure	covered	docs/observability.md (the "Relay down" row of the Alerts table)
+all_providers_unhealthy	All providers unhealthy	circuit open on every endpoint	every endpoint open	Requests failing; check upstream	covered	docs/observability.md (the "All providers unhealthy" row of the Alerts table)
+balance_negative	Balance negative	`balance_idr < 0`	0 (must equal 0)	Should be impossible (CHECK constraint). A bug	covered	docs/observability.md (the "Balance negative" row of the Alerts table)
+db_disk	DB disk	any age-based table holding a row past its retention window	0 (must be 0)	Usage rows growing; check retention	covered	docs/observability.md (the "DB disk" row of the Alerts table)
+error_rate	Error rate >5%	5 min window	5% over 5 min	Investigate	covered	docs/observability.md (the "Error rate" row of the Alerts table)
+stranded_hold	Stranded reservation hold	`reserve_*` negative ledger row with no positive row under the same ref	0 (must equal 0); incident at two consecutive sweeps	Investigate the release path and credit the account if the hold is lost	covered	docs/observability.md (the "Stranded reservation hold" row of the Alerts table)

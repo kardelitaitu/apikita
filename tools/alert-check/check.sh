@@ -158,6 +158,75 @@ case "$out" in
     *) fail "with a writable state dir the tool must still report the cooldown; got: $out" ;;
 esac
 
+
+# ---------------------------------------------------------------------------
+# The alert DEFINITION and the document that specifies it must agree.
+# ---------------------------------------------------------------------------
+# WHY THIS IS HERE. docs/observability.md:95 says of its Alerts table: "Each has
+# a threshold and an action. If you would not act, do not alert." The table IS the
+# specification; alerts.tsv IS the machine-readable definition every check reads.
+# Measured when this guard was added, they had already drifted TWICE:
+#
+#   1. The table listed TEN alerts and alerts.tsv had ELEVEN. The extra was
+#      stranded_hold - documented as its own section further down the same file,
+#      but missing from the table that claims to be the complete set. The scheduler
+#      runs that check nightly, so the omission was of a LIVE alert.
+#
+#   2. NINE of the eleven citations were off by one. Each cited a LINE NUMBER, so
+#      adding or removing a row silently re-pointed every citation below it at its
+#      neighbour; refund_refusal cited the webhook_rejection row, and so on down the
+#      table. This is why the citations now name the ROW instead of a line.
+#
+# Neither could be caught by reading: line numbers LOOK precise, which is what makes
+# a drifted one convincing. So this checks both the set and the references.
+OBS="$REPO/docs/observability.md"
+TSV="$REPO/tools/alert/alerts.tsv"
+if [ ! -f "$OBS" ] || [ ! -f "$TSV" ]; then
+    fail "cannot read $OBS and $TSV, so the alert definition was not compared"
+else
+    # The table's alert names, from the rows between the header and the next blank line.
+    TABLE=$(sed -n '/^| Alert | Condition | Action |/,/^$/p' "$OBS" \
+        | grep '^| \*\*' \
+        | sed 's/^| \*\*\([^*]*\)\*\*.*/\1/' \
+        | sed 's/[[:space:]]*$//')
+
+    # The definition's labels.
+    DEFS=$(grep -v '^#' "$TSV" | grep -v '^id' | cut -f2 | sed 's/[[:space:]]*$//')
+
+    # Guard the fixture: a sed that matched nothing would make both sides empty and
+    # every assertion below vacuously true.
+    T_COUNT=$(printf '%s\n' "$TABLE" | grep -c .)
+    D_COUNT=$(printf '%s\n' "$DEFS" | grep -c .)
+    if [ "$T_COUNT" -lt 8 ] || [ "$D_COUNT" -lt 8 ]; then
+        fail "parsed $T_COUNT table rows and $D_COUNT definitions - too few to be real, so the comparison below would be vacuous"
+    fi
+
+    # Set equality, both directions, so neither an alert in the table with no
+    # definition nor a definition with no table row can pass.
+    MISSING_FROM_TABLE=$(printf '%s\n' "$DEFS" | while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        printf '%s\n' "$TABLE" | grep -qxF "$d" || printf '%s\n' "$d"
+    done)
+    MISSING_FROM_TSV=$(printf '%s\n' "$TABLE" | while IFS= read -r t; do
+        [ -z "$t" ] && continue
+        printf '%s\n' "$DEFS" | grep -qxF "$t" || printf '%s\n' "$t"
+    done)
+
+    if [ -n "$MISSING_FROM_TABLE" ]; then
+        fail "alerts.tsv defines an alert the observability Alerts table does not list (the table says 'Each has a threshold and an action', so a missing row is a live alert with no specification): $(printf '%s' "$MISSING_FROM_TABLE" | tr '\n' ',')"
+    fi
+    if [ -n "$MISSING_FROM_TSV" ]; then
+        fail "the observability Alerts table lists an alert with no alerts.tsv definition (it would be specified and never checked): $(printf '%s' "$MISSING_FROM_TSV" | tr '\n' ',')"
+    fi
+
+    # And every definition must cite the document by NAME, not by line, so that
+    # inserting a row cannot silently re-point nine citations at their neighbours.
+    STOPPED=$(grep -v '^#' "$TSV" | grep -v '^id' | cut -f7 | grep 'observability' | grep -c 'observability.md:[0-9]')
+    if [ "$STOPPED" -gt 0 ]; then
+        fail "$STOPPED alerts.tsv citation(s) still use a LINE NUMBER (docs/observability.md:N). A line citation re-points at its neighbour the moment a row is added, which already happened to 9 of 11 of them - cite the row by name instead"
+    fi
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "alert-check: the alert delivery contract is BROKEN (see above)" >&2
     exit 1

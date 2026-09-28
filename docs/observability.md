@@ -106,6 +106,25 @@ Each has a threshold and an action. If you would not act, do not alert.
 | **Balance negative** | `balance_idr < 0` | Should be impossible (CHECK constraint). A bug |
 | **DB disk** | any age-based table holding a row past its retention window | Usage rows growing; check retention |
 | **Error rate >5%** | 5 min window | Investigate |
+| **Stranded reservation hold** | `reserve_*` negative ledger row with no positive row under the same ref | **Investigate the release path, then credit the account if the hold is lost.** Invisible to the drift query by construction — the hold left the wallet and no offsetting credit was written, so `balance` still equals `SUM(delta)` |
+
+**These are implemented, and the definition is machine-readable.** Every row above has
+an entry in [`tools/alert/alerts.tsv`](../tools/alert/alerts.tsv) — id, condition, threshold,
+action and a coverage verdict — and [`tools/alert/README.md`](../tools/alert/README.md) is the
+operator's view of it. Two scripts evaluate them without a metrics backend:
+`check-alerts.sh` runs the SQL-answerable checks against the database file, and `probe.sh`
+runs the external ones against `/health` and the relay. `alert.sh` is the transport, with
+Telegram, webhook, file and stdout channels and a per-key cooldown so one incident pages once
+rather than once per run.
+
+**And they run on a schedule.** `.docker/maintenance/` invokes both nightly, so a breach
+reaches an operator rather than only existing as a definition — see its README for which
+jobs are wired and which are not.
+
+**What is still a decision, not a gap:** WHICH channel to use and WHEN to run are an
+operator's choices, and a breach with no channel configured is reported as unmonitored
+rather than as a pass. `probe.sh` also states, in its own output, the alerts it cannot check
+and why, so a skipped check is never mistaken for a clean one.
 
 **The `db_disk` alert now measures RETENTION, not disk.** Its old name and condition
 ("DB disk >80% / volume usage") described a signal the backend cannot see, while its
