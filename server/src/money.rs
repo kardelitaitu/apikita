@@ -732,4 +732,91 @@ mod tests {
             );
         }
     }
+    /// The ledger is the AUTHORITATIVE record of every movement of customer money.
+    /// tools/reconcile/reconcile.sql says so in its header: "The ledger is
+    /// AUTHORITATIVE; wallets is a cache of it". An edit to it is therefore a MONEY
+    /// DEFECT by construction, not a style question.
+    ///
+    /// docs/launch-checklist.md:87 ticks an append-only claim that was TRUE but
+    /// enforced by NOTHING - it held by inspection. A later UPDATE written as a
+    /// "correction" would pass every other test and leave the tick green above it.
+    ///
+    /// Same class as a doc overstating a route (W30) with the polarity reversed: the
+    /// claim is accurate TODAY, and the risk is a FUTURE edit.
+    mod ledger_is_append_only {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        /// Every .rs under src/, resolved from the crate root so the scan does not
+        /// depend on the process CWD.
+        fn rust_sources() -> Vec<PathBuf> {
+            fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+                let entries = fs::read_dir(dir).expect("a readable source dir");
+                for entry in entries {
+                    let path = entry.expect("readable dir entry").path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else if path.extension().is_some_and(|e| e == "rs") {
+                        out.push(path);
+                    }
+                }
+            }
+            let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            let mut out = Vec::new();
+            walk(&src, &mut out);
+            out
+        }
+
+        /// The scan must be shown to have read REAL files. W38 lost cycles to an
+        /// assertion that passed over a tree it never found, so an empty walk is a
+        /// FAILURE here rather than a vacuous pass.
+        #[test]
+        fn the_scan_actually_read_the_tree() {
+            let files = rust_sources();
+            assert!(
+                files.len() > 10,
+                "the source scan found only {} .rs file(s), so it is not reading the real tree and every assertion below would pass vacuously",
+                files.len()
+            );
+            assert!(
+                files.iter().any(|p| p.ends_with("money.rs")),
+                "money.rs is not among the scanned files, so the scan looks elsewhere"
+            );
+        }
+
+        #[test]
+        fn no_source_statement_mutates_the_ledger() {
+            // THIS FILE IS SKIPPED, and that is not a loophole. The needles below appear
+            // as string literals in this very function, so scanning it would report the
+            // test as its own offender - which is what the first version did. The scan
+            // still covers every OTHER source file, and this file is checked by the
+            // rest of the suite in the ordinary way.
+            //
+            // Case-insensitive: SQL keywords appear in either case.
+            let this_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("money.rs");
+            let mut offenders = Vec::new();
+            for path in rust_sources() {
+                if path == this_file {
+                    continue;
+                }
+                let text = fs::read_to_string(&path).expect("a source file is UTF-8");
+                let upper = text.to_uppercase();
+                for (needle, label) in [
+                    ("UPDATE LEDGER", "UPDATE ledger"),
+                    ("DELETE FROM LEDGER", "DELETE FROM ledger"),
+                ] {
+                    if let Some(at) = upper.find(needle) {
+                        let line = upper[..at].matches('\n').count() + 1;
+                        offenders.push(format!("{}:{} contains {}", path.display(), line, label));
+                    }
+                }
+            }
+            assert!(
+                offenders.is_empty(),
+                "the ledger is append-only (docs/launch-checklist.md ticks it), but these statements mutate it: {offenders:#?}. Every customer money movement is recorded there and wallets is only a cache of it. Correct a mistake with an OFFSETTING entry, never an edit."
+            );
+        }
+    }
 }

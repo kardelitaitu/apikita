@@ -84,7 +84,11 @@ opinion.
 ### Ledger and balance
 
 - [x] **No client-reachable path can write `balance_idr`.**
-- [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase.
+- [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase. **Enforced** by
+  `money::tests::ledger_is_append_only::no_source_statement_mutates_the_ledger`, which scans
+  every `.rs` under `server/src` and fails on either statement. It was true by inspection
+  before that test existed, and the scan asserts it read the tree so it cannot pass
+  vacuously.
 - [x] The reconciliation query returns **zero rows** on production data.
 - [x] `CHECK (balance_idr >= 0)` present and exercised.
 - [x] Money is `INTEGER` IDR end to end; no float appears in any billing path. (Was `BIGINT` under Postgres; `STRICT` SQLite tables reject `BIGINT`, so the type is now `INTEGER` — see `decisions.md` §Money.)
