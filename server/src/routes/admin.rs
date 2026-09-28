@@ -2635,4 +2635,52 @@ mod tests {
         db.close().await;
     }
 
+    /// The `accounts.id` decode is defensive: the column is TEXT, so a row whose
+    /// id is not a uuid (a future migration path could introduce one) must be
+    /// reported as a 500, never an unchecked panic. This is the one defensive
+    /// parse in this module that is genuinely reachable - `sessions.account_id`
+    /// and `admin_audit.operator_id` both carry FK constraints to `accounts.id`,
+    /// so the parallel parses there can never see a non-uuid and are left as
+    /// documented exceptions. Covers admin.rs:399-403.
+    #[tokio::test]
+    async fn a_non_uuid_account_id_is_reported_not_panicked() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let operator = create_operator(&pool).await;
+        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        // `accounts.id` has no outward FK, so a malformed id is insertable and
+        // is the first row the DESC-ordered listing hits.
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO accounts (id, pb_user_id, status, is_operator, created_at, updated_at)
+             VALUES (?, ?, 'active', 0, ?, ?)",
+        )
+        .bind("not-a-uuid")
+        .bind("bad_pb_id")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert a malformed-id account");
+
+        let (status, body) = render(list_accounts(
+            State(test_state(pool.clone())),
+            operator_headers,
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+
+        // The public body is the generic internal_error (the detailed parse
+        // message is deliberately not leaked); the contract is that a malformed
+        // id yields a 500 rather than an unchecked panic.
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+        assert_eq!(body["error"]["code"], json!("internal_error"), "{body}");
+        db.close().await;
+    }
 }
