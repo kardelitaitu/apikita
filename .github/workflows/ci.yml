@@ -277,6 +277,25 @@ jobs:
           check_route 404 GET  /definitely-not-a-route
           # The api-spec marks these four DESIGNED-NOT-BUILT. Serving them would make
           # the spec wrong; 404 is what it claims.
+          # The rest of the mounted table. These six had NO probe: routes the server
+          # serves and the workflow never asked about. Expectations come from the CODE and
+          # the api-spec, not from the shape of the path.
+          check_route 401 GET  /api/admin/audit
+          check_route 401 GET  /api/usage/recent
+          check_route 401 POST /api/telegram/link-code
+          # LOGOUT IS INTENTIONALLY ANONYMOUS AND IDEMPOTENT. auth.rs:388-407 reads the
+          # cookie if present, revokes that session, and ALWAYS answers 204 with a cleared
+          # cookie - an unauthenticated logout is a no-op, not a leak. The api-spec table
+          # lists this group as "cookie / none", the only one that accepts no credential.
+          # A 204 here is the contract; asserting 401 would be asserting a bug.
+          check_route 204 POST /auth/logout
+          check_route 204 POST /auth/logout-all
+          # /auth/exchange is the ONE route whose status depends on an external service.
+          # With no body it fails extraction (422) before PocketBase is ever called, so the
+          # assertion stays hermetic. Its 500-when-PocketBase-is-down is deliberately NOT
+          # asserted here: CI has no identity provider, and fixing that status in a test
+          # would pin a behaviour the spec does not yet promise.
+          check_route 422 POST /auth/exchange
           check_route 404 GET  /api/reviews
           check_route 404 POST /api/bot/account
           check_route 404 POST /api/bot/notify-topup

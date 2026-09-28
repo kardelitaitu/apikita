@@ -12,6 +12,16 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 | Group | Endpoints | Auth |
 | --- | --- | --- |
 | Auth | `POST /auth/exchange`, `POST /auth/logout`, `POST /auth/logout-all` | cookie / none |
+
+**`POST /auth/exchange` is the one route whose failure mode depends on an EXTERNAL service.**
+It verifies the `pb_token` against PocketBase before creating a session, so with the identity
+provider unreachable it answers **500** (`code=internal_error`, a `request_id`, and the detail
+only in the log) — measured in a container with no PocketBase, logged as
+`PocketBase auth-refresh unreachable`. A client should treat that as "try again", not as a
+rejected credential: the request never reached the point of judging the token. The other auth
+verbs need no credential, and `logout`/`logout-all` are **intentionally idempotent** — they
+revoke the presented session if there is one and always answer **204** with a cleared cookie,
+so an anonymous call is a no-op rather than an error.
 | Account | `GET /api/me`, `GET /api/usage`, `GET /api/usage/recent`, `GET /api/topups`, `GET /api/export` | cookie |
 | Keys | `GET/POST /api/keys`, `PATCH /api/keys/:id`, `POST /api/keys/:id/revoke` | cookie |
 | Wallet | `POST /api/topups` | cookie |
