@@ -819,4 +819,176 @@ mod tests {
             );
         }
     }
+    /// Every IDR price in `config/apikita.toml` must be its CNY price x the documented
+    /// factor.
+    ///
+    /// The config states the rule itself (`config/apikita.toml:16-26`):
+    ///
+    ///   "1 CNY = 2,676.78 IDR ... Every IDR figure below is that CNY price x 2,676.78.
+    ///    To re-derive after an FX move: IDR_rate = CNY_rate * 2676.78 ... do not
+    ///    hand-edit the IDR values without updating this line."
+    ///
+    /// NOTHING COMPUTED IT. A search for the factor in `src/` found only hardcoded TEST
+    /// FIXTURES, so the rule the file calls out was enforced by care alone. A single
+    /// typed digit, or an FX move applied to some models and not others, shifts every
+    /// reservation and settlement for that model - and passes every other test, because
+    /// those use hardcoded rates rather than the config. The symptom would be a slightly
+    /// wrong invoice, the hardest kind of bug to notice and the one a customer finds.
+    mod config_prices_are_derived_from_the_documented_fx_rate {
+        use std::fs;
+        use std::path::Path;
+
+        /// The factor the config documents. A literal, so a change to the comment fails
+        /// this test rather than silently re-baselining it.
+        const FX_IDR_PER_CNY: f64 = 2676.78;
+
+        /// The factor as the config ITSELF declares it, read from the header line
+        /// "1 CNY = <factor> IDR".
+        ///
+        /// This is why the test reads the comment rather than trusting the constant
+        /// above: the file's own procedure is "to re-derive after an FX move ... do not
+        /// hand-edit the IDR values without updating this line". A test that only knew the
+        /// constant could not catch the instruction being followed for the COMMENT and not
+        /// the prices - which is exactly the half-done edit the sentence warns against.
+        fn documented_factor(toml: &str) -> f64 {
+            let marker = "1 CNY = ";
+            let line = toml
+                .lines()
+                .find(|l| l.contains(marker))
+                .unwrap_or_else(|| panic!("config/apikita.toml no longer states the FX factor"));
+            let rest = &line[line.find(marker).expect("marker present") + marker.len()..];
+            let digits: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+                .filter(|c| *c != ',')
+                .collect();
+            digits
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("cannot parse the FX factor from: {line}"))
+        }
+
+        /// One `<name> = <idr>  # <cny>` pair. Both comment forms appear in the file: a
+        /// bare yen figure and a quoted one.
+        struct Pair {
+            name: String,
+            idr: f64,
+            cny: f64,
+        }
+
+        fn pairs(toml: &str) -> Vec<Pair> {
+            let mut out = Vec::new();
+            for line in toml.lines() {
+                let Some((code, comment)) = line.split_once('#') else {
+                    continue;
+                };
+                let Some((key, value)) = code.split_once('=') else {
+                    continue;
+                };
+                let name = key.trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let Some(idr) = value.trim().parse::<f64>().ok() else {
+                    continue; // a string, bool or array value
+                };
+                let Some(yen) = comment.find('\u{a5}') else {
+                    continue;
+                };
+                let rest = comment[yen + '\u{a5}'.len_utf8()..].trim_start();
+                let digits: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                let Some(cny) = digits.parse::<f64>().ok() else {
+                    continue;
+                };
+                out.push(Pair { name, idr, cny });
+            }
+            out
+        }
+
+        fn config() -> String {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/apikita.toml");
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read config: {e}"))
+        }
+
+        /// The fixture guard. W38/W41/W43 all lost cycles to an assertion that passed over
+        /// a set it never populated, and a parser is exactly what stops matching after an
+        /// unrelated formatting change.
+        #[test]
+        fn the_parser_found_the_prices() {
+            let found = pairs(&config());
+            assert!(
+                found.len() >= 30,
+                "only {} price pairs parsed from config/apikita.toml; the format changed",
+                found.len()
+            );
+            assert!(
+                found.iter().any(|p| p.name == "input_peak"),
+                "input_peak was not parsed, so the parser is not reading the real prices"
+            );
+        }
+
+        #[test]
+        fn every_idr_price_is_its_cny_price_times_the_documented_factor() {
+            let toml = config();
+            // THE FACTOR THE FILE DECLARES, not the constant - see documented_factor. A test
+            // that only knew the constant could not catch the instruction in the header being
+            // followed for the COMMENT and not for the prices.
+            let factor = documented_factor(&toml);
+            assert!(
+                (factor - FX_IDR_PER_CNY).abs() < 0.005,
+                "config/apikita.toml declares an FX factor of {factor}, but this test was written for {FX_IDR_PER_CNY}. If the factor genuinely moved, every IDR value must move with it - re-derive them and update the constant here in the same commit."
+            );
+            let mut wrong = Vec::new();
+            for pair in pairs(&toml) {
+                let expected = pair.cny * factor;
+                // One decimal place in the file, so anything within a digit of rounding is
+                // exact by construction.
+                if (pair.idr - expected).abs() > 0.06 {
+                    wrong.push(format!(
+                        "{}: file says {} IDR, but {} CNY x {factor} = {:.2}",
+                        pair.name, pair.idr, pair.cny, expected
+                    ));
+                }
+            }
+            assert!(
+                wrong.is_empty(),
+                "these IDR prices are not their CNY price times the documented factor: {wrong:#?}"
+            );
+        }
+
+        /// A derived price with NO CNY figure beside it cannot be checked, so it must not
+        /// exist. This catches a value ADDED without its derivation, which the arithmetic
+        /// test above cannot see - it only looks at pairs.
+        #[test]
+        fn no_price_is_declared_without_its_cny_source() {
+            // Exempted BY NAME with a reason, rather than by a blanket suffix rule that
+            // would also excuse a real price (the W44 lesson about exemption lists).
+            const EXEMPT: &[&str] = &["low_balance_threshold_idr"];
+            let toml = config();
+            let paired: Vec<String> = pairs(&toml).into_iter().map(|p| p.name).collect();
+            let mut orphans = Vec::new();
+            for line in toml.lines() {
+                let Some((key, _)) = line.split_once('=') else {
+                    continue;
+                };
+                let name = key.trim();
+                if !(name.ends_with("_idr")
+                    || name.ends_with("_peak")
+                    || name.ends_with("_offpeak"))
+                {
+                    continue;
+                }
+                if paired.iter().any(|p| p == name) || EXEMPT.contains(&name) {
+                    continue;
+                }
+                orphans.push(name.to_string());
+            }
+            assert!(
+                orphans.is_empty(),
+                "these money-shaped keys carry no CNY figure, so nothing can check them: {orphans:#?}"
+            );
+        }
+    }
 }
