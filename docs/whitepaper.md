@@ -3,6 +3,30 @@ WHITEPAPER: CO-PLUS LLM ARBITRAGE ROUTING ENGINE
 A High-Throughput, Risk-Free Arbitrage Proxy Gateway Built in Rust
 ================================================================================
 
+> **Status: the ORIGINAL design — partly superseded. See
+> [architecture.md](architecture.md) for what actually shipped.**
+>
+> This document is kept because it is the founding statement of the business, not
+> because its details are current. Three classes of claim are out of date:
+>
+> - **The stack.** It names **Redis**, a Postgres/JSON document store, and a
+>   planned crypto rail. None shipped: the datastore is **embedded SQLite** (WAL)
+>   and `server/src/routes/proxy.rs` records that this build has *no* shared-state
+>   dependency. The crypto rail is **not built and not promised**
+>   (`decisions.md` §Money).
+> - **The economics (§2.1).** Its rate card was a single price vintage **2.43x
+>   below** the rate the system bills on. The verified card and the peak/off-peak
+>   split are in [business/02-pricing.md](business/02-pricing.md); the figures in
+>   §2.1 have been corrected in place, but the surrounding prose is the original
+>   analysis.
+> - **"Risk-Free" and the failover story.** Cross-provider failover is **not
+>   usable** with one provider, and is described honestly in
+>   [failover.md](failover.md). Nothing here is risk-free.
+>
+> A test pins the §2.1 figures to `config/apikita.toml`
+> (`website/tests/whitepaper-pricing.test.ts`), so the rate card cannot silently
+> drift again. The rest of the prose is **not** guarded — treat it as history.
+
 1. EXECUTIVE SUMMARY
 The rapid commoditization of Large Language Models (LLMs) has created a highly 
 fragmented wholesale market, driven largely by hyper-competitive, ultra-low-cost 
@@ -73,18 +97,24 @@ To safely offer variable, post-request token billing under a prepaid architectur
 the system operates a strict three-phase verification lifecycle:
 
 Phase 1: Pre-Flight Reservation Phase
-- Parse input text length using `tiktoken-rs`
-- Compute Worst-Case Cost (0% Cache + Max Output tokens)
+- Estimate input tokens from the request body. (**Not `tiktoken-rs` — that crate is
+  not a dependency; the estimate is the documented approximation, not a tokenizer.**)
+- Compute Worst-Case Cost (0% cache + Max Output tokens) at the PEAK rate, so a
+  request cannot lose money on a peak/off-peak flip.
 - If Wallet Balance < Worst-Case Cost -> REJECT request immediately.
 
 Phase 2: Inline Stream Monitoring Phase
-- Pipe network buffers via zero-copy tokio sockets
-- If generated response tokens cross remaining balance mid-sentence -> CUT pipeline.
+- Stream the upstream response through, unbuffered.
+- **The stream is NOT cut when it crosses the balance.** `mid_stream_cutoff = false`
+  is deliberate (`config/apikita.toml`): a truncated answer on non-refundable funds
+  is the most likely source of a delivery dispute. The hold simply bounds the loss.
 
 Phase 3: Post-Stream Final Settlement Phase
-- Extract actual usage block from the final JSON chunk sent by provider
-- Compute true cost with strict 50% multiplier applied
-- Deduct final cost from Redis wallet and release unused reserved balance.
+- Read the usage block the provider reports (or parse it from the final SSE chunk).
+- Compute the true cost with `ceil()` at the per-model multiplier.
+- Settle against the **embedded SQLite wallet in the same transaction** as the
+  ledger rows — there is no Redis (`server/src/routes/proxy.rs`), and the release
+  of the unused reserved balance lands with the debit, not after it.
 
 --------------------------------------------------------------------------------
 
@@ -97,10 +127,17 @@ Hong Kong or Singapore. These locations maintain dedicated high-speed fiber
 backbones directly interconnected with mainland networks, compressing connection 
 handshakes and stabilizing streaming performance.
 
-3.2 Thread-Safe, Hot-Reloadable Engine Structs
-The system abstracts raw supplier configurations behind an immutable public 
-routing layer. Configuration changes are executed via standard TOML files 
-parsed dynamically in memory using thread-safe read/write primitives (Arc<RwLock<T>>).
+3.2 Thread-Safe Engine Structs
+The system abstracts raw supplier configurations behind an immutable public
+routing layer. Configuration is read from standard TOML files **once at startup**
+and held shared and immutable for the process's life as `Arc<AppConfig>`
+(`server/src/routes/proxy.rs` `AppState`).
+
+**It is NOT hot-reloadable.** The `Arc<RwLock<T>>` described here is the design
+sketch, not the build: a config change is a **restart**, not an in-place reload.
+(The settle path does defend against a reload it cannot currently experience —
+a settled model that is no longer in the config releases its hold rather than
+stranding it — but that is a guard, not a feature.)
 
 [CODE STRUCTURE]
 pub struct TokenRates {
@@ -127,11 +164,17 @@ pub struct ConfigWrapper {
     pub models: Vec<ModelMapping>,
 }
 
-3.3 Dynamic Multi-Endpoint Resolution
-When a client payload arrives requesting a generic model abstraction (e.g., 
-"model": "model_a"), the router intercepts the request, isolates healthy suppliers, 
-executes an inline load-balancing mutation, and alters the network payload 
-dynamically using randomized or weighted algorithms across available active vectors.
+3.3 Multi-Endpoint Resolution
+When a client payload arrives requesting a model abstraction, the router resolves it
+to concrete upstreams and tries them **in configured order**, skipping any endpoint
+that is weight-0 (unregistered terms) or whose circuit is open. The payload's model
+name is rewritten to the endpoint's own upstream model name per attempt.
+
+**There is no "randomized or weighted" balancing.** The design sketch here promised
+inline load-balancing mutation across active vectors; the build is a deterministic
+failover loop, and that is deliberate — it makes behaviour reproducible and the
+failover order auditable (`server/src/upstream/client.rs`, `[models.endpoints]`
+weight semantics in `config/apikita.toml`).
 
 --------------------------------------------------------------------------------
 

@@ -34,7 +34,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
 const WEBSITE_TESTS = 163;
 
 /** The measured server count. Update WITH the run that changes it. */
-const SERVER_TESTS = 427;
+const SERVER_TESTS = 443;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -73,7 +73,8 @@ test('no doc still claims a superseded count', () => {
   // reappear only by someone updating the constants above AND the docs - which is
   // the deliberate two-file change this is meant to force.
   const superseded = [
-    '391 tests', '161 tests', '160 tests', '157 tests', '146 tests', '338 passed', '134 passed',
+    '391 tests', '161 tests', '160 tests', '157 tests', '146 tests',
+    '338 passed', '134 passed',
   ];
   for (const stale of superseded) {
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so

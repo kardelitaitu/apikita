@@ -358,9 +358,14 @@ output_peak        = 10707.12  # ¥4.00
 #   0 = unknown, in which case the router should learn it from 429s and back
 #   off, and a warning should be logged because capacity is then a guess.
 #
-# weight is relative; 0 = registered but never routed (unverified terms).
-# Selection is weighted-random across weight>0; set precedence explicitly if
-# strict primary->secondary->tertiary order is wanted.
+# weight is a GATE, not a probability: 0 = registered but never routed
+# (unverified terms), anything >0 = routable. It is NOT weighted-random.
+#
+# Selection is DETERMINISTIC: endpoints are tried in the order written below,
+# skipping any weight-0 entry and any whose circuit is open
+# (server/src/upstream/client.rs, the routing loop). So the ORDER of these
+# blocks is the failover precedence — put the primary first. An earlier version
+# of this comment said "weighted-random"; the implementation never was.
 
 [[models.endpoints]]
 name = "primary"
