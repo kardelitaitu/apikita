@@ -280,6 +280,45 @@ jobs:
           check_route 404 GET  /api/reviews
           check_route 404 POST /api/bot/account
           check_route 404 POST /api/bot/notify-topup
+
+          # The BOT endpoint is BUILT, and it is the one route with a different auth
+          # scheme (bot token, not cookie, not API key). It is also the endpoint
+          # docs/architecture/identity.md calls "the highest-risk endpoint in the
+          # Telegram surface": a 6-digit code is 10^6 possibilities.
+          #
+          # The property under test is ORDERING, and it is a security property rather
+          # than a status code: telegram.rs:331-335 checks the credential BEFORE the
+          # code shape, so an unauthenticated caller "learns nothing at all, not even
+          # whether their input was well formed". A refactor that swapped those two
+          # would leave every unit test green while turning the endpoint into an oracle
+          # for which codes are well formed.
+          #
+          # So the assertion is not "it refuses" - it is "it refuses IDENTICALLY".
+          bot_refusal() {
+            docker exec apikita-ci-api busybox wget -qO- --header='Content-Type: application/json' \
+              --post-data="$1" http://127.0.0.1:8080/api/bot/link 2>&1
+          }
+          bot_status() {
+            docker exec apikita-ci-api busybox wget -qO- --server-response \
+              --header='Content-Type: application/json' --post-data="$1" \
+              http://127.0.0.1:8080/api/bot/link 2>&1 \
+              | grep -m1 '^  HTTP/' | awk '{print $2}'
+          }
+          status_ok=$(bot_status '{"code":"123456"}')
+          status_bad=$(bot_status '{"code":"notacode"}')
+          if [ -z "$status_ok" ] || [ -z "$status_bad" ]; then
+            echo "::error::could not read a status from /api/bot/link (got '$status_ok' / '$status_bad')"
+            fail=1
+          elif [ "$status_ok" != "$status_bad" ]; then
+            echo "::error::/api/bot/link answers DIFFERENTLY for a well-formed and a malformed code with no credential ($status_ok vs $status_bad) - the credential must be checked before the shape"
+            fail=1
+          fi
+          body_ok=$(bot_refusal '{"code":"123456"}')
+          body_bad=$(bot_refusal '{"code":"notacode"}')
+          if [ "$body_ok" != "$body_bad" ]; then
+            echo "::error::/api/bot/link leaks the code shape in its refusal body"
+            fail=1
+          fi
           # And the refusal must carry the documented error model, request_id included,
           # or a client cannot report which request failed.
           docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/api/me \
