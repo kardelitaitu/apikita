@@ -190,12 +190,14 @@ proof of abuse on its own.
 | Distinct IPs per key | **Built** — `key_ip_daily`, salted daily hash; see [`ip-tracking.md`](ip-tracking.md) |
 | Key creation rate per account | **Enforced** — `limits.key_creation_per_day`, counted from `api_keys` rows |
 | Top-up rate per account | **Enforced** — `limits.topup_per_hour`, counted from `topups` rows |
-| Account suspend/restore | Specified in [`admin-surface.md`](admin-surface.md) — **endpoints not yet built** |
-| Incident log | **Not specified** |
+| Account suspend/restore | **Built** — `POST /api/admin/accounts/:id/suspend`, `/restore` (alias `/resume`). Revokes sessions and keys in one transaction, with an audit row. See [`admin-surface.md`](admin-surface.md) §Non-money actions |
+| Incident log | **Built** — the suspend/restore action trail (`admin_audit`) is readable per account and across accounts via `GET /api/admin/accounts/:id/audit` and `GET /api/admin/audit` |
 
-**The admin path is a real gap.** Suspending an account is a required capability with
-no specified endpoint. Options: PocketBase admin UI (manual, no audit trail) or a
-internal API endpoint (auditable, needs building).
+**The admin path is no longer a gap.** It was: suspending an account is a required
+capability, and at the time this table was written it had no endpoint at all. It now
+has one — auditable, in a single transaction, refusing self-action — so an operator
+responding to a live incident should use the console rather than the PocketBase admin
+UI. Reach for PocketBase only if the API itself is unreachable.
 
 ## Open items
 
