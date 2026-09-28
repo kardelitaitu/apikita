@@ -89,19 +89,77 @@ rows=$(sqlite3 "$PROTECTED" "SELECT COUNT(*) FROM accounts;" 2>/dev/null)
 # This is the control that makes the refusals above mean something. It needs a fully
 # migrated source, because the drill runs verify.sql and reconcile.sh against the
 # restored copy - a partial schema fails at step 6 for an honest reason.
+# A BROKEN MIGRATION IS A HARD FAILURE, NOT A SKIP, and this was a real false green.
+#
+# The loop below used to be `sqlite3 ... || break` and the guard `[ -f "$MIGRATED" ]`. A
+# migration that failed therefore left the database half-built, the EXISTENCE check saw a
+# file, and the positive control ran the drill against a PARTIAL schema - which still
+# reaches PASS, because verify.sql happens to work against the smaller schema. Measured:
+# replacing the second migration with garbage left 17 tables instead of 18 and the check
+# still printed "OK ... a consistent source drills to PASS" and exited 0.
+#
+# So: apply every migration, stop at the first failure naming the file, and only then
+# decide. A schema that cannot be built is a defect in the repository, not a reason to
+# skip - the skip path below is for a MISSING migrations directory, which is a different
+# fact.
 MIGRATED="$WORK/migrated.db"
 migrated=0
-if [ -f "$REPO/server/migrations/20260925000000_initial_schema.sql" ]; then
-    for f in "$REPO"/server/migrations/*.sql; do
-        sqlite3 -bail "$MIGRATED" < "$f" >/dev/null 2>&1 || break
+MIGRATION_DIR="$REPO/server/migrations"
+if [ -d "$MIGRATION_DIR" ] && [ -n "$(ls -A "$MIGRATION_DIR"/*.sql 2>/dev/null)" ]; then
+    migrate_failed=""
+    for f in "$MIGRATION_DIR"/*.sql; do
+        if ! sqlite3 -bail "$MIGRATED" < "$f" >/dev/null 2>"$WORK/mig.err"; then
+            migrate_failed=$(basename "$f")
+            break
+        fi
     done
-    [ -f "$MIGRATED" ] && migrated=1
+    if [ -n "$migrate_failed" ]; then
+        # NOT a skip: the repository is inconsistent and the control below cannot be trusted.
+        fail "the migration $migrate_failed did not apply, so the positive control would run against a PARTIAL schema: $(head -1 "$WORK/mig.err" 2>/dev/null)"
+    else
+        migrated=1
+    fi
 fi
 
 if [ "$migrated" -eq 0 ]; then
-    echo "drill-check: SKIPPED the positive control - could not build a migrated source" >&2
+    # Only two ways to get here: no migrations directory at all, or a migration that did
+    # not apply. The FIRST is a legitimate skip; the second already called fail() above and
+    # must not be described as a skip, or the report contradicts the exit code.
+    if [ "$FAILED" -ne 0 ]; then
+        echo "drill-check: the positive control could NOT run - see the failure above" >&2
+        exit 1
+    fi
+    echo "drill-check: SKIPPED the positive control - there is no migrations directory to build from" >&2
     echo "drill-check:   the GUARD cases above DID run and are the higher-stakes half" >&2
-    [ "$FAILED" -eq 0 ] && exit 0 || exit 1
+    exit 0
+fi
+
+# THE SCHEMA MUST BE COMPLETE, not merely present. This is the assertion whose absence made
+# the false green possible: `[ -f "$MIGRATED" ]` accepted a database built from one of three
+# migrations. Counting tables against the migrations themselves is what turns "a file exists"
+# into "the schema was built".
+#
+# The expectation comes from the SHIPPED MIGRATIONS READ AS TEXT - the count of
+# `CREATE TABLE` statements across them - not from a second build of the same files.
+#
+# A second build would be TAUTOLOGICAL: it applies the same files the same way, so the two
+# counts agree even when both are wrong, and it cannot catch the condition this exists for.
+# Reading the files is an INDEPENDENT measurement, and the two disagreeing is exactly the
+# signal that the build did not do what the migrations say.
+# `bc` is not guaranteed on the CI runner, so the sum is done in POSIX shell arithmetic.
+EXPECTED=0
+for f in "$MIGRATION_DIR"/*.sql; do
+    # `head -1` because grep -c can emit more than one line if a file has no trailing
+    # newline, and a multi-line value makes the arithmetic below fail with a syntax error.
+    n=$(grep -ci '^[[:space:]]*CREATE TABLE' "$f" 2>/dev/null | head -1)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    EXPECTED=$((EXPECTED + n))
+done
+ACTUAL=$(sqlite3 "$MIGRATED" "SELECT COUNT(*) FROM sqlite_master WHERE type='table'" 2>/dev/null)
+if [ -z "$EXPECTED" ] || [ -z "$ACTUAL" ]; then
+    fail "could not count tables in the built schema or in the migration files (got '$ACTUAL' vs '$EXPECTED')"
+elif [ "$ACTUAL" != "$EXPECTED" ]; then
+    fail "the migrated source has $ACTUAL tables but the migrations declare $EXPECTED CREATE TABLE statements - the positive control would run against an INCOMPLETE schema"
 fi
 
 sqlite3 "$MIGRATED" "
