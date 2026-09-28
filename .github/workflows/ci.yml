@@ -425,6 +425,11 @@ jobs:
           RUN="docker run --rm"
           MOUNT="-v $PWD/.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro"
           REC="-v $PWD/tools/reconcile:/usr/local/share/reconcile:ro"
+          # The alert jobs get the SAME mounts docker-compose.yml gives them. If the two
+          # sets drift apart, CI passes on a layout no deployment uses - which is how
+          # W49's three wiring faults each survived a green host check.
+          ALERT="-v $PWD/tools:/srv/apikita/tools:ro"
+          ALERT_ENV="-e ALERT_DIR=/srv/apikita/tools/alert -e ALERT_STATE_DIR=/srv/apikita/server/data/alert-state -e RELAY_HOST=nginx -e WEBHOOK_URL="
           ENV="-e DATABASE_URL=sqlite://data/server.db -e RECONCILE_DATABASE_URL=sqlite://data/server.db -e APP_DIR=/srv/apikita"
           EP=/usr/local/bin/maintenance-entrypoint.sh
 
@@ -519,6 +524,75 @@ jobs:
             echo "::error::the startup banner does not report hold-sweep as WIRED"
             exit 1
           }
+          # 4: the ALERT jobs. Added in W48/W49 and exercised by nothing until now.
+          #
+          # WHY THIS IS THE RIGHT PLACE AND NOT A NEW STEP. The host-side
+          # `alert-check` validates the transport and is thorough, but every actual
+          # failure in these jobs was a CONTAINER-INTEGRATION seam that CANNOT occur on
+          # the host: on the host the paths resolve and 127.0.0.1 is real. Three of
+          # them were found by hand - a false api_down against the container's own
+          # loopback, check-alerts.sh resolving its sibling through $SCRIPT_DIR/../..,
+          # and the DATABASE_URL vs RECONCILE_DATABASE_URL split. A green host check
+          # was true in all three cases. So this asserts the wiring, in the container,
+          # with the compose mounts.
+          #
+          # The database is left as step 3 seeded it, which is enough: these jobs must
+          # reach a VERDICT, and the failure being guarded is a wiring error that stops
+          # them before any verdict is possible.
+
+          # 4a: the database-backed checks must RUN, not crash on a missing mount.
+          out=$($RUN $MOUNT $REC $ALERT $ENV $ALERT_ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP alerts 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "job alerts: start" || {
+            echo "::error::the alerts job never started - the alert mounts are missing from this step"
+            exit 1
+          }
+          # A verdict, not a crash. NOT RUN is the exit-6 path ("a check that could not
+          # run is not a check that passed"), and it is exactly what a bad mount produces.
+          if echo "$out" | grep -q "job alerts: NOT RUN"; then
+            echo "::error::the alerts job could not reach a verdict - check-alerts.sh ran but something it needs is not mounted"
+            exit 1
+          fi
+          echo "$out" | grep -q "check-alerts: OK\|check-alerts: ALERT\|job alerts: CLEAN\|job alerts: FIRED" || {
+            echo "::error::the alerts job produced no recognisable verdict"
+            exit 1
+          }
+          # The run must not claim a channel it does not have: WEBHOOK_URL is EMPTY here.
+          echo "$out" | grep -q "NO CHANNEL IS CONFIGURED" || {
+            echo "::error::with no channel configured the run must SAY so - an unmonitored stack reported as monitored is the W52 defect"
+            exit 1
+          }
+
+          # 4b: the HTTP probes. THE assertion is the one W49 got wrong.
+          #
+          # probe.sh defaults PROBE_API_URL to 127.0.0.1:8080, which INSIDE a container
+          # is its own loopback: nothing is listening, so an unselected check fires a
+          # FALSE api_down and the job exits non-zero every night. W49 measured exactly
+          # that. So with PROBE_API_URL unset the check must be SKIPPED AND NAMED, and
+          # a blanket api_down alert is a regression.
+          out=$($RUN $MOUNT $REC $ALERT $ENV $ALERT_ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP alert-probes 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "job alert-probes: start" || {
+            echo "::error::the alert-probes job never started"
+            exit 1
+          }
+          echo "$out" | grep -q "SKIPPED - api_down" || {
+            echo "::error::api_down was not explicitly skipped - with PROBE_API_URL unset, probe.sh falls back to the container loopback and fires a false breach (W49)"
+            exit 1
+          }
+          if echo "$out" | grep -q "ALERT api_down"; then
+            echo "::error::api_down FIRED with no PROBE_API_URL set - that is the false alarm W49 fixed, aimed at the container's own loopback"
+            exit 1
+          fi
+          # relay_down IS selected, and with no relay on this network it must report the
+          # failure rather than pass. A probe that cannot fail is not a probe.
+          echo "$out" | grep -q "relay_down enabled" || {
+            echo "::error::relay_down was not selected - the relay check is the one that CAN run here"
+            exit 1
+          }
+
           # Cleanup is BEST-EFFORT and must NEVER fail the step. The volume is
           # scratch, and the daemon can still hold it for a moment after the
           # `--rm` containers exit, so the removal is allowed to fail.
