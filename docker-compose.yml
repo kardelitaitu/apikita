@@ -141,12 +141,38 @@ services:
       # default: the resolution of both DSNs depends on it, and a silent default
       # is not something a database path should rest on.
       APP_DIR: /srv/apikita
+      # Where tools/alert is mounted, so the entrypoint finds the checks.
+      ALERT_DIR: /srv/apikita/tools/alert
+      # The cooldown state. On the DATA volume, not /tmp, precisely because it
+      # must survive a container restart - a cooldown that resets pages repeatedly
+      # for one incident, which is the failure it exists to prevent.
+      ALERT_STATE_DIR: /srv/apikita/server/data/alert-state
+      ALERT_HOST: apikita-scheduler
+      # THE DELIVERY CHANNEL, passed through from the host. UNSET is a supported
+      # state, not an error: the checks still run and a CLEAN night still exits 0,
+      # but a breach with no channel exits non-zero rather than reporting a pass.
+      # That is a deployment decision (docs/launch-checklist.md keeps its box
+      # unticked for the same reason), so it is deliberately NOT defaulted here.
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       # Nightly run time, UTC hour 0-23. 03:00 UTC is a quiet hour for the stack.
       SCHEDULE_HOUR_UTC: ${SCHEDULE_HOUR_UTC:-3}
     volumes:
       - ./.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro
       # Read-only: reconcile.sh + reconcile.sql, unmodified and unowned by this job.
       - ./tools/reconcile:/usr/local/share/reconcile:ro
+      # Read-only: the alert checks, run nightly by `run_alert_checks`. They
+      # delegate to tools/reconcile (check 1 IS reconcile.sh), which is why this
+      # is read-only too - nothing in tools/alert writes to the repo. What it DOES
+      # write is its cooldown state, and that needs a PERSISTENT directory or the
+      # throttle resets every run and one incident pages once per run (see
+      # tools/alert/README.md:121-122). It lives on the data volume below.
+      # The whole tools/ tree, at the path its own scripts expect: check-alerts.sh
+      # derives the reconcile runner from its OWN location (`$SCRIPT_DIR/../..`),
+      # so mounting tools/alert alone would leave it looking for a sibling that is
+      # not there and reporting exit 6 forever. Mounting the tree mirrors the repo.
+      - ./tools:/srv/apikita/tools:ro
       # The API's data directory — the file the API writes, the same file these
       # jobs must open. Without this mount the container cannot see the database
       # at all, which is what made this service permanently unable to succeed.

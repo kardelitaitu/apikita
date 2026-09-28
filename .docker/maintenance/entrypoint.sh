@@ -114,6 +114,15 @@ RECONCILE_SH="${RECONCILE_SH:-/usr/local/share/reconcile/reconcile.sh}"
 
 TMP="${TMPDIR:-/tmp}"
 SQL_ERR="$TMP/maintenance-sql.$.err"
+
+# The alert checks, mounted read-only by docker-compose.yml. This script is the
+# caller; tools/alert/ owns what the checks are and what their exit codes mean.
+# Where docker-compose.yml mounts tools/alert, read-only. The checks are the repo's,
+# not this image's: check-alerts.sh delegates to tools/reconcile/reconcile.sh, so
+# mounting them keeps ONE definition of drift rather than a second copy here.
+ALERT_DIR="${ALERT_DIR:-/usr/local/share/alert}"
+ALERT_CHECK="$ALERT_DIR/check-alerts.sh"
+ALERT_OUT="$TMP/maintenance-alerts.$.out"
 trap 'rm -f "$SQL_ERR"' EXIT HUP INT TERM
 
 log() {
@@ -163,6 +172,16 @@ banner() {
     log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary NOT shipped in the server image; it does NOT run here. Its retention window IS enforced inline (see retention above)."
     log "NOT WIRED usage-purge - server/src/bin/usage-purge.rs, same: not shipped, does NOT run here. Its three sweeps ARE enforced inline (see retention above)."
     log "WIRED     hold-sweep - REPORT-ONLY, SQL inline in this entrypoint, using the SAME predicate as server/src/bin/hold-sweep.rs (which warns that a different predicate would make the binary and the library disagree about what 'stranded' means). Bound ${HOLD_SWEEP_BOUND_SECONDS}s. It counts, names and exits non-zero; it NEVER moves money, because silently crediting a hold is the same invisible-money anti-pattern the sweep exists to catch. --release stays a deliberate host action."
+    if [ -x "$ALERT_CHECK" ]; then
+        if [ -n "${WEBHOOK_URL:-}" ] || [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || [ -n "${ALERT_SINK_FILE:-}" ] || [ -n "${ALERT_SINK_STDOUT:-}" ]; then
+            log "WIRED     alerts     - tools/alert/check-alerts.sh, exit code preserved (1=fired 2=config 3=no sqlite3 4=failed 5=undelivered 6=unknown). A channel IS configured, so a breach is delivered."
+        else
+            log "WIRED     alerts     - tools/alert/check-alerts.sh RUNS nightly, but NO CHANNEL IS CONFIGURED, so a breach is reported as UNMONITORED rather than delivered. That is a deployment decision, not a defect: choose TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID, WEBHOOK_URL, ALERT_SINK_FILE or ALERT_SINK_STDOUT. A clean night still exits 0; a BREACH WITH NO CHANNEL DOES NOT."
+        fi
+        log "NOT WIRED alerts-http - probe.sh, the HTTP checks (api_down, relay_down, webhook_rejection, error_rate, refund_refusal), needs curl and this image has only sqlite3. Run it where curl exists; the database checks above do not depend on it."
+    else
+        log "NOT WIRED alerts     - $ALERT_CHECK is not present, so tools/alert is not mounted into this container. The checks exist and nothing runs them; see docker-compose.yml."
+    fi
     log "NOT WIRED two report-only gaps, not silent ones. Run them on the host on the same cadence: DATABASE_URL=... cargo run --manifest-path server/Cargo.toml --bin ip-purge (or --bin usage-purge)"
     log "DATABASE_URL=${DATABASE_URL:-<unset>}"
     log "RECONCILE_DATABASE_URL=${RECONCILE_DATABASE_URL:-<unset>}"
@@ -379,11 +398,146 @@ run_hold_sweep() {
     return 0
 }
 
+
+# -----------------------------------------------------------------------------
+# Alert checks
+# -----------------------------------------------------------------------------
+# Runs the DATABASE-BACKED alert checks (tools/alert/check-alerts.sh) after the
+# sweeps, so the four alerts docs/observability.md defines are actually evaluated
+# on a schedule rather than only existing.
+#
+# WHY THIS IS HERE AT ALL. entrypoint.sh:6-8 states the defect this file was built
+# to fix - "server/src/bin/{ip-purge,hold-sweep} and tools/reconcile/reconcile.sh
+# were written and then nothing ever ran them. A retention promise with no job
+# behind it is a sentence in a document, not a guarantee." tools/alert/ had
+# exactly that shape: the checks exist, every alert in alerts.tsv is `covered` by
+# one, and nothing invoked them. This is the coupling.
+#
+# THE RETURN CONTRACT, read from tools/alert/README.md:143-164, and it is NOT
+# "non-zero means broken":
+#
+#   0  CLEAN       - every runnable check ran, nothing breached.
+#   1  FIRED       - an alert fired AND was delivered. The tool worked; something
+#                    real is wrong. This must reach the operator as a non-zero
+#                    exit, or a nightly run that found money drift would look
+#                    identical to a clean one in the container's exit code.
+#   5  UNDELIVERED - an alert fired and could NOT be delivered.
+#   2/3/4/6        - CONFIG / MISSING / FAILED / UNKNOWN: a check could not run.
+#                    "a check that did not run is not a check that passed", so
+#                    these are not passes either.
+#
+# ALL NON-ZERO CODES ARE PROPAGATED UNCHANGED. The tool's precedence rule (5
+# beats 2/3/4/6, which beat 1) is a decision about which failure to report when
+# several are true, and it belongs to the tool that can see all of them. Re-
+# mapping the codes here would be a second opinion that can drift from the first.
+#
+# ⚠ THE ONE CASE THAT NEEDS A DECISION RATHER THAN PROPAGATION. With NO channel
+# configured, alert.sh exits 2 - "an alert nobody receives is worse than no
+# alerting, because it is believed". A stack that has simply not chosen a channel
+# yet must not report a CONFIG failure every night, so this function treats
+# "no channel" as a known configuration state and says so plainly:
+#
+#   no channel, nothing breached -> the checks ran clean. The stack is unmonitored
+#                                  BY CHOICE, and the log states that in full.
+#   no channel, something breached -> STILL NON-ZERO. Something is wrong and
+#                                  nobody can be told; reporting success here is
+#                                  the silent downgrade this whole directory
+#                                  exists to prevent.
+#
+# read-only against the database: check-alerts.sh opens it --readonly, so this
+# cannot move money even if it wanted to.
+run_alert_checks() {
+    log "job alerts: start (the checks tools/alert/alerts.tsv defines, evaluated nightly)"
+
+    if ! have_sqlite3; then
+        log "job alerts: FAILED - sqlite3 is not installed in this image"
+        return 1
+    fi
+    if [ -z "${RECONCILE_DATABASE_URL:-}" ]; then
+        log "job alerts: FAILED - RECONCILE_DATABASE_URL is not set (refusing to report checks that did not run)"
+        return 1
+    fi
+    if [ ! -x "$ALERT_CHECK" ]; then
+        log "job alerts: FAILED - $ALERT_CHECK is missing or not executable"
+        return 1
+    fi
+
+    # The alert checks read DATABASE_URL, NOT RECONCILE_DATABASE_URL - they are
+    # deliberately separate variables (see the compose comment), and check-alerts.sh
+    # resolves a RELATIVE sqlite:// path against its OWN REPO_ROOT, which is wherever
+    # tools/alert happens to be mounted - not the server working directory the DSN is
+    # written for. So a relative DSN that reconcile.sh resolves correctly would make the
+    # alert checks open a nonexistent file and report exit 6 forever. Resolving it here,
+    # with the same db_file_from_url the retention sweep uses, is what keeps the two jobs
+    # pointed at ONE database. This is the trap entrypoint.sh:116-123 documents for
+    # reconcile and it applies verbatim here.
+    if ! _alert_db=$(db_file_from_url "$RECONCILE_DATABASE_URL"); then
+        log "job alerts: FAILED - RECONCILE_DATABASE_URL is not a sqlite:// URL: $RECONCILE_DATABASE_URL"
+        return 1
+    fi
+    if [ ! -f "$_alert_db" ]; then
+        log "job alerts: FAILED - no such database file: $_alert_db (nothing was checked; unknown is not clean)"
+        return 1
+    fi
+    ALERT_DATABASE_URL=sqlite://"$_alert_db"
+    export ALERT_DATABASE_URL
+    DATABASE_URL="$ALERT_DATABASE_URL"
+    export DATABASE_URL
+
+    # A channel is configured iff one of the four the README documents is set.
+    if [ -n "${WEBHOOK_URL:-}" ] || [ -n "${TELEGRAM_BOT_TOKEN:-}" ] \
+        || [ -n "${ALERT_SINK_FILE:-}" ] || [ -n "${ALERT_SINK_STDOUT:-}" ]; then
+        _have_channel=1
+    else
+        _have_channel=0
+    fi
+
+    # ALERT_STATE_DIR must PERSIST or the cooldown resets every run and pages
+    # repeatedly for one incident - README.md:121-122. It is pinned in the compose
+    # file onto the data volume; this only warns if someone unset it to a tmpfs.
+    if [ -z "${ALERT_STATE_DIR:-}" ]; then
+        log "job alerts: WARNING - ALERT_STATE_DIR is unset, so the cooldown falls back to /tmp and does not survive a restart; one incident may page once per run"
+    fi
+
+    # Run it and take the code DIRECTLY. This was originally `if ! "$ALERT_CHECK"; then
+    # _rc=$?; fi`, which is WRONG in a way that matters here: inside `if ! cmd`, `$?`
+    # is the result of the NEGATION, so it is always 0 - every failure would have been
+    # reported as CLEAN, which is precisely the silent downgrade this function exists
+    # to avoid. Verified with a throwaway `(exit 5)` before shipping.
+    "$ALERT_CHECK" >"$ALERT_OUT" 2>&1
+    _rc=$?
+    while IFS= read -r _line; do log "job alerts:   $_line"; done < "$ALERT_OUT"
+
+    case "$_rc" in
+        0)
+            if [ "$_have_channel" = "0" ]; then
+                log "job alerts: CLEAN - every runnable check ran and nothing was breached, but NO CHANNEL IS CONFIGURED, so had one fired nobody would have been told"
+            else
+                log "job alerts: CLEAN - every runnable check ran and nothing was breached"
+            fi
+            return 0
+            ;;
+        1)
+            log "job alerts: FIRED - an alert fired and was delivered; see the lines above. The tool worked, something real is wrong"
+            return 1
+            ;;
+        5)
+            log "job alerts: UNDELIVERED - an alert fired and could NOT be delivered. This is NOT a pass"
+            return 1
+            ;;
+        *)
+            log "job alerts: NOT RUN ($_rc) - a check could not reach a verdict; consult tools/alert/README.md:143-164 for what $_rc means. Unknown is not clean"
+            return 1
+            ;;
+    esac
+}
+
 run_wired_jobs() {
     rc=0
     run_retention || rc=1
     run_reconcile || rc=1
     run_hold_sweep || rc=1
+    run_alert_checks || rc=1
     return "$rc"
 }
 
@@ -479,8 +633,12 @@ case "${1:-schedule}" in
         run_hold_sweep
         exit $?
         ;;
+    alerts)
+        run_alert_checks
+        exit $?
+        ;;
     *)
-        echo "usage: maintenance-entrypoint.sh [schedule|once|retention|reconcile|hold-sweep]" >&2
+        echo "usage: maintenance-entrypoint.sh [schedule|once|retention|reconcile|hold-sweep|alerts]" >&2
         exit 2
         ;;
 esac
