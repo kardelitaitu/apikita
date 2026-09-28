@@ -1579,4 +1579,52 @@ mod tests {
             "an endpoint without stream_options support must not receive the parameter: {payload}"
         );
     }
+
+    /// Every `UpstreamError` variant formats into a human-readable message. The
+    /// `Display` impl is what surfaces in logs and alert text, so each arm must
+    /// be exercised - the `matches!` assertions elsewhere only construct the
+    /// variants and never format them, leaving the `write!` arms uncovered.
+    #[test]
+    fn upstream_error_display_is_human_readable() {
+        assert_eq!(
+            format!("{}", UpstreamError::NoModel("gpt-x".into())),
+            "unknown model: gpt-x"
+        );
+        assert_eq!(
+            format!("{}", UpstreamError::NoHealthyUpstream("gpt-x".into())),
+            "no healthy upstream for model: gpt-x"
+        );
+        assert_eq!(
+            format!("{}", UpstreamError::RateLimited),
+            "upstream rate limited every key"
+        );
+        assert_eq!(
+            format!("{}", UpstreamError::ServerError(503)),
+            "upstream returned status 503"
+        );
+        assert_eq!(
+            format!("{}", UpstreamError::Transport("boom".into())),
+            "upstream transport error: boom"
+        );
+    }
+
+    /// A `data:` line whose payload is not valid UTF-8 must be skipped, not make
+    /// the whole parse panic. This is the `continue` at client.rs:104 - a
+    /// midstream chunk with mangled bytes still leaves the trailing valid usage
+    /// block findable.
+    #[test]
+    fn parse_usage_skips_lines_that_are_not_valid_utf8() {
+        let mut tail = b"data: ".to_vec();
+        tail.extend_from_slice(&[0xff, 0xfe, 0xfd]); // invalid UTF-8 payload
+        tail.extend_from_slice(b"\n\n");
+        tail.extend_from_slice(
+            b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+        );
+
+        let usage = parse_usage_from_sse(&tail).expect("the valid trailing block is still found");
+        assert_eq!(usage.input_tokens, 1);
+        assert_eq!(usage.output_tokens, 2);
+        // And a tail that is ONLY junk yields nothing rather than panicking.
+        assert_eq!(parse_usage_from_sse(&[0xff, 0xfe]), None);
+    }
 }
