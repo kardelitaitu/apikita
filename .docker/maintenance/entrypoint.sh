@@ -121,7 +121,14 @@ SQL_ERR="$TMP/maintenance-sql.$.err"
 # not this image's: check-alerts.sh delegates to tools/reconcile/reconcile.sh, so
 # mounting them keeps ONE definition of drift rather than a second copy here.
 ALERT_DIR="${ALERT_DIR:-/usr/local/share/alert}"
+# The relay service name in docker-compose.yml. probe.sh defaults to 127.0.0.1,
+# which INSIDE this container is its own loopback - nothing is listening there, so
+# an unconfigured run would report the relay down every night. The service name is
+# what is actually resolvable.
+RELAY_HOST="${RELAY_HOST:-nginx}"
 ALERT_CHECK="$ALERT_DIR/check-alerts.sh"
+ALERT_PROBE="$ALERT_DIR/probe.sh"
+ALERT_PROBE_OUT="$TMP/maintenance-probes.$.out"
 ALERT_OUT="$TMP/maintenance-alerts.$.out"
 trap 'rm -f "$SQL_ERR"' EXIT HUP INT TERM
 
@@ -178,7 +185,7 @@ banner() {
         else
             log "WIRED     alerts     - tools/alert/check-alerts.sh RUNS nightly, but NO CHANNEL IS CONFIGURED, so a breach is reported as UNMONITORED rather than delivered. That is a deployment decision, not a defect: choose TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID, WEBHOOK_URL, ALERT_SINK_FILE or ALERT_SINK_STDOUT. A clean night still exits 0; a BREACH WITH NO CHANNEL DOES NOT."
         fi
-        log "NOT WIRED alerts-http - probe.sh, the HTTP checks (api_down, relay_down, webhook_rejection, error_rate, refund_refusal), needs curl and this image has only sqlite3. Run it where curl exists; the database checks above do not depend on it."
+        log "WIRED     alert-probes - tools/alert/probe.sh, exit code preserved (1=fired 2=config 3=no curl 4=failed 5=undelivered 6=unknown). The relay is probed by SERVICE NAME ($RELAY_HOST:8000), because 127.0.0.1 is this container's own loopback. api_down additionally needs PROBE_API_URL, which has no safe default and is skipped with its reason printed when unset."
     else
         log "NOT WIRED alerts     - $ALERT_CHECK is not present, so tools/alert is not mounted into this container. The checks exist and nothing runs them; see docker-compose.yml."
     fi
@@ -446,6 +453,102 @@ run_hold_sweep() {
 #
 # read-only against the database: check-alerts.sh opens it --readonly, so this
 # cannot move money even if it wanted to.
+
+# Runs the HTTP alert checks (tools/alert/probe.sh) after the database ones.
+#
+# WHY THE IMAGE NOW CARRIES curl: probe.sh hard-requires it (probe.sh:164) and the
+# two checks worth having here are api_down and relay_down - both `covered`, and both
+# unreachable before because the binary was absent, not because of configuration.
+#
+# *** THE URLS ARE THE WHOLE DIFFICULTY. *** probe.sh defaults to 127.0.0.1:8080 and
+# 127.0.0.1:8000, which are HOST addresses. Inside this container those are the
+# container's own loopback - nothing is listening - so an unconfigured run would poll
+# an endpoint that cannot exist, conclude the API is DOWN, and fire a false alarm on
+# every scheduled run. That is worse than not checking at all, because it is believed
+# and it trains an operator to ignore the alert. So the relay is addressed by its
+# COMPOSE SERVICE NAME, which is what makes it resolvable at all.
+#
+# The API is a separate deployment in this stack (compose holds only nginx and the
+# scheduler), so its URL comes from the environment and is NOT defaulted to something
+# that cannot work. Unset means the check is skipped with the reason printed - which
+# is probe.sh's own SKIPPED semantics, not a silent pass.
+run_alert_probes() {
+    log "job alert-probes: start (the HTTP checks probe.sh covers)"
+
+    if [ ! -x "$ALERT_PROBE" ]; then
+        log "job alert-probes: SKIPPED - $ALERT_PROBE is not present, so tools/alert is not mounted"
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        log "job alert-probes: SKIPPED - curl is not installed in this image, and probe.sh requires it (probe.sh:164). The database checks are unaffected."
+        return 0
+    fi
+
+    # The relay answers /healthz from INSIDE the network, so a compose service name
+    # resolves where 127.0.0.1 does not. PROBE_RELAY_URL overrides for any other topol-
+    # ogy; the default is the service this compose actually defines.
+    PROBE_RELAY_URL="${PROBE_RELAY_URL:-http://$RELAY_HOST:8000}"
+    export PROBE_RELAY_URL
+
+    # *** SELECT THE CHECKS EXPLICITLY. *** This is not tidiness, it is the safety property
+    # of this function. probe.sh does NOT skip api_down when PROBE_API_URL is unset: it falls
+    # back to 127.0.0.1:8080 (probe.sh:49), which inside a container is its OWN loopback with
+    # nothing listening. MEASURED - an unconfigured run fired a FALSE api_down, and with no
+    # channel that became exit 5 UNDELIVERED: the nightly job reporting the API down when the
+    # API had never been addressed at all.
+    #
+    # A false alarm on a schedule is worse than a missing check. It is believed, and it
+    # trains an operator to ignore the alert. So a check runs only when the input it needs is
+    # present, and everything left out is NAMED with its reason - never silently defaulted
+    # and never silently dropped.
+    _probe_checks=""
+    if [ -n "${PROBE_API_URL:-}" ]; then
+        _probe_checks="$_probe_checks api_down"
+        log "job alert-probes: api_down enabled - probing the API at $PROBE_API_URL"
+    else
+        log "job alert-probes:   SKIPPED - api_down (PROBE_API_URL unset; 127.0.0.1 is THIS container, so there is no safe default)"
+    fi
+    _probe_checks="$_probe_checks relay_down"
+    log "job alert-probes: relay_down enabled - probing the relay at $PROBE_RELAY_URL"
+    # The log- and cookie-backed checks need inputs this stack does not provide; naming them
+    # keeps the omission visible instead of leaving it to be inferred from an absence.
+    log "job alert-probes:   SKIPPED - webhook_rejection, refund_refusal (PROBE_LOG_FILE unset)"
+    log "job alert-probes:   SKIPPED - error_rate, all_providers_unhealthy, db_disk (PROBE_OPERATOR_COOKIE unset)"
+
+    # A --check per selected id. The unquoted expansion below is deliberate and is why this
+    # is a loop rather than one string: each id must become its own word.
+    _args=""
+    for _c in $_probe_checks; do
+        _args="$_args --check $_c"
+    done
+
+    # No channel yet is a configuration state, not a failure - the same reasoning as
+    # run_alert_checks. probe.sh's own exit codes carry the rest.
+    # shellcheck disable=SC2086  # intentional word-splitting: _args is an argument list
+    "$ALERT_PROBE" $_args >"$ALERT_PROBE_OUT" 2>&1
+    _prc=$?
+    while IFS= read -r _line; do log "job alert-probes:   $_line"; done < "$ALERT_PROBE_OUT"
+
+    case "$_prc" in
+        0)
+            log "job alert-probes: CLEAN - every reachable check answered and nothing was breached"
+            return 0
+            ;;
+        1)
+            log "job alert-probes: FIRED - an alert fired and was delivered; see the lines above"
+            return 1
+            ;;
+        5)
+            log "job alert-probes: UNDELIVERED - an alert fired and could NOT be delivered. This is NOT a pass"
+            return 1
+            ;;
+        *)
+            log "job alert-probes: NOT RUN ($_prc) - a check could not reach a verdict; consult tools/alert/README.md for what $_prc means. Unknown is not clean"
+            return 1
+            ;;
+    esac
+}
+
 run_alert_checks() {
     log "job alerts: start (the checks tools/alert/alerts.tsv defines, evaluated nightly)"
 
@@ -538,6 +641,7 @@ run_wired_jobs() {
     run_reconcile || rc=1
     run_hold_sweep || rc=1
     run_alert_checks || rc=1
+    run_alert_probes || rc=1
     return "$rc"
 }
 
@@ -637,8 +741,12 @@ case "${1:-schedule}" in
         run_alert_checks
         exit $?
         ;;
+    alert-probes)
+        run_alert_probes
+        exit $?
+        ;;
     *)
-        echo "usage: maintenance-entrypoint.sh [schedule|once|retention|reconcile|hold-sweep|alerts]" >&2
+        echo "usage: maintenance-entrypoint.sh [schedule|once|retention|reconcile|hold-sweep|alerts|alert-probes]" >&2
         exit 2
         ;;
 esac

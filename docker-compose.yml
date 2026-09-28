@@ -148,6 +148,17 @@ services:
       # for one incident, which is the failure it exists to prevent.
       ALERT_STATE_DIR: /srv/apikita/server/data/alert-state
       ALERT_HOST: apikita-scheduler
+      # The relay, addressed by SERVICE NAME. probe.sh defaults to 127.0.0.1, which
+      # inside this container is its own loopback - nothing is listening, so an
+      # unconfigured run would call the relay down every night. A false alarm on a
+      # schedule is worse than no check: it is believed, and it teaches an operator
+      # to ignore the alert.
+      RELAY_HOST: nginx
+      # The BACKEND, which is a separate deployment - this compose holds only nginx
+      # and the scheduler, so there is no service name to default to and no safe
+      # guess. Unset leaves api_down SKIPPED with its reason printed, which is
+      # probe.sh's own semantic. Set it to wherever the API actually answers.
+      PROBE_API_URL: ${PROBE_API_URL:-}
       # THE DELIVERY CHANNEL, passed through from the host. UNSET is a supported
       # state, not an error: the checks still run and a CLEAN night still exits 0,
       # but a breach with no channel exits non-zero rather than reporting a pass.
