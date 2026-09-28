@@ -180,6 +180,85 @@ jobs:
           # returns 200 for the wrong reason cannot pass.
           docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/health \
             | grep -q '"database":"connected"'
+
+          # And the route table it serves must be the one we documented.
+          #
+          # The health poll above proves ONE endpoint. This proves the rest: every
+          # protected route must REFUSE an anonymous request with the documented error
+          # model, an unknown path must 404, and the routes the spec marks
+          # DESIGNED-NOT-BUILT must 404 rather than half-exist.
+          #
+          # A router test cannot cover this. Those drive the handler in-process and share
+          # the router - but they do not exercise the binary booting, reading its config,
+          # binding a listener, or assembling the middleware chain in main.rs. That is the
+          # seam these probes sit on, and it is the last one between the code and a
+          # customer.
+          echo "--- anonymous surface ---"
+          fail=0
+          # BusyBox wget has NO --method flag (it rejects it outright with "unrecognized
+          # option"), so GET is the default and POST is expressed with --post-data. Using
+          # --method here made every probe report "unrecognized" and would have failed the
+          # step on EVERY run - found by executing this helper against a live container
+          # rather than trusting it to be right.
+          status_of() {
+            method="$1"; path="$2"
+            if [ "$method" = "POST" ]; then
+              docker exec apikita-ci-api busybox wget -qO- --server-response \
+                --post-data="" "http://127.0.0.1:8080$path" 2>&1
+            else
+              docker exec apikita-ci-api busybox wget -qO- --server-response \
+                "http://127.0.0.1:8080$path" 2>&1
+            fi | grep -m1 '^  HTTP/' | awk '{print $2}'
+          }
+          check_route() {
+            want="$1"; method="$2"; path="$3"
+            got=$(status_of "$method" "$path")
+            if [ "$got" != "$want" ]; then
+              echo "::error::$method $path returned '$got', expected $want"
+              fail=1
+            fi
+          }
+          check_route 200 GET  /health
+          check_route 401 GET  /api/me
+          check_route 401 GET  /api/usage
+          check_route 401 GET  /api/keys
+          check_route 401 GET  /api/export
+          check_route 401 GET  /api/topups
+          # /api/telegram is registered for DELETE only, so GET is 405 - the method is
+          # wrong, which is a different fact from being unauthenticated. Asserting 401
+          # here was MY error, caught by running the helper against a live container.
+          #
+          # DELETE itself is NOT probed: BusyBox wget can send GET and POST and nothing
+          # else, so the probe cannot express it. Leaving it in asserted 405 against a
+          # 401 expectation and failed - the tool's limitation, not the server's, and a
+          # step that fails for a harness reason is worse than one that omits the case.
+          check_route 405 GET  /api/telegram
+          check_route 401 GET  /events
+          # The admin surface must refuse without a session. 401 rather than 403 is
+          # correct: the operator flag cannot be known before identity is.
+          check_route 401 GET  /api/admin/accounts
+          check_route 401 GET  /api/admin/metrics
+          check_route 401 POST /v1/chat/completions
+          # Unrouted paths are 404, not 401 - a route that does not exist must not
+          # pretend to be protected.
+          check_route 404 GET  /definitely-not-a-route
+          # The api-spec marks these four DESIGNED-NOT-BUILT. Serving them would make
+          # the spec wrong; 404 is what it claims.
+          check_route 404 GET  /api/reviews
+          check_route 404 POST /api/bot/account
+          check_route 404 POST /api/bot/notify-topup
+          # And the refusal must carry the documented error model, request_id included,
+          # or a client cannot report which request failed.
+          docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/api/me \
+            | grep -q '"code":"unauthenticated"' \
+            || { echo "::error::the 401 body is not the documented error model"; fail=1; }
+          docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/api/me \
+            | grep -q '"request_id":"req_' \
+            || { echo "::error::the 401 body carries no request_id"; fail=1; }
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the booted binary does not serve the documented route table"
+            exit 1
+          fi
           docker rm -f apikita-ci-api
           # Cleanup is BEST-EFFORT and must never fail the step: the volume is
           # scratch and a leftover one on a fresh CI runner is harmless. The
