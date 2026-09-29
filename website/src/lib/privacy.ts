@@ -93,7 +93,11 @@ export const retention = [
   { what: 'Sessions (expired/revoked)', keep: '30 days', why: 'Tidy up, but keep recent for security review' },
   { what: 'Reviews', keep: 'Until deleted by user', why: 'Published aggregate; individual text is theirs' },
   { what: 'Review history', keep: 'Same as review', why: 'Needed to make an edit meaningful' },
-  { what: 'link_codes', keep: 'Until used or expired + 24h', why: 'Then delete' },
+  // WAS the raw table name `link_codes`, which is the one row on this page that showed
+  // a schema identifier to a customer while every other row used a phrase. Internal
+  // naming is not what a privacy notice is for, and a row that reads as a database dump
+  // makes the eleven around it harder to take seriously.
+  { what: 'Telegram link codes', keep: 'Until used or expired + 24h', why: 'A link code is a short-lived secret for binding a Telegram account. It is deleted once used, and 24 hours after it expires otherwise, so an unused code never outlives its usefulness' },
   { what: 'Link-redemption attempts', keep: '7 days', why: 'Hashed source of failed link-code attempts; used only to stop credential attacks, then deleted' },
   // The two salt rows were missing here while the nightly sweep deleted them, and the
   // omission is the one this page must never make: it is a disclosure of what is kept.
