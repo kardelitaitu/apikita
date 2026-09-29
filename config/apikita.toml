@@ -144,6 +144,20 @@ topup_per_hour = 5
 # webhook credit is not caller-paced, and the proxy debit is bounded by the balance.
 # The moment a second caller-controlled wallet mutation appears, this is the line that
 # should be enforcing it and it will not.
+#
+# **AND WITH THESE TWO VALUES IT WOULD NOT BIND ANYWAY, which changes how urgent that is.**
+# 5 per hour is 5 per minute, which is under 10, so no client can reach this cap on ANY
+# route while topup_per_hour is the smaller number. Wiring this key without raising that
+# one would add a second query per request and change no outcome - so the trigger to wire
+# it is a NEW ROUTE, and the arithmetic below says when the arithmetic changes too.
+#
+#     5/hour  <  10/minute        this key can never bind
+#     600/hour >  10/minute       this key WOULD bind, and nothing would enforce it
+#
+# So there are two ways this becomes real, and they need different responses: a second
+# caller-controlled wallet mutation (wire this key), or `topup_per_hour` raised above 600
+# (which removes all per-minute protection with nothing failing). The second is the one
+# that is a single edit away today, and it is invisible from either value alone.
 wallet_mutations_per_minute = 10
 
 # Blunts limit circumvention by key-spam.
