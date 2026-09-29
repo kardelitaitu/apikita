@@ -361,20 +361,28 @@ called, and that carried six green tests of its own.
 
 The same run, after that function and the fields only it read were deleted:
 
-| Metric | 2026-09-27 | 2026-09-29 |
-| --- | ---: | ---: |
-| Region coverage | — | **97.07%** |
-| Line coverage | 96.64% | **98.02%** |
-| Function coverage | — | **94.36%** (100 of 1,773 not entered) |
-| **Named functions never entered by any test** | not measured | **0 of 1,841** |
+| Metric | 2026-09-27 | 2026-09-29 (first run) | 2026-09-29 (re-measured) |
+| --- | ---: | ---: | ---: |
+| Region coverage | — | 97.07% | **97.07%** |
+| Line coverage | 96.64% | 98.02% | **98.00%** |
+| Function coverage | — | 94.36% | **94.23%** (104 of 1,801 not entered) |
+| **Named functions never entered by any test** | not measured | 0 of 1,841 | **0 of 1,869** |
+| Tests passing | 461 | 468 | **470** |
 
-**Zero.** Every function in the crate that can be called by name is entered by at
-least one test. The 100 unentered "functions" are all **closures**, which llvm-cov
+**Zero, still.** Every function in the crate that can be called by name is entered by
+at least one test. The 104 unentered "functions" are all **closures**, which llvm-cov
 records under their line number rather than a name.
 
+The re-measurement is here because the numbers MOVE as the crate does, and a table
+that reads as current when it is three changes old is a stale claim wearing a fresh
+date. Line coverage fell by 0.02 points and function coverage by 0.13 across this
+round's work - not a regression, just the cost of adding code and tests together. The
+row that is supposed to be true is still true, and it is the only row here that is a
+claim about the code rather than a measurement of it.
+
 That last row is the one to keep, and **the trap is worth naming**: `config.rs`
-reports **62.64% function coverage** and looks like the worst-covered file in the
-crate by a distance — it is 34 closures, not 34 functions. Reading the per-file
+reports **62.77% function coverage** and looks like the worst-covered file in the
+crate by a distance — it is 35 closures, not 35 functions. Reading the per-file
 function column without separating closures from named functions sends you to
 investigate a file that has nothing wrong with it. The named-function figure is the
 one that means something, and it is a different question from the percentage: a
@@ -396,6 +404,21 @@ threshold *cannot* express is the question this section now answers by hand.
 "Entered by a test" is not "reached by production": the deleted
 `UpstreamClient::worst_case_reservation_idr` was entered by six of its own tests and
 called by no request. Coverage narrows the field; it does not close it.
+
+**The mirror image is worse, because coverage cannot see it at all.** A rule can be
+fully covered — every line of it executed by a test — while the code that actually
+runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was
+written inline in the handler and rewritten in two test helpers, because a test cannot
+call an expression buried in the middle of a request. The copies under test were at
+100%; the line the handler executed was at nothing. Every function is entered, every
+line is covered, and the money depends on a formula no test ever ran. It is now one
+method — `ModelConfig::reserved_output_tokens` — that all three sites call, which is
+the only arrangement in which "this test covers it" means anything.
+
+So coverage answers "did any test run this function", and the question that matters is
+"is the function the money depends on the function under test". The first is
+mechanical; the second is a review, and the first being green is precisely what makes
+the second worth doing.
 
 The obvious completion — a source-walk test asserting every `pub fn` has a
 production call site — was measured before being dismissed, and it does not work:
