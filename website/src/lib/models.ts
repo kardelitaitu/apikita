@@ -6,6 +6,25 @@
 // multiplier. Nothing here is estimated. This is transcription with a named
 // source on purpose: the website does not read config/ at build time and adds
 // no TOML dependency.
+//
+// **THE ARITHMETIC, so a reader can check this by eye in ten seconds** rather than
+// trust it, and so a drift is visible rather than silent. Each figure is the config's
+// `[models.rates]` PEAK value times the model's `price` multiplier (M = 1.50):
+//
+//     input  2676.78 x 1.5 =  4015.17  -> 4,015
+//     cache    53.54 x 1.5 =    80.31  ->     80
+//     output 10707.12 x 1.5 = 16060.68  -> 16,061
+//
+// and the off-peak column is the same three off the offpeak values:
+//     1338.39 -> 2,008 |  26.77 -> 40 |  5353.56 -> 8,030
+//
+// **NOTHING ENFORCES THIS, and the config header is explicit that it will move.**
+// `config/apikita.toml` warns at the top that we collect IDR and pay CNY, so an FX move
+// changes our cost with no change in the upstream price list - which is the exact moment
+// these six figures go stale, and they are what a customer reads before buying. A guard
+// that parsed the config from here would contradict the no-TOML-dependency decision
+// above, so the mitigation is the arithmetic being written down: checkable by eye, and
+// wrong in a way a reader can see in the same ten seconds.
 
 // The three token classes, in the order every price array below is aligned to.
 export const rateClasses = ['Input', 'Cache hit', 'Output'];
