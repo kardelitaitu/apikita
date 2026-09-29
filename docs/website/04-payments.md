@@ -134,11 +134,11 @@ usage reconciliation is a revenue-correctness control (see
 
 ## Security checklist
 
-- [x] Server key only in server env; never shipped to the client. **Verified:** no `server_key`/`MIDTRANS_SERVER_KEY` reference exists anywhere in `website/src`; the server reads it from the environment only (`webhooks.rs:99`).
-- [x] Signature verified on every webhook. **Verified:** `verify_midtrans_signature` is called before the status is even read (`webhooks.rs:128`), and an unusable/empty key refuses to verify rather than accepting anything (`is_usable_server_key`).
-- [x] Amount validated against the stored order, not the payload. **Verified:** the settle `UPDATE` carries `AND amount_idr = ?` as a guard (`db.rs:140`), so a mismatched amount settles nothing and reports `AmountMismatch`.
+- [x] Server key only in server env; never shipped to the client. **Verified:** no `server_key`/`MIDTRANS_SERVER_KEY` reference exists anywhere in `website/src`; the server reads it from the environment only, in `handle_midtrans_webhook` (`server/src/routes/webhooks.rs`).
+- [x] Signature verified on every webhook. **Verified:** `verify_midtrans_signature` is called before the status is even read, at the top of `handle_midtrans_webhook` (`server/src/routes/webhooks.rs`), and an unusable/empty key refuses to verify rather than accepting anything (`is_usable_server_key`).
+- [x] Amount validated against the stored order, not the payload. **Verified:** the settle `UPDATE` in `credit_topup_transaction` carries `AND amount_idr = ?` as a guard (`server/src/db.rs`), so a mismatched amount settles nothing and reports `AmountMismatch`.
 - [x] Crediting idempotent by `order_id`. **Verified:** `order_id` is `UNIQUE` in the schema, and the settle requires `status = 'pending'`, so a replay is `AlreadySettled`.
-- [x] Crediting atomic with the `topups` status update. **Verified:** the status update, the wallet credit and the ledger row are one `BEGIN IMMEDIATE` transaction, committed once (`db.rs:128-209`).
+- [x] Crediting atomic with the `topups` status update. **Verified:** the status update, the wallet credit and the ledger row are one `BEGIN IMMEDIATE` transaction in `credit_topup_transaction`, committed once (`server/src/db.rs`).
 - [x] No client-side path can write `balance_idr`. **Verified:** the only writers are wallet creation at zero (`auth.rs`) and the guarded debit in the proxy; no route accepts a balance from a request body.
 - [x] Top-up creation: **5/hour per account** (`decisions.md`).
 - [ ] Reconciliation runs monthly and is reviewed.

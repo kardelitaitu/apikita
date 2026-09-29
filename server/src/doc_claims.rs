@@ -633,6 +633,80 @@ mod tests {
                 "{name} is excluded with an empty reason, which is not an exclusion"
             );
         }
+
+        // A SECOND ASSERTION ON THE SAME LIST: an excluded document must carry no line
+        // citation left to go stale, unless the line number IS its content.
+        //
+        // The case this exists for: a frontend spec was excluded with a reason about
+        // TEST COVERAGE, which is a different question from whether a citation in it can
+        // mislead, and its citation had already drifted to a line about something else
+        // entirely. Being well-tested is not a reason, because a test passes whichever
+        // line a citation lands on.
+        //
+        // The exception has one shape - a document where converting the citation would
+        // destroy what is being said. A historical plan says what was believed when it
+        // was written and the drift is how a reader sees it has aged. ci-cd.md is a
+        // document ABOUT citations, so its line numbers are quoted examples of wrong
+        // ones. The frontend security table cites Go source inside the PocketBase
+        // container, which is not vendored here, and says so in the row.
+        const LINE_NUMBER_IS_THE_CONTENT: &[&str] = &[
+            "plans/proxy-hot-path-audit.md",
+            "plans/sqlite-migration.md",
+            "ci-cd.md",
+            "website/05-security-decisions.md",
+        ];
+
+        for (name, _) in TRIAGED {
+            if LINE_NUMBER_IS_THE_CONTENT.contains(name) {
+                continue;
+            }
+            let text = std::fs::read_to_string(doc_path(name)).unwrap_or_default();
+            assert!(
+                !cites_a_path_by_line(&text),
+                "docs/{name} is excluded from the citation check but still cites a file by LINE, which is exactly the drift the check exists to catch. Either the exclusion reason is the wrong KIND - a reason about coverage rather than about whether a citation can mislead - or the citation needs converting to a name. A document where the line number is the content belongs in LINE_NUMBER_IS_THE_CONTENT."
+            );
+        }
+    }
+
+    /// Whether a body cites a PATH by line number, as in db.rs:140.
+    ///
+    /// Three false positives shaped this, and each one was found by pointing the check at
+    /// the real documents rather than at a sample:
+    ///
+    /// - 06:00, a clock time, in a document about off-peak pricing.
+    /// - http://localhost:8080, a URL with a port.
+    /// - version 1.5, a version number.
+    ///
+    /// So the test is an EXTENSION: a dot followed by one to six letters at the end of
+    /// the token before the colon. Every real citation has one (db.rs, api-spec.md,
+    /// record_auth_with_oauth2.go, docker-compose.yml); none of the three has one.
+    fn cites_a_path_by_line(text: &str) -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if *c != ':' || !chars.get(i + 1).is_some_and(char::is_ascii_digit) {
+                continue;
+            }
+            let mut start = i;
+            while start > 0
+                && (chars[start - 1].is_alphanumeric()
+                    || chars[start - 1] == '.'
+                    || chars[start - 1] == '/'
+                    || chars[start - 1] == '-'
+                    || chars[start - 1] == '_')
+            {
+                start -= 1;
+            }
+            let run: String = chars[start..i].iter().collect();
+            // An extension, not merely a dot: `v1.5` has a dot and is not a citation.
+            let Some(dot) = run.rfind('.') else {
+                continue;
+            };
+            let ext = &run[dot + 1..];
+            if !ext.is_empty() && ext.len() <= 6 && ext.chars().all(|e| e.is_ascii_alphabetic()) {
+                return true;
+            }
+        }
+        false
     }
     /// The scanner itself, because a check that cannot find a citation it should find
     /// is a check that always passes. These are the shapes the rule exists to catch, and
