@@ -184,11 +184,20 @@ config types, in three test fixtures, and in the parser key list - and is read b
 nothing. Every one of those seven is a declaration, a literal, or a string, and none is
 an expression that affects behaviour.
 
-So this measurement cannot find PARSED BUT UNREAD configuration, which is a real
-category here and the one most likely to be mistaken for a working setting by whoever
-put it in the file. Distinguishing a field declaration from a field read needs real
-analysis rather than a name search: count the occurrences, and a field that changes
-behaviour will appear in a comparison or an arithmetic, not only in a struct literal.
+**THIS PARAGRAPH WAS WRONG AND WAS CORRECTED HERE, which is the whole reason it is
+worth reading.** It used to say the measurement cannot find PARSED BUT UNREAD
+configuration. It can: the fix was to require a FIELD ACCESS rather than a name, so a
+struct declaration, a fixture literal and the parser key list stopped counting as uses.
+That change found seventeen such keys, and `config/apikita.toml` now marks each one
+where it is set. This file was the authority the config comments pointed at, so a stale
+claim here was actively misleading a reader rather than merely out of date.
+
+What remains true of the name search is worth keeping, because it is the weaker tool and
+still the one people reach for: counting occurrences does not distinguish a declaration
+from a read, and a field that changes behaviour appears in a comparison or an arithmetic
+rather than only in a struct literal. A leading dot does. The measurement is still a
+heuristic - a key read through a macro or a generated accessor would be missed - and the
+honest description of its limit is that one, not the one this paragraph used to give.
 
 That is a heuristic and is described as one. Doing it properly means following uses of
 a field rather than searching for its name, which is what a call graph is for. Until
