@@ -234,6 +234,17 @@ max_key_attempts = 3
 #   "queue"      - hold the request until capacity frees (needs a queue)
 #   "reject_503" - fail fast with Retry-After
 # "reject_503" is the honest default for a proxy: the caller can retry.
+# RECORDED, NOT A SWITCH. Nothing reads on_pool_exhausted, and the behaviour it
+# names is what the code does unconditionally: when no key can be leased the underlying
+# error is WITHHELD from the client and surfaced as a 503 with Retry-After
+# (routes/proxy.rs). Setting this to fail_open would change nothing, and the key is
+# where someone would first try. The same is true of the three keys noted at the health
+# check below: health_check_interval_seconds, health_check_failures and
+# mid_stream_cutoff. On that last one the value is the CURRENT behaviour and it is
+# fortunate rather than coordinated - the pre-flight hold IS taken before routing and
+# an insufficient balance IS refused up front (routes/proxy.rs), which is the
+# mitigation the key describes, but it happens because the code does it, not because
+# this is set to false.
 on_pool_exhausted = "reject_503"
 
 [circuit_breaker]
