@@ -192,6 +192,27 @@ pub async fn handle_midtrans_webhook(
                     );
                     (StatusCode::OK, Json(json!({"status": "already_settled"})))
                 }
+                // NOT AN ALERT AND A 404, AND BOTH ARE WORTH A SECOND LOOK. The two
+                // neighbouring rejections are more careful than this one: an amount
+                // mismatch emits the documented `topup.rejected` event, which is what the
+                // `webhook_rejection` alert fires on, and an unverifiable signature emits
+                // its own. This arm warns and stops - so a payment for an order we do not
+                // have, which means a customer paid and we cannot credit them, is visible
+                // only in a log line nobody is required to read.
+                //
+                // The 404 is the other half. Midtrans, like most senders, treats a non-2xx
+                // as a failed delivery and retries on its own schedule, so a condition
+                // that can never succeed - the order does not exist and never will - is
+                // answered in a way that invites the sender to keep asking. A 200 with a
+                // refusal body would stop the retries; the credit behaviour is identical
+                // either way, since `NotFound` means no row and no row means no credit.
+                //
+                // NEITHER IS DECIDED HERE, because both are judgements about the payment
+                // provider's contract rather than bugs: 404 is more honest to the sender
+                // about what happened, and retrying is harmless for an unknown order while
+                // an alert that fires on every stray webhook trains people to ignore it.
+                // What is not defensible is leaving it undocumented, which is what this
+                // comment is for.
                 Ok(TopupCreditResult::NotFound) => {
                     warn!(
                         order_id = %payload.order_id,
