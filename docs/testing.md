@@ -71,6 +71,29 @@ So: automated checking here is excellent at pinning a stated rule to a stated
 instant, and blind to two rules quietly disagreeing. The first is a test. The
 second is a review.
 
+### One duplication that cannot be tested at all, and currently agrees
+
+The stranded-hold detector - a money invariant, because a stranded hold is
+invisible money - exists in **two languages**: the query in
+`server/src/bin/hold-sweep.rs` and an equivalent one in
+`.docker/maintenance/entrypoint.sh`, because the scheduler image does not ship the
+Rust binary. Both comments insist the predicate is the same, and both are right
+to: identical `ref LIKE 'reserve_%' AND delta_idr < 0`, grouped by account and ref,
+with no positive row under the same ref. They differ only in what the caller does
+next - the binary joins `accounts` to name the customer it may credit, and the
+scheduler applies an age bound so it does not report a hold still inside its
+settlement window. **Those are different jobs, and the difference is right.**
+
+Nothing tests that they agree, and nothing cheaply could: one is a Rust string
+constant, the other a shell heredoc. Both are exercised - CI seeds a stranded
+hold and asserts the scheduler's sweep fires, and the binary has its own tests -
+but each is tested alone, which is precisely the blind spot above. A drift here
+would mean the nightly job silently reporting nothing while the host binary still
+works, or the reverse.
+
+It is recorded here so the next reader does not assume the agreement is covered
+by a test. It is currently true; it is true by reading, not by assertion.
+
 ## Three habits that decide whether any of it works
 
 **Mutation-verify a guard.** A check that has never been seen to fire is a check
