@@ -722,6 +722,21 @@ mod tests {
         })
         .collect();
 
+        // NINE OF TWENTY-SEVEN, and one of the nine is `log`, a file type this repository
+        // does not have. So the list was written from imagination rather than measured, and it
+        // happens to be adequate rather than correct: the eighteen extensions it does not name
+        // (conf, css, env, html, js, json, mjs, py, svg, txt, and the rest) are not currently
+        // referenced after `limits.`, so nothing is being missed today.
+        //
+        // THE LIMIT IS STATED rather than the list widened, and the reason is the one this file
+        // keeps hitting: a hand-kept exclusion list is a second copy of a fact, and it goes
+        // stale silently. Deriving the set from the repository's actual extensions would remove
+        // the list, at the cost of a walk on every run - which is the right trade only once a
+        // false positive has actually appeared.
+        //
+        // THE TRIGGER: if this guard ever reports a key that is a file, the fix is to derive
+        // the set, not to append another stem. Appending is how a list becomes today's
+        // vocabulary rather than today's truth.
         const FILE_STEMS: &[&str] = &["md", "rs", "ts", "sh", "sql", "yml", "toml", "log", "astro"];
 
         // Every markdown a reader of the product would be shown, and every file the
