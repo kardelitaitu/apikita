@@ -123,6 +123,13 @@ pub mod db;
 /// Compiled out of every non-test build, like `test_support`.
 #[cfg(test)]
 mod doc_claims;
+/// Test-only: checks the SCHEMA against the promises the customer-facing pages make
+/// about it — above all that no request-path table holds request or response
+/// text, which is what lets the privacy page say we are a proxy and not a data
+/// processor. Its own module because it reads a migration file rather than a
+/// document, and `doc_claims` would then have been a name that lied.
+#[cfg(test)]
+mod doc_schema;
 pub mod error;
 pub mod ip_tracking;
 pub mod money;
