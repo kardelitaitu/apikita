@@ -435,6 +435,20 @@ also what the fourteen-document check asks for. That is slower, and it is the po
 check exists to keep a comment honest, and the fastest way to make a comment dishonest
 is to rewrite it without reading it.
 
+**AND THE RATE, MEASURED ON THE LARGEST CLUSTER, IS WHY.** Twenty-three source
+comments cite the JSON example or the field table in `docs/error-model.md` — the single
+biggest cluster in the crate. Reading all twenty-three against the document found **four
+that pointed at the wrong key**: two claimed `request_id` where the line held `code`,
+one claimed `code` where the line held the opening brace, one claimed `details` where
+the line held `message`. Roughly **one in six is wrong**, and every one of them still
+read as a plausible citation.
+
+A script converts all twenty-three uniformly and has no way to notice that four of them
+were lying. Reading them found four real mistakes in one pass, and would find roughly
+twenty-five more across the remaining 149 on the same ratio. That is the whole
+justification: the work is not typing, it is the reading, and the reading is the only
+part a machine cannot do.
+
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually
 runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was

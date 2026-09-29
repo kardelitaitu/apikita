@@ -714,7 +714,7 @@ mod tests {
         let e = error_object(&body);
         assert!(
             e.get("details").is_none(),
-            "docs/error-model.md:28 - details is optional; it must be absent, not null"
+            "docs/error-model.md, Response shape - details is optional; it must be absent, not null"
         );
     }
 
@@ -763,7 +763,7 @@ mod tests {
         assert_ne!(
             first,
             error_object(&other)["request_id"].as_str().unwrap(),
-            "a constant request_id correlates with nothing (docs/error-model.md:27)"
+            "a constant request_id correlates with nothing (docs/error-model.md, Response shape)"
         );
     }
 

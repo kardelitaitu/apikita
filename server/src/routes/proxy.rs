@@ -3012,7 +3012,8 @@ mod tests {
     #[test]
     fn every_error_event_carries_a_fresh_documented_request_id() {
         // Per-event, not per-process: the same inputs must not produce the same
-        // id, or it correlates with nothing (docs/error-model.md:27).
+        // id, or it correlates with nothing (docs/error-model.md, Response shape:
+        // request_id correlates with logs).
         let first = request_id_of(&error_event("upstream_failed", "boom"));
         let second = request_id_of(&error_event("upstream_failed", "boom"));
         assert_ne!(first, second, "request_id must be generated per event");
@@ -4054,7 +4055,8 @@ mod tests {
     // permitted to use it."
     //
     // The order is only observable through the error the caller gets back, so
-    // these tests assert the documented `code` (docs/error-model.md:25 - "code
+    // these tests assert the documented `code` (docs/error-model.md, Response shape -
+    // "code
     // is the contract; message is not") and, for the leak itself, that the
     // answer is IDENTICAL at a generous balance and at zero.
     //
