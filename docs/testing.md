@@ -196,6 +196,37 @@ then the honest statement is: this catches what is entirely unreferenced, and a
 configuration key that is referenced in a struct and nowhere else still looks healthy
 to it.
 
+### Six guards that passed when the thing they checked was wrong
+
+A guard is proven by CHANGING the thing it checks. A green guard proves nothing on
+its own, and six in this repository were green against defects:
+
+| The guard compared | Against | Found by |
+| --- | --- | --- |
+| a word list | the privacy page's own sentence | adding `raw_text` to the claim |
+| `**90 days**` | the document's markdown | unbolding a cell |
+| a shared decode helper | nothing - it was simply assumed | seeding a DATE-keyed row |
+| one straddling seed | the other table's window | swapping one constant for a neighbour's |
+| a hand-kept `SWEEP` list | the entrypoint that enforces it | 30 to 45 in the script |
+| two constants | a document it never opened | renaming the test to what it did |
+
+The last is the clearest and the worst. `the_retention_windows_match_the_privacy_statement`
+read no privacy statement: its whole body was `assert_eq!(SEEN_RETENTION_DAYS, 7)` and
+`assert_eq!(DAILY_RETENTION_DAYS, 90)` - a hand-kept copy of two numbers compared to two
+constants. The name promised a document the body never touched.
+
+**WHAT ALL SIX HAVE IN COMMON IS A RESTATEMENT.** Each one compared a COPY of the thing
+to a source, and a copy that is correct says nothing about the original. The fix is
+always the same shape and it is not a bigger test: read the ORIGINAL. Parse the number
+out of the script, open the page, find the row by its own text. The moment a check holds
+a literal that restates something, the literal is the weak part and the check is theatre.
+
+**THE TEST THAT FINDS IT.** Change the thing, run the guard, and read the result. That is
+five minutes, and it found six defects that no amount of reading had. The corollary
+matters just as much: a mutation that BREAKS THE BUILD has shown the wiring is
+load-bearing, which is weaker evidence than an assertion failing - a compile error says
+this name matters, a failed assertion says this value does.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
