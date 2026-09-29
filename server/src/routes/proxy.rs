@@ -24,7 +24,7 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -248,12 +248,6 @@ pub fn models_with_no_healthy_endpoint() -> Vec<String> {
         .filter(|name| upstream.all_endpoints_unhealthy(name))
         .map(str::to_string)
         .collect()
-}
-
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 /// Whether `model` is permitted for a key whose stored allowlist is
@@ -1130,7 +1124,22 @@ pub async fn chat_completions(
         .ok_or(AppError::Unauthenticated)?
         .trim();
 
-    let key_hash = hash_string(presented_key);
+    // THE ONE FUNCTION, and it has to be the one keys.rs WRITES with.
+    //
+    // This used to be a private hash_string here. The column api_keys.key_hash is
+    // written by create_key using routes::hash_token and read here, so the credential
+    // was accepted or refused by one function and issued by another, in the same
+    // column, with nothing asserting they agreed. They were byte-identical, so every
+    // key worked; a future edit to either would have made EVERY API KEY stop
+    // authenticating, with no compile error and no obvious cause.
+    //
+    // It is worth being honest about what pins this now: a TEST CANNOT. A test
+    // asserting the two ends agree would call one function and compare it to the
+    // other, which is true by construction the moment they are the same function
+    // and says nothing if someone reintroduces a copy. The guarantee is STRUCTURAL -
+    // there is only one function - and the comment is here so the next reader knows
+    // that is what is holding it, rather than assuming a test is.
+    let key_hash = crate::routes::hash_token(presented_key);
 
     // Served from the TTL cache when warm, from the database otherwise. The
     // checks below are identical either way - only the age of the row differs.
@@ -3138,7 +3147,7 @@ mod tests {
         )
         .bind(id.hyphenated())
         .bind(account_id.hyphenated())
-        .bind(hash_string(plaintext))
+        .bind(crate::routes::hash_token(plaintext))
         .bind(serde_json::to_value(models).expect("models as JSON"))
         .bind(chrono::Utc::now())
         .execute(pool)
@@ -4083,7 +4092,7 @@ mod tests {
         )
         .bind(id.hyphenated())
         .bind(account_id.hyphenated())
-        .bind(hash_string(plaintext))
+        .bind(crate::routes::hash_token(plaintext))
         .bind(serde_json::to_value(models).expect("models as JSON"))
         .bind(spend_limit_idr)
         .bind(chrono::Utc::now())
@@ -4485,7 +4494,7 @@ mod tests {
         let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
         sqlx::query("UPDATE api_keys SET expires_at = ? WHERE key_hash = ?")
             .bind(chrono::Utc::now() - chrono::Duration::hours(2))
-            .bind(hash_string(&key))
+            .bind(crate::routes::hash_token(&key))
             .execute(&pool)
             .await
             .expect("expire the key");
@@ -4511,7 +4520,7 @@ mod tests {
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
         sqlx::query("UPDATE api_keys SET rate_limit_rpm = 1 WHERE key_hash = ?")
-            .bind(hash_string(&key))
+            .bind(crate::routes::hash_token(&key))
             .execute(&pool)
             .await
             .expect("cap the key at one request per minute");
@@ -4538,7 +4547,7 @@ mod tests {
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
         sqlx::query("UPDATE api_keys SET token_limit = 1 WHERE key_hash = ?")
-            .bind(hash_string(&key))
+            .bind(crate::routes::hash_token(&key))
             .execute(&pool)
             .await
             .expect("cap the key at one token");
