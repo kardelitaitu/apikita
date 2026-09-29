@@ -1231,7 +1231,13 @@ mod tests {
         // schema, and this is precisely a check where an empty set means nothing:
         // zero columns would trivially contain no prompt column.
         assert!(
-            columns.len() >= 60,
+            // RAISED from 60 to 90. The schema declares 119 columns, so a floor of 60 was
+            // set from a measurement taken when the schema was smaller and drifted LOOSE as
+            // it grew - it would pass on a scan that read half the columns, which is this
+            // check missing a table entirely. The same rule as the tight floors, running
+            // the other way: a floor not re-derived as the content moves stops being a
+            // guard in whichever direction it was not watching.
+            columns.len() >= 90,
             "only {} column(s) were read from the migrations, so this test is not looking at the real schema.",
             columns.len()
         );
@@ -1711,7 +1717,10 @@ mod tests {
         // silent: a parse that found nothing, and a glob that matched only the first
         // migration - which is what it used to do.
         assert!(
-            files >= 4,
+            // Four migrations, so the floor is two. Set AT the count this was a tripwire:
+            // it fires when a file is deleted and says nothing about a walk that stopped
+            // early, which is the failure the floor exists to catch.
+            files >= 2,
             "only {files} migration file(s) were read, so a table created by a later migration would be invisible to this test."
         );
         assert!(
