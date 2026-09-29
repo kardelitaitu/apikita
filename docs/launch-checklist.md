@@ -357,3 +357,14 @@ moderation policy, the second-operator threshold, the bot runtime — are open b
    promise is false — check them again before any change to logging or tracking.
 4. Re-check Gate 2 (money correctness) after **any** change to the webhook, the
    ledger, or billing.
+5. **GATE 1 CANNOT BE TICKED FROM THIS REPOSITORY, and that is why it is said here once
+   rather than per item.** Every Gate 1 box is the state of a deployment - a volume, a
+   certificate, a proxy, a backup schedule - and none of them leaves a trace in git. A
+   reader auditing this checklist will go looking for the evidence, find none, and have to
+   decide whether the item is a lie or simply external. It is external. The repository
+   holds the CONFIGURATION for several of them (`.docker/nginx/relay.conf`, `tools/backup/`),
+   and the check tools verify that configuration: `relay-check` proves the relay is
+   configured as written and `backup-check` proves the backup script runs. Neither proves
+   anything is deployed. Configuration is checked; deployment is not, and no test in this
+   repository can make it so.
+
