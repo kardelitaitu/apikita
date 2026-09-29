@@ -275,22 +275,39 @@ else
 fi
 
 # --- the alerts this cannot deliver, stated on EVERY run ---------------------
-# Three of the eight are covered by tools/alert/probe.sh, which needs no database
+# SEVEN of the eight are covered by tools/alert/probe.sh, which needs no database
 # at all. They stay listed, marked, so nobody reads "not checked here" as "not
 # checked anywhere" - and so nobody claims this script covers them.
+#
+# THIS USED TO SAY THREE, AND NAMED THREE, WHILE probe.sh MARKED SEVEN COVERED. The
+# four it did not name were refund_refusal, error_rate, all_providers_unhealthy and
+# db_disk - all four listed below with no "covered elsewhere" note, and two of them
+# (all_providers_unhealthy, db_disk) read as though a metrics backend were the gap
+# to close. probe.sh has read the operator metrics route for all of them since the
+# ServerErrorCounter work landed. An operator reading this block would have gone
+# looking for a backend that already exists.
+#
+# The count is derived from probe.sh's own list and asserted in tools/alert-check,
+# because a hand-maintained count of what another file covers is the same class of
+# bug twice over.
 cat >&2 <<'NOTCOVERED'
 check-alerts: NOT CHECKED HERE (needs a metrics backend, an external probe or a log counter):
 check-alerts:   webhook_rejection  - COVERED BY tools/alert/probe.sh (counts the log line). No SQL
 check-alerts:                        can answer it: server/src/routes/webhooks.rs emits it as a
 check-alerts:                        structured LOG line (warn! at :116, error! at :188) and no
 check-alerts:                        counter column exists.
+check-alerts:   refund_refusal     - COVERED BY tools/alert/probe.sh (counts the log line).
 check-alerts:   api_down           - COVERED BY tools/alert/probe.sh (external GET /health probe).
 check-alerts:   relay_down         - COVERED BY tools/alert/probe.sh (external probe of the relay).
-check-alerts:   relay_5xx          - nginx access-log status counts; access logs are disabled for
-check-alerts:                        privacy (docs/edge-relay.md). Needs a metrics backend.
-check-alerts:   all_providers_unhealthy - upstream circuit-breaker state, in-process
-check-alerts:   db_disk            - volume usage
-check-alerts:   error_rate         - HTTP counters over a 5-minute window
+check-alerts:   error_rate         - COVERED BY tools/alert/probe.sh (GET /api/admin/metrics as
+check-alerts:                        an operator; alerts above a 5% 5xx rate).
+check-alerts:   all_providers_unhealthy - COVERED BY tools/alert/probe.sh (GET /api/admin/metrics;
+check-alerts:                        alerts when a model has NO usable endpoint).
+check-alerts:   db_disk            - COVERED BY tools/alert/probe.sh (the retention report on
+check-alerts:                        /api/admin/metrics; a table holding a row past its window).
+check-alerts:   relay_5xx          - NOT COVERED BY ANYTHING. nginx access-log status counts;
+check-alerts:                        access logs are disabled for privacy (docs/edge-relay.md).
+check-alerts:                        Needs a metrics backend, and it is the one real gap.
 check-alerts: Full table: tools/alert/README.md. Every definition: tools/alert/alert.sh --list
 NOTCOVERED
 

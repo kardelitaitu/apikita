@@ -181,6 +181,8 @@ esac
 # a drifted one convincing. So this checks both the set and the references.
 OBS="$REPO/docs/observability.md"
 TSV="$REPO/tools/alert/alerts.tsv"
+PROBE="$REPO/tools/alert/probe.sh"
+ALERT_CHECK="$REPO/tools/alert/check-alerts.sh"
 if [ ! -f "$OBS" ] || [ ! -f "$TSV" ]; then
     fail "cannot read $OBS and $TSV, so the alert definition was not compared"
 else
@@ -322,6 +324,36 @@ else
     }
 fi
 
+
+#   WHAT probe.sh ACTUALLY COVERS vs WHAT check-alerts.sh CLAIMS IT COVERS.
+#
+#   Two files describe the same fact - which alerts are automated - and they did not
+#   agree. check-alerts.sh said "Three of the eight are covered by tools/alert/probe.sh"
+#   and annotated three; probe.sh marked SEVEN covered. Four went unmentioned, and two
+#   of them (all_providers_unhealthy, db_disk) were listed as though a metrics backend
+#   were the gap to close, when probe.sh has been reading the operator metrics route
+#   for them since the ServerErrorCounter work landed.
+#
+#   An operator reading that block would have gone looking for a backend that already
+#   exists, and relay_5xx - the ONE real gap - was buried among four already closed.
+#   That is the worst shape for a coverage list: it makes closed items look open, so
+#   the open one is not acted on.
+#
+#   Read from probe.sh itself rather than from a list kept here, because a
+#   hand-maintained count of what another file covers is the same bug twice over.
+COVERED_BY_PROBE=$(grep -o '"[a-z_0-9]*" "covered"' "$PROBE" | sed 's/"//g; s/ covered//' | sort -u)
+
+# The fixture guard: if probe.sh could not be read, COVERED_BY_PROBE is empty and every
+# comparison below would vacuously pass, which is the failure this check exists to stop.
+if [ -z "$COVERED_BY_PROBE" ]; then
+    fail "could not read the covered alerts from $PROBE - the comparison below did not happen"
+else
+    for id in $COVERED_BY_PROBE; do
+        grep -q "$id.*COVERED BY tools/alert/probe.sh" "$ALERT_CHECK" || {
+            fail "check-alerts.sh does not say that $id is COVERED BY tools/alert/probe.sh, but probe.sh marks it covered. An alert that is automated but listed as needing a metrics backend sends an operator to build one that already exists."
+        }
+    done
+fi
 
 if [ "$FAILED" -ne 0 ]; then
     echo "alert-check: the alert delivery contract is BROKEN (see above)" >&2
