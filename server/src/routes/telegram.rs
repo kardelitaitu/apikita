@@ -259,8 +259,16 @@ pub async fn issue_link_code(
     let mut tx = crate::db::begin_immediate(&state.pool).await?;
 
     // Abuse guard: how many codes this ACCOUNT has issued this hour. Note this is
-    // the account cap, not the guessing cap - it bounds codes in flight, and
+    // the account cap, not the guessing cap - it bounds issuance VOLUME, and
     // the per-IP redemption cap is what stops the brute force.
+    //
+    // COUNTS link_code_issues, NOT link_codes, and that is the fix rather than a
+    // detail. It used to count link_codes - which 20260926000000 records as
+    // deliberate - and that was true when written and stopped being true when the
+    // DELETE below was added for the one-live-code guarantee. The DELETE makes the
+    // row count always 0 or 1, so a cap of 10 could never be approached: the guard
+    // parsed, ran, and did nothing. Issuances are recorded in a table that survives
+    // the delete, so the count means what the cap says it means.
     //
     // INSIDE THE TRANSACTION, which is NECESSARY BUT NOT SUFFICIENT here - and the
     // second half of that sentence is the more important half.
@@ -288,13 +296,27 @@ pub async fn issue_link_code(
     // correct, and necessary once the counting is.
     abuse::enforce_creation_cap_in(
         &mut tx,
-        "link_codes",
+        "link_code_issues",
         link_code_window(),
         state.config.limits.link_code_issuance_per_hour,
         account_id,
         now,
     )
     .await?;
+
+    // The ISSUANCE RECORD, in this same transaction and stamped with the same
+    // `now` as the cap check above.
+    //
+    // It has to be here and not after the commit: a record written outside the
+    // transaction would be a second failure mode, in which the code exists but the
+    // issuance was never counted and the next caller is admitted too - the exact
+    // defect this table exists to remove, reintroduced one line down. Together with
+    // the cap check, the count and the record commit as one fact.
+    sqlx::query("INSERT INTO link_code_issues (account_id, created_at) VALUES (?, ?)")
+        .bind(account_id.hyphenated())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
 
     // One live code per account. Deleting the predecessor inside the same
     // transaction as the insert means a crash cannot leave two live codes.
@@ -1075,36 +1097,39 @@ mod tests {
         db.close().await;
     }
 
-    /// THE ISSUANCE CAP NOW HOLDS UNDER CONCURRENCY.
+    /// THE ISSUANCE CAP NOW FIRES, and under concurrency.
     ///
-    /// The cap was a COUNT on the pool with the INSERT it governs inside a separate
-    /// transaction, so concurrent callers all read the same number and all issued a
-    /// code. It is now inside that transaction, alongside the DELETE that keeps one
-    /// live code per account - so the count and the row it bounds commit together.
-    ///
-    /// THIS GUARD IS DEAD, and the test is how that is known.
-    ///
+    /// This guard was DEAD, and the way that was found is the part worth keeping.
     /// `link_code_issuance_per_hour` is documented in docs/server/api-spec.md and
     /// docs/decisions.md as bounding how many link codes an ACCOUNT may issue in an
-    /// hour. It does not bound that, because it cannot fire: it counts rows in
-    /// `link_codes`, and `issue_link_code` DELETES every row for the account before
-    /// inserting the new one - so the count is always 0 or 1, and a cap of 10 is
-    /// never approached.
+    /// hour, and migration 20260926000000 records the design: it counts `link_codes`
+    /// rows, "which the existing table already carries (account_id, created_at), so
+    /// it needs nothing new and reuses abuse::enforce_creation_cap unchanged."
     ///
-    /// The first version of this test asserted the opposite, and failed with "1 codes
-    /// issued for an account whose cap is 10 (18 answered 200, 0 refused)". The 1
-    /// was the giveaway rather than the problem: the DELETE means the table can only
-    /// ever hold one row for the account, so the row count CANNOT measure the cap
-    /// whatever the cap does. The number that measures it is how many requests were
-    /// ADMITTED, and every one of them was.
+    /// That was true when written and stopped being true when issue_link_code gained
+    /// the DELETE that keeps one live code per account. The DELETE makes the row
+    /// count always 0 or 1, so a cap of 10 was never approached: the guard parsed,
+    /// ran, and did nothing.
     ///
-    /// So this is a characterisation test: it pins the defect rather than the
-    /// intent, and it fails the moment the cap starts working - at which point it
-    /// should be rewritten to assert the refusal instead. It is here because a
-    /// documented abuse guard that does nothing is invisible in every other way:
-    /// the config parses, the code path runs, and the tests are green.
+    /// A test written to assert the OPPOSITE is what surfaced it, failing with "1
+    /// codes issued for an account whose cap is 10 (18 answered 200, 0 refused)". The
+    /// 1 was the giveaway rather than the problem - the table can only ever hold one
+    /// row for the account, so the row count CANNOT measure the cap whatever it
+    /// does. The number that measures it is how many requests were ADMITTED, and
+    /// every one of them was.
+    ///
+    /// The fix is a table that survives the delete: issuances are recorded in
+    /// `link_code_issues`, the cap counts that, and the count and the record commit
+    /// in the same transaction as the code itself. Superseding the old rows instead
+    /// would have fixed the count too, but the DELETE is what expresses the
+    /// one-live-code guarantee, and a second mechanism for it is a second thing to get
+    /// wrong.
+    ///
+    /// The assertion is EXACT rather than approximate: a burst of cap+8 produces
+    /// exactly `cap` admissions, the rest are refused, exactly one issuance row is
+    /// written per admission, and exactly one code survives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_link_code_issuance_cap_cannot_fire_because_it_counts_rows_the_handler_deletes() {
+    async fn the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests() {
         let db = TestDb::new().await;
         let account = test_support::account(&db.pool).await;
         let state = state_for(db.pool.clone());
@@ -1137,33 +1162,51 @@ mod tests {
             }
         }
 
-        // The row count is the DELETEs visible, not the issues - which is the
-        // defect, restated in the form that made it visible.
+        // The cap must hold EXACTLY, under a burst, against a table that survives
+        // the delete. A test allowing a small overshoot would pass against the old
+        // link_codes counting on a fast machine - which is the whole problem the old
+        // counting had, since it could not fire at all.
+        let burst = limit as usize + 8;
+        assert_eq!(
+            issued, limit as usize,
+            "{issued} of {burst} concurrent issues were admitted against a cap of \
+             {limit}, with {refused} refused. The count and the record commit in one \
+             transaction, so the cap must hold EXACTLY"
+        );
+        assert_eq!(
+            refused,
+            burst - limit as usize,
+            "every request past the cap must be refused, and refused with 429 rather \
+             than silently succeeding"
+        );
+
+        // The issuance record is what makes the cap countable, so it is asserted
+        // directly: exactly one row per ADMITTED issue, not per surviving code.
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM link_code_issues WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count the issuance record");
+        assert_eq!(
+            recorded,
+            i64::from(limit),
+            "one issuance row per admitted issue: a refused request must not leave a \
+             record, or the cap would ratchet on every attempt and refuse an account \
+             that never actually issued anything"
+        );
+
+        // And the one-live-code guarantee is untouched by any of this.
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_codes WHERE account_id = ?")
             .bind(account.hyphenated())
             .fetch_one(&db.pool)
             .await
             .expect("count the surviving rows");
-
         assert_eq!(
             rows, 1,
-            "only one code may survive per account, whatever the cap does - and this \
-             is exactly why the cap cannot see how many were ISSUED"
-        );
-
-        let burst = limit as usize + 8;
-        assert_eq!(
-            issued, burst,
-            "{issued} of {burst} concurrent issues were admitted against a cap of \
-             {limit}, with {refused} refused. A cap that counts rows this handler \
-             deletes can never fire; if this assertion fails the cap has started \
-             working and this test should be rewritten to assert the refusal"
-        );
-        assert_eq!(
-            refused, 0,
-            "no request may be refused while the cap cannot fire; a refusal here \
-             would mean something else is limiting issuance, and the character above \
-             would be wrong"
+            "only one code may survive per account, whatever the cap does - the \
+             guarantee the DELETE exists for, and the reason the cap needed a \
+             separate table rather than a change to this one"
         );
 
         db.close().await;
