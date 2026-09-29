@@ -165,9 +165,19 @@ statement is false.**
       through the handler with a capturing subscriber installed at TRACE and asserts the
       sentinel never appears, with a positive control so silence cannot pass.
 - [x] No raw IP address is persisted; only a salted hash, salt deleted daily.
-      the module doc of `ip_tracking` ("**no raw IP is stored anywhere**. What is stored
-      is an HMAC ... under a salt that changes every day and is never written down"),
-      and the `DailySalt` docs (salt in memory, OS RNG, replaced at the UTC boundary).
+      **Enforced by a test**, not a review: `the_salt_is_stable_within_a_day_and_replaced_across_days`
+      (`server/src/ip_tracking.rs`) asserts the same day yields the same salt, the next day
+      mints a new one, and the replacement is then stable for the rest of that day - so the
+      property that matters is "a hash from yesterday cannot be recomputed today", and all
+      three halves of it are checked.
+      The module doc of `ip_tracking` states the rest — "**no raw IP is stored anywhere**. What
+      is stored is an HMAC ... under a salt that changes every day and is never written
+      down" — and `DailySalt` documents the salt as living in memory, from the OS RNG,
+      replaced at the UTC boundary. The column names are checked as well, so a migration
+      cannot quietly add a raw address beside them.
+      *This item used to cite only those documents, which understated it: a reader auditing
+      this checklist would conclude the rotation was inspection-only and re-verify it by
+      hand — the exact work the test was written to remove.*
 - [x] API keys stored as hashes only; the plaintext exists once, at creation.
       `create_key` in `server/src/routes/keys.rs` calls `hash_token` on the full key
       BEFORE the insert; only the hash is bound into the row.
