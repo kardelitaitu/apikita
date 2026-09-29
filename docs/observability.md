@@ -104,7 +104,7 @@ Each has a threshold and an action. If you would not act, do not alert.
 | **Relay down** | external check fails | Total outage — single point of failure |
 | **All providers unhealthy** | circuit open on every endpoint | Requests failing; check upstream |
 | **Balance negative** | `balance_idr < 0` | Should be impossible (CHECK constraint). A bug |
-| **DB disk** | any age-based table holding a row past its retention window | Usage rows growing; check retention |
+| **DB disk** | any age-based table holding a row past its retention window — all six, and it could not measure one of the original three until a decode fix | Usage rows growing; check retention |
 | **Error rate >5%** | **Process-lifetime ratio, not a 5-minute window** | Investigate |
 | **Stranded reservation hold** | `reserve_*` negative ledger row with no positive row under the same ref | **Investigate the release path, then credit the account if the hold is lost.** Invisible to the drift query by construction — the hold left the wallet and no offsetting credit was written, so `balance` still equals `SUM(delta)` |
 
