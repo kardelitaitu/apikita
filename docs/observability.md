@@ -114,7 +114,18 @@ action and a coverage verdict — and [`tools/alert/README.md`](../tools/alert/R
 operator's view of it. Two scripts evaluate them without a metrics backend:
 `check-alerts.sh` runs the SQL-answerable checks against the database file, and `probe.sh`
 runs the external ones against `/health` and the relay. `alert.sh` is the transport, with
-Telegram, webhook, file and stdout channels and a per-key cooldown so one incident pages once
+Telegram, webhook, file and stdout channels and a per-key cooldown so one incident pages once.
+
+**WHAT IS AND IS NOT CHECKED BETWEEN THESE TWO LISTS.** `alert-check` fails when an alert
+exists in one and not the other, in both directions — so MEMBERSHIP cannot drift. Wording is
+not compared, and should not be: this table states a condition in prose and the TSV quotes
+one in code, so a literal comparison would fail on formatting rather than on substance.
+That leaves condition and threshold free to drift apart, and two of them have in this
+work — `db_disk` said "any age-based table" while the struct measured three of six, and
+`error_rate` said "5 min window" while the counters were cumulative since process start.
+Both were fixed by hand, in the same commit as the code or the claim that made them true.
+The threshold and the coverage verdict exist ONLY in the TSV; this table has no column for
+either, which is why it is the TSV a reader should treat as the definition.
 rather than once per run.
 
 **And they run on a schedule.** `.docker/maintenance/` invokes both nightly, so a breach
