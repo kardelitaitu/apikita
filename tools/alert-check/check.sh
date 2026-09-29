@@ -355,6 +355,64 @@ else
     done
 fi
 
+#   alerts.tsv's COVERAGE COLUMN vs WHAT probe.sh ACTUALLY COVERS.
+#
+#   The third leg of the same chain. observability.md and alerts.tsv are already
+#   compared above; probe.sh is compared to check-alerts.sh by the guard above. This
+#   closes the loop between the machine-readable DEFINITION and the thing that runs.
+#
+#   A coverage column that is wrong is worse than a missing one: an operator reading
+#   it either trusts an alert that does not fire or stops watching one that does. The
+#   rows are:
+#
+#     7 covered by probe.sh    (the operator metrics route, the log counters, the
+#                               external /health and relay probes)
+#     3 covered by the SQL path in check-alerts.sh (ledger drift, negative balance,
+#                               stranded hold)
+#     1 genuinely uncovered    (relay_5xx, which needs a metrics backend)
+#
+#   So the two independent statements - the tsv's column and probe.sh's own list -
+#   must agree about which is which, and probe.sh names its single gap in its output.
+COVERED_TSV=$(grep -v '^#' "$TSV" | grep -v '^id' | awk -F'	' '$6 == "covered" {print $1}' | sort -u)
+NEEDS_METRICS_TSV=$(grep -v '^#' "$TSV" | grep -v '^id' | awk -F'	' '$6 == "needs-metrics" {print $1}' | sort -u)
+COVERED_PROBE=$(grep -o '"[a-z_0-9]*" "covered"' "$PROBE" | sed 's/"//g; s/ covered//' | sort -u)
+# The trailing quote matters: the line in probe.sh is an echo, so the captured
+# text ends in a double quote, the value came out as relay_5xx-with-a-quote, and this
+# guard failed on its own output.
+# @ as the sed delimiter, NOT /: the pattern contains tools/alert, and a bare
+# slash inside a slash-delimited s command silently ends the pattern early. The first
+# version of this line did exactly that and the guard failed on its own empty output.
+GAP_PROBE=$(sed -n 's@^.*not checked by anything in tools/alert yet: @@p' "$PROBE" | tr -d ' ' | tr -d '"' | tr ',' ' ' | sort -u)
+
+if [ -z "$COVERED_TSV" ] || [ -z "$COVERED_PROBE" ] || [ -z "$GAP_PROBE" ]; then
+    fail "could not read the coverage columns from $TSV or the covered list from $PROBE (tsv_covered=$COVERED_TSV probe_covered=$COVERED_PROBE probe_gap=$GAP_PROBE) - the comparison below did not happen"
+else
+    for id in $COVERED_PROBE; do
+        printf '%s
+' "$COVERED_TSV" | grep -qx "$id" || {
+            fail "probe.sh marks $id covered, but alerts.tsv does not. A coverage column an operator reads is a claim about whether an alert fires; if the two files disagree, one of them is lying and nobody can tell which."
+        }
+    done
+    for id in $GAP_PROBE; do
+        printf '%s
+' "$NEEDS_METRICS_TSV" | grep -qx "$id" || {
+            fail "probe.sh names $id as not covered by anything, but alerts.tsv does not mark it needs-metrics. An alert nothing checks must be the one the table singles out, or it is invisible."
+        }
+    done
+    for id in $COVERED_TSV; do
+        printf '%s
+' "$COVERED_PROBE" | grep -qx "$id" && continue
+        # Not covered by the prober: it must be one of the SQL-path alerts, which
+        # check-alerts.sh runs against the database.
+        case "$id" in
+            ledger_drift | balance_negative | stranded_hold) ;;
+            *)
+                fail "alerts.tsv marks $id covered, but neither probe.sh nor the known SQL-path alerts account for it. Either a check was removed and the table was not updated, or a new alert was added to the table with nothing implementing it."
+                ;;
+        esac
+    done
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "alert-check: the alert delivery contract is BROKEN (see above)" >&2
     exit 1
