@@ -9,6 +9,28 @@
 //!
 //! Thread-safe and dependency-free: one Mutex, no I/O, no clock abstraction.
 
+#![cfg_attr(
+    not(test),
+    // THIS MODULE'S FAILURE MODE IS A PANIC, NOT A WRONG NUMBER, and that is worth
+    // recording because it is the opposite of the money modules.
+    //
+    // `Instant + Duration` does not saturate - a bare `+` that leaves the
+    // representable range PANICS. The breaker holds a Mutex while it does this, so
+    // the panic happens under a lock, on a request, with no field name in sight.
+    //
+    // It took a measurement to find the boundary, and it is further out than the
+    // shape of the code suggests: a trillion seconds - 31,700 years - is fine, and
+    // only a nineteen-digit value panics. So this module is not carrying a live bug.
+    // What it carries is an unvalidated config value reaching an operation that
+    // panics rather than degrading, which is why config.rs now refuses a cooldown
+    // the clock cannot represent at LOAD, where the message can name the field.
+    //
+    // The remaining site here is the backoff multiplication, which is float and
+    // already guarded: cooldown_multiplier is checked for finiteness at its use
+    // site AND at config load, and the result is clamped to cooldown_max_seconds.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use crate::config::CircuitBreakerConfig;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -122,6 +144,22 @@ impl CircuitBreaker {
     /// A request failed (5xx, timeout, transport error). Trips the breaker once
     /// the consecutive-failure threshold is reached, and doubles the cooldown
     /// when a HalfOpen trial fails.
+    /// The `Instant + Duration` below is SAFE only because config.rs refuses a
+    /// cooldown the clock cannot represent, at LOAD, naming the field. A bare
+    /// `Instant + Duration` PANICS rather than saturating, and this runs while the
+    /// breaker lock is held. `inner.cooldown` is `base_cooldown()` or
+    /// `next_cooldown(...)`, and both are bounded by the two cooldown settings that
+    /// validation checks with `checked_add`.
+    ///
+    /// `checked_add` here as well would turn a missed validation into a tripped
+    /// breaker rather than a panic - but the two would then disagree about what "too
+    /// long" means, and the config check is the one that can name the operator's
+    /// mistake. This allow records that the line depends on it.
+    ///
+    /// On the function, not the statement: an attribute on an expression-statement
+    /// needs the unstable `stmt_expr_attributes` feature, and the compiler says so
+    /// rather than accepting it.
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn record_failure(&self) {
         let mut inner = self.lock();
         inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
@@ -165,6 +203,12 @@ impl CircuitBreaker {
 
     /// Multiply the current cooldown by cooldown_multiplier, clamped to
     /// cooldown_max_seconds. A multiplier of 1.0 or less disables the backoff.
+    ///
+    /// SAFE, and the guard is the line below it: a non-finite multiplier falls back
+    /// to 1.0 rather than producing a NaN duration, which the `.min` at the end
+    /// would then have to reason about. `as u64` on a float that is already finite
+    /// and non-negative saturates in Rust, and the result is clamped regardless.
+    #[allow(clippy::arithmetic_side_effects)]
     fn next_cooldown(&self, current: Duration) -> Duration {
         let multiplier =
             if self.cfg.cooldown_multiplier.is_finite() && self.cfg.cooldown_multiplier > 1.0 {

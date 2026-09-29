@@ -29,6 +29,23 @@
 //! A rate-limited key is already cooling when the loop comes back around, so the
 //! next iteration naturally lands on a different key.
 
+#![cfg_attr(
+    not(test),
+    // FENCED for the same reason as the circuit breaker beside it: the one piece of
+    // arithmetic here is `now + cooldown` on an `Instant`, which PANICS rather than
+    // saturating, and the cooldown is a config value.
+    //
+    // It is the only site. The other two arithmetic operations this module has are
+    // both `#[cfg(test)]` - the virtual clock's offset - and a test-only offset is
+    // not something production can be broken by, so the same scoping lib.rs uses
+    // leaves them out of the way rather than justifying them.
+    //
+    // The `in_flight` counter is atomic and already guards its own decrement against
+    // a double-release wrapping it, so it is deliberately NOT fenced here: it is a
+    // hint for selection rather than a limit, and the comment on it says so.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -100,6 +117,13 @@ impl KeySlot {
         matches!(until, Some(until) if now < until)
     }
 
+    /// Parks the slot until `now + cooldown`. The addition is a PANIC if the
+    /// cooldown leaves the clock's representable range, which is why config.rs
+    /// refuses `key_cooldown_seconds` at load when `checked_add` says it would.
+    ///
+    /// The allow is on the FUNCTION, because an attribute in tail-expression
+    /// position is still unstable.
+    #[allow(clippy::arithmetic_side_effects)]
     fn park(&self, now: Instant, cooldown: Duration) {
         *self
             .cooldown_until
