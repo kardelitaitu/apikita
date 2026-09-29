@@ -217,7 +217,40 @@ mod tests {
             "the document promises 90 days of key_ip_daily"
         );
 
-        // THE SAME POLICY IS PUBLISHED TWICE, and one document being correct is no
+        // THE SAME POLICY IS PUBLISHED A THIRD TIME, and this copy is the one a
+        // CUSTOMER reads. website/src/lib/privacy.ts is not a document about the
+        // policy - it is the page the site renders from, so a number in it is the
+        // number a customer is shown. It said per-request usage was "kept
+        // indefinitely" because a purge job was "not yet running", while the
+        // nightly scheduler deletes those rows at 90 days. The two internal
+        // documents were right; the one a customer reads was the one that was
+        // wrong, and no test could see it because it lives in another language.
+        let privacy = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("website")
+                .join("src")
+                .join("lib")
+                .join("privacy.ts"),
+        )
+        .expect("website/src/lib/privacy.ts must be readable, or this passes over nothing");
+        assert!(
+            privacy.contains("'Per-request usage', keep: '90 days'"),
+            "website/src/lib/privacy.ts no longer states 90 days for per-request usage. That \
+             array IS the privacy page the site renders, so a number in it is a number a \
+             customer is shown."
+        );
+        assert!(
+            !privacy.contains("kept indefinitely"),
+            "website/src/lib/privacy.ts tells customers their per-request usage is kept \
+             INDEFINITELY because no purge job is running. The nightly maintenance \
+             scheduler deletes those rows at 90 days, and two documents in this \
+             repository say so. A privacy page that understates collection is still a false \
+             statement about data handling, and this one is the statement a customer is \
+             held to."
+        );
+
+        // THE SAME POLICY IS PUBLISHED TWICE in docs/, and one document being correct is no
         // help when the other says something else. docs/ip-tracking.md carries its own
         // retention table for the same three tables. It is the page a customer asking
         // how long their IP is kept is answered from, while data-retention.md is the

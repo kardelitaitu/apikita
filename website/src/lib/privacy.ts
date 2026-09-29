@@ -45,7 +45,7 @@ export const retention = [
   { what: 'Ledger', keep: 'Forever', why: 'Financial record; it is the authoritative audit trail' },
   { what: 'Top-ups', keep: 'Forever', why: 'Financial; matches the ledger' },
   { what: 'Usage daily', keep: '24 months', why: 'Billing disputes, then aggregate only' },
-  { what: 'Per-request usage', keep: '90 days', why: 'Covers the 30-day spend window plus a dispute window. This retention period is policy; a purge job is not yet running, so for now these rows are kept indefinitely' },
+  { what: 'Per-request usage', keep: '90 days', why: 'Covers the 30-day spend window plus a dispute window. Deleted 90 days after the request by the nightly retention job' },
   { what: 'Sessions (expired/revoked)', keep: '30 days', why: 'Tidy up, but keep recent for security review' },
   { what: 'Reviews', keep: 'Until deleted by user', why: 'Published aggregate; individual text is theirs' },
   { what: 'Review history', keep: 'Same as review', why: 'Needed to make an edit meaningful' },

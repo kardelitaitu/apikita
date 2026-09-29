@@ -71,8 +71,18 @@ relationship and becomes a liability the moment a breach occurs.
 | **Logs** | 30-90 days | Debugging window; not a database |
 | **Accounts (closed)** | Keep record, drop personal data | See below |
 
-> **Age-based retention is now enforced by `server/src/bin/usage-purge.rs`,**
-> run nightly alongside `ip-purge`. It sweeps **three** tables to the periods
+> **Age-based retention is enforced NIGHTLY, but NOT by that binary — and the
+> difference matters if you go looking.** `server/src/bin/usage-purge.rs` is not
+> shipped in the server image and does not run: the maintenance scheduler
+> (`.docker/maintenance/entrypoint.sh`) performs the same three sweeps in inline
+> SQL, and logs itself as `WIRED retention` while logging the binary as
+> `NOT WIRED usage-purge`. The OUTCOME here is right — the rows are deleted — but a
+> reader who checks the mechanism the way this paragraph used to describe it will
+> find a binary that is never invoked, and conclude that nothing runs at all. That
+> is the opposite of the truth, and it is what `website/src/lib/privacy.ts` said
+> for months, to customers.
+>
+> It sweeps **three** tables to the periods
 > above: `usage_events` (90 days), `usage_daily` (24 months) and expired/revoked
 > `sessions` (30 days). It is idempotent, and deliberately NOT on the request
 > path — the settlement already writes a row per billed request, and a per-request
