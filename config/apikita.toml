@@ -433,6 +433,10 @@ max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -534,6 +538,10 @@ max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -599,6 +607,10 @@ max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -652,6 +664,10 @@ max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -690,6 +706,10 @@ max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -728,6 +748,10 @@ max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]

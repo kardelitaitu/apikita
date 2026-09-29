@@ -573,6 +573,112 @@ mod tests {
             panic!("{relative} must be readable, or this test passes over nothing: {e}")
         })
     }
+
+    /// Every config key is either READ by the code, or says so where it is set.
+    ///
+    /// Rounds of measuring turned up a dozen keys nothing reads, and the ones that
+    /// mattered were not wrong but UNREADABLE AS CONTROLS: a low-balance warning
+    /// described as being sent by a bot that cannot send it, a general
+    /// wallet-mutation limit that was really a specific one, a context ceiling whose
+    /// comment claimed it fed the pre-flight check that does not read it.
+    ///
+    /// The check is on the CONFIG, not the code, because the code cannot be wrong about
+    /// a key it ignores. A key counts as read if it appears as a field ACCESS - a
+    /// leading dot - which rules out the three things that make an unwired key look
+    /// wired: a struct declaration, a struct literal in a fixture, and the parser key
+    /// list. Still a heuristic, and described as one in docs/testing.md.
+    ///
+    /// Three escapes, each deliberate rather than convenient:
+    ///
+    /// - ZERO needs no marker. A key set to 0 whose comment says 0 disables it is
+    ///   self-consistent: the feature is off, so nothing depends on it being read.
+    /// - LABELS are unread on purpose. A description is documentation written in the
+    ///   file the documentation belongs in, and six NOT ENFORCED markers saying so
+    ///   would be a wall.
+    /// - A comment block carries to the next BLANK line, not to the next assignment, and
+    ///   is not consumed by the key it sits above. A TOML file documents a GROUP, and a
+    ///   marker written once above a pair is the natural way to write it - the first
+    ///   version of this test failed on the second key of an annotated pair, which is
+    ///   the test being wrong about how people write TOML rather than the file.
+    #[test]
+    fn an_unread_config_key_says_so_where_it_is_set() {
+        const MARKERS: &[&str] = &[
+            "NOT ENFORCED",
+            "RECORDED, NOT",
+            "no mechanism",
+            "to disable",
+        ];
+        const LABELS: &[&str] = &["description"];
+
+        let config = read_repo_file("config/apikita.toml");
+
+        // Every Rust file in the crate as one string, so a read is a substring test.
+        let mut source = String::new();
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut files = 0usize;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files += 1;
+                    source.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+                }
+            }
+        }
+
+        let mut above = String::new();
+        let mut checked = 0usize;
+        let mut total = 0usize;
+        for line in config.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                above.push_str(trimmed);
+                above.push(' ');
+                continue;
+            }
+            if trimmed.is_empty() {
+                above.clear();
+                continue;
+            }
+            let Some((key, value)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_string();
+            let value = value.split('#').next().unwrap_or("").trim().to_string();
+            total += 1;
+
+            let read = source.contains(&format!(".{key}"))
+                || LABELS.contains(&key.as_str())
+                || !key.chars().all(|c| c.is_alphanumeric() || c == '_');
+            if read || value == "0" {
+                continue;
+            }
+
+            assert!(
+                MARKERS.iter().any(|m| above.contains(m)),
+                "config key `{key} = {value}` is read nowhere in the crate and its comment carries none of {MARKERS:?}. Wire it, or mark it where it is set - a key that is neither is a control the operator believes they have."
+            );
+            checked += 1;
+        }
+
+        assert!(
+            files >= 30,
+            "only {files} Rust files were read, so nothing can look read"
+        );
+        assert!(
+            total >= 40,
+            "only {total} assignments were parsed from the config file"
+        );
+        assert!(
+            checked > 0,
+            "no unread key was checked, so this passes over every key"
+        );
+    }
     /// Every table the schema creates is either DISCLOSED on the privacy page or
     /// recorded here as deliberately unused.
     ///
