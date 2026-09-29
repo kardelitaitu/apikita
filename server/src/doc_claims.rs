@@ -1501,25 +1501,42 @@ mod tests {
     fn every_relative_markdown_link_resolves() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
 
+        // THE WHOLE REPOSITORY, not docs/ and the two root READMEs. The first version
+        // walked `docs/` only, and the name said "the documentation" - which is 30 files
+        // wider than what it checked: every tool README, the config provider notes, the
+        // nginx and maintenance READMEs, and the agent memory files. A guard narrower than
+        // its own name is the error this session has just spent a round on, in the
+        // direction that does not announce itself: a too-broad matcher cries wolf, and a
+        // too-narrow one simply does not look.
+        //
+        // Those thirty were measured before this was widened: 77 relative links, none
+        // broken. So the class was clean and the SCOPE was the defect, which is the
+        // better of the two findings and the cheaper to fix.
+        const SKIP: &[&str] = &[
+            "node_modules",
+            "target",
+            ".git",
+            "dist",
+            "build",
+            ".agents",
+            ".workbuddy-ai",
+        ];
         let mut sources: Vec<std::path::PathBuf> = Vec::new();
-        let mut stack = vec![repo.join("docs")];
+        let mut stack = vec![repo.clone()];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
                 if path.is_dir() {
-                    stack.push(path);
+                    if !SKIP.contains(&name.as_str()) {
+                        stack.push(path);
+                    }
                 } else if path.extension().is_some_and(|e| e == "md") {
                     sources.push(path);
                 }
-            }
-        }
-        for root in ["README.md", "AGENTS.md"] {
-            let path = repo.join(root);
-            if path.exists() {
-                sources.push(path);
             }
         }
         sources.sort();
@@ -1551,8 +1568,8 @@ mod tests {
         }
 
         assert!(
-            sources.len() >= 40,
-            "only {} markdown files were read",
+            sources.len() >= 70,
+            "only {} markdown files were read, so this is not walking the whole repository",
             sources.len()
         );
         assert!(
