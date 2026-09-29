@@ -3505,6 +3505,31 @@ mod tests {
             "30 days is past the 7-day window; if this is None then the table is being measured against a LONGER one, which is the failure a copied constant invites"
         );
 
+        // The same for `key_ip_daily`, whose 90-day window is the one a reader is most
+        // likely to doubt: 400 days is past 90 and comfortably inside usage_daily's 730,
+        // so a row at that age reports against the 90 and not against whichever constant
+        // happens to be adjacent in the source. The third table, link_redemption_attempts
+        // at 7 days, cannot be straddled against key_ip_seen because both windows are 7 -
+        // they are the same number, so there is nothing to confuse them with.
+        sqlx::query("DELETE FROM key_ip_daily")
+            .execute(&db.pool)
+            .await
+            .expect("clear");
+        let four_hundred = (today - chrono::Duration::days(400)).to_string();
+        sqlx::query("INSERT INTO key_ip_daily (api_key_id, day, distinct_ips) VALUES (?, ?, ?)")
+            .bind(key_id.hyphenated())
+            .bind(&four_hundred)
+            .bind(2i64)
+            .execute(&db.pool)
+            .await
+            .expect("seed a 400-day row");
+        let four = retention_lag(&db.pool, today).await.unwrap();
+        assert_eq!(
+            four.key_ip_daily,
+            Some(400),
+            "400 days is past key_ip_dailys 90-day window and inside usage_dailys 730; if this is None the two are being measured against the same number"
+        );
+
         db.close().await;
     }
     /// An EMPTY database is not lagging, and reports no oldest row.
