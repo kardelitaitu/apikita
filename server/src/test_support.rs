@@ -76,6 +76,20 @@ const SIDECARS: [&str; 2] = ["-wal", "-shm"];
 /// leak one database per test. Deferring gets both: by the time the next test
 /// database is built the handle is gone, so the file does go away — just not on
 /// the schedule Windows chose.
+///
+/// THE TWO ENDS OF THIS ARE CONNECTED, and checking that is worth the minute it
+/// takes: `close` retries the delete, and whatever is left lands in ORPHANS, and
+/// `reap_orphans` — called at the top of `TestDb::new` — tries those again on the next
+/// run. A list that is written and never read would be a leak that looks handled, and
+/// this one was nearly reported as exactly that before the caller was checked.
+///
+/// NOR is there a fragile sleep hiding here, which is what a 66-second suite run once
+/// suggested. The whole crate has two real sleeps outside a paused clock: this bounded
+/// retry, and the one-second stream deadline in the events tests. The circuit breaker
+/// and key pool use `tokio::time::advance`, so they are deterministic. That leaves the
+/// stream deadline as the only test that waits a full second of wall clock, and it is
+/// the place to look first if a contended run is ever slow again — not from theory, but
+/// because it is the only candidate left.
 static ORPHANS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 async fn template_path() -> &'static PathBuf {
