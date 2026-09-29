@@ -621,6 +621,26 @@ async fn oldest_row_past_window(
         .expect("midnight is a valid time")
         .and_utc();
 
+    // A DATE-keyed table stores `2023-12-14`, not an RFC3339 instant, and decoding
+    // that as a DateTime is an ERROR rather than a wrong number - which is what made
+    // the whole retention query fail on any database holding usage_daily rows, and the
+    // metrics endpoint report `behind: null` forever. The probe turns that into a
+    // standing db_disk alert, so the monitoring was not merely blind but LOUD.
+    //
+    // The branch is on the column name because SQLite exposes no per-column type sqlx
+    // can ask for on this path, and a wrong guess fails LOUDLY - a decode error - rather
+    // than silently comparing the wrong thing. That is the right direction for a type
+    // test; the alternative is a comparison that quietly measures the wrong column.
+    if column == "day" {
+        let oldest: Option<chrono::NaiveDate> =
+            sqlx::query_scalar(&format!("SELECT MIN({column}) FROM {table}"))
+                .fetch_one(pool)
+                .await?;
+        let cutoff_day = today - chrono::Duration::days(days);
+        return Ok(oldest
+            .filter(|d| *d <= cutoff_day)
+            .map(|d| (today - d).num_days()));
+    }
     // The oldest row overall. `MIN` over an empty table is NULL, which decodes to
     // `None` - the "no rows" case, distinct from "an old row".
     let oldest: Option<chrono::DateTime<chrono::Utc>> =
@@ -3227,6 +3247,86 @@ mod tests {
     // The model is a LAG IN DAYS, not a boolean alone: "retention is behind" without an
     // age is an alert an operator cannot act on.
 
+    /// A DATE-keyed table is MEASURED, not merely declared.
+    ///
+    /// This is the regression that made the whole retention query fail. `usage_daily`
+    /// stores `day` as a DATE, and the lag helper decoded every column as an RFC3339
+    /// instant, so the read returned a decode ERROR on any database with a single
+    /// usage_daily row in it. The metrics endpoint turned that into `behind: null`
+    /// forever, and the probe reports that as a standing db_disk alert - so the
+    /// monitoring was not merely blind, it was permanently firing.
+    ///
+    /// Nothing caught it because no test seeded a usage_daily row and asked for the
+    /// lag. The health-report tests construct a `RetentionLag` literal, so the query
+    /// behind them was never exercised for a DATE-keyed table. This seeds one row
+    /// and requires the query to answer.
+    #[tokio::test]
+    async fn a_date_keyed_table_is_measured_rather_than_failing_to_decode() {
+        let db = TestDb::new().await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let account = test_support::account(&db.pool).await;
+        let key_id = test_support::api_key(&db.pool, account).await;
+
+        // NEGATIVE CONTROL: with no rows the query must SUCCEED, not error. The
+        // old code also succeeded here, which is why the failure needed a row to
+        // show up at all.
+        assert!(
+            !retention_lag(&db.pool, today)
+                .await
+                .unwrap()
+                .anything_behind(),
+            "an empty database is not behind"
+        );
+
+        // 900 days old, well past the 730-day window.
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens) VALUES (?, ?, ?, 5)",
+        )
+        .bind(account.hyphenated())
+        .bind(key_id.hyphenated())
+        .bind((today - chrono::Duration::days(900)).to_string())
+        .execute(&db.pool)
+        .await
+        .expect("seed usage_daily");
+
+        // THE POINT: this used to return Err, not a value.
+        let lag = retention_lag(&db.pool, today)
+            .await
+            .expect("the lag query answers for a DATE-keyed table");
+        assert!(
+            lag.anything_behind(),
+            "a 900-day-old usage_daily row is behind a 730-day window"
+        );
+        assert_eq!(
+            lag.usage_daily,
+            Some(900),
+            "the age is measured in whole days from the DATE column"
+        );
+
+        // A row INSIDE the window must not report, so the branch is not simply
+        // returning an age for anything it finds.
+        sqlx::query("DELETE FROM usage_daily")
+            .execute(&db.pool)
+            .await
+            .expect("clear");
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens) VALUES (?, ?, ?, 5)",
+        )
+        .bind(account.hyphenated())
+        .bind(key_id.hyphenated())
+        .bind((today - chrono::Duration::days(400)).to_string())
+        .execute(&db.pool)
+        .await
+        .expect("seed an in-window row");
+        let inside = retention_lag(&db.pool, today).await.unwrap();
+        assert_eq!(
+            inside.usage_daily, None,
+            "400 days is inside the 730-day window"
+        );
+        assert!(!inside.anything_behind(), "and nothing is behind");
+
+        db.close().await;
+    }
     /// An EMPTY database is not lagging, and reports no oldest row.
     #[tokio::test]
     async fn an_empty_database_has_no_retention_lag() {
