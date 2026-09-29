@@ -209,6 +209,26 @@ pub fn link_code_window() -> Duration {
 /// The boundary arithmetic is `abuse::cap_outcome`, the same pure function the
 /// per-account caps use, so "exactly at the cap is refused", "floor the
 /// Retry-After at 1" and "0 disables" cannot drift between the two.
+///
+/// **WHAT THIS ACTUALLY LIMITS IS N PER UTC DAY, NOT N PER WINDOW — and that is a
+/// consequence of the salt, not a bug in the window.** The counter is keyed on
+/// `ip_hash`, which is an HMAC under a salt that `ip_tracking` replaces at the UTC day
+/// boundary. At midnight the same caller hashes to a different value, so the counter
+/// starts empty and every attempt before midnight becomes invisible. A sliding
+/// `link_code_window` is therefore really a daily allowance that resets on the hour,
+/// and an attacker who times it gets the full budget at 23:59 and again at 00:00.
+///
+/// It is written down rather than fixed because the two properties are in genuine
+/// conflict: a salt that does not rotate makes the counter work across days, and it also
+/// makes every day linkable, which is the whole privacy design in ip-tracking.md and the
+/// reason this is documented on a public page. Restoring the cross-day count would mean
+/// keeping a stable per-caller identifier, which is precisely what that document says is
+/// not kept.
+///
+/// So the honest statement of the control is: it stops an unbounded attempt stream from
+/// one caller within a day. It does not stop a caller who is willing to spend two
+/// budgets across midnight, and anyone reading `review_per_hour`-style numbers here
+/// should know that is the shape of what they have.
 async fn record_and_check_attempt(
     pool: &SqlitePool,
     ip_key: &str,
