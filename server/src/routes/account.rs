@@ -21,13 +21,13 @@ use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
+
 use sqlx::{Row, SqlitePool};
 use tracing::info;
 use uuid::fmt::Hyphenated;
@@ -98,50 +98,24 @@ pub struct UsageQuery {
     pub to: Option<String>,
 }
 
-/// SHA-256 hex of a session token.
+/// The account a request's session cookie resolves to.
 ///
-/// Carried over from the Postgres branch, where the shared
-/// `crate::routes::resolve_account_from_cookie` in mod.rs took a `PgPool`. That
-/// resolver is now a `SqlitePool` too, so this local copy is equivalent to it:
-/// this module keeps its own so the handler and its tests exercise the same
-/// resolver. Two copies of the hash-then-compare rule, so a divergence fails a
-/// test rather than passing silently
-/// into mod.rs. Same rule either way: the token is hashed, never stored raw.
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-async fn resolve_account_from_cookie(
-    pool: &SqlitePool,
-    headers: &HeaderMap,
-) -> Result<Uuid, AppError> {
-    let cookie_hdr = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthenticated)?;
-
-    for piece in cookie_hdr.split(';') {
-        let piece = piece.trim();
-        if let Some(token) = piece.strip_prefix("session=") {
-            let token_hash = hash_string(token);
-            let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
-            )
-            .bind(token_hash)
-            .bind(Utc::now())
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some(s) = session {
-                return Ok(s.try_get::<Hyphenated, _>("account_id")?.into_uuid());
-            }
-        }
-    }
-
-    Err(AppError::Unauthenticated)
-}
+/// THIS IS NOT A LOCAL COPY ANY MORE, and its comment used to say that it was.
+/// It claimed the local resolver was "equivalent to" `crate::routes`'s, on the
+/// grounds that both are `SqlitePool` - which was true of the hash and false of
+/// the RULE. The local copy filtered revocation and absolute expiry in SQL and
+/// stopped there. It never applied the idle bound (`last_seen_at + idle_days >
+/// now`) and never moved `last_seen_at`, so with the shipped
+/// `idle_days = 7` against `absolute_days = 30` a session idle for eight days
+/// was REFUSED by the cookie paths in mod.rs and ACCEPTED by every customer route
+/// in this file - and could still read the account, spend the balance and mint
+/// keys.
+///
+/// That divergence is exactly what the comment promised a test would catch, and
+/// no test did: nothing asserted that the copies agreed, and the copies are what
+/// the handlers called. The one resolver is now the only one, so the claim and
+/// the code are the same statement.
+use crate::routes::resolve_account_from_cookie;
 
 pub async fn get_me(
     State(pool): State<SqlitePool>,

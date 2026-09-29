@@ -4,7 +4,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::{stream, Stream, StreamExt};
-use sha2::{Digest, Sha256};
+
 use sqlx::{Row, SqlitePool};
 use std::{
     collections::{HashMap, VecDeque},
@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::broadcast::error::RecvError;
-use uuid::fmt::Hyphenated;
+
 use uuid::Uuid;
 
 use crate::config::RealtimeConfig;
@@ -371,48 +371,15 @@ fn last_event_id(headers: &HeaderMap) -> Option<u64> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-/// SHA-256 hex of a session token.
+/// The account a request's session cookie resolves to.
 ///
-/// Carried over from the Postgres branch, where the shared resolver in
-/// `crate::routes` took a `PgPool`. It is now a `SqlitePool` too, so this local
-/// copy is equivalent to it and is kept so the handler and its tests run the same
-/// resolver. The token is hashed, never stored raw.
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// The account a request's session cookie resolves to, against SQLite.
-async fn resolve_account_from_cookie(
-    pool: &SqlitePool,
-    headers: &HeaderMap,
-) -> Result<Uuid, AppError> {
-    let cookie_hdr = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthenticated)?;
-
-    for piece in cookie_hdr.split(';') {
-        let piece = piece.trim();
-        if let Some(token) = piece.strip_prefix("session=") {
-            let token_hash = hash_string(token);
-            let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
-            )
-            .bind(token_hash)
-            .bind(chrono::Utc::now())
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some(s) = session {
-                return Ok(s.try_get::<Hyphenated, _>("account_id")?.into_uuid());
-            }
-        }
-    }
-
-    Err(AppError::Unauthenticated)
-}
+/// The local resolver that used to sit here is DELETED, and its comment claimed it
+/// was "equivalent to" `crate::routes`'s because both take a `SqlitePool`. That
+/// was true of the hash and false of the RULE: the copy filtered revocation and
+/// absolute expiry in SQL and stopped, so it never applied the idle bound and
+/// never recorded activity. The one place the session rule lives is the only one
+/// now.
+use crate::routes::resolve_account_from_cookie;
 
 pub async fn sse_events_handler(
     State(state): State<AppState>,
@@ -802,7 +769,7 @@ mod tests {
         )
         .bind(Uuid::new_v4().hyphenated())
         .bind(account_id.hyphenated())
-        .bind(hash_string(&token))
+        .bind(crate::routes::hash_token(&token))
         .bind(now + chrono::Duration::hours(2))
         .bind(now)
         .bind(now)
@@ -1094,7 +1061,7 @@ mod tests {
             )
             .bind(Uuid::new_v4().hyphenated())
             .bind(account_id.hyphenated())
-            .bind(hash_string(token))
+            .bind(crate::routes::hash_token(token))
             .bind(expires_at)
             .bind(now)
             .bind(now)
