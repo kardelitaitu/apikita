@@ -365,6 +365,16 @@ max_context_tokens = 1000000
 # flash -- the cheap, high-concurrency workhorse. THIS IS WHERE THE MARGIN IS.
 # ===========================================================================
 
+# FOUR FIELDS HERE ARE RECORDED, NOT ENFORCED: supports_vision, supports_thinking,
+# billing_basis and concurrency_per_key. The model struct parses all four and nothing
+# reads them - there is no GET /v1/models, and no document advertises a vision or
+# thinking capability, so nothing customer-facing is currently false. The consequence
+# is behavioural rather than a false claim: a request carrying an image is NOT rejected
+# because this model is marked supports_vision = false, so the failure arrives as
+# whatever the provider does with it. Recorded here so the flags read as intent rather
+# than as a feature. billing_basis in particular does not affect the reserve: the
+# reservation is still made at the rate the code computes, not at the peak rate this
+# key names.
 [[models]]
 name = "flash"
 description = "Fast, low-cost general model. 1M context, vision capable."
