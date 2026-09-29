@@ -333,6 +333,108 @@ mod tests {
         (503, "no_upstream_available"),
     ];
 
+    /// The published table, parsed from the document rather than trusted from
+    /// memory.
+    ///
+    /// The comment on DOCUMENTED claims "any drift between error.rs and the
+    /// published contract fails a test". That is true of the CODE half and false of
+    /// the DOCUMENT half. DOCUMENTED is transcribed by hand, so editing
+    /// docs/error-model.md - changing a status, adding a code, dropping a row -
+    /// leaves every assertion here green while the published contract says
+    /// something the server does not do. The contract is what a client codes
+    /// against, and it is the copy nobody runs.
+    ///
+    /// So this reads the table. A hand-kept copy of what another file says is the
+    /// same bug twice over, which is why the alert guards read probe.sh rather than
+    /// counting its rows.
+    #[test]
+    fn the_published_status_table_is_the_one_the_code_serves() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("error-model.md"),
+        )
+        .expect("docs/error-model.md must be readable, or this checks nothing");
+
+        // Scoped to the status-code section, because the streaming codes below it
+        // are deliberately status-less - they travel as a frame after the headers
+        // are sent, and treating them as missing rows would be a false alarm about a
+        // design decision rather than a drift.
+        let start = spec
+            .find("## Status codes and their meanings")
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/error-model.md no longer has the Status codes section. The status \
+                 table is the contract a client codes against, and a check that cannot \
+                 find it would pass over nothing."
+                )
+            });
+        let section = &spec[start..];
+        let end = section[2..]
+            .find("\n## ")
+            .map(|at| at + 2)
+            .unwrap_or(section.len());
+        let table = &section[..end];
+
+        let mut published: Vec<(u16, String)> = Vec::new();
+        for line in table.lines() {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            if cells.len() < 3 {
+                continue;
+            }
+            let Ok(status) = cells[1].parse::<u16>() else {
+                continue;
+            };
+            // The code cell is wrapped in backticks in the document; stripping every
+            // one of them is simpler than matching one, and a code never contains
+            // a backtick.
+            let code = cells[2].replace(char::from(96), "");
+            let code = code.trim();
+            if code.is_empty() {
+                continue;
+            }
+            published.push((status, code.to_string()));
+        }
+
+        // The vacuity guard: an empty or unparsable table must fail loudly rather
+        // than comparing DOCUMENTED against nothing and passing.
+        assert!(
+            published.len() >= 10,
+            "only {} row(s) parsed out of the published status table, so the comparison \
+             below is not a comparison. A renamed heading or a reformat would land here \
+             rather than in a false PASS.",
+            published.len()
+        );
+
+        // DOCUMENTED is the AppError set. The published table is the whole API, and
+        // ONE code lives outside this enum: forbidden is built by
+        // admin.rs::forbidden_response for a non-operator or a self-action, because the
+        // operator surface needs a message that says WHICH, and AppError has no variant
+        // that carries one. Conflating the two sets is what the hand-transcribed copy did
+        // - it listed fourteen rows against a document with fifteen - so the difference is
+        // named here rather than papered over by adding the row to DOCUMENTED, which
+        // would break the sibling test asserting AppError's codes are exactly the
+        // documented AppError codes.
+        const OUTSIDE_APP_ERROR: &[(&str, u16)] = &[("forbidden", 403)];
+
+        let mut expected: Vec<(u16, String)> = DOCUMENTED
+            .iter()
+            .map(|(status, code)| (*status, (*code).to_string()))
+            .collect();
+        for (code, status) in OUTSIDE_APP_ERROR {
+            expected.push((*status, (*code).to_string()));
+        }
+        expected.sort();
+        let mut documented = published.clone();
+        documented.sort();
+        assert_eq!(
+            documented, expected,
+            "the published status table and the one error.rs serves have drifted. A \
+             client codes against the document, so a row that says one thing while the \
+             server does another is the contract breaking quietly. Update both together."
+        );
+    }
     /// Every AppError variant, one of each. The response-level tests run over
     /// this whole set, so a newly added variant is covered the day it lands
     /// rather than the day someone remembers to extend a hand-picked list.
