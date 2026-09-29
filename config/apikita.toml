@@ -123,12 +123,26 @@ idle_days = 7
 topup_per_hour = 5
 
 # Protects the wallet mutation path generally.
+#
+# NOT ENFORCED, and the word GENERALLY is the part that would mislead. Nothing reads
+# this key. What exists is limits.topup_per_hour, enforced on the one caller-controlled
+# wallet-mutation route (POST /api/topups) and covered by a test that drives the handler
+# at its cap. So today the wallet is protected, but by the specific key on the specific
+# route - not by this one. They agree only because that is the only such route: the
+# webhook credit is not caller-paced, and the proxy debit is bounded by the balance.
+# The moment a second caller-controlled wallet mutation appears, this is the line that
+# should be enforcing it and it will not.
 wallet_mutations_per_minute = 10
 
 # Blunts limit circumvention by key-spam.
 key_creation_per_day = 10
 
 # Review submissions. Edits are legitimate; flooding is not.
+#
+# NOT ENFORCED, and moot for now only because the review endpoints are marked DESIGNED,
+# NOT BUILT in the api-spec. There is nothing to rate limit yet. Whoever builds them
+# should read this as a requirement, not as a setting: a review endpoint with no rate
+# limit is a moderation problem from its first request, and a body limit alongside it.
 review_per_hour = 3
 
 # Telegram link codes the account may have ISSUED in an hour. Bounds codes in
