@@ -137,3 +137,36 @@ test('the deposit minimums are the config wallet minimums', async () => {
     'min_first_deposit is not above min_topup, so the page would quote two minimums where one is unreachable'
   );
 });
+
+// The third transcription: the model NAMES. `KNOWN_MODELS` says it is the config's
+// full inventory - config/apikita.toml, [[models]] name = ..., IN FILE ORDER - and the
+// access summary built on it tells a customer how many of their key's models are not
+// currently enabled. If a model is added to the config and not here, the summary
+// undercounts; if one is removed from the config and left here, the summary names a
+// model that cannot exist. Both are silent, because the number is a count.
+test('KNOWN_MODELS is the config model list, in file order', async () => {
+  const { KNOWN_MODELS, models } = await import('../src/lib/dashboard-form.ts');
+  const lib = await import('../src/lib/models.ts');
+
+  const declared = config
+    .split('[[models]]')
+    .slice(1)
+    .map((b) => (b.match(/^\s*name = "([^"]+)"/m) ?? [])[1])
+    .filter(Boolean);
+
+  assert.ok(declared.length >= 4, `only ${declared.length} models were read from the config`);
+  assert.deepEqual(
+    [...KNOWN_MODELS],
+    declared,
+    'KNOWN_MODELS is the config inventory, so it must BE that list in that order. The access summary counts against it, and a count that is quietly wrong tells a customer the wrong thing about their own key.'
+  );
+
+  // The routable subset must be a subset of the inventory: the picker offers what the
+  // proxy can serve, and a name outside the inventory could not be routed at all.
+  for (const m of lib.models) {
+    assert.ok(
+      KNOWN_MODELS.includes(m),
+      `models lists ${m}, which is not in the config inventory`
+    );
+  }
+});
