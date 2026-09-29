@@ -721,11 +721,21 @@ mod tests {
         headers
     }
 
+    /// The session cookie AMONG OTHERS, which is what a browser actually sends.
+    ///
+    /// This helper used to build a bare "session={token}". Four other route modules
+    /// build "a=1; session={token}; b=2", and the difference is not cosmetic: a bare
+    /// header never exercises the parser's scan past another cookie's "=", so a
+    /// regression in `session_token_from_cookie_header` that broke multi-cookie
+    /// parsing would have left every test in this file green.
+    ///
+    /// The header a customer's browser sends is never a lone cookie, so the fixture
+    /// that should be impossible is the one this file was using.
     fn cookie_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            format!("session={token}").parse().unwrap(),
+            format!("a=1; session={token}; b=2").parse().unwrap(),
         );
         headers
     }
