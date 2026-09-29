@@ -1243,6 +1243,28 @@ mod tests {
             "conversation",
         ];
 
+        // AND THE ADDRESS RULE, which is a pattern rather than a name.
+        //
+        // `docs/launch-checklist.md` Gate 4 says attempts are stored as a salted IP
+        // hash, "NEVER the raw address" - the strongest privacy claim in the
+        // documentation, and true today: every address-shaped column in the schema is
+        // `ip_hash` or `distinct_ips`, a count. What was missing is that nothing kept it
+        // true. The FORBIDDEN list above is a list of NAMES, and `ip` is not among them, so
+        // a migration adding `ip_address TEXT` would pass every check in this file and turn
+        // Gate 4's strongest claim false with a green suite.
+        //
+        // So this is not another word in a list. A column is an address if its name says
+        // so, UNLESS the name also says it is a hash or a count - which is precisely the
+        // distinction the schema already draws, and which a bare word list cannot express
+        // without listing `ip_hash` and `distinct_ips` as exceptions forever.
+        const ADDRESS_WORDS: &[&str] = &["ip", "addr", "address", "remote", "host"];
+        // `distinct` is here because the schema's word for a COUNT of addresses is
+        // `distinct_ips`, not `ip_count` - and the first run of this rule failed on it. A
+        // guard written from a guess at a vocabulary finds the real vocabulary on its first
+        // run, which is the `log` entry all over again: the list is not wrong, it is not
+        // MEASURED, and the difference only shows when the rule is switched on.
+        const ADDRESS_EXEMPT: &[&str] = &["hash", "count", "distinct", "prefix", "seen", "daily"];
+
         let migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         let mut entries: Vec<_> = std::fs::read_dir(&migrations)
             .expect("server/migrations must be readable, or this passes over nothing")
@@ -1307,6 +1329,27 @@ mod tests {
              column like this is genuinely needed, change the page in the same change, \"
              and mean it - a disclosure nobody has checked is worth less than one that \"
              was deliberately written."
+        );
+
+        // Gate 4's "never the raw address", checked the same way and with the same care
+        // about what the guard and the claim each say.
+        let raw_addresses: Vec<&String> = columns
+            .iter()
+            .filter(|c| {
+                let lower = c.to_ascii_lowercase();
+                let names_an_address = ADDRESS_WORDS.iter().any(|w| lower.contains(w));
+                let qualified = ADDRESS_EXEMPT.iter().any(|e| lower.contains(e));
+                names_an_address && !qualified
+            })
+            .collect();
+        assert!(
+            raw_addresses.is_empty(),
+            "schema column(s) {raw_addresses:?} look like a RAW network address. Gate 4 of the \
+             launch checklist says attempts are stored as a salted IP hash and NEVER the raw \
+             address, and the privacy page tells customers only a hash is kept. The schema draws \
+             the line with names - ip_hash and distinct_ips qualify because the name says what it \
+             is - so a column that does not qualify is holding the address itself. If a raw \
+             address is genuinely needed, change the disclosure in the same change."
         );
     }
     /// A test named after a LOG must use a log capture, or say it is not one.
