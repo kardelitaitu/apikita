@@ -373,6 +373,52 @@ impl AppConfig {
             if model.rates.input_peak <= 0.0 || model.rates.output_peak <= 0.0 {
                 return Err(format!("Model {} is missing peak rates", model.name).into());
             }
+            // THE CACHE-READ RATE MUST BE A REAL DISCOUNT, and nothing enforced it.
+            //
+            // The pre-flight hold prices the WHOLE prompt at the input rate, because
+            // at reservation time there is no way to know which of the prompt tokens
+            // the upstream will report as cache hits. Settlement splits those same
+            // tokens in two and charges the cache subset at its own, cheaper, rate:
+            //
+            //     hold   = estimated_input * input_peak
+            //     charge = input * input_peak + cache_read * cache_read_peak
+            //
+            // So the hold is a ceiling over settlement - which proxy.rs:1002 states
+            // outright, without qualification - ONLY while
+            // cache_read_peak <= input_peak. Flip that inequality and the ceiling
+            // INVERTS: a request whose prompt is mostly cache hits settles above its
+            // own hold. That is the same stranded-hold shape a cheaper endpoint
+            // override produced, arriving by a different route.
+            //
+            // The shipped config satisfies it by a wide margin (53.54 against
+            // 2676.78, a 50x discount) and nothing checked. A discount that is
+            // supposed to be the norm is exactly what a later edit "corrects"
+            // without noticing what it breaks, so it is a rule here rather than an
+            // assumption left in a comment.
+            //
+            // Per class, because the two are configured independently: an offpeak
+            // cache rate above the offpeak input rate is the same defect.
+            //
+            // AFTER the positivity rules deliberately. A zero or negative input rate
+            // makes this comparison true for ANY cache rate, so running it first
+            // would report "cache_read exceeds input" for a config whose actual
+            // fault is a missing peak rate - sending the operator to the wrong line
+            // of a six-rate block. The order is a real property and is asserted.
+            for (class, input_rate, cache_rate) in [
+                ("peak", rates.input_peak, rates.cache_read_peak),
+                ("offpeak", rates.input_offpeak, rates.cache_read_offpeak),
+            ] {
+                if cache_rate > input_rate {
+                    return Err(format!(
+                        "Model {} {class} cache_read rate {cache_rate} exceeds its input \
+                         rate {input_rate}: the pre-flight hold prices the whole prompt at \
+                         the input rate, so a cache-read rate above it makes settlement \
+                         exceed the hold and strand it. A cache read is a discount",
+                        model.name
+                    )
+                    .into());
+                }
+            }
             // An override is what the reservation is sized from, so a 0 or
             // negative one would under-reserve silently. A MISSING override
             // falls back to the model's rate, so only a present value is checked.
@@ -1099,6 +1145,161 @@ mod tests {
             _ => {}
         }
     }
+    /// THE CACHE-READ DISCOUNT IS A SAFETY PROPERTY, not a pricing preference.
+    ///
+    /// The hold prices the whole prompt at the input rate; settlement splits the
+    /// same tokens and charges the cache subset at its own rate. The hold is a
+    /// ceiling over settlement ONLY while cache_read_peak <= input_peak, and
+    /// proxy.rs:1002 already claims it is one without qualification. This asserts
+    /// the claim directly, as a relation between the two figures the validator now
+    /// refuses to let diverge.
+    ///
+    /// The sweep matters more than any single case, because the failure is not at
+    /// the extremes. A prompt that is ALL cache reads is the worst case for the
+    /// hold, and an all-plain prompt passes no matter what the rules are, so a
+    /// test that only tried the latter would be worthless.
+    #[test]
+    fn the_hold_is_a_ceiling_over_settlement_for_every_cache_split() {
+        const PROMPT: u64 = 1_000_000;
+
+        for (label, input_peak, cache_read_peak) in [
+            ("the shipped 50x discount", 2676.78, 53.54),
+            // Equality is the boundary the rule allows, and it must be allowed: a
+            // zero-discount cache read is odd, but it strands nothing, and a guard
+            // that refused it would be refusing a legitimate configuration.
+            ("a zero discount", 2676.78, 2676.78),
+        ] {
+            let hold = crate::money::calculate_preflight_reservation_idr(
+                1.5,
+                PROMPT,
+                input_peak,
+                0,
+                cache_read_peak,
+            );
+
+            for cache_read_tokens in [0, 1, PROMPT / 4, PROMPT / 2, PROMPT - 1, PROMPT] {
+                let charge = crate::money::calculate_token_cost_idr(
+                    1.5,
+                    PROMPT - cache_read_tokens,
+                    input_peak,
+                    cache_read_tokens,
+                    cache_read_peak,
+                    0,
+                    10707.12,
+                );
+                assert!(
+                    hold >= charge,
+                    "{label}: a prompt of {PROMPT} tokens with {cache_read_tokens} read \
+                     from cache charges {charge} IDR against a {hold} IDR hold"
+                );
+            }
+        }
+
+        // And the converse, which is the point of the whole rule: past the boundary
+        // the ceiling INVERTS. This is what the validator now refuses, shown rather
+        // than asserted in the abstract - a guard with no demonstrated failure is a
+        // guard nobody can tell apart from ceremony.
+        let hold =
+            crate::money::calculate_preflight_reservation_idr(1.5, PROMPT, 2676.78, 0, 53.54);
+        let charge =
+            crate::money::calculate_token_cost_idr(1.5, 0, 2676.78, PROMPT, 100_000.0, 0, 10707.12);
+        assert!(
+            charge > hold,
+            "a cache rate above the input rate MUST be able to exceed the hold, or \
+             refusing it in the validator would be refusing nothing"
+        );
+    }
+
+    /// The rule itself, in both directions, for both rate classes, and in the right
+    /// ORDER relative to the positivity checks.
+    #[test]
+    fn a_cache_read_rate_above_its_input_rate_is_refused_and_below_is_not() {
+        for class in ["peak", "offpeak"] {
+            // Above: refused, and the message must say WHICH figure is wrong.
+            // "invalid config" sends an operator to the wrong line of a six-rate
+            // block.
+            //
+            // Both figures must clear the SHIPPED input rates - 2676.78 peak,
+            // 1338.39 offpeak - because the case under test is "higher than the input
+            // rate". This test first used 2.0, which is far BELOW both, so every
+            // assertion in the loop was vacuous and the loop proved nothing.
+            for above in [5_000.0, 1_000_000.0] {
+                let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                    .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                    .expect("config/apikita.toml must load");
+                let rates = &mut config.models[0].rates;
+                if class == "peak" {
+                    rates.cache_read_peak = above;
+                } else {
+                    rates.cache_read_offpeak = above;
+                }
+                let err = config
+                    .validate()
+                    .expect_err("a cache-read rate above the input rate must be refused")
+                    .to_string();
+                assert!(
+                    err.contains(&format!("{class} cache_read rate")),
+                    "the {class} message must name the class and the field, got {err}"
+                );
+                assert!(
+                    err.contains("A cache read is a discount"),
+                    "the message must say WHY, or the rule reads as arbitrary, got {err}"
+                );
+            }
+
+            // Below and equal: accepted. Equality is the boundary the rule
+            // deliberately allows, and the shipped config is far below it.
+            for ok in [1000.0, 500.0, 0.0] {
+                let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                    .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                    .expect("config/apikita.toml must load");
+                let rates = &mut config.models[0].rates;
+                if class == "peak" {
+                    rates.cache_read_peak = ok;
+                } else {
+                    rates.cache_read_offpeak = ok;
+                }
+                config
+                    .validate()
+                    .unwrap_or_else(|e| panic!("a {class} cache rate of {ok} is legal: {e}"));
+            }
+        }
+
+        // THE ORDER IS PART OF THE RULE. A config whose peak input rate is 0 makes
+        // "cache_read exceeds input" true for any cache rate, so a discount check
+        // placed before the positivity check reports the wrong fault: an operator
+        // reading "cache_read exceeds its input rate" would go and fix a cache
+        // number that is perfectly fine, while the missing peak rate went unfixed.
+        let mut config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        config.models[0].rates.input_peak = 0.0;
+        let err = config
+            .validate()
+            .expect_err("a zero peak input rate must be refused")
+            .to_string();
+        assert!(
+            err.contains("missing peak rates"),
+            "a degenerate input rate must be reported as the degenerate rate it is, \
+             not as a cache discount problem, got {err}"
+        );
+    }
+
+    /// A non-positive override would size the hold from a rate that reserves
+    /// nothing, so it is refused at load like a non-positive model rate.
+    #[test]
+    fn a_non_positive_per_endpoint_rate_is_refused_at_load() {
+        let mut config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        config.models[0].endpoints[0].input_peak = Some(0.0);
+        let err = config
+            .validate()
+            .expect_err("a zero per-endpoint rate must be refused")
+            .to_string();
+        assert!(err.contains("non-positive peak rate override"), "got {err}");
+    }
+
     /// A model whose peak rates are absent reserves nothing and can never bill
     /// the peak it is documented to charge, so the missing figure is fatal.
     #[test]
