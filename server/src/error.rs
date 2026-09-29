@@ -347,6 +347,49 @@ mod tests {
     /// So this reads the table. A hand-kept copy of what another file says is the
     /// same bug twice over, which is why the alert guards read probe.sh rather than
     /// counting its rows.
+    /// Every EXAMPLE in the published table names something the code can actually do.
+    ///
+    /// The status-code guard below compares CODES, and every code matched - the 422 was
+    /// real, the `validation_failed` was real. What it did not compare is the column a
+    /// customer reads to understand WHY they got one, and that column had been the
+    /// canonical example of a validation failure for a field the system does not accept:
+    /// "rating out of range". No endpoint takes a rating and no code writes one; the
+    /// schema has three `rating` columns and nothing touches them. So the table was
+    /// correct in its codes and false in its prose, which is the more damaging half -
+    /// a developer debugging a 422 by that table would look for a field that is not there.
+    ///
+    /// So the two real 422s are now named in the table, and this test stops a fictional
+    /// example creeping back in. The general lesson is in docs/testing.md: a guard that
+    /// compares the machine-readable half of a document leaves the prose unguarded, and
+    /// the prose is what a human is actually reading.
+    #[test]
+    fn the_published_error_table_names_no_field_the_system_does_not_accept() {
+        let table = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("error-model.md"),
+        )
+        .expect("docs/error-model.md must be readable, or this checks nothing");
+        let mut checked = 0usize;
+        for example in ["rating", "score", "stars"] {
+            if table.contains(example) {
+                panic!(
+                    "docs/error-model.md names {example:?} in the status table. Nothing in the \
+                     crate accepts a rating: no route takes one and no code writes the three \
+                     rating columns the schema declares. Name a validation the code performs \
+                     instead - a top-up amount below the provider minimum, or a date that is not \
+                     YYYY-MM-DD."
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no examples were checked, so this test passes over nothing"
+        );
+    }
+
     #[test]
     fn the_published_status_table_is_the_one_the_code_serves() {
         let spec = std::fs::read_to_string(

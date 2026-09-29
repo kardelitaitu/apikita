@@ -57,7 +57,7 @@ matching on its text is a bug waiting to happen.
 | 403 | `wrong_credential_type` | **Reserved, never emitted** — a cookie on `/v1/*`, or a key on a cookie endpoint, returns 401 `unauthenticated` | Treat as 401 |
 | 404 | `not_found` | No such resource | Check the id |
 | 409 | `conflict` | Duplicate (e.g. Telegram already linked) | Reconcile state |
-| 422 | `validation_failed` | Well-formed but invalid (rating out of range) | Fix the value |
+| 422 | `validation_failed` | Well-formed but invalid (e.g. a top-up amount below the provider minimum, or a date that is not `YYYY-MM-DD`) | Fix the value |
 | 429 | `rate_limited` | Too fast | Back off; respect `Retry-After` |
 | 500 | `internal_error` | Our bug | Retry once, then report |
 | 503 | `no_upstream_available` | Every upstream is unhealthy | Retry after `Retry-After` |
