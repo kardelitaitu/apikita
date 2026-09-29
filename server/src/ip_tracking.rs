@@ -974,10 +974,50 @@ mod tests {
         );
     }
 
+    /// The two IP-hash windows, checked against the PAGE a customer reads.
+    ///
+    /// This test used to be called `the_retention_windows_match_the_privacy_statement`
+    /// and read no privacy statement at all. Its whole body was
+    /// `assert_eq!(SEEN_RETENTION_DAYS, 7)` and `assert_eq!(DAILY_RETENTION_DAYS, 90)` - a
+    /// hand-kept copy of two numbers compared to two constants, proving that the copy
+    /// agreed with the constants and nothing whatever about the page. Renaming it was the
+    /// honest minimum; reading the page is the actual fix, and it is the sixth time in
+    /// this work that a guard was found comparing a restatement of a thing rather than
+    /// the thing.
+    ///
+    /// It reads the CUSTOMER page rather than docs/ip-tracking.md, because ip-tracking.md
+    /// is where the constants are documented and this is the copy a reader never sees.
+    /// Both are real documents; only one of them is the promise.
     #[test]
-    fn the_retention_windows_match_the_privacy_statement() {
-        assert_eq!(SEEN_RETENTION_DAYS, 7);
-        assert_eq!(DAILY_RETENTION_DAYS, 90);
+    fn the_ip_hash_windows_are_the_ones_the_privacy_page_states() {
+        let page = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("website")
+                .join("src")
+                .join("lib")
+                .join("privacy.ts"),
+        )
+        .expect("website/src/lib/privacy.ts must be readable, or this passes over nothing");
+
+        // A row that does not exist at all is a silent pass, so each is FOUND first.
+        let seen_row = page
+            .lines()
+            .find(|l| l.contains("per address seen"))
+            .expect("the privacy page must disclose the per-address IP hash");
+        assert!(
+            seen_row.contains(&format!("keep: '{SEEN_RETENTION_DAYS} days'")),
+            "the privacy page says {seen_row:?}, but SEEN_RETENTION_DAYS is {SEEN_RETENTION_DAYS}. The page is what a customer is held to."
+        );
+
+        let daily_row = page
+            .lines()
+            .find(|l| l.contains("caller IP, per day"))
+            .expect("the privacy page must disclose the per-day IP count");
+        assert!(
+            daily_row.contains(&format!("keep: '{DAILY_RETENTION_DAYS} days'")),
+            "the privacy page says {daily_row:?}, but DAILY_RETENTION_DAYS is {DAILY_RETENTION_DAYS}."
+        );
     }
 
     #[test]
