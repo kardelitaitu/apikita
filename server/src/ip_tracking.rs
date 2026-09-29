@@ -683,6 +683,50 @@ mod tests {
     }
 
     #[test]
+    fn one_visitor_is_not_linkable_across_days_which_is_what_the_page_promises() {
+        // The published claim, in the words of the privacy page: the hash is
+        // HMAC-SHA256 of the address under a salt replaced at each UTC midnight, so
+        // THE SAME VISITOR IS NOT LINKABLE ACROSS DAYS. Nothing tested that end to
+        // end. The tests above prove the FUNCTION is sound - same inputs, same
+        // output, different inputs, different output - which is a different claim
+        // entirely. A perfectly correct HMAC under a salt that never rotated would
+        // pass every one of them.
+        let rot = DailySalt::new();
+        let day = today_utc();
+        let next = day.succ_opt().expect("a next day exists");
+
+        // The salt actually rotates between the two days...
+        assert_ne!(
+            rot.salt_for_day(day),
+            rot.salt_for_day(next),
+            "the salt must differ across days, or nothing below means anything"
+        );
+
+        // ...so the same address does not produce the same hash.
+        let visitor = ip("203.0.113.9");
+        assert_ne!(
+            ip_hash(&rot.salt_for_day(day), &visitor),
+            ip_hash(&rot.salt_for_day(next), &visitor),
+            "the same address on two days must not produce the same hash - that is the whole privacy claim, and a stable salt would break a promise on a public page while leaving every other test here green"
+        );
+
+        // THE DIRECTION THAT MATTERS. A hash stored yesterday is a 64-character
+        // string; what someone holding it must not be able to do is look up which
+        // address produced it under TODAYS salt. Since the two differ, a dictionary
+        // attack over the IPv4 space needs yesterdays salt, which is gone - and that
+        // is the reason the salt is process memory only.
+        let stored_yesterday = ip_hash(&rot.salt_for_day(day), &visitor);
+        let linkable = (1..=64u32)
+            .filter_map(|last| format!("203.0.113.{last}").parse().ok())
+            .any(|candidate: std::net::IpAddr| {
+                ip_hash(&rot.salt_for_day(next), &candidate) == stored_yesterday
+            });
+        assert!(
+            !linkable,
+            "a hash stored yesterday matched some address under TODAYS salt, so the two days are linkable and the unlinkability claim on the privacy page is false"
+        );
+    }
+    #[test]
     fn different_ips_and_different_salts_hash_differently() {
         let salt = [7u8; 32];
         let other_salt = [8u8; 32];
