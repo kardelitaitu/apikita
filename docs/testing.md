@@ -353,6 +353,40 @@ So the question is not "is this a copy" but **"what happens if the other file
 changes"**. For a definition, a copy that drifts is a lie. For a fixture, a copy
 that follows is a test that has stopped testing.
 
+### A negative result is only as good as the set it ranged over
+
+Two shapes. They look identical right up until you ask what set the search covered.
+
+| | what settles it | repeatable by someone else? |
+| --- | --- | --- |
+| **Countable** | a complete count: the string appears exactly once, in this line; the folder holds N files and I listed them | yes — the count is the evidence |
+| **Uncountable** | `Test-Path <somewhere>` returning False: I looked in one place, found nothing, and never named the set I should have covered | no — the place I chose is the claim |
+
+`todo.md` was the second, and it cost four rounds. The launch checklist said of its alert
+counts *"see `todo.md`, which now cites the same numbers."* I tested **`docs/todo.md`**,
+because I had assumed that a reference in a document under `docs/` points inside `docs/`.
+It returned False, I generalised that to a dangling reference, and I wrote the claim into a
+launch gate. `todo.md` is at the **repository root**, is git-tracked, and line 168 of it cites
+the same numbers. The sentence was correct and I replaced it with a false statement in the
+one document whose job is to be trustworthy.
+
+**THE TEST: could you state the SIZE of the set you searched?** `grep -c` gives you a
+number, and the number is the finding. `Test-Path` gives you a boolean about a location you
+chose, and the location is the claim — so you have to justify the choice before you can use
+the result, which is the step `todo.md` skipped.
+
+**WHAT A COUNTABLE NEGATIVE BUYS.** `/review withdraw` was found by grepping the whole
+repository for the string and getting exactly one hit. That is a positive count, not an
+absence: there is one occurrence and it is the line in the privacy page, so the command does
+not exist anywhere. The same search shape that produced the `todo.md` false positive
+produced a correct finding in a different round — the difference being that one counted the
+whole set and the other did not.
+
+**AND THE POSITIVE VERSION IS BETTER STILL.** A claim is safest when reading the
+implementation settles it. *"The proxy never reads a cookie"* is settled by the handler's
+signature: it takes `HeaderMap`, so a cookie is not in scope rather than being refused. No
+search is involved, and no reader has to trust that a search was thorough.
+
 ## The vacuity guard, applied everywhere
 
 A check that silently matches nothing passes over an empty set and reports a
