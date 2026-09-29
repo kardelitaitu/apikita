@@ -68,6 +68,8 @@ relationship and becomes a liability the moment a breach occurs.
 | **Review history** | Same as review | Needed to make an edit meaningful |
 | **link_codes** | Until used or expired + 24h | Then delete |
 | **Link-redemption attempts** | **7 days** | Salted IP hashes, same class as `key_ip_seen`; enough to investigate a live credential attack, then gone. **The "then gone" was false until this round**: the promise was in this table from before the sweep existed, and nothing deleted a single row. The nightly sweep now covers this table too, through the same instant helper `usage_events` uses |
+| `key_ip_seen` | **7 days** | One salted hash per (key, day, address): enough to see one address spreading a key across many accounts. Purged nightly, and the salt is replaced at each UTC midnight so days cannot be linked |
+| `key_ip_daily` | **90 days** | One count per (key, day) — a **trend, not a history**. The individual hashes are gone after 7 days; what survives is a number per day, which is what makes a 90-day view possible without keeping anything linkable |
 | **Logs** | 30-90 days | Debugging window; not a database |
 | **Accounts (closed)** | Keep record, drop personal data | See below |
 
