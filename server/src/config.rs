@@ -265,6 +265,52 @@ impl AppConfig {
             return Err("At least one model must be configured in models".into());
         }
         for model in &self.models {
+            // FINITENESS FIRST, and it is a separate check rather than a wider
+            // comparison because no comparison catches it. NaN <= 0.0 is FALSE in
+            // IEEE 754 - NaN is unordered, so it is greater than nothing, less
+            // than nothing, and equal to nothing - which means every "<= 0" guard
+            // below waves a NaN straight through, and inf sails past them too.
+            //
+            // TOML accepts "nan", "+inf" and "-inf" as float literals, so this is
+            // a config a human can actually write or a tool can emit, not a value
+            // only Rust can construct. The damage is not hypothetical and not
+            // symmetric:
+            //
+            //   * NaN reaches calculate_token_cost_idr, whose final "as i64" cast
+            //     maps NaN to ZERO. A model priced nan therefore bills every
+            //     request at 0 IDR - no error, no refusal, a ledger that balances
+            //     exactly, and revenue that is silently zero. Reconcile cannot see
+            //     it, because the ledger faithfully records the zero it was given.
+            //   * inf saturates to i64::MAX, so the reservation exceeds any wallet
+            //     and every request is refused. Loud, and still a dead service.
+            //
+            // Neither is a price a customer can be charged from, so the rule is
+            // FINITENESS and not positivity, and it is checked before the "<= 0"
+            // rules so the message names the real problem.
+            if !model.price.is_finite() {
+                return Err(format!(
+                    "Model {} has a price multiplier that is not a finite number",
+                    model.name
+                )
+                .into());
+            }
+            let rates = &model.rates;
+            for (field, rate) in [
+                ("input_peak", rates.input_peak),
+                ("output_peak", rates.output_peak),
+                ("input_offpeak", rates.input_offpeak),
+                ("output_offpeak", rates.output_offpeak),
+                ("cache_read_peak", rates.cache_read_peak),
+                ("cache_read_offpeak", rates.cache_read_offpeak),
+            ] {
+                if !rate.is_finite() {
+                    return Err(format!(
+                        "Model {} has a rate that is not a finite number: rates.{field} = {rate}",
+                        model.name
+                    )
+                    .into());
+                }
+            }
             if model.price <= 0.0 {
                 return Err(
                     format!("Model {} has invalid price multiplier <= 0", model.name).into(),
@@ -277,6 +323,21 @@ impl AppConfig {
             // negative one would under-reserve silently. A MISSING override
             // falls back to the model's rate, so only a present value is checked.
             for endpoint in &model.endpoints {
+                // An override is what the reservation is sized from, so a NaN here
+                // under-reserves by the same route a zero does, and for the same
+                // reason: the "<= 0" test below is false for it.
+                for (field, rate) in [
+                    ("input_peak", endpoint.input_peak),
+                    ("output_peak", endpoint.output_peak),
+                ] {
+                    if rate.is_some_and(|rate| !rate.is_finite()) {
+                        return Err(format!(
+                            "Model {} endpoint {} has a peak rate override that is not a finite number: {field}",
+                            model.name, endpoint.name
+                        )
+                        .into());
+                    }
+                }
                 if endpoint.input_peak.is_some_and(|rate| rate <= 0.0)
                     || endpoint.output_peak.is_some_and(|rate| rate <= 0.0)
                 {
@@ -519,6 +580,147 @@ mod tests {
         }
     }
 
+    /// A NaN or infinite price is NOT caught by the "<= 0" guard, and it is not a
+    /// cosmetic one: TOML accepts "nan" and "inf" as float literals, so a config
+    /// carrying one parses, and NaN <= 0.0 is FALSE in IEEE 754 - the value
+    /// compares greater than nothing, including itself, so every "<= 0" test in
+    /// validate() waves it straight through.
+    ///
+    /// What a NaN then does to money is the part that matters. The pricing function
+    /// ends in "total_customer.ceil() as i64", and a Rust "as" cast maps NaN to ZERO.
+    /// So a model priced nan bills every request at 0 IDR: no error, no refusal,
+    /// a ledger that balances perfectly, and a revenue line that is silently zero.
+    /// Reconcile cannot see it, because the ledger faithfully records the zero.
+    /// That is the worst shape a billing bug can take - invisible to every gate
+    /// this repository owns.
+    ///
+    /// An inf is loud rather than silent: "inf as i64" saturates to i64::MAX, so
+    /// the reservation is larger than any wallet and every request is refused. Still
+    /// a refusal to serve, and still a config no operator wrote on purpose.
+    ///
+    /// So the guard is FINITENESS, not positivity: a price that is not a number a
+    /// customer can be charged from is not a price, whatever it compares against.
+    #[test]
+    fn a_non_finite_price_or_rate_is_refused_at_validate() {
+        // The parse path is not a defence, so it is part of the claim: these are
+        // real TOML float literals, not values only Rust can construct.
+        for literal in ["nan", "inf", "-inf"] {
+            let doc = format!("[pricing]\nprice = {literal}\n");
+            let table: toml::Table = toml::from_str(&doc)
+                .unwrap_or_else(|e| panic!("TOML must parse the literal {literal}: {e}"));
+            let parsed = table["pricing"]["price"]
+                .as_float()
+                .unwrap_or_else(|| panic!("{literal} must parse as a float"));
+            assert!(
+                !parsed.is_finite(),
+                "{literal} must parse to a non-finite value, or this test proves nothing"
+            );
+        }
+
+        let non_finite = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+
+        for bad in non_finite {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            config.models[0].price = bad;
+            let err = config
+                .validate()
+                .expect_err("a non-finite price multiplier must be refused")
+                .to_string();
+            assert!(
+                err.contains("not a finite number"),
+                "a price of {bad} must be named as non-finite, got {err}"
+            );
+        }
+
+        for bad in non_finite {
+            for field in [
+                "input_peak",
+                "output_peak",
+                "input_offpeak",
+                "output_offpeak",
+                "cache_read_peak",
+                "cache_read_offpeak",
+            ] {
+                let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                    .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                    .expect("config/apikita.toml must load");
+                let rates = &mut config.models[0].rates;
+                match field {
+                    "input_peak" => rates.input_peak = bad,
+                    "output_peak" => rates.output_peak = bad,
+                    "input_offpeak" => rates.input_offpeak = bad,
+                    "output_offpeak" => rates.output_offpeak = bad,
+                    "cache_read_peak" => rates.cache_read_peak = bad,
+                    "cache_read_offpeak" => rates.cache_read_offpeak = bad,
+                    _ => panic!("unhandled field {field}"),
+                }
+                let err = config
+                    .validate()
+                    .expect_err("a non-finite rate must be refused")
+                    .to_string();
+                assert!(
+                    err.contains("not a finite number"),
+                    "rate {field} = {bad} must be named as non-finite, got {err}"
+                );
+            }
+        }
+
+        for bad in [f64::NAN, f64::INFINITY] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            config.models[0].endpoints[0].input_peak = Some(bad);
+            let err = config
+                .validate()
+                .expect_err("a non-finite endpoint override must be refused")
+                .to_string();
+            assert!(
+                err.contains("not a finite number"),
+                "an endpoint override of {bad} must be named as non-finite, got {err}"
+            );
+        }
+    }
+
+    /// The harm the finiteness guard exists to prevent, asserted end to end so the
+    /// guard cannot be dismissed as pedantry by someone tidying the validator.
+    ///
+    /// This is the actual behaviour, not an inference: a Rust "as" cast maps NaN to
+    /// 0, so a NaN multiplier is a FREE multiplier. If a future change to the cast,
+    /// the pricing function, or the float type alters that, this fails.
+    #[test]
+    fn a_nan_multiplier_prices_every_request_at_zero() {
+        // The literal cast, exactly as the pricing function ends.
+        let cost = f64::NAN.ceil() as i64;
+        assert_eq!(
+            cost, 0,
+            "NaN casts to ZERO, which is why a non-finite price is free usage rather than an error"
+        );
+        // And the real function, fed the multiplier a price = nan config supplies.
+        let free = crate::money::calculate_token_cost_idr(
+            f64::NAN,
+            1_000_000,
+            2676.78,
+            0,
+            53.54,
+            1_000_000,
+            10707.12,
+        );
+        assert_eq!(
+            free, 0,
+            "a NaN multiplier must bill 0 IDR - the invisible-money failure the finiteness guard blocks"
+        );
+        // The control: the same shape with a real multiplier is NOT free. Without
+        // this, "the function returns 0" would pass for the wrong reason.
+        let paid = crate::money::calculate_token_cost_idr(
+            1.5, 1_000_000, 2676.78, 0, 53.54, 1_000_000, 10707.12,
+        );
+        assert!(
+            paid > 0,
+            "the same request at M=1.5 must cost something, or the test above proves nothing"
+        );
+    }
     /// A model whose peak rates are absent reserves nothing and can never bill
     /// the peak it is documented to charge, so the missing figure is fatal.
     #[test]
