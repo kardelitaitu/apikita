@@ -1346,6 +1346,70 @@ mod tests {
         }
     }
 
+    /// Every model's margin is the ONE the decision record states.
+    ///
+    /// `docs/decisions.md` says, in a table: Margin value = `1.5 per model - no
+    /// global default`, and Margin location = `Per model, never global`. Those two
+    /// rows together are a decision to DE-CENTRALISE the margin and then to hold it
+    /// uniform, and nothing enforced the second half. Each model carries its own
+    /// `price`, so a model added at 1.6 would be a silent divergence from a recorded
+    /// decision, on the one number that decides what a customer pays - and the
+    /// customer-facing prices in website/src/lib/models.ts are derived from it.
+    ///
+    /// THE NUMBER IS READ FROM THE DECISION, not written here, for the same reason the
+    /// checklist bindings are: a copy beside the constant is a second place to
+    /// update, and it goes stale the way the claim would without it. If the decision
+    /// moves to 1.6, this test follows it and then requires every model to match -
+    /// which is the only way the decision can actually be changed without editing
+    /// seven places.
+    #[test]
+    fn every_model_carries_the_margin_the_decision_record_states() {
+        let decisions = read_repo_file("docs/decisions.md");
+        let row = decisions
+            .lines()
+            .find(|l| l.contains("Margin value"))
+            .expect("docs/decisions.md must still record a Margin value row");
+        // The FIRST number in that row, which is the operative multiplier.
+        let decided: f64 = row
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .find(|part| !part.is_empty())
+            .unwrap_or_else(|| panic!("the Margin value row carries no number: {row}"))
+            .parse()
+            .expect("a decimal parses");
+        assert!(
+            (decided - 1.5).abs() < 0.0001,
+            "the decision now reads {decided}; if that is intended, the website prices derived from it need repricing too."
+        );
+
+        let config = read_repo_file("config/apikita.toml");
+        let mut model = String::new();
+        let mut checked = 0usize;
+        for line in config.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("name = ") {
+                model = rest.trim_matches('"').to_string();
+            } else if let Some(rest) = trimmed.strip_prefix("price = ") {
+                let declared: f64 = rest
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("model {model} has an unparseable price: {rest}"));
+                assert_eq!(
+                    declared, decided,
+                    "model {model} declares price {declared} while the decision record states {decided}. The margin is per model BY DESIGN, so nothing else would notice a divergence - and this is the number the customer-facing prices are derived from."
+                );
+                checked += 1;
+            }
+        }
+
+        // The vacuity guard: a parse that matched no model would agree with anything.
+        assert!(
+            checked >= 6,
+            "only {checked} model price(s) were read from the config, so this is not looking at them all"
+        );
+    }
     /// Each bound claim carries the SAME NUMBER as the code, and this keeps no copy
     /// of either.
     ///
