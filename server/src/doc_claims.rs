@@ -825,26 +825,52 @@ mod tests {
             ),
         ];
 
-        let schema = read_repo_file("server/migrations/20260925000000_initial_schema.sql");
         let privacy = read_repo_file("website/src/lib/privacy.ts");
 
+        // EVERY migration, not the first one. This test is called
+        // every_table_is_either_disclosed_to_the_customer_or_recorded_as_unused, and it
+        // read exactly one of four files: link_redemption_attempts and link_code_issues
+        // are created by LATER migrations and were invisible to it. They passed because
+        // they had been listed by hand, which is luck, not construction - a fifth
+        // migration adding a table would have gone entirely unseen, in a test whose whole
+        // purpose is that a new table cannot.
+        let migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         let mut tables: Vec<String> = Vec::new();
-        for line in schema.lines() {
-            if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
-                tables.push(
-                    rest.split(|c: char| c == '(' || c.is_whitespace())
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
-                );
+        let mut files = 0usize;
+        let mut entries: Vec<_> = std::fs::read_dir(&migrations)
+            .expect("server/migrations must be readable, or this passes over nothing")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+            .collect();
+        entries.sort();
+        for path in entries {
+            files += 1;
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
+                    tables.push(
+                        rest.split(|c: char| c == '(' || c.is_whitespace())
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                }
             }
         }
         tables.sort();
+        tables.dedup();
 
-        // The vacuity guard: a parse that found nothing would pass over every table.
+        // Two vacuity guards, because the two ways this parse can be wrong are both
+        // silent: a parse that found nothing, and a glob that matched only the first
+        // migration - which is what it used to do.
         assert!(
-            tables.len() >= 15,
-            "only {} table(s) were read from the schema, so this test is not looking at the real one.",
+            files >= 4,
+            "only {files} migration file(s) were read, so a table created by a later migration would be invisible to this test."
+        );
+        assert!(
+            tables.len() >= 19,
+            "only {} table(s) were read from the migrations, so this test is not looking at the real schema.",
             tables.len()
         );
 
