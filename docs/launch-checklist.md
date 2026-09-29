@@ -124,6 +124,17 @@ opinion.
 
 - [x] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
       dashboard endpoints.
+- [x] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
+      dashboard endpoints.
+      *The first half is stronger than "rejected", and the difference matters before anyone
+      audits it.* `server/src/routes/proxy.rs` reads the credential from the
+      `Authorization: Bearer` header and **nothing else**: there is no code path in the
+      proxy that consults a cookie, so a session cookie cannot be accepted because there is
+      nowhere it would be read. "Rejected" describes a check that could be removed;
+      "never read" describes an attack surface that does not exist. Verifying this item means
+      looking for the ABSENCE of cookie handling in the proxy rather than for a 401, and a
+      reader who went looking for a rejection would find the guarantee, then wonder whether
+      the check enforcing it was tested. That is the question this note removes.*
 - [x] Logout revokes the session row; "sign out everywhere" revokes all of them.
 - [x] Suspension revokes sessions **and** keys atomically.
 - [x] Admin endpoints require the operator flag; an operator cannot act on
