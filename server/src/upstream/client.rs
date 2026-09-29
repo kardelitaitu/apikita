@@ -25,6 +25,26 @@
 //! The URL is used verbatim as configured. SSRF allowlisting is a separate
 //! concern and is not done here.
 
+#![cfg_attr(
+    not(test),
+    // THE UPSTREAM CLIENT, and this one is fenced for a reason the others were not:
+    // the values that reach this module are whatever bytes a THIRD PARTY sent.
+    //
+    // Every other fenced module computes figures from numbers this process
+    // produced. Here, a provider's response is parsed field by field, and a provider
+    // that is malfunctioning, compromised, or simply different from what we assume
+    // is indistinguishable from a correct one. So the arithmetic here is arithmetic
+    // on untrusted input, which is a stronger reason to deny it than "this computes
+    // money" ever was.
+    //
+    // It is also nearly free: two sites, and the one that mattered is not an
+    // argument at all. `prompt - cached` in the usage parser now SATURATES, because
+    // it is the subtraction most likely to be handed a nonsense pair, and because a
+    // negative token count does not stay negative - the proxy casts these to u64,
+    // where -1 is 18_446_744_073_709_551_615 tokens.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -117,9 +137,31 @@ pub fn parse_usage_from_sse(tail: &[u8]) -> Option<Usage> {
         let prompt = int_field(block, "prompt_tokens");
         // Cached tokens are a subset of the prompt. Never let a malformed
         // report push the split below zero or above the prompt total.
+        //
+        // `.min(prompt)` handles the UPPER bound. The LOWER one is handled by
+        // `int_field`, which clamps every field it reads with `.max(0)` - so
+        // `cached` and `prompt` are both non-negative here and the split cannot go
+        // negative. That is a CROSS-FUNCTION contract, and this line depends on it
+        // from a different function in a different part of the file.
         let cached = nested_int_field(block, "prompt_tokens_details", "cached_tokens").min(prompt);
         usage = Some(Usage {
-            input_tokens: prompt - cached,
+            // SATURATING, and this is the arithmetic that matters here, because the
+            // upstream is a THIRD PARTY and this value is whatever bytes it sent.
+            //
+            // If `cached` were ever to exceed `prompt` - which the `.min` above
+            // prevents, and `int_field`'s clamp keeps both operands non-negative -
+            // then `prompt - cached` on i64 could underflow. In a debug build that
+            // is a panic on the request path; in the release build that ships, it is
+            // a silent wrap to a hugely POSITIVE number. And a negative token count
+            // does not stay negative: routes/proxy.rs casts these to u64, where -1
+            // becomes 18_446_744_073_709_551_615 tokens, which prices at a figure no
+            // wallet can pay - so the request is refused. An adversarial provider
+            // could refuse service with one malformed usage block.
+            //
+            // Saturating costs one instruction and removes the dependency on a
+            // contract two functions away. The impossible case then degrades to a
+            // zero-token prompt rather than a panic or a 19-quintillion-token bill.
+            input_tokens: prompt.saturating_sub(cached),
             cache_read_tokens: cached,
             output_tokens: int_field(block, "completion_tokens"),
         });
@@ -409,6 +451,15 @@ impl UpstreamClient {
     /// An EMPTY routed pool gives `false` too: with nothing routed there is no outage
     /// to report, and a vacuously-true "all zero endpoints are open" would fire an
     /// alert for a model that was never served.
+    /// The `routed` count is SAFE by the length of its own input: it counts the
+    /// model's OWN endpoints, which come from the config file rather than from a
+    /// provider, and a config holding more endpoints than a usize can address is not
+    /// a thing. The count is only ever compared against zero, to tell "no endpoint
+    /// was routed" apart from "some were, and every one of them is open".
+    ///
+    /// The allow is on the FUNCTION because the increment is a loop tail
+    /// expression, and an attribute there is still unstable.
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn all_endpoints_unhealthy(&self, model: &str) -> bool {
         let Some(entry) = self.model(model) else {
             return false;
@@ -825,6 +876,77 @@ mod tests {
                 cache_read_tokens: 10,
                 output_tokens: 1,
             })
+        );
+    }
+
+    /// A NEGATIVE token count is the shape a hostile or broken provider sends,
+    /// and it is the one the existing tests never produced: the malformed-count test
+    /// above sends `cached_tokens` ABOVE the prompt total, which exercises the
+    /// `.min(prompt)` clamp. Nothing sent a negative, so the other half of the
+    /// defence - `int_field`'s `.max(0)` - was relied on by
+    /// `parse_usage_from_sse` and never checked.
+    ///
+    /// The consequence of not checking is specific and bad. `int_field` clamps, so
+    /// both operands are non-negative and `prompt - cached` cannot underflow. Remove
+    /// that clamp and `cached_tokens: i64::MIN` with `prompt_tokens: 10` gives
+    /// `min(i64::MIN, 10) == i64::MIN`, and `10 - i64::MIN` panics in a debug build
+    /// and WRAPS in the release build that ships.
+    ///
+    /// And a negative token count does not stay negative downstream: the proxy
+    /// casts these to u64, where -1 is 18_446_744_073_709_551_615 tokens. So the
+    /// failure is not a quiet miscount, it is a request priced beyond any wallet and
+    /// refused - one malformed usage block from one provider is enough.
+    #[test]
+    fn a_negative_token_count_from_the_provider_is_clamped_to_zero() {
+        for (prompt, cached, output) in [
+            (-50i64, -20i64, -1i64),
+            // The worst case for the subtraction: the most negative i64, against a
+            // small positive prompt. Without the clamp this is the underflow.
+            (10, i64::MIN, 0),
+            (0, i64::MIN, 0),
+        ] {
+            let tail = sse(&[json!({
+                "usage": {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": output,
+                    "prompt_tokens_details": { "cached_tokens": cached }
+                }
+            })]);
+
+            let usage = parse_usage_from_sse(&tail).expect("a usage block is present");
+            assert!(
+                usage.input_tokens >= 0,
+                "prompt {prompt} with cached {cached} produced a NEGATIVE input count: \
+                 a negative here becomes a huge u64 at the proxy's cast"
+            );
+            assert!(
+                usage.cache_read_tokens >= 0,
+                "cached {cached} survived as a negative cache-read count"
+            );
+            assert!(
+                usage.output_tokens >= 0,
+                "output {output} survived as a negative output count"
+            );
+        }
+
+        // The control: the clamp is not silently rewriting a normal report. A prompt
+        // of 10 with a cache hit of 4 must still split 6 + 4.
+        let tail = sse(&[json!({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "prompt_tokens_details": { "cached_tokens": 4 }
+            }
+        })]);
+        let usage = parse_usage_from_sse(&tail).expect("a usage block is present");
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cache_read_tokens,
+                usage.output_tokens
+            ),
+            (6, 4, 2),
+            "a well-formed report must be reported unchanged"
         );
     }
 
