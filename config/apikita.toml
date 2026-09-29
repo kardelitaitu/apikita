@@ -284,6 +284,12 @@ cooldown_multiplier = 2.0
 request_timeout_seconds = 120
 
 # External health check interval for relay/backend failover (see topology.md).
+#
+# NOT ENFORCED, along with health_check_failures below and mid_stream_cutoff further
+# down - all three are named in the note above on_pool_exhausted, which is where the
+# full statement of why they are not switches lives. In short: the failover circuit and
+# the pre-flight rejection they describe are both hardcoded to the behaviour these
+# values already name, so an operator who needs to change one has to change code.
 health_check_interval_seconds = 30
 # Consecutive failed checks before failing over.
 health_check_failures = 2
@@ -292,11 +298,24 @@ health_check_failures = 2
 # On balance exhaustion, reject at pre-flight rather than cutting a stream
 # mid-answer. A truncated answer on non-refundable funds is the most likely
 # source of a delivery dispute. See docs/business/05-risk.md R3.
+#
+# NOT ENFORCED as a switch, and the value below is the CURRENT behaviour rather than a
+# setting that produced it. The mitigation this describes IS implemented: the
+# pre-flight hold is taken before routing and an insufficient balance is refused up
+# front, unconditionally, in routes/proxy.rs. So the risk is mitigated - but by the code,
+# not by this line, and there is no way to turn it off by setting this to true.
 mid_stream_cutoff = false
 
 hard_max_output_tokens = 384000
 
 # Context window, for pre-flight input validation.
+#
+# NOT ENFORCED, and the comment above is the misleading part: the pre-flight input
+# validation does NOT read this. It calls money::calculate_preflight_reservation_idr,
+# which estimates from the request as it stands. Nothing compares a prompt against a
+# model context ceiling, so an over-long request is sent to the provider and fails there
+# - or, on some providers, is silently truncated. A context ceiling that is recorded
+# rather than applied is a task; the value is kept because the intent is the useful part.
 max_context_tokens = 1000000
 
 # ===========================================================================
@@ -405,6 +424,10 @@ name = "flash"
 description = "Fast, low-cost general model. 1M context, vision capable."
 price = 1.5                    # 50% markup over wholesale (M = 1.50)
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
@@ -502,6 +525,10 @@ name = "deepseek-v4-flash"
 description = "Legacy alias of flash. Identical pricing."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
@@ -563,6 +590,10 @@ name = "deepseek-v4-pro"
 description = "Higher-capability reasoning tier. Priced above flash."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
@@ -612,6 +643,10 @@ name = "dummy-glm-5.3-flash"
 description = "PLACEHOLDER -- not a real model. Never routed."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
@@ -646,6 +681,10 @@ name = "dummy-glm-5.2"
 description = "PLACEHOLDER -- not a real model. Never routed."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
@@ -680,6 +719,10 @@ name = "dummy-qwen-4-max"
 description = "PLACEHOLDER -- not a real model. Never routed."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
