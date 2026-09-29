@@ -449,6 +449,22 @@ twenty-five more across the remaining 149 on the same ratio. That is the whole
 justification: the work is not typing, it is the reading, and the reading is the only
 part a machine cannot do.
 
+**THE NEXT CLUSTER WAS WORSE: FOURTEEN OF NINETEEN.** The Retry-After citations —
+nineteen comments pointing into `docs/error-model.md` between lines 93 and 112 — were read
+next, and fourteen were wrong. Seven cited `:112` for the "floor at 1 second" rule
+while `:112` is the *formula*; the rule is the `429 — rate limited` section, twenty lines
+away. Four cited `:96`, which is a **blank line**, for the rule that a `Retry-After`
+header appears only on 429 and 503. Two cited the 402/429 status table for the rounding
+rule. A citation pointing at a blank line is the clearest possible statement that
+nobody has opened the file.
+
+Two ranges (`:99-110`, `:99-112`) were left alone: they are imprecise rather than wrong,
+and precision is a preference while pointing at nothing is a defect.
+
+So the rate is not one in six. Across thirty-one citations read so far, **eighteen were
+wrong** — and the errors are not cosmetic. A comment citing the formula when it means
+the floor rule will send a reader to write a client that retries instantly.
+
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually
 runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was

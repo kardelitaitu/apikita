@@ -120,7 +120,7 @@ impl CircuitBreaker {
     ///
     /// A cooldown that has already elapsed still reports `Some(0)` while the
     /// breaker reads Open, because a retry is plausible immediately; the caller
-    /// floors the reported value (docs/error-model.md:112).
+    /// floors the reported value (docs/error-model.md (429 — rate limited)).
     pub fn remaining_cooldown(&self) -> Option<Duration> {
         let inner = self.lock();
         if inner.state != BreakerState::Open {

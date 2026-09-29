@@ -353,7 +353,7 @@ impl UpstreamClient {
     /// come from a path where nothing tripped), and it is deliberately NOT
     /// collapsed into a number here: the caller decides what to emit and logs
     /// the cause, so the header is never an unexplained guess
-    /// (docs/error-model.md:96). Also `None` when the model is unknown.
+    /// (docs/error-model.md (Retry-After)). Also `None` when the model is unknown.
     /// Whether EVERY routed endpoint of `model` currently has its breaker OPEN, i.e.
     /// nothing in the pool can serve the model.
     ///
@@ -438,11 +438,11 @@ impl UpstreamClient {
             // Whole seconds, rounded UP, then floored at 1.
             //
             // Rounding up is the same rule the 429 path follows
-            // (docs/error-model.md:93-94) and it is the safe direction: a value
+            // (docs/error-model.md (429 — rate limited)) and it is the safe direction: a value
             // that is too low tells the client to retry before a retry can
             // succeed. Ceiling division via `u64::div_ceil` (stable since 1.73).
             //
-            // Floor at 1: docs/error-model.md:112 - "A zero or negative value
+            // Floor at 1: docs/error-model.md (429 — rate limited) - "A zero or negative value
             // is a malformed header", and a client that honours 0 retries into
             // a refusal.
             .map(|cooldown| (cooldown.as_millis() as u64).div_ceil(1000).max(1))
@@ -1182,7 +1182,7 @@ mod tests {
         let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
         trip_endpoint(&client, 0);
 
-        // docs/error-model.md:112 - a zero or negative Retry-After is a
+        // docs/error-model.md (429 — rate limited) - a zero or negative Retry-After is a
         // malformed header, so the floor is part of the accessor's contract.
         assert!(client.shortest_cooldown_secs("flash").unwrap() >= 1);
     }

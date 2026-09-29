@@ -895,7 +895,7 @@ impl Stream for MeteredStream {
 /// accessor means NO breaker is open, so there is no cooldown to report: the
 /// documented 1-second floor applies, and `cause` records which path produced
 /// the 503 so an operator can see why the floor applied instead of a real
-/// number (docs/error-model.md:96 forbids an unexplained value).
+/// number (docs/error-model.md (Retry-After) forbids an unexplained value).
 fn no_upstream_retry_after(
     cooldown: Option<u64>,
     model: &str,
@@ -2032,7 +2032,7 @@ mod tests {
 
     #[test]
     fn no_open_breaker_falls_back_to_the_documented_one_second_floor() {
-        // docs/error-model.md:112 - "Floor it at 1 second. A zero or negative
+        // docs/error-model.md (429 — rate limited) - "Floor it at 1 second. A zero or negative
         // value is a malformed header." The floor is the documented value, not
         // an estimate; the warn! inside records the cause.
         assert_eq!(

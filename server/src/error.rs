@@ -284,7 +284,8 @@ impl IntoResponse for AppError {
         // For 503 the value is the pool's shortest remaining cooldown. When no
         // breaker is open there is no cooldown to report, and the caller emits
         // the documented 1-second floor - never a fabricated estimate
-        // (docs/error-model.md:96, :112). Which path produced the 503 is logged
+        // (docs/error-model.md, Retry-After and 429 — rate limited). Which path
+        // produced the 503 is logged
         // at the call site so the floor is explained, not silent.
         let retry_after_secs = match self {
             Self::RateLimited { retry_after_secs }
@@ -789,7 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limited_retry_after_is_never_zero() {
-        // docs/error-model.md:93-94 - "never below 1".
+        // docs/error-model.md (429 — rate limited) - "never below 1".
         let (_, headers, _) = respond(AppError::RateLimited {
             retry_after_secs: 1,
         })
@@ -809,7 +810,7 @@ mod tests {
             let (status, headers, _) = respond(err).await;
             assert!(
                 headers.get(header::RETRY_AFTER).is_none(),
-                "unexpected Retry-After on {status} - a header that appears everywhere teaches callers to ignore it (docs/error-model.md:96)"
+                "unexpected Retry-After on {status} - a header that appears everywhere teaches callers to ignore it (docs/error-model.md (Retry-After))"
             );
         }
     }
@@ -818,7 +819,7 @@ mod tests {
     async fn no_upstream_available_carries_retry_after() {
         // docs/error-model.md:50  - 503 says "Retry after Retry-After".
         // docs/error-model.md:81  - "Included on 429 and 503."
-        // docs/error-model.md:112 - "Floor it at 1 second."
+        // docs/error-model.md (429 — rate limited) - "Floor it at 1 second."
         let (status, headers, _) = respond(AppError::NoUpstreamAvailable {
             retry_after_secs: 30,
         })
@@ -830,7 +831,10 @@ mod tests {
         let value = header_str(&headers, header::RETRY_AFTER)
             .expect("docs/error-model.md:81 - Retry-After is included on 503");
         let secs: u64 = value.parse().expect("Retry-After must be whole seconds");
-        assert!(secs >= 1, "docs/error-model.md:112 - floored at 1 second");
+        assert!(
+            secs >= 1,
+            "docs/error-model.md (429 — rate limited) - floored at 1 second"
+        );
         assert_eq!(
             secs, 30,
             "the header must carry the value the variant holds, not a constant"
@@ -840,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn a_503_with_the_documented_floor_still_reports_one() {
         // The no-breaker-open path emits the documented floor of 1
-        // (docs/error-model.md:112). Pinned so a future change cannot turn the
+        // (docs/error-model.md (429 — rate limited)). Pinned so a future change cannot turn the
         // floor into a 0, which is a malformed header.
         let (_, headers, _) = respond(AppError::NoUpstreamAvailable {
             retry_after_secs: 1,
