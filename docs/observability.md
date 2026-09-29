@@ -32,7 +32,7 @@ has a defined action; anything without an action is a dashboard, not an alert.
 | Event | Level | Why |
 | --- | --- | --- |
 | `auth.login` | info | Audit trail |
-| `auth.login_failed` | warn | Brute force detection |
+| `auth.login_failed` | warn | **Detection data, not detection.** It records a failed exchange; nothing counts it, alerts on it, or blocks anything. `alerts.tsv` has no brute-force row, so the only automated response to a credential attack is `api_down`, which fires on the *service* being unhealthy and not on anyone guessing passwords. The runbook's step 2 - block at the edge relay - is a human action |
 | `key.created` / `key.revoked` | info | Audit trail |
 | `topup.created` | info | Money in flight |
 | `topup.settled` | info | Money landed |
