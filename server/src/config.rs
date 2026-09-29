@@ -213,12 +213,21 @@ impl ModelConfig {
     /// a dearer provider would otherwise overdraw the balance
     /// (docs/failover.md:162-165). Each endpoint is priced at its own peak rates
     /// when it overrides them, else the model's; a model with no endpoints
-    /// registered reserves at the model rate, exactly as
-    /// `UpstreamClient::worst_case_reservation_idr` does.
+    /// registered reserves at the model rate.
     ///
-    /// This lives here rather than inline in the handler because the handler and
-    /// the upstream client previously each carried their own copy, and a rule
-    /// written twice is a rule that can disagree with itself.
+    /// This is the ONLY implementation. There was a second, on `UpstreamClient`,
+    /// which proxied to a `ModelEntry` copy of the same rule - and the handler and
+    /// that copy had each carried their own version, so the comment above used to
+    /// present them as parallel. The copy was called by NOTHING outside its own
+    /// tests: the handler has always called this one. A second implementation of a
+    /// money rule that no request reaches is worse than none, because it reads as a
+    /// cross-check and is not one - and a bug fixed in this copy in the same commit
+    /// that fixed a hold under-reserving left the dead copy still wrong, with tests
+    /// green over both.
+    ///
+    /// So it is deleted rather than left as a spare, and the fields it alone read
+    /// went with it. The rule now has one home, and the only test of it is a test of
+    /// the code that actually runs.
     pub fn worst_case_reservation_idr(
         &self,
         estimated_input_tokens: u64,
@@ -1599,6 +1608,20 @@ mod tests {
                  comment in bin/hold-sweep.rs presents it as if it would. A value that \
                  restates what the code already does is a documentation line wearing a \
                  config field's clothes.",
+            ),
+            (
+                "max_context_tokens",
+                "NOT A CAP, despite what the register used to call it - nothing refuses \
+                 a request whose prompt exceeds it. The hold is sized from the ACTUAL \
+                 body (estimated_input_tokens), so an over-long prompt is still \
+                 covered; the context ceiling simply bounds nothing.\n\n                 It had exactly one production reader, and that reader was DEAD: a second \
+                 worst_case_reservation_idr on UpstreamClient which proxied to a \
+                 ModelEntry copy and was called by nothing outside its own tests. So \
+                 the field looked wired - the guard could see a read - while the read \
+                 itself never ran. That is a SECOND-ORDER blind spot in the wiring \
+                 guard, and the only reason this is found is that the dead function \
+                 was deleted; a field read solely by unreachable code is \
+                 indistinguishable from a live one by any source-level check.",
             ),
             (
                 "description",

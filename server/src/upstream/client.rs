@@ -58,7 +58,6 @@ use futures_util::Stream;
 use serde_json::{json, Value};
 
 use crate::config::AppConfig;
-use crate::money::calculate_preflight_reservation_idr;
 use crate::upstream::circuit_breaker::CircuitBreaker;
 use crate::upstream::key_pool::{KeyLease, KeyPool};
 
@@ -196,69 +195,12 @@ struct EndpointEntry {
     pool: KeyPool,
     breaker: CircuitBreaker,
     supports_stream_options: bool,
-    /// This endpoint's peak rates, already resolved against the model's — an
-    /// endpoint may be dearer than the model's nominal rate because the reseller
-    /// charges more, and the reservation must be sized from the dearest one
-    /// (docs/failover.md:162-165).
-    input_peak: f64,
-    output_peak: f64,
 }
 
 /// One configured model with its endpoints.
 struct ModelEntry {
     name: String,
-    price: f64,
-    max_context_tokens: u64,
-    input_peak: f64,
-    output_peak: f64,
     endpoints: Vec<EndpointEntry>,
-}
-
-impl ModelEntry {
-    /// Worst-case pre-flight reservation in IDR for a request that may emit
-    /// `max_output_tokens`.
-    ///
-    /// The reservation is taken BEFORE routing and applies whichever endpoint
-    /// serves the request, so it must cover the dearest endpoint in the pool —
-    /// otherwise a failover to a dearer provider can overdraw the balance
-    /// (docs/failover.md). An endpoint MAY override the model's peak rates
-    /// (`ModelEndpoint::input_peak` / `output_peak`), so each one is priced at
-    /// its OWN rates here — a closure over the model's rates would make the
-    /// endpoints tie and the dearest-endpoint rule unobservable. The input side
-    /// is reserved at the model's full context window, which is the only upper
-    /// bound this layer can see.
-    ///
-    /// A model with no endpoints registered reserves at the model rate, so an
-    /// empty pool is not a zero hold.
-    fn worst_case_reservation_idr(&self, max_output_tokens: u64) -> i64 {
-        let at = |input_peak: f64, output_peak: f64| {
-            calculate_preflight_reservation_idr(
-                self.price,
-                self.max_context_tokens,
-                input_peak,
-                max_output_tokens,
-                output_peak,
-            )
-        };
-
-        // The MODEL's own rates are a CANDIDATE here, not just the empty-pool
-        // fallback, and that is the fix. This hold is sized before routing, so it
-        // prices each endpoint at its own rates; SETTLEMENT always charges the
-        // MODEL's rates (routes/proxy.rs:1522 passes model_cfg.rates.*, never an
-        // endpoint's). Taking the max over endpoints alone let an endpoint that
-        // overrides DOWNWARD - a cheaper reseller, the ordinary reason to add one -
-        // pull the hold below the charge, stranding money.
-        //
-        // Seeding the fold with the model-rate hold states the invariant: the
-        // product price is the FLOOR and an endpoint may only raise it. A config
-        // with no overrides ties with the model, so nothing changes for any
-        // deployment that ships today.
-        let at_model_rate = at(self.input_peak, self.output_peak);
-        self.endpoints
-            .iter()
-            .map(|endpoint| at(endpoint.input_peak, endpoint.output_peak))
-            .fold(at_model_rate, i64::max)
-    }
 }
 
 /// The resolved upstream for one request, streaming.
@@ -358,10 +300,6 @@ impl UpstreamClient {
             .iter()
             .map(|model| ModelEntry {
                 name: model.name.clone(),
-                price: model.price,
-                max_context_tokens: model.max_context_tokens,
-                input_peak: model.rates.input_peak,
-                output_peak: model.rates.output_peak,
                 endpoints: model
                     .endpoints
                     .iter()
@@ -378,11 +316,6 @@ impl UpstreamClient {
                         ),
                         breaker: CircuitBreaker::new(config.circuit_breaker.clone()),
                         supports_stream_options: endpoint.supports_stream_options,
-                        // Resolved through the config's own accessors so the
-                        // upstream client and the pre-flight reservation can never
-                        // disagree about what an endpoint costs.
-                        input_peak: endpoint.effective_input_peak(model),
-                        output_peak: endpoint.effective_output_peak(model),
                     })
                     .collect(),
             })
@@ -406,12 +339,6 @@ impl UpstreamClient {
             .iter()
             .map(|model| model.name.as_str())
             .collect()
-    }
-
-    /// Worst-case reservation in IDR, or `None` when the model is unknown.
-    pub fn worst_case_reservation_idr(&self, model: &str, max_output_tokens: u64) -> Option<i64> {
-        self.model(model)
-            .map(|entry| entry.worst_case_reservation_idr(max_output_tokens))
     }
 
     /// The shortest remaining cooldown across `model`'s endpoint pool, in whole
@@ -983,151 +910,6 @@ mod tests {
                 cache_read_tokens: 0,
                 output_tokens: 3,
             })
-        );
-    }
-
-    #[test]
-    fn worst_case_reservation_covers_the_dearest_endpoint_in_the_pool() {
-        let client = client(vec![model(
-            "flash",
-            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
-        )]);
-
-        let reserved = client
-            .worst_case_reservation_idr("flash", 4096)
-            .expect("configured model");
-
-        // Worst case = the dearest endpoint in the pool, at the model's peak
-        // rates, over the full context window:
-        //   in  1e6/1e6 * 2676.78 = 2676.78
-        //   out 4096/1e6 * 10707.12 = 43.8564
-        //   (2676.78 + 43.8564) * 1.5 = 4080.954 -> ceil 4081
-        assert_eq!(reserved, 4081);
-        assert_eq!(
-            reserved,
-            calculate_preflight_reservation_idr(1.5, 1_000_000, 2676.78, 4096, 10707.12)
-        );
-        // The reservation covers the whole context window as well as the output
-        // budget, so it is strictly dearer than an output-only reservation.
-        // (Today's schema prices rates per MODEL, so the endpoints of one model
-        // tie; the max over the pool is what makes a dearer endpoint win once
-        // per-endpoint rates exist.)
-        assert!(reserved > calculate_preflight_reservation_idr(1.5, 0, 2676.78, 4096, 10707.12));
-
-        // A bigger output budget reserves more; an unknown model reserves none.
-        assert!(client.worst_case_reservation_idr("flash", 8192).unwrap() > reserved);
-        assert_eq!(client.worst_case_reservation_idr("ghost", 4096), None);
-    }
-
-    /// THE DEAREST-ENDPOINT RULE, with a pool that genuinely differs.
-    ///
-    /// The test above uses two endpoints that TIE (both inherit the model's
-    /// rates), so max and min over that pool coincide and swapping .max() for
-    /// .min() in `ModelEntry::worst_case_reservation_idr` is program
-    /// equivalence - the mutation survives. An endpoint may override the peak
-    /// rates, so this pool holds a 1x, a 3x and a 9x provider and the dearest
-    /// figure is the only correct answer.
-    #[test]
-    fn the_dearest_endpoint_wins_when_the_pool_holds_different_rates() {
-        let cheap = endpoint_at("cheap", 1.0, Some(1000.0), Some(4000.0));
-        let mid = endpoint_at("mid", 1.0, Some(3000.0), Some(12_000.0));
-        let dear = endpoint_at("dear", 1.0, Some(9000.0), Some(36_000.0));
-        let upstream = client(vec![model("flash", vec![cheap, mid, dear])]);
-
-        let reserved = upstream
-            .worst_case_reservation_idr("flash", 4096)
-            .expect("configured model");
-
-        // in  1e6/1e6 * 9000   = 9000
-        // out 4096/1e6 * 36000 = 147.456
-        // (9000 + 147.456) * 1.5 = 13721.184 -> ceil 13722
-        assert_eq!(reserved, 13_722, "the DEAREST endpoint must set the hold");
-        assert_eq!(
-            reserved,
-            calculate_preflight_reservation_idr(1.5, 1_000_000, 9000.0, 4096, 36_000.0)
-        );
-
-        // POSITIVE CONTROL on the fixture: the pool must genuinely differ, or
-        // the assertion above is vacuous and the mutation is undetectable.
-        let cheapest = calculate_preflight_reservation_idr(1.5, 1_000_000, 1000.0, 4096, 4000.0);
-        assert!(
-            reserved > cheapest,
-            "the fixture must hold a dearer and a cheaper endpoint ({reserved} vs {cheapest})"
-        );
-        assert_ne!(
-            reserved, cheapest,
-            "reserving at the CHEAPEST endpoint would under-reserve"
-        );
-
-        // An endpoint that overrides NOTHING still falls back to the model rate,
-        // so an override-free pool keeps the old behaviour exactly.
-        let flat = client(vec![model(
-            "flash",
-            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
-        )]);
-        assert_eq!(
-            flat.worst_case_reservation_idr("flash", 4096),
-            Some(4081),
-            "with no overrides the hold is unchanged from the model-rate behaviour"
-        );
-    }
-
-    /// The other half of the rule, and the half that was WRONG.
-    ///
-    /// The test above puts a 9x reseller in the pool, so the dearest-endpoint rule
-    /// alone produced the right answer and the bug was invisible. The dangerous
-    /// shape is the opposite one: EVERY endpoint cheaper than the model. Taking
-    /// the max over endpoints then returns the cheapest of them, while SETTLEMENT
-    /// charges the model's rates - so the hold was sized off a reseller the customer
-    /// is never billed at.
-    ///
-    /// That is not a contrived configuration: "this reseller is cheaper" is the
-    /// ordinary reason to add a per-endpoint rate at all, and lowering the hold to
-    /// match is exactly what the customer would be billed if the product price were
-    /// per-endpoint. It is not, so the model's rate is the FLOOR.
-    ///
-    /// Asserted as a relation against the figure settlement actually charges, not as
-    /// a constant, so the test keeps its meaning if the rates are ever repriced.
-    #[test]
-    fn a_pool_cheaper_than_the_model_still_reserves_at_the_model_rate() {
-        // Both endpoints well below the model's 2676.78 / 10707.12, and neither
-        // carries a cache rate, so the comparison is purely input plus output.
-        let cheap_a = endpoint_at("cheap-a", 1.0, Some(1000.0), Some(4000.0));
-        let cheap_b = endpoint_at("cheap-b", 1.0, Some(900.0), Some(3600.0));
-        let upstream = client(vec![model("flash", vec![cheap_a, cheap_b])]);
-
-        let reserved = upstream
-            .worst_case_reservation_idr("flash", 4096)
-            .expect("configured model");
-
-        // What settlement charges: the MODEL's rates, over the same window.
-        let charge = calculate_preflight_reservation_idr(1.5, 1_000_000, 2676.78, 4096, 10707.12);
-
-        assert!(
-            reserved >= charge,
-            "every endpoint is cheaper than the model, so the hold was sized off a \
-             reseller the customer is never billed at: {reserved} IDR held against a \
-             {charge} IDR charge"
-        );
-
-        // POSITIVE CONTROL on the fixture. Without this the assertion above could be
-        // passing because the endpoints are not actually cheaper than the model, in
-        // which case it would be testing nothing.
-        let dearest_endpoint =
-            calculate_preflight_reservation_idr(1.5, 1_000_000, 1000.0, 4096, 4000.0);
-        assert!(
-            dearest_endpoint < charge,
-            "the fixture must hold endpoints CHEAPER than the model ({dearest_endpoint} \
-             vs {charge}), or this test is about the wrong case"
-        );
-
-        // And the hold must be the model's, not merely "at least the charge": a fix
-        // that simply multiplied by a fudge factor would also satisfy the first
-        // assertion, and would over-reserve every request forever.
-        assert_eq!(
-            reserved, charge,
-            "the model rate is the FLOOR and nothing here raises it, so the hold is \
-             exactly the model-rate charge"
         );
     }
 
