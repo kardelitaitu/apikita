@@ -45,7 +45,13 @@ export const stored = [
   { what: 'Per-request usage (model, token counts, cost, time)', where: 'Embedded SQLite (the database file)', sensitivity: 'Behavioural — never the prompt or the completion itself' },
   { what: 'API keys', where: 'Embedded SQLite (the database file)', sensitivity: 'Credentials (hashed) — the plaintext is never stored' },
   { what: 'Reviews + edit history', where: 'Embedded SQLite (the database file)', sensitivity: 'Opinion, published aggregate only' },
-  { what: 'Sessions', where: 'Embedded SQLite (the database file)', sensitivity: 'Contains IP hash and user agent' },
+  // This row is a CUSTOMER-FACING disclosure and it previously claimed an IP hash the
+  // sessions table does not hold: sessions.ip_hash is in the schema and NOTHING writes
+  // it, because the IP hash belongs to the key-scoped key_ip_seen and key_ip_daily
+  // tables where abuse correlation is the point. Overstating collection is the safer
+  // direction to be wrong in and it is still a false statement, so it is corrected here
+  // rather than left because it errs conservatively.
+  { what: 'Sessions', where: 'Embedded SQLite (the database file)', sensitivity: 'Contains the user agent of the login request. No IP address and no IP hash - those live in the key-scoped abuse-correlation tables' },
 ];
 
 // docs/data-retention.md, "What is NOT stored".

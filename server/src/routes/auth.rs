@@ -376,6 +376,19 @@ pub async fn exchange_token(
     #[allow(clippy::arithmetic_side_effects)]
     let expires_at = now + Duration::days(sessions.absolute_days as i64);
 
+    // WRITTEN AND NEVER READ, deliberately, and recorded here so nobody discovers it as
+    // a bug. A session's user agent is captured for incident review - "was this the same
+    // browser that logged in" - and is purged with the row on the 30-day sweep. It is
+    // NOT compared on use, so it is not a second factor and must not be described as
+    // one: a user agent is trivially forgeable and a session that required one to
+    // match would lock out legitimate users for no security gain.
+    //
+    // The sibling column `sessions.ip_hash` is the opposite case: it is in the schema and
+    // NOTHING writes it, because the IP hash belongs to the key-scoped key_ip_seen and
+    // key_ip_daily tables where abuse correlation is the point. The column is left in
+    // place because the schema is the schema, but the privacy page has been corrected -
+    // it claimed sessions carried an IP hash, which was false and is the kind of
+    // overstatement a disclosure must not make even in the safe direction.
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
