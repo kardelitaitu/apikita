@@ -546,6 +546,22 @@ mod tests {
     /// Note what this does NOT claim: that the listed documents are the right ones, or
     /// that the others are correctly excluded. It claims only that every file has been
     /// considered, which is the part that was silently untrue.
+    /// Every .md under a directory, as a path relative to docs/.
+    fn collect_documents(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if path.is_dir() {
+                collect_documents(&path, &format!("{prefix}{name}/"), out);
+            } else if name.ends_with(".md") {
+                out.push(format!("{prefix}{name}"));
+            }
+        }
+    }
+
     #[test]
     fn every_document_is_either_citation_checked_or_triaged_with_a_reason() {
         const TRIAGED: &[(&str, &str)] = &[
@@ -561,18 +577,41 @@ mod tests {
             ("testing.md", "describes the test suite; it is not a source of claims ABOUT the suite"),
             ("whitepaper.md", "marketing; nothing operational depends on it"),
             ("wind-down.md", "a plan for a state the service is not in"),
+            ("architecture/identity.md", "how a person becomes an account; superseded on stack by architecture.md, and its claims are about PocketBase which the port retired"),
+            ("business/00-overview.md", "the business case, not a contract"),
+            ("business/01-market.md", "market analysis; no code claim to check"),
+            ("business/02-pricing.md", "unit economics; the money rules themselves are tested in money.rs"),
+            ("business/03-financial-model.md", "a financial model, not a specification"),
+            ("business/04-gtm.md", "go to market"),
+            ("business/05-risk.md", "a risk register"),
+            ("business/README.md", "an index for the business set"),
+            ("plans/proxy-hot-path-audit.md", "a HISTORICAL audit record; its findings are dated, and rewriting them would destroy the record of what was believed then"),
+            ("plans/sqlite-migration.md", "a HISTORICAL migration plan, marked draft for review"),
+            ("telegram/README.md", "the bot channel spec, for a bot that is not built; the folder guard covers the not-built claim"),
+            ("website/01-architecture.md", "SUPERSEDED on stack by architecture.md, and it names frontend internals rather than claims an operator would act on"),
+            ("website/02-data-model.md", "SUPERSEDED - it documents the PostgreSQL schema the port retired; marking it historical beats keeping it current"),
+            ("website/03-functional-spec.md", "the frontend functional spec; the behaviours it describes are covered by the website suite"),
+            ("website/04-payments.md", "the end-to-end top-up flow; it describes the journey, and the money moves are tested in webhooks.rs and account.rs"),
+            ("website/05-security-decisions.md", "SUPERSEDED on stack, per its own first line"),
+            ("website/README.md", "an index for the frontend set"),
         ];
 
-        let mut documents: Vec<String> = std::fs::read_dir(doc_path("."))
-            .expect("docs/ must be readable")
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".md"))
-            .collect();
+        // RECURSIVE, and it was not for its first day. This test is called
+        // every_document_is_either_citation_checked_or_triaged, and it walked only the
+        // TOP LEVEL — so sixteen documents under architecture/, business/, plans/,
+        // telegram/ and website/ were never triaged at all. Sixteen, one of them
+        // website/04-payments.md. A guard that overstates its own scope is worse than
+        // no guard, because the NAME is what a reader trusts.
+        let mut documents: Vec<String> = Vec::new();
+        collect_documents(&doc_path("."), "", &mut documents);
         documents.sort();
 
         for name in &documents {
-            if OPERATIONAL_DOCS.contains(&name.as_str()) {
+            // OPERATIONAL_DOCS lists some entries by bare file name, so a document in a
+            // subdirectory is matched on both forms rather than the list being rewritten
+            // into paths nobody reads.
+            let bare = name.rsplit('/').next().unwrap_or(name);
+            if OPERATIONAL_DOCS.contains(&name.as_str()) || OPERATIONAL_DOCS.contains(&bare) {
                 continue;
             }
             assert!(
