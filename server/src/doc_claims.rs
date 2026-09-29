@@ -890,6 +890,69 @@ mod tests {
     /// them is named below, which is why this can be a name check at all. If a review
     /// column were ever renamed to one of these words the test would fail, and that
     /// failure would be worth reading rather than renaming the column.
+    /// The word list below is a COPY of a claim the privacy page makes in prose, and a
+    /// copy is a second source of truth. It drifted once already: the first version had
+    /// three of the page's four words and had quietly swapped `response_body` for two of
+    /// its own, so a column named `response_body` passed a test written for exactly that
+    /// case. The list is aligned now, and THIS is what keeps it aligned — it reads the
+    /// claim out of the page and fails if the two disagree, so the next edit to the
+    /// comment cannot drift away without a red suite.
+    ///
+    /// It reads the sentence rather than a data structure because the page is written in
+    /// prose, and a test that demanded a machine-readable list would be a test that
+    /// dictated the shape of a customer-facing file. Where the two disagree this fails
+    /// rather than choosing, because which one is right is a judgement about the claim
+    /// and not about the code.
+    #[test]
+    fn the_guard_checks_exactly_the_words_the_privacy_page_claims_are_absent() {
+        let page = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("website")
+                .join("src")
+                .join("lib")
+                .join("privacy.ts"),
+        )
+        .expect("website/src/lib/privacy.ts must be readable, or this passes over nothing");
+
+        let claimed: Vec<String> = page
+            .lines()
+            .find(|l| l.contains("no migration mentions"))
+            .expect("the page must still state which names it checked for")
+            .split("no migration mentions")
+            .nth(1)
+            .unwrap_or_default()
+            .split(" -")
+            .next()
+            .unwrap_or_default()
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| w.len() > 2)
+            .map(str::to_string)
+            .collect();
+
+        assert!(
+            claimed.len() >= 3,
+            "only {claimed:?} could be read from the page's claim; the sentence it lives in has probably been reworded and the sentence itself is what this test is about"
+        );
+
+        // The list in the guard, named here rather than reached into, so the two are
+        // compared as values and a future edit to either is a one-line change.
+        const GUARD: &[&str] = &[
+            "prompt",
+            "completion",
+            "request_body",
+            "response_body",
+            "messages",
+            "conversation",
+        ];
+        for word in &claimed {
+            assert!(
+                GUARD.contains(&word.as_str()),
+                "the privacy page claims no migration mentions {word:?}, and the guard that enforces it does not look for that word. The page is right or the guard is wrong, and this test will not guess which - add the word, or correct the claim."
+            );
+        }
+    }
+
     #[test]
     fn no_schema_column_is_named_for_a_prompt_or_a_completion() {
         // The words are taken from the page itself: its comment lists prompt,
