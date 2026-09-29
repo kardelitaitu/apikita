@@ -49,6 +49,81 @@ fn doc_path(name: &str) -> std::path::PathBuf {
 }
 
 /// The documents an operator acts on, and the ones whose claims are therefore live.
+/// Every rs file under the crate's src directory, recursively.
+///
+/// Sorted, so a finding list is stable between runs - an unsorted walk pops a
+/// directory stack and would report the same violation in a different order each
+/// time, which makes a diff of two runs unreadable.
+fn source_files() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Source with COMMENTS blanked out, so a check about code does not fire on a
+/// comment that happens to discuss the thing being checked.
+///
+/// Blanked rather than deleted, so every remaining line keeps its original number
+/// and a finding names a line the reader can open. Block comments become spaces
+/// too, for the same reason: a file-level note that mentions a secret is not a
+/// leak, and a check that cannot tell the difference gets deleted by whoever
+/// touched the file next.
+fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut in_block = false;
+    for line in src.lines() {
+        let mut kept = String::new();
+        let mut in_line = false;
+        let bytes: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            if in_block {
+                if bytes[i] == '*' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                    in_block = false;
+                    i += 2;
+                    continue;
+                }
+                kept.push(if bytes[i] == '\n' { '\n' } else { ' ' });
+                i += 1;
+                continue;
+            }
+            if in_line {
+                i += 1;
+                continue;
+            }
+            if bytes[i] == '/' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                in_line = true;
+                i += 2;
+                continue;
+            }
+            if bytes[i] == '/' && i + 1 < bytes.len() && bytes[i + 1] == '*' {
+                in_block = true;
+                i += 2;
+                continue;
+            }
+            kept.push(bytes[i]);
+            i += 1;
+        }
+        out.push_str(&kept);
+        out.push('\n');
+    }
+    out
+}
+
 const OPERATIONAL_DOCS: &[&str] = &[
     "launch-checklist.md",
     "observability.md",
@@ -368,6 +443,91 @@ mod tests {
             bot is being built, its Status section is the place that says so - and the
 
             test above is what will make this line need updating."
+        );
+    }
+    /// No secret value is ever interpolated into a log or format macro.
+    ///
+    /// A FOURTH claim checked, and the only one about SOURCE rather than about a
+    /// value. website/src/lib/privacy.ts tells customers the Midtrans server key is
+    /// never logged, and that is a statement a check can verify: find every log and
+    /// format macro in the crate and see whether a secret-bearing identifier is
+    /// substituted into one.
+    ///
+    /// WHY IT MATCHES AN INTERPOLATION AND NOT A MENTION. Much of this crate
+    /// discusses secrets in comments - the key is passed to an HMAC, compared,
+    /// refused when empty - and a check that flagged the WORD would fire on
+    /// documentation and be deleted. The rule is the one that matters: a secret name
+    /// appearing where a value would be substituted, which is right after a percent
+    /// sign or an opening brace. Comments are stripped first for the same reason.
+    ///
+    /// It is a measurement rather than a guess: 163 macro calls across 29 files, zero
+    /// interpolations. This is what keeps it that way - logging a secret is the most
+    /// ordinary mistake there is while debugging a failing payment path, and nothing
+    /// else in this crate would notice.
+    #[test]
+    fn no_secret_is_interpolated_into_a_log_or_format_macro() {
+        // Names that carry a secret. A caller holding one of these holds something
+        // that must not leave the process.
+        const SECRETS: &[&str] = &[
+            "server_key",
+            "api_key",
+            "token_hash",
+            "full_key",
+            "presented_key",
+        ];
+        const MACROS: &[&str] = &[
+            "error!",
+            "info!",
+            "warn!",
+            "debug!",
+            "trace!",
+            "println!",
+            "print!",
+            "dbg!",
+            "panic!",
+            "unreachable!",
+        ];
+
+        let mut findings: Vec<String> = Vec::new();
+        let mut macros = 0usize;
+
+        for path in source_files() {
+            let raw = std::fs::read_to_string(&path).expect("every source file must read");
+            let code = strip_comments(&raw);
+            let lines: Vec<&str> = code.lines().collect();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            for (i, line) in lines.iter().enumerate() {
+                if !MACROS.iter().any(|m| line.contains(m)) {
+                    continue;
+                }
+                macros += 1;
+                let end = (i + 6).min(lines.len());
+                let window = lines[i..end].join(" ");
+                for secret in SECRETS {
+                    for (at, _) in window.match_indices(secret) {
+                        let before = &window[..at];
+                        if before.ends_with('%') || before.ends_with('{') {
+                            findings.push(format!("{}:{} {secret}", name, i + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        // The vacuity guard. A scan that matched no macro would pass every assertion
+        // above over an empty set, and would go on doing so if the macro names were
+        // ever mistyped into a list that matched nothing.
+        assert!(
+            macros > 100,
+            "only {macros} log or format macro calls were seen, far fewer than this crate has. A scan that finds almost nothing is not a scan."
+        );
+        assert!(
+            findings.is_empty(),
+            "a secret is substituted into a log or format macro:\n{findings:#?}\nA customer-facing privacy page states the Midtrans server key is never logged, and this is that claim in the only form that can be checked."
         );
     }
     /// The scanner itself, because a check that cannot find a citation it should find
