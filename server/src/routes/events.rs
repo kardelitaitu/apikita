@@ -888,6 +888,66 @@ mod tests {
         db.close().await;
     }
 
+    /// A session revoked MID-STREAM is dropped, and this is the pair that does it.
+    ///
+    /// docs/realtime.md:173 and the handler's own comment both name the mechanism:
+    /// the stream ends at its deadline, the client reconnects, and the RECONNECT is
+    /// what finds the revocation. Neither half was tested as a pair.
+    ///
+    /// The deadline alone proves nothing - a timer is not a revocation. What makes the
+    /// claim true is that the reconnect is REFUSED, and that is a property of the
+    /// session resolver rather than of anything the stream does. So a test that only
+    /// watched a stream end would pass while revocation stopped working entirely, which
+    /// is the same shape as every other finding in this series: the rule lives in one
+    /// place, the claim is stated in another, and nothing connects them.
+    ///
+    /// The window this leaves open is worth naming, because it is the honest cost and
+    /// not a defect: a stream already open when a session is revoked keeps delivering
+    /// for up to max_stream_seconds, which ships at 1800. Revocation takes effect at
+    /// the NEXT reconnect, not at the instant. An operator suspending an abusive
+    /// account knows that, and the SSE surface carries balances and usage.
+    #[tokio::test]
+    async fn a_session_revoked_mid_stream_cannot_reconnect() {
+        let db = TestDb::new().await;
+        let config = finite_stream_config(10, 2);
+        let state = state_for(db.pool.clone(), &config);
+
+        let account = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account, 42_000).await;
+        let headers = cookie_for(&db.pool, account).await;
+
+        // (1) The stream opens on a live session, and the deadline ends it - which
+        // is the first half of the mechanism, and the only half the existing tests
+        // exercised.
+        let sse = sse_events_handler(State(state.clone()), headers.clone())
+            .await
+            .expect("a live session opens a stream");
+        let frames = opening_frames(sse).await;
+        assert!(
+            frames.contains("42000"),
+            "the stream must have carried real state before it ended, got: {frames}"
+        );
+
+        // (2) The session is revoked while the client is between streams - which is
+        // exactly the window the deadline creates, and the one an operator's
+        // suspend produces.
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE account_id = ?")
+            .bind(chrono::Utc::now())
+            .bind(account.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("revoke the session");
+
+        // (3) The RECONNECT is refused. Without this the claim in the handler comment
+        // and in docs/realtime.md would be unfalsifiable.
+        let result = sse_events_handler(State(state.clone()), headers).await;
+        assert!(
+            result.is_err(),
+            "a revoked session must not be able to re-establish a stream. The handler comment says the client reconnecting is how a mid-stream revocation is actually dropped, and that sentence is only true if this is refused."
+        );
+
+        db.close().await;
+    }
     /// CROSS-ACCOUNT ISOLATION ON THE REPLAY PATH.
     ///
     /// The broadcast is process-wide, so a replay buffer holds events for every
