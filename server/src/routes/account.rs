@@ -141,7 +141,7 @@ pub async fn get_me(
         .transpose()?
         .unwrap_or(0);
 
-    let today = Utc::now().date_naive();
+    let today = crate::ip_tracking::today_utc();
     let usage_today = sqlx::query(
         r#"
         SELECT
@@ -1675,7 +1675,7 @@ mod tests {
         token: String,
         other_account_id: Uuid,
     ) {
-        let today = Utc::now().date_naive();
+        let today = crate::ip_tracking::today_utc();
         let yesterday = today - chrono::Duration::days(1);
 
         // usage_daily.api_key_id is part of the primary key, so a real key row
@@ -1862,7 +1862,7 @@ mod tests {
         token: String,
         other_account_id: Uuid,
     ) {
-        let today = Utc::now().date_naive();
+        let today = crate::ip_tracking::today_utc();
         let key = create_api_key(&pool, account_id).await;
         let other_key = create_api_key(&pool, other_account_id).await;
 
@@ -2037,7 +2037,7 @@ mod tests {
             &pool,
             account_id,
             key,
-            Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
             (7, 8, 9, 10),
         )
         .await;

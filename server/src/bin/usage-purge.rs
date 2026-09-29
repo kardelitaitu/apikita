@@ -18,8 +18,8 @@
 
 use std::env;
 
-use apikita_server::db;
-use chrono::Utc;
+use apikita_server::{db, ip_tracking};
+
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -54,7 +54,7 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let today = Utc::now().date_naive();
+    let today = ip_tracking::today_utc();
     let purged = db::purge_expired_usage(&pool, today).await?;
 
     info!(

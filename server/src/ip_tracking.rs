@@ -195,6 +195,19 @@ impl std::fmt::Debug for DailySalt {
 
 /// The current UTC day. One definition, because the salt boundary and the
 /// `key_ip_daily.day` column must agree or the counts split across two rows.
+///
+/// **AND NOW IT REALLY IS ONE, which it was not for most of this crate's life.**
+/// The comment above made a promise that eighteen call sites did not keep: they
+/// wrote `Utc::now().date_naive()` themselves. The value was identical - this
+/// function is that exact expression - so nothing was wrong TODAY, and that is
+/// precisely what made it dangerous. A skew correction, a timezone, or a
+/// documented-but-unapplied offset added here would have moved the salt boundary
+/// and left every one of those sites on the old definition, which is the split the
+/// comment warns about, arriving by the most boring route available.
+///
+/// The same day also decides the usage and spend rollups, so a split here does not
+/// just split IP counts: a customer's 30-day spend would be windowed differently
+/// from the spend shown to them. Every one of those sites now calls this.
 pub fn today_utc() -> NaiveDate {
     Utc::now().date_naive()
 }

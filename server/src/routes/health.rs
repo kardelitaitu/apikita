@@ -186,7 +186,7 @@ pub async fn operator_metrics(
     // it is deliberately NOT allowed to fail the whole response: an operator asking for
     // the counters during an incident should still get them if the retention query
     // errors. A failed read is reported as a distinct field, never as "no lag".
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::ip_tracking::today_utc();
     let retention = match crate::db::retention_lag(&state.pool, today).await {
         Ok(lag) => lag,
         Err(err) => {

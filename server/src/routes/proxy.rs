@@ -1237,7 +1237,7 @@ pub async fn chat_completions(
             &state.pool,
             account_id,
             key_id,
-            chrono::Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
         )
         .await?;
         if limit_reached(spend_limit_idr, spend_used_idr) {
@@ -1258,7 +1258,7 @@ pub async fn chat_completions(
             &state.pool,
             account_id,
             key_id,
-            chrono::Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
         )
         .await?;
         if limit_reached(token_limit, tokens_used) {
@@ -4122,7 +4122,7 @@ mod tests {
         )
         .bind(account_id.hyphenated())
         .bind(key_id.hyphenated())
-        .bind(chrono::Utc::now().date_naive())
+        .bind(crate::ip_tracking::today_utc())
         .bind(cost_idr)
         .execute(pool)
         .await

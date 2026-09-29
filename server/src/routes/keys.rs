@@ -302,7 +302,7 @@ pub async fn list_keys(
 
     // Real 30-day spend per key. usage_daily.cost_idr is the settled cost of the
     // key's usage; a key with no rows in the window reads as 0.
-    let today = Utc::now().date_naive();
+    let today = crate::ip_tracking::today_utc();
     let usage_rows = sqlx::query(
         r#"
         SELECT api_key_id, day, cost_idr
@@ -498,7 +498,7 @@ pub async fn update_key(
     // sees the number rather than a silently ineffective limit.
     if let Some(requested) = payload.spend_limit_idr {
         let spend_used_idr =
-            key_spend_used(&state.pool, account_id, id, Utc::now().date_naive()).await?;
+            key_spend_used(&state.pool, account_id, id, crate::ip_tracking::today_utc()).await?;
         check_spend_limit(requested, spend_used_idr)?;
     }
     // A patch that is absent leaves the column alone (COALESCE below), so only a
@@ -1333,7 +1333,7 @@ mod tests {
             &pool,
             account_id,
             used_id,
-            Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
             100,
             20,
             50,
@@ -1394,7 +1394,7 @@ mod tests {
         let (key_id, _, _) =
             create_key_via_handler(&state, &headers, "window", vec!["flash".into()], 0).await;
 
-        let today = Utc::now().date_naive();
+        let today = crate::ip_tracking::today_utc();
 
         // The offsets are LITERALS, deliberately not derived from
         // SPEND_WINDOW_DAYS: a fixture computed from the constant under test
@@ -1505,9 +1505,14 @@ mod tests {
 
         // The key is exactly AT its ceiling: the window total equals the limit.
         assert_eq!(
-            key_spend_used(&pool, account_id, at_limit_id, Utc::now().date_naive())
-                .await
-                .expect("key_spend_used"),
+            key_spend_used(
+                &pool,
+                account_id,
+                at_limit_id,
+                crate::ip_tracking::today_utc()
+            )
+            .await
+            .expect("key_spend_used"),
             opening_idr
         );
 
@@ -1809,7 +1814,7 @@ mod tests {
             &pool,
             account_id,
             stale_id,
-            Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
             100,
             20,
             50,
@@ -1850,7 +1855,7 @@ mod tests {
             &pool,
             account_id,
             id,
-            Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
             100,
             20,
             50,

@@ -804,7 +804,7 @@ async fn record_usage(
     // has to be spelled out. Measured: the expression form accumulates a NULL
     // key and a real key into two separate rows (15 and 10 from 10+5 and 7+3),
     // which is the behaviour the COALESCE index exists to provide.
-    let today = Utc::now().date_naive();
+    let today = crate::ip_tracking::today_utc();
     sqlx::query(
         r#"
         INSERT INTO usage_daily (

@@ -351,7 +351,7 @@ pub async fn todays_usage(pool: &SqlitePool, account_id: Uuid) -> Result<UsageDe
         "#,
     )
     .bind(account_id.hyphenated())
-    .bind(chrono::Utc::now().date_naive())
+    .bind(crate::ip_tracking::today_utc())
     .fetch_one(pool)
     .await?;
 
