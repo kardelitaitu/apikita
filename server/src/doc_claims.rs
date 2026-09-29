@@ -792,6 +792,74 @@ mod tests {
         }
     }
 
+    /// Every DURATION the customer page commits to also appears in the policy
+    /// document it says it comes from.
+    ///
+    /// WHY THIS IS SEPARATE from the retention guard beside it, which is the whole
+    /// point. That one reads data-retention.md and ip-tracking.md and checks the
+    /// windows against the constants. It does not read the page a CUSTOMER reads.
+    ///
+    /// That omission was not theoretical: the 90-day per-request window was wrong on
+    /// the customer page and right in both internal documents, and the two internal
+    /// ones being right is exactly why nobody noticed. One assertion was added for
+    /// that one number, and the other rows were left with the same exposure - which is
+    /// how a one-off becomes an exception rather than a rule.
+    ///
+    /// WHY NUMBERS AND NOT ROWS. Matching row-to-row would need a mapping from ten
+    /// page rows to the document sections they summarise, and that mapping is a
+    /// judgement that would drift. What cannot drift is arithmetic: a duration
+    /// printed for a customer has to be a duration the policy states. The rows that
+    /// are not durations - Forever, Until deleted by user, Same as review, Keep
+    /// record - are deliberately outside it, because they are not numbers and a
+    /// check that tried to match them would be guessing.
+    #[test]
+    fn every_duration_the_customer_page_commits_to_is_in_the_policy_document() {
+        let page = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("website")
+                .join("src")
+                .join("lib")
+                .join("privacy.ts"),
+        )
+        .expect("website/src/lib/privacy.ts must be readable, or this passes over nothing");
+        let policy = std::fs::read_to_string(doc_path("data-retention.md"))
+            .expect("docs/data-retention.md must be readable, or this passes over nothing");
+
+        // The retention table, as the page writes it: what / keep / why.
+        let mut durations: Vec<String> = Vec::new();
+        for line in page.lines() {
+            let Some(rest) = line.trim().strip_prefix("{ what:") else {
+                continue;
+            };
+            let Some((_, after_what)) = rest.split_once(", keep: '") else {
+                continue;
+            };
+            let Some((keep, _)) = after_what.split_once("', why:") else {
+                continue;
+            };
+            // A duration and nothing else. `30-90 days` is one, because a customer
+            // reading a range is still being told a period.
+            if keep.contains("day") || keep.contains("month") || keep.contains("hour") {
+                durations.push(keep.to_string());
+            }
+        }
+
+        // The vacuity guard: a parser that matched no row would agree with anything,
+        // and this file is written in a style a small edit can change.
+        assert!(
+            durations.len() >= 4,
+            "only {} duration row(s) were read from the page, so this test is not looking at the real retention table.",
+            durations.len()
+        );
+
+        for keep in &durations {
+            assert!(
+                policy.contains(keep.as_str()),
+                "the customer page promises {keep:?} and docs/data-retention.md does not state that period at all. The page says it restates the policy, so a number on it that the policy does not carry is a promise with no source."
+            );
+        }
+    }
     /// No column in the schema is NAMED for a prompt or a completion.
     ///
     /// WHY THIS IS A SEPARATE TEST. The privacy page tells customers their prompts
