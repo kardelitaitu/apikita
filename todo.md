@@ -163,6 +163,7 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
           reconcile check, spot-checks a balance, measures the restore time, writes a drill log, and
           tears the scratch DB down. A refusal guard makes it impossible to point at the live database.
     - [ ] Run it against the **production** database once provisioned; that is the real RTO measurement.
+    <!-- alert-scheduling: wired -->
     - [ ] Alerts (webhook rejection, ledger drift, API down, circuit open) — **the code half is done**;
           what remains is a deployment decision. **10 of its 11 alerts are `covered`** in
           [`tools/alert/alerts.tsv`](tools/alert/alerts.tsv) — the exception is `relay_5xx`,
@@ -173,10 +174,21 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
           [`tools/alert/check-alerts.sh`](tools/alert/check-alerts.sh) (`ledger_drift`, which needs
           database access). [`tools/alert/alert.sh`](tools/alert/alert.sh) is the transport that
           delivers one alert over a configured channel, with a cooldown so one incident pages once
-          rather than once per run. What is missing is the **coupling**: the `scheduler` service in
-          [`docker-compose.yml`](docker-compose.yml) runs retention, reconcile and hold-sweep, but
-          **nothing currently invokes the alert checks on a schedule**, and there is no channel
-          configured. So this needs a schedule an operator chooses and a delivery channel — the same
-          reason
-          [`docs/launch-checklist.md`](docs/launch-checklist.md) keeps its own copy of this line
-          unticked. "The code half is done."
+          rather than once per run. **The coupling is in place too**: the `scheduler` service in
+          [`docker-compose.yml`](docker-compose.yml) runs retention, reconcile, hold-sweep **and both
+          alert jobs** — `run_wired_jobs` calls `run_alert_checks` (the database-backed alerts) and
+          `run_alert_probes` (the HTTP ones) every night at `SCHEDULE_HOUR_UTC`, default 03:00 UTC,
+          which an operator can move. What is still missing is the **delivery channel**, and that is
+          the same reason [`docs/launch-checklist.md`](docs/launch-checklist.md) keeps its own copy of
+          this line unticked: with no channel a breach is reported UNMONITORED and the run exits
+          non-zero rather than passing, so a night nobody was told about cannot read as a clean
+          sheet. "The code half is done, and so is the wiring."
+
+          *(Correction: this line once asserted that **nothing invokes the alert checks on a
+          schedule**. That was true when written and was invalidated when the jobs were wired into
+          `run_wired_jobs`. The note existed to state what remained and was not revisited when the
+          remaining thing got done. [`docs/launch-checklist.md`](docs/launch-checklist.md) made the
+          same claim, and `tools/alert-check/check.sh` now holds BOTH files against the code in
+          `entrypoint.sh` through an explicit `alert-scheduling:` marker, so neither can go stale a
+          second time. The previous version grepped the checklist for one exact sentence; todo.md's
+          read "nothing CURRENTLY invokes…", which is why it got past.)*

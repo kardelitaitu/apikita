@@ -231,34 +231,89 @@ fi
 # ---------------------------------------------------------------------------
 # The documented scheduling status must match what the scheduler does.
 # ---------------------------------------------------------------------------
-# WHY THIS IS HERE, and it is the third time this class has appeared. The
+# WHY THIS IS HERE, and it is now the fourth time this class has appeared. The
 # launch checklist told a reader "nothing invokes the alert checks on a schedule"
 # - which was TRUE when written and was invalidated by the two rounds that wired
-# them. The sentence existed to state precisely what remained, and it was not
-# revisited when the remaining thing got done. A reader deciding whether alerting
-# is finished was misled in the direction that wastes effort.
+# the jobs. todo.md told a reader the same thing. Both sentences existed to state
+# precisely what remained, and neither was revisited when the remaining thing got
+# done. A reader deciding whether alerting is finished was misled in the direction
+# that wastes effort.
 #
-# The claim is mechanical - is run_alert_checks in run_wired_jobs? - so the two
-# sides can be held together. NEITHER SIDE IS ASSERTED ALONE: the assertion is
-# that they AGREE, so it stays true whichever way someone changes it, and it fails
-# in EITHER direction rather than pinning today's state.
+# WHY IT IS NOW A MARKER AND NOT A GREP FOR THE SENTENCE. The previous version
+# grepped the checklist for the literal phrase "nothing invokes the alert checks".
+# That is exactly how todo.md got through: its sentence read "nothing CURRENTLY
+# invokes the alert checks", so the checklist's exact phrase did not match, and the
+# one document still carrying the claim was the one the grep could not see. The same
+# fragility runs the other way - a correction note cannot safely QUOTE the claim it
+# corrects, because the note would trip the very grep meant to catch the claim.
+#
+# So a document now declares its status with an explicit marker instead:
+#
+#     <!-- alert-scheduling: wired -->      <!-- alert-scheduling: not-wired -->
+#
+# which a reader never sees, which a prose paraphrase cannot collide with, and which
+# can be asserted EXACTLY: present once, spelled one of two ways, and agreeing with
+# the code.
+#
+# The claim is still mechanical - is run_alert_checks in run_wired_jobs? - so the two
+# sides are held together. NEITHER SIDE IS ASSERTED ALONE: the assertion is that they
+# AGREE, so it stays true whichever way someone changes it, and it fails in EITHER
+# direction rather than pinning today's state.
 ENTRYPOINT="$REPO/.docker/maintenance/entrypoint.sh"
-CHECKLIST="$REPO/docs/launch-checklist.md"
-if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$CHECKLIST" ]; then
-    fail "cannot read $ENTRYPOINT and $CHECKLIST, so the documented scheduling status was not compared"
+# Every document that tells a reader whether the alert checks run on a schedule. A
+# NEW document that repeats the claim must be added here, or it repeats todo.md's
+# fate: correct in isolation, stale within a fortnight.
+SCHEDULING_DOCS="$REPO/docs/launch-checklist.md $REPO/todo.md"
+
+if [ ! -f "$ENTRYPOINT" ]; then
+    fail "cannot read $ENTRYPOINT, so the documented scheduling status was not compared"
 else
     WIRED=no
     sed -n '/^run_wired_jobs()/,/^}/p' "$ENTRYPOINT" | grep -q 'run_alert_checks' && WIRED=yes
+    # THE SAME VOCABULARY as the marker, so the comparison below is a real equality
+    # and not a yes/no compared against wired/not-wired - which compares unequal
+    # ALWAYS and fails on a tree where the two sides already agree.
+    [ "$WIRED" = yes ] && CODE_MARKER=wired || CODE_MARKER=not-wired
 
-    CLAIMS_UNSCHEDULED=no
-    grep -q 'nothing invokes the alert checks' "$CHECKLIST" && CLAIMS_UNSCHEDULED=yes
-
-    if [ "$WIRED" = yes ] && [ "$CLAIMS_UNSCHEDULED" = yes ]; then
-        fail "run_wired_jobs schedules run_alert_checks, but docs/launch-checklist.md still tells the reader nothing invokes the alert checks on a schedule"
-    fi
-    if [ "$WIRED" = no ] && [ "$CLAIMS_UNSCHEDULED" = no ]; then
-        fail "run_wired_jobs does NOT schedule run_alert_checks, yet the launch checklist no longer says so - a reader would believe the alerts run themselves"
-    fi
+    for doc in $SCHEDULING_DOCS; do
+        rel="${doc#"$REPO"/}"
+        if [ ! -f "$doc" ]; then
+            fail "cannot read $rel, so its documented scheduling status was not compared"
+            continue
+        fi
+        # ANCHORED TO THE FULL MARKER FORM, `<!-- alert-scheduling: X -->`, and not to the
+        # bare string. A document that EXPLAINS the marker necessarily writes the words
+        # "alert-scheduling:" in prose - this file's own history, and todo.md's correction
+        # note, both do - and a bare grep counts those as markers, so a document that
+        # documents the convention fails the check for doing exactly that. Found by
+        # running it: the note explaining the marker made todo.md look ambiguous.
+        count=$(grep -c '<!-- alert-scheduling:' "$doc")
+        case "$count" in
+            '' | *[!0-9]*)
+                fail "could not count the alert-scheduling markers in $rel - the comparison did not actually happen"
+                continue
+                ;;
+        esac
+        if [ "$count" -ne 1 ]; then
+            fail "$rel carries $count 'alert-scheduling:' markers; exactly one is required, or its documented status is ambiguous"
+            continue
+        fi
+        MARKER=$(sed -n 's/.*<!-- alert-scheduling: *\([a-z-]*\) *-->.*/\1/p' "$doc" | head -n 1)
+        case "$MARKER" in
+            wired | not-wired) ;;
+            *)
+                fail "$rel has an unreadable alert-scheduling marker '$MARKER'; use exactly 'wired' or 'not-wired'"
+                continue
+                ;;
+        esac
+        if [ "$MARKER" != "$CODE_MARKER" ]; then
+            if [ "$WIRED" = yes ]; then
+                fail "run_wired_jobs schedules run_alert_checks, but $rel still declares the alert checks '$MARKER' - a reader is misled about whether alerting runs on its own"
+            else
+                fail "run_wired_jobs does NOT schedule run_alert_checks, but $rel declares them '$MARKER' - a reader would believe the alerts run themselves"
+            fi
+        fi
+    done
 
     # Guard the fixture: if the nightly job list could not be read, WIRED would be
     # "no", and only the second branch above would be live.
@@ -266,6 +321,7 @@ else
         fail "could not read the run_wired_jobs job list from $ENTRYPOINT - the comparison above did not actually happen"
     }
 fi
+
 
 if [ "$FAILED" -ne 0 ]; then
     echo "alert-check: the alert delivery contract is BROKEN (see above)" >&2

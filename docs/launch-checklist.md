@@ -200,6 +200,7 @@ statement is false.**
       `docs/server/api-spec.md:466-470` states the rule and why (an upstream outage must
       not look like a dead server and trigger a restart loop). Tested, including the
       unauthenticated-body leak rules.
+<!-- alert-scheduling: wired -->
 - [ ] Alerts configured: webhook rejection, ledger drift, API down, circuit open.
       **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`: **10 of its 11
 alerts are `covered`**, and the one exception is `relay_5xx`, which is `needs-metrics` because
