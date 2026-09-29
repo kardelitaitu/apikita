@@ -155,6 +155,8 @@ mod tests {
     fn the_published_retention_periods_are_the_periods_the_sweeps_enforce() {
         let doc = std::fs::read_to_string(doc_path("data-retention.md"))
             .expect("docs/data-retention.md must be readable, or this passes over nothing");
+        let ip_doc = std::fs::read_to_string(doc_path("ip-tracking.md"))
+            .expect("docs/ip-tracking.md must be readable, or this passes over nothing");
 
         // Table named in the doc, the period the doc states, the constant enforcing it.
         let promises: [(&str, &str, i64); 5] = [
@@ -214,7 +216,32 @@ mod tests {
             90,
             "the document promises 90 days of key_ip_daily"
         );
+
+        // THE SAME POLICY IS PUBLISHED TWICE, and one document being correct is no
+        // help when the other says something else. docs/ip-tracking.md carries its own
+        // retention table for the same three tables. It is the page a customer asking
+        // how long their IP is kept is answered from, while data-retention.md is the
+        // page an operator reading a sweep is answered from. The two agreeing IS the
+        // promise; one of them being right is not.
+        //
+        // Matched on the table ROW rather than a bare number, because a document that
+        // says 90 days somewhere is not the same as one that promises 90 days OF
+        // key_ip_daily.
+        for (table, stated) in [
+            ("key_ip_seen", "| `key_ip_seen` hashes | **7 days**"),
+            (
+                "link_redemption_attempts",
+                "| `link_redemption_attempts` hashes | **7 days**",
+            ),
+            ("key_ip_daily", "| `key_ip_daily` counts | 90 days"),
+        ] {
+            assert!(
+                ip_doc.contains(stated),
+                "docs/ip-tracking.md no longer states {stated} for {table}. That table and the one in data-retention.md are the same policy published twice, and a promise that differs between the page a customer reads and the page an operator reads is not a promise."
+            );
+        }
     }
+
     /// The REGISTER's session lifetime is the config's session lifetime.
     ///
     /// Same class as the retention periods, and a sharper case, because this one is
