@@ -1662,6 +1662,158 @@ mod tests {
         );
     }
 
+    /// The pricing document restates the shipped card, and is bound to the config.
+    ///
+    /// `docs/business/02-pricing.md` carries a table with the IDR off-peak and peak figures
+    /// and, in the same row, the CNY source each was converted from. Two things are
+    /// asserted, and the second is the one that matters:
+    ///
+    ///   1. each IDR figure is the CNY beside it times the stated FX - the document is
+    ///      internally consistent;
+    ///   2. each figure is a rate the FLASH model actually ships - the document restates
+    ///      the config rather than a self-consistent set of its own.
+    ///
+    /// The second is the whole point, and it is the check a copy-against-copy comparison
+    /// cannot give. There are four copies of this card - the config, the website, this
+    /// document, and the margin decision - and when `deepseek-v4-pro input_peak` read
+    /// 12045.50 where 4.50 x 2676.78 is 12045.51, THREE OF THE FOUR AGREED WITH EACH
+    /// OTHER. Only the config's own arithmetic was wrong, so every check that compared a
+    /// copy to a copy passed while a customer-visible price was a cent off its source.
+    ///
+    /// Asserting against the config's rates rather than only against the FX is what makes
+    /// this different from the guard on `config/apikita.toml`, which asks whether each
+    /// rate IS its own conversion. Together the two close the loop from both ends.
+    #[test]
+    fn the_pricing_document_restates_the_shipped_card() {
+        let config = read_repo_file("config/apikita.toml");
+        let doc = read_repo_file("docs/business/02-pricing.md");
+
+        // The FX comes from the config header, never from this file: a second place to
+        // update a number is the defect this test exists to find.
+        let fx: f64 = config
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().trim_start_matches('#').trim();
+                let rest = rest.strip_prefix("1 CNY = ")?;
+                let digits: String = rest
+                    .split_whitespace()
+                    .next()?
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                digits.parse().ok()
+            })
+            .expect("the config header must state the CNY to IDR rate");
+
+        // The flash model's six shipped rates, as numbers.
+        let flash = config
+            .split("[[models]]")
+            .find(|block| block.contains("name = \"flash\""))
+            .expect("the config must declare a model named flash");
+        let mut shipped: Vec<f64> = Vec::new();
+        for key in [
+            "input_offpeak",
+            "input_peak",
+            "cache_read_offpeak",
+            "cache_read_peak",
+            "output_offpeak",
+            "output_peak",
+        ] {
+            let line = flash
+                .lines()
+                .find(|l| l.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("the flash model no longer declares {key}"));
+            let value = line
+                .split('=')
+                .nth(1)
+                .unwrap_or_default()
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            let value: f64 = value
+                .parse()
+                .unwrap_or_else(|_| panic!("{key} is not a number: {value:?}"));
+            shipped.push(value);
+        }
+        assert_eq!(shipped.len(), 6, "the flash card must contribute six rates");
+
+        // A table cell that is a bare figure, possibly with a thousands separator.
+        let figure = |cell: &str| -> Option<f64> {
+            let t = cell.trim();
+            if t.is_empty()
+                || !t
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ',' || c == '.')
+            {
+                return None;
+            }
+            t.replace(',', "").parse().ok()
+        };
+
+        let mut rows = 0usize;
+        for line in doc.lines() {
+            if !line.starts_with('|') {
+                continue;
+            }
+            let cells: Vec<&str> = line.split('|').collect();
+
+            // The CNY source cell: two figures either side of a slash. The sign is not
+            // matched, only the digits after it, because a sign is a shape and this is a
+            // value.
+            let cny_cell = cells.iter().find(|c| {
+                c.contains('/')
+                    && c.matches(|ch: char| ch.is_ascii_digit() || ch == '.')
+                        .count()
+                        >= 4
+            });
+            let Some(cny_cell) = cny_cell else { continue };
+            let cny: Vec<f64> = cny_cell
+                .split('/')
+                .map(|part| {
+                    let digits: String = part
+                        .chars()
+                        .filter(|ch| ch.is_ascii_digit() || *ch == '.')
+                        .collect();
+                    digits.parse().ok()
+                })
+                .collect::<Option<Vec<f64>>>()
+                .unwrap_or_default();
+            if cny.len() != 2 {
+                continue;
+            }
+
+            let shown: Vec<f64> = cells.iter().filter_map(|c| figure(c)).collect();
+            if shown.len() != 2 {
+                continue;
+            }
+            rows += 1;
+
+            for (i, label) in ["off-peak", "peak"].iter().enumerate() {
+                let expected = (cny[i] * fx * 100.0).round() / 100.0;
+                assert!(
+                    (expected - shown[i]).abs() < 0.001,
+                    "the pricing document quotes {} as {} for the {label} figure, but the CNY beside it is {} and {} x {fx} rounds to {expected}",
+                    cells.iter().find(|c| !c.trim().is_empty()).unwrap_or(&"").trim(),
+                    shown[i],
+                    cny[i],
+                    cny[i]
+                );
+                assert!(
+                    shipped.contains(&shown[i]),
+                    "the pricing document quotes {shown_i} but no flash model ships that rate - the document has restated a card of its own instead of the config's",
+                    shown_i = shown[i]
+                );
+            }
+        }
+
+        // The vacuity guard, with slack: three rows today, and a table that loses its
+        // figures would otherwise pass over an empty set.
+        assert!(
+            rows >= 3,
+            "only {rows} pricing row(s) carried both figures and a CNY source, so this is not reading the table"
+        );
+    }
     /// Every rate in the price card is its stated CNY source times the stated FX.
     ///
     /// The config opens with the conversion (1 CNY = 2,676.78 IDR) and the rule for
