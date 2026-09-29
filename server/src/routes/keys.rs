@@ -399,8 +399,24 @@ pub async fn create_key(
     // so a revoked key still counts - revoking one to mint another is exactly
     // the circumvention the cap is for. The cap comes from the config the app
     // already owns.
-    crate::abuse::enforce_creation_cap(
-        &state.pool,
+    //
+    // HELD OPEN ACROSS THE INSERT, and that is the fix. The cap is a COUNT, and a
+    // count taken before the insert it guards is a count of the past: concurrent
+    // callers all read the same number and all insert, so the cap held against a
+    // sequential script and not at all against a parallel one. SQLite serialises
+    // writers, so one transaction spanning the COUNT and the INSERT makes the two
+    // atomic - a second caller either sees the first caller's row or is still
+    // waiting for the lock.
+    //
+    // This path can afford that because everything between them is LOCAL: key
+    // generation, hashing and three validations, all microseconds of CPU. The
+    // top-up path cannot - its insert comes after a Midtrans Snap call, and a
+    // transaction spanning a network round trip to a payment provider would
+    // serialise every other top-up in the process behind it. That path keeps the
+    // non-transactional variant and its race is characterised in abuse.rs.
+    let mut tx = crate::db::begin_immediate(&state.pool).await?;
+    crate::abuse::enforce_creation_cap_in(
+        &mut tx,
         "api_keys",
         crate::abuse::key_creation_window(),
         state.config.limits.key_creation_per_day,
@@ -484,10 +500,17 @@ pub async fn create_key(
     .bind(payload.rate_limit_rpm)
     .bind(payload.expires_at)
     .bind(Utc::now())
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
 
     let id: Uuid = key_record.get::<Hyphenated, _>("id").into_uuid();
+
+    // Commit BEFORE the response is built, so a caller that sees a 201 knows the
+    // key is durable. The write lock is held for the whole of the above: the
+    // generate/hash/validate sequence is local, but it is still a write lock, and
+    // that is the price of a cap that actually caps. See the note at the
+    // transaction's opening.
+    tx.commit().await?;
 
     Ok((
         StatusCode::CREATED,
@@ -1996,6 +2019,102 @@ mod tests {
             "fixture must not drift"
         );
         db.close().await;
+    }
+
+    /// THE KEY CAP NOW HOLDS UNDER CONCURRENCY, and this is the test that says so.
+    ///
+    /// The cap was a COUNT taken on the pool, with the INSERT that it guards
+    /// happening afterwards and outside any transaction - so concurrent callers all
+    /// read the same number and all created a key. The fix holds one write
+    /// transaction open across the COUNT and the INSERT, and SQLite serialises
+    /// writers, so a second caller either sees the first caller's row or is still
+    /// waiting for the lock.
+    ///
+    /// The assertion is the strict one, and deliberately so: the total must be
+    /// EXACTLY the cap, not "about the cap". A test that allowed a small overshoot
+    /// would pass against the old code on a fast machine, which is the whole problem
+    /// the old code had.
+    ///
+    /// It is driven through the real handler rather than a helper, so the
+    /// transaction the fix introduced is the one under test and not a stand-in for
+    /// it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_key_creation_cap_holds_under_concurrent_requests() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = test_support::account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let limit = state.config.limits.key_creation_per_day;
+        assert!(limit > 0, "the fixture assumes a configured daily cap");
+
+        // Seed to ONE UNDER, so exactly one more caller is entitled to a key.
+        for i in 0..limit - 1 {
+            create_key_via_handler(
+                &state,
+                &headers,
+                &format!("seed-{i}"),
+                vec!["flash".into()],
+                0,
+            )
+            .await;
+        }
+
+        // Sixteen at once, of which at most one may succeed.
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let state = state.clone();
+            let headers = headers.clone();
+            handles.push(tokio::spawn(async move {
+                create_key(
+                    State(state),
+                    headers,
+                    Json(CreateKeyRequest {
+                        label: Some(format!("burst-{i}")),
+                        models: vec!["flash".into()],
+                        spend_limit_idr: 0,
+                        token_limit: 0,
+                        rate_limit_rpm: 0,
+                        expires_at: None,
+                    }),
+                )
+                .await
+                .map(|response| response.into_response().status())
+            }));
+        }
+
+        let mut created = 0usize;
+        let mut refused = 0usize;
+        for handle in handles {
+            match handle.await.expect("the create task must not panic") {
+                Ok(status) => {
+                    assert_eq!(
+                        status,
+                        StatusCode::CREATED,
+                        "a permitted key must answer 201, not {status}"
+                    );
+                    created += 1;
+                }
+                Err(AppError::RateLimited { .. }) => refused += 1,
+                Err(other) => panic!("unexpected error from a burst request: {other:?}"),
+            }
+        }
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("count the keys");
+
+        assert_eq!(
+            total,
+            i64::from(limit),
+            "{total} keys for an account whose cap is {limit} ({created} created and \
+             {refused} refused across a burst of sixteen). The cap must hold \
+             EXACTLY: an assertion that allowed a small overshoot would pass against \
+             the old, non-transactional code on a fast machine"
+        );
     }
 
     /// A NEGATIVE CEILING IS REFUSED, AND NOTHING IS WRITTEN.
