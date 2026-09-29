@@ -235,5 +235,5 @@ relationship visible, not present them as unrelated numbers.
 - [x] Exclude `key_hash` from list responses — enforced server-side by Rust `GET /api/keys`.
 - [x] Cache TTL **60s** — see [`docs/decisions.md`](../decisions.md).
 - [x] Spend limit returns **402** — see [`docs/decisions.md`](../decisions.md).
-- [x] Rolling window **30 days** — `config/apikita.toml` `[limits]`.
+- [x] Rolling window **30 days** — `routes::keys::SPEND_WINDOW_DAYS`, a code constant. It is **not** a config key, and this line used to say it was: `config/apikita.toml` `[limits]` has no window setting, and an operator told to change one would find nothing to change. The constant is deliberate — the proxy and the dashboard must fold the same window, and a configurable length would need a single reader anyway. The "e.g. the trailing 30 days" above is the DESIGN discussion; this is the value, and they agree because the example was taken as the specification.
 - [x] Key creation: **10/day per account** (`decisions.md`).
