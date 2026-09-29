@@ -48,6 +48,42 @@ fn doc_path(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+// ===========================================================================
+// WRITING A GUARD HERE - and where the rule is NOT enforced, which is deliberate
+// ===========================================================================
+//
+// A GUARD THAT ASSERTS AN ABSENCE NEEDS A SCOPE, and the scope comes from what the
+// absence is taken over. Three answers, and only the middle one needs a floor:
+//
+//   - A CLOSED SET - an enum, a matched `Self`. Scoped by the COMPILER: adding a
+//     variant fails the build, which is the strongest guarantee available. Do nothing.
+//   - A RECURSIVE WALK. Scoped by your own discipline, so CARRY A FLOOR on the count
+//     (`>= 18` for a 30-file crate), set with SLACK. A floor AT the count is a
+//     tripwire: it fires when a file is deleted and is silent when the walk stops early.
+//   - A SINGLE DIRECTORY READ. Exhaustive by construction - `read_dir` returns every
+//     entry or panics - so there is no traversal to get wrong and no floor is needed.
+//     The telegram scaffolding guard below is exempt on this basis, not overlooked.
+//
+// A floor must be BELOW the count, never equal to it, and must not drift loose: the
+// schema declares 119 columns, so a column floor of 60 would pass on a scan reading
+// half the schema. Re-derive a floor when the scope it guards changes.
+//
+// WHY THIS IS A COMMENT AND NOT A CHECK. Two attempts to enforce it by reading this
+// file's own source both passed against the defect they were written to catch, and the
+// mutation is what told them apart:
+//
+//   1. Searching each guard's body for a floor matched the WORD in a PROSE COMMENT, so
+//      changing a floor to the forbidden strict form still passed.
+//   2. Stripping comments first did not help, because the body was extracted to the end
+//      of the FILE rather than the end of the function - so every guard's body contained
+//      every later guard's floors and the check could not fail at all.
+//
+// Enforcing this properly needs real brace matching, which is a parser rather than a
+// matcher, and a rule enforced by a check that is silently vacuous is worse than a
+// rule carried as a convention. A comment cannot pass vacuously. If someone writes a
+// correct enforcement, the first thing to do with it is the mutation above.
+// ===========================================================================
+
 /// The documents an operator acts on, and the ones whose claims are therefore live.
 /// Every rs file under the crate's src directory, recursively.
 ///
