@@ -9,6 +9,20 @@
 //
 // PUBLIC_* values are INLINED INTO BROWSER JAVASCRIPT AND ARE NOT SECRET. The
 // Midtrans server key is server-only and must never appear here.
+//
+// **THERE IS NO DISABLED STATE ON THE SUBMIT BUTTON, and that is a decision rather
+// than an oversight** - it is worth recording here because the reasoning is not
+// visible from the markup. Double-clicking creates a SECOND PENDING ORDER, and it
+// cannot double-charge: the customer would have to pay both QRIS codes, and the
+// wallet credits what the webhook says was paid, per order. So the worst outcome of
+// a double submit is a spare pending order, and that is already counted - `stale_orders`
+// in the health endpoint is exactly this - so it is watched rather than prevented.
+//
+// The property that WOULD be money is server-side, where it belongs: crediting one
+// order twice on a repeated webhook. That is a property of the settlement path, not
+// of this form, and guarding it here would protect nothing. If a disable is added
+// later, it is an ergonomic improvement to a form that is already correct - and it
+// must not become the thing that makes a double submit impossible to observe.
 
 // Which Snap host the page loads follows PUBLIC_MIDTRANS_ENV — the browser-side
 // mirror of the server's MIDTRANS_ENV (see .env.example). The rule is copied
