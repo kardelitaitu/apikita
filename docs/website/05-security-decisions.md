@@ -287,7 +287,7 @@ address, an attacker could register it elsewhere and take the account.
 | --- | --- | --- | --- |
 | D1 | Client could write own balance | Money in SQLite, no client DB access, Rust authorization + `CHECK (balance_idr >= 0)` | Shipped schema: [`server/migrations/20260925000000_initial_schema.sql`](../../server/migrations/20260925000000_initial_schema.sql); design record: [`02-data-model.md`](02-data-model.md) |
 | D2 | Token revocation | **Superseded** — SQLite `sessions` rows; logout revokes immediately | [`docs/architecture.md`](../architecture.md) §Sessions |
-| D3 | Verification disables anti-hijacking | Unchanged — `verified` gated to PocketBase's own flows; hook rejects client writes | `apis/record_auth_with_oauth2.go:340-362` |
+| D3 | Verification disables anti-hijacking | Unchanged — `verified` gated to PocketBase's own flows; hook rejects client writes | `apis/record_auth_with_oauth2.go:340-362` **in the PocketBase source**, not in this repository — PocketBase runs as a container and its Go source is not vendored here, so a reader looking in `server/` will not find it. The two prose citations above are to the same file |
 
 ## Open items
 
