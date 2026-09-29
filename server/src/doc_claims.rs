@@ -1346,6 +1346,90 @@ mod tests {
         }
     }
 
+    /// Every RELATIVE markdown link in the documentation resolves to a file.
+    ///
+    /// The instance: the whitepaper told a reader to see
+    /// `website/tests/retired-docs.test.ts` to understand why its figures must not come
+    /// back. No such file has ever existed - the test is `retired-whitepaper.test.ts` -
+    /// and the LINK TEXT said the same wrong name, so the sentence agreed with itself
+    /// and disagreed with the filesystem. That shape survives review, because reading
+    /// the sentence is exactly what a reviewer does.
+    ///
+    /// This is existence, not meaning: a link can resolve and still point at the wrong
+    /// thing, which is the limit stated rather than hidden. What it does catch is a
+    /// path that has MOVED, which is the common case and the one a reader pays for.
+    ///
+    /// The sweep that found the instance covered 48 files and 440 links, so the
+    /// vacuity guards below are set from a real measurement rather than a guess.
+    #[test]
+    fn every_relative_markdown_link_resolves() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![repo.join("docs")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "md") {
+                    sources.push(path);
+                }
+            }
+        }
+        for root in ["README.md", "AGENTS.md"] {
+            let path = repo.join(root);
+            if path.exists() {
+                sources.push(path);
+            }
+        }
+        sources.sort();
+
+        let mut broken: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for path in &sources {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let dir = path.parent().unwrap_or(path.as_path());
+            for hit in text.match_indices("](") {
+                let rest = &text[hit.0 + 2..];
+                let Some(end) = rest.find(')') else { continue };
+                let raw = &rest[..end];
+                // An anchor is part of the target, not a separate link; and only
+                // RELATIVE paths are ours to resolve.
+                let target = raw.split('#').next().unwrap_or_default().trim();
+                if target.is_empty()
+                    || target.contains("://")
+                    || target.starts_with("mailto:")
+                    || target.starts_with('#')
+                {
+                    continue;
+                }
+                checked += 1;
+                if !dir.join(target).exists() {
+                    broken.push(format!("{} -> {target}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            sources.len() >= 40,
+            "only {} markdown files were read",
+            sources.len()
+        );
+        assert!(
+            checked >= 300,
+            "only {checked} relative link(s) were checked, so this passes over the documentation"
+        );
+        assert_eq!(
+            broken,
+            Vec::<String>::new(),
+            "a relative markdown link points at a file that does not exist, so a reader following it is told the path moved or never existed, with no way to tell which."
+        );
+    }
+
     /// Every table the schema creates is either DISCLOSED on the privacy page or
     /// recorded here as deliberately unused.
     ///
