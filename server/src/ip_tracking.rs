@@ -130,6 +130,26 @@ pub const DAILY_RETENTION_DAYS: i64 = 90;
 /// above it (the doc puts a mobile user at 10-50 IPs/day).
 pub const SHARING_SUSPICION_IPS: i32 = 20;
 
+/// Whether a day's distinct-IP count has just crossed the sharing threshold.
+///
+/// EXACTLY EQUAL, not `>=`, and that is a deliberate choice with a precondition: the
+/// crossing warning is logged once at the transition rather than on every subsequent
+/// request, so 20 requests from 20 addresses must stay quiet or the log becomes noise an
+/// operator learns to skip. For that to be safe the count must climb by exactly one per
+/// new address, which the upsert guarantees and a test pins.
+///
+/// The risk is a future change that lets a single call move the count by more than one -
+/// a batched insert, a backfill, a corrected counter - and the warning then fires for
+/// NOTHING, silently, because the count skipped 21. `>=` would remove that risk at the
+/// cost of one log line per request after the crossing, which is the wrong trade for a
+/// control whose whole purpose is to be noticed once.
+///
+/// A pure function so the boundary is testable at all: the warning goes to a log
+/// subscriber, and a predicate nobody can call is a predicate nobody can check.
+pub fn crossed_sharing_threshold(distinct_ips: i32) -> bool {
+    distinct_ips == SHARING_SUSPICION_IPS + 1
+}
+
 /// The counters for one key on one day, as they stand after a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyIpCounts {
@@ -334,7 +354,7 @@ pub async fn record_key_ip(
         request_count: row.get("request_count"),
     };
 
-    if counts.distinct_ips == SHARING_SUSPICION_IPS + 1 {
+    if crossed_sharing_threshold(counts.distinct_ips) {
         // Logged once, at the crossing. A suspicion threshold is a flag for a
         // human, not a refusal — see the module note.
         warn!(
@@ -1413,8 +1433,39 @@ mod tests {
         assert_eq!(v6_mask(64), u128::MAX << 64, "a /64 masks on the low half");
     }
 
+    /// The crossing fires AT the threshold and not before, not after, and not again.
+    ///
+    /// The old test for this was named `recording_past_the_sharing_threshold_warns_once`
+    /// and never observed a warning - it counted distinct IPs and stopped. The name
+    /// promised a log assertion the body did not make, which is the same shape as a guard
+    /// named after a document it never opened, and it is why the `==` in the predicate was
+    /// never checked from either side.
+    #[test]
+    fn the_sharing_warning_fires_at_the_crossing_and_nowhere_else() {
+        // One below, and the threshold itself: quiet. A control that fires early is a
+        // control an operator learns to ignore.
+        assert!(
+            !crossed_sharing_threshold(SHARING_SUSPICION_IPS - 1),
+            "below the threshold must be silent"
+        );
+        assert!(
+            !crossed_sharing_threshold(SHARING_SUSPICION_IPS),
+            "AT the threshold must still be silent - the promise is MORE than 20"
+        );
+
+        // The crossing, and exactly it.
+        assert!(
+            crossed_sharing_threshold(SHARING_SUSPICION_IPS + 1),
+            "one past the threshold is the crossing and must fire"
+        );
+        assert!(
+            !crossed_sharing_threshold(SHARING_SUSPICION_IPS + 2),
+            "firing again on every later request would make it noise, and the precondition is that the count climbs by exactly one"
+        );
+    }
+
     #[tokio::test]
-    async fn recording_past_the_sharing_threshold_warns_once() {
+    async fn the_distinct_ip_count_climbs_by_exactly_one_per_new_address() {
         // docs/ip-tracking.md: a key seen from >20 distinct domestic IPs in a
         // day is a sharing-suspicion flag for a human, not a refusal. The
         // warning is logged at the crossing (distinct_ips == SHARING_SUSPICION_IPS + 1),
