@@ -4,7 +4,25 @@
 // lib/dashboard-form.ts does: the test suite loads this module directly with Node,
 // and a disclosure that drops a category is exactly what a test must catch.
 //
-// Source of truth: docs/data-retention.md. Every row here is one of that
+// THE NEVER-THE-PROMPT ROW, and the claim it carries. That row is the most
+// load-bearing sentence on this page: the framing above it - a proxy, not a
+// data processor - is the whole business position, and it rests on no column in
+// this system holding request or response text.
+//
+// Verified 2026-09-29, three ways, because the claim is worth more than the
+// confidence behind it:
+//   1. the usage_events schema has no text column of any kind - model, token
+//      counts, cost, ref and timestamps only;
+//   2. no migration mentions prompt, completion, request_body or response_body;
+//   3. the only free-text columns in the database are the three review bodies,
+//      which are customer-written testimonials the same page discloses below.
+//
+// What is NOT covered: the claim is about the DATABASE. The one test that comes
+// close, a_customer_prompt_never_reaches_the log, covers the log. A prompt column
+// added to a request-path table for debugging would break this claim silently -
+// the column lands, every test stays green, and this page goes on telling
+// customers their prompts are not stored. If you add one, change this row and
+// this comment together.
 // document's, restated in plain language. docs/data-retention.md:32-34 states the
 // rule this file exists to honour: the /privacy page "must be updated in the same
 // change if any of it moves again". tests/privacy.test.ts enforces the coverage
