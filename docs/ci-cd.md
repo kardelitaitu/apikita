@@ -361,24 +361,32 @@ called, and that carried six green tests of its own.
 
 The same run, after that function and the fields only it read were deleted:
 
-| Metric | 2026-09-27 | 2026-09-29 (first run) | 2026-09-29 (re-measured) |
-| --- | ---: | ---: | ---: |
-| Region coverage | — | 97.07% | **97.07%** |
-| Line coverage | 96.64% | 98.02% | **98.00%** |
-| Function coverage | — | 94.36% | **94.23%** (104 of 1,801 not entered) |
-| **Named functions never entered by any test** | not measured | 0 of 1,841 | **0 of 1,869** |
-| Tests passing | 461 | 468 | **470** |
+| Metric | 2026-09-27 | 2026-09-29 (first run) | 2026-09-29 (re-measured) | 2026-09-30 (third) |
+| --- | ---: | ---: | ---: | ---: |
+| Region coverage | — | 97.07% | 97.07% | **97.09%** |
+| Line coverage | 96.64% | 98.02% | 98.00% | **97.99%** |
+| Function coverage | — | 94.36% | 94.23% | **94.06%** (109 of 1,835) |
+| **Named functions never entered by any test** | not measured | 0 of 1,841 | 0 of 1,869 | **0 of 1,903** |
+| Tests passing | 461 | 468 | 470 | **484** |
 
 **Zero, still.** Every function in the crate that can be called by name is entered by
-at least one test. The 104 unentered "functions" are all **closures**, which llvm-cov
+at least one test. The 109 unentered "functions" are all **closures**, which llvm-cov
 records under their line number rather than a name.
 
-The re-measurement is here because the numbers MOVE as the crate does, and a table
-that reads as current when it is three changes old is a stale claim wearing a fresh
-date. Line coverage fell by 0.02 points and function coverage by 0.13 across this
-round's work - not a regression, just the cost of adding code and tests together. The
-row that is supposed to be true is still true, and it is the only row here that is a
-claim about the code rather than a measurement of it.
+The re-measurements are here because the numbers MOVE as the crate does, and a table
+that reads as current when it is several changes old is a stale claim wearing a fresh
+date. Line coverage moved by -0.01 and function coverage by -0.17 across two rounds of
+adding tests and the guards those tests live in - not a regression, but the cost of
+writing checks. The row that is supposed to be true is still true, and it is the only
+row here that is a claim about the code rather than a measurement of it.
+
+**WHY THE PERCENTAGES FALL WHILE THE SUITE GROWS.** The guards added over these
+rounds - the claim checks, the schema check, the route and alert assertions - are
+themselves code, and they run at test time, so they are instrumented and largely
+uncovered by the tests they belong to. A guard exists to fail when something ELSE
+changes, which is the opposite of being exercised. Read a falling coverage percentage
+here as "more machinery was added", and read the named-function row as the one that
+says whether anything is unreachable.
 
 That last row is the one to keep, and **the trap is worth naming**: `config.rs`
 reports **62.77% function coverage** and looks like the worst-covered file in the
