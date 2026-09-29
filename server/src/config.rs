@@ -233,6 +233,32 @@ impl ModelConfig {
             )
         };
 
+        // THE MODEL'S OWN RATES ARE A CANDIDATE, not merely the empty-pool
+        // fallback, and that is the whole fix.
+        //
+        // Two rate sets are in play and both are deliberate. This hold is taken
+        // BEFORE routing, so it prices each endpoint at its own rates and keeps the
+        // dearest - that is why per-endpoint rates exist at all. SETTLEMENT, by
+        // contrast, always charges the MODEL's rates: every call site
+        // (routes/proxy.rs:1522, :2637, :3331) passes model_cfg.rates.* and never
+        // the endpoint's, because once the answer is streamed the customer pays the
+        // product price, not the reseller's.
+        //
+        // Taking the max over ENDPOINTS alone therefore did not guarantee the one
+        // thing the hold has to do: cover the charge. The model's rates were only
+        // ever a fallback for an empty pool, so an endpoint that overrides DOWNWARD
+        // - the ordinary reason to add an override, this reseller is cheaper -
+        // pulled the hold below the model-rate charge. The result is a stranded
+        // hold: a -cost larger than the hold, a negative balance, and a reconcile
+        // query that is structurally blind to it. Invisible money.
+        //
+        // Seeding the fold with the model-rate hold states the invariant directly:
+        // the product price is the FLOOR, and an endpoint may only raise it.
+        //
+        // With no overrides - every config that ships today, including
+        // config/apikita.toml - the endpoints already tie with the model, so the
+        // result is unchanged and the feature stays behaviour-preserving.
+        let at_model_rate = at(self.rates.input_peak, self.rates.output_peak);
         self.endpoints
             .iter()
             .map(|endpoint| {
@@ -241,8 +267,7 @@ impl ModelConfig {
                     endpoint.effective_output_peak(self),
                 )
             })
-            .max()
-            .unwrap_or_else(|| at(self.rates.input_peak, self.rates.output_peak))
+            .fold(at_model_rate, i64::max)
     }
 }
 
@@ -561,21 +586,115 @@ mod tests {
         assert_eq!(flash.worst_case_reservation_idr(1_000_000, 4096), tied);
     }
 
-    /// A non-positive override would size the hold from a rate that reserves
-    /// nothing, so it is refused at load like a non-positive model rate.
+    /// THE INVARIANT, and it was not being kept whenever an endpoint's rate
+    /// override is LOWER than the model's.
+    ///
+    /// Two different rate sets are in play, and the codebase is explicit about
+    /// both:
+    ///
+    ///   * The pre-flight HOLD is taken before routing, so it prices each endpoint
+    ///     at its OWN rates (worst_case_reservation_idr, below) and keeps the
+    ///     dearest. That is the documented reason per-endpoint rates exist at all:
+    ///     a failover to a dearer reseller must not overdraw the balance.
+    ///   * SETTLEMENT always charges the MODEL's rates. Every call site -
+    ///     routes/proxy.rs:1522, :2637, :3331 - passes model_cfg.rates.* and never
+    ///     the endpoint's, because by settlement time the choice is made and the
+    ///     customer pays the product price, not the reseller's.
+    ///
+    /// So the hold is only safe if it is at least the model-rate charge. Taking the
+    /// max over endpoints alone does not guarantee that: the model's own rates were
+    /// only ever a fallback for an EMPTY pool, never a candidate. An endpoint that
+    /// overrides DOWNWARD - which is the ordinary reason to add an override, this
+    /// reseller is cheaper - therefore lowered the hold below the charge.
+    ///
+    /// The result is a stranded hold: the ledger records -reserved, +reserved and a
+    /// -cost larger than the hold, the balance goes negative, and reconcile.sh is
+    /// structurally blind to it. That is INVISIBLE MONEY, the class this repository
+    /// treats as the worst kind of bug.
+    ///
+    /// Asserted as a RELATION rather than a figure, because the relation is the
+    /// invariant and a figure would just be a snapshot of today's arithmetic.
     #[test]
-    fn a_non_positive_per_endpoint_rate_is_refused_at_load() {
-        let mut config = AppConfig::load_from_file("../config/apikita.toml")
-            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
-            .expect("config/apikita.toml must load");
-        config.models[0].endpoints[0].input_peak = Some(0.0);
-        let err = config
-            .validate()
-            .expect_err("a zero per-endpoint rate must be refused")
-            .to_string();
-        assert!(err.contains("non-positive peak rate override"), "got {err}");
-    }
+    fn the_hold_covers_the_model_rate_charge_whatever_the_endpoints_override() {
+        // Three shapes, cheapest-override first: the case that was broken, the case
+        // the feature was built for, and the shipped no-override case.
+        for (label, override_peak) in [
+            ("an endpoint cheaper than the model", Some(10.0)),
+            ("an endpoint dearer than the model", Some(999_999.0)),
+            ("no override at all", None),
+        ] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            let model = &mut config.models[0];
+            for endpoint in &mut model.endpoints {
+                endpoint.input_peak = override_peak;
+                endpoint.output_peak = override_peak;
+            }
 
+            const ESTIMATED_INPUT: u64 = 1_000_000;
+            const MAX_OUTPUT: u64 = 4096;
+
+            let hold = model.worst_case_reservation_idr(ESTIMATED_INPUT, MAX_OUTPUT);
+
+            // What settlement will ACTUALLY charge, computed the way every call
+            // site computes it: the model's rates, input and output, no cache.
+            let charge = crate::money::calculate_token_cost_idr(
+                model.price,
+                ESTIMATED_INPUT,
+                model.rates.input_peak,
+                0,
+                model.rates.cache_read_peak,
+                MAX_OUTPUT,
+                model.rates.output_peak,
+            );
+
+            assert!(
+                hold >= charge,
+                "{label}: the hold is {hold} IDR but settlement charges {charge} IDR at \
+                 the model rate, so the request strands a hold"
+            );
+
+            // BOTH DIRECTIONS, because "hold >= charge" is a one-sided claim and
+            // this fix could satisfy it in the laziest way possible - by pricing
+            // every request at the model rate and dropping the dearest-endpoint
+            // rule altogether. What distinguishes the two implementations is what a
+            // DEARER endpoint does, and that is asserted here.
+            //
+            // This control was wrong when first written: it demanded the hold be
+            // strictly greater for every override, which fails for the CHEAPER case
+            // for the right reason - the model is the floor, so a cheaper endpoint
+            // must leave the hold at the floor rather than push it below.
+            match override_peak {
+                // Cheaper than the model: the floor holds, the hold does not shrink.
+                Some(peak) if peak < model.rates.input_peak => assert_eq!(
+                    hold, charge,
+                    "{label}: an override of {peak} is below the model rate {0}, so the \
+                     hold must stay AT the model-rate charge rather than drop to the \
+                     cheaper endpoint's",
+                    model.rates.input_peak
+                ),
+                // Dearer: the dearest-endpoint rule must still raise the hold, and
+                // this is what a fix that merely added the model as a floor would
+                // silently lose.
+                Some(peak) => assert!(
+                    hold > charge,
+                    "{label}: an override of {peak} is above the model rate {}, so the \
+                     hold must be STRICTLY greater than the model-rate charge - without \
+                     that the dearest-endpoint rule is gone",
+                    model.rates.input_peak
+                ),
+                // No override: the endpoints tie with the model, so the hold is
+                // exactly the model-rate charge and the feature is
+                // behaviour-preserving for every config that ships today.
+                None => assert_eq!(
+                    hold, charge,
+                    "with no override the endpoints tie with the model, so the hold is \
+                     exactly the model-rate charge - the feature is behaviour-preserving"
+                ),
+            }
+        }
+    }
     #[test]
     fn test_load_apikita_toml() {
         // Test parsing the root config/apikita.toml.

@@ -199,11 +199,23 @@ impl ModelEntry {
             )
         };
 
+        // The MODEL's own rates are a CANDIDATE here, not just the empty-pool
+        // fallback, and that is the fix. This hold is sized before routing, so it
+        // prices each endpoint at its own rates; SETTLEMENT always charges the
+        // MODEL's rates (routes/proxy.rs:1522 passes model_cfg.rates.*, never an
+        // endpoint's). Taking the max over endpoints alone let an endpoint that
+        // overrides DOWNWARD - a cheaper reseller, the ordinary reason to add one -
+        // pull the hold below the charge, stranding money.
+        //
+        // Seeding the fold with the model-rate hold states the invariant: the
+        // product price is the FLOOR and an endpoint may only raise it. A config
+        // with no overrides ties with the model, so nothing changes for any
+        // deployment that ships today.
+        let at_model_rate = at(self.input_peak, self.output_peak);
         self.endpoints
             .iter()
             .map(|endpoint| at(endpoint.input_peak, endpoint.output_peak))
-            .max()
-            .unwrap_or_else(|| at(self.input_peak, self.output_peak))
+            .fold(at_model_rate, i64::max)
     }
 }
 
@@ -935,6 +947,65 @@ mod tests {
             flat.worst_case_reservation_idr("flash", 4096),
             Some(4081),
             "with no overrides the hold is unchanged from the model-rate behaviour"
+        );
+    }
+
+    /// The other half of the rule, and the half that was WRONG.
+    ///
+    /// The test above puts a 9x reseller in the pool, so the dearest-endpoint rule
+    /// alone produced the right answer and the bug was invisible. The dangerous
+    /// shape is the opposite one: EVERY endpoint cheaper than the model. Taking
+    /// the max over endpoints then returns the cheapest of them, while SETTLEMENT
+    /// charges the model's rates - so the hold was sized off a reseller the customer
+    /// is never billed at.
+    ///
+    /// That is not a contrived configuration: "this reseller is cheaper" is the
+    /// ordinary reason to add a per-endpoint rate at all, and lowering the hold to
+    /// match is exactly what the customer would be billed if the product price were
+    /// per-endpoint. It is not, so the model's rate is the FLOOR.
+    ///
+    /// Asserted as a relation against the figure settlement actually charges, not as
+    /// a constant, so the test keeps its meaning if the rates are ever repriced.
+    #[test]
+    fn a_pool_cheaper_than_the_model_still_reserves_at_the_model_rate() {
+        // Both endpoints well below the model's 2676.78 / 10707.12, and neither
+        // carries a cache rate, so the comparison is purely input plus output.
+        let cheap_a = endpoint_at("cheap-a", 1.0, Some(1000.0), Some(4000.0));
+        let cheap_b = endpoint_at("cheap-b", 1.0, Some(900.0), Some(3600.0));
+        let upstream = client(vec![model("flash", vec![cheap_a, cheap_b])]);
+
+        let reserved = upstream
+            .worst_case_reservation_idr("flash", 4096)
+            .expect("configured model");
+
+        // What settlement charges: the MODEL's rates, over the same window.
+        let charge = calculate_preflight_reservation_idr(1.5, 1_000_000, 2676.78, 4096, 10707.12);
+
+        assert!(
+            reserved >= charge,
+            "every endpoint is cheaper than the model, so the hold was sized off a \
+             reseller the customer is never billed at: {reserved} IDR held against a \
+             {charge} IDR charge"
+        );
+
+        // POSITIVE CONTROL on the fixture. Without this the assertion above could be
+        // passing because the endpoints are not actually cheaper than the model, in
+        // which case it would be testing nothing.
+        let dearest_endpoint =
+            calculate_preflight_reservation_idr(1.5, 1_000_000, 1000.0, 4096, 4000.0);
+        assert!(
+            dearest_endpoint < charge,
+            "the fixture must hold endpoints CHEAPER than the model ({dearest_endpoint} \
+             vs {charge}), or this test is about the wrong case"
+        );
+
+        // And the hold must be the model's, not merely "at least the charge": a fix
+        // that simply multiplied by a fudge factor would also satisfy the first
+        // assertion, and would over-reserve every request forever.
+        assert_eq!(
+            reserved, charge,
+            "the model rate is the FLOOR and nothing here raises it, so the hold is \
+             exactly the model-rate charge"
         );
     }
 
