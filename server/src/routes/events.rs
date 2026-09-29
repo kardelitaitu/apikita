@@ -1217,6 +1217,76 @@ mod tests {
         assert!(matches!(hub.resume(Some(1)), Resume::Snapshot));
     }
 
+    /// The HANDLER must not put another account data on the stream.
+    ///
+    /// The companion test above proves the hub broadcasts to everyone and that the
+    /// filter drops what it should. It drives the HUB and never calls
+    /// sse_events_handler, so it says nothing about the filter in the live arm - and a
+    /// mutation that removed that filter left it green, twice.
+    ///
+    /// So this drives the handler, and the negative control is that the SAME stream
+    /// must receive the event belonging to the account holding it. Without that, the
+    /// absence of other-account data is satisfied by a stream that delivered nothing,
+    /// which is the vacuous shape one level up.
+    ///
+    /// The read has to interleave with the publish, so the body is collected in a
+    /// spawned task. The frame it ends on is the deadline, the same mechanism
+    /// docs/realtime.md names for revocation.
+    #[tokio::test]
+    async fn the_handler_never_puts_another_accounts_data_on_the_stream() {
+        let db = TestDb::new().await;
+        let config = RealtimeConfig {
+            replay_buffer_events: 64,
+            max_connections_per_account: 5,
+            // Long enough for the live arm to deliver, short enough to finish.
+            max_stream_seconds: 1,
+        };
+        let state = state_for(db.pool.clone(), &config);
+
+        let x = test_support::account_with_wallet(&db.pool).await;
+        let y = test_support::account_with_wallet(&db.pool).await;
+        // Distinctive values, so the check is a string search and not a judgement
+        // about numbers that could coincide.
+        publish_balance(&state.events, y, 987_654);
+        publish_usage(&state.events, y, test_usage(11, 22, 33, 44));
+
+        let headers = cookie_for(&db.pool, x).await;
+        let sse = sse_events_handler(State(state.clone()), headers)
+            .await
+            .expect("a live session opens a stream");
+        use axum::response::IntoResponse;
+        let body = axum::body::to_bytes(sse.into_response().into_body(), usize::MAX);
+        let reader = tokio::spawn(async move {
+            String::from_utf8_lossy(&body.await.expect("the stream is finite")).into_owned()
+        });
+
+        // While the body is read: one event for the holder, more for the other.
+        publish_balance(&state.events, x, 111_222);
+        publish_balance(&state.events, y, 555_666);
+        publish_usage(&state.events, y, test_usage(77, 88, 99, 111));
+
+        let frames = reader.await.expect("the reader task must not panic");
+
+        // NEGATIVE CONTROL, first. If this fails the absences below prove only that
+        // nothing was delivered.
+        assert!(
+            frames.contains("111222"),
+            "the stream must carry the balance belonging to the account holding it, or it delivered nothing and every assertion below is vacuous. Frames: {frames}"
+        );
+
+        // THE CLAIM: nothing belonging to the other account reached the wire.
+        for (what, needle) in [
+            ("a live balance", "555666"),
+            ("an opening snapshot balance", "987654"),
+        ] {
+            assert!(
+                !frames.contains(needle),
+                "{what} belonging to the OTHER account ({needle}) reached this stream. The live arm account filter is the only thing between a process-wide broadcast and another customer balance. Frames: {frames}"
+            );
+        }
+
+        db.close().await;
+    }
     #[tokio::test]
     async fn a_session_cookie_with_no_matching_row_falls_through_to_unauthenticated() {
         let db = TestDb::new().await;
