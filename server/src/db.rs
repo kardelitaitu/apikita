@@ -1245,18 +1245,30 @@ mod tests {
     use super::*;
     use crate::test_support::{self, TestDb};
 
-    /// Rows returned by the reconciliation check in docs/observability.md:
-    /// wallets.balance_idr must equal SUM(ledger.delta_idr).
+    /// Rows returned by the reconciliation check: wallets.balance_idr must equal
+    /// SUM(ledger.delta_idr).
+    ///
+    /// This is a TRANSCRIPTION of tools/reconcile/reconcile.sql, and it is now faithful
+    /// rather than convenient. It used to anchor on wallets with a LEFT JOIN, so it
+    /// could not see an account whose wallets row is MISSING, the cache gone entirely,
+    /// and every assertion built on it was checking a weaker rule than the one that
+    /// ships.
+    ///
+    /// The SQL was fixed for that case long ago; its comment records a +250000 adjustment
+    /// with no wallet row reporting a PASS, which is the exact figure the case below
+    /// reproduces. A transcription is only safe if it is the same rule, so it now joins
+    /// the same way and refuses in the same two directions.
     async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
-                SELECT w.account_id
+                SELECT COALESCE(w.account_id, l.account_id) AS account_id
                 FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
+                WHERE COALESCE(w.account_id, l.account_id) = ?
+                GROUP BY w.account_id, l.account_id, w.balance_idr
+                HAVING w.account_id IS NULL
+                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
@@ -2458,6 +2470,46 @@ mod tests {
             .await
             .expect("restore the balance");
         assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+    }
+
+    /// The gate must report an account whose WALLET ROW IS MISSING, and this is its
+    /// own test rather than a fourth step above, for a reason worth stating.
+    ///
+    /// It was tried as a fourth step and it broke a NEIGHBOURING test: that test asserts
+    /// a release against a wallet-less account writes no ledger row, and seeding this
+    /// case first moved what it counted. A case that mutates the shape another test
+    /// depends on belongs in its own database, which run_with_teardown gives every
+    /// #[tokio::test]. Coupling them for brevity is how a suite ends up with tests that
+    /// pass only in the order they happen to run.
+    ///
+    /// The fixture is built through the REAL money path and then the cache row removed,
+    /// so the ledger row carries a valid reason and this is a state the system can
+    /// reach. A hand-inserted row was tried first and the STRICT schema refused it on
+    /// the reason vocabulary, which is the schema working.
+    #[tokio::test]
+    async fn the_gate_reports_an_account_whose_wallet_row_is_missing() {
+        run_with_teardown(ledger_only_assertions).await;
+    }
+
+    async fn ledger_only_assertions(pool: SqlitePool, account_id: Uuid) {
+        // A funded account reconciles clean, so the failure below is the DELETION
+        // doing it and not a fixture that was never sound.
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        fund_through_topup(&pool, account_id, 250_000).await;
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+
+        sqlx::query("DELETE FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("remove the cache row, leaving ledger money with no wallet");
+
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            1,
+            "an account with ledger money and NO wallet row is the worst case, not an ignorable one. Anchoring on wallets with a LEFT JOIN reports nothing for it, which is how a +250000 adjustment once reported a clean reconcile."
+        );
     }
 
     /// unpaired_hold_rows: a hold with no matching release is money that left the
