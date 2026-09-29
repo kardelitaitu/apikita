@@ -271,7 +271,7 @@ Decided *values* that the running system reads are in `config/apikita.toml`:
 | Config section | Holds |
 | --- | --- |
 | `[pricing]` | Currency (margin is per model) |
-| `[wallet]` | Deposit minimums. **Not enforced:** `low_balance_threshold_idr`, `low_balance_max_per_day`, `dormancy_days` — no low-balance alert is emitted and no sweep ages a wallet out |
+| `[wallet]` | Deposit minimums. **Not enforced:** `low_balance_threshold_idr`, `low_balance_max_per_day`, `dormancy_days` (no low-balance alert is emitted and no sweep ages a wallet out), `min_monthly_tokens` (no monthly token floor is applied to anything), `reserve_settlement_cycles` (the reservation *is* sized for one cycle, by construction in `worst_case_reservation_idr` — this setting restates a hardcoded behaviour while reading as a control, and setting it to 5 would change nothing) |
 | `[sessions]` | Absolute and idle lifetimes |
 | `[limits]` | Per-account rate caps (top-up, key creation, link codes), key metadata cache TTL, limit window, admin threshold. **Not enforced:** `wallet_mutations_per_minute`, `review_per_hour` — a rate limit for a limiter that was never written, and for a review endpoint that does not exist |
 | `[realtime]` | SSE replay buffer, connection cap, stream lifetime |

@@ -1582,6 +1582,25 @@ mod tests {
                 "the key pool applies one global concurrency policy; the per-endpoint\n                 override is parsed and never consulted.",
             ),
             (
+                "min_monthly_tokens",
+                "no monthly token floor is applied to anything. The only place this \
+                 name appeared outside the struct was a SENTENCE in abuse.rs citing it \
+                 as an example of the zero-disables-the-cap convention - and a comment \
+                 is not a use. Found by the guard once it stopped counting comments as \
+                 reads, which is the same failure as a dead guard: a citation in prose \
+                 protected a field nothing enforces.",
+            ),
+            (
+                "reserve_settlement_cycles",
+                "the sharpest form of inert. The reservation IS sized to cover exactly \
+                 one settlement cycle - worst_case_reservation_idr does it by \
+                 construction - so this setting DESCRIBES a hardcoded behaviour while \
+                 reading as a control. Setting it to 5 would change nothing, and the doc \
+                 comment in bin/hold-sweep.rs presents it as if it would. A value that \
+                 restates what the code already does is a documentation line wearing a \
+                 config field's clothes.",
+            ),
+            (
                 "description",
                 "the model's human description is carried but never returned to a\n                 client. Harmless, and the obvious use is a future model-listing\n                 response.",
             ),
@@ -1731,6 +1750,47 @@ mod tests {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
+                // COMMENTS ARE STRIPPED, and that came from a real miss rather than
+                // from foresight. abuse.rs cites min_monthly_tokens in a sentence
+                // explaining the "zero disables the cap" convention, and the guard read
+                // that sentence as a use - so a field that nothing enforces was
+                // reported as wired. A comment is not a use, and a guard that cannot
+                // tell the difference will protect dead fields indefinitely.
+                //
+                // Only WHOLE-LINE comments are removed, plus block comments. A naive
+                // scan for "//" would truncate every line containing a URL - the
+                // codebase has several - and could drop a real read that happened to
+                // share a line with one, which is the direction this guard must never
+                // fail in. A trailing comment after code on the same line is the
+                // residual gap, and it is narrow enough to state rather than solve.
+                let mut kept = String::with_capacity(text.len());
+                let mut in_block_comment = false;
+                for line in text.lines() {
+                    let trimmed = line.trim_start();
+                    if in_block_comment {
+                        if let Some((_, after)) = trimmed.split_once("*/") {
+                            in_block_comment = false;
+                            kept.push_str(after);
+                            kept.push('\n');
+                        }
+                        continue;
+                    }
+                    if let Some(rest) = trimmed.strip_prefix("/*") {
+                        match rest.split_once("*/") {
+                            Some((_, after)) => kept.push_str(after),
+                            None => in_block_comment = true,
+                        }
+                        kept.push('\n');
+                        continue;
+                    }
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+                let text = kept;
+
                 // Truncate at the LAST "mod tests", NOT at the first
                 // "#[cfg(test)]". Several files carry a test-only attribute on an
                 // individual item - proxy.rs has two, at lines 49 and 612 - and
