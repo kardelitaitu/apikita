@@ -291,6 +291,38 @@ alert-check 1 on no `probe.sh`, ci-docs-check 3 on no `ci-cd.md`, and relay-chec
 `relay.conf`. **None of the seven can pass vacuously**, and until this was measured that
 was an assumption rather than a fact.
 
+### Read the code before writing a sentence about it
+
+Three notes in this repository were WRONG when written, and all three were about code
+that had just been changed:
+
+- an alert row saying "THREE of the six age-based tables" - written to correct a false
+  claim, and falsified hours later by the very change it described;
+- a retention row saying "PROMISED, NOT ENFORCED" - correct when written, then enforced
+  in the same change, which nobody revisited;
+- a config note saying the client "KNOWN, NOT YET FIXED" - the config value it pointed
+  at had already been changed, and one line of reading showed the fix was in place.
+
+**THE CAUSE IS THE SAME IN ALL THREE, AND IT IS NOT CARELESSNESS.** Each sentence was
+easy to write and felt obviously true, so it was written before the code beside it was
+read. In the third case the note was committed *describing a fix made in the previous
+commit* - the information was one function away.
+
+The rule that separates the successful checks from these:
+
+> Read the code, THEN write the sentence. In that order the sentence cannot be wrong
+> about something you have just looked at.
+
+The failure mode is specific and worth naming because it is invisible while it happens:
+a comment that describes a *gap* goes stale the moment the gap closes, and nothing in
+CI notices a comment being optimistic. The guards here all check machine-readable things
+for exactly this reason, and a comment is the one artefact no guard can reach.
+
+So the discipline for prose is the one for code that this file keeps arriving at:
+**assert on something that cannot drift.** For a note about a config value, the thing
+that cannot drift is the config value itself - which is why the note is now paired with a
+test that reads `config/apikita.toml` rather than restating what it contains.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
