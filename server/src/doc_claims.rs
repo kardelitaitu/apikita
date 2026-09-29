@@ -717,7 +717,14 @@ mod tests {
             }
         }
 
-        assert!(walked >= 30, "only {walked} markdown files were read");
+        // A FLOOR WITH SLACK, never AT the measured value. server/src holds exactly 30
+        // .rs files, so a floor OF 30 is a tripwire: it passes today, fails the moment one
+        // file is deleted, and cannot tell a whole-crate walk from a narrowed one that
+        // happens to reach 30. The count is content; the scope is what this floor guards.
+        assert!(
+            walked >= 18,
+            "only {walked} source files were read, so this is not walking the crate"
+        );
         assert!(
             checked >= 3,
             "only {checked} limits key(s) were checked, so this passes over the documents"
@@ -822,7 +829,10 @@ mod tests {
         }
 
         assert!(
-            files >= 30,
+            // Slack, for the reason the two source walks above now carry: 30 is the
+            // file count, so a floor equal to it cannot distinguish a whole-crate walk
+            // from a narrowed one.
+            files >= 18,
             "only {files} Rust files were read, so nothing can look read"
         );
         assert!(
@@ -1291,7 +1301,9 @@ mod tests {
         }
         sources.sort();
         assert!(
-            walked >= 30,
+            // Slack for the same reason as the other source walk: 30 is the file count,
+            // and a floor equal to it is a tripwire rather than a guard.
+            walked >= 18,
             "only {walked} Rust files were walked, so this test is not looking at the whole crate"
         );
 
