@@ -116,6 +116,99 @@ mod tests {
         );
     }
 
+    /// The PUBLISHED retention promise equals the code that enforces it.
+    ///
+    /// WHY THIS IS NOT REDUNDANT WITH THE DOC CITATION CHECK. doc_claims keeps the
+    /// documents citing code BY NAME rather than by line. It says nothing about the
+    /// NUMBERS, and the numbers are the promise: this document is what a customer is
+    /// shown, and what an operator reads to know what a sweep will delete. Its own
+    /// closing paragraph names the failure - the policy lived in this document and
+    /// nothing connected it to the code - and the fix it records is that the sweeps
+    /// exist. The sweeps existing is not the same as the sweeps keeping the period
+    /// the document states, and a constant edited from 90 to 60 would leave every
+    /// test green while the promise quietly became a lie.
+    ///
+    /// So each row is pinned in BOTH directions: the document must state the period,
+    /// and the constant must equal it. Changing either alone fails here.
+    ///
+    /// 24 months is pinned as 730 days and the approximation is stated rather than
+    /// hidden - a month is not 30.3025 days, so the two can never agree for all time,
+    /// and a test pretending otherwise would be asserting a fiction. The constant is
+    /// the authority for the sweep, the document is the authority for the promise, and
+    /// this test is the only thing that makes them one claim.
+    #[test]
+    fn the_published_retention_periods_are_the_periods_the_sweeps_enforce() {
+        // Resolved through CARGO_MANIFEST_DIR rather than a relative path, because a
+        // relative one is relative to the test binary's working directory, which is not
+        // guaranteed to be the package root - and a path that resolves to nothing here
+        // produced a file read error rather than a vacuous pass, which is the correct
+        // failure and the reason it is worth stating.
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs")
+            .join("data-retention.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .expect("docs/data-retention.md must be readable, or this passes over nothing");
+
+        // Table named in the doc, the period the doc states, the constant enforcing it.
+        let promises: [(&str, &str, i64); 5] = [
+            (
+                "usage_events",
+                "**90 days**",
+                crate::db::USAGE_EVENTS_RETENTION_DAYS,
+            ),
+            (
+                "usage_daily",
+                "24 months",
+                crate::db::USAGE_DAILY_RETENTION_DAYS,
+            ),
+            ("sessions", "30 days", crate::db::SESSION_RETENTION_DAYS),
+            (
+                "key_ip_seen",
+                "**7 days**",
+                crate::ip_tracking::SEEN_RETENTION_DAYS,
+            ),
+            (
+                "key_ip_daily",
+                "**90 days**",
+                crate::ip_tracking::DAILY_RETENTION_DAYS,
+            ),
+        ];
+
+        for (table, stated, constant) in promises {
+            assert!(
+                doc.contains(stated),
+                "docs/data-retention.md no longer states {stated} for {table}; a retention period nobody was told about is not a promise, and the constant is {constant} days. Either the row was reworded or the policy changed without the promise being updated."
+            );
+        }
+
+        // The constants, named outright, because a table row that merely CONTAINS
+        // the number would also be satisfied by a change to the constant alone.
+        assert_eq!(
+            crate::db::USAGE_EVENTS_RETENTION_DAYS,
+            90,
+            "the document promises 90 days of per-request usage"
+        );
+        assert_eq!(
+            crate::db::USAGE_DAILY_RETENTION_DAYS, 730,
+            "the document promises 24 months of usage_daily and 730 days is what that resolves to here; if the sweep changes, the promise must be re-read, because two thirds of a year is a different promise"
+        );
+        assert_eq!(
+            crate::db::SESSION_RETENTION_DAYS,
+            30,
+            "the document promises 30 days of expired sessions"
+        );
+        assert_eq!(
+            crate::ip_tracking::SEEN_RETENTION_DAYS,
+            7,
+            "the document promises 7 days of key_ip_seen"
+        );
+        assert_eq!(
+            crate::ip_tracking::DAILY_RETENTION_DAYS,
+            90,
+            "the document promises 90 days of key_ip_daily"
+        );
+    }
     /// The scanner itself, because a check that cannot find a citation it should find
     /// is a check that always passes. These are the shapes the rule exists to catch, and
     /// the shapes it must NOT catch - a heading, a numbered list, a version.
