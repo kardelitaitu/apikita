@@ -1,3 +1,19 @@
+#![cfg_attr(
+    not(test),
+    // THE CUSTOMER WALLET SURFACE, fenced like the money modules for the same
+    // structural reason. This is where a deposit limit is compared and where the
+    // wallet figures a customer is shown are assembled, so an overflow here would be
+    // a limit that silently stops biting or a balance that reads wrong in the
+    // dashboard.
+    //
+    // It costs nothing, which is the finding rather than the assumption: measured
+    // before adding it, this module has ZERO arithmetic_side_effects sites outside
+    // its tests. Every money computation happens in db.rs and this module routes to
+    // it rather than repeating it. That is worth locking in - a fence is only
+    // useful if it is cheap, and this one was.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use std::borrow::Cow;
 use std::env;
 use std::sync::OnceLock;

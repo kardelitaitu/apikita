@@ -26,6 +26,30 @@
 //! Rollout is read-only + suspend/restore (docs/admin-surface.md:179-185); the
 //! money actions are deliberately absent.
 
+// -----------------------------------------------------------------------
+// An operator surface that ARITHMETIC cannot quietly get wrong.
+// -----------------------------------------------------------------------
+#![cfg_attr(
+    not(test),
+    // Fenced like the money modules, and for the same structural reason: this file's
+    // own header says it is 'deliberately built from the SAME pieces the customer
+    // surface uses, so there is no second code path to drift'. That claim is about
+    // behaviour, and a lint makes it structural instead - a limit computed here
+    // would have to be written again, and the fence refuses it.
+    //
+    // NOT because an operator types money into this surface. They cannot: the
+    // header is explicit that the money actions are deliberately absent, and this
+    // module is a read-only lookup plus suspend and resume. An earlier version of
+    // this comment justified the fence by an operator-entered balance adjustment,
+    // which is a feature this file does not have - the same overstatement this
+    // repository keeps having to correct, written here by the same hand.
+    //
+    // What the fence actually costs: nothing. Measured before adding it, ZERO
+    // arithmetic_side_effects sites outside this module's tests. The counts and
+    // limits it reports are all read or computed in db.rs.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
