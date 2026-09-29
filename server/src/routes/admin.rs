@@ -85,7 +85,7 @@ const TARGET_TYPE_ACCOUNT: &str = "account";
 /// emitting either would make a documented promise false. Forbidden therefore
 /// renders the crate's own error envelope (the same ApiErrorResponse /
 /// ApiErrorBody structs AppError serialises) with the new stable code
-/// "forbidden" - which docs/error-model.md:186 rule 4 permits ("code values are
+/// "forbidden" - which docs/error-model.md, rule 4 rule 4 permits ("
 /// permanent. Adding is fine; changing meaning is not").
 ///
 /// The status is 403 and not 401/404 on purpose. The caller IS authenticated:

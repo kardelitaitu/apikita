@@ -465,6 +465,22 @@ So the rate is not one in six. Across thirty-one citations read so far, **eighte
 wrong** — and the errors are not cosmetic. A comment citing the formula when it means
 the floor rule will send a reader to write a client that retries instantly.
 
+**THE THIRD CLUSTER WAS WORSE AGAIN, AND IT HAD A SINGLE CAUSE.** Thirteen citations
+into `docs/error-model.md` around the streaming and upstream sections: **eleven wrong**.
+Five pointed at `:159`, a blank line. Two at `:164`, the section HEADING. One at `:165`,
+the heading's blank line. One at `:171`, a line inside a fenced code block. Two at prose
+about unrelated subjects.
+
+Almost all of them mean the same thing, and none cited it: **the numbered list under
+`## Rules` at the end of the document.** The comments already say "rule 1", "rule 4",
+"always include `request_id`" — they were paraphrasing the rules and citing whatever
+line number was near. All eleven now cite the rule they name, which reads better than
+the number it replaces and cannot drift.
+
+**Across forty-four citations read, twenty-nine were wrong.** The remaining 128 are
+untouched, and on this ratio the expected yield is roughly ninety more. That is the
+honest size of the remaining job, and it is a reading job.
+
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually
 runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was

@@ -12,7 +12,7 @@ use tracing::error;
 /// The fixed, generic `message` returned to clients for the two variants whose
 /// inner value is diagnostic rather than contractual. It deliberately carries
 /// nothing: no SQL, no table or column name, no host, IP, port, provider or
-/// library name (docs/error-model.md:159, rule 1). It stays honest and
+/// library name (docs/error-model.md, rule 1). It stays honest and
 /// non-alarming, and it is not a contract - the `code` is.
 const UNEXPECTED_ERROR_MESSAGE: &str =
     "An unexpected error occurred. Please try again, and quote the request_id if it persists.";
@@ -63,8 +63,8 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
-    /// Carries the offending field, not just prose. docs/error-model.md:165
-    /// (rule 5) requires `details.field` so a UI can highlight the input
+    /// Carries the offending field, not just prose. docs/error-model.md
+    /// rule 5 requires `details.field` so a UI can highlight the input
     /// without parsing the message; making it a required field means a new
     /// call site cannot forget it.
     #[error("Validation failed: {message}")]
@@ -646,7 +646,7 @@ mod tests {
 
         assert_eq!(
             actual, documented,
-            "docs/error-model.md:164 - code values are permanent; adding is fine, changing meaning is not"
+            "docs/error-model.md, rule 4 - ; adding is fine, changing meaning is not"
         );
     }
 
@@ -725,7 +725,7 @@ mod tests {
             let (_, _, body) = respond(err).await;
             let id = error_object(&body)["request_id"]
                 .as_str()
-                .expect("docs/error-model.md:162 - always include request_id")
+                .expect("docs/error-model.md, rule 3 - always include ")
                 .to_string();
             assert!(
                 id.starts_with("req_"),
@@ -854,7 +854,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Never leak internals (docs/error-model.md:159, rule 1)
+    // Never leak internals (docs/error-model.md, rule 1)
     // ---------------------------------------------------------------------
 
     #[tokio::test]
@@ -1005,7 +1005,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_validation_error_names_the_offending_field_in_details() {
-        // docs/error-model.md:165, rule 5 - validation errors name the field.
+        // docs/error-model.md, rule 5, rule 5 - validation errors .
         let (status, _, body) = respond(AppError::ValidationFailed {
             message: "amount_idr must be at least 10000".into(),
             field: "amount_idr".into(),

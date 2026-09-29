@@ -720,7 +720,7 @@ pub fn invalidate_key_cache(config: &AppConfig, key_hash: &str) {
 /// assertion fails. It is safe to derive here because `UpstreamStream`'s own
 /// manual `Debug` deliberately prints only the endpoint name and whether a lease
 /// is held — never the body — so a hangup outcome cannot spill streamed content
-/// into a log line (docs/error-model.md:159).
+/// into a log line (docs/error-model.md, rule 1: never leak internals).
 #[derive(Debug)]
 enum StreamEnd {
     /// The stream completed and the tail parsed into a usage report.
@@ -877,7 +877,7 @@ impl Stream for MeteredStream {
                 // retried: a retry would append a second answer and bill for
                 // both (docs/failover.md:133). The detail is logged, not sent:
                 // a reqwest error carries the provider URL, and the client must
-                // never see provider names (docs/error-model.md:159).
+                // never see provider names (docs/error-model.md, rule 1).
                 warn!(error = %err, "Upstream stream failed mid-answer");
                 Poll::Ready(Some(Ok(Bytes::from(error_event(
                     "upstream_failed",
@@ -920,7 +920,7 @@ fn no_upstream_retry_after(
 ///
 /// A transport error's Display embeds the provider URL, so it is logged and
 /// withheld: the client gets the generic upstream-unavailable error instead
-/// (DEFECT 3, docs/error-model.md:159). The other variants carry no provider URL
+/// (DEFECT 3, docs/error-model.md, rule 1). The other variants carry no provider URL
 /// or hostname.
 fn upstream_error(
     err: UpstreamError,
@@ -2700,7 +2700,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("the data field must be JSON: {e}"));
         parsed["error"]["request_id"]
             .as_str()
-            .expect("docs/error-model.md:171 - always include request_id")
+            .expect("docs/error-model.md, rule 3 - always include ")
             .to_string()
     }
 
