@@ -530,7 +530,19 @@ mod tests {
             "a secret is substituted into a log or format macro:\n{findings:#?}\nA customer-facing privacy page states the Midtrans server key is never logged, and this is that claim in the only form that can be checked."
         );
     }
-    /// Every document is TRIAGED: either citation-checked, or listed here with a reason.
+    /// Every document UNDER docs/ is TRIAGED: citation-checked, or listed with a reason.
+    ///
+    /// The scope is docs/ and the NAME SAYS SO, which is the point of the rename. There
+    /// are 34 other markdown files here - a README per tool, the provider notes,
+    /// AGENTS.md, and the agent scratch under .workbuddy-ai/ - and this test does not
+    /// govern them. Most describe a CHECK rather than make a claim about the service: a
+    /// tool README that could misstate a retention window is already covered by the check
+    /// it describes, and the retention guard reads those files directly. Widening this one
+    /// to all thirty-four would add a long list of entries that record nothing, and a list
+    /// that records nothing is worse than a smaller one that is consulted.
+    ///
+    /// So the boundary is stated rather than implied. A name that outruns its parse is
+    /// worse than a narrower name, because the name is what a reader trusts.
     ///
     /// WHY. The list of citation-checked documents above is hand-maintained, and a
     /// hand-maintained list fails SILENTLY in one direction: a new document arrives, is
@@ -889,7 +901,7 @@ mod tests {
         }
     }
     #[test]
-    fn every_document_is_either_citation_checked_or_triaged_with_a_reason() {
+    fn every_document_under_docs_is_either_citation_checked_or_triaged_with_a_reason() {
         const TRIAGED: &[(&str, &str)] = &[
             ("abuse-runbook.md", "what to do when a limit trips; a runbook is read after the fact, not acted on by line citation"),
             ("backup-and-restore.md", "operational, but its claims are about drills and RTOs; it cites no source lines"),
