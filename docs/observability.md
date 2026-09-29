@@ -105,7 +105,7 @@ Each has a threshold and an action. If you would not act, do not alert.
 | **All providers unhealthy** | circuit open on every endpoint | Requests failing; check upstream |
 | **Balance negative** | `balance_idr < 0` | Should be impossible (CHECK constraint). A bug |
 | **DB disk** | any age-based table holding a row past its retention window | Usage rows growing; check retention |
-| **Error rate >5%** | 5 min window | Investigate |
+| **Error rate >5%** | **Process-lifetime ratio, not a 5-minute window** | Investigate |
 | **Stranded reservation hold** | `reserve_*` negative ledger row with no positive row under the same ref | **Investigate the release path, then credit the account if the hold is lost.** Invisible to the drift query by construction — the hold left the wallet and no offsetting credit was written, so `balance` still equals `SUM(delta)` |
 
 **These are implemented, and the definition is machine-readable.** Every row above has
@@ -155,13 +155,30 @@ WORKING, so the server does not reuse its cooldown accessor for this. It counts 
 ROUTED endpoints (weight > 0), so an unrouted placeholder can neither cause a false
 alarm nor mask a real outage on the endpoint that is actually serving.
 
-**The error-rate alert is SERVED.** `error.rs` counts 5xx responses and total
-responses in process, and `GET /api/admin/metrics` (operator-only) reports them, so
+**The error-rate alert is SERVED, and it is a LIFETIME ratio.** `error.rs` counts 5xx
+responses and total responses in process with cumulative `fetch_add`s, and
+`GET /api/admin/metrics` (operator-only) reports them, so
 `tools/alert/probe.sh --check error_rate` measures a real number instead of declaring
-the alert unchecked. Two caveats worth knowing: the ceiling is over **handled**
-requests (a 404 for an unmatched path never reaches `AppError`, so it is not counted),
-and an empty window reports **`null`, not `0.0`** — the probe treats null as no-data
-rather than a healthy service.
+the alert unchecked.
+
+**Three caveats, and the first is the one that matters.** The ratio is over everything
+the process has served since it started, NOT over a 5-minute window — the counters have
+no window, no reset and no ring buffer. A burst of errors during an incident moves it
+very little on a service that has been up a week, so **this alert under-fires by design
+of its implementation** and an operator should treat a silent `error_rate` as "below 5%
+for the whole life of the process", not "below 5% for the last five minutes". Both tables in
+this repository said 5 min until now; the prose here always said "in process", which is
+the shape of the error worth watching for — the careful sentence is written and the table
+beside it is not updated.
+
+The other two: the ceiling is over **handled** requests (a 404 for an unmatched path never
+reaches `AppError`, so it is not counted), and a process that has served nothing reports
+**`null`, not `0.0`** — the probe treats null as no-data rather than a healthy service.
+
+A real window is a small change and a deliberate one: two `VecDeque`s of (instant, was_5xx)
+behind the same atomics, trimmed on read. It is not done because a lifetime ratio answers a
+real question — "is this service returning 5xx at all" — and a windowed one would need its
+own tuning for minimum traffic before it was worth alerting on.
 
 **What is deliberately NOT alerted:** individual 401s, individual 500s, high CPU
 with normal latency, slow upstream (their problem, and you cannot fix it).
