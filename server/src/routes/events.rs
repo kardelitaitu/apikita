@@ -566,6 +566,57 @@ mod tests {
         assert_ne!(parsed["input_tokens"], 9200);
     }
 
+    /// A CLIENT DISCONNECT frees the connection slot, through the handler.
+    ///
+    /// The test above proves the mechanism - dropping a guard returns the slot. It does
+    /// not prove the WIRING: that the guard is moved into the response stream, so the
+    /// slot is released when an HTTP client goes away rather than when the stream
+    /// reaches its deadline.
+    ///
+    /// That is the production shape, and it is the one that matters. EventSource
+    /// reconnects in a loop, so a guard that outlived a disconnect would exhaust the
+    /// account budget within five attempts and leave the customer locked out of its own
+    /// stream for the lifetime of the process, with every test in the suite green
+    /// because they all acquire the slot directly.
+    ///
+    /// One connection is allowed, so the sequence is unambiguous: the first stream takes
+    /// it, the second is refused, dropping the first gives it back, and the third is
+    /// accepted. No stream is ever read, so nothing here can pass on the deadline.
+    #[tokio::test]
+    async fn a_client_disconnect_returns_the_connection_slot() {
+        let db = TestDb::new().await;
+        let config = RealtimeConfig {
+            replay_buffer_events: 8,
+            max_connections_per_account: 1,
+            max_stream_seconds: 1800,
+        };
+        let state = state_for(db.pool.clone(), &config);
+        let account = test_support::account_with_wallet(&db.pool).await;
+        let headers = cookie_for(&db.pool, account).await;
+
+        let first = sse_events_handler(State(state.clone()), headers.clone())
+            .await
+            .expect("the first stream takes the only slot");
+
+        let refused = sse_events_handler(State(state.clone()), headers.clone()).await;
+        assert!(
+            refused.is_err(),
+            "with one slot taken the second stream must be refused while it is open"
+        );
+
+        // The client goes away. Nothing is read, so no deadline can have fired and no
+        // event needed to arrive - the slot is released purely by the response being
+        // dropped.
+        drop(first);
+
+        let third = sse_events_handler(State(state.clone()), headers).await;
+        assert!(
+            third.is_ok(),
+            "the slot was not returned when the client disconnected, so an EventSource that reconnects in a loop would exhaust the budget and lock the account out of its own stream"
+        );
+
+        db.close().await;
+    }
     #[test]
     fn connection_cap_is_enforced_and_released_on_drop() {
         let hub = Arc::new(RealtimeHub::new(&hub_config(10, 2)));
