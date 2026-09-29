@@ -117,6 +117,36 @@ green: `routes/mod.rs` pinned the idle bound by calling the resolver
 *directly*, so it passed whatever the handlers did. The test that matters is the
 one at the **handler**, driving the route a request actually takes.
 
+**Guards written for this class found a live instance of it on the first run — twice.**
+Closing the mount/spec chain found the api-spec test that checked its routes were
+unmounted and had never opened the spec. Reading the error status table found a
+documented-and-served code missing from the hand copy. Neither was hypothetical.
+
+That is worth weighing when deciding what to close next: the chains that had gone
+unverified for the longest are the ones most likely to have drifted quietly, and
+"no test covers it" is not evidence that there is nothing to find.
+
+### A hand-kept copy is not always the same bug
+
+The guards above all read the file they describe rather than keeping a copy. That
+rule is right for a **definition** and wrong for a **fixture**, and the difference
+is worth stating before someone "fixes" the wrong one.
+
+- A copy that **claims to BE the published contract** must be read from it. The
+  `DOCUMENTED` table in `error.rs` said any drift would fail a test; it was true
+  of the code half and false of the document half, and the document had fifteen
+  rows to the copy's fourteen. That was a real defect.
+- A copy used as a **fixture** is a tripwire, and reading it from the file would
+  destroy it. `money.rs` transcribes the shipped rates as literals *on purpose*:
+  a config edit that silently changes what a customer is billed should **break a
+  test**, not quietly rewrite the expected value. Pin those constants to the
+  config and the pricing tests become tautological - they would assert whatever
+  the config says, which is the thing that is supposed to be under test.
+
+So the question is not "is this a copy" but **"what happens if the other file
+changes"**. For a definition, a copy that drifts is a lie. For a fixture, a copy
+that follows is a test that has stopped testing.
+
 ## The vacuity guard, applied everywhere
 
 A check that silently matches nothing passes over an empty set and reports a
