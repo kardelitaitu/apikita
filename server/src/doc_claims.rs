@@ -679,6 +679,101 @@ mod tests {
             "no unread key was checked, so this passes over every key"
         );
     }
+
+    /// Every retention WINDOW the documents promise is a window the nightly sweep
+    /// deletes by, and the sweep deletes nothing the documents have not promised.
+    ///
+    /// This is the guard whose absence let a promise sit in a document for months
+    /// with no code behind it. data-retention.md has said 7 days for
+    /// link_redemption_attempts since before the sweep existed; nothing deleted a
+    /// single row, and no test compared the two lists, because each was individually
+    /// plausible. The two documents agreed with each other and neither agreed with the
+    /// shell script.
+    ///
+    /// Both directions are asserted, because each has failed here. The forward one
+    /// catches a promise with no enforcement; the reverse catches a delete nobody
+    /// promised, which is a different kind of surprise - a table emptied on a schedule
+    /// nobody agreed to. A blank count is not a zero count, and an unlisted table is not
+    /// a harmless one.
+    ///
+    /// The windows live in the SWEEP and the promises in the DOCUMENTS, so the sweep is
+    /// the definition and the map below is the transcription - the same arrangement as
+    /// the reconciliation query, and for the same reason: a transcription is only safe if
+    /// it is checked, which is what the two loops are.
+    #[test]
+    fn every_promised_retention_window_is_a_window_the_sweep_deletes() {
+        const SWEEP: &[(&str, u32)] = &[
+            ("key_ip_seen", 7),
+            ("key_ip_daily", 90),
+            ("usage_daily", 730),
+            ("usage_events", 90),
+            ("sessions", 30),
+            ("link_redemption_attempts", 7),
+        ];
+
+        // Which document states each window. Not the same file throughout, which is
+        // part of why this went unnoticed: the promise and the code were never in one
+        // place to be compared.
+        let sources = [
+            read_repo_file("docs/data-retention.md"),
+            read_repo_file("docs/ip-tracking.md"),
+        ];
+        let published = sources.join("\n");
+
+        for (table, days) in SWEEP {
+            // The table must be named somewhere in the published documents, and the
+            // window must be one of the two renderings a document uses: N days, or
+            // N months where 730 stands for 24.
+            assert!(
+                published.contains(table),
+                "the nightly sweep deletes `{table}` after {days} days, but neither data-retention.md nor ip-tracking.md mentions it. A table emptied on a schedule nobody agreed to is not harmless - say what it is and when."
+            );
+            let stated_days = format!("{days} days");
+            let stated_months = if *days == 730 {
+                "24 months".to_string()
+            } else {
+                String::new()
+            };
+            assert!(
+                published.contains(&stated_days) || (!stated_months.is_empty() && published.contains(&stated_months)),
+                "the sweep deletes `{table}` after {days} days, but no document states {days} days for it (nor 24 months for the 730 case). A window nobody was told about is not a promise."
+            );
+        }
+
+        // THE REVERSE. Every retention_delete against a table that is not in the list
+        // above is a delete this check has not agreed to.
+        let entrypoint = read_repo_file(".docker/maintenance/entrypoint.sh");
+        let mut swept: Vec<String> = Vec::new();
+        for line in entrypoint.lines() {
+            if !line.contains("retention_delete") {
+                continue;
+            }
+            let Some(rest) = line.split("$DB_FILE").nth(1) else {
+                continue;
+            };
+            let name = rest
+                .split_whitespace()
+                .find(|t| !t.is_empty() && !t.contains('"'))
+                .unwrap_or_default();
+            if !name.is_empty() {
+                swept.push(name.to_string());
+            }
+        }
+
+        // The vacuity guard: a parse that found nothing would agree with anything.
+        assert!(
+            swept.len() >= 6,
+            "only {} retention deletes were parsed from the entrypoint",
+            swept.len()
+        );
+
+        for table in &swept {
+            assert!(
+                SWEEP.iter().any(|(t, _)| t == table),
+                "the entrypoint deletes `{table}` but no window in this test claims to. Either the promise is missing from the documents, or this list is out of date - both are worth knowing, and neither may be resolved by silently editing the list."
+            );
+        }
+    }
     /// Every table the schema creates is either DISCLOSED on the privacy page or
     /// recorded here as deliberately unused.
     ///
