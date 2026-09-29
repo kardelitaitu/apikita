@@ -669,7 +669,13 @@ billing_basis = "peak"
 cache_read_offpeak = 200.76     # ¥0.075
 cache_read_peak    = 401.52     # ¥0.15
 input_offpeak      = 6022.76    # ¥2.25
-input_peak         = 12045.50   # ¥4.50
+# 4.50 x 2676.78 = 12045.51; this read 12045.50, a cent low, and it was the ONLY cell of 36 in
+# the price card that was not exact against its own CNY comment - measured across all six
+# models at both bases. It is displayed on /models as a coming-soon price, and the website's
+# 18,068 is unchanged either way (12045.50 x 1.5 and 12045.51 x 1.5 both round to it), so
+# this was invisible until something asked whether each rate is the conversion of the CNY
+# printed beside it.
+input_peak         = 12045.51   # ¥4.50
 output_offpeak     = 18068.27   # ¥6.75
 output_peak        = 36136.53   # ¥13.50
 
