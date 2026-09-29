@@ -1,8 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub pricing: PricingConfig,
     pub wallet: WalletConfig,
@@ -16,7 +16,7 @@ pub struct AppConfig {
     pub models: Vec<ModelConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetworkConfig {
     /// CIDRs of reverse proxies allowed to speak for the caller.
     ///
@@ -27,12 +27,12 @@ pub struct NetworkConfig {
     pub trusted_proxy_cidrs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PricingConfig {
     pub currency: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WalletConfig {
     pub min_topup: u64,
     pub min_first_deposit: u64,
@@ -43,13 +43,13 @@ pub struct WalletConfig {
     pub low_balance_max_per_day: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SessionsConfig {
     pub absolute_days: u32,
     pub idle_days: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LimitsConfig {
     pub topup_per_hour: u32,
     pub wallet_mutations_per_minute: u32,
@@ -102,14 +102,14 @@ fn default_link_redemption_per_hour() -> u32 {
     20
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealtimeConfig {
     pub replay_buffer_events: usize,
     pub max_connections_per_account: usize,
     pub max_stream_seconds: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KeyPoolConfig {
     pub rate_limit_status: Vec<u16>,
     pub key_cooldown_seconds: u64,
@@ -117,7 +117,7 @@ pub struct KeyPoolConfig {
     pub on_pool_exhausted: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     pub cooldown_seconds: u64,
@@ -128,14 +128,14 @@ pub struct CircuitBreakerConfig {
     pub health_check_failures: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamingConfig {
     pub mid_stream_cutoff: bool,
     pub hard_max_output_tokens: u64,
     pub max_context_tokens: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
     pub name: String,
     pub description: String,
@@ -150,7 +150,7 @@ pub struct ModelConfig {
     pub endpoints: Vec<ModelEndpoint>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelRates {
     pub cache_read_offpeak: f64,
     pub cache_read_peak: f64,
@@ -160,7 +160,7 @@ pub struct ModelRates {
     pub output_peak: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelEndpoint {
     pub name: String,
     pub url: String,
@@ -261,6 +261,25 @@ impl AppConfig {
             .map_err(|err| format!("network.trusted_proxy_cidrs: {err}"))?;
         validate_trusted_proxy_width(&self.network.trusted_proxy_cidrs)?;
 
+        // The LAST f64 in this config, and the one that was already defended at its
+        // use site: next_cooldown in upstream/circuit_breaker.rs checks
+        // is_finite() and falls back to 1.0. That fallback is safe but SILENT - a
+        // breaker whose backoff never grows is a breaker that retries a failing
+        // provider at full rate, and nothing anywhere says the operator's
+        // multiplier was ignored. Every other f64 here is now refused at load, so
+        // refusing this one too is what makes the rule a rule rather than a habit.
+        //
+        // A multiplier of 1.0 or less is legal and documented as "disables the
+        // backoff", so only finiteness is refused - the positivity case stays with
+        // the circuit breaker, which is where that semantic already lives.
+        if !self.circuit_breaker.cooldown_multiplier.is_finite() {
+            return Err(format!(
+                "circuit_breaker.cooldown_multiplier is not a finite number: {}",
+                self.circuit_breaker.cooldown_multiplier
+            )
+            .into());
+        }
+
         if self.models.is_empty() {
             return Err("At least one model must be configured in models".into());
         }
@@ -271,22 +290,32 @@ impl AppConfig {
             // than nothing, and equal to nothing - which means every "<= 0" guard
             // below waves a NaN straight through, and inf sails past them too.
             //
-            // TOML accepts "nan", "+inf" and "-inf" as float literals, so this is
-            // a config a human can actually write or a tool can emit, not a value
-            // only Rust can construct. The damage is not hypothetical and not
-            // symmetric:
+            // WHAT THIS IS AND IS NOT, measured rather than assumed. TOML does accept
+            // "nan", "+inf" and "-inf" as float literals, so the VALUE is writable.
+            // But the toml crate's deserializer refuses a non-finite float when it
+            // reaches a struct field - "invalid type: floating point NaN, expected
+            // struct CircuitBreakerConfig" - and load_from_file goes through exactly
+            // that. So a config FILE cannot carry one into AppConfig today, and this
+            // check is the SECOND line of defence, not the only one. It is here
+            // because that first line is somebody else's implementation detail: a
+            // loader change, a new source (env, a control plane), or a hand-built
+            // config in a binary would all walk straight past it, and then nothing
+            // else in the process would notice.
+            //
+            // Why it would matter, if it ever did get through:
             //
             //   * NaN reaches calculate_token_cost_idr, whose final "as i64" cast
-            //     maps NaN to ZERO. A model priced nan therefore bills every
-            //     request at 0 IDR - no error, no refusal, a ledger that balances
-            //     exactly, and revenue that is silently zero. Reconcile cannot see
-            //     it, because the ledger faithfully records the zero it was given.
-            //   * inf saturates to i64::MAX, so the reservation exceeds any wallet
-            //     and every request is refused. Loud, and still a dead service.
+            //     maps NaN to ZERO. A model priced nan would bill every request at
+            //     0 IDR - no error, no refusal, a ledger that balances exactly, and
+            //     revenue that is silently zero. Reconcile cannot see it, because
+            //     the ledger faithfully records the zero it was given.
+            //   * inf saturates to i64::MAX, so the reservation would exceed any
+            //     wallet and every request would be refused. Loud, and still a
+            //     dead service.
             //
             // Neither is a price a customer can be charged from, so the rule is
-            // FINITENESS and not positivity, and it is checked before the "<= 0"
-            // rules so the message names the real problem.
+            // FINITENESS and not positivity, and it runs before the "<= 0" rules
+            // so the message names the real problem.
             if !model.price.is_finite() {
                 return Err(format!(
                     "Model {} has a price multiplier that is not a finite number",
@@ -599,22 +628,34 @@ mod tests {
     }
 
     /// A NaN or infinite price is NOT caught by the "<= 0" guard, and it is not a
-    /// cosmetic one: TOML accepts "nan" and "inf" as float literals, so a config
-    /// carrying one parses, and NaN <= 0.0 is FALSE in IEEE 754 - the value
-    /// compares greater than nothing, including itself, so every "<= 0" test in
-    /// validate() waves it straight through.
+    /// cosmetic one: NaN <= 0.0 is FALSE in IEEE 754 - the value compares greater
+    /// than nothing, including itself, so every "<= 0" test in validate() waves it
+    /// straight through, and inf sails past them too.
     ///
-    /// What a NaN then does to money is the part that matters. The pricing function
-    /// ends in "total_customer.ceil() as i64", and a Rust "as" cast maps NaN to ZERO.
-    /// So a model priced nan bills every request at 0 IDR: no error, no refusal,
-    /// a ledger that balances perfectly, and a revenue line that is silently zero.
+    /// HONEST SCOPE, because the first version of this test implied more than is
+    /// true. TOML accepts "nan" and "inf" as float literals and a toml::Table really
+    /// does hold the non-finite value. But the toml crate then REFUSES to
+    /// deserialise one into a struct field, which is the path load_from_file uses,
+    /// so a config file cannot deliver a NaN price to validate() today. Measured on
+    /// all three routes:
+    ///
+    ///     toml::from_str -> toml::Table        ACCEPTED
+    ///     toml::from_str -> CircuitBreakerCfg refused
+    ///     toml::Value::try_into                refused
+    ///
+    /// So this is defence in depth against a future loader, not a fix for a live
+    /// billing outage, and the commit that added it said otherwise. The value is
+    /// still worth refusing: the first line of defence is a dependency behaviour
+    /// nobody here controls, and a hand-built or env-sourced config would not go
+    /// through it at all.
+    ///
+    /// Why it would matter if it ever got through. The pricing function ends in
+    /// "total_customer.ceil() as i64", and a Rust "as" cast maps NaN to ZERO, so a
+    /// model priced nan would bill every request at 0 IDR - no error, no refusal,
+    /// a ledger that balances perfectly, and revenue that is silently zero.
     /// Reconcile cannot see it, because the ledger faithfully records the zero.
-    /// That is the worst shape a billing bug can take - invisible to every gate
-    /// this repository owns.
-    ///
-    /// An inf is loud rather than silent: "inf as i64" saturates to i64::MAX, so
-    /// the reservation is larger than any wallet and every request is refused. Still
-    /// a refusal to serve, and still a config no operator wrote on purpose.
+    /// An inf is loud rather than silent: it saturates to i64::MAX, so the
+    /// reservation exceeds any wallet and every request is refused.
     ///
     /// So the guard is FINITENESS, not positivity: a price that is not a number a
     /// customer can be charged from is not a price, whatever it compares against.
@@ -780,6 +821,163 @@ mod tests {
             config.validate().unwrap_or_else(|e| {
                 panic!("a weight of {ok} is a legal way to park an endpoint: {e}")
             });
+        }
+    }
+
+    /// The sweep, closed: every f64 this config can hold is now refused when it is
+    /// not finite. There were five groups - the model price, the six rate fields,
+    /// the two endpoint rate overrides, the endpoint weight, and the circuit
+    /// breaker multiplier - and each has a test naming what it costs to skip it.
+    ///
+    /// This one was already defended where it is used, so the test also pins that
+    /// the two defences agree: refusing a bad multiplier at load is only correct
+    /// if the fallback it replaces was reachable, and 1.0 remains legal because the
+    /// breaker documents it as "disables the backoff".
+    #[test]
+    fn a_non_finite_circuit_breaker_multiplier_is_refused_but_one_is_legal() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            config.circuit_breaker.cooldown_multiplier = bad;
+            let err = config
+                .validate()
+                .expect_err("a non-finite cooldown multiplier must be refused")
+                .to_string();
+            assert!(
+                err.contains("not a finite number"),
+                "a multiplier of {bad} must be named as non-finite, got {err}"
+            );
+        }
+
+        for ok in [1.0, 2.0, 0.5] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            config.circuit_breaker.cooldown_multiplier = ok;
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("a multiplier of {ok} is a documented value: {e}"));
+        }
+    }
+    /// THE INVENTORY, so the finiteness guard cannot quietly stop covering a field.
+    ///
+    /// The per-field tests above each pin one group of f64s, and between them they
+    /// cover every float this config holds TODAY. What they cannot do is notice the
+    /// NEXT one: add a `f64` to a config struct, wire it to something that
+    /// multiplies, and the suite stays green. A guard written only as a list of the
+    /// things it currently catches is a guard that decays.
+    ///
+    /// So this walks the config for real - serialise it to TOML, descend every table
+    /// and array, collect the path of every float leaf - and requires that set to
+    /// match, exactly, the list of floats the finiteness rule has been taught about.
+    /// Add a float anywhere and this fails naming the new path, which is the prompt
+    /// to decide whether it needs a rule too. The config types derive Serialize for
+    /// exactly this reason.
+    ///
+    /// WHY IT COMPARES INVENTORY AND NOT BEHAVIOUR. The obvious version of this test
+    /// poisons each float with NaN and requires validate() to refuse it, and that is
+    /// what it was written as first. It cannot work, and the reason is worth
+    /// keeping: poisoning has to travel through TOML, and the toml crate REFUSES to
+    /// deserialise a non-finite float into a struct field. The test failed on its
+    /// first float with "invalid type: floating point NaN, expected struct
+    /// CircuitBreakerConfig" - the same fact that limits the guard itself, and a
+    /// reminder that a reflection test can fail for a reason that has nothing to do
+    /// with what it is checking.
+    ///
+    /// Array indices collapse to "*", so the list describes the SHAPE of the config
+    /// rather than the shipped file: adding a seventh model, or removing one, must
+    /// not require editing it. The optional endpoint overrides are given values
+    /// first, because a None override does not serialise and would otherwise make
+    /// the shape depend on the shipped file.
+    #[test]
+    fn every_float_in_the_config_is_one_the_finiteness_rule_accounts_for() {
+        let mut config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        // Every override on every endpoint, so the shape is the struct's rather
+        // than the shipped file's.
+        for model in &mut config.models {
+            for endpoint in &mut model.endpoints {
+                endpoint.input_peak = Some(1.0);
+                endpoint.output_peak = Some(1.0);
+            }
+        }
+
+        let doc = toml::Value::try_from(&config).expect("the config must serialise to TOML");
+        let mut found = Vec::new();
+        collect_float_paths(&doc, &mut Vec::new(), &mut found);
+        let shape: std::collections::BTreeSet<String> =
+            found.iter().map(|p| collapse_indices(p)).collect();
+
+        let expected: std::collections::BTreeSet<String> = [
+            "circuit_breaker.cooldown_multiplier",
+            "models.*.endpoints.*.input_peak",
+            "models.*.endpoints.*.output_peak",
+            "models.*.endpoints.*.weight",
+            "models.*.price",
+            "models.*.rates.cache_read_offpeak",
+            "models.*.rates.cache_read_peak",
+            "models.*.rates.input_offpeak",
+            "models.*.rates.input_peak",
+            "models.*.rates.output_offpeak",
+            "models.*.rates.output_peak",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // BOTH directions, so a float that stopped existing is caught as surely as
+        // one that appeared. Either way this list is where the decision is recorded:
+        // does this field need a finiteness rule, and does it need a test?
+        let added: Vec<_> = shape.difference(&expected).collect();
+        let removed: Vec<_> = expected.difference(&shape).collect();
+        assert!(
+            added.is_empty() && removed.is_empty(),
+            "the config holds floats the finiteness rule does not account for. NEW (decide whether each needs a rule and a test): {added:?}. GONE (a field was removed or renamed - drop it from the list): {removed:?}"
+        );
+
+        // The vacuity guard on the walk itself. If it stopped descending, the
+        // comparison above would pass on an empty set and the test would be theatre.
+        assert_eq!(
+            shape.len(),
+            expected.len(),
+            "the walk and the list disagree in size, so the comparison above is not a real check"
+        );
+    }
+
+    /// Replaces an array index with "*", so models.0 and models.7 share a shape.
+    fn collapse_indices(path: &str) -> String {
+        path.split('.')
+            .map(|segment| match segment.parse::<usize>() {
+                Ok(_) => "*".to_string(),
+                Err(_) => segment.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// Every path through a TOML document whose leaf is a float, joined with a dot.
+    /// Array elements are indexed numerically, so a config with a table of floats
+    /// still yields one path per element rather than a single ambiguous one.
+    fn collect_float_paths(node: &toml::Value, prefix: &mut Vec<String>, out: &mut Vec<String>) {
+        match node {
+            toml::Value::Table(table) => {
+                for (key, value) in table {
+                    prefix.push(key.clone());
+                    collect_float_paths(value, prefix, out);
+                    prefix.pop();
+                }
+            }
+            toml::Value::Array(items) => {
+                for (index, value) in items.iter().enumerate() {
+                    prefix.push(index.to_string());
+                    collect_float_paths(value, prefix, out);
+                    prefix.pop();
+                }
+            }
+            toml::Value::Float(_) => out.push(prefix.join(".")),
+            _ => {}
         }
     }
     /// A model whose peak rates are absent reserves nothing and can never bill
