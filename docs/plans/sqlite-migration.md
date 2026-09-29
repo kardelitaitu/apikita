@@ -1,6 +1,7 @@
 # Plan: Retire PocketBase and PostgreSQL for Embedded SQLite
 
-**Status:** draft for review · **Date:** 2026-09-25 · **Branch:** `0.0.1`
+**Status:** COMPLETE - PocketBase and PostgreSQL are both gone; this is the historical plan
+**Date:** 2026-09-25 (written) · **Branch at writing:** `0.0.1` · shipped and on `0.0.2`
 **Supersedes:** the untitled "Remove PocketBase and Migrate to Embedded SQLite + Custom Admin UI" draft
 **Amends:** [`decisions.md`](../decisions.md) — see [§3](#3-decisions-this-forces-the-register-to-change)
 **Companion:** [`proxy-hot-path-audit.md`](proxy-hot-path-audit.md) — the request path; this plan is the storage path

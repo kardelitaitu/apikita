@@ -1,6 +1,8 @@
 # Proxy Hot-Path Audit — the "SOTA blueprint" against the implementation
 
-**Status:** analysis, for review · **Date:** 2026-09-25 · **Actions re-verified 2026-09-29: 7 of 9 done, 2 open — see [§8](#8-actions)** · **Branch:** `0.0.1`
+**Status:** COMPLETE - the port shipped; this is the historical plan, not an open question
+**Date:** 2026-09-25 (written) · **Branch at writing:** `0.0.1` · shipped and on `0.0.2`
+**Actions re-verified 2026-09-29**
 **Companion to:** [`sqlite-migration.md`](sqlite-migration.md) — that plan covers the
 *storage* port; this covers the *request* path.
 **Input:** an external "SOTA Rust proxy blueprint" and a `rusqlite` vs `sqlx` analysis.
