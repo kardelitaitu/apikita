@@ -21,10 +21,19 @@
 // **NOTHING ENFORCES THIS, and the config header is explicit that it will move.**
 // `config/apikita.toml` warns at the top that we collect IDR and pay CNY, so an FX move
 // changes our cost with no change in the upstream price list - which is the exact moment
-// these six figures go stale, and they are what a customer reads before buying. A guard
-// that parsed the config from here would contradict the no-TOML-dependency decision
-// above, so the mitigation is the arithmetic being written down: checkable by eye, and
-// wrong in a way a reader can see in the same ten seconds.
+// these six figures go stale, and they are what a customer reads before buying.
+//
+// The website deliberately does not check it, and that is TWO independent decisions
+// rather than one gap. This file adds no TOML dependency, so the config is not read from
+// here; and `tests/landing-claims.test.ts` reads the pages as TEXT on purpose, stating
+// that its guard is about what the file SAYS rather than a value it computes. A guard
+// here would have to contradict one of those, so the mitigation is the arithmetic above:
+// checkable by eye, and wrong in a way a reader can see in the same ten seconds.
+//
+// Worth naming for what it is, though: the side that CAN check computed values - the
+// Rust test suite, which reads config/apikita.toml freely - does not cover the website
+// transcription, because the transcription is not a value it can see. That boundary is
+// the honest limit of the design, not an oversight in it.
 
 // The three token classes, in the order every price array below is aligned to.
 export const rateClasses = ['Input', 'Cache hit', 'Output'];
