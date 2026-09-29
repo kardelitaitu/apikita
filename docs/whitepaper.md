@@ -70,5 +70,8 @@ phases were kept; the mechanisms it named for them were replaced. See
 
 *Retired 2026-09-28. The original 205-line document is in git history
 (`git log -- docs/whitepaper.md`), and is not to be restored: see
-[`website/tests/retired-docs.test.ts`](../website/tests/retired-docs.test.ts),
-which fails if a live document starts quoting its superseded figures again.*
+[`website/tests/retired-whitepaper.test.ts`](../website/tests/retired-whitepaper.test.ts),
+which fails if a live document starts quoting its superseded figures again. Both the link text
+and the target used to say `retired-docs.test.ts`, which is not a file that has ever
+existed here; the test was named for this document when it was written, and a sweep of
+440 relative links across the documentation is what found it.*
