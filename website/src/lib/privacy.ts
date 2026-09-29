@@ -56,7 +56,7 @@ export const stored = [
   // the privacy page had been corrected into silence. It had not; it had been corrected
   // into omission.
   { what: 'Salted IP hash of API-key traffic (per key, per day)', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, not anonymous — HMAC-SHA256 of the address under a salt replaced at each UTC midnight, so the same visitor is not linkable across days. Held 7 days per seen-address and 90 per day total' },
-  { what: 'Salted IP hash of failed link-code attempts', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, same salt scheme. **These are not deleted at the 7 days docs/data-retention.md promises — the nightly sweep does not cover this table**, and a credential-guessing attempt writes one hash per attempt. If we ship a sweep, this row and that table change together' },
+  { what: 'Salted IP hash of failed link-code attempts', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, same salt scheme, held 7 days and swept nightly. A credential-guessing attempt writes one hash per attempt, and the window is the limit on how long a breached salt would link them' },
   { what: 'Telegram link codes, and operator audit rows', where: 'Embedded SQLite (the database file)', sensitivity: 'A link code is deleted once used or 24h after expiry; an operator audit row records which operator did what to which account' },
 ];
 

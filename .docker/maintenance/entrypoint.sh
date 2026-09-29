@@ -285,15 +285,29 @@ run_retention() {
         return 1
     }
 
-    # A blank count is not a zero count: `SELECT changes()` always returns a row, so
+    # link_redemption_attempts: the salted IP hashes written when someone guesses at a
+# Telegram link code. docs/data-retention.md has promised 7 days for this table since
+# before the sweep existed, and nothing deleted a single row - the promise was kept in
+# the document and not in the code, which is the worst of both. Same helper, same
+# instant form as usage_events, because attempted_at carries the same RFC3339 +00:00.
+#
+# Deleting rows here is safe for the limiter itself: it counts attempts over a window
+# measured in MINUTES, and a seven-day-old row was never going to be inside one.
+link_attempts=$(retention_delete_instant "$DB_FILE" link_redemption_attempts attempted_at 7) || {
+  log "job retention: FAILED - the link_redemption_attempts delete did not run (sqlite3 error above)"
+  return 1
+}
+
+# A blank count is not a zero count: `SELECT changes()` always returns a row, so
     # anything non-numeric means the delete did not do what this job claims.
     case "$seen" in ''|*[!0-9]*) log "job retention: FAILED - key_ip_seen returned '$seen', not a count"; return 1 ;; esac
     case "$daily" in ''|*[!0-9]*) log "job retention: FAILED - key_ip_daily returned '$daily', not a count"; return 1 ;; esac
     case "$usage_daily" in ''|*[!0-9]*) log "job retention: FAILED - usage_daily returned '$usage_daily', not a count"; return 1 ;; esac
     case "$usage_events" in ''|*[!0-9]*) log "job retention: FAILED - usage_events returned '$usage_events', not a count"; return 1 ;; esac
-    case "$sessions" in ''|*[!0-9]*) log "job retention: FAILED - sessions returned '$sessions', not a count"; return 1 ;; esac
+    case "$link_attempts" in ''|*[!0-9]*) log "job retention: FAILED - link_redemption_attempts returned '$link_attempts', not a number: the delete did not do what this job claims"; return 1 ;; esac
+case "$sessions" in ''|*[!0-9]*) log "job retention: FAILED - sessions returned '$sessions', not a count"; return 1 ;; esac
 
-    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d)"
+    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d), link_redemption_attempts=$link_attempts (7d)"
     return 0
 }
 
