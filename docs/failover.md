@@ -166,6 +166,31 @@ serves the request.** Upstream cost differs per provider, so the reservation use
 the **most expensive** endpoint in the pool — otherwise a failover to a dearer
 provider can overdraw the balance.
 
+**…but the most expensive endpoint is a floor, not a ceiling.** Settlement does not
+bill the endpoint's rates: it always charges the **model's** rates (the
+`calculate_token_cost_idr` call in the settlement path passes `model_cfg.rates.*` and
+never an endpoint's), because once the answer has been streamed the customer pays the
+product price, not the reseller's. So the hold must cover the model-rate charge as
+well as the dearest endpoint's. Taking the max over endpoints alone let an endpoint
+that overrides *downward* — a cheaper reseller, which is the ordinary reason to add a
+per-endpoint rate at all — pull the hold **below** the charge and strand money. The
+rule is therefore:
+
+    hold = max( model-rate charge , dearest-endpoint charge )
+
+`worst_case_reservation_idr` states it as a fold seeded with the model rate, so the
+product price is the floor and an endpoint can only raise it. A config with no
+overrides ties with the model, so the rule is behaviour-preserving for everything
+that ships today.
+
+**The cache-read rate must be a real discount, for the same reason.** The hold
+prices the whole prompt at the input rate, because at reservation time no one knows
+which prompt tokens the upstream will report as cache hits; settlement splits them
+and charges the cache subset at `cache_read_peak`. The hold is a ceiling over
+settlement only while `cache_read_peak <= input_peak`, and the validator now
+enforces that per rate class — a cache-read rate above its input rate inverts the
+ceiling and strands the hold.
+
 ## Health and observability
 
 | Signal | Metric |
