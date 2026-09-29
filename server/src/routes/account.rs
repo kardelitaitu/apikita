@@ -933,6 +933,53 @@ pub async fn create_topup(
     // `rail` is named explicitly and is `'midtrans'` because Midtrans QRIS is the
     // only rail implemented. The column is NOT NULL with no default precisely so
     // that a future second rail cannot inherit this literal by omission.
+    //
+    // THE CAP IS RE-CHECKED HERE, INSIDE THIS TRANSACTION, and that is the fix.
+    //
+    // The check at the top of this handler is a COUNT on the pool, and this INSERT
+    // is the row it governs - with a Midtrans Snap call and a PocketBase lookup in
+    // between. So concurrent callers all read the same count, all saw room, and all
+    // created a top-up; abuse.rs measures that at fourteen rows against a cap of
+    // five.
+    //
+    // The obvious fix - one transaction from the first check to the INSERT - is NOT
+    // available, and deliberately not attempted: it would hold a SQLite WRITE LOCK
+    // across a network round trip to a payment provider, and every other top-up in
+    // the process would serialise behind it.
+    //
+    // So the cap is checked TWICE, and the two checks have different jobs. The early
+    // one is a cheap gate that refuses an over-cap account BEFORE a Snap session is
+    // created - which is the whole reason it is first. This one is authoritative
+    // and atomic, because there is nothing between it and the INSERT but this
+    // comment: SQLite serialises writers, so a second caller either sees the first
+    // caller's row or is still waiting for the lock.
+    //
+    // WHAT THAT COSTS, stated rather than glossed: a caller that passes the early
+    // check and then loses this one has already created a Snap transaction with no
+    // matching row, so its payment would be orphaned. That is the same state a Snap
+    // call that succeeded and whose INSERT then failed already produces, and the
+    // window for it is a burst by an account already at its cap - the case the
+    // early gate exists to stop in the first place. Trading an unbounded abuse
+    // window for that is the right way round, but it is a trade and not a free win.
+    //
+    // ONE instant for both the cap boundary and the row's created_at, read inside
+    // the transaction rather than beside it. They must agree: a row stamped slightly
+    // after the check that admitted it could in principle fall on the far side of a
+    // window edge, and then the count that refused the next caller and the row that
+    // was admitted would disagree about what "in the window" means.
+    let now = Utc::now();
+    let mut tx = crate::db::begin_immediate(&state.pool).await?;
+
+    crate::abuse::enforce_creation_cap_in(
+        &mut tx,
+        "topups",
+        crate::abuse::topup_window(),
+        state.config.limits.topup_per_hour,
+        account_id,
+        now,
+    )
+    .await?;
+
     sqlx::query(
         "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, rail, created_at) VALUES (?, ?, ?, ?, 'pending', ?, 'midtrans', ?)",
     )
@@ -941,9 +988,11 @@ pub async fn create_topup(
     .bind(payload.amount_idr)
     .bind(&order_id)
     .bind(&snap_token)
-    .bind(Utc::now())
-    .execute(&state.pool)
+    .bind(now)
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     info!(
         topup_id = %topup_id,
