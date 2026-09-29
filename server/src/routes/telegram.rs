@@ -253,23 +253,48 @@ pub async fn issue_link_code(
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = crate::routes::resolve_account_from_cookie(&state.pool, &headers).await?;
 
-    // Abuse guard: how many codes this ACCOUNT has issued this hour. Note this is
-    // the account cap, not the guessing cap - it bounds codes in flight, and the
-    // per-IP redemption cap is what stops the brute force.
-    abuse::enforce_creation_cap(
-        &state.pool,
-        "link_codes",
-        link_code_window(),
-        state.config.limits.link_code_issuance_per_hour,
-        account_id,
-        Utc::now(),
-    )
-    .await?;
-
     let now = Utc::now();
     let expires_at = now + Duration::minutes(LINK_CODE_TTL_MINUTES);
 
     let mut tx = crate::db::begin_immediate(&state.pool).await?;
+
+    // Abuse guard: how many codes this ACCOUNT has issued this hour. Note this is
+    // the account cap, not the guessing cap - it bounds codes in flight, and
+    // the per-IP redemption cap is what stops the brute force.
+    //
+    // INSIDE THE TRANSACTION, which is NECESSARY BUT NOT SUFFICIENT here - and the
+    // second half of that sentence is the more important half.
+    //
+    // Necessary: this was a COUNT on the pool with the INSERT it governs inside a
+    // separate transaction, so concurrent callers would each read the same count.
+    // The transaction was already open for the DELETE below, so the COUNT joins it
+    // for free.
+    //
+    // NOT SUFFICIENT, and writing it up as a fix would be a false claim. This cap
+    // CANNOT FIRE AT ALL. It counts rows in link_codes for the account - and the
+    // DELETE immediately below removes every one of them before the INSERT, so the
+    // count is always 0 or 1. Against a cap of 10 the comparison is true forever.
+    // The guard is documented in docs/server/api-spec.md and docs/decisions.md as
+    // bounding how many codes an account may issue in an hour, and it bounds
+    // nothing. MEASURED by the test below: eighteen concurrent issues against a cap
+    // of ten produce eighteen successes and zero refusals.
+    //
+    // Nothing here makes the cap fire, and pretending otherwise is the easy
+    // mistake. Counting ISSUES rather than LIVE ROWS needs a record that survives
+    // the delete - a counter table, or superseding old rows instead of removing
+    // them - and superseding would break the one-live-code-per-account guarantee
+    // that doubles an attacker's chance per guess. So the fix is a schema and
+    // behaviour change, and this transaction move is the part that can be done now:
+    // correct, and necessary once the counting is.
+    abuse::enforce_creation_cap_in(
+        &mut tx,
+        "link_codes",
+        link_code_window(),
+        state.config.limits.link_code_issuance_per_hour,
+        account_id,
+        now,
+    )
+    .await?;
 
     // One live code per account. Deleting the predecessor inside the same
     // transaction as the insert means a crash cannot leave two live codes.
@@ -1047,6 +1072,100 @@ mod tests {
             "with no configured secret there is no way to tell the bot from an attacker, so this must fail CLOSED"
         );
         assert_eq!(linked_account(&db.pool, "5550008").await, None);
+        db.close().await;
+    }
+
+    /// THE ISSUANCE CAP NOW HOLDS UNDER CONCURRENCY.
+    ///
+    /// The cap was a COUNT on the pool with the INSERT it governs inside a separate
+    /// transaction, so concurrent callers all read the same number and all issued a
+    /// code. It is now inside that transaction, alongside the DELETE that keeps one
+    /// live code per account - so the count and the row it bounds commit together.
+    ///
+    /// THIS GUARD IS DEAD, and the test is how that is known.
+    ///
+    /// `link_code_issuance_per_hour` is documented in docs/server/api-spec.md and
+    /// docs/decisions.md as bounding how many link codes an ACCOUNT may issue in an
+    /// hour. It does not bound that, because it cannot fire: it counts rows in
+    /// `link_codes`, and `issue_link_code` DELETES every row for the account before
+    /// inserting the new one - so the count is always 0 or 1, and a cap of 10 is
+    /// never approached.
+    ///
+    /// The first version of this test asserted the opposite, and failed with "1 codes
+    /// issued for an account whose cap is 10 (18 answered 200, 0 refused)". The 1
+    /// was the giveaway rather than the problem: the DELETE means the table can only
+    /// ever hold one row for the account, so the row count CANNOT measure the cap
+    /// whatever the cap does. The number that measures it is how many requests were
+    /// ADMITTED, and every one of them was.
+    ///
+    /// So this is a characterisation test: it pins the defect rather than the
+    /// intent, and it fails the moment the cap starts working - at which point it
+    /// should be rewritten to assert the refusal instead. It is here because a
+    /// documented abuse guard that does nothing is invisible in every other way:
+    /// the config parses, the code path runs, and the tests are green.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_link_code_issuance_cap_cannot_fire_because_it_counts_rows_the_handler_deletes() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let state = state_for(db.pool.clone());
+        let session = session_for(&db.pool, account).await;
+
+        let limit = state.config.limits.link_code_issuance_per_hour;
+        assert!(limit > 0, "the fixture assumes a configured hourly cap");
+
+        let mut handles = Vec::new();
+        for _ in 0..(limit + 8) {
+            let state = state.clone();
+            let headers = cookie_headers(&session);
+            handles.push(tokio::spawn(async move {
+                issue_link_code(State(state), headers)
+                    .await
+                    .map(|response| response.into_response().status())
+            }));
+        }
+
+        let mut issued = 0usize;
+        let mut refused = 0usize;
+        for handle in handles {
+            match handle.await.expect("the issue task must not panic") {
+                Ok(status) => {
+                    assert_eq!(status, StatusCode::OK, "a permitted issue answers 200");
+                    issued += 1;
+                }
+                Err(AppError::RateLimited { .. }) => refused += 1,
+                Err(other) => panic!("unexpected error from a burst request: {other:?}"),
+            }
+        }
+
+        // The row count is the DELETEs visible, not the issues - which is the
+        // defect, restated in the form that made it visible.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_codes WHERE account_id = ?")
+            .bind(account.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count the surviving rows");
+
+        assert_eq!(
+            rows, 1,
+            "only one code may survive per account, whatever the cap does - and this \
+             is exactly why the cap cannot see how many were ISSUED"
+        );
+
+        let burst = limit as usize + 8;
+        assert_eq!(
+            issued, burst,
+            "{issued} of {burst} concurrent issues were admitted against a cap of \
+             {limit}, with {refused} refused. A cap that counts rows this handler \
+             deletes can never fire; if this assertion fails the cap has started \
+             working and this test should be rewritten to assert the refusal"
+        );
+        assert_eq!(
+            refused, 0,
+            "no request may be refused while the cap cannot fire; a refusal here \
+             would mean something else is limiting issuance, and the character above \
+             would be wrong"
+        );
+
         db.close().await;
     }
 
