@@ -1433,15 +1433,22 @@ mod tests {
         assert_eq!(v6_mask(64), u128::MAX << 64, "a /64 masks on the low half");
     }
 
-    /// The crossing fires AT the threshold and not before, not after, and not again.
+    /// The crossing PREDICATE fires at the threshold and not before, not after, not
+    /// again - and the name says predicate because this does not observe a log line.
     ///
-    /// The old test for this was named `recording_past_the_sharing_threshold_warns_once`
-    /// and never observed a warning - it counted distinct IPs and stopped. The name
-    /// promised a log assertion the body did not make, which is the same shape as a guard
-    /// named after a document it never opened, and it is why the `==` in the predicate was
-    /// never checked from either side.
+    /// It is named carefully on purpose. webhooks.rs has a `capture_logs` helper and two
+    /// tests that genuinely use it, so log observation IS available in this crate; a test
+    /// called `..._warns_once` that does not use it claims something it did not do, which
+    /// is exactly how the old test for this ended up pinning a count and calling it a
+    /// warning. This one is honest about being one step short: the predicate is checked
+    /// from both sides, and the `warn!` consuming it is a single call whose argument is
+    /// this boolean.
+    ///
+    /// The step it does not take is stated rather than hidden. Capturing THIS log would
+    /// mean moving `capture_logs` out of webhooks.rs into test_support, which is worth
+    /// doing when a second caller needs it rather than for one test.
     #[test]
-    fn the_sharing_warning_fires_at_the_crossing_and_nowhere_else() {
+    fn the_sharing_crossing_predicate_fires_at_the_threshold_and_nowhere_else() {
         // One below, and the threshold itself: quiet. A control that fires early is a
         // control an operator learns to ignore.
         assert!(

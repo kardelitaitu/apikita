@@ -1115,6 +1115,134 @@ mod tests {
              was deliberately written."
         );
     }
+    /// A test named after a LOG must use a log capture, or say it is not one.
+    ///
+    /// THE SEVENTH RESTATEMENT, and the first one at TEST level rather than guard level.
+    /// A test was called `recording_past_the_sharing_threshold_warns_once` and never
+    /// observed a warning: it counted distinct IPs and stopped. The name promised a log
+    /// assertion the body did not make, which is the same shape as a guard named after a
+    /// document it never opened. The difference is that this one is mechanically checkable,
+    /// because the crate already has `capture_logs` in webhooks.rs and two tests that use
+    /// it - so a test can observe a log here, and one that does not is saying so by
+    /// omission.
+    ///
+    /// The test that triggered this says `..._predicate_fires_at...` rather than
+    /// `..._warning_fires...` for exactly this reason, and says in its doc comment that
+    /// it stops one step short. That is the shape the rule asks for: if you cannot observe
+    /// the thing, name the part you can.
+    ///
+    /// The exemption list is the set of names that CLAIM a log without being one - they
+    /// are assertions about the `warn!` call site itself, and they are listed rather than
+    /// silently passing, because a silent exemption and a forgotten test look identical.
+    #[test]
+    fn a_test_named_after_a_log_uses_a_capture_or_says_it_is_not_one() {
+        // Not tests at all. `capture_logs` is the HELPER, and a guard that flagged the
+        // thing it depends on would be a guard nobody could satisfy.
+        const NOT_TESTS: &[&str] = &["capture_logs", "post_logged"];
+
+        // Named for a log, and observes one through the crate's helper.
+        const OBSERVES: &[&str] = &[
+            "a_webhook_rejection_is_logged_under_the_documented_topup_rejected_event",
+            "a_refund_refusal_is_logged_under_its_own_documented_event",
+            "a_customer_prompt_never_reaches_the_log",
+        ];
+        // Named for a log, asserts about the CALL, and says so.
+        const EXEMPTS: &[(&str, &str)] = &[
+            (
+                "internal_errors_log_their_status_field_when_a_subscriber_is_active",
+                "asserts the field is passed to a subscriber, and says a subscriber is active",
+            ),
+            (
+                "no_secret_is_interpolated_into_a_log_or_format_macro",
+                "asserts an ABSENCE across the source, not an emission",
+            ),
+            (
+                "summary_reports_an_alert_when_a_hold_exceeds_the_bound",
+                "an alert row in a printed summary, not a tracing event",
+            ),
+        ];
+
+        // EVERY .rs in the crate, walked rather than listed - and that is the second
+        // restatement in one commit, caught by this guard's own mutation. The first
+        // version named five files, which meant a test in ip_tracking.rs could claim a
+        // log it never observes and the guard passed, which is the scope-too-narrow
+        // failure this whole section is about. A hand-kept file list is a hand-kept copy
+        // of the thing, and it was the fourth one this round.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![root];
+        let mut walked = 0usize;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    walked += 1;
+                    sources.push(path);
+                }
+            }
+        }
+        sources.sort();
+        assert!(
+            walked >= 30,
+            "only {walked} Rust files were walked, so this test is not looking at the whole crate"
+        );
+
+        // Names that look like a log claim, collected from the sources above.
+        let mut claimed: Vec<(String, String)> = Vec::new();
+        for path in sources {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in text.lines() {
+                // `fn ` ANYWHERE in the line, so the async and pub forms are covered:
+                // most tests here are `async fn`, and a prefix match found one of six.
+                let Some(at) = line.find("fn ") else {
+                    continue;
+                };
+                let rest = &line[at + 3..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() {
+                    continue;
+                };
+                let lower = name.to_ascii_lowercase();
+                if ["logged", "logs", "warns", "logging"]
+                    .iter()
+                    .any(|w| lower.contains(w))
+                {
+                    claimed.push((path.display().to_string(), name));
+                }
+            }
+        }
+
+        // The vacuity guard: a pattern change that matched nothing would pass over every
+        // test in the crate.
+        assert!(
+            claimed.len() >= 3,
+            "only {} test name(s) looked like a log claim, so this test is not looking at the real set.",
+            claimed.len()
+        );
+
+        for (path, name) in &claimed {
+            if NOT_TESTS.contains(&name.as_str())
+                || OBSERVES.contains(&name.as_str())
+                || EXEMPTS.iter().any(|(n, _)| n == name)
+            {
+                continue;
+            }
+            panic!(
+                "{path} names a test `{name}` after a log, and it neither uses `capture_logs` nor lists itself as a call-site assertion. If it cannot observe the log, rename it after the part it does check - a predicate, a count, a field - and say in its doc comment that it stops short. A name that claims an observation the body does not make is the test-level form of a guard comparing a restatement."
+            );
+        }
+    }
+
     /// Every table the schema creates is either DISCLOSED on the privacy page or
     /// recorded here as deliberately unused.
     ///
