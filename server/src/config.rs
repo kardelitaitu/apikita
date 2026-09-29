@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -303,6 +304,63 @@ impl AppConfig {
                 self.circuit_breaker.cooldown_multiplier
             )
             .into());
+        }
+
+        // COOLDOWNS ARE ADDED TO AN INSTANT, AND THAT PANICS ON OVERFLOW.
+        //
+        // Three settings reach `Instant + Duration` on the request path: the
+        // breaker's base cooldown and its cap, and the key pool's cooldown. Unlike
+        // the f64 fields above, nothing here saturates - a bare `+` on an Instant
+        // that leaves its representable range is a PANIC, on a request, from a
+        // thread holding the breaker lock.
+        //
+        // MEASURED, not assumed, because the obvious guess is wrong in the
+        // reassuring direction:
+        //
+        //     Instant::now() + Duration::from_secs(1_000_000_000_000)  ok
+        //     Instant::now() + Duration::from_secs(u64::MAX)            PANIC
+        //
+        // A trillion seconds is 31,700 years and does not panic. So this is NOT a
+        // live bug and the commit that added it says so: a config typo would have
+        // to be a nineteen-digit number to reach it. It is here because when such a
+        // number does appear, the alternative is a panic minutes later in a
+        // circuit breaker, on a request, with nothing in the log naming the setting
+        // that caused it. Refusing it at load names the field and the value.
+        //
+        // `checked_add` rather than a magic ceiling, so the rule is the actual
+        // property instead of a number this file would have to defend. It is
+        // evaluated against the clock at load, which is conservative for a service
+        // that then runs for years.
+        //
+        // ONLY THESE THREE. `max_stream_seconds` and `request_timeout_seconds` are
+        // also large numbers from the same config, but they reach `tokio::time`,
+        // which saturates rather than panicking - bounding them would be a rule
+        // with no failure behind it.
+        for (field, secs) in [
+            (
+                "circuit_breaker.cooldown_seconds",
+                self.circuit_breaker.cooldown_seconds,
+            ),
+            (
+                "circuit_breaker.cooldown_max_seconds",
+                self.circuit_breaker.cooldown_max_seconds,
+            ),
+            (
+                "key_pool.key_cooldown_seconds",
+                self.key_pool.key_cooldown_seconds,
+            ),
+        ] {
+            if Instant::now()
+                .checked_add(Duration::from_secs(secs))
+                .is_none()
+            {
+                return Err(format!(
+                    "{field} = {secs} cannot be a cooldown: adding it to the clock \
+                     overflows, and the circuit breaker and key pool would PANIC on a \
+                     request rather than refuse one"
+                )
+                .into());
+            }
         }
 
         if self.models.is_empty() {
@@ -1283,6 +1341,65 @@ mod tests {
             "a degenerate input rate must be reported as the degenerate rate it is, \
              not as a cache discount problem, got {err}"
         );
+    }
+
+    /// A cooldown that cannot be added to the clock is refused at load, for the
+    /// three settings that actually reach an `Instant + Duration`.
+    ///
+    /// The boundary is measured, and it is far further out than a plausible typo
+    /// would reach: a trillion seconds - 31,700 years - is fine. So this test is
+    /// about naming a setting at load rather than panicking inside the breaker
+    /// later, and the values below are chosen to straddle the boundary rather than
+    /// to be realistic.
+    ///
+    /// The control matters more than the cases: a value an operator COULD write is
+    /// accepted, or the guard would be refusing the configuration the repository
+    /// ships.
+    #[test]
+    fn a_cooldown_too_large_for_the_clock_is_refused_and_a_plausible_one_is_not() {
+        for (field, absurd, plausible) in [
+            ("cooldown_seconds", u64::MAX, 30u64),
+            ("cooldown_max_seconds", u64::MAX, 900),
+            ("key_cooldown_seconds", u64::MAX, 5),
+        ] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+
+            set_duration(&mut config, field, absurd);
+            let err = config
+                .validate()
+                .expect_err("a cooldown the clock cannot represent must be refused")
+                .to_string();
+            assert!(
+                err.contains(field) && err.contains("cannot be a cooldown"),
+                "the message must name the setting and the problem, got {err}"
+            );
+
+            // The control: an ordinary value still loads. Without this, a guard that
+            // refused everything would pass.
+            set_duration(&mut config, field, plausible);
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("{field} = {plausible} is a normal cooldown: {e}"));
+        }
+
+        // And the SHIPPED config, which is the one that has to keep working.
+        AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("the shipped config must still load and validate");
+    }
+
+    /// Sets one of the three cooldown settings by name. A helper rather than three
+    /// copies of a match, so adding a fourth field to the rule does not mean
+    /// editing a fourth arm here.
+    fn set_duration(config: &mut AppConfig, field: &str, secs: u64) {
+        match field {
+            "cooldown_seconds" => config.circuit_breaker.cooldown_seconds = secs,
+            "cooldown_max_seconds" => config.circuit_breaker.cooldown_max_seconds = secs,
+            "key_cooldown_seconds" => config.key_pool.key_cooldown_seconds = secs,
+            _ => panic!("unhandled field {field}"),
+        }
     }
 
     /// A non-positive override would size the hold from a rate that reserves
