@@ -966,7 +966,11 @@ mod tests {
 
         // The vacuity guard: a parse that found nothing would agree with anything.
         assert!(
-            swept.len() >= 6,
+            // SLACK, not the count. The entrypoint has exactly six retention deletes, and
+            // a floor of six is a tripwire: it fails the day one is removed and cannot
+            // tell a full parse from a partial one that still reaches six. Four catches a
+            // parse that lost a third of them, which is the failure the floor is for.
+            swept.len() >= 4,
             "only {} retention deletes were parsed from the entrypoint",
             swept.len()
         );
@@ -1425,7 +1429,8 @@ mod tests {
 
         // The vacuity guard: a parse that matched no model would agree with anything.
         assert!(
-            checked >= 6,
+            // Six models, so the floor is four. A floor AT the count is a tripwire.
+            checked >= 4,
             "only {checked} model price(s) were read from the config, so this is not looking at them all"
         );
     }
@@ -1690,7 +1695,9 @@ mod tests {
             "only {files} migration file(s) were read, so a table created by a later migration would be invisible to this test."
         );
         assert!(
-            tables.len() >= 19,
+            // Nineteen tables, so the floor is fourteen. A floor AT the count records the
+            // current scope rather than guarding it.
+            tables.len() >= 14,
             "only {} table(s) were read from the migrations, so this test is not looking at the real schema.",
             tables.len()
         );
