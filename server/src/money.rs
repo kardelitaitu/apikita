@@ -1,3 +1,34 @@
+#![cfg_attr(
+    not(test),
+    // THIS MODULE ARITHMETIC IS DENIED, not merely permitted.
+    //
+    // server/src/lib.rs denies unwrap_used and indexing_slicing crate-wide and
+    // says so, and it used to also claim that this catches "arithmetic that can
+    // overflow in release". It does not. Measured by planting i64 addition,
+    // multiplication and subtraction in a production item and asking the gate:
+    // all three were ACCEPTED. The lint that does say it is
+    // clippy::arithmetic_side_effects, and it was not enabled because it reports
+    // sites across the whole crate.
+    //
+    // This module is where that trade-off stops being acceptable. It is the
+    // PRICING code: every IDR figure a customer is charged is produced here, and
+    // [profile.release] leaves overflow-checks at its default of OFF, so an
+    // overflow in the build that ships wraps silently rather than panicking. The
+    // cost is not a wrong number in a log - it is a wrong number in a ledger.
+    //
+    // It costs nothing here. Measured before adding it: this module has ZERO
+    // arithmetic_side_effects sites outside its tests. It reaches the ceiling not
+    // by fixing numbers but by never multiplying a money quantity in the first
+    // place - the rates are f64 per million tokens and the arithmetic is on the
+    // SCALED quantity, then a single saturating cast to i64. So the deny is free
+    // today and is a fence for whatever is written next.
+    //
+    // Scoped to non-test builds, as lib.rs is: a property test that adds 1 to a
+    // counter has failed loudly and cost nothing. Seven of this module's own
+    // tests would trip it.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use subtle::ConstantTimeEq;

@@ -1,3 +1,31 @@
+#![cfg_attr(
+    not(test),
+    // THE MONEY MODULE, so its arithmetic is denied too.
+    //
+    // lib.rs denies unwrap_used and indexing_slicing and, before that, claimed
+    // these also catch "arithmetic that can overflow in release". They do not:
+    // i64 addition, multiplication and subtraction were all measured as ACCEPTED
+    // by the real gate. The lint that does say it is
+    // clippy::arithmetic_side_effects, and it was not enabled crate-wide because
+    // it reports sites in modules where an overflow costs a wrong counter rather
+    // than wrong money.
+    //
+    // This module is the other half of the money path. Every balance, hold and
+    // ledger delta is computed here, inside transactions whose whole point is that
+    // the figures are exact, and [profile.release] leaves overflow-checks OFF - so
+    // an overflow in the shipped build WRAPS rather than panicking. A wrapped
+    // ledger delta is invisible to reconcile.sh, which compares SUM(delta_idr) to
+    // the balance: a wrap that lands on a plausible positive figure satisfies the
+    // check it was supposed to fail.
+    //
+    // It is not free here - this module has nine sites, in seven functions - so
+    // each function that carries one states WHY its operands are bounded, as an
+    // explicit #[allow]. A blanket allow at the top of the file would have been the
+    // cheaper option and would have been worth nothing: it would silence the lint
+    // for every site added afterwards, which is the whole point of adding it.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use crate::error::AppError;
 use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -244,6 +272,25 @@ pub enum UsageSettlement {
 ///
 /// A zero or negative balance debits nothing and the whole cost is shortfall: the
 /// usage row is still written, because the tokens were genuinely consumed.
+// SAFE BY CONSTRUCTION, and the argument is short enough to be worth writing.
+//
+//   debited = cost.max(0).min(available.max(0)), so 0 <= debited <= cost.max(0).
+//   * cost >= 0:  0 <= debited <= cost,  so cost - debited lies in [0, cost].
+//   * cost <  0:  debited == 0,         so cost - debited == cost.
+//
+// Neither arm can overflow: in the first the subtraction is bounded above by cost
+// and below by zero; in the second one operand is literally zero. There is no input
+// for which this panics in a debug build or wraps in a release one - the property
+// the lint cannot see, and the one the deny would otherwise assert on our behalf.
+//
+// The second element is the SHORTFALL. The argument above is not only prose:
+// `clamp_debit_holds_every_money_invariant_over_the_whole_domain` runs this function
+// over the boundary grid (i64::MIN, i64::MIN+1, i64::MAX-1, i64::MAX, zero and the
+// near-zero shapes money really takes), the overflow edge crossed with that grid on
+// both sides, and 40 000 fixed-seed pairs of which half are drawn from the raw i64
+// plane - so an input that broke the bound above would be found, and in a debug
+// build an overflow would panic rather than quietly produce the wrong figure.
+#[allow(clippy::arithmetic_side_effects)]
 pub fn clamp_debit(cost_idr: i64, available_idr: i64) -> (i64, i64) {
     // A negative cost is not a charge; refusing to "collect" it must not turn into
     // a credit. Floored at zero, and a negative available balance debits nothing.
@@ -266,6 +313,19 @@ pub fn clamp_debit(cost_idr: i64, available_idr: i64) -> (i64, i64) {
 ///
 /// A negative argument is floored: a charge is never a credit and a release is
 /// never a second hold.
+// SAFE BY CONSTRUCTION, and this is the one that LOOKS like an overflow at a
+// glance. The negation is applied to cost_idr.max(0), never to the raw value, so
+// the negated operand is always >= 0:
+//
+//   * cost_idr == i64::MIN  ->  max(0) == 0  ->  -0 == 0.  No overflow, because
+//     the magnitude was discarded BEFORE the negation.
+//   * cost_idr >  i64::MIN  ->  max(0) is the value itself, and negating a
+//     non-negative i64 is always representable - i64::MIN is the only value whose
+//     negation overflows, and that case is the one handled above.
+//
+// Negating the RAW value instead is the classic money bug: -i64::MIN wraps to
+// i64::MIN in a release build, which is a large POSITIVE delta, which is a credit.
+#[allow(clippy::arithmetic_side_effects)]
 pub fn settlement_ledger_deltas(released_idr: i64, cost_idr: i64) -> (i64, i64) {
     (released_idr.max(0), -cost_idr.max(0))
 }
@@ -513,6 +573,22 @@ impl RetentionLag {
 /// A free function rather than a closure: it needs its own `async` body and an
 /// explicit error type, and a closure carrying a lifetime-bound `pool` reference
 /// fights the borrow checker for no benefit.
+// SAFE, but for a different reason than the money functions, and worth being
+// explicit about: chrono's date arithmetic PANICS on an out-of-range result
+// rather than wrapping. It cannot produce the silent corruption the release
+// profile allows elsewhere, so the failure mode here is a panic and not a wrong
+// ledger figure - which is a better failure and still a failure.
+//
+// The bound is the retention window itself. `days` is a call-site constant (
+// USAGE_EVENTS_RETENTION_DAYS and its siblings, all under a few hundred), never a
+// request-supplied value, and `today` is the current date. Subtracting a few
+// hundred days from a date near the chrono epoch is the only way to leave the
+// representable range, and the epoch is 262143 BCE.
+//
+// If a caller ever passes an unbounded `days`, the panic becomes the correct
+// behaviour and this comment becomes wrong - which is the point of writing the
+// assumption down where the deny can no longer see it.
+#[allow(clippy::arithmetic_side_effects)]
 async fn oldest_row_past_window(
     pool: &SqlitePool,
     table: &'static str,
@@ -585,6 +661,11 @@ pub async fn retention_lag(
         sessions,
     })
 }
+// SAFE for the same reason as `oldest_row_past_window`: chrono panics rather
+// than wraps on a date out of range, and the operands are retention-window
+// constants against the current date. See that function's comment for the full
+// argument - it is the same shape and repeating it here would rot independently.
+#[allow(clippy::arithmetic_side_effects)]
 pub async fn purge_expired_usage(
     pool: &SqlitePool,
     today: chrono::NaiveDate,
@@ -673,13 +754,38 @@ async fn record_usage(
     let (release_delta, charge_delta) = settlement_ledger_deltas(released_idr, charged_idr);
 
     if release_delta != 0 {
+        // CHECKED RATHER THAN ALLOWED. This is the one arithmetic site in the
+        // settlement path that is worth spending a check on, because its result is
+        // the balance the ledger row claims to leave behind - the figure
+        // reconcile.sh sums - rather than a derived quantity.
+        //
+        // The bound is enormous: charge_delta is at most the cost of one request,
+        // which is derived from token counts capped at streaming.hard_max_output_tokens
+        // (384,000) times a per-million rate, so reaching i64::MAX (9.2e18 IDR, about
+        // 6e11 USD) is not reachable by any input the proxy will accept. "Not
+        // reachable today" is exactly the kind of claim that silently stops being
+        // true, and the failure mode if it became false is the worst in this file:
+        // a wrapped NEGATIVE balance written into an append-only ledger, which the
+        // reconciliation query would then flag - or worse, a wrap that lands on a
+        // plausible positive figure, which it would not.
+        //
+        // So the check costs one branch on a cold path and turns an unrepresentable
+        // result into a refused settlement, which the caller handles by releasing
+        // the hold. Every other site in this file is bounded by construction and
+        // carries a written argument instead; this one is bounded by MAGNITUDE,
+        // which is a different and weaker kind of argument.
+        let balance_after_release = new_balance.checked_sub(charge_delta).ok_or_else(|| {
+            AppError::Internal(format!(
+                "settlement balance overflow: {new_balance} minus charge {charge_delta}"
+            ))
+        })?;
         // The balance the release left: the charge below has not been taken yet.
         insert_ledger_row(
             &mut tx,
             account_id,
             release_delta,
             ref_batch,
-            new_balance - charge_delta,
+            balance_after_release,
         )
         .await?;
     }
@@ -903,6 +1009,12 @@ pub async fn reserve_balance_transaction(
     // The guard lives inside the statement, never in a preceding read.
     match try_debit(&mut tx, account_id, reserved_idr).await? {
         Some(new_balance) => {
+            // SAFE BY THE GUARD ABOVE, not by arithmetic luck. `reserved_idr <= 0`
+            // already returned `ReservationResult::Zero`, so the negated operand is
+            // a strictly positive i64, and i64::MIN - the only value whose negation
+            // overflows - is negative and cannot reach here. Negating a positive i64
+            // is always representable, in a debug build and a release one alike.
+            #[allow(clippy::arithmetic_side_effects)]
             insert_ledger_row(&mut tx, account_id, -reserved_idr, ref_batch, new_balance).await?;
             tx.commit().await?;
 
@@ -1000,6 +1112,13 @@ async fn settle_partial_usage(
     };
 
     // Recomputed rather than carried: the retry above can change what was debited.
+    //
+    // SAFE BY CONSTRUCTION, and it is the same argument as `clamp_debit` above:
+    // `debited_idr` came out of that function (or out of a retry through it, or is
+    // a literal 0), so `0 <= debited_idr <= cost_idr.max(0)` and the subtraction is
+    // bounded above by cost and below by zero. The shortfall is a NON-NEGATIVE
+    // figure by definition - it is money the customer owed and did not have.
+    #[allow(clippy::arithmetic_side_effects)]
     let shortfall_idr = cost_idr - debited_idr;
 
     // usage_daily carries the FULL cost: the tokens were consumed and the counters
