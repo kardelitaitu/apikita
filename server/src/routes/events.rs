@@ -381,6 +381,22 @@ fn last_event_id(headers: &HeaderMap) -> Option<u64> {
 /// now.
 use crate::routes::resolve_account_from_cookie;
 
+/// Whether event belongs to account_id and may therefore reach its wire.
+///
+/// ONE definition, and it is a security boundary: the broadcast is process-wide, so
+/// every account's balance and usage passes through every subscriber. This was written
+/// in three places - the live arm, the replay arm, and inside the cross-account
+/// isolation test, which re-implemented it with a comment saying it mirrors the live
+/// unfold filter. A test that mirrors production exercises the MIRROR, so had the
+/// production filter been dropped or inverted the suite would have stayed green while
+/// the stream leaked one account's balance to another.
+///
+/// The account is taken by value so the live arm's match guard stays a plain call,
+/// which is what keeps the one-liner there readable.
+fn for_account(account_id: Uuid, event: &RealtimeEvent) -> bool {
+    event.account_id == account_id
+}
+
 pub async fn sse_events_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -403,12 +419,20 @@ pub async fn sse_events_handler(
     // an account would observe another account's wallet balance and token
     // totals. We also swallow `Lagged` (absolute values self-heal) and only end
     // on `Closed`.
+    //
+    // The rule is `for_account`, ONE function, and that is not tidiness. It was
+    // written in three places - the live arm below, the replay arm further down,
+    // and again inside the cross-account isolation test, which re-implemented it
+    // with a comment claiming it "mirrors the live unfold filter". A test that
+    // mirrors production exercises the mirror: had the production filter been
+    // dropped or inverted, that test would have kept passing while the stream
+    // leaked one account's balance to another.
     let live = stream::unfold(
         (state.events.subscribe(), account_id),
         |(mut rx, owner)| async move {
             loop {
                 match rx.recv().await {
-                    Ok(event) if event.account_id == owner => {
+                    Ok(event) if for_account(owner, &event) => {
                         return Some((Ok(event.into_event()), (rx, owner)));
                     }
                     // Belongs to another account: never forward it.
@@ -439,8 +463,7 @@ pub async fn sse_events_handler(
         Resume::Replay(events) => events
             .into_iter()
             // DEFECT 1: only this account's replayed events escape to the wire.
-            .filter(|e| e.account_id == account_id)
-            // DEFECT 1: only this account's replayed events escape to the wire.
+            .filter(|e| for_account(account_id, e))
             .map(|e| Ok(e.into_event()))
             .collect(),
         Resume::Snapshot => state
@@ -653,7 +676,11 @@ mod tests {
 
     /// DEFECT 1 regression: a subscriber whose account is X must never observe an
     /// event published for account Y, even though the broadcast channel is shared
-    /// process-wide. This mirrors the `live` unfold filter in `sse_events_handler`.
+    /// process-wide.
+    ///
+    /// It calls for_account - the same function the live and replay arms call - rather
+    /// than re-implementing the comparison. A comment claiming this mirrors the
+    /// handler was true only until the handler changed.
     #[test]
     fn a_subscriber_only_sees_its_own_account_events() {
         let hub = Arc::new(RealtimeHub::new(&hub_config(64, 5)));
@@ -670,19 +697,41 @@ mod tests {
         publish_usage(&hub, account_y, test_usage(10, 20, 30, 40));
         publish_key_update(&hub, account_y, Uuid::new_v4(), None);
 
-        // Account X applies exactly the filter the handler applies — only events
-        // owned by account_x reach the wire. None of Y's events may leak through.
-        let observed: Vec<&'static str> = std::iter::repeat(())
+        // Drain X's receiver ONCE and draw both conclusions from it, because the
+        // broadcast is process-wide and nothing upstream filters it.
+        //
+        // The first assertion is the NEGATIVE CONTROL and it was the missing half:
+        // everything Y published must actually ARRIVE at X. Without it the second is
+        // vacuous - drain, filter, find nothing, conclude isolation - and it passes
+        // identically whether the hub filters or not. A mutation proved exactly that:
+        // dropping the account check from the LIVE ARM of sse_events_handler left this
+        // test green, because the test filtered on its own and the leak it claims to
+        // catch never crossed it.
+        let delivered: Vec<RealtimeEvent> = std::iter::repeat(())
             .map_while(|_| rx_x.try_recv().ok())
-            .filter(|event| event.account_id == account_x)
+            .collect();
+
+        assert_eq!(
+            delivered.len(),
+            3,
+            "account X must be handed all three of account Y events, because the broadcast is process-wide. If it received none there is nothing to filter and every isolation assertion here is vacuous."
+        );
+        assert!(
+            delivered.iter().all(|e| e.account_id == account_y),
+            "every delivered event belongs to Y, so the filter below has something real to drop"
+        );
+
+        // Now the claim: the filter the handler uses keeps all of them off X wire.
+        let observed: Vec<&'static str> = delivered
+            .iter()
+            .filter(|event| for_account(account_x, event))
             .map(|event| event.name())
             .collect();
 
         assert!(
             observed.is_empty(),
-            "account X saw account Y's events: {observed:?}"
+            "account X saw account Y events: {observed:?}"
         );
-
         // And the other direction holds: Y sees exactly its own three events.
         let seen_by_y: Vec<&'static str> = std::iter::repeat(())
             .map_while(|_| rx_y.try_recv().ok())
