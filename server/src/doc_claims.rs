@@ -626,6 +626,109 @@ mod tests {
         })
     }
 
+    /// Every `limits.<key>` a document NAMES exists in the shipped config.
+    ///
+    /// The instance this closes: a checklist told an operator to set
+    /// `config/apikita.toml` `[limits]` for the rolling spend window, which is a code
+    /// constant. An operator told to change a value finds nothing to change, and a
+    /// checklist item reads as an instruction rather than a description.
+    ///
+    /// THE DENYLIST IS DELIBERATE. `limits.md` is a FILENAME, and a naive
+    /// `limits.([a-z_]+)` match takes it as the key `md` and reports a knob that does
+    /// not exist. Rather than widen the regex - which is how a check becomes noisy and
+    /// gets ignored - the two-letter file stems are listed, because a configuration key
+    /// is not called `md` or `rs`. That is the same boundary as the citation matcher that
+    /// read clock times, and the same rule: only check a claim where the claim is
+    /// unambiguous.
+    #[test]
+    fn every_limits_key_a_document_names_exists_in_the_config() {
+        // Parsed, not string-matched. The first version required a four-space indent the
+        // file does not use, so it reported ten keys as MISSING that were all present -
+        // the same class as a check that cries wolf, in the other direction: a guard that
+        // fails when the code is right is as useless as one that passes when it is wrong.
+        let declared_keys: std::collections::HashSet<String> = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("config")
+                .join("apikita.toml"),
+        )
+        .expect("config/apikita.toml must be readable, or this passes over nothing")
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                return None;
+            }
+            let (key, _) = trimmed.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                .then(|| key.to_string())
+        })
+        .collect();
+
+        const FILE_STEMS: &[&str] = &["md", "rs", "ts", "sh", "sql", "yml", "toml", "log", "astro"];
+
+        // Every markdown a reader of the product would be shown, and every file the
+        // website renders, so a key named in either place is covered.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![root.clone()];
+        let mut walked = 0usize;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    // Skip build output, dependencies and the agent scratch.
+                    if !matches!(
+                        name.as_str(),
+                        "target" | "node_modules" | ".agents" | ".git"
+                    ) {
+                        stack.push(path);
+                    }
+                } else if name.ends_with(".md") {
+                    walked += 1;
+                    sources.push(path);
+                }
+            }
+        }
+        sources.sort();
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for path in &sources {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            for hit in text.match_indices("limits.") {
+                let rest = &text[hit.0 + "limits.".len()..];
+                let key: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
+                if key.is_empty() || FILE_STEMS.contains(&key.as_str()) {
+                    continue;
+                }
+                checked += 1;
+                if !declared_keys.contains(key.as_str()) {
+                    offenders.push(format!("{}: limits.{key}", path.display()));
+                }
+            }
+        }
+
+        assert!(walked >= 30, "only {walked} markdown files were read");
+        assert!(
+            checked >= 3,
+            "only {checked} limits key(s) were checked, so this passes over the documents"
+        );
+        assert_eq!(
+            offenders,
+            Vec::<String>::new(),
+            "a document names a config key that does not exist, so an operator told to set it finds nothing to set."
+        );
+    }
+
     /// Every config key is either READ by the code, or says so where it is set.
     ///
     /// Rounds of measuring turned up a dozen keys nothing reads, and the ones that
