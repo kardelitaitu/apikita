@@ -27,11 +27,35 @@
     // unstable". Found by running the scoping rather than reasoning about it.
     //
     // A panic on the request path is an availability incident, not a style
-    // choice. These two lints catch the common accidental forms: indexing that
-    // can go out of bounds, and arithmetic that can overflow in release.
+    // choice. These two lints catch two of the common accidental forms:
+    // indexing that can go out of bounds, and an unwrap that turns a Result into
+    // a panic.
     //
-    // SCOPED TO NON-TEST BUILDS, and the reason is the sentence above: this is
-    // about the request path. A test that unwraps a fixture it just built has
+    // THIS COMMENT ONCE ALSO CLAIMED THESE CATCH ARITHMETIC OVERFLOW. THEY DO NOT.
+    // Measured, by planting each form in a production item and asking this gate:
+    // out-of-bounds indexing is refused (indexing_slicing), a Result.expect() is
+    // refused (unwrap_used), and i64 addition, multiplication and subtraction are
+    // all ACCEPTED. None of the two says anything about arithmetic, and
+    // [profile.release] below leaves overflow-checks at its default of OFF, so
+    // an overflow in the build that ships wraps silently.
+    //
+    // The lint that does say it is clippy::arithmetic_side_effects, and it is not
+    // enabled here because it reports 43 sites in this crate, most of them
+    // arithmetic that cannot overflow in practice (a u8 counter, a Duration).
+    // Turning it on is a deliberate piece of work, not a one-line change: each
+    // site needs a judgement about whether its operands are actually bounded.
+    //
+    // So the honest statement of what protects money is the schema and the
+    // reconciliation gate, not a lint: wallets carry CHECK (balance_idr >= 0), and
+    // tools/reconcile compares SUM(ledger.delta_idr) to the balance per account.
+    // A wrapped NEGATIVE is refused by the CHECK and a wrapped ledger value is
+    // caught by reconcile. What neither can catch is a wrap that lands on a
+    // plausible positive figure - which is why the non-finite price guard in
+    // config.rs is a hard validation rather than a lint too, and why a config
+    // that bills at zero cannot be reconciled away.
+    //
+    // SCOPED TO NON-TEST BUILDS, because a panic is an availability incident
+    // only on the request path. A test that unwraps a fixture it just built has
     // failed loudly and cost nothing; a handler that does is an outage.
     //
     // Measured before scoping it: the test corpus trips these two lints 512
