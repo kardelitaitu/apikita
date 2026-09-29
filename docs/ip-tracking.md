@@ -88,7 +88,7 @@ what was settled:
 | Where does the salt live? | **Process memory only.** 32 bytes from the OS RNG, replaced at the UTC day boundary, never written to disk or to the database |
 | Relay or backend computes the hash? | **The backend.** It owns the salt and the tables; the relay has neither |
 | How is the caller's address known? | `X-Forwarded-For`, but **only from a peer inside `network.trusted_proxy_cidrs`** |
-| What enforces retention? | `cargo run --bin ip-purge`, run nightly alongside the backup and reconciliation jobs |
+| What enforces retention? | The maintenance scheduler (`.docker/maintenance/entrypoint.sh`), nightly, in inline SQL alongside the other jobs. **Not** `cargo run --bin ip-purge` — that binary is not shipped in the server image, and the scheduler logs it as NOT WIRED. See "Not enforced" below. |
 
 **The salt is never persisted, on purpose.** A salt derived from a stored server
 secret plus the date would behave identically in every test — stable within a

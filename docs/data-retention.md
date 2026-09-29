@@ -61,9 +61,9 @@ relationship and becomes a liability the moment a breach occurs.
 | --- | --- | --- |
 | **Ledger** | **Forever** | Financial record; it is the authoritative audit trail |
 | **Top-ups** | **Forever** | Financial; matches the ledger |
-| **Usage daily** | 24 months | Billing disputes, then aggregate only. Swept by `usage-purge` |
-| **Per-request usage** (`usage_events`) | **90 days** | Outlasts the 30-day rolling spend window plus a dispute window. Swept nightly by `cargo run --bin usage-purge`; the boundary is inclusive, so the cutoff day is deleted and exactly 89 preceding days are kept |
-| **Sessions (expired/revoked)** | 30 days | Tidy up, but keep recent for security review. The window runs from the instant the session STOPPED being usable — `revoked_at` for an early logout, else `expires_at`. Swept by `usage-purge` |
+| **Usage daily** | 24 months | Billing disputes, then aggregate only. Swept nightly by the maintenance scheduler, in inline SQL |
+| **Per-request usage** (`usage_events`) | **90 days** | Outlasts the 30-day rolling spend window plus a dispute window. Swept nightly by the maintenance scheduler in inline SQL (**not** by `cargo run --bin usage-purge`, which is not shipped); the boundary is inclusive, so the cutoff day is deleted and exactly 89 preceding days are kept |
+| **Sessions (expired/revoked)** | 30 days | Tidy up, but keep recent for security review. The window runs from the instant the session STOPPED being usable — `revoked_at` for an early logout, else `expires_at`. Swept nightly by the maintenance scheduler in inline SQL |
 | **Reviews** | Until deleted by user | Published aggregate; individual text is theirs |
 | **Review history** | Same as review | Needed to make an edit meaningful |
 | **link_codes** | Until used or expired + 24h | Then delete |
@@ -97,8 +97,9 @@ relationship and becomes a liability the moment a breach occurs.
 > It deliberately does **not** touch `ledger` or `topups` (financial records, kept
 > forever), `reviews`/`review_history` (kept until the user deletes them),
 > `link_codes` (its own "+24h after use/expiry" rule is a different shape), or
-> `key_ip_*`/`link_redemption_attempts` (swept by `ip-purge`, which owns the
-> salted-hash retention and the salt-rotation contract).
+> `key_ip_*`/`link_redemption_attempts` (swept by the maintenance scheduler in
+> inline SQL, which owns the salted-hash retention and the salt-rotation contract;
+> `bin/ip-purge.rs` states the same windows but is not shipped and does not run).
 
 **The ledger is never deleted, even when a customer leaves.** It is the record of
 money that moved. That is normal accounting, not a retention violation — but it
