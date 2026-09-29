@@ -38,11 +38,22 @@
 // changes our cost with no change in the upstream price list - which is the exact moment
 // these six figures go stale, and they are what a customer reads before buying.
 //
-// The website deliberately does not check it, and that is TWO independent decisions
-// rather than one gap. This file adds no TOML dependency, so the config is not read from
-// here; and `tests/landing-claims.test.ts` reads the pages as TEXT on purpose, stating
-// that its guard is about what the file SAYS rather than a value it computes. A guard
-// here would have to contradict one of those, so the mitigation is the arithmetic above:
+// The website deliberately does not check it HERE, and that is one decision about the
+// SHIPPED SITE: this file adds no TOML dependency, so the config is not read into
+// anything the browser downloads. The arithmetic above is the mitigation for that.
+//
+// **IT IS NOW CHECKED ANYWAY, from the test suite, and my reasoning that it could not
+// be was wrong in a way worth recording.** The no-TOML rule constrains the BUILD, not
+// the tests: `tests/prices.test.ts` reads config/apikita.toml as TEXT - the same
+// technique landing-claims.test.ts already uses on the pages, deliberately - and
+// derives these six figures from the config's own rates and multiplier. That adds no
+// dependency to the site, because nothing it reads is ever bundled.
+//
+// The distinction that makes it safe: reading a file in a TEST costs the shipped
+// artifact nothing, and a constraint about what the artifact contains is not a
+// constraint about what the repository may check. Conflating them is how a correct
+// restriction becomes a permanent excuse, and the excuse outlives the reason - by the
+// time this was checked, the written arithmetic had been load-bearing for a round.
 // checkable by eye, and wrong in a way a reader can see in the same ten seconds.
 //
 // Worth naming for what it is, though: the side that CAN check computed values - the
