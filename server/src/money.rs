@@ -524,6 +524,88 @@ mod tests {
             }
         }
     }
+    /// The charge is EXACTLY k times the charge for one unit, to within the
+    /// accumulated ceiling - and that bound is derived, not guessed.
+    ///
+    /// With W the wholesale cost of one unit and M the multiplier, the function
+    /// returns ceil(n * W * M). Writing c = ceil(n * W * M), and using that ceil(x)
+    /// lies in (x-1, x], the true product k*n*W*M is in (k*c - k, k*c], so exactly:
+    ///
+    ///       k*c - (k-1)  <=  cost(k*n)  <=  k*c
+    ///
+    /// That is a statement about COLLECTION, not just shape. The rounding error the
+    /// platform keeps for itself never exceeds ONE RUPIE PER UNIT BILLED, whatever
+    /// the size, the rate or the multiplier - so an operator can say what the worst
+    /// case costs, and a customer can bound what rounding can take.
+    ///
+    /// It is also the test a monotonicity sweep cannot be. Monotonicity asks only
+    /// that bigger is not smaller, and a BULK DISCOUNT satisfies it: halve the price
+    /// above a million tokens and every rung still rises. This bound does not, because
+    /// the discount shows up as the charge falling short of k times by far more than
+    /// the (k-1) allowance. The monotonicity test records that it could not catch
+    /// that; this one can, and is mutation-checked doing so.
+    ///
+    /// THE UPPER EDGE CARRIES ONE EXTRA RUPIE, and that is measured rather than
+    /// padding. The bound above is exact only in real arithmetic, and this test
+    /// FAILED against it: at 3 x 1e9 input tokens the charge came to k*c + 1. The
+    /// cause is the f64 product, because 2676.78 is not representable, so
+    /// 3000.0 * 2676.78 * 1.5 lands a few billionths ABOVE the exact 12_045_510.0
+    /// and the ceiling then bills a whole extra rupiah.
+    ///
+    /// So the honest answer to "can this ever overcharge?" is: BY ONE RUPIE PER
+    /// REQUEST relative to exact proportionality, whenever the true total lands on a
+    /// whole number. It does NOT scale with the amount - the f64 error is relative,
+    /// around 2e-16, so at a billion rupiah the absolute error is still far under a
+    /// rupiah and only the ceiling decides. (Where the i64 cast SATURATES, at the far
+    /// end of any ladder, proportionality is not a meaningful claim at all: the charge
+    /// is pinned at i64::MAX whatever the units.)
+    #[test]
+    fn the_charge_scales_exactly_with_the_units_billed() {
+        const R_IN: f64 = 2676.78;
+        const R_CACHE: f64 = 53.54;
+        const R_OUT: f64 = 10707.12;
+
+        // Unit sizes chosen to straddle the interesting magnitudes: below a million
+        // (where per-million scaling is well under one rupiah), around it, and far
+        // above it, where a f64-per-million product is large enough for its own
+        // rounding to matter.
+        for n in [1u64, 999, 1_000, 1_000_000, 7_777_777, 1_000_000_000] {
+            for k in [2u64, 3, 10, 1000] {
+                // One class at a time, so a failure names which one.
+                for label in ["input", "cache-read", "output"] {
+                    let at = |units| match label {
+                        "input" => calculate_token_cost_idr(PRICE, units, R_IN, 0, 0.0, 0, 0.0),
+                        "cache-read" => {
+                            calculate_token_cost_idr(PRICE, 0, 0.0, units, R_CACHE, 0, 0.0)
+                        }
+                        _ => calculate_token_cost_idr(PRICE, 0, 0.0, 0, 0.0, units, R_OUT),
+                    };
+
+                    let one = at(n);
+                    let many = at(n.saturating_mul(k));
+                    let scaled = one.saturating_mul(k as i64);
+                    let allowance = k as i64 - 1;
+
+                    assert!(
+                        many <= scaled + 1,
+                        "{label}: {k} x {n} billed {} but one unit alone bills {one}, so k \\
+                         units should bill at most {} - more than proportionally, and more \\
+                         than the one rupiah of f64 rounding",
+                        many,
+                        scaled + 1
+                    );
+                    assert!(
+                        many >= scaled - allowance,
+                        "{label}: {k} x {n} billed {} but one unit alone bills {one}, so k \\
+                         units should bill at least {} - the allowance is one rupiah per \\
+                         unit, and a discount hides in the gap",
+                        many,
+                        scaled - allowance
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn zero_tokens_or_zero_rates_produce_zero_not_a_negative_charge() {
         assert_eq!(bill(0, 0, 0), 0);
