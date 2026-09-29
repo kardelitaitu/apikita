@@ -44,21 +44,31 @@
     // arithmetic that cannot overflow in practice (a u8 counter, a Duration) and
     // where an overflow would cost a wrong counter rather than wrong money.
     //
-    // IT IS enabled where the trade-off inverts, one module at a time. FOUR modules
-    // now carry their own deny of the same lint, scoped the same way: `money` and
-    // `db`, which produce every figure a customer is charged, and `routes/account`
-    // and `routes/admin`, the customer wallet surface and the operator surface.
-    // [profile.release] wraps rather than panics, so the cost of a wrong figure in
-    // any of them is financial rather than cosmetic.
+    // IT IS enabled where the trade-off inverts, one module at a time. FIVE
+    // modules now carry their own deny of the same lint, scoped the same way:
+    // `money` and `db`, which produce every figure a customer is charged;
+    // `routes/account` and `routes/admin`, the customer wallet surface and the
+    // operator surface; and `routes/keys`, where the per-key spend and token limits
+    // are compared. [profile.release] wraps rather than panics, so the cost of a
+    // wrong figure in any of them is financial rather than cosmetic.
     //
-    // THREE OF THE FOUR COST NOTHING - measured before installing each, zero sites
+    // THREE OF THE FIVE COST NOTHING - measured before installing each, zero sites
     // outside their tests, because the money arithmetic all lives in db.rs and the
     // others route to it. That is the argument for doing them one module at a time
     // rather than as one sweep of all 43: a fence that needs a page of justifications
-    // to install is one nobody keeps, and three of these needed none. Only db.rs had
-    // real work - nine sites in seven functions, each now carrying a written argument
-    // for why its operands are bounded, except the one bounded only by MAGNITUDE
+    // to install is one nobody keeps, and three of these needed none.
+    //
+    // The two that were NOT free are the two that found something. db.rs had nine
+    // sites in seven functions, each now carrying a written argument for why its
+    // operands are bounded, except the one bounded only by MAGNITUDE
     // (new_balance - charge_delta), which is checked at runtime instead.
+    // routes/keys had three, and the first was not an argument at all: the 30-day
+    // spend total accumulated with a wrapping `+=`, so a total crossing i64::MAX
+    // came back NEGATIVE - and a negative spend is "nowhere near the limit", so the
+    // arithmetic computing a limit's own input was the one thing that could switch
+    // the limit off. That became saturating_add, because for a ceiling the safe
+    // direction is to read too high. Fencing a module is how you find out which of
+    // its sites were arguments and which were bugs.
     //
     // So the honest statement of what protects money is now three things, not two:
     // the schema and the reconciliation gate below, plus a lint on the modules where
