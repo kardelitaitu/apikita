@@ -661,6 +661,83 @@ mod tests {
         assert!(all_cached_actual <= reserved);
     }
 
+    /// The hold covers a CACHE-READ settlement, and the reason it does is a CONFIG
+    /// RULE stated somewhere else entirely.
+    ///
+    /// The pre-flight reservation prices the whole prompt at the INPUT rate, because
+    /// at reservation time nobody knows which tokens the upstream will report as
+    /// cache hits. Settlement then splits those same tokens and prices the cache
+    /// subset at its own, cheaper, rate. So the hold covers the settlement exactly
+    /// because cache_read_peak <= input_peak, which config.rs now REFUSES to
+    /// violate.
+    ///
+    /// Two files, one invariant, and until now nothing connected them. The test above
+    /// proves the property with its OWN hardcoded rates, so it would keep passing if
+    /// the shipped config ever put the cache rate above the input rate - which is
+    /// precisely the configuration that would strand a hold on every cache-heavy
+    /// request, silently, at settlement time.
+    ///
+    /// So this reads the SHIPPED rates and re-derives the sweep from them. If the two
+    /// are ever transposed, this fails, and it names which rule broke.
+    #[test]
+    fn the_hold_covers_a_cache_settlement_at_the_shipped_rates() {
+        use crate::config::AppConfig;
+
+        let config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        let model = config
+            .models
+            .iter()
+            .find(|m| m.name == "flash")
+            .expect("the shipped config must carry the flash model");
+        let r_in = model.rates.input_peak;
+        let r_cache = model.rates.cache_read_peak;
+        let r_out = model.rates.output_peak;
+
+        // The rule itself, asserted FIRST so the failure names the cause rather than
+        // a downstream symptom. It is the same inequality config.rs enforces in
+        // validate(); asserting it here as well is what makes the connection visible
+        // from the money side.
+        assert!(
+            r_cache <= r_in,
+            "cache_read_peak ({r_cache}) is above input_peak ({r_in}). The hold prices \
+             a cache hit at the INPUT rate, so a higher cache rate would make every \
+             cache-heavy request settle ABOVE its own reservation"
+        );
+
+        for estimated_input in [1u64, 1_000, 1_000_000, 7_777_777] {
+            for max_output in [0u64, 1_024, 384_000] {
+                let reserved = calculate_preflight_reservation_idr(
+                    model.price,
+                    estimated_input,
+                    r_in,
+                    max_output,
+                    r_out,
+                );
+                // Every split of the prompt the upstream could report, from none
+                // cached to all of it.
+                for cache_read in [0u64, 1, estimated_input / 2, estimated_input] {
+                    let actual = calculate_token_cost_idr(
+                        model.price,
+                        estimated_input - cache_read,
+                        r_in,
+                        cache_read,
+                        r_cache,
+                        max_output,
+                        r_out,
+                    );
+                    assert!(
+                        actual <= reserved,
+                        "prompt {estimated_input} (of which {cache_read} cached) and \
+                         {max_output} output: charged {actual} against a hold of \
+                         {reserved} - a shortfall is written off silently, because the \
+                         debit is clamped to what was reserved"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn the_reservation_is_monotonic_in_output_tokens() {
         let previous = [
