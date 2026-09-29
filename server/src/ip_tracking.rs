@@ -332,6 +332,13 @@ pub struct PurgedRows {
     /// know the link-code table is actually being swept. A count that cannot be
     /// printed cannot be noticed when it silently stops moving.
     pub link_attempts: u64,
+    /// `link_code_issues` rows deleted.
+    ///
+    /// A third field for the same reason as the second: this table was added because
+    /// the issuance cap could not count anything, and the counter it counts has to
+    /// be swept on a policy someone can see. A count that cannot be printed cannot
+    /// be noticed when it silently stops moving.
+    pub link_issues: u64,
 }
 
 /// Deletes rows past their retention window.
@@ -412,10 +419,34 @@ pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<Purged
         .await?
         .rows_affected();
 
+    // The link-code ISSUANCE counter is the same class again: an account_id and a
+    // timestamp, feeding an abuse guard and holding nothing a person is identified
+    // by. Same 7-day bound, same sweep, same reason - a second retention policy is a
+    // second place the policy can be forgotten, and the first version of that table
+    // shipped with none at all.
+    //
+    // The cutoff reuses seen_cutoff and the same midnight-UTC instant, which is
+    // correct here for the same reason as above: created_at is a TIMESTAMP in a TEXT
+    // column, so binding a bare date would compare 2026-09-27 as a string against
+    // 2026-09-27T03:04:05+00:00 - the shorter sorts first, the DELETE matches
+    // nothing, and the rows survive forever. A silent retention failure in the
+    // direction that keeps data.
+    let link_issues = sqlx::query("DELETE FROM link_code_issues WHERE created_at <= ?")
+        .bind(
+            seen_cutoff
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid")
+                .and_utc(),
+        )
+        .execute(pool)
+        .await?
+        .rows_affected();
+
     Ok(PurgedRows {
         seen,
         daily,
         link_attempts,
+        link_issues,
     })
 }
 
