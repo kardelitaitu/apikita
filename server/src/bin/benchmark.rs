@@ -126,6 +126,18 @@ async fn bench_midtrans_signatures() {
 }
 
 /// Scenario 3: Simulates 100-key pool router under concurrent load with 10% 429 injection
+// The three counters below - `retries`, the in-flight fetch arithmetic, and
+// `successful` - are all bounded by this function's own parameters: a request id
+// that counts up to `total_requests`, and a retry loop that exits after a fixed
+// number of attempts. None is a money figure, an access decision, or anything
+// persisted; this binary measures a system, it does not run one. An overflow here
+// would print a wrong throughput figure, which is worth catching but is not the
+// class of failure the library's fences are about.
+//
+// Per-function rather than one file-level allow, because a blanket allow would
+// silence the lint for anything added here afterwards, and the point of the rule
+// lib.rs states is that the fence is for the NEXT site, not the current ones.
+#[allow(clippy::arithmetic_side_effects)]
 async fn bench_100_key_pool_routing() {
     println!("--> [Scenario 3] Benchmarking 100-Key Pool Least-Loaded Routing & 429 Cooldown...");
     println!("    Simulating 100 keys, 5,000 requests, 10% random 429 throttle rate...");
@@ -214,6 +226,10 @@ async fn bench_100_key_pool_routing() {
 }
 
 /// Scenario 4: Simulates 500 concurrent streaming SSE connections
+// SAFE, and for the same reason as the function above: the accumulators here are
+// a byte total over twenty fixed chunks per stream and a token total of
+// `concurrency * 20`. Every operand is bounded by the harness's own arguments.
+#[allow(clippy::arithmetic_side_effects)]
 async fn bench_concurrent_streaming_streams(concurrency: usize) {
     println!(
         "--> [Scenario 4] Benchmarking Concurrent SSE Streams ({} simultaneous connections)...",

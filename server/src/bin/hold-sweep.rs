@@ -1,3 +1,14 @@
+#![cfg_attr(
+    not(test),
+    // FENCED, and free. This binary's only arithmetic outside its tests is date
+    // arithmetic over the same 900-second bound the whole tool is about, and the one
+    // site clippy reports here is inside `mod tests` - so the non-test scoping
+    // leaves nothing to justify. It is added anyway so that a future figure added
+    // to this file is held to the same standard as the library, where an overflow
+    // would be a wrong balance rather than a wrong console line.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 //! Stranded-hold sweep: the stated bound that makes an unpaired reservation an
 //! incident instead of invisible money.
 //!

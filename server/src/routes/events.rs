@@ -268,6 +268,12 @@ impl RealtimeHub {
             });
         }
 
+        // SAFE by the guard directly above, and this is the one site in the crate
+        // where the bound is a LINE rather than a config value: `open >= max` has
+        // already returned, so `open < max_connections_per_account`, and `max` is a
+        // u32 - therefore `open + 1` is at most `u32::MAX` and cannot wrap. The
+        // counter is per account, so the increment is once per open connection.
+        #[allow(clippy::arithmetic_side_effects)]
         connections.insert(account_id, open + 1);
         Ok(ConnectionGuard {
             hub: Arc::clone(self),

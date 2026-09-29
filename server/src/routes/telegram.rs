@@ -1,3 +1,29 @@
+//
+// FENCED, and the allow is at the TOP of the module rather than on each site,
+// because there is one production site here and it is a constant-bounded date
+// subtraction already argued in full above it. A per-site allow for a single site
+// would be the same thing with more ceremony.
+#![cfg_attr(
+    not(test),
+    // THE HIGHEST-RISK ENDPOINT IN THE PRODUCT, fenced for that reason rather than
+    // for the arithmetic.
+    //
+    // docs/architecture/identity.md calls this "the highest-risk endpoint in the
+    // Telegram surface", and the reason is money: a 6-digit code is 10^6
+    // possibilities, and a successful guess attaches an attacker's Telegram to a
+    // FUNDED WALLET. Two of this module's three caps are what stand between the
+    // public internet and somebody else's balance - the per-IP redemption cap on
+    // guessing, and the per-account issuance cap on how many codes exist to guess.
+    //
+    // The third cap is the reason this file is worth fencing at all. The issuance
+    // cap counted link_codes, a table this very handler DELETEs from, so it could
+    // not fire at all; a cap that cannot fire is indistinguishable from a cap that is
+    // not being hit, and the suite was green throughout. It now counts
+    // link_code_issues. A module whose job is enforcing limits should not be the
+    // one place where a limit is quietly inert.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 //! Telegram link-code redemption: the binding of a chat to a funded account.
 //!
 //! `docs/architecture/identity.md` names this the **highest-risk endpoint in the
@@ -197,12 +223,21 @@ async fn record_and_check_attempt(
     }
 
     let window: i64 = link_code_window().num_hours();
+    // SAFE, and the same argument as every other date subtraction in this
+    // repository: chrono's DateTime arithmetic PANICS on an out-of-range result
+    // rather than wrapping, and the operand is `link_code_window()` - an hour, a
+    // constant in abuse.rs - rather than anything a caller supplies. The subtraction
+    // is on the ATTACK path, so a panic here would be a denial of service by
+    // anyone who can make this run; the bound is what keeps that unreachable.
+    #[allow(clippy::arithmetic_side_effects)]
+    let window_start = now - Duration::hours(window);
+
     let row = sqlx::query(
         "SELECT COUNT(*) AS used, MIN(attempted_at) AS oldest \
          FROM link_redemption_attempts WHERE ip_hash = ? AND attempted_at >= ?",
     )
     .bind(ip_key)
-    .bind(now - Duration::hours(window))
+    .bind(window_start)
     .fetch_one(pool)
     .await?;
 
@@ -254,6 +289,12 @@ pub async fn issue_link_code(
     let account_id = crate::routes::resolve_account_from_cookie(&state.pool, &headers).await?;
 
     let now = Utc::now();
+    // SAFE: LINK_CODE_TTL_MINUTES is a compile-time constant, so the operand cannot be
+    // anything but a few minutes and the addition cannot leave the representable
+    // range. Worth saying because chrono's DateTime arithmetic PANICS rather than
+    // wrapping, and this is the code that mints a link code - a panic here is a
+    // refusal of a legitimate customer, not a wrong number.
+    #[allow(clippy::arithmetic_side_effects)]
     let expires_at = now + Duration::minutes(LINK_CODE_TTL_MINUTES);
 
     let mut tx = crate::db::begin_immediate(&state.pool).await?;
