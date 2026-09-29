@@ -227,8 +227,16 @@ statement is false.**
       **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`: **10 of its 11
 alerts are `covered`**, and the one exception is `relay_5xx`, which is `needs-metrics` because
 it cannot be derived from the database or `/health` alone. (This line said "9 of 10" until it
-was measured: the table has grown since, and nothing tied the sentence to the file — see
-`todo.md`, which now cites the same numbers.) "Configured" also means a delivery channel and
+was measured: the table has grown since, and nothing tied the sentence to the file. The
+counts are therefore stated HERE, from `alerts.tsv`, and nowhere else - one source, one
+restatement. *This sentence used to point at a `todo.md` "which now cites the same numbers".
+There is no `docs/todo.md` in this repository, so the pointer to the fix for a drift named a
+document that was never there - a dangling reference in the one line whose job is to record
+that a stale count was fixed.* A bare backticked filename is invisible to the link guard, which
+checks `](target)` markdown links and not filenames in prose, so nothing would have said so.
+The numbers are themselves checked: a guard counts the rows in `alerts.tsv` and the `covered`
+values, which is the instrument that actually prevents the drift rather than describing it.
+"Configured" also means a delivery channel and
 a schedule, which are deployment decisions. **The code half is done AND THE COUPLING IS NOW IN PLACE** —
 `run_wired_jobs` invokes BOTH alert jobs every night alongside retention, reconcile and
 hold-sweep: `run_alert_checks` evaluates the database-backed alerts and `run_alert_probes`
