@@ -25,6 +25,28 @@
 //! would hide the abuse this exists to find. Over-counting is a human
 //! investigating; under-counting is nobody investigating.
 //!
+//! THE RULE THAT FALLS OUT OF THE ROTATION, learned the hard way from a sibling
+//! table. An ip_hash is a stable identifier for ONE UTC day, so anything that COUNTS
+//! on it must have a window that is itself one day, or must aggregate per day and
+//! keep the aggregate. `key_ip_daily` does exactly that - `(api_key_id, day)` with a
+//! 90-day trend over counts that are already daily - and the window and the salt line
+//! up, so the two can never split across rows.
+//!
+//! `link_redemption_attempts` is the case that got it wrong, and it is wrong QUIETLY.
+//! Its counter is keyed on ip_hash over a sliding multi-hour `link_code_window`, so at
+//! midnight the key changes, the counter starts empty, and the pre-midnight attempts
+//! stop counting. The limiter reads as an hours-shaped cap and is a daily allowance
+//! that resets on the hour. Nothing errors; the limit simply stops applying to the
+//! attacker it was written for, and the test suite passes because a within-window
+//! attempt stream is still refused.
+//!
+//! So the shape to recognise is: a sliding window over a daily-rotating identifier. It
+//! will not fail loudly, it will fail as a limit that quietly stops limiting, and the
+//! cause is a privacy decision that is correct on its own terms - which is exactly why
+//! it survives review. The fix is to document the real ceiling, or to count on something
+//! stable, and never to lengthen the salt's life without saying what that costs
+//! unlinkability.
+//!
 //! SUSPICION, NOT ENFORCEMENT. The doc draws a hard line between the two:
 //! a suspicion threshold is "flagged for a human to look at", a hard cap
 //! (`config/apikita.toml [limits]`) "refuses the request". Nothing here refuses
