@@ -1,3 +1,20 @@
+#![cfg_attr(
+    not(test),
+    // THE API-KEY SURFACE, fenced with the other money-adjacent modules.
+    //
+    // This is where a per-key spend limit and a token ceiling are COMPARED, so an
+    // overflow here does not corrupt a total so much as stop a limit from biting.
+    // That is the permissive direction, which is why the fold in this module now
+    // saturates rather than wrapping, and why this fence exists at all: the
+    // arithmetic that decides whether a key keeps being served is arithmetic.
+    //
+    // It is NOT free here, and the difference from the last three modules is worth
+    // recording: this one has two real sites, and both carry a written argument.
+    // The third was the fold, and that one was not an argument at all - it was a
+    // wrong direction, so it became saturating_add instead of an allow.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
@@ -75,6 +92,18 @@ pub const SPEND_WINDOW_DAYS: i64 = 30;
 
 /// First day (inclusive) of the rolling spend window ending on `today`.
 /// The window holds exactly 30 day-values, so it starts 29 days back.
+///
+/// SAFE, twice over. `SPEND_WINDOW_DAYS - 1` is `30 - 1` on a const, folded at
+/// compile time with no runtime operand that could overflow. And `NaiveDate -
+/// Duration` PANICS on an out-of-range result rather than wrapping, so even a
+/// nonsense window length would fail loudly instead of silently dating rows to the
+/// wrong side of the boundary. 29 days back from any real date is in range.
+///
+/// The allow is on the FUNCTION, not on the expression. An attribute in
+/// tail-expression position is still unstable - "attributes on expressions are
+/// experimental" - so the version that put it on the line below did not compile,
+/// and the compiler said so rather than accepting it.
+#[allow(clippy::arithmetic_side_effects)]
 pub(crate) fn spend_window_start(today: NaiveDate) -> NaiveDate {
     today - chrono::Duration::days(SPEND_WINDOW_DAYS - 1)
 }
@@ -95,7 +124,26 @@ fn fold_spend_in_window(rows: &[(Uuid, NaiveDate, i64)], today: NaiveDate) -> Ha
         if !in_spend_window(day, today) {
             continue;
         }
-        *spend.entry(key_id).or_insert(0) += cost_idr;
+        // SATURATING, not wrapping, and the direction is the whole point.
+        //
+        // This total decides whether the per-key spend limit bites. A wrapped sum
+        // that crosses i64::MAX comes back NEGATIVE, and a negative spend is
+        // "nowhere near the limit" - so the one condition that stops a key being
+        // served would be the one arithmetic that turned the limit off. That is
+        // the exact failure shape this repository treats as worst: silent, and
+        // pointed in the permissive direction.
+        //
+        // Saturating puts the failure on the other side: the total reads as
+        // i64::MAX, which is above every spend_limit_idr the config can express, so
+        // the limit keeps biting. Being wrong about how MUCH a key has spent is
+        // recoverable; not enforcing a limit is not.
+        //
+        // Unreachable with real figures - 30 days of IDR would have to exceed
+        // 9.2e18 - but the same sum IS implemented a second time in SQL by
+        // `key_spend_used`, which is the read the PROXY enforces from, and the two
+        // must not fail in opposite directions. This one now saturates.
+        let total = spend.entry(key_id).or_insert(0);
+        *total = total.saturating_add(cost_idr);
     }
     spend
 }
@@ -370,6 +418,19 @@ pub async fn create_key(
     const KEY_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let random_bytes: String = (0..43)
         .map(|_| {
+            // SAFE: a remainder is strictly less than its divisor, and the divisor
+            // is a non-zero constant, so the modulo cannot overflow or divide by
+            // zero. The narrowing casts are also bounded - the value is already
+            // < 62 and the target types are wider than that.
+            //
+            // What the modulo DOES cost is a slight bias, and it is left in place
+            // deliberately: 2^32 is not a multiple of 62, so the first
+            // (2^32 mod 62) alphabet characters are very slightly more likely than
+            // the rest. The alphabet is 62 characters over a 43-character key, so
+            // the bias is ~1 in 10^7 per position and 43 positions do not make it
+            // attackable. Correcting it would mean rejection sampling, which is
+            // real code for a defect this key length cannot express.
+            #[allow(clippy::arithmetic_side_effects)]
             let idx = (rand_core::OsRng.next_u32() % KEY_ALPHABET.len() as u32) as usize;
             KEY_ALPHABET.get(idx).copied().unwrap_or(b'0') as char
         })
@@ -578,6 +639,63 @@ mod tests {
         assert!(!in_spend_window(start - chrono::Duration::days(1), today));
         assert!(!in_spend_window(day(2026, 4, 20), today));
         assert_eq!(spend_window_start(day(2026, 3, 1)), day(2026, 1, 31));
+    }
+
+    /// THE DIRECTION OF THE OVERFLOW, which is the whole reason the fold saturates.
+    ///
+    /// The window total decides whether the per-key spend limit bites, so the two
+    /// ways to be wrong are not equally bad. A wrapping sum that crosses i64::MAX
+    /// comes back NEGATIVE, and a negative spend is "nowhere near the limit" - the
+    /// limit stops enforcing, silently, and only for a key that has somehow run up an
+    /// absurd total. A saturating sum reads as i64::MAX, which is above every
+    /// spend_limit_idr the schema can hold, so the limit keeps biting.
+    ///
+    /// This is asserted on the FUNCTION rather than in prose, with figures no
+    /// database would ever produce, because the property is exactly that it holds
+    /// for figures no database would ever produce. A debug build panics on the
+    /// wrapping version, so the two implementations are distinguishable by this
+    /// test alone.
+    ///
+    /// The two rows are the minimum that crosses the boundary: i64::MAX alone sums
+    /// to itself, and only the second row pushes the running total past the edge.
+    #[test]
+    fn a_window_total_that_overflows_reads_as_over_the_limit_and_never_below_it() {
+        let today = day(2026, 5, 20);
+        let start = spend_window_start(today);
+        let key = Uuid::new_v4();
+
+        let rows = vec![(key, start, i64::MAX), (key, today, 1)];
+        let spend = fold_spend_in_window(&rows, today);
+
+        let total = spend
+            .get(&key)
+            .copied()
+            .expect("a key with rows in the window must appear in the fold");
+        assert_eq!(
+            total,
+            i64::MAX,
+            "an over-large window total must SATURATE, not wrap to a negative that \
+             reads as 'under the limit'"
+        );
+
+        // The property that actually matters, stated without reference to i64: the
+        // total is above every limit, so a limit comparison refuses. A spend limit
+        // is an i64 column, so i64::MAX is the largest one that can exist.
+        assert!(
+            total > 0,
+            "a saturated spend must never read as zero or negative: that is the \
+             direction in which a limit silently stops biting"
+        );
+
+        // The control, or the assertion above could pass because nothing was summed
+        // at all. A single row must still be reported exactly.
+        let one = vec![(key, today, 4_242)];
+        assert_eq!(
+            fold_spend_in_window(&one, today).get(&key).copied(),
+            Some(4_242),
+            "an ordinary total must be reported unchanged - saturation must not \
+             perturb the normal case"
+        );
     }
 
     #[test]
