@@ -565,8 +565,8 @@ pub async fn export_account_data(
         // machine-readable; a value that does not parse is passed through as text
         // rather than dropped — losing a key's allowlist would misstate the account.
         let models_raw: String = r.try_get("models")?;
-        let models_value: serde_json::Value = serde_json::from_str(&models_raw)
-            .unwrap_or(serde_json::Value::String(models_raw));
+        let models_value: serde_json::Value =
+            serde_json::from_str(&models_raw).unwrap_or(serde_json::Value::String(models_raw));
         keys_json.push(json!({
             "prefix": r.try_get::<String, _>("prefix")?,
             "label": r.try_get::<Option<String>, _>("label")?,
@@ -2713,8 +2713,11 @@ mod tests {
     #[tokio::test]
     async fn account_email_reads_the_address_from_pocketbase_and_trims_it() {
         let _env = EnvLock::acquire();
-        let origin =
-            pb_stub(http_response("200 OK", r#"{"email":"  ada@example.com  "}"#)).await;
+        let origin = pb_stub(http_response(
+            "200 OK",
+            r#"{"email":"  ada@example.com  "}"#,
+        ))
+        .await;
         let _guard = EnvGuard::set("POCKETBASE_URL", &origin);
 
         let email = account_email(&snap_client(), "pb_user_1").await;
@@ -2781,8 +2784,11 @@ mod tests {
         .await
         .expect("create session");
 
-        let (status, body) =
-            respond(export_account_data(State(pool.clone()), cookie_header(&token))).await;
+        let (status, body) = respond(export_account_data(
+            State(pool.clone()),
+            cookie_header(&token),
+        ))
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert!(
             body["wallet"].is_null(),
@@ -2805,8 +2811,11 @@ mod tests {
         let pool = db.pool.clone();
         let account = live_account(&pool).await;
 
-        let endpoint = snap_stub(http_response("200 OK", r#"{"token":"snap-token-no-redirect"}"#))
-            .await;
+        let endpoint = snap_stub(http_response(
+            "200 OK",
+            r#"{"token":"snap-token-no-redirect"}"#,
+        ))
+        .await;
 
         let mut env_vars = EnvGuard::set("MIDTRANS_ENV", "sandbox");
         env_vars.also("MIDTRANS_SNAP_URL", &endpoint);
@@ -2829,7 +2838,11 @@ mod tests {
             StatusCode::CREATED,
             "a token without a redirect_url is still a created top-up: {body}"
         );
-        assert_eq!(body["snap_token"], json!("snap-token-no-redirect"), "{body}");
+        assert_eq!(
+            body["snap_token"],
+            json!("snap-token-no-redirect"),
+            "{body}"
+        );
         db.close().await;
     }
 
@@ -3321,7 +3334,16 @@ mod tests {
         let key_id = test_support::api_key(&pool, mine.account_id).await;
         test_support::fund(&pool, mine.account_id, 42_000).await;
         debit_usage_transaction(
-            &pool, mine.account_id, Some(key_id), "flash", 100, 10, 50, 111, Some("exp_ref"), 0,
+            &pool,
+            mine.account_id,
+            Some(key_id),
+            "flash",
+            100,
+            10,
+            50,
+            111,
+            Some("exp_ref"),
+            0,
         )
         .await
         .expect("a settlement");
@@ -3338,20 +3360,41 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         for field in [
-            "account", "wallet", "ledger", "topups", "usage_daily",
-            "usage_events", "api_keys", "telegram_linked", "exported_at", "note",
+            "account",
+            "wallet",
+            "ledger",
+            "topups",
+            "usage_daily",
+            "usage_events",
+            "api_keys",
+            "telegram_linked",
+            "exported_at",
+            "note",
         ] {
-            assert!(body.get(field).is_some(), "export is missing {field}: {body}");
+            assert!(
+                body.get(field).is_some(),
+                "export is missing {field}: {body}"
+            );
         }
 
-        assert_eq!(body["account"]["id"], json!(mine.account_id.hyphenated().to_string()));
+        assert_eq!(
+            body["account"]["id"],
+            json!(mine.account_id.hyphenated().to_string())
+        );
         // The balance AFTER the settlement: 42,000 funded minus the 111 IDR the
         // request cost. Asserting the net (not the funding) is what proves the
         // export reads the wallet rather than echoing a fixture constant.
         assert_eq!(body["wallet"]["balance_idr"], json!(42_000 - 111));
         // The ledger carries the matching rows, so the export can reconcile.
-        assert!(!body["ledger"].as_array().unwrap().is_empty(), "the ledger must be exported");
-        assert_eq!(body["usage_events"].as_array().unwrap().len(), 1, "the request must be exported");
+        assert!(
+            !body["ledger"].as_array().unwrap().is_empty(),
+            "the ledger must be exported"
+        );
+        assert_eq!(
+            body["usage_events"].as_array().unwrap().len(),
+            1,
+            "the request must be exported"
+        );
 
         // A key's `models` is emitted as a real JSON array, not a string that
         // contains JSON — the export must be machine-readable.
@@ -3364,14 +3407,25 @@ mod tests {
         // No secret or internal identifier anywhere in the document, by name.
         let text = body.to_string();
         for forbidden in [
-            "key_hash", "token_hash", "pb_user_id", "snap_token",
-            "apk_live_", "password", "ip_hash",
+            "key_hash",
+            "token_hash",
+            "pb_user_id",
+            "snap_token",
+            "apk_live_",
+            "password",
+            "ip_hash",
         ] {
-            assert!(!text.contains(forbidden), "the export leaked {forbidden}: {text}");
+            assert!(
+                !text.contains(forbidden),
+                "the export leaked {forbidden}: {text}"
+            );
         }
 
         // The other account's money never appears.
-        assert!(!text.contains("999999"), "the export leaked another account's balance: {text}");
+        assert!(
+            !text.contains("999999"),
+            "the export leaked another account's balance: {text}"
+        );
 
         db.close().await;
     }
@@ -3380,7 +3434,11 @@ mod tests {
     #[tokio::test]
     async fn export_requires_a_session() {
         let db = TestDb::new().await;
-        let (status, _) = respond(export_account_data(State(db.pool.clone()), HeaderMap::new())).await;
+        let (status, _) = respond(export_account_data(
+            State(db.pool.clone()),
+            HeaderMap::new(),
+        ))
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         db.close().await;
     }

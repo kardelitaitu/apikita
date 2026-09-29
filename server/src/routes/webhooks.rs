@@ -1571,13 +1571,7 @@ mod tests {
         let state = live_app_state(db.pool.clone());
 
         let order_id = pending_topup(&db.pool, account_id, 50_000).await;
-        let refund = notification(
-            &order_id,
-            "200",
-            "50000.00",
-            "refund",
-            LIVE_TEST_SERVER_KEY,
-        );
+        let refund = notification(&order_id, "200", "50000.00", "refund", LIVE_TEST_SERVER_KEY);
 
         let (status, body) = {
             let (_guard, sink) = capture_logs();
@@ -1696,15 +1690,24 @@ mod tests {
         // A valid signature over a non-numeric amount: the amount parse runs
         // AFTER the signature check, so this exercises the parse failure arm
         // specifically, not the rejection arm.
-        let payload =
-            notification("order_x", "200", "not-a-number", "settlement", LIVE_TEST_SERVER_KEY);
+        let payload = notification(
+            "order_x",
+            "200",
+            "not-a-number",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
         let (status, body) = post(&state, payload).await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
             "an unparseable gross_amount is a 400: {body}"
         );
-        assert_eq!(body["error"], json!("invalid gross_amount format"), "{body}");
+        assert_eq!(
+            body["error"],
+            json!("invalid gross_amount format"),
+            "{body}"
+        );
         assert_reconciled(&db.pool, account_id, "after a bad gross_amount").await;
         db.close().await;
     }
@@ -1722,7 +1725,13 @@ mod tests {
         let state = live_app_state(db.pool.clone());
 
         let order_id = "no-such-order-00000000";
-        let payload = notification(&order_id, "200", "50000.00", "settlement", LIVE_TEST_SERVER_KEY);
+        let payload = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
         let (status, body) = post_logged(&state, payload).await;
         assert_eq!(
             status,
@@ -1758,7 +1767,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(topup_status_of(&db.pool, &order_id).await, "denied");
 
-        let settle = notification(&order_id, "200", "50000.00", "settlement", LIVE_TEST_SERVER_KEY);
+        let settle = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
         let (status, body) = post_logged(&state, settle).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(
@@ -1789,7 +1804,13 @@ mod tests {
         const AMOUNT: i64 = 50_000;
         let order_id = pending_topup(&db.pool, account_id, AMOUNT).await;
         // Settle it first; the row is now `settled`, not `pending`.
-        let settle = notification(&order_id, "200", "50000.00", "settlement", LIVE_TEST_SERVER_KEY);
+        let settle = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
         let (status, body) = post(&state, settle).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(topup_status_of(&db.pool, &order_id).await, "settled");
@@ -1826,7 +1847,13 @@ mod tests {
         let state = live_app_state(db.pool.clone());
 
         let order_id = pending_topup(&db.pool, account_id, 50_000).await;
-        let payload = notification(&order_id, "201", "50000.00", "pending", LIVE_TEST_SERVER_KEY);
+        let payload = notification(
+            &order_id,
+            "201",
+            "50000.00",
+            "pending",
+            LIVE_TEST_SERVER_KEY,
+        );
         let (status, body) = post(&state, payload).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(body["status"], json!("pending"), "{body}");

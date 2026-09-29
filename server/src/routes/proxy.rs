@@ -4114,8 +4114,9 @@ mod tests {
     fn error_event_carries_the_code_message_and_a_request_id() {
         let event = error_event("upstream_incomplete", "the stream ended early");
         assert!(event.starts_with("event: error\ndata: "));
-        let data: Value = serde_json::from_str(event.trim_start_matches("event: error\ndata: ").trim())
-            .expect("the error event payload is JSON");
+        let data: Value =
+            serde_json::from_str(event.trim_start_matches("event: error\ndata: ").trim())
+                .expect("the error event payload is JSON");
         assert_eq!(data["error"]["code"], "upstream_incomplete");
         assert_eq!(data["error"]["message"], "the stream ended early");
         assert!(data["error"]["request_id"]
@@ -4127,7 +4128,10 @@ mod tests {
     #[test]
     fn requested_stream_flag_reads_only_an_explicit_bool() {
         assert_eq!(requested_stream_flag(&json!({"stream": true})), Some(true));
-        assert_eq!(requested_stream_flag(&json!({"stream": false})), Some(false));
+        assert_eq!(
+            requested_stream_flag(&json!({"stream": false})),
+            Some(false)
+        );
         // absent, null and a non-bool value all fall through to "unset", never to false.
         assert_eq!(requested_stream_flag(&json!({})), None);
         assert_eq!(requested_stream_flag(&json!({"stream": null})), None);
@@ -4190,22 +4194,33 @@ mod tests {
 
         // An unknown model is an allowlist error, not an upstream outage.
         assert!(matches!(
-            upstream_error(UpstreamError::NoModel("flash".into()), "flash", account_id, &client),
+            upstream_error(
+                UpstreamError::NoModel("flash".into()),
+                "flash",
+                account_id,
+                &client
+            ),
             AppError::ModelNotAllowed(_)
         ));
 
         // Every endpoint open: a 503 carrying the cooldown (or the 1s floor).
-        let AppError::NoUpstreamAvailable { retry_after_secs } =
-            upstream_error(UpstreamError::NoHealthyUpstream("flash".into()), "flash", account_id, &client)
-        else {
+        let AppError::NoUpstreamAvailable { retry_after_secs } = upstream_error(
+            UpstreamError::NoHealthyUpstream("flash".into()),
+            "flash",
+            account_id,
+            &client,
+        ) else {
             panic!("NoHealthyUpstream must become NoUpstreamAvailable");
         };
         assert!(retry_after_secs >= 1);
 
         // A transport error is withheld from the client and surfaced as a 503.
-        let AppError::NoUpstreamAvailable { retry_after_secs } =
-            upstream_error(UpstreamError::Transport("tls alert".into()), "flash", account_id, &client)
-        else {
+        let AppError::NoUpstreamAvailable { retry_after_secs } = upstream_error(
+            UpstreamError::Transport("tls alert".into()),
+            "flash",
+            account_id,
+            &client,
+        ) else {
             panic!("Transport must become NoUpstreamAvailable");
         };
         assert!(retry_after_secs >= 1);
@@ -4217,7 +4232,12 @@ mod tests {
             AppError::Internal(_)
         ));
         assert!(matches!(
-            upstream_error(UpstreamError::ServerError(400), "flash", account_id, &client),
+            upstream_error(
+                UpstreamError::ServerError(400),
+                "flash",
+                account_id,
+                &client
+            ),
             AppError::Internal(_)
         ));
     }
@@ -4242,9 +4262,13 @@ mod tests {
             .await
             .expect("expire the key");
 
-        let err = call_chat_completions(&test_state(pool.clone()), &key, r#"{"model":"flash","stream":true}"#)
-            .await
-            .expect_err("an expired key must not authenticate");
+        let err = call_chat_completions(
+            &test_state(pool.clone()),
+            &key,
+            r#"{"model":"flash","stream":true}"#,
+        )
+        .await
+        .expect_err("an expired key must not authenticate");
         assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
         assert_eq!(err.code(), "key_expired");
         db.close().await;
@@ -4303,13 +4327,18 @@ mod tests {
         .await
         .expect("record prior token usage");
 
-        let err = call_chat_completions(&test_state(pool.clone()), &key, r#"{"model":"flash","stream":true}"#)
-            .await
-            .expect_err("a key at its token ceiling must be refused");
+        let err = call_chat_completions(
+            &test_state(pool.clone()),
+            &key,
+            r#"{"model":"flash","stream":true}"#,
+        )
+        .await
+        .expect_err("a key at its token ceiling must be refused");
         assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(err.code(), "key_limit_exceeded");
         assert_eq!(
-            err.details().and_then(|d| d["reason"].as_str().map(str::to_string)),
+            err.details()
+                .and_then(|d| d["reason"].as_str().map(str::to_string)),
             Some("token_limit_reached".to_string())
         );
         db.close().await;
@@ -4501,14 +4530,10 @@ mod tests {
         let reservation = reservation_for(&config, &body);
         assert!(reservation > 0, "the fixture's hold must be a real hold");
 
-        let held = reserve_balance_transaction(
-            &db.pool,
-            account_id,
-            reservation,
-            Some(&reservation_ref),
-        )
-        .await
-        .expect("the funded wallet covers the worst case");
+        let held =
+            reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+                .await
+                .expect("the funded wallet covers the worst case");
         assert!(
             matches!(held, ReservationResult::Held { .. }),
             "the fixture wallet must be able to hold: {held:?}"
@@ -4573,8 +4598,9 @@ mod tests {
         .await;
 
         // Billed exactly the upstream's own report: 10 in, 0 cached, 5 out.
-        let (input, cached, output, cost) =
-            usage_today(&db.pool, account_id).await.expect("usage recorded");
+        let (input, cached, output, cost) = usage_today(&db.pool, account_id)
+            .await
+            .expect("usage recorded");
         assert_eq!((input, cached, output), (10, 0, 5));
         assert!(cost > 0, "a reported answer must cost something");
 
@@ -4705,7 +4731,8 @@ mod tests {
         let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
         let db = TestDb::new().await;
 
-        let content_part = "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        let content_part =
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
         let usage_part =
             "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n";
         let endpoint = streaming_upstream_in_two_parts(
@@ -4762,8 +4789,9 @@ mod tests {
 
         // The drained body still carried the usage block, so the tokens the
         // upstream generated are on the books.
-        let (input, cached, output, cost) =
-            usage_today(&db.pool, account_id).await.expect("drained usage is billed");
+        let (input, cached, output, cost) = usage_today(&db.pool, account_id)
+            .await
+            .expect("drained usage is billed");
         assert_eq!((input, cached, output), (10, 0, 5));
         assert!(cost > 0);
         assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000 - cost);
@@ -4783,8 +4811,7 @@ mod tests {
 
         // Content-Length promises 500 more bytes than are sent, then the
         // connection closes: hyper reports a transport error mid-body.
-        let endpoint =
-            streaming_upstream(sse_http("200 OK", "data: {\"ch", 500)).await;
+        let endpoint = streaming_upstream(sse_http("200 OK", "data: {\"ch", 500)).await;
         let (account_id, key_id, client, config, reservation_ref) =
             stream_fixture(&db, endpoint).await;
 
@@ -4807,7 +4834,9 @@ mod tests {
         use futures_util::StreamExt;
         let mut forwarded = String::new();
         while let Some(item) = metered.next().await {
-            forwarded.push_str(&String::from_utf8_lossy(&item.expect("the tee yields Ok chunks")));
+            forwarded.push_str(&String::from_utf8_lossy(
+                &item.expect("the tee yields Ok chunks"),
+            ));
         }
 
         assert!(

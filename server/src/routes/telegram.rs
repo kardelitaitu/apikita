@@ -533,13 +533,12 @@ mod tests {
         let result = record_and_check_attempt(&db.pool, "ip-test-disabled", 0, now).await;
         assert!(result.is_ok(), "limit 0 must never refuse: {result:?}");
         // The attempt was recorded despite the refusal being disabled.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM link_redemption_attempts WHERE ip_hash = ?",
-        )
-        .bind("ip-test-disabled")
-        .fetch_one(&db.pool)
-        .await
-        .expect("count attempts");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM link_redemption_attempts WHERE ip_hash = ?")
+                .bind("ip-test-disabled")
+                .fetch_one(&db.pool)
+                .await
+                .expect("count attempts");
         assert_eq!(count, 1, "the attempt must be recorded even when disabled");
         db.close().await;
     }

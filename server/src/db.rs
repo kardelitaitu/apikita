@@ -623,13 +623,11 @@ pub async fn purge_expired_usage(
     // promises.
     //
     // The cutoff is a full RFC3339 instant because both columns are timestamps.
-    let sessions = sqlx::query(
-        "DELETE FROM sessions WHERE COALESCE(revoked_at, expires_at) <= ?",
-    )
-    .bind(midnight(SESSION_RETENTION_DAYS))
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let sessions = sqlx::query("DELETE FROM sessions WHERE COALESCE(revoked_at, expires_at) <= ?")
+        .bind(midnight(SESSION_RETENTION_DAYS))
+        .execute(pool)
+        .await?
+        .rows_affected();
 
     Ok(PurgedUsage {
         usage_events,
@@ -3101,7 +3099,10 @@ mod tests {
         .unwrap();
 
         let lag = retention_lag(&db.pool, today).await.unwrap();
-        assert!(lag.usage_events.is_none(), "a row inside the window is not lagging");
+        assert!(
+            lag.usage_events.is_none(),
+            "a row inside the window is not lagging"
+        );
         assert!(!lag.anything_behind());
 
         db.close().await;
@@ -3129,7 +3130,10 @@ mod tests {
         .unwrap();
 
         let lag = retention_lag(&db.pool, today).await.unwrap();
-        assert!(lag.anything_behind(), "a 200-day-old row breaks a 90-day promise");
+        assert!(
+            lag.anything_behind(),
+            "a 200-day-old row breaks a 90-day promise"
+        );
         let days_old = lag
             .usage_events
             .expect("usage_events is the lagging table and must be named");
@@ -3238,15 +3242,22 @@ mod tests {
         }
 
         let purged = purge_expired_usage(&db.pool, today).await.unwrap();
-        assert_eq!(purged.usage_events, 1, "only the row AT the cutoff day is deleted");
+        assert_eq!(
+            purged.usage_events, 1,
+            "only the row AT the cutoff day is deleted"
+        );
 
         // The two survivors are the second-after-cutoff and the recent one.
-        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(kept, 2, "90 days are RETAINED, so the boundary day goes and 89 stay");
+        let kept: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kept, 2,
+            "90 days are RETAINED, so the boundary day goes and 89 stay"
+        );
 
         db.close().await;
     }
@@ -3272,9 +3283,18 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(purge_expired_usage(&db.pool, today).await.unwrap().usage_events, 1);
         assert_eq!(
-            purge_expired_usage(&db.pool, today).await.unwrap().usage_events,
+            purge_expired_usage(&db.pool, today)
+                .await
+                .unwrap()
+                .usage_events,
+            1
+        );
+        assert_eq!(
+            purge_expired_usage(&db.pool, today)
+                .await
+                .unwrap()
+                .usage_events,
             0,
             "the second sweep removes nothing"
         );
@@ -3287,7 +3307,6 @@ mod tests {
     fn usage_events_retention_constant_is_documented() {
         assert_eq!(USAGE_EVENTS_RETENTION_DAYS, 90);
     }
-
 
     /// `usage_daily` is kept 24 months: a row at the cutoff DAY is deleted, one a
     /// day later is kept. `day` is a TEXT date, so the bound is a date, not an
@@ -3367,9 +3386,21 @@ mod tests {
         }
 
         // (a) Long expired, never revoked -> deleted.
-        seed_session(&db.pool, account_id, cutoff - chrono::Duration::days(1), None).await;
+        seed_session(
+            &db.pool,
+            account_id,
+            cutoff - chrono::Duration::days(1),
+            None,
+        )
+        .await;
         // (b) Revoked early with a FUTURE expires_at -> deleted, on `revoked_at`.
-        seed_session(&db.pool, account_id, future, Some(cutoff - chrono::Duration::days(1))).await;
+        seed_session(
+            &db.pool,
+            account_id,
+            future,
+            Some(cutoff - chrono::Duration::days(1)),
+        )
+        .await;
         // (c) Still live (expires in the future, not revoked) -> kept.
         seed_session(&db.pool, account_id, future, None).await;
 
@@ -3422,14 +3453,10 @@ mod tests {
         let account_id = test_support::account(&db.pool).await;
 
         for requested in [0, -1] {
-            let outcome = reserve_balance_transaction(
-                &db.pool,
-                account_id,
-                requested,
-                Some("zero_ref"),
-            )
-            .await
-            .expect("a zero reservation is not an error");
+            let outcome =
+                reserve_balance_transaction(&db.pool, account_id, requested, Some("zero_ref"))
+                    .await
+                    .expect("a zero reservation is not an error");
             assert_eq!(outcome, ReservationResult::Zero, "requested {requested}");
         }
 
@@ -3481,7 +3508,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*debited_idr, 0, "no wallet means nothing could be debited");
-                assert_eq!(*shortfall_idr, 1_000, "the whole cost is a visible shortfall");
+                assert_eq!(
+                    *shortfall_idr, 1_000,
+                    "the whole cost is a visible shortfall"
+                );
             }
             other => panic!("expected a partial settlement, got {other:?}"),
         }
