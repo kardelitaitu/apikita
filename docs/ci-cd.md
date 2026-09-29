@@ -405,6 +405,33 @@ threshold *cannot* express is the question this section now answers by hand.
 `UpstreamClient::worst_case_reservation_idr` was entered by six of its own tests and
 called by no request. Coverage narrows the field; it does not close it.
 
+### What this repository has established it CANNOT check automatically
+
+Three separate ideas for an automatic guard were built and **measured to death**, and
+the results are here so nobody builds them again.
+
+| Proposed check | Measured | Verdict |
+| --- | --- | --- |
+| Every `pub fn` has a production call site | 137 examined, **37 have none, all false positives** | axum route handlers, which the ROUTER calls by path. Would need a 37-entry list that is really a list of every endpoint. |
+| Every operational document cites code by name, not line | shipped, and fires | the one that works |
+| A comment's quoted text must sit near the line it cites | 4 candidates crate-wide, **0 misplaced** | measured, nothing left to catch, **not built** |
+| A production function name appears in only one place | 251 scanned, **13 collisions, 0 real** | `new` ×8, `main` ×6, `into_response`/`fmt`/`drop` trait impls, per-type methods. All legitimate. |
+
+**The common finding is that name- and shape-based checks cannot see the defect this
+repository actually has.** The dangerous copies had *different bodies*: three session
+resolvers that were each a little weaker than the original, and a rule copied into two
+places so two copies could drift. A check for duplicate bodies would have caught only
+the hash copies. A check for duplicate names catches none of the four. What separates
+the real duplication from the 13 false positives is **whether the copies are supposed to
+be the same rule**, and that is a judgement no source-level test can make — which is
+why the four real findings took reading, and why the one that mattered most took a test
+written at the *handler* rather than at the shared function.
+
+So the honest summary of automated checking here: it is excellent at pinning a stated
+rule to a stated instant, and it is blind to two rules quietly disagreeing. The first
+kind has produced the money and session invariants in this crate. The second is a
+review activity, and this section exists to say so rather than to imply otherwise.
+
 **The same class of drift is still open in SOURCE COMMENTS, and the scope is
 measured rather than guessed.** The check above covers the fourteen documents an
 operator acts on. It does not cover the Rust, which cites documents by line in
