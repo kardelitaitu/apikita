@@ -1,6 +1,6 @@
 # Proxy Hot-Path Audit — the "SOTA blueprint" against the implementation
 
-**Status:** analysis, for review · **Date:** 2026-09-25 · **Branch:** `0.0.1`
+**Status:** analysis, for review · **Date:** 2026-09-25 · **Actions re-verified 2026-09-29: 7 of 9 done, 2 open — see [§8](#8-actions)** · **Branch:** `0.0.1`
 **Companion to:** [`sqlite-migration.md`](sqlite-migration.md) — that plan covers the
 *storage* port; this covers the *request* path.
 **Input:** an external "SOTA Rust proxy blueprint" and a `rusqlite` vs `sqlx` analysis.
@@ -437,25 +437,56 @@ Worth recording, because these are the parts to keep:
 
 Ordered by value per unit of effort.
 
-| # | Action | Effort | Where |
-| --- | --- | --- | --- |
-| 1 | Delete `allow_negative_balance_overdraft` from config, struct and fixture | minutes | F2 |
-| 2 | Resolve `default_max_output_tokens` — wire it up or delete it, and fix the comment | minutes | F3 |
-| 3 | Set `tcp_nodelay(true)` on the upstream client; measure | minutes | F1 |
-| 4 | Set `TCP_NODELAY` on the server's accepted sockets; measure time-to-first-token | small | F1 |
-| 5 | State the stranded-hold bound; schedule the sweep alongside `ip-purge` | small | F6 |
-| 6 | Add `supports_stream_options` per endpoint | small | F4 |
-| 7 | Set `pool_idle_timeout` deliberately | minutes | F5 |
-| 8 | State the mid-stream-disconnect billing rule in the Terms of Service | small | [§4.5](#45-graceful-disconnect--the-codebase-does-the-opposite-on-purpose) |
-| 9 | Pin `worker_threads` | minutes | F7 |
+| # | Action | Effort | Where | Status |
+| --- | --- | --- | --- | --- |
+| 1 | Delete `allow_negative_balance_overdraft` from config, struct and fixture | minutes | F2 | **DONE** |
+| 2 | Resolve `default_max_output_tokens` — wire it up or delete it, and fix the comment | minutes | F3 | **DONE** — deleted |
+| 3 | Set `tcp_nodelay(true)` on the upstream client; measure | minutes | F1 | **DONE** — `upstream/client.rs`, not measured |
+| 4 | Set `TCP_NODELAY` on the server's accepted sockets; measure time-to-first-token | small | F1 | **OPEN — and the effort estimate was wrong, see below** |
+| 5 | State the stranded-hold bound; schedule the sweep alongside `ip-purge` | small | F6 | **DONE** — bound stated in `bin/hold-sweep.rs`; the scheduler runs it nightly |
+| 6 | Add `supports_stream_options` per endpoint | small | F4 | **DONE** — on every endpoint in `config/apikita.toml` |
+| 7 | Set `pool_idle_timeout` deliberately | minutes | F5 | **DONE** — 30s, with the reasoning inline |
+| 8 | State the mid-stream-disconnect billing rule in the Terms of Service | small | [§4.5](#45-graceful-disconnect--the-codebase-does-the-opposite-on-purpose) | **DONE** — `docs/terms-of-service.md`, "Billing when the client disconnects mid-answer" |
+| 9 | Pin `worker_threads` | minutes | F7 | **OPEN** — needs a measurement, see below |
 
-**Actions 1 and 2 are the ones worth doing immediately**, because they are not
+*(The status column was added after the fact. Seven of these nine were already done
+when this table was last read as a to-do list, and the table gave no sign of that: it
+is the same stale-document class this repository keeps having to fix — a list that
+reads as outstanding work long after the work landed, which sends a reader to redo
+it. Every DONE above was re-verified against the tree before being marked, not
+inferred from the absence of a complaint.)*
+
+**ACTION 4 IS NOT THE `small` CHANGE THIS TABLE SUGGESTED.** The upstream half is one
+line. The server half is not, and the reason is a platform API, not effort:
+`TCP_NODELAY` has to be set on the LISTENING socket before the accept loop starts,
+and the only stable-Rust route to a socket option is `std::net::TcpSocket` — which is
+still `#![feature(tcp_socket)]`, unstable. `TcpListener::bind` sets no options at all,
+so an accepted socket keeps the system default — and that default is **Nagle ON**.
+Measured rather than assumed: binding, accepting, and reading the option back through
+`into_std().nodelay()` returns `false`, which is the same statement said the other way
+round. So the downstream SSE leg (provider to browser, the one the customer waits on)
+has had Nagle enabled all along, while the upstream leg has had it off since action 3.
+
+So closing it means one of: a `socket2` dependency, a nightly toolchain, or giving up
+`axum::serve` for a hand-written accept loop that sets `set_nodelay(true)` per
+connection. The last is the worst of the three — per-connection is a worse place to
+set it, because it leaves a window on the first bytes, and it means owning shutdown.
+None of that is worth doing for a win nobody has measured, which is what this audit's
+own instruction below says to do first. **The blocker is the missing measurement, and
+the estimate hid a real API constraint behind it.**
+
+**Action 9 wants a number this repository does not have.** `worker_threads` is
+untuned because the right value depends on the container's CPU allocation, which is
+Northflank's developer tier until Phase 6 provisions it. Pinning a number now would
+be pinning a guess, and the runtime's default is already `available_parallelism`.
+
+**Actions 1 and 2 were the ones worth doing immediately**, because they are not
 optimisations — they are the repository contradicting its own decision register, which
-is the failure mode the register exists to prevent.
+is the failure mode the register exists to prevent. Both are done.
 
-**Actions 3 and 4 are the only performance work the audit found**, and both are
-single-line changes on the streaming path. Measure before and after; do not assume the
-size of the win.
+**Actions 3 and 4 are the only performance work the audit found.** Action 3 is done
+and was not measured. Action 4 is open, for the reason above. If either is taken up,
+measure before and after; do not assume the size of the win.
 
 **Nothing in this audit changes [`sqlite-migration.md`](sqlite-migration.md).** That plan
 was checked against these findings: the `sqlx` choice stands
