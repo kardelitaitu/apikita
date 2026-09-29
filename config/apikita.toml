@@ -5,7 +5,19 @@
 # Two configs with the same rates and different keys is a startup failure.
 #
 # SECRETS: this file names ENVIRONMENT VARIABLES only. Never inline a key.
-# The names here must match .env.example exactly.
+#
+# The names here should match `.env.example`, and this line used to say they must,
+# which was false. `APK_V4PRO_PRIMARY_KEY_1` names a real endpoint below and is NOT in
+# `.env.example`, so an operator who copies that file to `.env` and fills it in never
+# sets it, and the v4pro endpoint has no key to lease. It is listed there rather than
+# added to `.env.example` because the resale terms for that route are unverified and it
+# is not one to invite an operator to configure until they are.
+#
+# The `APK_DUMMY_*` names further down are the other direction and are CORRECTLY absent:
+# they are placeholders in example endpoint blocks, and shipping a dummy key in a file
+# meant to be copied into production invites someone to leave it there. So the rule is
+# not "identical" - it is that a name an operator is expected to set appears in both, and
+# a name that is a placeholder or an unconfigured route appears only here.
 #
 # Deployment: docs/deployment.md · Decisions: docs/decisions.md
 
