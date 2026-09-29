@@ -126,6 +126,29 @@ That is worth weighing when deciding what to close next: the chains that had gon
 unverified for the longest are the ones most likely to have drifted quietly, and
 "no test covers it" is not evidence that there is nothing to find.
 
+### One link in the route chain has no check, and a naive one is wrong
+
+The API surface is guarded in three directions: every route `MOUNTED` lists is
+mounted by `create_router` (the table test drives the real router, not a test app),
+every route `MOUNTED` lists is in the spec, and every route the spec presents as
+built is mounted. What is **not** checked is the first link going the other way: a
+route added to `create_router` and forgotten in `MOUNTED` would escape all three,
+because every check starts from the table rather than the router.
+
+It is empty today — the two agree. It is recorded because closing it is a trap,
+and one I fell into while writing this. A source-level parse of `create_router` looks
+trivial and is not: several `.route(` calls put the path on the NEXT line, so a
+regex of the form `route("PATH"` matches twenty of twenty-six and reports
+`/webhooks/midtrans` — the Midtrans webhook — as unmounted. It is mounted, and
+`webhooks.rs` has a test that routes it.
+
+axum does not expose its route table, so a sound check cannot be written by
+scraping the source. The honest options are to enumerate the routes in a macro or a
+constant that `create_router` itself consumes, or to leave the link unverified and
+**say so**, which is what this paragraph is. A check built on the regex would have
+reported a missing payment webhook, and that is worse than no check: it is a false
+alarm on the one route that moves money.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
