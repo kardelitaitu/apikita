@@ -111,3 +111,29 @@ test('every ticker figure is its own model config rate times its own multiplier'
     }
   }
 });
+
+// The OTHER transcription in this module: the deposit minimums. They were written into
+// one place two rounds ago because the landing page stated them twice, and a figure that
+// lives in one place is still a COPY - one place is not one source. `min_first_deposit`
+// and `min_topup` are read here for the same reason the rates are: a customer who
+// deposits 10,000 having read 10,001 is rejected by a server the page contradicts, and
+// the page is what they read.
+test('the deposit minimums are the config wallet minimums', async () => {
+  const { minFirstDepositIdr, minTopupIdr } = await import('../src/lib/models.ts');
+
+  const wallet = config.slice(config.indexOf('[wallet]'));
+  const read = (key: string): number => {
+    const m = wallet.match(new RegExp('^\\s*' + key + '\\s*=\\s*([0-9]+)', 'm'));
+    assert.ok(m, 'the config no longer declares wallet.' + key);
+    return Number(m[1]);
+  };
+
+  assert.equal(minFirstDepositIdr, read('min_first_deposit'));
+  assert.equal(minTopupIdr, read('min_topup'));
+  // A first deposit below the later minimum would make the second figure unreachable,
+  // which is a coherent-looking config that no longer means what the page says.
+  assert.ok(
+    minFirstDepositIdr > minTopupIdr,
+    'min_first_deposit is not above min_topup, so the page would quote two minimums where one is unreachable'
+  );
+});
