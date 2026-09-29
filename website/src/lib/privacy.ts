@@ -13,9 +13,17 @@
 // confidence behind it:
 //   1. the usage_events schema has no text column of any kind - model, token
 //      counts, cost, ref and timestamps only;
-//   2. no migration mentions prompt, completion, request_body or response_body;
+//   2. no migration mentions prompt, completion, request_body or response_body -
+//      and that one is now ENFORCED rather than checked once, by
+//      no_schema_column_is_named_for_a_prompt_or_a_completion, which reads every
+//      migration. It uses the four words above plus messages and conversation;
+//      when it was first written it had three of the four and had swapped
+//      response_body for two of its own, which is the kind of drift that makes a
+//      guard decoration;
 //   3. the only free-text columns in the database are the three review bodies,
 //      which are customer-written testimonials the same page discloses below.
+//      This one is a judgement rather than a check - "free text" is not a schema
+//      property - and is the reason the guard above looks at NAMES.
 //
 // The DATABASE side of this claim is now checked. A prompt column added to the
 // schema for debugging used to break it silently - the column lands, every other

@@ -824,10 +824,18 @@ mod tests {
     /// failure would be worth reading rather than renaming the column.
     #[test]
     fn no_schema_column_is_named_for_a_prompt_or_a_completion() {
+        // The words are taken from the page itself: its comment lists prompt,
+        // completion, request_body and response_body as the names it checked for and did
+        // not find. The first version of this test covered three of those four and
+        // quietly swapped response_body for two of its own - so the guard and the claim
+        // it was written to enforce were not saying the same thing, and a column named
+        // response_body would have passed a test named for exactly that case. A guard
+        // and its claim have to use the same list or one of them is decoration.
         const FORBIDDEN: &[&str] = &[
             "prompt",
             "completion",
             "request_body",
+            "response_body",
             "messages",
             "conversation",
         ];
