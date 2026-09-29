@@ -5,6 +5,12 @@ The system, end to end. This document **supersedes** the stack choices in
 frontend's internal structure and is still useful, but where it names
 PocketBase or Pages Functions, this document wins.
 
+**Changing the code?** [testing.md](testing.md) is the one to read before you
+add a rule, a guard or a test — it records what this suite does check, the one
+defect class that produces most of the real findings (a duplicated rule drifting
+toward the weaker reading), and three ideas for an automatic guard that were
+built here, measured, and rejected.
+
 ## Stack
 
 | Component | Runs on | Language | Purpose |
