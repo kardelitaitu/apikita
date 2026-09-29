@@ -39,20 +39,33 @@
     // [profile.release] below leaves overflow-checks at its default of OFF, so
     // an overflow in the build that ships wraps silently.
     //
-    // The lint that does say it is clippy::arithmetic_side_effects, and it is not
-    // enabled here because it reports 43 sites in this crate, most of them
-    // arithmetic that cannot overflow in practice (a u8 counter, a Duration).
-    // Turning it on is a deliberate piece of work, not a one-line change: each
-    // site needs a judgement about whether its operands are actually bounded.
+    // The lint that does say it is clippy::arithmetic_side_effects. It is NOT
+    // enabled here, because at crate level it reports 43 sites, most of them
+    // arithmetic that cannot overflow in practice (a u8 counter, a Duration) and
+    // where an overflow would cost a wrong counter rather than wrong money.
     //
-    // So the honest statement of what protects money is the schema and the
-    // reconciliation gate, not a lint: wallets carry CHECK (balance_idr >= 0), and
-    // tools/reconcile compares SUM(ledger.delta_idr) to the balance per account.
-    // A wrapped NEGATIVE is refused by the CHECK and a wrapped ledger value is
-    // caught by reconcile. What neither can catch is a wrap that lands on a
-    // plausible positive figure - which is why the non-finite price guard in
-    // config.rs is a hard validation rather than a lint too, and why a config
-    // that bills at zero cannot be reconciled away.
+    // IT IS enabled where the trade-off inverts. `money` and `db` each carry their
+    // own module-level deny of the same lint, scoped the same way, because those
+    // two modules produce every figure a customer is charged and [profile.release]
+    // wraps rather than panics. money.rs cost nothing - it has zero sites outside
+    // its tests. db.rs had nine, in seven functions, and each one now carries a
+    // written argument for why its operands are bounded, except the one that is
+    // bounded only by MAGNITUDE (new_balance - charge_delta), which is checked at
+    // runtime instead.
+    //
+    // So the honest statement of what protects money is now three things, not two:
+    // the schema and the reconciliation gate below, plus a lint on the modules where
+    // an overflow would be financial. Wallets carry CHECK (balance_idr >= 0) and
+    // tools/reconcile compares SUM(ledger.delta_idr) to the balance per account, so a
+    // wrapped NEGATIVE is refused by the CHECK and a wrapped ledger value is caught
+    // by reconcile. What neither can catch is a wrap that lands on a plausible
+    // POSITIVE figure - which is why the non-finite price guard in config.rs is a
+    // hard validation rather than a lint too, and why a config that bills at zero
+    // cannot be reconciled away.
+    //
+    // Extending the deny to the remaining modules is available and is not done: each
+    // site there needs the same judgement, and doing 43 of them in one pass is how
+    // a written argument ends up being a rubber stamp.
     //
     // SCOPED TO NON-TEST BUILDS, because a panic is an availability incident
     // only on the request path. A test that unwraps a fixture it just built has
