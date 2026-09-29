@@ -1286,11 +1286,10 @@ pub async fn chat_completions(
     // under-reserve. The true cost is charged at settlement regardless, so only
     // the over-askers benefit from the extra headroom and the under-reserved case
     // is gone.
-    let max_output = meta
-        .max_tokens
-        .unwrap_or(0)
-        .max(model_cfg.max_output_tokens)
-        .min(state.config.streaming.hard_max_output_tokens);
+    let max_output = model_cfg.reserved_output_tokens(
+        meta.max_tokens,
+        state.config.streaming.hard_max_output_tokens,
+    );
 
     // One reservation per endpoint, and the DEAREST wins: the hold is taken
     // before routing and may be served by any endpoint in the pool, so it must
@@ -3239,10 +3238,8 @@ mod tests {
             .find(|m| m.name == model)
             .expect("the model must be in the config");
         let estimated_input = estimated_input_tokens(body);
-        let max_output = max_tokens
-            .unwrap_or(0)
-            .max(model_cfg.max_output_tokens)
-            .min(config.streaming.hard_max_output_tokens);
+        let max_output =
+            model_cfg.reserved_output_tokens(max_tokens, config.streaming.hard_max_output_tokens);
 
         let at = |input_peak: f64, output_peak: f64| {
             calculate_preflight_reservation_idr(
@@ -4705,9 +4702,8 @@ mod tests {
     fn reservation_for(config: &AppConfig, body: &str) -> i64 {
         let model_cfg = &config.models[0];
         let estimated_input = estimated_input_tokens(body.as_bytes());
-        let max_output = 50u64
-            .max(model_cfg.max_output_tokens)
-            .min(config.streaming.hard_max_output_tokens);
+        let max_output =
+            model_cfg.reserved_output_tokens(Some(50), config.streaming.hard_max_output_tokens);
         model_cfg.worst_case_reservation_idr(estimated_input, max_output)
     }
 

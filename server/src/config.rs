@@ -228,6 +228,46 @@ impl ModelConfig {
     /// So it is deleted rather than left as a spare, and the fields it alone read
     /// went with it. The rule now has one home, and the only test of it is a test of
     /// the code that actually runs.
+    ///
+    /// AND IT IS NOT JUST A SPARE THAT IS DELETED - it is also that the OUTPUT side of
+    /// the hold had the same problem in reverse. `max(requested, model cap).min(hard
+    /// cap)` was written inline in the handler, and then REWRITTEN a second time in two
+    /// test helpers, because a test could not call an expression buried in the middle
+    /// of a request. So the formula the money depended on was pinned in two copies
+    /// that no test shared, and neither was the line the handler actually runs.
+    ///
+    /// This method is that formula, so the three sites call ONE implementation and the
+    /// tests call the code that actually runs.
+    ///
+    /// The output tokens the pre-flight hold is taken against, and WHY it is not the
+    /// client's own cap.
+    ///
+    /// A request that omits `max_tokens`, or asks for less than the model can produce,
+    /// still lets the upstream stream up to the model's own ceiling - so holding only
+    /// the client's figure leaves a 4096-token hold guarding a model that can emit
+    /// 384000 tokens, and an over-long answer overdrew the wallet. The bound is
+    /// therefore max(requested, model cap), clamped to the global hard cap.
+    ///
+    /// The tradeoff is deliberate and worth stating, because it takes money from
+    /// clients who asked for less: when a client asks for 1000 tokens the hold covers
+    /// the model's 384000. The true cost is charged at settlement regardless, so the
+    /// hold is released down to what was actually used - over-asking customers lose
+    /// headroom, and the under-reserved case is gone entirely. A hold's job is to
+    /// never under-reserve, and an over-reserve is bounded and refunded.
+    ///
+    /// The clamp is NOT vacuous, which is worth saying because it reads that way when
+    /// `hard_max_output_tokens` and every model's `max_output_tokens` ship at the same
+    /// 384000. The two fire in different places: the model cap binds for every
+    /// ordinary request, and the HARD cap binds only when a client ASKS for more -
+    /// `{"max_tokens": 1000000}` clamps to 384000. Setting the global equal to the
+    /// model cap is therefore a backstop, not a no-op; raising a model's ceiling above
+    /// the global is what makes the global the binding constraint for everyone.
+    pub fn reserved_output_tokens(&self, requested: Option<u64>, hard_cap: u64) -> u64 {
+        requested
+            .unwrap_or(0)
+            .max(self.max_output_tokens)
+            .min(hard_cap)
+    }
     pub fn worst_case_reservation_idr(
         &self,
         estimated_input_tokens: u64,
@@ -640,6 +680,82 @@ fn validate_trusted_proxy_width(cidrs: &[String]) -> Result<(), Box<dyn std::err
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The output side of the pre-flight hold, pinned at all four corners.
+    ///
+    /// The formula is max(requested, model cap).min(hard cap), and each clause
+    /// exists because of a way the hold has been wrong before:
+    ///
+    ///   - A request that OMITS max_tokens must still hold the model's ceiling.
+    ///     Holding only the client's figure left a 4096-token hold guarding a model
+    ///     that emits up to 384000 tokens, and an over-long answer overdrew the
+    ///     wallet.
+    ///   - A request that asks for LESS than the model can produce must also hold
+    ///     the model's ceiling, for the same reason.
+    ///   - A request that asks for MORE than the global cap is CLAMPED to it.
+    ///
+    /// The last clause reads as vacuous, because hard_max_output_tokens and every
+    /// model's max_output_tokens ship at the same 384000 - so this file previously
+    /// carried the claim that the global cap can never bind. That claim was WRONG, and
+    /// worth recording as wrong: the two fire in DIFFERENT PLACES. The model cap
+    /// binds for every ordinary request, and the hard cap binds exactly when a
+    /// client asks for more than it. Setting the global equal to the model cap is a
+    /// BACKSTOP, not a no-op.
+    #[test]
+    fn the_output_hold_is_the_model_ceiling_clamped_to_the_global() {
+        let config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        let model = &config.models[0];
+        let hard = config.streaming.hard_max_output_tokens;
+
+        // (1) OMITTED: no cap in the request at all.
+        assert_eq!(
+            model.reserved_output_tokens(None, hard),
+            model.max_output_tokens,
+            "a request that omits max_tokens still lets the upstream stream to the \
+             model's ceiling, so the hold must be the model's own"
+        );
+
+        // (2) ASKING FOR LESS: the upstream is not obliged to stop at the client's
+        // figure, so holding their cap would under-reserve.
+        for asked in [1u64, 1000, 4096] {
+            assert_eq!(
+                model.reserved_output_tokens(Some(asked), hard),
+                model.max_output_tokens,
+                "a client asked for {asked} tokens but the model can emit {}, so holding \
+                 their cap would under-reserve",
+                model.max_output_tokens
+            );
+        }
+
+        // (3) ASKING FOR MORE: this is the clamp the global cap exists for.
+        for asked in [hard + 1, hard * 2, u64::MAX / 2] {
+            assert_eq!(
+                model.reserved_output_tokens(Some(asked), hard),
+                hard,
+                "a client asked for {asked} output tokens, which must clamp to the \
+                 global ceiling"
+            );
+        }
+
+        // (4) THE GLOBAL BELOW THE MODEL: then the hard cap binds for EVERYONE,
+        // including a request that asked for nothing. Without this, reading the two
+        // as equal and therefore redundant would look safe.
+        let tighter = model.max_output_tokens - 1;
+        assert_eq!(
+            model.reserved_output_tokens(None, tighter),
+            tighter,
+            "when the global ceiling is below the model's own, the global binds for \
+             every request - the configuration that makes the hard cap load bearing \
+             rather than a backstop"
+        );
+
+        assert_eq!(
+            model.max_output_tokens, hard,
+            "the shipped config sets the global ceiling equal to the model's, so the \
+             hard cap binds only for clients who ask for more - which it does handle"
+        );
+    }
     use crate::money::calculate_preflight_reservation_idr;
 
     /// A config with NO per-endpoint rate overrides must load and validate
