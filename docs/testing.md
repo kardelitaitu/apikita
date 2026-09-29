@@ -170,6 +170,32 @@ false alarm costs more than a missed one here, because the reader either has to
 re-check it or learns that findings in this repository are noisy - and a repository
 where findings are noisy is one where the real ones stop being trusted.
 
+### The never-mentioned measurement, and its one blind spot
+
+The technique that found the fictional 422 example is simple: list the names the
+schema declares, or the keys the config file sets, and report the ones no source file
+mentions. It is cheap, it is mechanical, and it has found real defects that reading
+the document in question did not.
+
+It is also a LOWER BOUND, and the reason is worth writing down so nobody trusts it
+for more than it is worth. A name that is mentioned is not necessarily a name that is
+used. `max_context_tokens` appears seven times in the crate - as a struct field on two
+config types, in three test fixtures, and in the parser key list - and is read by
+nothing. Every one of those seven is a declaration, a literal, or a string, and none is
+an expression that affects behaviour.
+
+So this measurement cannot find PARSED BUT UNREAD configuration, which is a real
+category here and the one most likely to be mistaken for a working setting by whoever
+put it in the file. Distinguishing a field declaration from a field read needs real
+analysis rather than a name search: count the occurrences, and a field that changes
+behaviour will appear in a comparison or an arithmetic, not only in a struct literal.
+
+That is a heuristic and is described as one. Doing it properly means following uses of
+a field rather than searching for its name, which is what a call graph is for. Until
+then the honest statement is: this catches what is entirely unreferenced, and a
+configuration key that is referenced in a struct and nowhere else still looks healthy
+to it.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
