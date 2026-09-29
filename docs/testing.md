@@ -149,6 +149,27 @@ constant that `create_router` itself consumes, or to leave the link unverified a
 reported a missing payment webhook, and that is worse than no check: it is a false
 alarm on the one route that moves money.
 
+### Four false alarms, and what they had in common
+
+Every one of these rounds has produced a finding that turned out, on checking, not
+to be one. A regex that reported the Midtrans webhook unmounted - the parse missed
+multi-line route calls. A hand-inserted fixture the STRICT schema refused on its
+reason vocabulary. A rewrite that panicked on behaviour the code documents as
+correct. And an api-spec that appeared to advertise four unbuilt endpoints in the
+present tense: it does not. They carry a warning marker, the marker is **defined**
+four lines below the table, and the count matches the code SPEC_ONLY list exactly.
+
+The fourth is the instructive one. The review section gives a full request contract,
+and reading that section alone suggests a live endpoint. The legend is at the top
+of the document and the contract is at the bottom, and I read one and not the other.
+
+**A document misleads in parts less often than a reader assumes.** Before reporting
+that a document disagrees with the code, read the part of it that would have
+explained the thing you found: the legend, the note, the status column, the count. A
+false alarm costs more than a missed one here, because the reader either has to
+re-check it or learns that findings in this repository are noisy - and a repository
+where findings are noisy is one where the real ones stop being trusted.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
