@@ -224,7 +224,9 @@ fn retain_usage_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
 static UPSTREAM: OnceLock<UpstreamClient> = OnceLock::new();
 
 /// The models whose EVERY routed endpoint currently has an open circuit, i.e. the
-/// `all_providers_unhealthy` alert condition (`docs/observability.md:104`).
+/// `all_providers_unhealthy` alert condition (the "All providers unhealthy" row of
+/// the Alerts table in `docs/observability.md`; cited by row because the line moved when
+/// the table gained an entry, which left this pointing at "Relay down").
 ///
 /// Returns the model NAMES rather than a boolean so the operator reading the metrics
 /// route learns WHICH models are down, not merely that something is. An alert that

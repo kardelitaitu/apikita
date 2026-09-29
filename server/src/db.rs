@@ -541,8 +541,9 @@ impl RetentionLag {
 
 /// Whether the age-based tables still hold rows older than their retention windows.
 ///
-/// WHY THIS EXISTS, and why it is not a disk percentage. `docs/observability.md:106`
-/// states the `db_disk` alert with the condition "volume usage" but the ACTION
+/// WHY THIS EXISTS, and why it is not a disk percentage. The "DB disk" row of the
+/// Alerts table in `docs/observability.md` states the `db_disk` alert with the
+/// condition "volume usage" but the ACTION
 /// "Usage rows growing; check retention" - so the operator's real question is whether
 /// RETENTION IS WORKING. A volume figure cannot answer that: 80% full is normal for a
 /// database doing its job, and a sweep that silently STOPPED is an incident at any
@@ -3164,7 +3165,8 @@ mod tests {
     // retention_lag: whether a retention PROMISE is being broken
     // ---------------------------------------------------------------------
     //
-    // `docs/observability.md:106` states the db_disk alert as "volume usage" but its
+    // The "DB disk" row of the Alerts table in `docs/observability.md` states the
+    // db_disk alert as "volume usage" but its
     // ACTION is "Usage rows growing; check retention" - the operator's real question
     // is whether RETENTION IS WORKING. A volume percentage cannot answer that (80% is
     // normal for a working database), while a sweep that silently stopped is an

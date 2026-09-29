@@ -115,14 +115,21 @@ pub(crate) fn metrics_payload(
         "server_errors": server_errors,
         "responses": responses,
         "error_rate": error_rate,
-        // The all_providers_unhealthy condition (docs/observability.md:104). A LIST,
-        // empty when every model has at least one usable endpoint. Named rather than a
-        // boolean so an operator learns WHICH model is down without a second lookup.
-        // The all_providers_unhealthy condition (docs/observability.md:104). A LIST,
-        // empty when every model has at least one usable endpoint. Named rather than a
-        // boolean so an operator learns WHICH model is down without a second lookup.
+        // The all_providers_unhealthy condition (the "All providers unhealthy" row of
+        // the Alerts table in docs/observability.md). A LIST, empty when every model has
+        // at least one usable endpoint. Named rather than a boolean so an operator
+        // learns WHICH model is down without a second lookup.
+        //
+        // CITED BY ROW, NOT BY LINE, and that is a correction rather than a style
+        // choice: this comment read docs/observability.md:104, which is the "Relay
+        // down" row. The row it meant had moved to 105 when that table gained an
+        // entry, so the citation pointed a reader at a completely different alert and
+        // still read as a plausible reference. The repo already knows this - it fails
+        // if alerts.tsv cites observability.md:N, for the same reason - and the same
+        // rule now applies here.
         "unhealthy_models": unhealthy_models,
-        // The db_disk alert's REAL question (docs/observability.md:106): its condition
+        // The db_disk alert's REAL question (the "DB disk" row of the Alerts table in
+        // docs/observability.md): its condition
         // column says "volume usage" but its ACTION says "check retention". This is the
         // age of the oldest row per age-based table, present ONLY when a row is past
         // that table's window. An empty object means retention is keeping up.

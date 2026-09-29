@@ -360,7 +360,8 @@ impl UpstreamClient {
     /// **This is NOT `shortest_cooldown_secs`, and the difference is the whole point.**
     /// That accessor answers "when could a retry succeed" and returns `Some` as soon as
     /// ONE endpoint is cooling. The alert condition
-    /// (`docs/observability.md:104`, "circuit open on every endpoint") is the opposite
+    /// (the "All providers unhealthy" row of the Alerts table in
+    /// `docs/observability.md`, condition "circuit open on every endpoint") is the opposite
     /// extreme: ONE open endpoint means failover is WORKING, which is normal operation,
     /// while EVERY endpoint open means the model cannot be served at all. Reusing the
     /// cooldown accessor would page an operator during healthy failover - worse than no

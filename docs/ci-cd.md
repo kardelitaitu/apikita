@@ -405,6 +405,24 @@ threshold *cannot* express is the question this section now answers by hand.
 `UpstreamClient::worst_case_reservation_idr` was entered by six of its own tests and
 called by no request. Coverage narrows the field; it does not close it.
 
+**The same class of drift is still open in SOURCE COMMENTS, and the scope is
+measured rather than guessed.** The check above covers the fourteen documents an
+operator acts on. It does not cover the Rust, which cites documents by line in
+**165 places** — `docs/error-model.md:N` alone accounts for about seventy. Five of
+them were found wrong in a single pass: `docs/observability.md:104` and `:106` in
+`health.rs`, `proxy.rs`, `client.rs` and `db.rs` all pointed a reader at a DIFFERENT
+ALERT, because that table gained a row and the citations did not move. They had
+drifted because an earlier change in this same series edited the table. They are now
+cited by row.
+
+So the rule this section recommends is applied to the documents and NOT to the code
+that explains them, which is the more surprising half: the comment is where a developer
+learns WHY, and a wrong WHY is worse than no WHY. The 160 remaining are not fixed
+here — converting them is a large mechanical diff against documents that are still
+moving, and doing it in a hurry would replace wrong citations with confidently wrong
+ones. It is recorded so the next pass starts from a number instead of from a
+suspicion.
+
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually
 runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was
