@@ -1167,35 +1167,36 @@ async fn settle_partial_usage(
     })
 }
 
-/// Verification query: confirms that wallet balance equals sum of ledger entries.
-pub async fn verify_wallet_reconciliation(
-    pool: &SqlitePool,
-    account_id: Uuid,
-) -> Result<bool, AppError> {
-    let row = sqlx::query(
-        r#"
-        SELECT
-            w.balance_idr AS wallet_balance,
-            COALESCE(SUM(l.delta_idr), 0) AS ledger_sum
-        FROM wallets w
-        LEFT JOIN ledger l ON l.account_id = w.account_id
-        WHERE w.account_id = ?
-        GROUP BY w.balance_idr
-        "#,
-    )
-    .bind(account_id.hyphenated())
-    .fetch_optional(pool)
-    .await?;
-
-    match row {
-        Some(r) => {
-            let wallet_balance: i64 = r.get("wallet_balance");
-            let ledger_sum: i64 = r.get("ledger_sum");
-            Ok(wallet_balance == ledger_sum)
-        }
-        None => Err(AppError::NotFound("Wallet not found".into())),
-    }
-}
+// THE MONEY GATE IS NOT HERE.
+//
+// A function used to stand in this place, and it was the third time in this crate's
+// history that a copy of a money rule outlived the thing that superseded it and then
+// read like the real thing. Deleted, with the reason:
+//
+// - IT WAS PRODUCTION-DEAD. Its only callers were its own four tests. The benchmark
+//   doc that named it was struck once that claim was checked, and it named this
+//   function as the thing the benchmark ran.
+// - IT WAS WEAKER THAN THE REAL GATE. It anchored on wallets with a LEFT JOIN, so an
+//   account with ledger money and NO wallets row - the cache missing entirely - was
+//   invisible to it. tools/reconcile/reconcile.sql uses a FULL OUTER JOIN for exactly
+//   that case, and its comment records the incident: a +250000 adjustment with no
+//   wallet row used to return nothing and the gate reported PASSING.
+// - THE TWO DISAGREED IN KIND. This returned Err(NotFound) for a missing wallet;
+//   the gate returns a row saying NO WALLET ROW and then fails. A caller that treated
+//   an error as "not drift" would have passed a real incident.
+// - IT LOOKED COVERED. Four tests exercised it, and that is the part that made it
+//   dangerous: a dead function with green tests is indistinguishable from a live one
+//   until somebody reads the callers.
+//
+// WHAT THE INVARIANT NOW RESTS ON: tools/reconcile/reconcile.sh running
+// reconcile.sql, which tools/reconcile-check mutation-tests in both directions - a
+// drifted database must fail and NAME the account, a consistent one must pass, and
+// the no-wallet-row arm is a case it breaks on purpose.
+//
+// The per-account test in this file still covers the arithmetic, through the local
+// helper. That helper is deliberately a copy, and it is not the mistake the deleted
+// function was: a test helper asserts a rule in isolation, where the shipped gate is
+// verified where it actually runs.
 
 /// Reconciliation sweep for STRANDED HOLDS - the money-loss defect this fix
 /// closes (a reservation taken but never paired with a release or a charge, so
@@ -2421,63 +2422,42 @@ mod tests {
         run_with_teardown(reconciliation_assertions).await;
     }
 
+    // The per-account arithmetic, through the local helper, after the dead duplicate
+    // of this rule was deleted from the file above.
+    //
+    // The helper is deliberately a COPY, and that is not the mistake the deleted
+    // function was. A test helper that reimplements a rule asserts the arithmetic in
+    // isolation; the shipped gate is verified where it actually runs, by
+    // tools/reconcile-check against reconcile.sql, including the no-wallet-row arm
+    // that neither Rust copy could see.
     async fn reconciliation_assertions(pool: SqlitePool, account_id: Uuid) {
         const AMOUNT: i64 = 50_000;
-
         fund_through_topup(&pool, account_id, AMOUNT).await;
 
-        // 1. A consistent fixture is clean.
-        assert!(
-            verify_wallet_reconciliation(&pool, account_id)
-                .await
-                .expect("verify a consistent wallet"),
-            "a wallet whose balance is its ledger sum must verify clean"
-        );
+        // A consistent wallet reports clean.
         assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
 
-        // 2. Manufacture drift the only way it can happen: a balance the ledger
-        //    cannot explain. The checker must SEE it.
+        // Drift the ledger cannot explain must be FOUND, not missed.
         sqlx::query("UPDATE wallets SET balance_idr = balance_idr + 1 WHERE account_id = ?")
             .bind(account_id.hyphenated())
             .execute(&pool)
             .await
             .expect("manufacture drift");
-
-        assert!(
-            !verify_wallet_reconciliation(&pool, account_id)
-                .await
-                .expect("verify a drifted wallet"),
-            "the checker must report a balance the ledger cannot explain: {}",
-            drift_report(&pool, account_id).await
-        );
         assert_eq!(
             ledger_drift_rows(&pool, account_id).await,
             1,
-            "the drift the checker reports must be the drift the sweep finds"
+            "the drift the checker reports must be the drift the sweep finds: {}",
+            drift_report(&pool, account_id).await
         );
 
-        // 3. Restore, and the checker agrees again - so it is reading the data, not
-        //    answering from a constant.
+        // Restoring it clears the report, so the query is reading the data rather than
+        // answering from a constant.
         sqlx::query("UPDATE wallets SET balance_idr = balance_idr - 1 WHERE account_id = ?")
             .bind(account_id.hyphenated())
             .execute(&pool)
             .await
             .expect("restore the balance");
-
-        assert!(
-            verify_wallet_reconciliation(&pool, account_id)
-                .await
-                .expect("verify the restored wallet"),
-            "after restoring the balance the checker must report clean again"
-        );
         assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
-
-        // 4. No wallet at all is an error, not a silent "clean".
-        let bare = bare_account(&pool).await;
-        match verify_wallet_reconciliation(&pool, bare).await {
-            Err(AppError::NotFound(_)) => {}
-            other => panic!("a missing wallet must be NotFound, got {other:?}"),
-        }
     }
 
     /// unpaired_hold_rows: a hold with no matching release is money that left the
