@@ -1494,6 +1494,235 @@ mod tests {
         }
     }
 
+    /// EVERY CONFIG FIELD MUST BE READ BY PRODUCTION CODE, or be on a list below
+    /// with a reason.
+    ///
+    /// WHY THIS EXISTS. The link-code issuance cap was a guard that parsed, ran, and
+    /// could never fire - it counted a table its own handler DELETEs from. Nothing
+    /// about it looked wrong, and the suite was green. Probing for that shape by
+    /// hand found fourteen more fields in the same state: documented settings that
+    /// nothing reads, including two that docs/decisions.md presents as a capability
+    /// the breaker module explicitly disclaims ("no I/O" - recovery is a trial
+    /// request on real traffic, not a background job).
+    ///
+    /// A hand-run probe finds today's dead fields and none of tomorrow's. This is
+    /// the probe, as a test, so the next one is a red build rather than an
+    /// afternoon's reading.
+    ///
+    /// HOW THE INVENTORY IS BUILT. Not by parsing struct definitions with a regex -
+    /// by serialising the loaded config to TOML and walking the result. That cannot
+    /// drift from the real schema, because it IS the real schema: a field added and
+    /// forgotten appears here without anybody editing a list.
+    ///
+    /// AND THE LIMITATION, stated because a test that quietly under-reports is worse
+    /// than none: the search is a substring match on the source, so a field whose
+    /// name collides with an ordinary word (name, description) reads as wired
+    /// whether or not it is. That is why the list below is a judgement rather than a
+    /// measurement, and why every entry on it carries a reason - a name with no
+    /// reason is a claim nobody can check.
+    #[test]
+    fn every_config_field_is_read_by_production_code_or_explained() {
+        /// DELIBERATELY NOT WIRED, each with the reason it is still here.
+        ///
+        /// An entry earns its place by being either an honest leftover from a
+        /// blueprint or a decision not to build something yet. "Unknown" is not an
+        /// acceptable reason and is not used.
+        const UNWIRED: &[(&str, &str)] = &[
+            (
+                "health_check_interval_seconds",
+                "there is no active health check. The breaker is deliberately PASSIVE -\
+                 its module doc says 'no I/O' and recovery is a trial request on real\n                 traffic. This knob and health_check_failures are leftovers from the\n                 blueprint, and docs/decisions.md still lists 'health checks' under\n                 [circuit_breaker], which is the part that is wrong.",
+            ),
+            (
+                "health_check_failures",
+                "Same as health_check_interval_seconds: no background prober exists to\n                 count its failures.",
+            ),
+            (
+                "wallet_mutations_per_minute",
+                "no wallet-mutation rate limit is implemented. The wallet is only\n                 mutated by settlement, webhook and topup paths, each with its own\n                 bound; there is no per-minute limiter in front of them.",
+            ),
+            (
+                "review_per_hour",
+                "no review endpoint exists to rate limit. The field parses and is\n                 carried all the way to the config struct for no effect.",
+            ),
+            (
+                "dormancy_days",
+                "no dormancy sweep reads it. purge_expired covers usage, sessions and\n                 the link-code counters; nothing ages a wallet out.",
+            ),
+            (
+                "low_balance_threshold_idr",
+                "no low-balance warning is emitted. The threshold is configured and\n                 never compared against anything.",
+            ),
+            (
+                "low_balance_max_per_day",
+                "Same as low_balance_threshold_idr - the cap on a warning that is never\n                 sent.",
+            ),
+            (
+                "mid_stream_cutoff",
+                "the mid-stream cut-off is always OFF and the flag is not consulted.\n                 The behaviour it names does not exist in either state.",
+            ),
+            (
+                "on_pool_exhausted",
+                "only reject_503 is implemented, and the config comment says the\n                 other option 'needs a queue'. A one-valued enum is not a setting.",
+            ),
+            (
+                "supports_vision",
+                "advertised on the model but never used to gate or annotate a request.\n                 No capability is enforced or reported from it.",
+            ),
+            (
+                "supports_thinking",
+                "Same as supports_vision - declared, never read for a decision.",
+            ),
+            (
+                "billing_basis",
+                "every price is computed from the PEAK rates; the offpeak class is\n                 configured on the model and never selected. Selecting it would be a\n                 pricing change, which is why this is listed rather than fixed.",
+            ),
+            (
+                "concurrency_per_key",
+                "the key pool applies one global concurrency policy; the per-endpoint\n                 override is parsed and never consulted.",
+            ),
+            (
+                "description",
+                "the model's human description is carried but never returned to a\n                 client. Harmless, and the obvious use is a future model-listing\n                 response.",
+            ),
+            // FOUND BY THIS TEST, NOT BY THE PROBE THAT PROMPTED IT. The hand-run
+            // probe that motivated this test listed fourteen fields and missed these
+            // four, which is the argument for having the check at all: a probe run
+            // once finds what its author remembered to look for.
+            (
+                "input_offpeak",
+                "the offpeak class is configured and never charged. Settlement prices\n                 every token from the PEAK rates, and the field that would select the\n                 class - billing_basis - is itself unwired. The only place this name\n                 appears outside the struct is validate()'s own finiteness and discount\n                 checks, which is validation, not behaviour - and a rate that is\n                 checked but never charged is a rate an operator believes is in effect.",
+            ),
+            (
+                "output_offpeak",
+                "Same as input_offpeak: configured, checked, never charged.",
+            ),
+            (
+                "cache_read_offpeak",
+                "Same as input_offpeak. The cache discount validate() enforces is\n                 between the cache rate and the input rate of the SAME class, so checking\n                 the offpeak pair is meaningful even though charging it is not\n                 implemented.",
+            ),
+        ];
+
+        let config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        let doc = toml::Value::try_from(&config).expect("the config must serialise to TOML");
+
+        let mut leaves = std::collections::BTreeSet::new();
+        collect_leaves(&doc, &mut leaves);
+        assert!(
+            leaves.len() > 40,
+            "the inventory found only {} leaves, so the walk is broken and the check\n             below would pass vacuously",
+            leaves.len()
+        );
+
+        // The production source of every module except this one, with each
+        // cfg(test) block removed. Without the strip the answer is a uniform false
+        // negative: the test fixtures build a whole AppConfig literal and every
+        // field therefore appears read.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut corpus = String::new();
+        collect_rust_source(&root, "config.rs", &mut corpus);
+        assert!(
+            !corpus.is_empty(),
+            "no production source was read, so every field would look unwired"
+        );
+
+        let mut unwired: Vec<&str> = UNWIRED.iter().map(|(field, _)| *field).collect();
+        unwired.sort_unstable();
+
+        let mut missing: Vec<String> = Vec::new();
+        for leaf in &leaves {
+            if corpus.contains(leaf.as_str()) {
+                continue;
+            }
+            if unwired.binary_search(&leaf.as_str()).is_ok() {
+                continue;
+            }
+            missing.push(leaf.clone());
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "these config fields are read by NOTHING in production code and are not\n             on the UNWIRED list with a reason: {missing:?}. Either wire them up or\n             explain why they are still here - a setting nobody reads is a setting an\n             operator believes is working."
+        );
+
+        // And the other direction, which is what stops the list rotting into a
+        // graveyard: a field that HAS been wired must come off it, or the list goes on
+        // claiming things that are no longer true.
+        let stale: Vec<&str> = UNWIRED
+            .iter()
+            .map(|(field, _)| *field)
+            .filter(|field| corpus.contains(field))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these fields are on the UNWIRED list but are now read by production\n             code, so the list is claiming something untrue: {stale:?}"
+        );
+    }
+
+    /// Every scalar leaf key in a TOML document, deduplicated by NAME rather than by
+    /// path - rates.input_peak and an endpoint's input_peak are the same question, and
+    /// the answer is the same for both.
+    fn collect_leaves(node: &toml::Value, out: &mut std::collections::BTreeSet<String>) {
+        match node {
+            toml::Value::Table(table) => {
+                for (key, value) in table {
+                    match value {
+                        toml::Value::Table(_) | toml::Value::Array(_) => collect_leaves(value, out),
+                        _ => {
+                            out.insert(key.clone());
+                        }
+                    }
+                }
+            }
+            toml::Value::Array(items) => {
+                for item in items {
+                    collect_leaves(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every .rs file under dir except skip, with test modules stripped, concatenated.
+    /// Walks the tree the crate actually ships rather than a list kept by hand, so a
+    /// new module is covered without being remembered.
+    fn collect_rust_source(dir: &std::path::Path, skip: &str, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_source(&path, skip, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_some_and(|n| n != skip)
+            {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Truncate at the LAST "mod tests", NOT at the first
+                // "#[cfg(test)]". Several files carry a test-only attribute on an
+                // individual item - proxy.rs has two, at lines 49 and 612 - and
+                // truncating at the first one discarded fifteen hundred lines of
+                // PRODUCTION code, including the settlement that charges
+                // cache_read_peak. The guard then reported a live field as dead,
+                // which is the one direction a completeness check must not fail in:
+                // it would have sent someone to wire up something already wired.
+                //
+                // "mod tests" is the convention and it lives at the end, so the LAST
+                // occurrence is the right anchor. A file with a mid-file test module
+                // would be over-stripped here, which is the safe direction: it can
+                // only report a field as unwired, never as wired.
+                match text.rfind("mod tests") {
+                    Some(at) => out.push_str(&text[..at]),
+                    None => out.push_str(&text),
+                }
+                out.push('\n');
+            }
+        }
+    }
     /// A non-positive override would size the hold from a rate that reserves
     /// nothing, so it is refused at load like a non-positive model rate.
     #[test]
