@@ -118,6 +118,21 @@ fn in_spend_window(day: NaiveDate, today: NaiveDate) -> bool {
 ///
 /// The summed value is `usage_daily.cost_idr`, which the settlement path already
 /// stores as the money.rs `calculate_token_cost_idr` result — no second formula.
+///
+/// **THIS IS USAGE, NOT WHAT THE CUSTOMER WAS BILLED**, and for a clamped request
+/// those differ. When a hold cannot be fully covered the debit is clamped to the
+/// balance, so the wallet takes less than the service cost, while `usage_daily` records
+/// the full cost because the service was genuinely consumed. This function sums the full
+/// cost, so a customer whose balance ran out has their key SPEND limit advanced by money
+/// they were never charged.
+///
+/// That is defensible — a limit expressed in IDR is most safely read as a ceiling on
+/// consumption, and using revenue would let a customer with a tiny balance and a large
+/// limit consume without ever reaching it. But the column is `spend_limit_idr`, the
+/// documentation calls it a spend limit, and a customer who finds their key blocked for
+/// spend that was never collected deserves to know why. The behaviour is right; the NAME
+/// reads the other way, and that is what this note is for. The same divergence is
+/// recorded under Overdraft in `docs/decisions.md`.
 fn fold_spend_in_window(rows: &[(Uuid, NaiveDate, i64)], today: NaiveDate) -> HashMap<Uuid, i64> {
     let mut spend: HashMap<Uuid, i64> = HashMap::new();
     for &(key_id, day, cost_idr) in rows {
