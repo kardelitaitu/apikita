@@ -254,6 +254,18 @@ max_stream_seconds = 1800
 # The order matters. The 4xx-is-the-caller branch is CORRECT for 400, 404 and 422, where
 # retrying the same body elsewhere would be wrong. 401 is different in kind - it is our
 # credential - and it is the value above that sorts the two, not a new branch in the loop.
+#
+# HOW FAR THIS IS VERIFIED, precisely, because a note here went stale once already.
+# Checked by READING: `is_rate_limit` consults this value, so a 401 takes the park-and-
+# rotate branch. Checked by TEST: `the_shipped_config_parks_a_401` reads this file and
+# fails if 401 leaves the set, and `a_401_frees_the_slot_without_parking_the_key` pins the
+# pool's behaviour for a 429-only set.
+#
+# NOT verified by execution: no test drives a stubbed upstream that answers 401 and then
+# 200, so the end-to-end rotation is argued from two reads rather than observed. That is
+# the one remaining piece of this work and it needs a stub that can return a chosen status
+# per call, which the proxy tests do not have. Worth building: the failure it would catch
+# is a customer receiving our own 401.
 rate_limit_status = [429, 401]
 
 # Seconds a key stays out of rotation after being throttled. Short: the
