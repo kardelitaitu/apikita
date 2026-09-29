@@ -38,7 +38,7 @@ so an anonymous call is a no-op rather than an error.
 schema, a documented contract, and **no handler**: `GET`/`POST /api/reviews`,
 `GET /api/bot/account`, `GET /api/bot/reviews/mine` and `POST /api/bot/notify-topup`.
 They are not missing by accident — the whole reviews and top-up-feed flow is driven by
-the Telegram **bot**, and `docs/launch-checklist.md:211` records that the bot itself is
+the Telegram **bot**, and the launch checklist records that the bot itself is
 still design-only, so their HTTP halves have nothing to exercise them. The tables they
 need have existed since the initial migration (`reviews`, `review_history`,
 `review_sessions`).

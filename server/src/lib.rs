@@ -118,6 +118,11 @@
 pub mod abuse;
 pub mod config;
 pub mod db;
+/// Test-only: checks claims the OPERATIONAL documents make about this code, so a
+/// citation cannot quietly re-point at a neighbour the way a line number does.
+/// Compiled out of every non-test build, like `test_support`.
+#[cfg(test)]
+mod doc_claims;
 pub mod error;
 pub mod ip_tracking;
 pub mod money;

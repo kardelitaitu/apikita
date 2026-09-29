@@ -107,14 +107,14 @@ opinion.
 >
 > | Item | Evidence |
 > | --- | --- |
-> | Signature verified | `money.rs:73` `ct_eq` over SHA-512, pinned by known-vector tests |
-> | Stored-amount validation | `db.rs:140` matches `order_id AND status AND amount_idr`; `AmountMismatch` handled at `webhooks.rs:205` |
+> | Signature verified | `verify_midtrans_signature` in `money.rs` compares with `ct_eq` over SHA-512, pinned by known-vector tests |
+> | Stored-amount validation | the `find_by_order_id` lookup in `db.rs` matches `order_id AND status AND amount_idr`, and `handle_midtrans_webhook` handles `AmountMismatch` |
 > | Idempotent crediting | the conditional UPDATE above is the claim; replay test asserts exactly one credit |
 > | Atomic credit | one `BEGIN IMMEDIATE` covers the status change, the wallet and the ledger row |
-> | Refunds refused | `money.rs:126` `PaymentAction::RefundRefused`; two live tests, incl. an inflated amount |
+> | Refunds refused | `evaluate_payment_status` in `money.rs` returns `PaymentAction::RefundRefused`; two live tests, incl. an inflated amount |
 > | No route writes `balance_idr` | all 7 UPDATE sites are in `db.rs` (transactional) or `bin/hold-sweep.rs` (operator tool) |
 > | `CHECK (balance_idr >= 0)` | `migrations/20260925000000_initial_schema.sql:66` |
-> | Cache-read not counted as input | `upstream/client.rs:120` clamps with `cached.min(prompt)` so a malformed report cannot push the split negative; `money.rs:344` `a_cached_token_is_never_also_billed_as_an_input_token` asserts the arithmetic |
+> | Cache-read not counted as input | `parse_usage_from_sse` in `upstream/client.rs` clamps with `cached.min(prompt)` so a malformed report cannot push the split negative; `a_cached_token_is_never_also_billed_as_an_input_token` asserts the arithmetic |
 >
 > **The refund-alerting box is explicitly OUTSIDE this group and left unticked**,
 > because it is the one part that is genuinely outstanding: the event is logged but
@@ -165,19 +165,20 @@ statement is false.**
       through the handler with a capturing subscriber installed at TRACE and asserts the
       sentinel never appears, with a positive control so silence cannot pass.
 - [x] No raw IP address is persisted; only a salted hash, salt deleted daily.
-      `server/src/ip_tracking.rs:6-8` ("**no raw IP is stored anywhere**. What is stored
+      the module doc of `ip_tracking` ("**no raw IP is stored anywhere**. What is stored
       is an HMAC ... under a salt that changes every day and is never written down"),
-      `:16-17` (salt in memory, OS RNG, replaced at the UTC boundary).
+      and the `DailySalt` docs (salt in memory, OS RNG, replaced at the UTC boundary).
 - [x] API keys stored as hashes only; the plaintext exists once, at creation.
-      `server/src/routes/keys.rs:388` hashes the full key BEFORE the insert; only the
-      hash is bound into the row.
+      `create_key` in `server/src/routes/keys.rs` calls `hash_token` on the full key
+      BEFORE the insert; only the hash is bound into the row.
 - [x] Session tokens stored hashed; cookies are HttpOnly, Secure, SameSite.
-      `server/src/routes/auth.rs:251-253` sets all three, and `:558-560` asserts the
-      serialized cookie CARRIES them, so the flags cannot be dropped silently.
+      The cookie builder in `session_cookie` (`server/src/routes/auth.rs`) sets all
+      three, and `session_cookie_carries_expected_attributes` asserts the serialized
+      cookie CARRIES them, so the flags cannot be dropped silently.
 - [x] `PUBLIC_*` variables contain nothing secret.
-      No `PUBLIC_*` key is defined in `server/` or `config/`; the single mention
-      (`server/src/routes/account.rs:60`) is a comment about the browser cross-checking
-      its own value. **Enforced for the case that actually leaks** by
+      No `PUBLIC_*` key is defined in `server/` or `config/`; the single mention is a
+      comment in `server/src/routes/account.rs` about the browser cross-checking its
+      own value. **Enforced for the case that actually leaks** by
       `website/tests/public-secrets.test.ts`: it pins the set of `PUBLIC_` variables the
       build can inline (only ones the source references are substituted) and fails if any
       of them is named like a secret. That gap was real — the CI Secret scan checks
@@ -197,7 +198,7 @@ statement is false.**
 
 - [x] `/health` checks the process and the database, **not** upstream providers.
       `server/src/routes/health.rs` probes `SELECT 1` only; the doc-comment at
-      `docs/server/api-spec.md:466-470` states the rule and why (an upstream outage must
+      The `### Health` section of `docs/server/api-spec.md` states the rule and why (an upstream outage must
       not look like a dead server and trigger a restart loop). Tested, including the
       unauthenticated-body leak rules.
 <!-- alert-scheduling: wired -->
@@ -228,21 +229,23 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       than only ever passing — a corrupted artifact and a plausible-looking TRUNCATED one
       both FAIL with exit 6. **What remains is running it against production data**, which
       needs a deployed database and is why this box stays unticked:
-      `docs/backup-and-restore.md:190-192` records that the only measured RTO so far is
+      The RTO section of `docs/backup-and-restore.md` records that the only measured RTO so far is
       "**dev-sized**... the production number is unmeasured until the drill runs there."
 - [ ] Drill log records the measured restore time — that is the real RTO. **The log DOES
       record it** (verified: `restore_ms 304` and `118` on my runs, alongside the result and
       the artifact SHA-256), so the mechanism works. The number to record is a PRODUCTION
       one; a dev-sized figure would be a claim we cannot stand behind.
 - [x] Error responses match [`error-model.md`](error-model.md), including `request_id`.
-      `server/src/error.rs:233` mints `req_<uuid>` per failure and `:273` puts it in the
-      body; `error.rs:607` asserts the exact documented shape
-      `{error: {code, message, request_id}}`.
+      `error.rs` mints `req_<uuid>` per failure and puts it in the
+      body; `error_object` in that file is the helper every error test reads the body
+      through, and it fails unless the shape is exactly
+      `{error: {code, message, request_id}}` — so the shape is asserted by every error
+      test rather than by one that could be skipped.
 - [x] SSE heartbeat runs; a dropped stream surfaces as a stale indicator, not a
       silently frozen balance.
-      **Now enforced by tests on both halves.** Server: `events.rs:26-28` sets a 25s
+      **Now enforced by tests on both halves.** Server: `HEARTBEAT_SECONDS` in `events.rs` sets a 25s
       heartbeat (docs/realtime.md asks for 20-30s) and `:550` pins that window.
-      Frontend: `live.ts:195` marks the store `stale` on error, and
+      Frontend: the events store in `live.ts` marks itself `stale` on error, and
       `a dropped stream keeps the last balance, marks it stale, and never relabels
       polled data live` (`website/tests/live.test.ts`) asserts the last KNOWN balance
       survives and that polled data is never presented as live — mutation-verified in
@@ -252,7 +255,7 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
 ## Gate 6 — Product surfaces
 
 - [x] Signup shows the cross-border disclosure before the first request.
-      `website/src/pages/signup.astro:73-83` carries a "Where your prompts go" block
+      The signup page (`website/src/pages/signup.astro`) carries a "Where your prompts go" block
       above the submit control, naming the mainland-China provider and the retention
       that is outside our control. **Pinned by a test**:
       `signup discloses where prompts are forwarded, and does so before the submit
@@ -260,18 +263,18 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       jurisdiction, AND the ORDERING — because the claim is "before the first request",
       not "exists somewhere" (`privacy.astro` alone would not satisfy it).
 - [x] Top-up screen states the fee and the non-refundable policy before payment.
-      `website/src/pages/dashboard/wallet.astro:27-31` states the non-refundable policy
+      The wallet page (`website/src/pages/dashboard/wallet.astro`) states the non-refundable policy
       and the 2-year expiry, and the header flags that first-deposit and top-up minimums
       differ. **Pinned by a test** (`the wallet states the non-refundable policy and the
       expiry before the top-up action`).
 - [x] Deposit minimums enforced server-side (first vs re-top-up differ).
-      `server/src/routes/account.rs:695-712` — `check_deposit_limit` selects
+      `check_deposit_limit` in `server/src/routes/account.rs` selects
       `min_first_deposit` when `settled_topups == 0`, else `min_topup`, and returns a 422
       naming the limit. Covered by live tests in the same module.
 - [x] API key shown once, with an acknowledged warning.
-      Behaviour: `plaintextKeyOf` (`website/tests/dashboard-form.test.ts:139`) pins that
+      Behaviour: `plaintextKeyOf` (`website/tests/dashboard-form.test.ts`) pins that
       only a create response can reveal a key and a missing one is never invented.
-      Warning: `website/src/pages/dashboard/keys/new.astro:26-28` says the key is shown
+      Warning: the new-key page (`website/src/pages/dashboard/keys/new.astro`) says the key is shown
       **once** and that the server stores only its SHA-256 hash — **pinned by a test**,
       because a copy edit can delete the warning while the code stays correct.
 - [x] Telegram `/link` flow works end to end **on the server side** — issue,

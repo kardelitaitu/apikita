@@ -227,7 +227,7 @@ a *given* value means. It cannot detect that the two values disagree.
 
 A mismatch is never diagnosed as a mismatch, and the two directions are not equally
 bad. The server calls Snap *before* it writes anything, and only inserts the top-up row
-once that call succeeds ([`server/src/routes/account.rs:558-572`](../server/src/routes/account.rs)):
+once that call succeeds (the Snap call and the INSERT are in `create_topup` in [`server/src/routes/account.rs`](../server/src/routes/account.rs), with the top-up row written last):
 
 - **Server sandbox, browser production.** The server's Snap call is rejected, so no
   top-up row is ever written. Nothing is charged and nothing is left pending — the
