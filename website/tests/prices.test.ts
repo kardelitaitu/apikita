@@ -170,3 +170,24 @@ test('KNOWN_MODELS is the config model list, in file order', async () => {
     );
   }
 });
+
+// The per-hour top-up cap, the third figure the wallet page shows. It was a local
+// `const` in that page naming this key, which is better than a bare literal and still a
+// transcription - and a transcription is exactly what the two minimums were. It lives in
+// lib/models.ts so this can DERIVE it: the wallet page is the only surface that shows it,
+// so there was nothing to consolidate with, and moving it here is what makes it checkable
+// rather than merely documented.
+test('the wallet rate cap is the config topup_per_hour', async () => {
+  const { topupPerHour } = await import('../src/lib/models.ts');
+
+  // [limits] in the config, read as text for the reason the whole file is text.
+  const limits = config.slice(config.indexOf('[limits]'));
+  const match = limits.match(/^\s*topup_per_hour\s*=\s*([0-9]+)/m);
+  assert.ok(match, 'the config no longer declares [limits] topup_per_hour');
+
+  assert.equal(
+    topupPerHour,
+    Number(match[1]),
+    'the wallet page quotes a top-up cap the config does not have, so a customer reads a limit that is not enforced'
+  );
+});

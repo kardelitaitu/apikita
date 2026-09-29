@@ -10,10 +10,8 @@ import TopUpForm from '../../islands/wallet/TopUpForm.astro';
 //
 // That is the failure this file is now evidence of: a fix that consolidates SOME copies
 // of a value, and a check that pins the consolidated one.
-import { minFirstDepositIdr, minTopupIdr, idr } from '../../lib/models.ts';
+import { minFirstDepositIdr, minTopupIdr, topupPerHour, idr } from '../../lib/models.ts';
 
-// config/apikita.toml [limits] topup_per_hour, and the same class of number: one a
-// customer reads, that only the config can be right about.
 //
 // THE PARAGRAPH BELOW IS ONE LINE ON PURPOSE. A line break on either side of an
 // {expression} is collapsed by Astro, so the space lands on whichever side is NOT the

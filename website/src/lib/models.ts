@@ -91,6 +91,17 @@ export const models = ['flash', 'deepseek-v4-flash'];
  */
 export const minFirstDepositIdr = 50000;
 export const minTopupIdr = 10000;
+
+/**
+ * Top-ups per hour, from config/apikita.toml `[limits] topup_per_hour`.
+ *
+ * It was a local `const` in the wallet page with a comment naming this key - better than a
+ * bare literal, but still a transcription, and a transcription is what the two figures above
+ * were. The wallet page is the only surface that shows it, so there is nothing to consolidate
+ * *with*; putting it here is what makes it CHECKABLE instead of merely documented, because
+ * `tests/prices.test.ts` reads the config's `[limits]` and can compare.
+ */
+export const topupPerHour = 5;
 export const idr = (n: number) => n.toLocaleString('en-US');
 
 const peakPrices = rates.map((rate) => rate.price);
