@@ -61,4 +61,53 @@ test('the quoted peak prices are the config peak rates times the model multiplie
   });
 });
 
+// EVERY figure on the ticker, not just the three the pricing table shows. The comment
+// above `tickerModels` claims each number below is the configured rate times the
+// configured multiplier for EVERY model at BOTH bases, and that is 6 x 2 x 3 = 36
+// numbers. Comparing the EXPORTED array rather than the source text matters: two models
+// share the `peakPrices` constant and four carry literals, so a source-reading check
+// silently runs past the first two and reports the third model's figures for them -
+// which is exactly the false alarm this was written to catch, arriving by the other
+// route.
+test('every ticker figure is its own model config rate times its own multiplier', async () => {
+  const { tickerModels } = await import('../src/lib/models.ts');
 
+  const blocks = config
+    .split('[[models]]')
+    .slice(1)
+    .map((b) => ({
+      name: (b.match(/^\s*name = "([^"]+)"/m) ?? [])[1],
+      block: b,
+    }))
+    .filter((m) => Boolean(m.name));
+
+  assert.equal(
+    tickerModels.length,
+    blocks.length,
+    'the ticker and the config have a different number of models, so a figure cannot be checked against the model it belongs to'
+  );
+
+  const bases: [string, string[]][] = [
+    ['peak', ['input_peak', 'cache_read_peak', 'output_peak']],
+    ['offPeak', ['input_offpeak', 'cache_read_offpeak', 'output_offpeak']],
+  ];
+
+  for (const model of tickerModels) {
+    const mine = blocks.find((b) => b.name === model.name);
+    assert.ok(mine, `the ticker shows ${model.name} and the config does not declare it`);
+    const multiplier = numberIn(mine.block, 'price');
+
+    for (const [basis, keys] of bases) {
+      const shown = model[basis as keyof typeof model] as string[];
+      assert.equal(shown.length, keys.length, `${model.name} ${basis} is not three figures`);
+      keys.forEach((key, i) => {
+        const expected = Math.round(numberIn(mine.block, key) * multiplier);
+        assert.equal(
+          asNumber(shown[i]),
+          expected,
+          `${model.name} ${basis} ${key}: the site shows ${shown[i]} but ${key} x ${multiplier} = ${expected}`
+        );
+      });
+    }
+  }
+});
