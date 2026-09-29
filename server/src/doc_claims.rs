@@ -33,6 +33,21 @@ const CITED_EXTENSIONS: &[&str] = &[
     "rs", "md", "sh", "ts", "tsx", "astro", "py", "tsv", "toml", "yml", "yaml",
 ];
 
+/// Resolves a document in the repository's docs/ tree.
+///
+/// ONE definition, through CARGO_MANIFEST_DIR rather than a relative path. A
+/// relative path is relative to the test binary's working directory, which is not
+/// guaranteed to be the package root - and the first version of the retention check
+/// below got the depth wrong and read nothing. That failed loudly, which is the
+/// correct outcome, but a second copy of this path in the next test would have
+/// failed the same way for a different reason.
+fn doc_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("docs")
+        .join(name)
+}
+
 /// The documents an operator acts on, and the ones whose claims are therefore live.
 const OPERATIONAL_DOCS: &[&str] = &[
     "launch-checklist.md",
@@ -138,16 +153,7 @@ mod tests {
     /// this test is the only thing that makes them one claim.
     #[test]
     fn the_published_retention_periods_are_the_periods_the_sweeps_enforce() {
-        // Resolved through CARGO_MANIFEST_DIR rather than a relative path, because a
-        // relative one is relative to the test binary's working directory, which is not
-        // guaranteed to be the package root - and a path that resolves to nothing here
-        // produced a file read error rather than a vacuous pass, which is the correct
-        // failure and the reason it is worth stating.
-        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("docs")
-            .join("data-retention.md");
-        let doc = std::fs::read_to_string(&doc_path)
+        let doc = std::fs::read_to_string(doc_path("data-retention.md"))
             .expect("docs/data-retention.md must be readable, or this passes over nothing");
 
         // Table named in the doc, the period the doc states, the constant enforcing it.
@@ -207,6 +213,46 @@ mod tests {
             crate::ip_tracking::DAILY_RETENTION_DAYS,
             90,
             "the document promises 90 days of key_ip_daily"
+        );
+    }
+    /// The REGISTER's session lifetime is the config's session lifetime.
+    ///
+    /// Same class as the retention periods, and a sharper case, because this one is
+    /// a SECURITY property and the register is where a reader looks to learn how
+    /// long a stolen credential survives. docs/decisions.md states 30 days absolute
+    /// and 7 days idle; config/apikita.toml carries the two numbers that decide it.
+    ///
+    /// There IS a test that couples them, and it is not this one. The session test
+    /// ages a session 8 days and expects a refusal, which passes only because the
+    /// shipped idle bound is 7. That is a real coupling and a poor statement of it:
+    /// it fails with a message about the REGISTER when the CONFIG changed, and it
+    /// would fail for the wrong reason if both moved together. This states the claim
+    /// directly, so a change to either side names itself.
+    ///
+    /// Both directions again: the register must say it, and the config must match.
+    #[test]
+    fn the_register_session_lifetime_is_the_lifetime_the_config_enforces() {
+        let register = std::fs::read_to_string(doc_path("decisions.md"))
+            .expect("docs/decisions.md must be readable, or this passes over nothing");
+        let config =
+            crate::config::AppConfig::load_from_file(concat!("../", "config/apikita.toml"))
+                .or_else(|_| crate::config::AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+
+        assert!(
+            register.contains("30 days absolute, 7 days idle"),
+            "the decision register no longer states the session lifetime as 30 days absolute and 7 days idle. The config carries {} and {} respectively, so either the register was reworded or the policy changed without it being written down - and a stale register is worse than none, because it is what a reader trusts.",
+            config.sessions.absolute_days,
+            config.sessions.idle_days
+        );
+
+        assert_eq!(
+            config.sessions.absolute_days, 30,
+            "the register promises a 30-day absolute session lifetime"
+        );
+        assert_eq!(
+            config.sessions.idle_days, 7,
+            "the register promises a 7-day idle session lifetime, and that is also the only combination that makes the idle bound bind at all: at or above absolute_days the idle rule is inert by construction"
         );
     }
     /// The scanner itself, because a check that cannot find a citation it should find
