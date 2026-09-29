@@ -253,6 +253,55 @@ mod tests {
     }
 
     #[test]
+    /// A key the upstream rejects as UNAUTHORISED is never parked, and that is
+    /// currently a hole rather than a decision.
+    ///
+    /// `report_status` parks only a status in `rate_limit_status`, which the shipped
+    /// config sets to `[429]`. A wholesale key that has been revoked, or whose
+    /// provider-side quota has run out at the auth layer, answers 401 — which is not in
+    /// the set, so the slot is freed and the key stays selectable.
+    ///
+    /// WORSE, IT IS SELF-REINFORCING. Selection is least in-flight, and a key that
+    /// fails fast is in flight for less time, so it has the fewest leases and is
+    /// therefore picked MORE often. The dead key drifts towards being the one every
+    /// request tries, and the caller's loop returns any HTTP response to the customer
+    /// rather than retrying, so a share of requests answers 401 from our own wholesale
+    /// layer. The circuit breaker does not catch it either: it is per-ENDPOINT, and the
+    /// endpoint is healthy - one key of several is not.
+    ///
+    /// This test PINS the behaviour rather than changing it, because both fixes are
+    /// product decisions rather than bugs. Adding 401 to `rate_limit_status` is one
+    /// config line and stops the key being preferred, but the customer who drew it
+    /// still sees a 401. Retrying on 401 as the loop already retries on 429 removes that,
+    /// and costs an extra upstream call per attempt during an incident. Nobody has
+    /// chosen between them, so the honest state is recorded and visible.
+    fn a_401_frees_the_slot_without_parking_the_key() {
+        let pool = pool(2, 30);
+
+        let lease = pool.acquire().expect("a key");
+        let key = lease.key().to_string();
+        lease.report_status(401);
+
+        // The slot came back, so the next lease is available.
+        let next = pool.acquire().expect("the slot came back");
+        next.report_success();
+
+        // And the key is still selectable, which is the finding. Nothing in the pool
+        // knows this key is dead until something configures 401 into the park set.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            if let Some(lease) = pool.acquire() {
+                seen.insert(lease.key().to_string());
+                lease.report_status(401);
+            }
+        }
+        assert!(
+            seen.contains(&key),
+            "a 401 must not park the key under the shipped config, and this asserts the
+             CURRENT behaviour so a change to it is deliberate rather than silent"
+        );
+    }
+    #[test]
     fn least_loaded_picks_lowest_in_flight() {
         let pool = pool(3, 30);
 
