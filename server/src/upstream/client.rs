@@ -1202,6 +1202,104 @@ mod tests {
         assert_eq!(client.allowed_models(), vec!["flash", "deepseek-v4-flash"]);
     }
 
+    /// A 401 from the upstream rotates to the next key instead of reaching the caller.
+    ///
+    /// This is the end-to-end half of a fix previously argued from two reads. The
+    /// config lists 401 in `rate_limit_status`; `is_rate_limit` consults it; so the
+    /// retry loop parks and continues. Every step of that is code the suite could read
+    /// and none of it was code the suite RAN, which is what the config note said and
+    /// what this closes.
+    ///
+    /// TWO KEYS, and that is the whole point rather than a detail. A 401 parks the
+    /// first key, so rotating needs somewhere to rotate TO; with one key the pool is
+    /// simply exhausted and the caller sees a rate-limit error - a different bug, which
+    /// an earlier attempt at this test would have read as the 401 leaking through.
+    /// `endpoint()` builds a one-element `api_key_envs`, so the second key is added
+    /// explicitly here rather than by setting another environment variable, which
+    /// does nothing the pool can see.
+    #[tokio::test]
+    async fn a_401_from_the_upstream_rotates_to_the_next_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local addr");
+
+        // TWO connections: the first rejected, the second served. If the loop ever
+        // returned the 401, the second accept would never happen and this task would
+        // never finish, so the assertion at the end is not the only thing holding it.
+        let served = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 1024];
+                    let read = socket.read(&mut chunk).await.expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buffer).into_owned();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let expected: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_string)
+                        })
+                        .and_then(|len| len.trim().parse().ok())
+                        .unwrap_or(0);
+                    if body.len() >= expected {
+                        break;
+                    }
+                }
+
+                let mut body = Vec::new();
+                let status = if attempt == 0 {
+                    "401 Unauthorized"
+                } else {
+                    body.extend_from_slice(&sse(&[fake_usage_chunk()]));
+                    body.extend_from_slice(b"data: [DONE]\n\n");
+                    "200 OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write head");
+                if !body.is_empty() {
+                    socket.write_all(&body).await.expect("write body");
+                }
+                socket.flush().await.expect("flush");
+            }
+        });
+
+        let _lock = EnvLock::acquire();
+        let _env1 = EnvGuard::set("APK_TEST_LIVE_KEY_1", "test-key-1");
+        let _env2 = EnvGuard::set("APK_TEST_LIVE_KEY_2", "test-key-2");
+        let mut live = endpoint("live", 1.0);
+        live.url = format!("http://{addr}/v1");
+        live.api_key_envs = vec!["APK_TEST_LIVE_KEY_1".into(), "APK_TEST_LIVE_KEY_2".into()];
+        let client = client(vec![model("flash", vec![live])]);
+
+        let stream = client
+            .stream_chat(
+                "flash",
+                json!({ "model": "flash", "messages": [], "stream": true }),
+            )
+            .await
+            .expect("a 401 must rotate to the next key, not reach the caller");
+        assert_eq!(stream.endpoint_name(), "live");
+
+        served.await.expect("the stub served both attempts");
+    }
     #[tokio::test]
     async fn stream_chat_sends_the_endpoint_model_and_streams_the_body() {
         use futures_util::StreamExt;

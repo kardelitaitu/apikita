@@ -261,11 +261,17 @@ max_stream_seconds = 1800
 # fails if 401 leaves the set, and `a_401_frees_the_slot_without_parking_the_key` pins the
 # pool's behaviour for a 429-only set.
 #
-# NOT verified by execution: no test drives a stubbed upstream that answers 401 and then
-# 200, so the end-to-end rotation is argued from two reads rather than observed. That is
-# the one remaining piece of this work and it needs a stub that can return a chosen status
-# per call, which the proxy tests do not have. Worth building: the failure it would catch
-# is a customer receiving our own 401.
+# Verified END TO END now, in two halves that are checked separately because neither
+# alone is the claim. `the_shipped_config_parks_a_401` reads THIS FILE and fails if 401
+# leaves the set, so the shipped value is pinned. And `a_401_from_the_upstream_rotates_to_
+# the_next_key` drives a stubbed upstream that answers 401 then 200 and requires the
+# stream to succeed, so the BEHAVIOUR is observed rather than argued. The first test does
+# not need a stub and the second does not need this file, which is why neither can quietly
+# cover for the other.
+#
+# That test needs TWO keys: a 401 parks the first, so rotating requires somewhere to rotate
+# to. With one key the pool is simply exhausted and the caller sees a rate-limit error - a
+# different bug, which an earlier attempt at that test read as the 401 leaking through.
 rate_limit_status = [429, 401]
 
 # Seconds a key stays out of rotation after being throttled. Short: the
