@@ -754,13 +754,17 @@ mod tests {
     /// it is checked, which is what the two loops are.
     #[test]
     fn every_promised_retention_window_is_a_window_the_sweep_deletes() {
-        const SWEEP: &[(&str, u32)] = &[
-            ("key_ip_seen", 7),
-            ("key_ip_daily", 90),
-            ("usage_daily", 730),
-            ("usage_events", 90),
-            ("sessions", 30),
-            ("link_redemption_attempts", 7),
+        const SWEEP: &[(&str, u32, i64)] = &[
+            ("key_ip_seen", 7, crate::ip_tracking::SEEN_RETENTION_DAYS),
+            ("key_ip_daily", 90, crate::ip_tracking::DAILY_RETENTION_DAYS),
+            ("usage_daily", 730, crate::db::USAGE_DAILY_RETENTION_DAYS),
+            ("usage_events", 90, crate::db::USAGE_EVENTS_RETENTION_DAYS),
+            ("sessions", 30, crate::db::SESSION_RETENTION_DAYS),
+            (
+                "link_redemption_attempts",
+                7,
+                crate::db::LINK_ATTEMPT_RETENTION_DAYS,
+            ),
         ];
 
         // Which document states each window. Not the same file throughout, which is
@@ -777,20 +781,23 @@ mod tests {
         ];
         let published = sources.join("\n");
 
-        for (table, days) in SWEEP {
-            // THE SHELL LITERAL MUST BE THE RUST CONSTANT, which is the check that did
-            // not exist while the link window lived only as a 7 typed into a shell
-            // script. The privacy page, the policy table and the metrics endpoint all
-            // read the number from Rust while the sweep read it from a literal, so
-            // nothing tied the promise to the thing that enforces it.
-            if *table == "link_redemption_attempts" {
-                assert_eq!(
-                    *days as i64,
-                    crate::db::LINK_ATTEMPT_RETENTION_DAYS,
-                    "the entrypoint deletes link_redemption_attempts after {days} days while the Rust constant is {}. One of the two is the promise and the other is the enforcement.",
-                    crate::db::LINK_ATTEMPT_RETENTION_DAYS
-                );
-            }
+        for (table, days, constant) in SWEEP {
+            // THE SHELL LITERAL MUST BE THE RUST CONSTANT, for ALL SIX, which is the
+            // check that did not exist while these windows lived as literals typed into
+            // the entrypoint. The privacy page, the policy table and the metrics endpoint
+            // all read the numbers from Rust while the sweep read them from a script, so
+            // nothing tied any promise to the thing that enforces it - a sweep could be
+            // deleting at 30 days while every document said 7, and every other check here
+            // would still pass because they compare the documents to the CONSTANTS.
+            //
+            // It started as a special case for the one window that had no constant at all,
+            // which is the shape this class of bug usually takes: fixed once, in one
+            // place, and the other five left because they already had numbers to copy.
+            assert_eq!(
+                *days as i64,
+                *constant,
+                "the entrypoint deletes {table} after {days} days while the Rust constant is {constant}. One of the two is the promise and the other is the enforcement, and every other check in this file compares documents to the constant rather than to the script."
+            );
 
             // The table must be named somewhere in the published documents, and the
             // window must be one of the two renderings a document uses: N days, or
@@ -814,7 +821,7 @@ mod tests {
         // THE REVERSE. Every retention_delete against a table that is not in the list
         // above is a delete this check has not agreed to.
         let entrypoint = read_repo_file(".docker/maintenance/entrypoint.sh");
-        let mut swept: Vec<String> = Vec::new();
+        let mut swept: Vec<(String, i64)> = Vec::new();
         for line in entrypoint.lines() {
             if !line.contains("retention_delete") {
                 continue;
@@ -822,13 +829,26 @@ mod tests {
             let Some(rest) = line.split("$DB_FILE").nth(1) else {
                 continue;
             };
-            let name = rest
-                .split_whitespace()
-                .find(|t| !t.is_empty() && !t.contains('"'))
+            // Splitting on the closing paren is wrong here: the sessions call passes a
+            // quoted COALESCE(...) that contains one, and the first paren is inside it.
+            // The last token before the assignment ends is the day count, with the paren
+            // trimmed off - which reads the same for `key_ip_seen 7)` and for
+            // `... "COALESCE(revoked_at, expires_at)" 30)`.
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            let Some(name) = tokens.iter().find(|t| !t.contains('"')).copied() else {
+                continue;
+            };
+            // The DAY COUNT the script actually passes, not the one written in this test.
+            // Reading the name only was the gap: the list above is a hand-kept copy, so
+            // comparing it to a constant only proves the copy agrees with the constant
+            // and says nothing about the script. A mutation changing the entrypoint from
+            // 30 to 45 passed the previous version of this check.
+            let days = tokens
+                .iter()
+                .rev()
+                .find_map(|t| t.trim_end_matches(')').parse::<i64>().ok())
                 .unwrap_or_default();
-            if !name.is_empty() {
-                swept.push(name.to_string());
-            }
+            swept.push((name.to_string(), days));
         }
 
         // The vacuity guard: a parse that found nothing would agree with anything.
@@ -838,10 +858,20 @@ mod tests {
             swept.len()
         );
 
-        for table in &swept {
-            assert!(
-                SWEEP.iter().any(|(t, _)| t == table),
-                "the entrypoint deletes `{table}` but no window in this test claims to. Either the promise is missing from the documents, or this list is out of date - both are worth knowing, and neither may be resolved by silently editing the list."
+        for (table, days) in &swept {
+            let claimed = SWEEP
+                .iter()
+                .find(|(t, _, _)| t == table)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the entrypoint deletes `{table}` but no window in this test claims to. Either the promise is missing from the documents, or this list is out of date - both are worth knowing, and neither may be resolved by silently editing the list."
+                    )
+                });
+            assert_eq!(
+                *days,
+                claimed.2,
+                "the entrypoint deletes `{table}` after {days} days while every document, the metrics endpoint and the Rust constant say {}. The script is the only place the number is not read from, and it is the only place that enforces it.",
+                claimed.2
             );
         }
     }
