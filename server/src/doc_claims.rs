@@ -1738,6 +1738,33 @@ mod tests {
         }
         assert_eq!(shipped.len(), 6, "the flash card must contribute six rates");
 
+        // THE DOCUMENT'S OWN STATED FX, and this is the binding that closes the loop.
+        // `docs/business/02-pricing.md` says "Converted at 1 CNY = 2,676.78 IDR" and
+        // gives the rule. The FX is read from the CONFIG above, so every figure below is
+        // checked against the config's rate - and if the document quoted a DIFFERENT rate,
+        // every figure in it would convert correctly and the guard would say nothing: the
+        // document would be consistent with the config's arithmetic while telling a reader
+        // a different conversion. That is the same class as a self-consistent copy, one
+        // level up, and it is invisible to any check that takes the rate from one file and
+        // applies it to figures in another.
+        let doc_fx: f64 = doc
+            .lines()
+            .find_map(|line| {
+                let rest = line.split("1 CNY =").nth(1)?.trim();
+                let digits: String = rest
+                    .split_whitespace()
+                    .next()?
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                digits.parse().ok()
+            })
+            .expect("the pricing document must state the CNY to IDR rate it converted at");
+        assert!(
+            (doc_fx - fx).abs() < 0.001,
+            "the pricing document says the card was converted at 1 CNY = {doc_fx} IDR while config/apikita.toml says {fx}. Every figure in the document converts correctly by the rate it quotes, so nothing else here would notice."
+        );
+
         // A table cell that is a bare figure, possibly with a thousands separator.
         let figure = |cell: &str| -> Option<f64> {
             let t = cell.trim();
