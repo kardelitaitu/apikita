@@ -375,6 +375,21 @@ impl UpstreamClient {
     /// unrouted placeholder could both cause a false alarm and, worse, mask a real
     /// outage on the one endpoint that IS routed.
     ///
+    /// **AND ONLY ENDPOINTS THAT CAN ACTUALLY SERVE.** Weight alone is not enough, and
+    /// the gap was live. A weighted endpoint with NO CONFIGURED KEYS can never answer
+    /// a request: `keys_from_env` yields an empty pool, `acquire` returns None, and the
+    /// failover loop steps straight past it. Its breaker is never exercised either, so
+    /// it never records a failure and stays Closed forever.
+    ///
+    /// So a placeholder left at weight 1.0 with no keys votes "this model is
+    /// available" even when the one real provider is down. The shipped config has
+    /// exactly that: `secondary` on the flash model is documented as a placeholder
+    /// whose resale terms were never read, carries weight 1.0, and its two key
+    /// variables are empty in .env.example. `all_providers_unhealthy` therefore could
+    /// not fire for the only outage it was written to catch. An alert that is
+    /// structurally unable to fire is worse than no alert, because it reads as one
+    /// that is working.
+    ///
     /// An EMPTY routed pool gives `false` too: with nothing routed there is no outage
     /// to report, and a vacuously-true "all zero endpoints are open" would fire an
     /// alert for a model that was never served.
@@ -393,7 +408,14 @@ impl UpstreamClient {
         };
 
         let mut routed = 0usize;
-        for endpoint in entry.endpoints.iter().filter(|e| e.weight > 0.0) {
+        // A weighted endpoint with no keys cannot serve, so it must not count: its
+        // breaker never trips, and counting it lets a placeholder mask a real outage
+        // on the provider that is actually serving. See the doc above.
+        for endpoint in entry
+            .endpoints
+            .iter()
+            .filter(|e| e.weight > 0.0 && e.pool.key_count() > 0)
+        {
             routed += 1;
             if endpoint.breaker.allow_request() {
                 // At least one routed endpoint can still serve, so the model is up.
@@ -611,6 +633,7 @@ mod tests {
         NetworkConfig, PricingConfig, RealtimeConfig, SessionsConfig, StreamingConfig,
         WalletConfig,
     };
+    use crate::routes::test_env::{EnvGuard, EnvLock};
     use crate::upstream::circuit_breaker::BreakerState;
 
     /// Serialize JSON chunks as an SSE body, the way an OpenAI-style upstream
@@ -941,8 +964,15 @@ mod tests {
     // model.
 
     /// Only ONE endpoint open is NOT unhealthy: failover is doing its job.
+    ///
+    /// Both endpoints are KEYED, because "failover is working" is only true if the
+    /// second one could actually answer. With an unkeyed second endpoint the correct
+    /// answer is the opposite - which is the defect the sibling test pins.
     #[test]
     fn one_open_endpoint_is_not_all_providers_unhealthy() {
+        let _lock = EnvLock::acquire();
+        let _primary = EnvGuard::set("APK_TEST_PRIMARY_KEY_1", "test-key");
+        let _secondary = EnvGuard::set("APK_TEST_SECONDARY_KEY_1", "test-key");
         let client = client(vec![model(
             "flash",
             vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
@@ -968,9 +998,51 @@ mod tests {
         );
     }
 
+    /// A WEIGHTED endpoint with NO KEYS cannot mask a real outage on the endpoint
+    /// that can serve, and this is the shipped shape.
+    ///
+    /// config/apikita.toml leaves the flash model's secondary endpoint at weight 1.0 -
+    /// a placeholder whose resale terms were never read - with its two key variables
+    /// empty in .env.example. keys_from_env yields an empty pool, acquire returns
+    /// None, and the failover loop steps straight past it. Its breaker is never
+    /// exercised either, so it stays Closed and votes "this model is available".
+    ///
+    /// Before this test existed, that meant the all_providers_unhealthy alert could not
+    /// fire for the only outage it was written to catch: the one real provider goes
+    /// down, its breaker opens, and an unkeyed placeholder says everything is fine.
+    #[test]
+    fn a_weighted_endpoint_with_no_keys_cannot_mask_a_real_outage() {
+        let _lock = EnvLock::acquire();
+        // The one real provider: keyed, and tripped below.
+        let _key = EnvGuard::set("APK_TEST_PRIMARY_KEY_1", "test-key");
+        // The placeholder: weighted 1.0, and deliberately NO key.
+        let _no_key = EnvGuard::remove("APK_TEST_SECONDARY_KEY_1");
+
+        let client = client(vec![model(
+            "flash",
+            vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
+        )]);
+        trip_endpoint(&client, 0);
+
+        assert!(
+            client.all_endpoints_unhealthy("flash"),
+            "the only endpoint that can SERVE is open, so the model is down. A weighted \
+             endpoint with no keys cannot answer a request, so it must not vote \
+             healthy and hide the outage"
+        );
+    }
+
     /// EVERY endpoint open IS unhealthy: nothing can serve this model.
+    ///
+    /// Both endpoints are KEYED, which this fixture previously was not - it ran with
+    /// two empty pools and passed, which is the bug the test above pins rather than
+    /// the property it claims. An endpoint with no keys cannot serve, so asserting
+    /// "nothing can serve" about one asserts nothing.
     #[test]
     fn every_open_endpoint_is_all_providers_unhealthy() {
+        let _lock = EnvLock::acquire();
+        let _primary = EnvGuard::set("APK_TEST_PRIMARY_KEY_1", "test-key");
+        let _secondary = EnvGuard::set("APK_TEST_SECONDARY_KEY_1", "test-key");
         let client = client(vec![model(
             "flash",
             vec![endpoint("primary", 1.0), endpoint("secondary", 1.0)],
@@ -1022,8 +1094,14 @@ mod tests {
     }
 
     /// A weight-0 endpoint does NOT mask a real outage on a routed one.
+    ///
+    /// The routed endpoint is KEYED, for the same reason as above: an unkeyed one
+    /// cannot serve, so asserting an outage for it would be asserting the bug rather
+    /// than the property.
     #[test]
     fn a_weightless_endpoint_does_not_mask_a_routed_outage() {
+        let _lock = EnvLock::acquire();
+        let _key = EnvGuard::set("APK_TEST_PRIMARY_KEY_1", "test-key");
         let client = client(vec![model(
             "flash",
             vec![endpoint("ghost", 0.0), endpoint("primary", 1.0)],
@@ -1176,7 +1254,13 @@ mod tests {
         });
 
         // The key comes from the environment variable the endpoint names.
-        std::env::set_var("APK_TEST_LIVE_KEY_1", "test-key");
+        // The ONE process-wide lock over environment mutation. These tests
+        // run in PARALLEL THREADS, and the environment is process-global, so
+        // without it two tests interleave their writes and the fixtures stop
+        // meaning what they say. It is deliberately not Send: it belongs in
+        // the test body, not in a spawned task.
+        let _lock = EnvLock::acquire();
+        let _env = EnvGuard::set("APK_TEST_LIVE_KEY_1", "test-key");
         let mut live = endpoint("live", 1.0);
         live.url = format!("http://{addr}/v1");
         let client = client(vec![model("flash", vec![live])]);
@@ -1304,7 +1388,13 @@ mod tests {
 
     /// A client whose single endpoint points at the given url, with its key installed.
     fn client_pointed_at(url: &str) -> UpstreamClient {
-        std::env::set_var("APK_TEST_SOLO_KEY_1", "test-key");
+        // The ONE process-wide lock over environment mutation. These tests
+        // run in PARALLEL THREADS, and the environment is process-global, so
+        // without it two tests interleave their writes and the fixtures stop
+        // meaning what they say. It is deliberately not Send: it belongs in
+        // the test body, not in a spawned task.
+        let _lock = EnvLock::acquire();
+        let _env = EnvGuard::set("APK_TEST_SOLO_KEY_1", "test-key");
         let mut solo = endpoint("solo", 1.0);
         solo.url = url.to_string();
         client(vec![model("flash", vec![solo])])
@@ -1425,8 +1515,14 @@ mod tests {
         let dead = upstream_answering("500 Internal Server Error", "{}").await;
         let healthy = upstream_answering("200 OK", "").await;
 
-        std::env::set_var("APK_TEST_DEAD_KEY_1", "dead-key");
-        std::env::set_var("APK_TEST_ALIVE_KEY_1", "alive-key");
+        // The ONE process-wide lock over environment mutation. These tests
+        // run in PARALLEL THREADS, and the environment is process-global, so
+        // without it two tests interleave their writes and the fixtures stop
+        // meaning what they say. It is deliberately not Send: it belongs in
+        // the test body, not in a spawned task.
+        let _lock = EnvLock::acquire();
+        let _dead = EnvGuard::set("APK_TEST_DEAD_KEY_1", "dead-key");
+        let _alive = EnvGuard::set("APK_TEST_ALIVE_KEY_1", "alive-key");
 
         let mut first = endpoint("dead", 1.0);
         first.url = dead;
@@ -1456,7 +1552,13 @@ mod tests {
     #[tokio::test]
     async fn a_weightless_endpoint_is_skipped_entirely() {
         let url = upstream_answering("200 OK", "").await;
-        std::env::set_var("APK_TEST_GHOST_KEY_1", "ghost-key");
+        // The ONE process-wide lock over environment mutation. These tests
+        // run in PARALLEL THREADS, and the environment is process-global, so
+        // without it two tests interleave their writes and the fixtures stop
+        // meaning what they say. It is deliberately not Send: it belongs in
+        // the test body, not in a spawned task.
+        let _lock = EnvLock::acquire();
+        let _ghost = EnvGuard::set("APK_TEST_GHOST_KEY_1", "ghost-key");
 
         let mut ghost = endpoint("ghost", 0.0);
         ghost.url = url;
@@ -1475,6 +1577,16 @@ mod tests {
 
     #[tokio::test]
     async fn stream_chat_reports_an_unknown_model_and_a_missing_key() {
+        // Built FIRST, while the local `client` below does not yet shadow the helper
+        // of the same name, and after the key is removed - the key pool is populated
+        // when UpstreamClient::new reads the environment, so removing the variable
+        // afterwards would leave a pool that already holds the key. Both orderings
+        // were wrong here and made this test fail for a reason that had nothing to do
+        // with what it asserts.
+        let _lock = EnvLock::acquire();
+        let _env = EnvGuard::remove("APK_TEST_PRIMARY_KEY_1");
+        let keyless_client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+
         let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
 
         let unknown = client
@@ -1483,10 +1595,8 @@ mod tests {
             .expect_err("unknown model");
         assert!(matches!(unknown, UpstreamError::NoModel(name) if name == "ghost"));
 
-        // No APK_TEST_PRIMARY_KEY_1 in the environment: the pool is empty, so
-        // there is nothing to send with and the request fails fast (503).
-        std::env::remove_var("APK_TEST_PRIMARY_KEY_1");
-        let keyless = client
+        // A keyless endpoint must fail FAST (503), with no request sent at all.
+        let keyless = keyless_client
             .stream_chat("flash", json!({ "model": "flash" }))
             .await
             .expect_err("empty key pool");
