@@ -260,22 +260,47 @@ max_context_tokens = 1000000
 # PROVIDERS AND MODELS
 # ===========================================================================
 #
-# ONE VERIFIED PROVIDER. The endpoint list below has three entries, but only
-# the first is a real, terms-checked supplier:
+# ONE VERIFIED PROVIDER, AND ONE PLACEHOLDER THAT IS CURRENTLY ROUTABLE.
+# The flash endpoint list below has three entries, and only the first is a real,
+# terms-checked supplier:
 #
-#   primary    - the reseller in config/provider1.md. VERIFIED.
+#   primary    - the reseller in config/provider1.md. VERIFIED. weight 1.0.
 #   secondary  - PLACEHOLDER URL. No provider identified, terms unread.
+#                weight 1.0 - SO IT IS ROUTED. This contradicts the rule stated
+#                below, and it is the one thing here that must change before a
+#                launch: see the note under FAILOVER below.
 #   tertiary   - PLACEHOLDER URL. weight 0, so never routed.
 #
 # The placeholder URLs are NOT real endpoints. They exist so the config shape
 # is visible; replace them before deploying, or delete the entries.
 #
-# Consequence for failover: with one real provider there is nothing to fail
+# Consequence for failover: with one real provider there is nothing real to fail
 # over TO. Circuit breaking and key rotation work today; cross-provider
 # failover does not. See docs/failover.md.
 #
-# A provider must not be enabled until its resale terms are read - the config
-# enforces this with weight = 0 on unverified entries.
+# A provider must not be enabled until its resale terms are read, and the way
+# this file expresses that is weight = 0. IT DOES NOT ENFORCE IT CONSISTENTLY:
+# two placeholders are listed, one at weight 0 and one at weight 1.0. There is no
+# verified flag to check, so nothing rejects an unverified entry that someone has
+# left enabled - the rule is a convention here, not a constraint, and a reader who
+# took the old wording at face value would believe the opposite.
+#
+# FAILOVER, and what weight 1.0 on a placeholder actually does. The router selects
+# every endpoint with weight > 0, so on a primary 429 or 5xx the request is offered
+# to the secondary. If its key variables are unset it has an EMPTY key pool, the
+# failover loop steps past it, and the request fails - no worse than before, but the
+# attempt and the timeout are real. If an operator sets APK_FLASH_SECONDARY_KEY_1,
+# traffic is then sent to api.xyz.com, which is not the provider.
+#
+# It also has one more effect that is easy to miss, and the server was fixed for it:
+# a weighted endpoint with no keys can never answer, and its circuit breaker never
+# trips, so it used to vote "this model is available" in all_providers_unhealthy and
+# hide a real outage of the primary. That is corrected in the code
+# (upstream/client.rs, an endpoint counts only if it also has keys).
+#
+# THE FIX, when there is authority to make it, is one line: set this endpoint's
+# weight to 0.0. It is left as-is rather than changed here because choosing which
+# providers are real is a deployment decision, not a code one.
 
 # ===========================================================================
 # MODEL LIST

@@ -756,6 +756,60 @@ mod tests {
              hard cap binds only for clients who ask for more - which it does handle"
         );
     }
+    /// The provider header's claim about routability must match the WEIGHTS.
+    ///
+    /// The config says how many providers are verified and asserts that unverified
+    /// entries are held at weight 0 so they are never routed. It also carried a
+    /// placeholder at weight 1.0 - so a reader taking the header at face value would
+    /// believe the router only ever offers requests to the one real supplier, when
+    /// it would offer them to a URL that is not a provider.
+    ///
+    /// This pins the two together, because the comment is what an operator reads
+    /// before deploying and the weights are what the router obeys. Adding a second
+    /// routable placeholder - or fixing the existing one - makes one of the two
+    /// wrong, and the test names which.
+    ///
+    /// WHAT IS NOT ASSERTED, because it is a deployment decision rather than a
+    /// property of the file: that the routable endpoint is the VERIFIED one. The
+    /// config carries no verified flag, so nothing can check that today - which is
+    /// itself why the header used to overstate what this file enforces.
+    #[test]
+    fn the_config_header_does_not_overstate_how_many_endpoints_are_routable() {
+        let config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+
+        // The flash list is the one the PROVIDERS AND MODELS header describes, and
+        // the only one carrying more than one entry.
+        let flash = config
+            .models
+            .iter()
+            .find(|m| m.name == "flash")
+            .expect("the shipped config must carry the flash model");
+        let routable: Vec<&str> = flash
+            .endpoints
+            .iter()
+            .filter(|e| e.weight > 0.0)
+            .map(|e| e.name.as_str())
+            .collect();
+
+        // The header names the first as verified and warns the rest are placeholders
+        // held at weight 0. Two routable entries means that warning is NOT being
+        // enforced, and the header now says so in as many words.
+        assert_eq!(
+            routable.len(),
+            2,
+            "routable flash endpoints are {routable:?}, but the header describes one verified provider and says the rest are held at weight 0. If a placeholder was correctly set to 0.0, update the header; if a real provider was added, update the header too. Either way the two must agree."
+        );
+        assert!(
+            routable.contains(&"primary"),
+            "the verified provider must stay routable, got {routable:?}"
+        );
+        assert!(
+            routable.contains(&"secondary"),
+            "the flash secondary is expected to be routable today, because setting it to weight 0 is the fix the header recommends and that decision has not been taken. If it has been, update this assertion AND the header in the same commit - that is the whole point of the test. Got {routable:?}"
+        );
+    }
     use crate::money::calculate_preflight_reservation_idr;
 
     /// A config with NO per-endpoint rate overrides must load and validate
