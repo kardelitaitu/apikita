@@ -530,6 +530,71 @@ mod tests {
             "a secret is substituted into a log or format macro:\n{findings:#?}\nA customer-facing privacy page states the Midtrans server key is never logged, and this is that claim in the only form that can be checked."
         );
     }
+    /// Every document is TRIAGED: either citation-checked, or listed here with a reason.
+    ///
+    /// WHY. The list of citation-checked documents above is hand-maintained, and a
+    /// hand-maintained list fails SILENTLY in one direction: a new document arrives, is
+    /// correct, and simply never joins the list. Nothing says so. This test makes the
+    /// omission loud instead - the day a file appears in docs/, the suite goes red and
+    /// someone decides whether it is a document an operator acts on.
+    ///
+    /// The decision it forces IS the judgement, because operational is not derivable: it
+    /// is a judgement about whether a reader would be misled by a citation that points
+    /// somewhere else. That is a call for a person, so the test does not make it - it
+    /// makes it REQUIRED.
+    ///
+    /// Note what this does NOT claim: that the listed documents are the right ones, or
+    /// that the others are correctly excluded. It claims only that every file has been
+    /// considered, which is the part that was silently untrue.
+    #[test]
+    fn every_document_is_either_citation_checked_or_triaged_with_a_reason() {
+        const TRIAGED: &[(&str, &str)] = &[
+            ("abuse-runbook.md", "what to do when a limit trips; a runbook is read after the fact, not acted on by line citation"),
+            ("backup-and-restore.md", "operational, but its claims are about drills and RTOs; it cites no source lines"),
+            ("benchmark.md", "a record of one measurement, not a contract"),
+            ("cache-pricing-options.md", "a design note for a cache that is not built"),
+            ("ci-cd.md", "describes the pipeline itself, and ci-docs-check is what keeps it honest"),
+            ("cost-and-sizing.md", "sizing arithmetic, which is testable rather than cited"),
+            ("decisions.md", "the register; it NAMES files and sections, and the retention and session checks read it"),
+            ("plan-audit.md", "a historical record of a past audit"),
+            ("terms-of-service.md", "legal text, deliberately uncited"),
+            ("testing.md", "describes the test suite; it is not a source of claims ABOUT the suite"),
+            ("whitepaper.md", "marketing; nothing operational depends on it"),
+            ("wind-down.md", "a plan for a state the service is not in"),
+        ];
+
+        let mut documents: Vec<String> = std::fs::read_dir(doc_path("."))
+            .expect("docs/ must be readable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".md"))
+            .collect();
+        documents.sort();
+
+        for name in &documents {
+            if OPERATIONAL_DOCS.contains(&name.as_str()) {
+                continue;
+            }
+            assert!(
+                TRIAGED.iter().any(|(n, _)| n == name),
+                "docs/{name} is neither citation-checked nor listed as deliberately not checked. Every document needs a decision: if an operator would be misled by a citation here that points somewhere else, add it to OPERATIONAL_DOCS; if not, add it to TRIAGED with the reason. A hand-kept list fails silently in exactly this direction."
+            );
+        }
+
+        // The vacuity guard, both directions: a list that matched nothing, or a
+        // docs/ directory the read did not actually see, would pass over everything.
+        assert!(
+            documents.len() >= 20,
+            "only {} top-level document(s) were read, so this test is not looking at the real docs/ tree.",
+            documents.len()
+        );
+        for (name, reason) in TRIAGED {
+            assert!(
+                !reason.trim().is_empty(),
+                "{name} is excluded with an empty reason, which is not an exclusion"
+            );
+        }
+    }
     /// The scanner itself, because a check that cannot find a citation it should find
     /// is a check that always passes. These are the shapes the rule exists to catch, and
     /// the shapes it must NOT catch - a heading, a numbered list, a version.
