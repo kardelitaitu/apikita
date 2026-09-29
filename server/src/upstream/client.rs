@@ -740,7 +740,10 @@ mod tests {
                 max_stream_seconds: 1800,
             },
             key_pool: KeyPoolConfig {
-                rate_limit_status: vec![429],
+                // Mirrors the SHIPPED config/apikita.toml. It was [429] alone, which meant these
+                // tests described a client that returns a 401 to the customer while the one
+                // that ships rotates on it - a fixture quietly contradicting production.
+                rate_limit_status: vec![429, 401],
                 key_cooldown_seconds: 5,
                 max_key_attempts: 3,
                 on_pool_exhausted: "reject_503".to_string(),
