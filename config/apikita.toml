@@ -234,7 +234,22 @@ max_stream_seconds = 1800
 
 [key_pool]
 # HTTP status treated as "this key is saturated, rotate to the next".
-rate_limit_status = [429]
+# 401 IS HERE BECAUSE IT IS A KEY, NOT A CALLER. A 429 says this key is saturated;
+# a 401 says this key is REJECTED - revoked, misconfigured, or out of provider quota at
+# the auth layer - and it is just as specific to this key. Parking it matters more than it
+# looks: selection is least in-flight, so a key that fails fast is in flight for LESS time
+# and therefore gets picked MORE often. With 401 absent, a dead key drifts towards being
+# the one every request tries.
+#
+# 403 is deliberately NOT here. It usually means the key is valid but lacks access to the
+# model, which is a configuration decision rather than a broken credential, and parking it
+# would hide a misconfiguration behind a silent key rotation.
+#
+# KNOWN, NOT YET FIXED: the upstream client still RETURNS a 401 to the customer rather
+# than rotating, because its retry loop treats every 4xx that is not 429 or 5xx as "the
+# caller's request, not a provider fault". Parking the key fixes which key is tried next;
+# it does not yet stop the one customer who drew the dead key from seeing our auth failure.
+rate_limit_status = [429, 401]
 
 # Seconds a key stays out of rotation after being throttled. Short: the
 # provider's own concurrency window frees up quickly.

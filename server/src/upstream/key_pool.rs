@@ -275,6 +275,31 @@ mod tests {
     /// still sees a 401. Retrying on 401 as the loop already retries on 429 removes that,
     /// and costs an extra upstream call per attempt during an incident. Nobody has
     /// chosen between them, so the honest state is recorded and visible.
+    /// The SHIPPED config parks a 401, which is what the change above relies on.
+    ///
+    /// The test beside this one pins the POOL, and the pool is built with a literal
+    /// vec![429] - so it cannot see config/apikita.toml and passed UNCHANGED after the
+    /// config was fixed. A test that does not read the thing that was changed is a test
+    /// that would have stayed green through the whole defect, which is the whole point of
+    /// reading before asserting.
+    fn the_shipped_config_parks_a_401() {
+        let config = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("config")
+                .join("apikita.toml"),
+        )
+        .expect("config/apikita.toml must be readable, or this passes over nothing");
+        let line = config
+            .lines()
+            .find(|l| l.trim_start().starts_with("rate_limit_status"))
+            .expect("the config must still state rate_limit_status");
+        assert!(
+            line.contains("401"),
+            "rate_limit_status must park a 401: it is a KEY being rejected, not a caller being refused, and least-loaded selection makes a fast-failing key the one picked most. 403 stays out deliberately - it is a configuration decision, not a broken credential."
+        );
+    }
+    #[test]
     fn a_401_frees_the_slot_without_parking_the_key() {
         let pool = pool(2, 30);
 
