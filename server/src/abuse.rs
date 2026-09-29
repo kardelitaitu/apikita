@@ -21,6 +21,27 @@
 //! config the application already owns (`AppState.config`), and is passed in, so
 //! this module holds no state and no second view of the configuration.
 
+#![cfg_attr(
+    not(test),
+    // THE ABUSE CAPS, fenced for the reason the breaker was: this module REFUSES
+    // requests, so its arithmetic is the last thing standing between a script and
+    // the wallet. It is a third kind of site, though - neither a money figure nor a
+    // panic, but a figure handed to a CLIENT in a Retry-After header.
+    //
+    // That makes the failure mode specific: an overflow here does not corrupt
+    // anything, it produces a wrong answer to the question "when may I try again".
+    // Wrong in the permissive direction - a tiny Retry-After - invites a client to
+    // retry immediately into the same refusal, which docs/error-model.md calls out
+    // as what "reads as a broken limiter". The floor of 1 second below is the guard
+    // against exactly that, and it is why the ceiling division is here at all.
+    //
+    // Three sites, and all three are bounded by the WINDOW LENGTH, which is a
+    // constant in this file rather than anything a caller or a row supplies. The
+    // arguments are written at each one, because "the window is an hour" is exactly
+    // the kind of fact that stops being true when someone parameterises it.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
@@ -50,7 +71,13 @@ pub fn key_creation_window() -> Duration {
 /// second must not be told `0`) and floored at 1 — a `Retry-After: 0` invites an
 /// immediate retry that is refused again, which reads as a broken limiter
 /// (docs/error-model.md).
+#[allow(clippy::arithmetic_side_effects)]
 fn retry_after_secs(oldest: DateTime<Utc>, window: Duration, now: DateTime<Utc>) -> u64 {
+    // SAFE, and the bound is the window rather than the inputs. `oldest` comes from
+    // MIN(created_at) over rows this server wrote, so it is a real timestamp; a
+    // clock that jumped forward would make it older, not further away. chrono's
+    // `DateTime + Duration` PANICS rather than wrapping on an out-of-range result,
+    // so even that would fail loudly instead of silently dating the window wrong.
     let remaining_ms = (oldest + window)
         .signed_duration_since(now)
         .num_milliseconds();
@@ -59,6 +86,22 @@ fn retry_after_secs(oldest: DateTime<Utc>, window: Duration, now: DateTime<Utc>)
     }
     // Ceiling division by hand: `div_ceil` on a signed integer is not stable in
     // this toolchain's std yet. `remaining_ms` is positive here.
+    //
+    // The `+ 999` cannot overflow, which is the one place this needs arguing: the
+    // guard above has already returned for anything <= 0, and the largest positive
+    // value is a window length measured in milliseconds - 3_600_000 for the hourly
+    // cap, 86_400_000 for the daily one. A row stamped far in the FUTURE would raise
+    // it, and would have to be stamped 292 million years ahead to reach i64::MAX.
+    //
+    // The `as u64` is a cast rather than a checked conversion, which is only sound
+    // because of that same bound: the value is positive and far below u64::MAX. The
+    // floor of 1 above is what keeps the permissive direction out - a client told
+    // "retry in 0 seconds" retries into the same refusal, which reads as a broken
+    // limiter.
+    //
+    // No second allow here: the expression is this function's TAIL, and an attribute
+    // in that position needs the unstable `stmt_expr_attributes` feature. The one on
+    // the function above covers it.
     ((remaining_ms + 999) / 1000) as u64
 }
 
@@ -114,9 +157,18 @@ pub async fn enforce_creation_cap(
          FROM {table} WHERE account_id = ? AND created_at >= ?"
     );
 
+    // SAFE, and for the same reason as the addition in retry_after_secs: `window` is
+    // a constant from this file (an hour, or a day) and `now` is the clock, so the
+    // subtraction is nowhere near the edge. chrono's DateTime arithmetic panics
+    // rather than wrapping on an out-of-range result, so a future parameterisation
+    // of the window would fail loudly here instead of silently counting the wrong
+    // rows.
+    #[allow(clippy::arithmetic_side_effects)]
+    let window_start = now - window;
+
     let row = sqlx::query(&sql)
         .bind(account_id.hyphenated())
-        .bind(now - window)
+        .bind(window_start)
         .fetch_one(pool)
         .await?;
 
@@ -229,6 +281,97 @@ mod tests {
         test_support::pending_topup(pool, account_id, 10_000).await;
     }
 
+    /// A CHARACTERISATION TEST, and the name says what it is: it records a
+    /// limitation that is REAL rather than asserting a property the code does not
+    /// have.
+    ///
+    /// `enforce_creation_cap` is a SELECT COUNT, and the row it guards is inserted
+    /// by the CALLER afterwards. Nothing holds a lock between the two, so requests
+    /// that arrive together read the same count, all see room, and all insert.
+    /// MEASURED here: sixteen concurrent callers against a cap of five, seeded one
+    /// under, produced fourteen rows. The cap is enforced against a stale read.
+    ///
+    /// THE OBVIOUS FIX IS NOT AVAILABLE, and the reason matters more than the race.
+    /// On the top-up path the insert happens after a Midtrans Snap call and a
+    /// PocketBase lookup, so a transaction spanning check and insert would hold a
+    /// SQLite WRITE LOCK across a network round trip to a payment provider, and
+    /// every other top-up in the process would serialise behind it. The fix is a
+    /// reservation - claim the slot atomically at check time, by inserting the row
+    /// then, or by counting in a dedicated table - which is a schema and flow
+    /// change rather than a patch.
+    ///
+    /// So this pins what exists instead of pretending otherwise, and it fails if
+    /// the cap is removed or stops bounding anything:
+    ///
+    ///   * no round may exceed the number of callers plus the seed, which is the
+    ///     trivial bound and catches a change that lets everyone through
+    ///     unconditionally;
+    ///   * at least one round must EXCEED the cap, or the weakness is gone and this
+    ///     characterisation is stale - which is the good outcome, and the test
+    ///     should be rewritten as a plain assertion when it happens.
+    ///
+    /// FIVE ROUNDS rather than one, because whether the tasks interleave is
+    /// scheduling and a single round can pass by luck - which is exactly what the
+    /// first version of this test did. That version seeded the table to exactly the
+    /// cap and counted allowed CHECKS; it passed, and proved nothing, because an
+    /// account already at its cap is refused by any number of readers, sequential or
+    /// otherwise. It tested the predicate, not the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_creation_cap_is_enforced_against_a_stale_read_under_concurrency() {
+        const CALLERS: u64 = 16;
+        const ROUNDS: usize = 5;
+
+        let limit = configured_limits().topup_per_hour;
+        assert!(limit > 0, "the fixture assumes a configured hourly cap");
+        let mut worst: i64 = 0;
+
+        for _ in 0..ROUNDS {
+            let db = TestDb::new().await;
+            let account_id = test_support::account(&db.pool).await;
+            let now = Utc::now();
+            for _ in 0..limit - 1 {
+                insert_topup(&db.pool, account_id).await;
+            }
+
+            let mut handles = Vec::new();
+            for _ in 0..CALLERS {
+                let pool = db.pool.clone();
+                handles.push(tokio::spawn(async move {
+                    // Exactly the caller's sequence: check, then insert if allowed.
+                    if enforce_creation_cap(&pool, "topups", topup_window(), limit, account_id, now)
+                        .await
+                        .is_ok()
+                    {
+                        insert_topup(&pool, account_id).await;
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.await.expect("the caller task must not panic");
+            }
+
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM topups WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count the top-ups");
+            worst = worst.max(total);
+
+            assert!(
+                total <= i64::from(limit - 1) + CALLERS as i64,
+                "{total} rows from {CALLERS} callers: more than the callers plus the
+                seed, so the cap is no longer bounding anything at all"
+            );
+        }
+
+        assert!(
+            worst > i64::from(limit),
+            "across {ROUNDS} rounds the cap of {limit} was never exceeded (worst
+            {worst}). The race is either gone or the fixture stopped
+            interleaving - either way this characterisation is now stale and should
+            be rewritten as an assertion that the cap holds"
+        );
+    }
     #[tokio::test]
     async fn the_topup_cap_lets_the_limit_through_and_refuses_the_next() {
         let db = TestDb::new().await;
