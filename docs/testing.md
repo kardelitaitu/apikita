@@ -250,6 +250,27 @@ path - `live_webhook_settlement_credits_exactly_once_and_a_replay_does_not` - do
 measure it: it asserts the ledger row count is 1 after the first webhook and 0 after each
 replay. The pattern holds where it matters; it simply is not machine-checkable by name.
 
+### Testing a guard by deleting the wrong file
+
+A vacuity check asks whether a guard passes when the thing it guards is absent. The easy
+way to get that wrong is to delete a file the guard was never reading.
+
+`ci-docs-check` passed with `docs/data-retention.md` missing, which looked like a fifth
+vacuous pass. It is not one: that check reads exactly one file, `docs/ci-cd.md`, and
+compares the CI workflow steps against it. Deleting the retention document is outside its
+subject entirely, so a pass was the only correct answer. Removing the file it actually
+reads fails it with exit 3.
+
+The same holds for the others: `reconcile-check` fails with `reconcile.sql` missing, and
+`alert-check` fails with `probe.sh` missing. **All three fail loudly on their own input.**
+
+**THE DISCIPLINE, WHICH IS THE WHOLE POINT.** Before concluding a check is vacuous, ask
+whether it would have read that file at all. A check that passes because its subject was
+never in scope is not broken - and a finding built on deleting the wrong file is a false
+alarm, which costs the reader more than the missed defect would have. This is the fifth
+false alarm recorded here, and the same shape as the rest: the defect was in the
+measurement, not in the code.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
