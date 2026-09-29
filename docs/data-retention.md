@@ -67,7 +67,7 @@ relationship and becomes a liability the moment a breach occurs.
 | **Reviews** | Until deleted by user | Published aggregate; individual text is theirs |
 | **Review history** | Same as review | Needed to make an edit meaningful |
 | **link_codes** | Until used or expired + 24h | Then delete |
-| **Link-redemption attempts** | **7 days** | Salted IP hashes, same class as `key_ip_seen`; enough to investigate a live credential attack, then gone |
+| **Link-redemption attempts** | **7 days** — **PROMISED, NOT ENFORCED** | Salted IP hashes, same class as `key_ip_seen`; enough to investigate a live credential attack, then gone. **The "then gone" is the part that is not true: nothing deletes these rows.** The nightly sweep covers `key_ip_seen`, `key_ip_daily`, `usage_daily`, `usage_events` and `sessions`; it does not cover this table, and neither does the request path, which only inserts and counts. A credential-guessing attack writes one salted IP hash per attempt, indefinitely |
 | **Logs** | 30-90 days | Debugging window; not a database |
 | **Accounts (closed)** | Keep record, drop personal data | See below |
 
@@ -97,9 +97,12 @@ relationship and becomes a liability the moment a breach occurs.
 > It deliberately does **not** touch `ledger` or `topups` (financial records, kept
 > forever), `reviews`/`review_history` (kept until the user deletes them),
 > `link_codes` (its own "+24h after use/expiry" rule is a different shape), or
-> `key_ip_*`/`link_redemption_attempts` (swept by the maintenance scheduler in
-> inline SQL, which owns the salted-hash retention and the salt-rotation contract;
-> `bin/ip-purge.rs` states the same windows but is not shipped and does not run).
+> `key_ip_*` (swept by the maintenance scheduler in inline SQL, which owns the
+> salted-hash retention and the salt-rotation contract; `bin/ip-purge.rs` states the
+> same windows but is not shipped and does not run). `link_redemption_attempts` is the
+> same class of data and is **not** swept — the sentence here once said it was, and that
+> was my own error, corrected when the nightly job was read line by line rather than
+> assumed. The table above says 7 days; the code keeps them forever.
 
 **The ledger is never deleted, even when a customer leaves.** It is the record of
 money that moved. That is normal accounting, not a retention violation — but it
