@@ -778,6 +778,20 @@ mod tests {
         let published = sources.join("\n");
 
         for (table, days) in SWEEP {
+            // THE SHELL LITERAL MUST BE THE RUST CONSTANT, which is the check that did
+            // not exist while the link window lived only as a 7 typed into a shell
+            // script. The privacy page, the policy table and the metrics endpoint all
+            // read the number from Rust while the sweep read it from a literal, so
+            // nothing tied the promise to the thing that enforces it.
+            if *table == "link_redemption_attempts" {
+                assert_eq!(
+                    *days as i64,
+                    crate::db::LINK_ATTEMPT_RETENTION_DAYS,
+                    "the entrypoint deletes link_redemption_attempts after {days} days while the Rust constant is {}. One of the two is the promise and the other is the enforcement.",
+                    crate::db::LINK_ATTEMPT_RETENTION_DAYS
+                );
+            }
+
             // The table must be named somewhere in the published documents, and the
             // window must be one of the two renderings a document uses: N days, or
             // N months where 730 stands for 24.

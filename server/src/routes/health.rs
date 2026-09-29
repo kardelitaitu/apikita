@@ -155,6 +155,9 @@ fn retention_report(
         "usage_events": crate::db::USAGE_EVENTS_RETENTION_DAYS,
         "usage_daily": crate::db::USAGE_DAILY_RETENTION_DAYS,
         "sessions": crate::db::SESSION_RETENTION_DAYS,
+        "key_ip_seen": crate::ip_tracking::SEEN_RETENTION_DAYS,
+        "key_ip_daily": crate::ip_tracking::DAILY_RETENTION_DAYS,
+        "link_redemption_attempts": crate::db::LINK_ATTEMPT_RETENTION_DAYS,
     });
 
     // ONLY the tables that are behind, so an empty object reads as "retention is
@@ -728,6 +731,9 @@ mod tests {
             usage_events: Some(200),
             usage_daily: None,
             sessions: None,
+            key_ip_seen: None,
+            key_ip_daily: None,
+            link_redemption_attempts: None,
         };
         let report = retention_report(&behind, today);
         assert_eq!(report["behind"], json!(true));

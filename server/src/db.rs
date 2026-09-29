@@ -536,23 +536,49 @@ pub struct RetentionLag {
     pub usage_daily: Option<i64>,
     /// Age of the oldest expired/revoked `sessions` row, when past the 30-day window.
     pub sessions: Option<i64>,
+    /// Age of the oldest `key_ip_seen` day, when past the 7-day window.
+    pub key_ip_seen: Option<i64>,
+    /// Age of the oldest `key_ip_daily` day, when past the 90-day window.
+    pub key_ip_daily: Option<i64>,
+    /// Age of the oldest `link_redemption_attempts` row, when past the 7-day window.
+    pub link_redemption_attempts: Option<i64>,
 }
+
+/// The link-redemption window, which until now existed only as the `7` literal in the
+/// maintenance entrypoint. It lives here so the measurement and the promise are the same
+/// number, and so the sweep guard can require the shell to agree with this constant rather
+/// than with whatever someone typed into a script.
+pub const LINK_ATTEMPT_RETENTION_DAYS: i64 = 7;
 
 impl RetentionLag {
     /// Whether ANY age-based table is holding a row past its retention period.
     pub fn anything_behind(&self) -> bool {
-        self.usage_events.is_some() || self.usage_daily.is_some() || self.sessions.is_some()
+        self.usage_events.is_some()
+            || self.usage_daily.is_some()
+            || self.sessions.is_some()
+            || self.key_ip_seen.is_some()
+            || self.key_ip_daily.is_some()
+            || self.link_redemption_attempts.is_some()
     }
 
     /// Each table with the age of its oldest row, in the order the docs list them.
     ///
     /// The NAME is carried alongside the value so a caller cannot swap two tables in
     /// a log line, the same reasoning as `PurgedUsage`'s named fields.
-    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 3] {
+    ///
+    /// The array LENGTH is a literal on purpose: adding a field to the struct without
+    /// adding it here is a compile error rather than a silently shorter report, which is
+    /// the failure this change exists to remove. It caught the one test that built a
+    /// `RetentionLag` literally, and that is the whole argument for writing 6 rather
+    /// than trimming the report to fit.
+    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 6] {
         [
             ("usage_events", self.usage_events),
             ("usage_daily", self.usage_daily),
             ("sessions", self.sessions),
+            ("key_ip_seen", self.key_ip_seen),
+            ("key_ip_daily", self.key_ip_daily),
+            ("link_redemption_attempts", self.link_redemption_attempts),
         ]
     }
 }
@@ -694,10 +720,41 @@ pub async fn retention_lag(
     )
     .await?;
 
+    // The three IP-hash tables, each measured on the SAME column the sweep filters on.
+    // The two key_ip tables are DATE-keyed and take the branch added for usage_daily;
+    // link_redemption_attempts is an instant like usage_events.
+    let key_ip_seen = oldest_row_past_window(
+        pool,
+        "key_ip_seen",
+        "day",
+        crate::ip_tracking::SEEN_RETENTION_DAYS,
+        today,
+    )
+    .await?;
+    let key_ip_daily = oldest_row_past_window(
+        pool,
+        "key_ip_daily",
+        "day",
+        crate::ip_tracking::DAILY_RETENTION_DAYS,
+        today,
+    )
+    .await?;
+    let link_redemption_attempts = oldest_row_past_window(
+        pool,
+        "link_redemption_attempts",
+        "attempted_at",
+        LINK_ATTEMPT_RETENTION_DAYS,
+        today,
+    )
+    .await?;
+
     Ok(RetentionLag {
         usage_events,
         usage_daily,
         sessions,
+        key_ip_seen,
+        key_ip_daily,
+        link_redemption_attempts,
     })
 }
 // SAFE for the same reason as `oldest_row_past_window`: chrono panics rather
@@ -3324,6 +3381,129 @@ mod tests {
             "400 days is inside the 730-day window"
         );
         assert!(!inside.anything_behind(), "and nothing is behind");
+
+        db.close().await;
+    }
+    /// The three IP-hash tables are MEASURED, not merely declared.
+    ///
+    /// A field that exists and is always `None` is indistinguishable from a working
+    /// one in every other test, and the privacy promise would be unmonitored exactly
+    /// as before - so this seeds a row past each window and requires the lag to name
+    /// it. The negative control comes first, because an empty database reading clean
+    /// is also what a broken measurement would report.
+    ///
+    /// Two of the three are DATE-keyed, which is the branch the previous regression
+    /// added; the third is an instant. Between them they exercise both paths, so this
+    /// is also the test that would notice one of them being mis-keyed.
+    #[tokio::test]
+    async fn an_ip_hash_table_past_its_window_is_reported_as_behind() {
+        let db = TestDb::new().await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let account = test_support::account(&db.pool).await;
+        let key_id = test_support::api_key(&db.pool, account).await;
+
+        // NEGATIVE CONTROL: nothing seeded, nothing behind, all six named.
+        let empty = retention_lag(&db.pool, today).await.unwrap();
+        assert!(!empty.anything_behind(), "an empty database is not behind");
+        assert_eq!(
+            empty.oldest_days_by_table().len(),
+            6,
+            "the report names every table the sweep deletes, not the three it used to"
+        );
+
+        // 200 days old: behind all three windows, which are 7, 90 and 7.
+        let old = (today - chrono::Duration::days(200)).to_string();
+        sqlx::query("INSERT INTO key_ip_seen (api_key_id, day, ip_hash) VALUES (?, ?, ?)")
+            .bind(key_id.hyphenated())
+            .bind(&old)
+            .bind("h")
+            .execute(&db.pool)
+            .await
+            .expect("seed key_ip_seen");
+        sqlx::query("INSERT INTO key_ip_daily (api_key_id, day, distinct_ips) VALUES (?, ?, ?)")
+            .bind(key_id.hyphenated())
+            .bind(&old)
+            .bind(1i64)
+            .execute(&db.pool)
+            .await
+            .expect("seed key_ip_daily");
+        sqlx::query("INSERT INTO link_redemption_attempts (ip_hash, attempted_at) VALUES (?, ?)")
+            .bind("h")
+            .bind(
+                today
+                    .checked_sub_signed(chrono::Duration::days(200))
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .to_rfc3339(),
+            )
+            .execute(&db.pool)
+            .await
+            .expect("seed link_redemption_attempts");
+
+        let lag = retention_lag(&db.pool, today)
+            .await
+            .expect("the lag query answers");
+        assert!(
+            lag.anything_behind(),
+            "three seeded tables are past their windows"
+        );
+        for table in ["key_ip_seen", "key_ip_daily", "link_redemption_attempts"] {
+            let named = lag
+                .oldest_days_by_table()
+                .into_iter()
+                .any(|(name, age)| name == table && age.is_some());
+            assert!(
+                named,
+                "{table} is seeded 200 days old and must be reported by name; a field that is always None is the failure this test exists to prevent"
+            );
+        }
+
+        // And a row INSIDE every window reports nothing, so the branch is not simply
+        // returning an age for anything it finds.
+        sqlx::query("DELETE FROM key_ip_seen")
+            .execute(&db.pool)
+            .await
+            .expect("clear");
+        let fresh = (today - chrono::Duration::days(3)).to_string();
+        sqlx::query("INSERT INTO key_ip_seen (api_key_id, day, ip_hash) VALUES (?, ?, ?)")
+            .bind(key_id.hyphenated())
+            .bind(&fresh)
+            .bind("h2")
+            .execute(&db.pool)
+            .await
+            .expect("seed an in-window row");
+        let inside = retention_lag(&db.pool, today).await.unwrap();
+        assert_eq!(
+            inside.key_ip_seen, None,
+            "3 days is inside the 7-day window"
+        );
+
+        // EACH TABLE IS MEASURED AGAINST ITS OWN WINDOW, which the 200-day seed above
+        // cannot establish: that row is past 7, 90 and 7 alike, so swapping one constant
+        // for a neighbour's changes nothing and the test still passes. A row at 30 days
+        // does distinguish them - past the 7-day window, comfortably inside the 90-day
+        // one - so this is the assertion that notices a table measured against its
+        // neighbour's number, which is exactly what copying a constant invites.
+        sqlx::query("DELETE FROM key_ip_seen")
+            .execute(&db.pool)
+            .await
+            .expect("clear");
+        let straddling = (today - chrono::Duration::days(30)).to_string();
+        sqlx::query("INSERT INTO key_ip_seen (api_key_id, day, ip_hash) VALUES (?, ?, ?)")
+            .bind(key_id.hyphenated())
+            .bind(&straddling)
+            .bind("h3")
+            .execute(&db.pool)
+            .await
+            .expect("seed a 30-day row");
+        let thirty = retention_lag(&db.pool, today).await.unwrap();
+        assert_eq!(
+            thirty.key_ip_seen,
+            Some(30),
+            "30 days is past the 7-day window; if this is None then the table is being measured against a LONGER one, which is the failure a copied constant invites"
+        );
 
         db.close().await;
     }
