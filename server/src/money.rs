@@ -40,6 +40,30 @@ pub struct MidtransNotification {
     pub gross_amount: String,
     pub transaction_status: String,
     pub signature_key: String,
+    /// Midtrans' own fraud verdict (`accept` / `deny` / `challenge`), which this
+    /// crate PARSES AND NEVER READS.
+    ///
+    /// Recorded as a decision rather than left implicit, because it is the only field
+    /// in the payload with no reader, and it sits on the path that moves money IN.
+    /// `evaluate_payment_status` treats `transaction_status` as the authority: a
+    /// challenged payment arrives as `pending` (so `Pending`, no credit) and a
+    /// fraud-rejected one as `deny` (so `TerminalNoAction`), which is why consulting
+    /// `fraud_status` as well would be redundant today.
+    ///
+    /// WHAT IS NOT CLAIMED HERE: that Midtrans can never send `settlement` together
+    /// with a non-`accept` `fraud_status`. That is a claim about a third party's
+    /// API, and this repository is not the place to assert it. If Midtrans ever sends
+    /// that pair, the customer is credited for a payment that is not final, because
+    /// only `transaction_status` is consulted. The test
+    /// `a_validly_signed_settlement_credits_even_when_fraud_status_says_deny` pins
+    /// exactly that, so the behaviour is deliberate and greppable rather than an
+    /// oversight, and changing it is a one-line decision with a test already in
+    /// place.
+    ///
+    /// Note the signature does NOT cover this field: `compute_midtrans_signature`
+    /// hashes order_id, status_code, gross_amount and the server key. So a forged
+    /// notification could set it freely - which is another reason not to treat it as
+    /// an authority without changing what is signed.
     pub fraud_status: Option<String>,
 }
 

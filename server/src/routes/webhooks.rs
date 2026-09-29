@@ -1471,6 +1471,60 @@ mod tests {
         String::from_utf8(sink.lock().expect("log sink lock").clone()).expect("log lines are utf-8")
     }
 
+    /// `fraud_status` is parsed and never read, and this pins what that means.
+    ///
+    /// Midtrans sends its own fraud verdict alongside `transaction_status`. This
+    /// crate treats the latter as the authority and ignores the former, so a
+    /// validly-signed notification that says `fraud_status: "deny"` alongside
+    /// `transaction_status: "settlement"` is CREDITED. That is the current
+    /// behaviour, asserted here so it is a decision rather than an oversight.
+    ///
+    /// The test is built on the reasoning that makes it safe today: a challenged
+    /// payment arrives as `pending` (no credit) and a fraud-rejected one as
+    /// `deny` (`TerminalNoAction`), so `fraud_status` adds nothing the primary
+    /// signal does not already carry. What is NOT claimed is that Midtrans can never
+    /// send `settlement` with a non-`accept` fraud verdict — that is a claim about a
+    /// third party's API, and this repository is not the place to assert it.
+    ///
+    /// Worth pinning for a second reason: the SIGNATURE DOES NOT COVER
+    /// `fraud_status`. `compute_midtrans_signature` hashes order_id, status_code,
+    /// gross_amount and the server key, so this field is the one part of the payload
+    /// an attacker could alter freely. That is precisely why it must not become an
+    /// authority without also becoming signed — and why treating it as one now would
+    /// be worse than ignoring it.
+    #[tokio::test]
+    async fn a_validly_signed_settlement_credits_even_when_fraud_status_says_deny() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let order_id = pending_topup(&db.pool, account_id, 50_000).await;
+        let mut payload = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+        // Signed correctly for every field the signature ACTUALLY covers.
+        payload.fraud_status = Some("deny".into());
+
+        let (status, body) = post(&state, payload).await;
+        assert_eq!(status, StatusCode::OK, "the body is {body}");
+        assert_eq!(body["status"], json!("settled"), "the body is {body}");
+        assert_eq!(
+            topup_status_of(&db.pool, &order_id).await,
+            "settled",
+            "fraud_status is deliberately not consulted: transaction_status is the \
+             authority, and Midtrans reports a challenged payment as pending and a \
+             fraud-rejected one as deny. If this ever needs to change, the change is \
+             to consult it HERE and to add it to compute_midtrans_signature, because a \
+             field the signature does not cover cannot be an authority."
+        );
+    }
+
     #[tokio::test]
     async fn a_webhook_rejection_is_logged_under_the_documented_topup_rejected_event() {
         let _env = EnvLock::acquire();
