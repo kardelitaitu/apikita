@@ -1431,6 +1431,76 @@ mod tests {
         outcome.expect("the get_me assertions panicked");
     }
 
+    /// A session past its IDLE bound is refused by the CUSTOMER ROUTE, not only by
+    /// the shared resolver.
+    ///
+    /// WHY THIS EXISTS AND WHY IT IS NOT THE TEST BESIDE IT. routes/mod.rs already
+    /// pins that resolve_account_from_cookie refuses a session idle for eight days.
+    /// That test calls the function DIRECTLY, so it passes whatever the handlers do -
+    /// and for most of this file's life they did not call it. account.rs, events.rs
+    /// and keys.rs each carried a private resolver that filtered revocation and
+    /// absolute expiry in SQL and stopped there, so a customer could read the account,
+    /// spend the balance and mint keys with a session the idle rule had already ended.
+    /// Every test in those files stayed green, because none of them asked whether an
+    /// IDLE session was refused at all - only whether a REVOKED or EXPIRED one was.
+    ///
+    /// So this drives the HANDLER. That is the whole point: it passes only if the
+    /// route resolves the session through the rule that has the idle bound, so a
+    /// local resolver reintroduced tomorrow fails here rather than in production.
+    ///
+    /// The shape is the one that was exploitable - 30-day absolute expiry, 8 days idle
+    /// - so ONLY the idle bound can refuse it, and the row looks perfectly healthy to
+    /// any query that checks revocation and expiry.
+    #[tokio::test]
+    async fn an_idle_expired_session_is_refused_by_the_customer_routes() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let live = live_account(&pool).await;
+
+        // POSITIVE CONTROL: the same session, used now, must work. Without this the
+        // refusal below would also be satisfied by a handler that refuses everything.
+        let (ok, _) = respond(get_me(State(pool.clone()), cookie_header(&live.token))).await;
+        assert_eq!(
+            ok,
+            StatusCode::OK,
+            "a session used now must resolve, or the refusal below proves nothing"
+        );
+
+        // 8 days idle against a 30-day absolute expiry: far from expiring, so the
+        // only rule that can refuse it is the idle bound.
+        age_session(&pool, &live.token, 8).await;
+        let (status, body) = respond(get_me(State(pool.clone()), cookie_header(&live.token))).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a session idle for 8 days must be refused by /api/me, not only by the shared resolver: docs/decisions.md settles the lifetime as 30 days absolute AND 7 days idle, and a customer route that skips the idle half is a credential that outlives it. Got {body}"
+        );
+
+        // The bound, not "any old session": 6 days is inside a 7-day bound and must
+        // still be admitted. A single-sided assertion would pass against a handler
+        // that refused everything older than a minute.
+        age_session(&pool, &live.token, 6).await;
+        let (status, _) = respond(get_me(State(pool.clone()), cookie_header(&live.token))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a session idle for 6 days is inside the 7-day bound and must be admitted"
+        );
+
+        db.close().await;
+    }
+
+    /// Moves a session's stored activity back in time, which is the only way to
+    /// drive the idle rule: it is evaluated against the STORED value, never against
+    /// `now`.
+    async fn age_session(pool: &SqlitePool, token: &str, days: i64) {
+        sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?")
+            .bind(Utc::now() - chrono::Duration::days(days))
+            .bind(crate::routes::hash_token(token))
+            .execute(pool)
+            .await
+            .expect("age the session");
+    }
     async fn get_me_assertions(
         pool: SqlitePool,
         account_id: Uuid,
