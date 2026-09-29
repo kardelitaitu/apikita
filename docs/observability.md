@@ -220,10 +220,21 @@ nothing except its own tests**. Three copies of this detector exist:
 | Implementation | Runs |
 | --- | --- |
 | `db::unpaired_hold_rows` (`server/src/db.rs`) | **never in production** — tests only |
-| `bin/hold-sweep.rs` | nightly, via the maintenance scheduler |
+| `bin/hold-sweep.rs` | **never in production** — not shipped in the server image, the scheduler logs it as NOT WIRED |
+| `.docker/maintenance/entrypoint.sh` (`run_hold_sweep`) | nightly, and it is **the one** the scheduler runs |
 | `tools/alert/check-alerts.sh` (`HOLDS_OVER`) | nightly, fires the `stranded_hold` alert |
 
-The two that run carry their own SQL rather than calling the Rust one, which is the
+**There are FOUR copies, and this table previously named the wrong one.** It listed
+`bin/hold-sweep.rs` as "nightly, via the maintenance scheduler". The binary is not
+shipped in the server image and the scheduler says so on every run: `NOT WIRED
+hold-sweep` is not what it prints — it prints `WIRED hold-sweep - REPORT-ONLY, SQL
+inline in this entrypoint, using the SAME predicate as
+server/src/bin/hold-sweep.rs`. What runs is the **inline SQL**, not the binary. This is
+the same error this paragraph already documents for retention, where
+`data-retention.md` said the sweeps were enforced by `usage-purge.rs` and the binary
+that enforces them does not run either.
+
+All three that run carry their own SQL rather than calling the Rust ones, which is the
 same duplication that hid a second reservation rule until it was measured. The
 `db.rs` copy is left in place because it states the invariant in the place a reader
 looks for it — but it is not the detector, and an operator told to run it would find
