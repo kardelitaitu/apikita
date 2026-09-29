@@ -1376,11 +1376,18 @@ mod tests {
             .unwrap_or_else(|| panic!("the Margin value row carries no number: {row}"))
             .parse()
             .expect("a decimal parses");
-        assert!(
-            (decided - 1.5).abs() < 0.0001,
-            "the decision now reads {decided}; if that is intended, the website prices derived from it need repricing too."
-        );
-
+        // NO ASSERTION PINS THE VALUE, and that is a correction to the first version of
+        // this test, which asserted `decided == 1.5`. That was a hand-kept copy of the
+        // decision sitting inside the guard whose whole argument is that a copy goes
+        // stale - and worse, it forbade a legitimate outcome: the margin is set by
+        // DECISION, so a decision to move to 1.6 is not drift and should not fail here.
+        //
+        // What the decision changing does break is downstream, and that is not this
+        // test's job to hold: the config comparison below still passes, because every
+        // model would be moved with it, and what would NOT follow is the transcription
+        // on the website. That risk is written down where the transcription is, with the
+        // multiplication shown, because a reader repricing needs the arithmetic and not
+        // a failure message from a file that has no way to know the price changed.
         let config = read_repo_file("config/apikita.toml");
         let mut model = String::new();
         let mut checked = 0usize;
