@@ -277,22 +277,31 @@ mod tests {
             // because key_ip_daily also says 90 and the string was still present. A guard
             // that cannot tell two rows apart is checking that a number occurs, not that a
             // promise is made, and the name says it is the latter.
-            // KNOWN WEAKNESS, RECORDED RATHER THAN FIXED IN HALF. This is a
-            // document-wide substring check, so two rows sharing a number are
-            // indistinguishable: changing the per-request window from 90 to 60 days
-            // passes, because key_ip_daily also says 90. The mutation proved it.
+            // IN A ROW THAT NAMES THE TABLE, and that is possible now rather than a
+            // hand-kept mapping. It failed two rounds ago because the retention table
+            // did not contain the table names at all - it called them "Usage daily" and
+            // "Sessions (expired/revoked)", and had no row whatsoever for the two key_ip
+            // tables the sweep deletes.
             //
-            // A per-row check is the right shape and was tried: find the retention row
-            // that NAMES this table. It fails for a real reason - the document calls it
-            // "Usage daily", not `usage_daily`, so the row that carries the promise does
-            // not carry the name the check searches for. Fixing it properly means a
-            // label-to-table mapping, and a hand-kept mapping is the same copy that has
-            // drifted in this repository before. So the weakness is written down, the
-            // constant is still checked below, and the claim in the name is narrowed to
-            // what this actually asserts.
+            // The fix was to the DOCUMENT, not to the check: every row now names the
+            // table it governs, so a reader can find it in the schema and a test can find
+            // the row by name. A retention table that names its tables can be checked
+            // against the code; one that does not can only be checked by string
+            // coincidence, and this check did exactly that - two rows sharing a number
+            // were indistinguishable, so changing the per-request window from 90 to 60
+            // days passed because key_ip_daily also said 90.
+            //
+            // It takes SOME naming row rather than the first, because the document has
+            // three tables that mention these names and only the retention one carries a
+            // period.
+            let promised = doc
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with('|') && l.contains(table))
+                .any(|row| row.contains(stated));
             assert!(
-                doc.contains(stated),
-                "docs/data-retention.md no longer states {stated} for {table}; the constant is {constant} days. A retention period nobody was told about is not a promise, and either the row was reworded or the policy changed without the promise being updated."
+                promised,
+                "no table row in docs/data-retention.md naming {table} states {stated}; the constant is {constant} days. A retention period nobody was told about is not a promise, and one table changing its window does not revise another's."
             );
         }
 
