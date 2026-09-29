@@ -481,6 +481,22 @@ the number it replaces and cannot drift.
 untouched, and on this ratio the expected yield is roughly ninety more. That is the
 honest size of the remaining job, and it is a reading job.
 
+**AND THEN A CLUSTER CAME BACK CLEAN, WHICH CORRECTS THAT ESTIMATE.** Thirteen
+`docs/failover.md` citations in the mid-stream and wallet-ordering sections: **none are
+wrong.** Eleven are imprecise — `:138-144` stops one line short of the word it is
+citing, `:162-165` includes a code fence and ends before "most expensive endpoint" —
+and those now name their sections. Two are correct as they stand.
+
+So the yield is not a constant. It depends on whether a comment is quoting a DOCUMENT'S
+RULES or its own prose. Every cluster that quoted a rule was mostly wrong, because the
+writer paraphrased the rule and cited whatever line was near; every cluster that quoted
+prose was fine, because the prose had not moved. The three `error-model.md` clusters
+quoted rules — 18 wrong of 31. This one quoted prose — 0 wrong of 13.
+
+That is a better guide than a flat ratio, and it changes what the remaining 128 are: the
+ones worth reading first are the comments that name a rule, a code, or a status code,
+because those are the ones that drifted.
+
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually
 runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was

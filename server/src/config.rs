@@ -181,7 +181,7 @@ pub struct ModelEndpoint {
     /// endpoints of one model are the same thing sold at the same price, bought
     /// from resellers who charge differently. The pre-flight reservation is taken
     /// before routing and may be served by any endpoint in the pool, so it must
-    /// cover the DEAREST one (docs/failover.md:162-165); without a per-endpoint
+    /// cover the DEAREST one (docs/failover.md (Ordering with the wallet checks)); without a per-endpoint
     /// rate there is nothing for that rule to compare.
     #[serde(default)]
     pub input_peak: Option<f64>,
@@ -211,7 +211,7 @@ impl ModelConfig {
     /// The hold is taken BEFORE routing and applies whichever endpoint serves the
     /// request, so it must cover the DEAREST endpoint in the pool — a failover to
     /// a dearer provider would otherwise overdraw the balance
-    /// (docs/failover.md:162-165). Each endpoint is priced at its own peak rates
+    /// (docs/failover.md (Ordering with the wallet checks)). Each endpoint is priced at its own peak rates
     /// when it overrides them, else the model's; a model with no endpoints
     /// registered reserves at the model rate.
     ///

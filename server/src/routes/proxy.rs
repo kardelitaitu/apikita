@@ -745,7 +745,7 @@ enum StreamEnd {
 /// rather than dropping it: the upstream generated that answer and will report
 /// usage for it, so abandoning the body would bill nothing while the provider
 /// charges us. The settlement task drains it and settles what the upstream
-/// reported (docs/failover.md:138-144).
+/// reported (docs/failover.md (Mid-stream failure and billing)).
 struct MeteredStream {
     inner: Option<UpstreamStream>,
     tail: Vec<u8>,
@@ -967,7 +967,7 @@ fn upstream_error(
 /// anywhere — there is no client left — and no chunk is retained except the tail.
 ///
 /// `None` means the upstream reported no usage. That is the documented washed case
-/// (docs/failover.md:138-144) and settles nothing: token counts are never invented.
+/// (docs/failover.md (Mid-stream failure and billing)) and settles nothing: token counts are never invented.
 async fn drain_for_usage(stream: Option<UpstreamStream>) -> Option<Usage> {
     let mut stream = stream?;
     let mut tail: Vec<u8> = Vec::new();
@@ -1273,7 +1273,7 @@ pub async fn chat_completions(
     // cap, clamped to the hard limit. The reservation must cover the dearest
     // endpoint in the pool, not the one that happens to serve the request —
     // otherwise a failover to a dearer provider can overdraw the balance
-    // (docs/failover.md:162-165).
+    // (docs/failover.md (Ordering with the wallet checks)).
     let estimated_input = estimated_input_tokens(&body);
     // The reservation must cover the worst case the upstream can actually emit,
     // not just the client's cap. A request that omits max_tokens (or asks for
@@ -1296,7 +1296,7 @@ pub async fn chat_completions(
     // One reservation per endpoint, and the DEAREST wins: the hold is taken
     // before routing and may be served by any endpoint in the pool, so it must
     // cover the dearest one or a failover to a dearer provider overdraws the
-    // balance (docs/failover.md:162-165). An endpoint may override the model's
+    // balance (docs/failover.md (Ordering with the wallet checks)). An endpoint may override the model's
     // peak rates, so each is priced at its OWN rates.
     //
     // The rule itself lives on ModelConfig, in ONE place: the upstream client
@@ -1442,7 +1442,7 @@ enum SettlementPlan {
     Bill(Usage),
     /// No usage was reported — a truncated stream, a client hangup whose upstream
     /// said nothing, or a lost settlement channel. Settle NOTHING and give the whole
-    /// hold back. This is the documented washed case (docs/failover.md:138-144);
+    /// hold back. This is the documented washed case (docs/failover.md (Mid-stream failure and billing));
     /// token counts are never invented to fill the gap.
     Wash,
 }
@@ -2199,7 +2199,7 @@ mod tests {
 
     /// A completed stream that reported usage is billed by exactly what the
     /// upstream said, and a stream that reported nothing is washed — never billed
-    /// against invented counts (docs/failover.md:138-144).
+    /// against invented counts (docs/failover.md (Mid-stream failure and billing)).
     #[test]
     fn a_reported_usage_is_billed_and_a_missing_one_is_washed() {
         let full = Usage {
@@ -3697,7 +3697,7 @@ mod tests {
     }
 
     /// THE WASHED CASE. A stream that ended without a usage report is billed
-    /// NOTHING and gives the whole hold back (docs/failover.md:138-144). Token
+    /// NOTHING and gives the whole hold back (docs/failover.md (Mid-stream failure and billing)). Token
     /// counts are never invented to fill the gap.
     #[tokio::test]
     async fn a_stream_without_usage_is_washed_and_the_whole_hold_returns() {
@@ -3927,7 +3927,7 @@ mod tests {
     // ---------------------------------------------------------------------
     // THE DEAREST-ENDPOINT RULE, made observable.
     //
-    // docs/failover.md:162-165: the hold is taken BEFORE routing and applies
+    // docs/failover.md (Ordering with the wallet checks): the hold is taken BEFORE routing and applies
     // whichever endpoint serves the request, so it must cover the DEAREST
     // endpoint in the pool. Until per-endpoint rates existed, every endpoint of
     // a model tied (rates lived only on the model), so max() and min() over the

@@ -1041,7 +1041,7 @@ pub async fn reserve_balance_transaction(
 ///
 /// Used on the paths where no billable usage exists: the upstream was never
 /// reached, the stream ended without a usage report (the documented washed case,
-/// docs/failover.md:138-144), or the settlement channel closed with no outcome.
+/// docs/failover.md (Mid-stream failure and billing)), or the settlement channel closed with no outcome.
 /// The credit is the exact inverse of the guarded debit that took the hold, so the
 /// ledger nets to zero and no money is created.
 ///
