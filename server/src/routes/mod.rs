@@ -1,3 +1,20 @@
+#![cfg_attr(
+    not(test),
+    // EVERY HTTP SURFACE, fenced at the MODULE ROOT rather than per file.
+    //
+    // An inner attribute here covers every submodule beneath it, so this is one
+    // line of intent rather than nine - and it is also the placement that cannot
+    // rot: a new handler file under routes/ is covered the moment it is added, with
+    // nothing to remember. Fencing each file separately meant a file added later
+    // would be unfenced until somebody noticed, which is how auth.rs and events.rs
+    // still carry per-function allows while their neighbours carry a module deny.
+    //
+    // Non-test scoping, as everywhere else: a test that adds 1 to a counter has
+    // failed loudly and cost nothing, and the test corpus trips this lint dozens of
+    // times.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 pub mod account;
 pub mod admin;
 pub mod auth;
@@ -79,6 +96,7 @@ pub fn session_token_from_cookie_header(cookie_header: &str) -> Option<&str> {
 /// idle half LESS binding, never cut a session short - which is why the shipped
 /// `idle_days = 7` against `absolute_days = 30` is the only combination that
 /// changes behaviour.
+#[allow(clippy::arithmetic_side_effects)]
 pub fn session_is_live_at(
     now: chrono::DateTime<chrono::Utc>,
     last_seen_at: chrono::DateTime<chrono::Utc>,
@@ -95,6 +113,18 @@ pub fn session_is_live_at(
         return false;
     }
 
+    // SAFE because config.rs refuses a lifetime the clock cannot represent, at load.
+    // A bare `DateTime + Duration` PANICS on an out-of-range result, and this is on
+    // EVERY session resolution, so an unrepresentable idle bound would panic on the
+    // first request and every request after it - which is why the config check names
+    // `idle_days` rather than only the absolute bound.
+    //
+    // `idle_days` is an i64 here rather than the config's u32, so a caller could in
+    // principle pass a negative; `checked_add_signed` accepts that happily, and it is
+    // harmless - the sum moves into the past and the session reads as idle.
+    //
+    // The allow is on the FUNCTION: this addition is the function's tail expression,
+    // and an attribute there needs the unstable `stmt_expr_attributes` feature.
     last_seen_at + chrono::Duration::days(idle_days) > now
 }
 

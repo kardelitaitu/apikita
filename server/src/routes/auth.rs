@@ -366,6 +366,14 @@ pub async fn exchange_token(
     // Absolute lifetime from config. The idle bound (7d) is measured from
     // `last_seen_at`, which the schema now carries and this insert seeds. The
     // expiry is derived from the same instant as the row's other timestamps.
+    //
+    // SAFE because config.rs refuses a lifetime the clock cannot represent, at load,
+    // naming the field. A bare `DateTime + Duration` PANICS on an out-of-range
+    // result rather than saturating, and this runs on the login path. Measured
+    // boundary: fine to ten million days, panic at a hundred million - and a lifetime
+    // is in DAYS, so nine digits is enough to reach it. The allow records the
+    // dependency rather than re-deriving the bound here.
+    #[allow(clippy::arithmetic_side_effects)]
     let expires_at = now + Duration::days(sessions.absolute_days as i64);
 
     let user_agent = headers

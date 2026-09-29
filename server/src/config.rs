@@ -363,6 +363,47 @@ impl AppConfig {
             }
         }
 
+        // SESSION LIFETIMES ARE ADDED TO A DateTime, AND THAT PANICS ON OVERFLOW TOO.
+        //
+        // The same class as the cooldowns above, with a DIFFERENT boundary, which is
+        // why it is checked separately rather than folded into the same loop: chrono's
+        // NaiveDate and std's Instant have unrelated ranges. Measured again rather
+        // than assumed, and the reassuring direction holds here as well:
+        //
+        //     now + Duration::days(10_000_000)    ok     (27,000 years)
+        //     now + Duration::days(100_000_000)  PANIC  (273,000 years)
+        //
+        // Two settings reach it on the request path: `absolute_days`, which seeds
+        // `expires_at` at login, and `idle_days`, which every session check adds to
+        // `last_seen_at`. Both are u32, so a nine-digit value is enough - and a
+        // nine-digit number is a far more plausible typo than the nineteen digits the
+        // cooldown check needs. That is the whole difference between this and the
+        // block above, and it is why this one is closer to a live bug.
+        //
+        // `checked_add_signed` for the same reason as `checked_add` above: the rule
+        // is the property, not a number this file would have to defend.
+        //
+        // `idle_days` is the one that hurts. The absolute bound is evaluated once, at
+        // login; the idle bound is added on EVERY session resolution, so a value that
+        // panics would do so on the first request of every request thereafter.
+        let now_utc = chrono::Utc::now();
+        for (field, days) in [
+            ("sessions.absolute_days", self.sessions.absolute_days),
+            ("sessions.idle_days", self.sessions.idle_days),
+        ] {
+            if now_utc
+                .checked_add_signed(chrono::Duration::days(i64::from(days)))
+                .is_none()
+            {
+                return Err(format!(
+                    "{field} = {days} cannot be a session lifetime: adding it to the \
+                     clock overflows the representable date range, and the session \
+                     check would PANIC on the request rather than refuse the session"
+                )
+                .into());
+            }
+        }
+
         if self.models.is_empty() {
             return Err("At least one model must be configured in models".into());
         }
@@ -1398,6 +1439,57 @@ mod tests {
             "cooldown_seconds" => config.circuit_breaker.cooldown_seconds = secs,
             "cooldown_max_seconds" => config.circuit_breaker.cooldown_max_seconds = secs,
             "key_cooldown_seconds" => config.key_pool.key_cooldown_seconds = secs,
+            _ => panic!("unhandled field {field}"),
+        }
+    }
+
+    /// A session lifetime that cannot be added to the clock is refused at load.
+    ///
+    /// The boundary is measured, and it is much CLOSER than the cooldown one: a
+    /// session lifetime is in DAYS, so nine digits is enough, where a cooldown in
+    /// seconds needed nineteen. The values below straddle the boundary rather than
+    /// being realistic, and the control matters more than the cases - a guard that
+    /// refused every value would pass the first half.
+    ///
+    /// `idle_days` is the one worth singling out. The absolute bound is evaluated
+    /// once, when a session is created; the idle bound is added on EVERY session
+    /// resolution, so an unrepresentable value would panic on the first request and
+    /// every request after it.
+    #[test]
+    fn a_session_lifetime_too_large_for_the_clock_is_refused_and_a_real_one_is_not() {
+        for field in ["absolute_days", "idle_days"] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+
+            set_session_days(&mut config, field, u32::MAX);
+            let err = config
+                .validate()
+                .expect_err("a session lifetime the clock cannot represent must be refused")
+                .to_string();
+            assert!(
+                err.contains(field) && err.contains("cannot be a session lifetime"),
+                "the message must name the setting and the problem, got {err}"
+            );
+
+            for real in [1u32, 7, 30, 365] {
+                set_session_days(&mut config, field, real);
+                config
+                    .validate()
+                    .unwrap_or_else(|e| panic!("{field} = {real} is a real lifetime: {e}"));
+            }
+        }
+
+        // And the shipped config, which is the one that has to keep working.
+        AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("the shipped config must still load and validate");
+    }
+
+    fn set_session_days(config: &mut AppConfig, field: &str, days: u32) {
+        match field {
+            "absolute_days" => config.sessions.absolute_days = days,
+            "idle_days" => config.sessions.idle_days = days,
             _ => panic!("unhandled field {field}"),
         }
     }
