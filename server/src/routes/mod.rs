@@ -902,6 +902,66 @@ mod tests {
         stale.close().await;
     }
 
+    /// Both bounds are INCLUSIVE-UNUSABLE, pinned at the exact instant.
+    ///
+    /// The function's own doc states the rule - "Both bounds are inclusive-unusable,
+    /// matching the expires_at > ? predicate the lookup has always used" - and the
+    /// test above cannot catch a change to it. It compares two CALLS to the same
+    /// function, so a boundary that moved on both sides at once still passes. What a
+    /// customer meets at the boundary is the difference between a session that is
+    /// gone and one that is not, and it is a single instant wide.
+    ///
+    /// Each bound is isolated by making the other comfortably satisfied, so a failure
+    /// names which of the two moved rather than that "something did".
+    #[test]
+    fn both_session_bounds_are_inclusive_unusable_at_the_exact_instant() {
+        let now = chrono::Utc::now();
+        const IDLE_DAYS: i64 = 7;
+        const ABSOLUTE_DAYS: i64 = 30;
+        let live = |last_seen_at, expires_at| {
+            session_is_live_at(now, last_seen_at, expires_at, IDLE_DAYS, ABSOLUTE_DAYS)
+        };
+
+        // (1) ABSOLUTE. last_seen_at is now, so the idle rule is satisfied by a
+        // fortnight and cannot be what refuses these.
+        assert!(
+            !live(now, now),
+            "expires_at EXACTLY now must already be unusable: the rule is a session is
+             live while its expiry is still in the future, and a boundary flipped to
+             `<` would keep it alive for one more instant"
+        );
+        assert!(
+            live(now, now + chrono::Duration::microseconds(1)),
+            "one microsecond of headroom must be enough: a session whose expiry has
+             not yet passed is live, and pinning only the dead side would let a
+             boundary move in the direction that refuses a valid session"
+        );
+
+        // (2) IDLE. expires_at is a year out, so the absolute rule cannot be what
+        // refuses these.
+        let far = now + chrono::Duration::days(365);
+        let at_bound = now - chrono::Duration::days(IDLE_DAYS);
+        assert!(
+            !live(at_bound, far),
+            "last_seen_at EXACTLY idle_days ago must already be unusable: the rule is
+             last_seen_at + idle_days > now, so the instant itself is out"
+        );
+        assert!(
+            live(at_bound + chrono::Duration::microseconds(1), far),
+            "one microsecond of activity inside the bound must be enough, and pinning
+             only the dead side would let a boundary move in the direction that cuts a
+             session short while it is still in use"
+        );
+
+        // (3) BOTH AT ONCE, which is the shape a real expiry produces: the bounds
+        // are independent refusals and either is enough, so the two dead rungs above
+        // must not depend on the other rule being slack.
+        assert!(
+            !live(at_bound, now),
+            "a session at both bounds at once is refused, and it would be refused by
+             either rule alone - neither is leaning on the other"
+        );
+    }
     /// The idle bound must be INERT unless it is STRICTER than the absolute
     /// lifetime, and that is a property of the code rather than of a particular
     /// config value.
