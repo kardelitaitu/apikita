@@ -115,7 +115,13 @@ export const requests = [
   { request: 'Export it', how: 'Download your account data from Settings — balance, ledger, top-ups, usage and key metadata' },
   { request: 'Correct it', how: 'Edit profile; the ledger is immutable by design' },
   { request: 'Delete your account', how: 'The closure flow below, anonymising where possible' },
-  { request: 'Delete a review', how: '/review withdraw — the bot path' },
+  // WAS: /review withdraw — the bot path. That command exists NOWHERE in this
+  // repository: not in the bot, which is scaffolding, and not in the server, where the
+  // review endpoints are marked DESIGNED, NOT BUILT in the api-spec. A privacy page
+  // telling someone how to exercise a deletion right, by a command that does not exist,
+  // is the most consequential kind of wrong thing this file can say - and it was the
+  // single occurrence of the string `withdraw` in the whole tree, here.
+  { request: 'Delete a review', how: 'Reviews cannot be posted or withdrawn yet, so there is nothing published to remove. This is the one right on this page with no working path, and it stays on the page rather than disappearing so the gap is visible rather than inferred' },
 ];
 
 /** Every disclosure array, for a test that wants to check coverage across all. */
