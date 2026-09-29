@@ -57,6 +57,30 @@
 //! assumption is recorded so it is a known constraint rather than a latent
 //! surprise.
 
+#![cfg_attr(
+    not(test),
+    // THIS MODULE IS FENCED FOR A DIFFERENT REASON than the money ones, and the
+    // reason is worth being precise about rather than folding into the same list.
+    //
+    // Nothing here computes a figure a customer is charged. What it computes is the
+    // TRUST BOUNDARY: the CIDR mask decides whose X-Forwarded-For is believed, and a
+    // peer that is believed chooses the address it is recorded as - which is the
+    // exact signal docs/ip-tracking.md exists to raise.
+    //
+    // Two of the four sites are SHIFTS (`32 - prefix`, `128 - prefix`), and a shift
+    // whose amount is computed rather than literal is where a mask silently becomes
+    // the wrong mask. A mask that is too wide trusts more hosts than the operator
+    // wrote; a mask that is too narrow trusts fewer. Both are security outcomes, and
+    // neither raises anything.
+    //
+    // Like account, admin and money, this one cost nothing to install: four sites,
+    // all bounded by construction, each argued below. Unlike those, the argument
+    // for the two shifts is CROSS-FUNCTION - it depends on IpCidr::parse rejecting a
+    // prefix past the family width - which is exactly the kind of thing that rots
+    // when the check and the use live far apart, so both are written down here.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use chrono::{NaiveDate, Utc};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
@@ -338,7 +362,16 @@ pub struct PurgedRows {
 /// happen once a day.
 pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<PurgedRows, AppError> {
     // Inclusive cutoffs: the boundary day is deleted, `today - N + 1` is kept.
+    //
+    // SAFE, and it is the same argument as every other date subtraction in this
+    // repository: chrono's date arithmetic PANICS on an out-of-range result rather
+    // than wrapping, so a nonsense window fails loudly instead of quietly dating
+    // every row to the wrong side of the cutoff. The operands are retention
+    // constants (7 and 90 days) against the current date, so the range is never in
+    // question anyway.
+    #[allow(clippy::arithmetic_side_effects)]
     let seen_cutoff = today - chrono::Duration::days(SEEN_RETENTION_DAYS);
+    #[allow(clippy::arithmetic_side_effects)]
     let daily_cutoff = today - chrono::Duration::days(DAILY_RETENTION_DAYS);
 
     let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day <= ?")
@@ -466,8 +499,25 @@ impl IpCidr {
     }
 }
 
-/// `prefix == 0` is handled separately: shifting a 32-bit value by 32 is
-/// undefined, and it would panic in a debug build — on the request path.
+/// `prefix == 0` is handled separately, and the comment this replaces called the
+/// consequence "undefined". It is not undefined - Rust defines a shift past the
+/// width as an overflow, which panics in a debug build and masks in a release one.
+/// Both are wrong here: this runs on the REQUEST PATH, so the failure would be a
+/// panic under a debug build and a silently wrong mask in the one that ships.
+// SAFE, and the bound is CROSS-FUNCTION, which is why it is written down rather
+// than left to the reader: `32 - prefix` underflows for any prefix above 32, and
+// the result feeds a shift whose amount must stay under 32. IpCidr::parse rejects a
+// prefix past the family width, so the only way to reach this above 32 is to build
+// the struct without it - the fields are private, so that is this module's own tests
+// and nothing else.
+//
+// If that ever changes, the failure in production is not a crash but a mask that
+// trusts a different set of hosts than the operator wrote, which is the outcome this
+// whole module exists to make hard.
+//
+// The allow is on the FUNCTION: an attribute in tail-expression position is still
+// unstable, and the version that put it on the `else` arm did not compile.
+#[allow(clippy::arithmetic_side_effects)]
 fn v4_mask(prefix: u8) -> u32 {
     if prefix == 0 {
         0
@@ -476,6 +526,13 @@ fn v4_mask(prefix: u8) -> u32 {
     }
 }
 
+/// The v6 form, with the same cross-function bound against 128. The widest legal
+/// v6 prefix is /128, which makes this the largest shift either mask function
+/// performs, and it was the one end of the range nothing tested.
+///
+/// SAFE for the same reason as `v4_mask`: parse bounds prefix to 128, so
+/// `128 - prefix` is 0..=127 and the shift stays inside the type.
+#[allow(clippy::arithmetic_side_effects)]
 fn v6_mask(prefix: u8) -> u128 {
     if prefix == 0 {
         0
@@ -1154,13 +1211,56 @@ mod tests {
         );
     }
 
+    /// The mask must trust EXACTLY the hosts the operator wrote, at every prefix.
+    ///
+    /// The previous test checked one value - `v4_mask(0)` and `v6_mask(0)` - and
+    /// nothing else. Zero is the easy end: it is the special case the function
+    /// handles in its own arm, so it cannot be reached by a mistake in the shift.
+    /// The ends that CAN be reached by a mistake are the other two: the widest legal
+    /// prefix, where the shift amount is largest, and anything near it.
+    ///
+    /// The property is swept rather than spot-checked, and it is stated as a count
+    /// rather than as figures: a mask for prefix `n` must have exactly `n` leading
+    /// ones. Too few and the relay stops being trusted; too many and hosts the
+    /// operator deliberately excluded are trusted, which is the outcome
+    /// docs/ip-tracking.md exists to make hard. A single wrong number cannot hide in
+    /// a set bit count, and every legal prefix is covered rather than a sample.
+    ///
+    /// 0 and the family width are named explicitly as well, because they are the two
+    /// the implementation branches on and the two a sweep could otherwise treat as
+    /// merely interior points.
     #[test]
-    fn the_zero_prefix_mask_is_explicitly_zero() {
-        // `prefix == 0` is the documented special case: shifting a 32- or
-        // 128-bit value by its full width is undefined and would panic on the
-        // request path, so both masks return 0 explicitly.
-        assert_eq!(v4_mask(0), 0);
-        assert_eq!(v6_mask(0), 0);
+    fn a_mask_trusts_exactly_the_hosts_the_operator_wrote_at_every_prefix() {
+        for prefix in 0u8..=32 {
+            assert_eq!(
+                v4_mask(prefix).count_ones(),
+                u32::from(prefix),
+                "an IPv4 /{prefix} mask must have exactly {prefix} leading ones"
+            );
+        }
+        for prefix in 0u8..=128 {
+            assert_eq!(
+                v6_mask(prefix).count_ones(),
+                // count_ones() is u32 for BOTH widths, including u128 - which is
+                // itself a small trap in a test that is otherwise about 128-bit
+                // values, and caught here by the compiler rather than by a sweep
+                // that silently compared nothing.
+                u32::from(prefix),
+                "an IPv6 /{prefix} mask must have exactly {prefix} leading ones"
+            );
+        }
+
+        // The branch points, named rather than left to the sweep above to imply.
+        // `prefix == 0` is a special arm because `u32::MAX << 32` is an overflow -
+        // Rust defines a shift past the width rather than leaving it undefined, and
+        // an overflow panics in a debug build and masks in a release one. Both are
+        // wrong on the request path, which is why the arm exists.
+        assert_eq!(v4_mask(0), 0, "a /0 trusts nobody");
+        assert_eq!(v6_mask(0), 0, "a /0 trusts nobody");
+        assert_eq!(v4_mask(32), u32::MAX, "a /32 trusts exactly one address");
+        assert_eq!(v6_mask(128), u128::MAX, "a /128 trusts exactly one address");
+        assert_eq!(v4_mask(24), 0xFFFF_FF00, "a /24 masks on the last octet");
+        assert_eq!(v6_mask(64), u128::MAX << 64, "a /64 masks on the low half");
     }
 
     #[tokio::test]
