@@ -1278,6 +1278,77 @@ mod tests {
         );
     }
 
+    /// The SPEC must actually say so, which the test above never checked.
+    ///
+    /// `the_spec_marks_exactly_the_designed_but_unbuilt_routes_as_designed` asserts that
+    /// the four designed-only paths are NOT MOUNTED. It never opened the spec. So the
+    /// claim in its own comment - that each "must therefore carry a designed-not-built
+    /// marker in the spec" - was a comment, and the W30 defect it exists to prevent
+    /// could return by editing the spec alone: delete the markers, leave the routes
+    /// unmounted, and the suite stays green while the table promises four endpoints
+    /// that 404.
+    ///
+    /// That is the API CONTRACT, which is the one document a client codes against, and
+    /// a promise the server does not keep is worse here than silence: an integrator
+    /// calls /api/reviews, gets a 404, and concludes the SERVER is broken.
+    ///
+    /// Read from the spec rather than a list kept here, for the same reason the alert
+    /// guards read probe.sh: a hand-maintained copy of what another file says is the
+    /// same bug twice over.
+    #[test]
+    fn the_spec_names_every_route_it_does_not_serve() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("server")
+                .join("api-spec.md"),
+        )
+        .expect("docs/server/api-spec.md must be readable, or this checks nothing");
+
+        // The paragraph that carries the promise, located by its own heading rather
+        // than by line: a line citation here would be the very defect this test
+        // exists to catch, and the paragraph moves whenever a route is added.
+        let start = spec
+            .find("MARKED ROUTES ARE DESIGNED, NOT BUILT")
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/server/api-spec.md no longer carries the MARKED ROUTES ARE \
+                     DESIGNED, NOT BUILT paragraph. Without it a reader has no way to \
+                     tell a documented route from a served one."
+                )
+            });
+        // A generous window: the paragraph names all four and may grow a sentence.
+        let end = (start + 700).min(spec.len());
+        let promise = &spec[start..end];
+
+        const SPEC_ONLY: &[&str] = &[
+            "/api/reviews",
+            "/api/bot/account",
+            "/api/bot/reviews/mine",
+            "/api/bot/notify-topup",
+        ];
+        for path in SPEC_ONLY {
+            assert!(
+                promise.contains(path),
+                "docs/server/api-spec.md does not say that {path} is designed and not \
+                 built, while the route table presents it. An integrator who calls it \
+                 gets a 404 and concludes the server is broken - which is exactly the \
+                 defect this paragraph was added to prevent."
+            );
+        }
+
+        // The table carries the marker too, and that is the half a scanner sees: the
+        // paragraph is four paragraphs below the table, so a reader skimming the table
+        // meets the row before the warning.
+        assert!(
+            spec.contains("| Reviews ⚠ |"),
+            "the api-spec route table no longer marks the Reviews row as designed-not-built. \
+             The warning paragraph is further down; the marker is what someone reading \
+             the table actually sees."
+        );
+    }
+
     #[tokio::test]
     async fn every_mounted_route_dispatches_and_every_near_miss_is_refused() {
         let app = table_app();
