@@ -6,7 +6,15 @@
 import Base from '../layouts/Base.astro';
 
 // Shared with /models so the two pages cannot disagree.
-import { models, rateClasses, rates, tickerCards } from '../lib/models';
+import {
+  models,
+  rateClasses,
+  rates,
+  tickerCards,
+  minFirstDepositIdr,
+  minTopupIdr,
+  idr,
+} from '../lib/models';
 
 const steps = [
   {
@@ -17,7 +25,10 @@ const steps = [
   {
     n: '2',
     title: 'Top up the wallet',
-    body: 'Prepaid balance, paid by QRIS through Midtrans. First deposit is 50,000 IDR; later top-ups start at 10,000 IDR. Only the Midtrans webhook credits a balance — the browser never does.',
+    body: `Prepaid balance, paid by QRIS through Midtrans. First deposit is ${idr(
+      minFirstDepositIdr
+    )} IDR; later top-ups start at ${idr(minTopupIdr)} IDR. Only the Midtrans webhook credits a
+    balance — the browser never does.`,
   },
   {
     n: '3',
@@ -191,11 +202,11 @@ const faq = [
     <dl class="mt-8 grid gap-4 text-sm sm:grid-cols-3">
       <div class="rounded-lg border border-edge bg-surface-raised p-4">
         <dt class="text-ink-muted">First deposit</dt>
-        <dd class="mt-1 font-mono">50,000 IDR</dd>
+        <dd class="mt-1 font-mono">{idr(minFirstDepositIdr)} IDR</dd>
       </div>
       <div class="rounded-lg border border-edge bg-surface-raised p-4">
         <dt class="text-ink-muted">Later top-ups, minimum</dt>
-        <dd class="mt-1 font-mono">10,000 IDR</dd>
+        <dd class="mt-1 font-mono">{idr(minTopupIdr)} IDR</dd>
       </div>
       <div class="rounded-lg border border-edge bg-surface-raised p-4">
         <dt class="text-ink-muted">Refunds</dt>

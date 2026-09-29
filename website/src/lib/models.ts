@@ -49,6 +49,24 @@ export const rates = [
 // ticker below, each marked on its face as not purchasable.
 export const models = ['flash', 'deepseek-v4-flash'];
 
+/**
+ * The deposit minimums, from config/apikita.toml `[wallet]`.
+ *
+ * THEY WERE WRITTEN TWICE IN index.astro - once in the "top up the wallet" step and
+ * once in the figures list two hundred lines down - and that page already states the
+ * rule this broke: its own copy rule shares the PRICES with /models "so the two pages
+ * cannot disagree", while the minimums were duplicated inside one file. A figure stated
+ * twice is a figure that gets changed once.
+ *
+ * Transcribed, and transcribed correctly: 50,000 and 10,000 IDR are
+ * `min_first_deposit` and `min_topup`. Same status as the rates above - the website
+ * does not read config/ at build time, by decision - so the mitigation is that the
+ * number now lives in ONE place and names the key it came from.
+ */
+export const minFirstDepositIdr = 50000;
+export const minTopupIdr = 10000;
+export const idr = (n: number) => n.toLocaleString('en-US');
+
 const peakPrices = rates.map((rate) => rate.price);
 const offPeakPrices = ['2,008', '40', '8,030'];
 
