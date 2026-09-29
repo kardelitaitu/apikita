@@ -271,14 +271,14 @@ Decided *values* that the running system reads are in `config/apikita.toml`:
 | Config section | Holds |
 | --- | --- |
 | `[pricing]` | Currency (margin is per model) |
-| `[wallet]` | Deposit minimums, low-balance threshold |
+| `[wallet]` | Deposit minimums. **Not enforced:** `low_balance_threshold_idr`, `low_balance_max_per_day`, `dormancy_days` — no low-balance alert is emitted and no sweep ages a wallet out |
 | `[sessions]` | Absolute and idle lifetimes |
-| `[limits]` | Per-account rate caps, key metadata cache TTL, limit window, admin threshold |
+| `[limits]` | Per-account rate caps (top-up, key creation, link codes), key metadata cache TTL, limit window, admin threshold. **Not enforced:** `wallet_mutations_per_minute`, `review_per_hour` — a rate limit for a limiter that was never written, and for a review endpoint that does not exist |
 | `[realtime]` | SSE replay buffer, connection cap, stream lifetime |
-| `[key_pool]` | Rotation, cooldowns, attempts |
-| `[circuit_breaker]` | Trip threshold, cooldown + backoff cap, upstream timeout, health checks |
-| `[streaming]` | Mid-stream cutoff, max output tokens, context cap. `allow_negative_balance_overdraft` was **removed** — overdraft is not permitted |
-| `[[models]]` | Per-model margin, rates, endpoints, key env names |
+| `[key_pool]` | Rotation, cooldowns, attempts. **Not enforced:** `on_pool_exhausted` — only `reject_503` is implemented, and the config comment says the alternative "needs a queue", so a one-valued enum is presented as a setting |
+| `[circuit_breaker]` | Trip threshold, cooldown + backoff cap, upstream timeout. **Not enforced:** `health_check_interval_seconds`, `health_check_failures` — there is no background health check; recovery is a trial request on real traffic, and `upstream/circuit_breaker.rs` says "no I/O" |
+| `[streaming]` | Max output tokens, context cap. **Not enforced:** `mid_stream_cutoff` — the cut-off is always off and the flag is never consulted. `allow_negative_balance_overdraft` was **removed** — overdraft is not permitted |
+| `[[models]]` | Per-model margin, peak rates, endpoints, key env names. **Not enforced:** `billing_basis` (every price is computed from the peak rates, so the offpeak class `input_offpeak` / `output_offpeak` / `cache_read_offpeak` is configured, checked, and never charged), `supports_vision`, `supports_thinking`, `concurrency_per_key`, `description` |
 
 **A decision here without a corresponding config value cannot be enforced.** If you
 add one, give it a home in the config or it will be implemented as a hardcoded

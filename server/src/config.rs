@@ -1647,6 +1647,35 @@ mod tests {
             "these config fields are read by NOTHING in production code and are not\n             on the UNWIRED list with a reason: {missing:?}. Either wire them up or\n             explain why they are still here - a setting nobody reads is a setting an\n             operator believes is working."
         );
 
+        // THE REGISTER MUST NAME EVERY ONE OF THEM. docs/decisions.md is the single
+        // source for what this system does, and its own rule is that a stale decision
+        // is worse than none "because it is followed" - yet four of its config rows
+        // claimed capabilities the code does not have, an active health check among
+        // them. So the disclosure belongs in the REGISTER, and not only here, where
+        // the next person to read a config table would not see it.
+        //
+        // Requiring the NAME rather than a judgement about the prose is what keeps
+        // this checkable. The register is prose, and a rule that tried to parse it
+        // would be brittle in a way that would itself rot. What can be asserted
+        // cheaply and durably is this: a field that is configured, unwired, and
+        // unnamed in the register is precisely the case that matters, because an
+        // operator has no way to learn it is inert.
+        let register = std::fs::read_to_string("../docs/decisions.md")
+            .or_else(|_| std::fs::read_to_string("docs/decisions.md"))
+            .expect("docs/decisions.md must be readable");
+        let undisclosed: Vec<&str> = UNWIRED
+            .iter()
+            .map(|(field, _)| *field)
+            .filter(|field| !register.contains(field))
+            .collect();
+        assert!(
+            undisclosed.is_empty(),
+            "these config fields are unwired and are NOT named in docs/decisions.md: \
+             {undisclosed:?}. A setting nobody reads that the register also does not \
+             mention is a setting an operator has no way to learn is inert. Name it \
+             under Not enforced in the config table, or wire it up."
+        );
+
         // And the other direction, which is what stops the list rotting into a
         // graveyard: a field that HAS been wired must come off it, or the list goes on
         // claiming things that are no longer true.
