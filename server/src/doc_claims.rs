@@ -500,10 +500,17 @@ mod tests {
     /// appearing where a value would be substituted, which is right after a percent
     /// sign or an opening brace. Comments are stripped first for the same reason.
     ///
-    /// It is a measurement rather than a guess: 163 macro calls across 29 files, zero
-    /// interpolations. This is what keeps it that way - logging a secret is the most
-    /// ordinary mistake there is while debugging a failing payment path, and nothing
-    /// else in this crate would notice.
+    /// It is a measurement rather than a guess: hundreds of macro calls, zero
+    /// interpolations. The macro count is ASSERTED below and moves with the code; the
+    /// FILE count is deliberately not stated, because a number written beside a claim
+    /// about an absence is a number that drifts - this one said 29 files when the crate
+    /// held 30, and a reader could reasonably have read that as the guard missing one.
+    /// `source_files` walks the whole of src with no exclusions, so the scope is a
+    /// property of that function and not of a number here.
+    ///
+    /// This is what keeps the property: logging a secret is the most ordinary mistake
+    /// there is while debugging a failing payment path, and nothing else in this crate
+    /// would notice.
     #[test]
     fn no_secret_is_interpolated_into_a_log_or_format_macro() {
         // Names that carry a secret. A caller holding one of these holds something
