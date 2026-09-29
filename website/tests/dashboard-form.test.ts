@@ -18,7 +18,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  ENABLED_MODELS,
+  KNOWN_MODELS,
   allowsModel,
   buildCreateKeyRequest,
   describeModelAccess,
@@ -59,8 +59,8 @@ test('an empty allowlist permits nothing, and every listed model is permitted', 
   assert.equal(allowsModel(['flash'], 'deepseek-v4-flash'), false);
 
   // "All models" is the full list written out — not a wildcard.
-  assert.equal(allowsModel([...ENABLED_MODELS], 'flash'), true);
-  assert.equal(allowsModel([...ENABLED_MODELS], 'deepseek-v4-flash'), true);
+  assert.equal(allowsModel([...KNOWN_MODELS], 'flash'), true);
+  assert.equal(allowsModel([...KNOWN_MODELS], 'deepseek-v4-flash'), true);
 
   // A model enabled later is not granted by an allowlist written before it.
   assert.equal(allowsModel(['flash'], 'model-enabled-next-year'), false);
@@ -71,7 +71,7 @@ test('the model-access summary says "nothing" for empty and "all" only for the f
   assert.match(none, /can call nothing/);
   assert.match(none, /deny by default/);
 
-  const all = describeModelAccess([...ENABLED_MODELS]);
+  const all = describeModelAccess([...KNOWN_MODELS]);
   assert.match(all, /^All 6 enabled models/);
 
   const some = describeModelAccess(['flash']);

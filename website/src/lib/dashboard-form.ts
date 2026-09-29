@@ -13,15 +13,24 @@
 import { confirmationError, passwordRuleError } from './auth-flow.ts';
 
 /**
- * The models the proxy exposes by name: config/apikita.toml, [[models]]
+ * Every model the CONFIG knows by name: config/apikita.toml, [[models]]
  * `name = ...`, in file order. Two are routed today (`flash`,
  * `deepseek-v4-flash`); `deepseek-v4-pro` and the three `dummy-*` entries
  * are registered with `weight = 0.0` on every endpoint and can never be
- * selected. The KeyManagement island offers its own subset and is not driven
- * from this list, so the two can differ while this list stays the config's
- * full inventory.
+ * selected.
+ *
+ * IT WAS CALLED `ENABLED_MODELS`, which said the opposite of what it holds: four of
+ * the five entries are disabled on every endpoint, and the summary this feeds tells
+ * the customer so in as many words - "model(s) that are not currently enabled". The
+ * name and the user-facing text contradicted each other, and a reader of the code had
+ * to take the comment below on trust to learn it. It is the full INVENTORY because a
+ * key's allowlist can name a model that has since been retired, and
+ * `describeModelAccess` reports those rather than dropping them.
+ *
+ * The KeyManagement island offers its own routable subset and is not driven from this
+ * list, so the two can differ while this one stays the config's full inventory.
  */
-export const ENABLED_MODELS: readonly string[] = [
+export const KNOWN_MODELS: readonly string[] = [
   'flash',
   'deepseek-v4-flash',
   'deepseek-v4-pro',
@@ -59,7 +68,7 @@ export function allowsModel(allowlist: readonly string[], model: string): boolea
  */
 export function describeModelAccess(
   allowlist: readonly string[],
-  enabled: readonly string[] = ENABLED_MODELS,
+  enabled: readonly string[] = KNOWN_MODELS,
 ): string {
   const granted = enabled.filter((model) => allowsModel(allowlist, model));
   const retired = allowlist.filter((model) => !enabled.includes(model));
