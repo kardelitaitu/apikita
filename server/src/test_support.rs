@@ -403,6 +403,49 @@ pub async fn ledger_sum(pool: &SqlitePool, account_id: Uuid) -> i64 {
 mod tests {
     use super::*;
 
+    /// `CHECK (balance_idr >= 0)` actually refuses a negative write.
+    ///
+    /// The launch checklist's Gate 2 requires the constraint "present and exercised",
+    /// and only the first half was true: no test drove a balance below zero and watched
+    /// SQLite refuse it. That matters more than it looks, because the constraint is
+    /// explicitly a BACKSTOP - `db.rs` puts it that way - the layer that catches you when
+    /// the layer above fails. The clamp above it is proven in isolation (a pure function
+    /// with the case analysis written out), so the CHECK is the only thing standing between
+    /// a bug in that proof and a wallet that owes money.
+    ///
+    /// A backstop that has never been exercised is a backstop whose behaviour has never
+    /// been demonstrated, and the failure it exists to catch is the one nobody would notice
+    /// in a test: a migration that dropped the constraint, or a code path that bypassed the
+    /// clamp. Both look fine right up until a balance is negative.
+    ///
+    /// Written here rather than in `db.rs` because the harness owns the migrated database
+    /// and both sides of the invariant, and a test that reached for its own pool would be
+    /// testing the setup rather than the constraint.
+    #[tokio::test]
+    async fn the_balance_check_refuses_a_negative_write() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = account(&pool).await;
+        wallet(&pool, account_id).await;
+
+        let result = sqlx::query("UPDATE wallets SET balance_idr = -1 WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .execute(&pool)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the schema accepted a negative balance. The clamp above is what should refuse it, so if the CHECK is gone a bug in the clamp now silently owes money."
+        );
+        // And the row is untouched, so the refusal is a refusal and not a silent clamp.
+        assert_eq!(
+            balance(&pool, account_id).await,
+            0,
+            "the negative write was refused but the balance changed"
+        );
+        db.close().await;
+    }
+
     /// The URL the helper builds must name the file it was given.
     ///
     /// This is not ceremony. If `from_str` mis-parsed the path, every test would
