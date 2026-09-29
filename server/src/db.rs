@@ -510,6 +510,24 @@ pub struct PurgedUsage {
 /// `Some(days)` is the AGE of the table's oldest row when that age EXCEEDS the
 /// window - i.e. the sweep has left a row it promised to delete. `None` is "inside
 /// the window", including the empty table.
+///
+/// **THIS MEASURES THREE OF THE SIX TABLES THE SWEEP DELETES, and the three it misses
+/// are the ones with privacy promises.** The nightly job purges key_ip_seen (7 days),
+/// key_ip_daily (90) and link_redemption_attempts (7) as well as the three below, and
+/// nothing measures whether those are keeping up. `anything_behind` feeds the db_disk
+/// alert, whose stated condition was "any age-based table holding a row past its
+/// retention window" - false for half of them, and now corrected in alerts.tsv.
+///
+/// The consequence is specific. If the sweep breaks on the IP-hash tables the rows grow
+/// without limit, the privacy page keeps stating 7 and 90 days, and no alert, metric or
+/// log line says so. The sweep prints its own counts, so the only signal is a human
+/// reading a nightly log nobody is required to read.
+///
+/// The fix is three fields here, three more in `oldest_days_by_table` (whose array
+/// length is a literal `3`, so the compiler points at each one), the lag query, and a
+/// constant for the link window, which today lives only in the entrypoint as a shell
+/// literal. That constant is the reason to do it carefully: once the number is in Rust,
+/// the sweep guard can require the shell to match it, and no such check exists today.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RetentionLag {
     /// Age of the oldest `usage_events` row, when past the 90-day window.
