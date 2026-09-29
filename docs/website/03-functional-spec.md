@@ -106,7 +106,8 @@ Live-updating by default (see [01-architecture.md](01-architecture.md)).
 | Recent requests | last N metered calls (`GET /api/usage/recent`, source `usage_events`) | On load |
 | Status | `GET /health` — the API and its database only | Poll (60s) |
 
-> **Status limited by design.** `docs/observability.md:193` forbids `/health` from
+> **Status limited by design.** The "Uptime monitoring" section of
+> `docs/observability.md` forbids `/health` from
 > probing upstream providers ("an upstream outage would then look like a dead
 > server and trigger a restart loop"). So this indicator reports whether the
 > platform is **reachable**, not whether a model provider is healthy, and its copy

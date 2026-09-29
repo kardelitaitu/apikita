@@ -590,7 +590,7 @@ mod tests {
             ("telegram/README.md", "the bot channel spec, for a bot that is not built; the folder guard covers the not-built claim"),
             ("website/01-architecture.md", "SUPERSEDED on stack by architecture.md, and it names frontend internals rather than claims an operator would act on"),
             ("website/02-data-model.md", "SUPERSEDED - it documents the PostgreSQL schema the port retired; marking it historical beats keeping it current"),
-            ("website/03-functional-spec.md", "the frontend functional spec; the behaviours it describes are covered by the website suite"),
+            ("website/03-functional-spec.md", "the frontend functional spec. It DID carry a drifted line citation - observability.md:193, which is an onboarding check and never mentioned the /health prohibition it was cited for - so it is corrected here rather than excluded, and this reason was WRONG the first time: saying the behaviours are covered by the website suite argues about coverage, not about whether a citation can mislead, and the wrong argument is what let a stale citation through"),
             ("website/04-payments.md", "the end-to-end top-up flow; it describes the journey, and the money moves are tested in webhooks.rs and account.rs"),
             ("website/05-security-decisions.md", "SUPERSEDED on stack, per its own first line"),
             ("website/README.md", "an index for the frontend set"),
