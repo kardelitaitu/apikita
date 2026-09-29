@@ -726,14 +726,28 @@ import Skeleton from '../../components/Skeleton.astro';
 
   // --- The confirmation flow ------------------------------------------------
   // ONE flow for both entry points: the detail pane's buttons and the row buttons
-  // in the listing. The row buttons pass their own id, so the confirmation
-  // always names the account it is about to change rather than trusting the
-  // detail pane to still be showing the right one.
+  // in the listing. The row buttons pass their own id, so the ACTION lands on the
+  // account whose row was clicked rather than on whatever the detail pane happens
+  // to be showing.
+  //
+  // AND THE DIALOG NAMES THAT ACCOUNT, in the title. It used not to: the comment
+  // here claimed the confirmation "always names the account it is about to change",
+  // which was half true. The id reached `pending` and so the right account WAS
+  // changed, but `describeAction` returns the CONSEQUENCE and takes only the action,
+  // so the dialog identified what would happen in detail and never which account it
+  // would happen to. That is the worse of the two states for a confirmation: the body
+  // is long, specific and authoritative about a revocation the operator cannot undo by
+  // clicking cancel, and an operator with a list of accounts in front of them has no
+  // way to check the dialog is about the one they meant.
   let pending: { action: 'suspend' | 'resume'; id: string } | null = null;
 
   function askConfirmFor(action: 'suspend' | 'resume', id: string): void {
     pending = { action, id };
-    confirmTitle.textContent = action === 'suspend' ? 'Suspend this account?' : 'Resume this account?';
+    // The id is in the TITLE, so the consequence paragraph below can stay about the
+    // consequence. An operator reads the title first; this is the only place in the
+    // dialog that says which account is about to be changed.
+    confirmTitle.textContent =
+      (action === 'suspend' ? 'Suspend account ' : 'Resume account ') + id + '?';
     confirmBody.textContent = describeAction(action);
     confirmBox.hidden = false;
   }
