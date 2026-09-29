@@ -15,11 +15,13 @@ import DashboardLayout from '../../../layouts/DashboardLayout.astro';
 import KeyManagement from '../../../islands/keys/KeyManagement.astro';
 import { describeModelAccess, KNOWN_MODELS } from '../../../lib/dashboard-form.ts';
 
-// KNOWN_MODELS, not the old ENABLED_MODELS: the rename was applied to the two files the
-// tests compile, and this page imports the constant from a .astro file that `npm test`
-// never builds - so the rename broke it and nothing noticed. The list is the config's full
-// inventory, four of whose five entries are weight 0.0 and unroutable; see the comment on
-// the export in lib/dashboard-form.ts.
+// KNOWN_MODELS, not the old ENABLED_MODELS. The rename was applied to the two files
+// `npm test` compiles, and this page is a third caller that the local test command never
+// touches — so the rename broke it and the local suite stayed green. CI was always right
+// about this: it typechecks the website and builds it (.github/workflows/ci.yml), and
+// would have failed on the broken import. The gap was in the local loop, not in the
+// project. The list is the config's full inventory, four of whose five entries are weight
+// 0.0 and unroutable; see the comment on the export in lib/dashboard-form.ts.
 const modelAccess = describeModelAccess(KNOWN_MODELS);
 ---
 
