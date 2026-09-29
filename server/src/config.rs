@@ -326,6 +326,24 @@ impl AppConfig {
                 // An override is what the reservation is sized from, so a NaN here
                 // under-reserves by the same route a zero does, and for the same
                 // reason: the "<= 0" test below is false for it.
+                // Weight is the ROUTED flag, read as "weight > 0.0" in three places
+                // (client.rs:406, :462 and the endpoint-key documentation check), so it
+                // suffers the same IEEE 754 blind spot from the other end: NaN > 0.0 is
+                // false, so a NaN weight does not fail a check, it silently DISABLES
+                // the endpoint. Nothing is ever routed to it, and because
+                // all_endpoints_unhealthy only counts endpoints that passed the same
+                // filter, it cannot report the model as down either. The endpoint
+                // vanishes with no error and no alert.
+                //
+                // A non-positive weight is legitimate and means "do not route to
+                // this", so only finiteness is refused here, not positivity.
+                if !endpoint.weight.is_finite() {
+                    return Err(format!(
+                        "Model {} endpoint {} has a weight that is not a finite number: {}",
+                        model.name, endpoint.name, endpoint.weight
+                    )
+                    .into());
+                }
                 for (field, rate) in [
                     ("input_peak", endpoint.input_peak),
                     ("output_peak", endpoint.output_peak),
@@ -720,6 +738,49 @@ mod tests {
             paid > 0,
             "the same request at M=1.5 must cost something, or the test above proves nothing"
         );
+    }
+    /// The same IEEE 754 hole as the price, at the other end of the comparison.
+    ///
+    /// Weight is read as "weight > 0.0" wherever routing is decided, and NaN > 0.0
+    /// is false. So a NaN weight does not fail a validation, it silently switches an
+    /// endpoint OFF: nothing is ever routed to it. The failure is not a loud refusal
+    /// but an absence, and it is invisible to the health signal as well, because
+    /// all_endpoints_unhealthy counts only the endpoints that passed the same
+    /// filter - a model whose every endpoint is disabled by a NaN weight reports
+    /// healthy with nothing behind it.
+    ///
+    /// A non-positive weight is LEGAL and means "do not route here", so this asserts
+    /// the discrimination the validator has to make: non-finite is refused, zero and
+    /// negative are not. A guard that also rejected 0.0 would be refusing a
+    /// documented feature.
+    #[test]
+    fn a_non_finite_endpoint_weight_is_refused_but_a_zero_one_is_legal() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            config.models[0].endpoints[0].weight = bad;
+            let err = config
+                .validate()
+                .expect_err("a non-finite endpoint weight must be refused")
+                .to_string();
+            assert!(
+                err.contains("not a finite number"),
+                "a weight of {bad} must be named as non-finite, got {err}"
+            );
+        }
+
+        // The other half: weight 0 is how an operator parks an endpoint, and the
+        // shipped config relies on the idea. Refusing it would be a regression.
+        for ok in [0.0, -1.0] {
+            let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+            config.models[0].endpoints[0].weight = ok;
+            config.validate().unwrap_or_else(|e| {
+                panic!("a weight of {ok} is a legal way to park an endpoint: {e}")
+            });
+        }
     }
     /// A model whose peak rates are absent reserves nothing and can never bill
     /// the peak it is documented to charge, so the missing figure is fatal.
