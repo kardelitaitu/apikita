@@ -81,7 +81,8 @@ const TARGET_TYPE_ACCOUNT: &str = "account";
 ///
 /// The two variants exist because the crate's AppError has no 403 that is honest
 /// here: ModelNotAllowed is about a model allowlist and WrongCredentialType is
-/// documented as RESERVED AND NEVER EMITTED (docs/error-model.md:44, :67-71), so
+/// documented as RESERVED AND NEVER EMITTED (docs/error-model.md, Status codes,
+/// wrong_credential_type row), so
 /// emitting either would make a documented promise false. Forbidden therefore
 /// renders the crate's own error envelope (the same ApiErrorResponse /
 /// ApiErrorBody structs AppError serialises) with the new stable code
@@ -90,7 +91,7 @@ const TARGET_TYPE_ACCOUNT: &str = "account";
 ///
 /// The status is 403 and not 401/404 on purpose. The caller IS authenticated:
 /// the cookie resolved to a real account, we know exactly who they are, and they
-/// may not do this (docs/error-model.md:52-59, the 401-vs-403 table). A 404
+/// may not do this (docs/error-model.md, 401 vs 403). A 404
 /// would be a lie about a resource the operator surface exists to administer,
 /// and a 401 would tell an operator with a perfectly good session to re-login
 /// for a permissions problem.

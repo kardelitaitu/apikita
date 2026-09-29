@@ -4312,7 +4312,7 @@ mod tests {
             assert_eq!(
                 err.status_code(),
                 StatusCode::PAYMENT_REQUIRED,
-                "a key limit is a 402, not a 429 (docs/error-model.md:73-86), got {err:?}"
+                "a key limit is a 402, not a 429 (docs/error-model.md, 402 vs 429), got {err:?}"
             );
             assert_eq!(err.code(), "key_limit_exceeded");
             assert_eq!(

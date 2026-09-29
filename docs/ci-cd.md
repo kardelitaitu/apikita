@@ -497,6 +497,23 @@ That is a better guide than a flat ratio, and it changes what the remaining 128 
 ones worth reading first are the comments that name a rule, a code, or a status code,
 because those are the ones that drifted.
 
+**THE GUIDE HELD ON THE NEXT CLUSTER, AND THE CAUSE IS SHARPER.** Thirteen citations
+into `docs/error-model.md` naming a STATUS CODE or a status-code rule: **twelve wrong**.
+They cited one of four neighbouring things while meaning another. `error-model.md` has a
+status table (47-63), a `401 vs 403` table (67-72), a `402 vs 429` section (86-99) and a
+`Retry-After` section (101-116), all within sixty lines of each other, and a comment that
+says "a key limit is a 402, not a 429" cited `:73-86` — the 401/403 discussion and the
+heading of the very section it meant. Three cited `:81`, which is a sentence about
+`wrong_credential_type`. Two cited `:50`, the **401** row, for a comment about 503.
+
+So it is not only rules. It is **any citation that names a specific value** — a status
+code, a row in a table, a numbered rule — because naming a value is what makes a comment
+feel precise enough to deserve a line number. Comments that quote prose were fine three
+clusters out of three. Comments that name a value are where the errors are.
+
+That is now a testable predictor rather than a hunch, and it is the right order to read
+the remaining 115: not by cluster size, but by whether the comment names a value.
+
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually
 runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was

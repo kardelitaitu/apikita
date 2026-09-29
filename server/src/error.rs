@@ -73,7 +73,8 @@ pub enum AppError {
     #[error("Rate limited")]
     RateLimited { retry_after_secs: u64 },
 
-    /// Every upstream is unhealthy (docs/error-model.md:50). Carries the
+    /// Every upstream is unhealthy (docs/error-model.md, Status codes, the 503
+    /// no_upstream_available row). Carries the
     /// `Retry-After` the client must honour, sourced from the pool's shortest
     /// remaining cooldown, so the wait is never guessed.
     #[error("No upstream available")]
@@ -277,7 +278,7 @@ impl IntoResponse for AppError {
 
         let mut res = (status, Json(body)).into_response();
 
-        // The ONE place a Retry-After is decided (docs/error-model.md:79-82:
+        // The ONE place a Retry-After is decided (docs/error-model.md, Retry-After:
         // "Included on 429 and 503"). Both variants carry their value, so the
         // header logic lives here rather than at either call site.
         //
@@ -652,7 +653,7 @@ mod tests {
 
     #[test]
     fn a_bad_key_is_401_and_a_denied_model_is_403() {
-        // docs/error-model.md:52-62 - "Do not return 403 for a bad key."
+        // docs/error-model.md, 401 vs 403 - "Do not return 403 for a bad key."
         for bad_credential in [
             AppError::Unauthenticated,
             AppError::KeyRevoked,
@@ -670,7 +671,7 @@ mod tests {
 
     #[test]
     fn a_key_limit_is_402_never_429() {
-        // docs/error-model.md:64-77 - "A client must not retry a 402."
+        // docs/error-model.md, 402 vs 429 - "A client must not retry a 402."
         assert_eq!(
             AppError::KeyLimitExceeded { details: None }.status_code(),
             StatusCode::PAYMENT_REQUIRED
@@ -780,11 +781,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         let value = header_str(&headers, header::RETRY_AFTER)
-            .expect("docs/error-model.md:81 - Retry-After is included on 429");
+            .expect("docs/error-model.md, Retry-After - included on 429");
         assert_eq!(value, "42");
         assert!(
             value.parse::<u64>().is_ok(),
-            "docs/error-model.md:81-82 - seconds, not a date"
+            "docs/error-model.md, Retry-After - seconds, not a date"
         );
     }
 
@@ -817,8 +818,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_upstream_available_carries_retry_after() {
-        // docs/error-model.md:50  - 503 says "Retry after Retry-After".
-        // docs/error-model.md:81  - "Included on 429 and 503."
+        // docs/error-model.md, Status codes - the 503 row says "Retry after
+        // Retry-After"; the Retry-After section says "Included on 429 and 503."
         // docs/error-model.md (429 — rate limited) - "Floor it at 1 second."
         let (status, headers, _) = respond(AppError::NoUpstreamAvailable {
             retry_after_secs: 30,
@@ -829,7 +830,7 @@ mod tests {
         // tells the client nothing about when to come back, which is the very
         // retry-loop the header exists to prevent.
         let value = header_str(&headers, header::RETRY_AFTER)
-            .expect("docs/error-model.md:81 - Retry-After is included on 503");
+            .expect("docs/error-model.md, Retry-After - included on 503");
         let secs: u64 = value.parse().expect("Retry-After must be whole seconds");
         assert!(
             secs >= 1,

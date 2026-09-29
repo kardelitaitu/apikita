@@ -608,7 +608,7 @@ mod tests {
     ///
     /// The distinction matters: the caller IS authenticated, we know exactly who they
     /// are, and they may not read this. A 401 would tell a user with a perfectly good
-    /// session to log in again for a permissions problem (docs/error-model.md:52-59).
+    /// session to log in again for a permissions problem (docs/error-model.md, 401 vs 403).
     #[tokio::test]
     async fn the_metrics_route_refuses_a_non_operator_with_403() {
         let db = TestDb::new().await;
