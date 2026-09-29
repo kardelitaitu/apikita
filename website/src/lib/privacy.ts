@@ -47,11 +47,17 @@ export const stored = [
   { what: 'Reviews + edit history', where: 'Embedded SQLite (the database file)', sensitivity: 'Opinion, published aggregate only' },
   // This row is a CUSTOMER-FACING disclosure and it previously claimed an IP hash the
   // sessions table does not hold: sessions.ip_hash is in the schema and NOTHING writes
-  // it, because the IP hash belongs to the key-scoped key_ip_seen and key_ip_daily
-  // tables where abuse correlation is the point. Overstating collection is the safer
-  // direction to be wrong in and it is still a false statement, so it is corrected here
-  // rather than left because it errs conservatively.
-  { what: 'Sessions', where: 'Embedded SQLite (the database file)', sensitivity: 'Contains the user agent of the login request. No IP address and no IP hash - those live in the key-scoped abuse-correlation tables' },
+  // it. Overstating collection is the safer direction to be wrong in and it is still a
+  // false statement, so it is corrected rather than left because it errs conservatively.
+  { what: 'Sessions', where: 'Embedded SQLite (the database file)', sensitivity: 'Contains the user agent of the login request, and no IP address and no IP hash — the sessions row never had them' },
+  // The next three rows were ABSENT, and their absence is the serious direction. The
+  // page listed no IP-derived data at all, while docs/data-retention.md has always
+  // disclosed these windows — so a reader comparing the two documents would conclude
+  // the privacy page had been corrected into silence. It had not; it had been corrected
+  // into omission.
+  { what: 'Salted IP hash of API-key traffic (per key, per day)', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, not anonymous — HMAC-SHA256 of the address under a salt replaced at each UTC midnight, so the same visitor is not linkable across days. Held 7 days per seen-address and 90 per day total' },
+  { what: 'Salted IP hash of failed link-code attempts', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, same salt scheme, held 7 days. Exists to detect credential guessing against one Telegram account' },
+  { what: 'Telegram link codes, and operator audit rows', where: 'Embedded SQLite (the database file)', sensitivity: 'A link code is deleted once used or 24h after expiry; an operator audit row records which operator did what to which account' },
 ];
 
 // docs/data-retention.md, "What is NOT stored".
