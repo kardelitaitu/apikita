@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 162;
+const WEBSITE_TESTS = 168;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -54,7 +54,7 @@ const WEBSITE_TESTS = 162;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 444;
+const SERVER_TESTS = 509;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
