@@ -68,10 +68,28 @@ dormancy_days = 0
 
 # Upstream prepaid float policy. Hold roughly one settlement cycle of
 # unpurchased liability so a provider outage does not stall paid customers.
+#
+# NOT ENFORCED, and this one is about money: nothing reads this key, so whatever the
+# float policy is, it is not this number. The comment describes the reason it would be
+# worth having, which is why the value is kept rather than deleted - the intent is the
+# useful part, and an unenforced key with a stated intent is a task, whereas an
+# unenforced key presented as live is a trap.
 reserve_settlement_cycles = 1
 
 # Low-balance warning, sent by the Telegram bot as a DM (never in a shared
 # room). Capped so it cannot become spam.
+#
+# NOT ENFORCED. Neither key is read by anything. There is no low-balance alert in
+# tools/alert/alerts.tsv, and the bot has no DM capability, so nothing will be sent and
+# nothing will complain that it was not. The comment above used to read as a description
+# of a working safety net, and an operator reading it would set a threshold and wait for
+# a warning that cannot arrive - about the upstream float running low, which is the case
+# where a provider outage stalls paid customers.
+#
+# The value is kept so the intended policy is recorded, and the same is true of
+# reserve_settlement_cycles above. Both are on the worklist produced by the field-access
+# measurement described in docs/testing.md: 17 config keys are named somewhere in the
+# crate and read as a field access nowhere.
 low_balance_threshold_idr = 10000
 low_balance_max_per_day = 1
 
