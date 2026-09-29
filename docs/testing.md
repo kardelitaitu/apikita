@@ -227,6 +227,29 @@ matters just as much: a mutation that BREAKS THE BUILD has shown the wiring is
 load-bearing, which is weaker evidence than an assertion failing - a compile error says
 this name matters, a failed assertion says this value does.
 
+### Where this rule stops, and why it stops there
+
+The log guard checks the SEVENTH restatement, and it works because `logged`, `logs` and
+`warns` are unambiguous: a test with one of those in its name is claiming to observe a
+log. The obvious next step was to extend the same idea to COUNT claims - `once`,
+`exactly`, `only` - and the measurement says not to.
+
+Seventeen test names in the crate contain `once` or `exactly`. Most of them are not count
+claims at all: `returns exactly the token the response carried`, `bills exactly what the
+upstream reported`, `the_error_frame_is_exactly_one_event_line_then_one_data_line` are
+adverbs of PRECISION, not assertions about a number of occurrences. A guard that could not
+tell those apart would be either vacuous - matching nothing - or noisy, and this suite has
+already produced enough false alarms that the bar for a matcher is that it is quiet.
+
+**The word is only checkable where the claim it makes is unambiguous.** That is the same
+condition as the log guard having to rely on `capture_logs` existing: a rule about
+over-claiming is only enforceable where the claim could have been true in the first place.
+
+Spot-checked rather than assumed. The one test that genuinely claims a count in a money
+path - `live_webhook_settlement_credits_exactly_once_and_a_replay_does_not` - does
+measure it: it asserts the ledger row count is 1 after the first webhook and 0 after each
+replay. The pattern holds where it matters; it simply is not machine-checkable by name.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
