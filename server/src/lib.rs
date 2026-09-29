@@ -44,14 +44,21 @@
     // arithmetic that cannot overflow in practice (a u8 counter, a Duration) and
     // where an overflow would cost a wrong counter rather than wrong money.
     //
-    // IT IS enabled where the trade-off inverts. `money` and `db` each carry their
-    // own module-level deny of the same lint, scoped the same way, because those
-    // two modules produce every figure a customer is charged and [profile.release]
-    // wraps rather than panics. money.rs cost nothing - it has zero sites outside
-    // its tests. db.rs had nine, in seven functions, and each one now carries a
-    // written argument for why its operands are bounded, except the one that is
-    // bounded only by MAGNITUDE (new_balance - charge_delta), which is checked at
-    // runtime instead.
+    // IT IS enabled where the trade-off inverts, one module at a time. FOUR modules
+    // now carry their own deny of the same lint, scoped the same way: `money` and
+    // `db`, which produce every figure a customer is charged, and `routes/account`
+    // and `routes/admin`, the customer wallet surface and the operator surface.
+    // [profile.release] wraps rather than panics, so the cost of a wrong figure in
+    // any of them is financial rather than cosmetic.
+    //
+    // THREE OF THE FOUR COST NOTHING - measured before installing each, zero sites
+    // outside their tests, because the money arithmetic all lives in db.rs and the
+    // others route to it. That is the argument for doing them one module at a time
+    // rather than as one sweep of all 43: a fence that needs a page of justifications
+    // to install is one nobody keeps, and three of these needed none. Only db.rs had
+    // real work - nine sites in seven functions, each now carrying a written argument
+    // for why its operands are bounded, except the one bounded only by MAGNITUDE
+    // (new_balance - charge_delta), which is checked at runtime instead.
     //
     // So the honest statement of what protects money is now three things, not two:
     // the schema and the reconciliation gate below, plus a lint on the modules where
