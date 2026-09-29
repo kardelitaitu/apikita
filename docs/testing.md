@@ -271,6 +271,26 @@ alarm, which costs the reader more than the missed defect would have. This is th
 false alarm recorded here, and the same shape as the rest: the defect was in the
 measurement, not in the code.
 
+
+**AND IT HAPPENED AGAIN IMMEDIATELY, which is the useful part of this entry.** The round
+after writing the paragraph above, the same test was run on the remaining checks and
+`relay-check` was reported as passing with `docs/edge-relay.md` missing. It does not read
+that document: it reads `.docker/nginx/relay.conf`, and it refuses a missing config at
+the top with exit 2 before doing anything. The second identical error, in the very next
+round, after the lesson was already on the page.
+
+So the honest conclusion is not "ask the question" - that was written down and did not
+help. It is that the question is answered by READING THE CHECK before choosing a file to
+delete, rather than by choosing a file and then asking. A note in a document does not
+change what a careless experiment does; only reading the thing you are about to test does.
+
+The audit itself is complete and the result is clean: every one of the seven tool checks
+refuses a missing input. compose-check exits 2 on no `docker-compose.yml`, backup-check 1
+on no `backup.sh`, drill-check 1 on no `drill.sh`, reconcile-check 1 on no `reconcile.sql`,
+alert-check 1 on no `probe.sh`, ci-docs-check 3 on no `ci-cd.md`, and relay-check 2 on no
+`relay.conf`. **None of the seven can pass vacuously**, and until this was measured that
+was an assumption rather than a fact.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
