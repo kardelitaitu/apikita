@@ -30,10 +30,30 @@ import { dirname, join } from 'node:path';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const read = (p: string) => readFileSync(join(root, p), 'utf8');
 
-/** The website suite's own count, as the runner just reported it. */
+/**
+ * The website suite's count. A LITERAL, despite what this comment used to say.
+ *
+ * It said "as the runner just reported it", and it never did: the runner reports the count
+ * to the shell, and a test cannot read another run's output without running it, which is the
+ * recursion the note above is about. So it is a hand-kept number wearing the clothes of a
+ * measurement, and that matters more than being wrong, because the comment tells the next
+ * person there is nothing to update.
+ */
 const WEBSITE_TESTS = 162;
 
-/** The measured server count. Update WITH the run that changes it. */
+/**
+ * The server count, and the same kind of literal for the same reason.
+ *
+ * Update WITH the run that changes it. **BOTH NUMBERS ARE CURRENTLY BEHIND**: the
+ * website suite is at 168 and the server at 509, and the documents these two pin still say
+ * 162 and 444 - the front page of this repository tells a reader there are 444 tests.
+ *
+ * That is the design working as intended rather than a broken guard: this file exists so
+ * that ONE edit cannot update four documents and miss the fifth, and the cost of that is
+ * that a stale number here is propagated consistently instead of being corrected
+ * independently in five places. Bumping these is five documents and two constants, which is
+ * why it has not been done opportunistically and why it should be done deliberately.
+ */
 const SERVER_TESTS = 444;
 
 /** Every doc that states the server count, and the exact text it must carry. */
