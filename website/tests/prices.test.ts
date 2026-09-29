@@ -1,4 +1,6 @@
-// The customer-facing prices, derived from the config that sets them.
+// Every figure the customer-facing site shows that config/apikita.toml sets: the token
+// rates, the ticker cards for all six models, the deposit minimums, the per-hour top-up
+// cap, and the key-metadata cache TTL. Derived, not transcribed.
 //
 // THIS IS THE CHECK THE "no TOML dependency" DECISION WAS WRONGLY BELIEVED TO FORBID.
 // That decision governs the BUILD: nothing read here is ever bundled, because a test
@@ -189,5 +191,26 @@ test('the wallet rate cap is the config topup_per_hour', async () => {
     topupPerHour,
     Number(match[1]),
     'the wallet page quotes a top-up cap the config does not have, so a customer reads a limit that is not enforced'
+  );
+});
+
+// The key-metadata cache TTL, which the quickstart quotes as the wait for a LOWERED key
+// limit to apply. It was a bare number in prose, which no guard could see: a customer-facing
+// figure with no derivation behind it, on the page a developer plans against.
+test('the key-metadata cache TTL is the config key_metadata_cache_seconds', async () => {
+  const { keyMetadataCacheSeconds } = await import('../src/lib/models.ts');
+
+  // [limits], NOT [key_pool]: the proxy key-metadata TTL is a rate cap, and the
+  // section it lives in is the one that decides it. I looked under [key_pool]
+  // first, on the reasonable guess that a cache TTL belongs beside the pool, and
+  // the guard failed - which is what it is for.
+  const limits = config.slice(config.indexOf(String.fromCharCode(91) + 'limits' + String.fromCharCode(93)));
+  const match = limits.match(/^\s*key_metadata_cache_seconds\s*=\s*([0-9]+)/m);
+  assert.ok(match, 'the config no longer declares key_metadata_cache_seconds');
+
+  assert.equal(
+    keyMetadataCacheSeconds,
+    Number(match[1]),
+    'the quickstart quotes a wait the config does not have, so a developer plans around a limit change that lands sooner or later than it will'
   );
 });

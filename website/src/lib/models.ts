@@ -102,6 +102,17 @@ export const minTopupIdr = 10000;
  * `tests/prices.test.ts` reads the config's `[limits]` and can compare.
  */
 export const topupPerHour = 5;
+
+/**
+ * Key-metadata cache TTL, from config/apikita.toml `[key_pool]
+ * key_metadata_cache_seconds`.
+ *
+ * The quickstart tells a developer to allow this long for a LOWERED key limit to take
+ * effect, which is a real fact they plan around, and it was a bare number in prose. Same
+ * shape as the top-up cap and for the same reason: a value spelled in a surface is a copy
+ * not yet consolidated, and a comment cannot keep it honest.
+ */
+export const keyMetadataCacheSeconds = 60;
 export const idr = (n: number) => n.toLocaleString('en-US');
 
 const peakPrices = rates.map((rate) => rate.price);

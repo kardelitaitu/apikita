@@ -1,5 +1,11 @@
 ---
 import Base from '../../layouts/Base.astro';
+// One figure in this page is a config value rather than an example: the key-metadata
+// cache TTL, which decides how long a LOWERED limit takes to apply. It was a bare number
+// in prose - the shape this session has been closing, a value spelled in a surface
+// rather than derived from the thing that sets it.
+import { keyMetadataCacheSeconds } from '../../lib/models.ts';
+
 
 // Endpoints, request/response shapes and error codes are transcribed from
 // docs/server/api-spec.md and docs/error-model.md. No base URL is hardcoded:
@@ -134,7 +140,7 @@ const errorCodes = [
       </p>
       <p class="mt-3 text-sm text-ink-muted">
         Raising a key's limits takes effect immediately. Lowering them is subject to
-        the proxy's metadata cache, so allow up to 60 seconds.
+        the proxy's metadata cache, so allow up to {keyMetadataCacheSeconds} seconds.
       </p>
     </section>
 
