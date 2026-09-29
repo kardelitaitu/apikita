@@ -347,7 +347,22 @@ mod tests {
     /// So this reads the table. A hand-kept copy of what another file says is the
     /// same bug twice over, which is why the alert guards read probe.sh rather than
     /// counting its rows.
-    /// Every EXAMPLE in the published table names something the code can actually do.
+    /// The published table names no rating, and the NAME SAYS SO.
+    ///
+    /// This was `the_published_error_table_names_no_field_the_system_does_not_accept`,
+    /// which is the overstatement pattern for the third time in three rounds, and the
+    /// most blatant of the three: behind that name are three strings.
+    ///
+    /// A general version is not available, and pretending otherwise would be the same
+    /// mistake with a better disguise. The column is PROSE - "Well-formed but invalid
+    /// (a top-up amount below the provider minimum)" - so telling a field name from an
+    /// English word is a judgement, and a heuristic would either miss an invented field
+    /// wearing ordinary words or flag the ordinary words. This suite has a documented
+    /// history of false alarms on exactly that kind of matcher, including one that read
+    /// three clock times and a URL as file citations.
+    ///
+    /// So the check is what it is - the way a rating gets spelled, all three of them -
+    /// and the name says that rather than claiming a general sweep it does not perform.
     ///
     /// The status-code guard below compares CODES, and every code matched - the 422 was
     /// real, the `validation_failed` was real. What it did not compare is the column a
@@ -363,7 +378,7 @@ mod tests {
     /// compares the machine-readable half of a document leaves the prose unguarded, and
     /// the prose is what a human is actually reading.
     #[test]
-    fn the_published_error_table_names_no_field_the_system_does_not_accept() {
+    fn the_published_error_table_names_no_ratings() {
         let table = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")

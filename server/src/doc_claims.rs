@@ -726,6 +726,11 @@ mod tests {
         // Which document states each window. Not the same file throughout, which is
         // part of why this went unnoticed: the promise and the code were never in one
         // place to be compared.
+        // TWO files, named here rather than globbed. Every markdown file under docs/
+        // is read and triaged by the guard below, so a THIRD document gaining a
+        // retention window is the case this misses - and it is a narrow one, because
+        // the other two are the only documents that state one, and the triage list is
+        // the thing that would change if that stopped being true.
         let sources = [
             read_repo_file("docs/data-retention.md"),
             read_repo_file("docs/ip-tracking.md"),
