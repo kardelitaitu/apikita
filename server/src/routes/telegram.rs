@@ -218,6 +218,17 @@ pub fn link_code_window() -> Duration {
 /// `link_code_window` is therefore really a daily allowance that resets on the hour,
 /// and an attacker who times it gets the full budget at 23:59 and again at 00:00.
 ///
+/// **THE EXPOSURE IS BOUNDED, and it is small: one extra budget per DAY.** The window
+/// here is an hour and the salt rotates every twenty-four, so a salt boundary can fall
+/// inside a window at most once a day. The worst case is one additional hour of
+/// attempts, once, at midnight.
+///
+/// I first wrote this as a limit that quietly stops limiting, which reads as though the
+/// cap were unbounded. It is not, and the difference is the whole point: an operator
+/// needs the worst case, not the mood. A rule that sounds alarming is a rule people
+/// disable, and this one is a price worth paying - one budget a day for history that is
+/// unlinkable across days, which is the property the privacy page promises.
+///
 /// It is written down rather than fixed because the two properties are in genuine
 /// conflict: a salt that does not rotate makes the counter work across days, and it also
 /// makes every day linkable, which is the whole privacy design in ip-tracking.md and the
