@@ -1,3 +1,21 @@
+#![cfg_attr(
+    not(test),
+    // THE STREAMING HOT PATH, and the module where the fence has been worth the most.
+    //
+    // Everything money-shaped happens downstream of this file, but two of its own
+    // counters GATE ACCESS directly: the per-key rate window decides whether a
+    // request is served at all, and the cache generation decides whether an
+    // in-flight read may write its result back. Both were plain `+=`, and both
+    // wrap in a release build - which for a ceiling is the permissive direction, the
+    // failure shape this repository treats as worst. They now saturate, so a
+    // wrapped counter cannot hand out a fresh allowance or resurrect a stale entry.
+    //
+    // It is not free here: six sites, and the two counters above are the reason the
+    // fence was worth installing rather than merely tidy. The remaining four carry
+    // written arguments.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, State},
@@ -189,6 +207,11 @@ const USAGE_TAIL_CAP: usize = 64 * 1024;
 /// (`drain(..excess)`) is therefore load-bearing, not an implementation detail.
 fn retain_usage_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
     tail.extend_from_slice(chunk);
+    // SAFE, and the guard above it is the whole argument: the subtraction only runs
+    // when `len > USAGE_TAIL_CAP`, so `len - CAP` is at least 1 and cannot
+    // underflow. `len` is a Vec length, so it is bounded by the allocation and the
+    // drain is in bounds for the same reason.
+    #[allow(clippy::arithmetic_side_effects)]
     if tail.len() > USAGE_TAIL_CAP {
         let excess = tail.len() - USAGE_TAIL_CAP;
         tail.drain(..excess);
@@ -310,7 +333,30 @@ impl RateWindow {
             };
         }
 
-        self.count += 1;
+        // SATURATING, and the honest reason is DEFENCE, not a fix.
+        //
+        // This is the rate limit's own counter, so a wrap would be the permissive
+        // failure: a window reading zero is a window that has just granted a full
+        // fresh allowance. That is why it is written this way rather than +=.
+        //
+        // BUT THE WRAP IS UNREACHABLE, and claiming otherwise would be a false claim
+        // of exactly the kind this repository keeps having to correct. The guard
+        // above refuses at `count >= limit_rpm`, and `limit_rpm` is itself a u32, so
+        // `count` can never pass `limit_rpm` and therefore can never reach
+        // u32::MAX + 1.
+        //
+        // The first version of this comment claimed a wrapping counter "returns to
+        // zero and grants a fresh allowance", and the test written to prove it could
+        // not: u32::MAX - 1 + 1 IS u32::MAX, and at u32::MAX the guard has already
+        // denied. The comment and the test were wrong in the same direction, and the
+        // test passed against the very code it claimed to disprove - which is why the
+        // real property is now asserted below instead.
+        //
+        // What is left is worth keeping: the invariant now lives HERE, at the
+        // increment, rather than depending on a guard some lines up. If someone later
+        // relaxes that guard - to let a burst over the ceiling through, say - this
+        // line still cannot hand out a fresh allowance.
+        self.count = self.count.saturating_add(1);
         RateDecision::Allow
     }
 }
@@ -476,7 +522,13 @@ impl KeyCache {
     fn remove(&mut self, key_hash: &str) {
         self.entries.remove(key_hash);
         self.order.retain(|key| key != key_hash);
-        self.generation += 1;
+        // SATURATING, for the same reason as the rate window: this is a counter a
+        // lookup compares against to decide whether the row it read is still
+        // current, so a wrap could make a pre-invalidation read look post-
+        // invalidation. Saturating keeps it monotonic, which is the property
+        // `insert_if_unchanged` actually relies on. Unreachable at 2^64
+        // invalidations, and free.
+        self.generation = self.generation.saturating_add(1);
     }
 
     /// The cached record, or None when it is absent or past its TTL.
@@ -1021,6 +1073,14 @@ fn stream_flag_allowed(requested: Option<bool>) -> Result<(), AppError> {
 /// guard. Kept a free function rather than inlined because the handler and the
 /// test oracle each carried their own copy of `len/4`, and a rule written twice
 /// is a rule that can disagree with itself.
+///
+/// SAFE by the length of its own input. Both counters advance once per byte, so
+/// each is at most `body.len()`; the final sum is at most `len + len/4`, which for a
+/// 64-bit `len` cannot overflow because a slice of that size cannot be allocated.
+/// The direction of any underestimate is also the safe one - this figure sizes a
+/// HOLD, and the counter test above it pins that a dense body is counted generously
+/// rather than cheaply.
+#[allow(clippy::arithmetic_side_effects)]
 fn estimated_input_tokens(body: &[u8]) -> u64 {
     let mut ascii_bytes = 0u64;
     let mut multi_byte_bytes = 0u64;
@@ -2441,6 +2501,83 @@ mod tests {
         assert!(windows.len() <= capacity, "memory stays bounded");
     }
 
+    /// THE REACHABLE INVARIANT: a window's counter never passes its ceiling.
+    ///
+    /// This replaces a test that asserted something stronger and FALSE - that a
+    /// wrapping u32 counter would reset to zero at the ceiling and hand out a fresh
+    /// allowance. It cannot: u32::MAX - 1 + 1 IS u32::MAX, and the guard refuses at
+    /// count >= limit_rpm, and limit_rpm is itself a u32, so count can never pass
+    /// it. The original test passed against the very code it claimed to disprove,
+    /// which is the worst way for a test to be wrong: green, and worthless.
+    ///
+    /// What is worth pinning is the property that KEEPS the wrap unreachable,
+    /// because it is the one a future edit could break: if a change let the counter
+    /// rise past its ceiling, the u32 wrap stops being unreachable and the rate
+    /// limit starts switching itself off. So the counter is read back after every
+    /// request and required to stay within the limit.
+    ///
+    /// Swept rather than spot-checked, because the interesting limits are the ones
+    /// near a boundary: 1, the ordinary cap, and u32::MAX, where a wrap would be
+    /// one request away. A limit of 0 never reaches here - the caller skips the
+    /// whole mechanism for an unlimited key - so it is not swept.
+    #[test]
+    fn a_window_counter_never_passes_its_ceiling() {
+        let now = Instant::now();
+
+        for limit in [1u32, 2, 3, 17, 1000, u32::MAX - 1, u32::MAX] {
+            let key = Uuid::new_v4();
+            let mut windows: HashMap<Uuid, RateWindow> = HashMap::new();
+            windows.insert(
+                key,
+                RateWindow {
+                    started_at: now,
+                    count: 0,
+                },
+            );
+
+            // Ask for far more than the ceiling could ever grant, but CAP the
+            // number of requests. The first version of this test used
+            // limit.saturating_add(8) as the bound, which at limit = u32::MAX - 1
+            // saturates to u32::MAX rather than to 8 - so the sweep ran four billion
+            // iterations and had to be killed. The comment claimed the opposite,
+            // which is how it went unnoticed until the test did not finish.
+            //
+            // The cap is what makes the sweep possible, and it does not weaken the
+            // property: the counter is re-read on EVERY request, so a breach is
+            // caught the moment it happens rather than only at the end.
+            for _ in 0..limit.min(64).saturating_add(8) {
+                let _ = check_rate_limit_in(&mut windows, 16, key, limit, now);
+                let count = windows
+                    .get(&key)
+                    .expect("the window is never evicted")
+                    .count;
+                assert!(
+                    count <= limit,
+                    "a window capped at {limit} reached {count}: past the ceiling is
+                    how a u32 counter gets close enough to wrap, and a wrap there is
+                    a rate limit handing out a fresh allowance"
+                );
+            }
+
+            // And the ceiling is actually ENFORCED, not merely respected - a
+            // counter stuck at zero would also satisfy the bound above.
+            let mut one: HashMap<Uuid, RateWindow> = HashMap::new();
+            one.insert(
+                key,
+                RateWindow {
+                    started_at: now,
+                    count: limit,
+                },
+            );
+            assert!(
+                matches!(
+                    check_rate_limit_in(&mut one, 16, key, limit, now),
+                    RateDecision::Deny { .. }
+                ),
+                "a window sitting exactly on its ceiling of {limit} must refuse"
+            );
+        }
+    }
     // DEFECT 2 regression: the invalidation drops the entry, and a lookup that
     // read the row before the invalidation cannot put it back.
     #[test]
