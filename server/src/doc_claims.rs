@@ -791,6 +791,107 @@ mod tests {
             );
         }
     }
+
+    /// No column in the schema is NAMED for a prompt or a completion.
+    ///
+    /// WHY THIS IS A SEPARATE TEST. The privacy page tells customers their prompts
+    /// and completions are never stored, and the page's own comment says the claim is
+    /// about the DATABASE and that nothing checks it: the log test covers the log, and
+    /// a prompt column added to a request-path table for debugging would land, leave
+    /// every test green, and the page would go on promising otherwise. Of every
+    /// untested promise found in this repository this is the one a customer would
+    /// care about most, and it was the only one nobody could check by reading.
+    ///
+    /// IT ALSO MATTERS THAT THE SCAN READS A COMPACT TABLE, and the first version of
+    /// this test did not and the mutation proved it: a one-line create-table carrying a
+    /// prompt column slipped straight through, because the line begins with CREATE and
+    /// the parser was looking for a column at the start of a line. A table written that
+    /// way is not hypothetical - it is how a quick one gets added - and a guard with
+    /// that hole is the same silent kind of check this one exists to replace.
+    ///
+    /// WHY IT IS NAMED FOR NAMES. This looks for a COLUMN NAME, and a check that
+    /// read the code instead would have to decide whether every string in the crate
+    /// is prompt text, which is not a question a test can answer. The rule below is
+    /// therefore deliberately narrow, and its limit is stated rather than hidden: a
+    /// column called payload, raw or debug would NOT be caught. The second half of
+    /// this control is the review prompt on the migration, and the honest description
+    /// of the pair is that they cover the careless case and the deliberate one.
+    ///
+    /// Four of the forty-three TEXT columns are text a person wrote - reviews.body,
+    /// review_sessions.body, admin_audit.detail, link_code_issues.reason - and none of
+    /// them is named below, which is why this can be a name check at all. If a review
+    /// column were ever renamed to one of these words the test would fail, and that
+    /// failure would be worth reading rather than renaming the column.
+    #[test]
+    fn no_schema_column_is_named_for_a_prompt_or_a_completion() {
+        const FORBIDDEN: &[&str] = &[
+            "prompt",
+            "completion",
+            "request_body",
+            "messages",
+            "conversation",
+        ];
+
+        let migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut entries: Vec<_> = std::fs::read_dir(&migrations)
+            .expect("server/migrations must be readable, or this passes over nothing")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+            .collect();
+        entries.sort();
+
+        let mut columns: Vec<String> = Vec::new();
+        for path in entries {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("--") {
+                    continue;
+                }
+                let Some((name, rest)) = trimmed.split_once(char::is_whitespace) else {
+                    continue;
+                };
+                if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                // Only a column DECLARATION: an uppercase type, and a type this
+                // schema actually uses.
+                let upper = rest.trim_start().to_ascii_uppercase();
+                if ["TEXT", "INTEGER", "REAL", "BLOB", "NUMERIC"]
+                    .iter()
+                    .any(|t| upper.starts_with(t))
+                {
+                    columns.push(name.to_string());
+                }
+            }
+        }
+
+        // The vacuity guard. A parser that matched nothing would pass over the whole
+        // schema, and this is precisely a check where an empty set means nothing:
+        // zero columns would trivially contain no prompt column.
+        assert!(
+            columns.len() >= 60,
+            "only {} column(s) were read from the migrations, so this test is not looking at the real schema.",
+            columns.len()
+        );
+
+        let offenders: Vec<&String> = columns
+            .iter()
+            .filter(|c| {
+                let lower = c.to_ascii_lowercase();
+                FORBIDDEN.iter().any(|f| lower.contains(f))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "schema column(s) {offenders:?} are named for prompt or completion text. The privacy \"
+             page tells customers their prompts and completions are never stored. If a \"
+             column like this is genuinely needed, change the page in the same change, \"
+             and mean it - a disclosure nobody has checked is worth less than one that \"
+             was deliberately written."
+        );
+    }
     /// Every table the schema creates is either DISCLOSED on the privacy page or
     /// recorded here as deliberately unused.
     ///

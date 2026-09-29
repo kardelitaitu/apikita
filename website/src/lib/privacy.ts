@@ -17,12 +17,18 @@
 //   3. the only free-text columns in the database are the three review bodies,
 //      which are customer-written testimonials the same page discloses below.
 //
-// What is NOT covered: the claim is about the DATABASE. The one test that comes
-// close, a_customer_prompt_never_reaches_the log, covers the log. A prompt column
-// added to a request-path table for debugging would break this claim silently -
-// the column lands, every test stays green, and this page goes on telling
-// customers their prompts are not stored. If you add one, change this row and
-// this comment together.
+// The DATABASE side of this claim is now checked. A prompt column added to the
+// schema for debugging used to break it silently - the column lands, every other
+// test stays green, and this page goes on telling customers their prompts are not
+// stored. no_schema_column_is_named_for_a_prompt_or_a_completion fails the moment a
+// migration declares one, and it reads compact single-line tables as well as the
+// multi-line style, because the first version did not and its mutation proved it.
+//
+// What is still NOT covered: the check looks at COLUMN NAMES, so a column called
+// payload, raw or debug would not be caught. That is deliberate rather than a
+// limitation to apologise for - a test cannot decide whether every string in the
+// crate is prompt text - and the second half of the control is the other half of
+// this comment: if you add one, change this row and this comment together.
 // document's, restated in plain language. docs/data-retention.md:32-34 states the
 // rule this file exists to honour: the /privacy page "must be updated in the same
 // change if any of it moves again". tests/privacy.test.ts enforces the coverage
