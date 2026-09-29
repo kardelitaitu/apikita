@@ -2790,6 +2790,118 @@ mod tests {
         );
     }
 
+    /// The SAME invariant as the test above, swept instead of exemplified.
+    ///
+    /// the_input_estimate_covers_a_utf8_dense_body proves the ceiling for ONE body
+    /// shape, and that is the shape that broke. But the defect is a FUNCTION of the
+    /// byte mix and the length, not of one string, so one point is one example.
+    ///
+    /// This walks the space instead: almost-pure-ASCII through almost-pure-CJK, over
+    /// four orders of magnitude of length, asserting two properties.
+    ///
+    ///   1. THE CEILING. The hold covers the cost of the tokens the body really is.
+    ///      This is the invariant whose violation strands money: the debit is clamped
+    ///      to what was reserved, so a shortfall is written off silently and no alert
+    ///      fires.
+    ///   2. MONOTONICITY. A longer body never holds less. Not required by the money
+    ///      model, but a hold that DECREASES with size is the signature of the
+    ///      estimate and the charge disagreeing about which is bigger.
+    ///
+    /// The token model is a MODEL of a BPE tokenizer, not one - a byte-level BPE
+    /// cannot emit more tokens than the body has bytes, and a character-level one
+    /// emits about one per non-ASCII character. Every fixture is inside both bounds,
+    /// so the test is not asking the estimate to beat a bound it cannot be held to.
+    ///
+    /// A FIXED-SEED xorshift, as db.rs already does, rather than a new dependency: a
+    /// failure has to be reproducible, and a property test that cannot be re-run to
+    /// the same input is one that gets deleted the first time it is inconvenient.
+    #[test]
+    fn the_hold_covers_the_charge_for_every_body_shape() {
+        let config = live_config();
+        let model = config
+            .models
+            .iter()
+            .find(|m| m.name == "flash")
+            .expect("the shipped config must carry the flash model");
+
+        struct XorShift64(u64);
+        impl XorShift64 {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+        }
+        let mut rng = XorShift64(0x9E37_79B9_7F4A_7C15);
+
+        // Three bytes: the dense case. The sweep varies the MIX, which is what
+        // decides how many tokens a byte-length heuristic miscounts.
+        let cjk: Vec<u8> = "\u{4e2d}".as_bytes().to_vec();
+
+        let hold = |body: &[u8]| model.worst_case_reservation_idr(estimated_input_tokens(body), 0);
+        let charge = |body: &[u8]| {
+            let multi = body
+                .iter()
+                .filter(|b| !b.is_ascii() && **b & 0xC0 != 0x80)
+                .count() as u64;
+            let ascii = body.iter().filter(|b| b.is_ascii()).count() as u64;
+            calculate_token_cost_idr(
+                model.price,
+                multi + (ascii / 4).max(1),
+                model.rates.input_peak,
+                0,
+                model.rates.cache_read_peak,
+                0,
+                model.rates.output_peak,
+            )
+        };
+
+        let mut cases = 0usize;
+        for dense_every in [1usize, 2, 3, 5, 9, 64, usize::MAX] {
+            for size in [1usize, 7, 64, 997, 4096, 65_536] {
+                let mut body: Vec<u8> = Vec::new();
+                for i in 0..size {
+                    if i % dense_every == 0 {
+                        body.extend_from_slice(&cjk);
+                    } else {
+                        body.push(b'a' + (rng.next() % 26) as u8);
+                    }
+                }
+                let h = hold(&body);
+                let c = charge(&body);
+                assert!(
+                    h >= c,
+                    "{} bytes, every {dense_every}th multi-byte: hold {h} against a charge \
+                     of {c}",
+                    body.len()
+                );
+
+                let mut longer = body.clone();
+                for _ in 0..size {
+                    if size % dense_every == 0 {
+                        longer.extend_from_slice(&cjk);
+                    } else {
+                        longer.push(b'z');
+                    }
+                }
+                assert!(
+                    hold(&longer) >= h,
+                    "{} bytes holds {h} but {} bytes holds only {}",
+                    body.len(),
+                    longer.len(),
+                    hold(&longer)
+                );
+                cases += 1;
+            }
+        }
+
+        // The vacuity guard: a sweep that generated nothing passes every assertion
+        // above over an empty set.
+        assert_eq!(cases, 42, "the sweep must cover every mix at every size");
+    }
     #[test]
     fn the_error_frame_ends_with_a_blank_line() {
         let frame = error_event("upstream_failed", "boom");
