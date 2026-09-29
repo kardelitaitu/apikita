@@ -1662,6 +1662,114 @@ mod tests {
         );
     }
 
+    /// Every rate in the price card is its stated CNY source times the stated FX.
+    ///
+    /// The config opens with the conversion (1 CNY = 2,676.78 IDR) and the rule for
+    /// re-deriving: `IDR_rate = CNY_rate * 2676.78`. Every rate then carries its CNY
+    /// origin in a trailing comment after a yen sign. This asks whether each rate IS that
+    /// conversion.
+    ///
+    /// The instance: `deepseek-v4-pro` `input_peak` read 12045.50 where 4.50 x 2676.78 is
+    /// 12045.51 - one cell of thirty-six, and the only inexact one. It survived because it
+    /// is invisible: 12045.50 x 1.5 and 12045.51 x 1.5 both round to the 18,068 the
+    /// customer is quoted, so nothing downstream disagreed. Only asking whether the number
+    /// is the conversion of the number beside it found it.
+    ///
+    /// **FOUR VERSIONS OF THIS FAILED FIRST, all matchers of mine, and the reasons are
+    /// recorded because each is a way a check is silently wrong:**
+    ///
+    ///   1. the header is a COMMENT and writes the rate with a comma, so a bare `1 CNY = `
+    ///      and a bare float matched NOTHING and this failed on a wholly correct config;
+    ///   2. the CNY is written after a YEN SIGN, not as the text `CNY `, so nothing
+    ///      matched - caught by the vacuity floor below, not by reading the file;
+    ///   3. the first version that matched reached past the rates and read the CNY out of
+    ///      `price = 1.5  # 50% markup`, calling a MULTIPLIER a rate and reporting drift;
+    ///   4. `split_once('=')` splits on the FIRST `=`, so the value still carried its comment
+    ///      and would not parse - also caught by the vacuity floor.
+    ///
+    /// Every one of those would have been a green run. The floors are what made them loud,
+    /// which is the whole argument for a floor on a check that reads a shape.
+    #[test]
+    fn every_rate_in_the_price_card_is_its_cny_source_times_the_stated_fx() {
+        let config = read_repo_file("config/apikita.toml");
+
+        // Read from the header, never written here, for the reason every floor in this
+        // file carries: a copy beside the comparison goes stale and then asserts its own
+        // staleness. The line is a comment and uses a thousands separator.
+        let fx: f64 = config
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().trim_start_matches('#').trim();
+                let rest = rest.strip_prefix("1 CNY = ")?;
+                let digits: String = rest
+                    .split_whitespace()
+                    .next()?
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                digits.parse().ok()
+            })
+            .expect("the config header must state the CNY to IDR rate");
+        assert!(
+            fx > 0.0,
+            "the stated FX rate is {fx}, which no price derives from"
+        );
+
+        // THE SIX RATE KEYS, NAMED, because a guard that reaches past its subject finds
+        // something: an earlier version read the `price` multiplier's comment as a rate.
+        // The trade is stated - a NEW rate class is unchecked until added here, and the
+        // floor below fails if these six stop being found, so a seventh is visible as a
+        // config key with no counterpart, the cheapest kind of miss to catch in review.
+        const RATE_KEYS: &[&str] = &[
+            "input_peak",
+            "input_offpeak",
+            "cache_read_peak",
+            "cache_read_offpeak",
+            "output_peak",
+            "output_offpeak",
+        ];
+
+        let mut checked = 0usize;
+        for line in config.lines() {
+            let trimmed = line.trim();
+            // The COMMENT IS SPLIT OFF FIRST, or the value carries it and will not parse.
+            let Some((before_comment, comment)) = trimmed.split_once('#') else {
+                continue;
+            };
+            let Some((key, value)) = before_comment.split_once('=') else {
+                continue;
+            };
+            if !RATE_KEYS.contains(&key.trim()) {
+                continue;
+            }
+
+            let cny: String = comment
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            let (Ok(cny), Ok(stated)) = (cny.parse::<f64>(), value.trim().parse::<f64>()) else {
+                continue;
+            };
+            checked += 1;
+
+            // The config states every rate ROUNDED TO TWO DECIMALS, so the comparison is
+            // against the rounded product. Comparing raw with a tolerance sitting on half
+            // a cent flagged 2.25 x 2676.78 = 6022.755 stated as 6022.76 - correct rounding,
+            // not drift.
+            let expected = (cny * fx * 100.0).round() / 100.0;
+            assert!(
+                (expected - stated).abs() < 0.001,
+                "{key} is stated as {stated} but its comment says CNY {cny}, and {cny} x {fx} rounds to {expected}. A rate and the CNY it came from have drifted apart."
+            );
+        }
+
+        // The vacuity guard, and it is not decorative: it caught two of the four versions
+        // above, both of which would otherwise have been green runs.
+        assert!(
+            checked >= 30,
+            "only {checked} rate(s) with a CNY source were found, so this is not checking the price card"
+        );
+    }
     /// Every table the schema creates is either DISCLOSED on the privacy page or
     /// recorded here as deliberately unused.
     ///
