@@ -534,6 +534,29 @@ So the remaining 102 are, on this evidence, mostly comments that paraphrase pros
 is not permission to skip them: the one clean cluster was a cluster, and a 3-of-3 record
 on one kind of comment is a reason to order the work, not a reason to stop.
 
+**AND THEN THE QUOTE-WORK WAS MEASURED BEFORE IT WAS BUILT, WHICH CHANGED THE ANSWER.**
+Round 40 found a class with an anchor: a comment that QUOTES a document and cites a line
+where the quote is not. A quote is checkable — the text itself is the lookup key — so
+unlike every other check here, this one can be automated. A guard was written to do it.
+
+**It was not committed, because it has nothing left to catch.** Across the whole crate,
+four citations carry a quotable phrase. Three are correct. **Zero are misplaced** — the four
+round 40 found by hand were all fixed in that round. A check with no candidates is a
+check that cannot fail, and a guard that never fires reads as protection while providing
+none. Measured first, therefore not built.
+
+**What the measurement found instead is a third class, which is a new one.** A comment
+may not merely point at the wrong line — it may put words in a document's mouth that are
+not there. `routes/admin.rs` quoted `docs/admin-surface.md` as calling the audit trail
+"the record that makes disputes resolvable"; the document says **"the audit trail that
+makes disputes resolvable"**, at line 19, while the citation said 288. Fixed to the
+verbatim text and the section that is actually the subject.
+
+So there are three, and they are genuinely different: **WRONG** (points at unrelated
+content — the bulk of what the review has found), **MISPLACED** (the quoted text is real
+and elsewhere), and **MISQUOTED** (the quoted text does not exist). Only the middle one
+has a machine-checkable anchor, and it is now empty.
+
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually
 runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was

@@ -535,10 +535,10 @@ pub struct AdminAuditEntry {
 /// `GET /api/admin/accounts/{id}/audit` - what operators have done to an account.
 ///
 /// Why this exists: every admin action writes an `admin_audit` row
-/// (docs/admin-surface.md:288), but **nothing read them back**, so the trail the
-/// doc calls "the record that makes disputes resolvable" was invisible to the very
-/// operator meant to consult it. This is the read side of a table that was
-/// write-only.
+/// (docs/admin-surface.md, Audit trail section), but **nothing read them back**, so the
+/// trail the doc calls "the audit trail that makes disputes resolvable" was invisible
+/// to the very operator meant to consult it. This is the read side of a table that
+/// was write-only.
 ///
 /// Safety, same order as every sibling:
 ///
