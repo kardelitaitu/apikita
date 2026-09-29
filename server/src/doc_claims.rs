@@ -282,6 +282,61 @@ mod tests {
             "the register promises a 7-day idle session lifetime, and that is also the only combination that makes the idle bound bind at all: at or above absolute_days the idle rule is inert by construction"
         );
     }
+    /// The bot README's claim about the FOLDER is true, checked against the tree.
+    ///
+    /// A third kind of promise, and the other two are the wrong shape for this one.
+    /// The retention and lifetime checks tie a DOCUMENT to CODE. This one ties a
+    /// document to the REPOSITORY TREE: telegram/README.md states that the folder
+    /// holds this README and nothing else, and docs/launch-checklist.md carries an
+    /// open item that depends on the same fact - that the bot is design-only, which is
+    /// a launch gate.
+    ///
+    /// Both are claims a reader trusts and nothing keeps honest. And this one has a
+    /// property the others do not: it goes STALE by someone doing ordinary work. Writing
+    /// the bot is not a defect, it is the next task - and the two documents that say
+    /// there is no bot would quietly become wrong, which for a launch gate is the
+    /// expensive direction to be wrong in.
+    ///
+    /// So the failure is deliberately a NUDGE rather than a veto, and it says what to
+    /// do. -Force matters: without it a .gitkeep or an editor swap file would read as
+    /// a bot, and the check would cry wolf the first time someone opened the folder.
+    #[test]
+    fn the_telegram_folder_is_still_the_scaffolding_its_readme_claims() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("telegram");
+
+        let mut others: Vec<String> = std::fs::read_dir(&dir)
+            .expect("telegram/ must be readable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "README.md")
+            .collect();
+        others.sort();
+
+        assert!(
+            others.is_empty(),
+            "telegram/ now holds {others:?} besides its README. That is the NEXT TASK rather than a defect, but two documents now say otherwise: telegram/README.md states the folder holds this README and nothing else, and docs/launch-checklist.md carries an open item because the bot is design-only - which is a launch gate. Update both, and drop the checklist item if the bot is done enough to unblock a launch."
+        );
+
+        // The README is the other half of the claim, and it is worth asserting that the
+
+        // document still EXISTS - a guard that reads a file nobody removed is a guard
+
+        // whose subject has quietly gone.
+
+        let readme = std::fs::read_to_string(dir.join("README.md"))
+            .expect("telegram/README.md must exist for the claim above to be about it");
+
+        assert!(
+            readme.contains("empty scaffolding"),
+            "telegram/README.md no longer describes itself as empty scaffolding. If the
+
+            bot is being built, its Status section is the place that says so - and the
+
+            test above is what will make this line need updating."
+        );
+    }
     /// The scanner itself, because a check that cannot find a citation it should find
     /// is a check that always passes. These are the shapes the rule exists to catch, and
     /// the shapes it must NOT catch - a heading, a numbered list, a version.
