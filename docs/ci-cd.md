@@ -514,6 +514,26 @@ clusters out of three. Comments that name a value are where the errors are.
 That is now a testable predictor rather than a hunch, and it is the right order to read
 the remaining 115: not by cluster size, but by whether the comment names a value.
 
+**THE PREDICTOR WAS USED AS A FILTER, AND IT SHRANK THE JOB.** Applying it to the 115
+remaining citations — a comment counts if the text around it names a three-digit HTTP
+status, a numbered rule, a field of the error envelope, a config key, or an endpoint
+path — selects **13, which is 11% of what is left.** Nine were wrong. Four cited a blank
+line, the Telegram link-code section, an alerts paragraph, and the wrong JSON field;
+one cited the status table's **401** row for a comment about 503. The four Retry-After
+citations quoted a real sentence from the document that sits twenty-four lines below
+where they pointed.
+
+That last one is the most useful thing the filter found, and it is a class no ratio would
+have predicted: **the comment QUOTES the document verbatim, and the citation is still
+wrong.** `"the shortest remaining cooldown across the endpoint pool"` is real text — it
+is at `error-model.md:123`, not the `:99-110` the comment cited. A citation that is
+checkable, specific and quoted is still drift. Checking the quote exists is not the same
+as checking where it is.
+
+So the remaining 102 are, on this evidence, mostly comments that paraphrase prose. That
+is not permission to skip them: the one clean cluster was a cluster, and a 3-of-3 record
+on one kind of comment is a reason to order the work, not a reason to stop.
+
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually
 runs is a *different copy* of it. `max(requested, model cap).min(hard cap)` was

@@ -890,7 +890,7 @@ impl Stream for MeteredStream {
 
 /// The Retry-After for a 503, from the pool's shortest remaining cooldown.
 ///
-/// docs/error-model.md:99-110 defines the value as "the shortest remaining
+/// docs/error-model.md (Retry-After) defines the value as "the shortest remaining
 /// cooldown across the endpoint pool", floored at 1 second. A None from the
 /// accessor means NO breaker is open, so there is no cooldown to report: the
 /// documented 1-second floor applies, and `cause` records which path produced
@@ -2009,7 +2009,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // The 503 Retry-After decision (docs/error-model.md:99-112)
+    // The 503 Retry-After decision (docs/error-model.md, Retry-After)
     // ---------------------------------------------------------------------
 
     #[test]

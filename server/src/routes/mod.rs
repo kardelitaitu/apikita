@@ -1178,7 +1178,7 @@ mod tests {
     // while the tables they need have existed since the initial migration.
     //
     // They are not bugs to fix (the whole reviews/feed flow is Telegram-BOT driven,
-    // and `docs/launch-checklist.md:211` records that the bot is still design-only),
+    // and the launch checklist records that the bot is still design-only),
     // but an integrator reading that table would call /api/reviews, get a 404, and
     // conclude the SERVER was broken. So the spec now marks them DESIGNED-NOT-BUILT,
     // and this test keeps the two documents from drifting apart again.

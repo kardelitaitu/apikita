@@ -128,7 +128,8 @@ impl AppError {
     }
 
     /// The client-facing `message`. This is the non-contract field
-    /// (docs/error-model.md:30) and the one rule 1 constrains: for `Database`
+    /// (docs/error-model.md, Response shape: code is the contract, message is not)
+    /// and the one rule 1 constrains: for `Database`
     /// and `Internal` it is fixed and generic, so no SQL, schema, host, IP,
     /// port, provider or library name can reach a customer. The underlying
     /// detail is not dropped - `into_response` logs it at `error!` level.
@@ -606,7 +607,7 @@ mod tests {
 
     fn error_object(body: &Json) -> &Json {
         body.get("error")
-            .expect("docs/error-model.md:12-20 - the shape is {error: {code, message, request_id}}")
+            .expect("docs/error-model.md, Response shape - {error: {code, message, request_id}}")
     }
 
     fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {

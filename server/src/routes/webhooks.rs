@@ -854,7 +854,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
-            "docs/server/api-spec.md:274 - a signature mismatch is 401. body: {body}"
+            "docs/server/api-spec.md, POST /webhooks/midtrans - a signature mismatch is 401. body: {body}"
         );
         assert_eq!(body["error"], json!("invalid signature"), "{body}");
 

@@ -344,7 +344,7 @@ impl UpstreamClient {
     /// The shortest remaining cooldown across `model`'s endpoint pool, in whole
     /// seconds, floored at 1.
     ///
-    /// This is the value docs/error-model.md:99-110 defines for a 503: "the
+    /// This is the value docs/error-model.md (Retry-After) defines for a 503: "the
     /// earliest moment a retry could plausibly succeed", i.e.
     /// `min over endpoints of (cooldown_until - now)`.
     ///
@@ -939,7 +939,7 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // shortest_cooldown_secs: the source of a 503 Retry-After
-    // (docs/error-model.md:99-110)
+    // (docs/error-model.md, Retry-After)
     // ---------------------------------------------------------------------
 
     /// Trips the breaker of endpoint `index` on `client`'s first model, the way

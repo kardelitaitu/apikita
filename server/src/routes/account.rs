@@ -87,7 +87,7 @@ pub struct LimitQuery {
     pub limit: Option<i64>,
 }
 
-/// The window parameters docs/server/api-spec.md:97 advertises on
+/// The window parameters docs/server/api-spec.md (Account, GET /api/usage) advertises on
 /// `GET /api/usage`. Held as raw strings, not `NaiveDate`, so a malformed
 /// value produces OUR JSON 422 naming the field instead of axum's plain-text
 /// extractor rejection - docs/error-model.md:10 requires every response to be
