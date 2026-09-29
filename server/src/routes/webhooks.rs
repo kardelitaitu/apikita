@@ -1726,7 +1726,7 @@ mod tests {
 
         let order_id = "no-such-order-00000000";
         let payload = notification(
-            &order_id,
+            order_id,
             "200",
             "50000.00",
             "settlement",

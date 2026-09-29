@@ -3041,7 +3041,6 @@ mod tests {
         db.close().await;
     }
 
-    /// The 90-day boundary: a row at the cutoff instant is DELETED, one a second
     // ---------------------------------------------------------------------
     // retention_lag: whether a retention PROMISE is being broken
     // ---------------------------------------------------------------------

@@ -638,7 +638,7 @@ mod tests {
         // drive responses through `into_response` concurrently. A route reading a
         // DIFFERENT or stale source would still fail this.
         assert!(
-            body["server_errors"].as_u64().unwrap_or(0) >= errors_before + 1,
+            body["server_errors"].as_u64().unwrap_or(0) > errors_before,
             "the route must report the shared counter: {body}"
         );
         assert!(
@@ -697,21 +697,6 @@ mod tests {
         );
     }
 
-    /// The ROUTE's payload reports `null` for an empty window, never `0.0`.
-    ///
-    /// This calls `metrics_payload`, the SAME function the handler calls, so it cannot
-    /// drift from the route's behaviour. That matters, because the first version of
-    /// this test re-stated the mapping instead of exercising it, and a mutation that
-    /// reported `0.0` for an empty window **survived**: every other test records
-    /// responses first, so the process-wide counter is never empty by then.
-
-    /// The payload REPORTS the unhealthy models by NAME, and an empty list when all
-    /// are healthy. This is the `all_providers_unhealthy` condition.
-    ///
-    /// Named rather than a boolean on purpose: an alert saying "a provider is down"
-    /// without saying WHICH costs a second investigation, and the operator already has
-    /// the route open.
-
     /// The retention half of the payload: empty when healthy, NAMED when behind.
     ///
     /// `db_disk`'s action is "check retention", so an operator needs to know WHICH
@@ -750,6 +735,13 @@ mod tests {
             json!(crate::db::USAGE_EVENTS_RETENTION_DAYS)
         );
     }
+
+    /// The payload REPORTS the unhealthy models by NAME, and an empty list when all
+    /// are healthy. This is the `all_providers_unhealthy` condition.
+    ///
+    /// Named rather than a boolean on purpose: an alert saying "a provider is down"
+    /// without saying WHICH costs a second investigation, and the operator already has
+    /// the route open.
     #[test]
     fn the_payload_names_every_model_with_no_usable_endpoint() {
         let counter = crate::error::ServerErrorCounter::default();
@@ -780,6 +772,14 @@ mod tests {
         );
         assert_eq!(payload["unhealthy_models"], json!(down));
     }
+
+    /// The ROUTE's payload reports `null` for an empty window, never `0.0`.
+    ///
+    /// This calls `metrics_payload`, the SAME function the handler calls, so it cannot
+    /// drift from the route's behaviour. That matters, because the first version of
+    /// this test re-stated the mapping instead of exercising it, and a mutation that
+    /// reported `0.0` for an empty window **survived**: every other test records
+    /// responses first, so the process-wide counter is never empty by then.
     #[test]
     fn the_routes_payload_reports_unknown_rather_than_a_healthy_zero() {
         // An EMPTY counter: the fresh-deploy case.

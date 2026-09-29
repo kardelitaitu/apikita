@@ -777,22 +777,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-
-    /// REGRESSION for the session-lifetime hazard plan section 4.6: an expired
-    /// session must not authenticate.
-    ///
-    /// The guard is `expires_at > ?` with the instant bound from Rust. It used to
-    /// compare against SQL `now()`, and under SQLite that returned TRUE for a
-    /// session already past its expiry — measured: `now()` emits the
-    /// space-separated format, `'T'` sorts after a space, so
-    /// `2026-09-25T07:00:00+00:00` compared greater than the current time
-    /// indefinitely and the session never expired. Silent, and it fails in the
-    /// direction that keeps access.
-    ///
-    /// The schema's GLOB CHECK now makes the mixed format unrepresentable. This is
-    /// the behavioural half: the real cookie path, against the real schema.
-
-    // -----------------------------------------------------------------------
     // The SSE handler itself.
     //
     // `sse_events_handler` was the single largest uncovered block left in the
@@ -1074,6 +1058,20 @@ mod tests {
         drop(after_drop);
         db.close().await;
     }
+
+    /// REGRESSION for the session-lifetime hazard plan section 4.6: an expired
+    /// session must not authenticate.
+    ///
+    /// The guard is `expires_at > ?` with the instant bound from Rust. It used to
+    /// compare against SQL `now()`, and under SQLite that returned TRUE for a
+    /// session already past its expiry — measured: `now()` emits the
+    /// space-separated format, `'T'` sorts after a space, so
+    /// `2026-09-25T07:00:00+00:00` compared greater than the current time
+    /// indefinitely and the session never expired. Silent, and it fails in the
+    /// direction that keeps access.
+    ///
+    /// The schema's GLOB CHECK now makes the mixed format unrepresentable. This is
+    /// the behavioural half: the real cookie path, against the real schema.
     #[tokio::test]
     async fn an_expired_session_is_refused_and_a_live_one_is_accepted() {
         let db = TestDb::new().await;

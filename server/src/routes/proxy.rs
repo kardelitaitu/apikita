@@ -3047,15 +3047,6 @@ mod tests {
         .await
     }
 
-    /// Runs the money assertions, then closes the fixture's database whether they
-    /// passed or panicked.
-    ///
-    /// The Postgres original deleted its rows by name here, so a failing run could
-    /// not leave residue in a database other runs shared. SQLite makes that
-    /// unnecessary: TestDb owns a private temp database and close() removes it.
-    /// close() is awaited rather than trusted to drop order, for the reason
-    /// documented in test_support - dropping the pool only signals the close, so
-    /// the removal would race it.
     // -----------------------------------------------------------------------
     // THE LOG-PRIVACY PROMISE, AS A TEST RATHER THAN A REVIEW.
     // -----------------------------------------------------------------------
@@ -3071,19 +3062,6 @@ mod tests {
     // (that an expected event name APPEARS): a tracing subscriber writing into an
     // in-memory sink. Nobody had used it to assert that something NEVER appears,
     // which is what a privacy promise needs.
-
-    /// An io::Write sink that captures the lines the process would emit.
-    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log sink lock").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
 
     /// The process-wide log sink every capturing test reads.
     ///
