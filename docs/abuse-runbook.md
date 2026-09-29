@@ -169,7 +169,17 @@ proof of abuse on its own.
 
 **Signal:** failed logins, link-code redemption failures, enumeration attempts.
 
-1. Rate limits should already contain it (login, link-code redemption).
+1. Rate limits should already contain it — **link-code redemption is ours**
+   (`limits.link_redemption_per_hour`, enforced in `routes/telegram.rs`), and **login is
+   NOT.** Nothing in `server/src/routes/auth.rs` calls a limiter: `POST /auth/exchange` has
+   no rate limit of ours, because login is PocketBase's decision and any limit on it is
+   configured there rather than in `config/apikita.toml`. This row used to name login
+   alongside link-code redemption as though both were contained, and an operator working a
+   credential attack would have had no reason to reach step 2 — which is the step that
+   actually stops one.
+   **So: confirm the limit exists on the PocketBase side before relying on it.** If it does
+   not, the answer to this incident is step 2 immediately, not after checking whether the
+   backend is "supposed" to be limiting it.
 2. If it is sustained, block the source at the **edge relay**, not in the backend.
 3. Alert the affected account if there is evidence of a successful attempt.
 
