@@ -565,6 +565,19 @@ mod tests {
             }
         }
 
+        // THE SCOPE FLOOR, which is the half of this guard that used to be missing.
+        // A scan over a set it cannot report the size of asserts an absence over whatever
+        // it happened to be handed: `source_files` covers the whole of `src` today, and
+        // nothing here would notice a future skip that halved it. The floor is 25 against
+        // 30 files, with slack on purpose - a floor AT the count is a tripwire that fires
+        // when a file is deleted and says nothing about a scan that stopped early, which is
+        // the failure this floor exists to catch.
+        let scanned = source_files().len();
+        assert!(
+            scanned >= 25,
+            "the secret scan covered only {scanned} source files, so it is not looking at the whole crate"
+        );
+
         // The vacuity guard. A scan that matched no macro would pass every assertion
         // above over an empty set, and would go on doing so if the macro names were
         // ever mistyped into a list that matched nothing.
