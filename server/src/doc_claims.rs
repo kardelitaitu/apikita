@@ -562,6 +562,105 @@ mod tests {
         }
     }
 
+    /// A repository file, read from the workspace root rather than the crate root.
+    fn read_repo_file(relative: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(relative),
+        )
+        .unwrap_or_else(|e| {
+            panic!("{relative} must be readable, or this test passes over nothing: {e}")
+        })
+    }
+    /// Every table the schema creates is either DISCLOSED on the privacy page or
+    /// recorded here as deliberately unused.
+    ///
+    /// WHY THIS DIRECTION, because the opposite one is already guarded. A row that
+    /// contradicts the code is a false statement somebody can catch by reading; a
+    /// table MISSING from the disclosure is invisible, and it is the one a customer
+    /// would be angry about. Three were missing until two rounds ago: the key_ip
+    /// tables, the link-code attempts, and the audit rows.
+    ///
+    /// The pairing matters. Each DISCLOSED entry names a phrase that must actually
+    /// appear in the page, so the map cannot drift from the text it describes; and
+    /// every table must appear on one side or the other, so a new table cannot be
+    /// added and left unmentioned. Adding one to a migration makes this red until
+    /// somebody decides whether a customer is told about it.
+    #[test]
+    fn every_table_is_either_disclosed_to_the_customer_or_recorded_as_unused() {
+        // table -> a phrase that must be present in website/src/lib/privacy.ts.
+        const DISCLOSED: &[(&str, &str)] = &[
+            ("accounts", "Telegram ID"),
+            ("wallets", "Wallet balance + ledger"),
+            ("ledger", "Wallet balance + ledger"),
+            ("topups", "Top-up history"),
+            ("usage_daily", "Token usage per day"),
+            ("usage_events", "Per-request usage"),
+            ("api_keys", "API keys"),
+            ("reviews", "Reviews + edit history"),
+            ("review_history", "Reviews + edit history"),
+            ("review_sessions", "Reviews + edit history"),
+            ("telegram_links", "Telegram ID"),
+            ("sessions", "Sessions"),
+            ("key_ip_seen", "Salted IP hash of API-key traffic"),
+            ("key_ip_daily", "Salted IP hash of API-key traffic"),
+            (
+                "link_redemption_attempts",
+                "Salted IP hash of failed link-code attempts",
+            ),
+            ("link_codes", "Telegram link codes"),
+            ("link_code_issues", "Telegram link codes"),
+            ("admin_audit", "operator audit rows"),
+        ];
+
+        // Tables that exist and hold nothing. A reason is required, because an empty
+        // string is not a reason and a future reader cannot tell deliberate from
+        // forgotten.
+        const UNUSED: &[(&str, &str)] = &[
+            (
+                "identities",
+                "auth lives in PocketBase and this table is never written; it holds an email and an Argon2id password hash, and the privacy page says both live in PocketBase. If the port ever moves identity HERE the page goes false in the direction nobody reviews"
+            ),
+        ];
+
+        let schema = read_repo_file("server/migrations/20260925000000_initial_schema.sql");
+        let privacy = read_repo_file("website/src/lib/privacy.ts");
+
+        let mut tables: Vec<String> = Vec::new();
+        for line in schema.lines() {
+            if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
+                tables.push(
+                    rest.split(|c: char| c == '(' || c.is_whitespace())
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        tables.sort();
+
+        // The vacuity guard: a parse that found nothing would pass over every table.
+        assert!(
+            tables.len() >= 15,
+            "only {} table(s) were read from the schema, so this test is not looking at the real one.",
+            tables.len()
+        );
+
+        for table in &tables {
+            if let Some((_, phrase)) = DISCLOSED.iter().find(|(t, _)| t == table) {
+                assert!(privacy.contains(phrase), "table `{table}` is recorded as disclosed under the phrase {phrase:?}, but that phrase is not in website/src/lib/privacy.ts. The map has drifted from the page it describes.");
+                continue;
+            }
+            let Some((_, reason)) = UNUSED.iter().find(|(t, _)| t == table) else {
+                panic!("table `{table}` is neither disclosed to the customer nor recorded as unused. A new table that is never mentioned is invisible on the page, and that is the direction no reviewer is looking at.");
+            };
+            assert!(
+                !reason.trim().is_empty(),
+                "table `{table}` is recorded as unused with an empty reason, which is not a record"
+            );
+        }
+    }
     #[test]
     fn every_document_is_either_citation_checked_or_triaged_with_a_reason() {
         const TRIAGED: &[(&str, &str)] = &[
