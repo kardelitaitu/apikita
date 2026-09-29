@@ -168,6 +168,22 @@ impl Drop for ReservationGuard {
         let model = std::mem::take(&mut self.model);
         // Fire-and-forget: `Drop` cannot await and the hold must come back even
         // if this future is being torn down.
+        //
+        // THE GUARANTEE ENDS AT THE PROCESS, and the sentence above should not be read
+        // as saying otherwise. A dropped FUTURE always gets its spawned task run - the
+        // runtime is still alive, which is the case this guard exists for, and it covers a
+        // client reset, a `?`, an early return and a failed settlement.
+        //
+        // A killed PROCESS is different. If the container is stopped or the pod is
+        // rescheduled between the debit and the compensating credit, the spawned task
+        // never runs, the `reserve_*` row keeps its negative ledger row with no positive
+        // one under the same ref, and the money is out of the wallet until somebody
+        // releases it. That is not a bug to be fixed here - no ordering of statements
+        // removes the window - it is what `db::unpaired_hold_rows` detects, what the
+        // `stranded_hold` alert fires on, and what the hold sweep and its documented
+        // `hold-sweep --release` operator action exist for. The compensation path is
+        // deliberate recovery, not an oversight, and writing that here is what keeps a
+        // reader of the comment above from believing the window is closed.
         tokio::spawn(async move {
             release_quietly(&pool, account_id, reserved_idr, &reservation_ref, &model).await;
         });
