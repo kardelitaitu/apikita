@@ -1346,6 +1346,71 @@ mod tests {
         }
     }
 
+    /// Each bound claim carries the SAME NUMBER as the code, and this keeps no copy
+    /// of either.
+    ///
+    /// The number is read OUT OF THE SENTENCE and compared to the constant. Listing
+    /// the expected figure beside the constant would be a second place to update, and
+    /// would go stale exactly the way these claims would without it - the defect this
+    /// file has now found four times. So the only thing written down is the phrase to
+    /// find; the value comes from the document and from Rust.
+    ///
+    /// THE DOCUMENT IS PART OF THE BINDING, which is the part the first attempt got
+    /// wrong. Searching one document for every phrase found `20 distinct` nowhere in
+    /// the launch checklist - it is in ip-tracking.md, and the real sentence is
+    /// `>20 domestic-distinct`. A binding to the wrong file is a check that could
+    /// have passed on the wrong text, which is worse than one that fails.
+    ///
+    /// Three claims, each verified to exist in the file named before this was
+    /// written. A full check would bind every numeral in the documentation; the honest
+    /// limit is that it binds these three and not the rest, stated rather than left to
+    /// look like coverage.
+    #[test]
+    fn a_bound_claim_carries_the_number_the_code_has() {
+        let bindings: [(&str, &str, i64); 3] = [
+            (
+                "docs/launch-checklist.md",
+                "30 days absolute",
+                crate::db::SESSION_RETENTION_DAYS,
+            ),
+            (
+                "docs/ip-tracking.md",
+                "SHARING_SUSPICION_IPS = 20",
+                crate::ip_tracking::SHARING_SUSPICION_IPS as i64,
+            ),
+            (
+                "docs/website/06-api-keys-and-limits.md",
+                "Rolling window **30 days**",
+                crate::routes::keys::SPEND_WINDOW_DAYS,
+            ),
+        ];
+
+        let mut cache: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+        let mut checked = 0usize;
+        for (doc_path, phrase, constant) in bindings {
+            let doc = cache
+                .entry(doc_path)
+                .or_insert_with(|| read_repo_file(doc_path));
+            let line = doc
+                .lines()
+                .find(|l| l.contains(phrase))
+                .unwrap_or_else(|| panic!("{doc_path} no longer contains the phrase {phrase:?}"));
+            // The first run of digits in the sentence that carries the claim.
+            let stated: i64 = line
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|part| !part.is_empty())
+                .unwrap_or_else(|| panic!("the phrase {phrase:?} carries no number: {line}"))
+                .parse()
+                .expect("a run of digits parses");
+            assert_eq!(
+                stated,
+                constant,
+                "{doc_path} says {stated} for {phrase:?} and the code says {constant}. The checklist and the key-limits page are what a customer and a launcher read."
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, bindings.len(), "a binding was skipped");
+    }
     /// Every RELATIVE markdown link in the documentation resolves to a file.
     ///
     /// The instance: the whitepaper told a reader to see
