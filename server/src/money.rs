@@ -456,6 +456,74 @@ mod tests {
         assert_eq!(calculate_token_cost_idr(1.0, 1, 1.0, 0, 0.0, 0, 0.0), 1);
     }
 
+    /// The pricing function swept rather than illustrated, and the property that
+    /// matters most is MONOTONICITY.
+    ///
+    /// Every other test in this file pins a figure. A figure is one point; the
+    /// economic claim the whole billing model rests on is a shape: MORE TOKENS NEVER
+    /// COST LESS. A non-monotonic price is not a wrong number, it is a discount a
+    /// customer can farm - send a larger prompt, pay less - and no example catches
+    /// it, because an example only ever lands on one side of the claim.
+    ///
+    /// The ladder is ascending and ends at u64::MAX, which is not a hypothetical
+    /// input: the token counts arrive from an upstream provider's report over a JSON
+    /// body, and a hostile or broken one can carry any u64. That is where the
+    /// arithmetic stops being f64 and becomes an i64, and the cast SATURATES rather
+    /// than wrapping - so the last rung is the one that proves the ceiling holds at
+    /// the top of the range instead of falling off it.
+    ///
+    /// Each rung is checked against the one below it, in EVERY class independently
+    /// and with all three moving together, because a defect that makes one class
+    /// non-monotonic need not move the others.
+    ///
+    /// WHAT IT DOES NOT CATCH, measured rather than assumed. The ladder spans seven
+    /// orders of magnitude, which is what makes it a real sweep - and it also means a
+    /// change to the RATE is invisible here. A first mutation divided the multiplier
+    /// for large prompts, halving the price at every rung above a million tokens, and
+    /// the sweep passed: at a billion tokens the halved price is still two million
+    /// against four thousand at a million. Monotonicity in the TOKEN COUNT is what is
+    /// pinned; a bulk discount - wrong economically, but not non-monotonic - is not
+    /// what this test is for, and catching it needs closely-spaced rungs either side of
+    /// a threshold, which is a different test for a different purpose.
+    #[test]
+    fn the_cost_never_decreases_as_any_token_class_grows() {
+        const R_IN: f64 = 2676.78;
+        const R_CACHE: f64 = 53.54;
+        const R_OUT: f64 = 10707.12;
+
+        // Ascending, spanning every order of magnitude a token count can plausibly
+        // take, plus the saturating cast at the top.
+        let ladder: [u64; 9] = [
+            0,
+            1,
+            2,
+            100,
+            1_000,
+            1_000_000,
+            1_000_000_000,
+            u64::MAX / 2,
+            u64::MAX,
+        ];
+
+        let at = |input, cache, output| {
+            calculate_token_cost_idr(PRICE, input, R_IN, cache, R_CACHE, output, R_OUT)
+        };
+
+        for window in ladder.windows(2) {
+            let (lo, hi) = (window[0], window[1]);
+            for (label, low, high) in [
+                ("input", at(lo, 0, 0), at(hi, 0, 0)),
+                ("cache-read", at(0, lo, 0), at(0, hi, 0)),
+                ("output", at(0, 0, lo), at(0, 0, hi)),
+                ("all three", at(lo, lo, lo), at(hi, hi, hi)),
+            ] {
+                assert!(
+                    high >= low,
+                    "{label} tokens {lo} -> {hi} moved the price {low} -> {high}",
+                );
+            }
+        }
+    }
     #[test]
     fn zero_tokens_or_zero_rates_produce_zero_not_a_negative_charge() {
         assert_eq!(bill(0, 0, 0), 0);
