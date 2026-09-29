@@ -152,6 +152,59 @@ pub async fn enforce_creation_cap(
     account_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    // See the race note on `enforce_creation_cap_in`: this variant is the one that
+    // is NOT atomic with the insert, because the two are separated by whatever the
+    // caller does next. It is kept because two of the three call sites cannot close
+    // that gap - the top-up path inserts after a Midtrans call - but it now at least
+    // runs its COUNT under a write lock, so the read is not torn against a
+    // concurrent writer.
+    let mut tx = crate::db::begin_immediate(pool).await?;
+    let outcome = enforce_creation_cap_in(&mut tx, table, window, limit, account_id, now).await;
+    // The check only reads, so there is nothing to roll back - but the transaction
+    // still has to be closed, and a rollback is the honest way to say "no writes".
+    match outcome {
+        Ok(()) => {
+            tx.rollback().await?;
+            Ok(())
+        }
+        Err(err) => {
+            tx.rollback().await?;
+            Err(err)
+        }
+    }
+}
+
+/// THE CAP CHECK, INSIDE A TRANSACTION THE CALLER OWNS.
+///
+/// This is the variant that can be ATOMIC with the insert it guards, and the
+/// difference is the whole point of the split. If the caller opens a write
+/// transaction, runs this, and inserts before committing, then SQLite serialises the
+/// COUNT and the INSERT against every other writer: a second caller either sees the
+/// first one's row or is still waiting for the lock. That is the cap actually
+/// holding, rather than holding against a caller that happens to arrive one at a
+/// time.
+///
+/// IT IS NOT AVAILABLE EVERYWHERE, and pretending otherwise would be the easy
+/// mistake. A transaction may only span the check and the insert if everything
+/// between them is local. On the key-creation path it is - key generation, hashing
+/// and three validations, all microseconds of CPU - so that path now holds one. On
+/// the top-up path it is a Midtrans Snap call and a PocketBase lookup, and a
+/// transaction spanning those would hold a SQLite WRITE LOCK across a network round
+/// trip to a payment provider, serialising every other top-up in the process behind
+/// it. That path keeps the pool variant, and its race is characterised by
+/// `the_creation_cap_is_enforced_against_a_stale_read_under_concurrency`.
+///
+/// The fix for the paths that cannot close the gap is a reservation - claim the
+/// slot atomically at check time - which is a schema and flow change rather than a
+/// patch.
+pub async fn enforce_creation_cap_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &'static str,
+    window: Duration,
+    limit: u32,
+    account_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
     let sql = format!(
         "SELECT COUNT(*) AS used, MIN(created_at) AS oldest \
          FROM {table} WHERE account_id = ? AND created_at >= ?"
@@ -169,7 +222,7 @@ pub async fn enforce_creation_cap(
     let row = sqlx::query(&sql)
         .bind(account_id.hyphenated())
         .bind(window_start)
-        .fetch_one(pool)
+        .fetch_one(&mut **tx)
         .await?;
 
     let used: i64 = row.get("used");
