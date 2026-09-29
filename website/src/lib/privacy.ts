@@ -95,6 +95,12 @@ export const retention = [
   { what: 'Review history', keep: 'Same as review', why: 'Needed to make an edit meaningful' },
   { what: 'link_codes', keep: 'Until used or expired + 24h', why: 'Then delete' },
   { what: 'Link-redemption attempts', keep: '7 days', why: 'Hashed source of failed link-code attempts; used only to stop credential attacks, then deleted' },
+  // The two salt rows were missing here while the nightly sweep deleted them, and the
+  // omission is the one this page must never make: it is a disclosure of what is kept.
+  // They were findable only in ip-tracking.md, which no customer reads, so a reader had
+  // no way to learn that a salted hash of their address is kept at all.
+  { what: 'Salt hash of an API key’s caller IP, per address seen', keep: '7 days', why: 'Detects one address spreading a key across many accounts. Purged nightly; the salt is replaced at each UTC midnight so days cannot be linked' },
+  { what: 'Salt hash of an API key’s caller IP, per day', keep: '90 days', why: 'A trend, not a history: one count per key per day, so the individual hashes are gone long before the trend is' },
   { what: 'Logs', keep: '30-90 days', why: 'Debugging window; not a database' },
   { what: 'Accounts (closed)', keep: 'Keep record, drop personal data', why: 'See below' },
 ];
