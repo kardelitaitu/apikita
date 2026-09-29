@@ -86,10 +86,23 @@ const SIDECARS: [&str; 2] = ["-wal", "-shm"];
 /// NOR is there a fragile sleep hiding here, which is what a 66-second suite run once
 /// suggested. The whole crate has two real sleeps outside a paused clock: this bounded
 /// retry, and the one-second stream deadline in the events tests. The circuit breaker
-/// and key pool use `tokio::time::advance`, so they are deterministic. That leaves the
-/// stream deadline as the only test that waits a full second of wall clock, and it is
-/// the place to look first if a contended run is ever slow again — not from theory, but
-/// because it is the only candidate left.
+/// and key pool use `tokio::time::advance`, so they are deterministic under load.
+///
+/// THE STREAM DEADLINE IS NOT THE ANSWER, and arithmetic is what says so. I wrote it
+/// down last round as the one remaining candidate; it is not. A one-second wait accounts
+/// for at most one second of a run that took fifty-two longer than usual, so chasing it
+/// would have been chasing a number that cannot fit.
+///
+/// The run in question also had `npm test` and a cargo invocation in the same command,
+/// so compilation contending with the suite is the better explanation — and a test
+/// failing while the crate is being rebuilt says something about the machine, not about
+/// the test. That is a hypothesis, not a finding, and is labelled as one.
+///
+/// The deadline stays at a second regardless, and that is a decision rather than an
+/// accident: it is generous enough that the live arm reliably delivers, and it costs one
+/// second of a fourteen-second suite. Shortening it would trade a rare flake for a
+/// common one, which is the wrong way round for the test that guards the cross-account
+/// boundary.
 static ORPHANS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 async fn template_path() -> &'static PathBuf {
