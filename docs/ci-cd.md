@@ -408,20 +408,32 @@ called by no request. Coverage narrows the field; it does not close it.
 **The same class of drift is still open in SOURCE COMMENTS, and the scope is
 measured rather than guessed.** The check above covers the fourteen documents an
 operator acts on. It does not cover the Rust, which cites documents by line in
-**165 places** — `docs/error-model.md:N` alone accounts for about seventy. Five of
-them were found wrong in a single pass: `docs/observability.md:104` and `:106` in
-`health.rs`, `proxy.rs`, `client.rs` and `db.rs` all pointed a reader at a DIFFERENT
-ALERT, because that table gained a row and the citations did not move. They had
-drifted because an earlier change in this same series edited the table. They are now
-cited by row.
+**172 places** — `docs/error-model.md:N` alone accounts for about seventy. Five were
+found wrong in a single pass: `docs/observability.md:104` and `:106` in `health.rs`,
+`proxy.rs`, `client.rs` and `db.rs` all pointed a reader at a DIFFERENT ALERT, because
+that table gained a row and the citations did not move. They had drifted because an
+earlier change in this same series edited the table. A sixth, in `health.rs`, cited
+`error-model.md:168` for the "never echo the driver's detail" rule, which is not at 168
+at all — 168 is the streaming-error section, and the rule lives twenty lines earlier.
 
-So the rule this section recommends is applied to the documents and NOT to the code
-that explains them, which is the more surprising half: the comment is where a developer
-learns WHY, and a wrong WHY is worse than no WHY. The 160 remaining are not fixed
-here — converting them is a large mechanical diff against documents that are still
-moving, and doing it in a hurry would replace wrong citations with confidently wrong
-ones. It is recorded so the next pass starts from a number instead of from a
-suspicion.
+**ALL 172 RESOLVE TO A NAMED SECTION, and the obvious move was rejected anyway.**
+Finding the nearest preceding heading turns every one of them into a section name that
+cannot drift, and a script did exactly that: 167 rewritten, 5 correctly skipped where
+the "heading" was prose from a code block. It was reverted, for a reason that matters
+more than the diff size.
+
+**A WRONG LINE NUMBER IS AUDITABLE. A WRONG SECTION NAME IS NOT.** The
+`error-model.md:168` citation above was already wrong. Converting it mechanically would
+have produced `error-model.md ("Streaming errors")` — a wrong citation wearing the
+authority of a heading, with nothing left that invites a reader to check it. The number
+was wrong, but it was *visibly* wrong to anyone who looked, and that visibility is what
+let this pass find it. A blanket conversion removes the audit trail from 172 places in
+one commit, and the mistakes it bakes in are the ones nobody re-checks.
+
+So the citations are fixed by hand, where each one can be READ and confirmed — which is
+also what the fourteen-document check asks for. That is slower, and it is the point: the
+check exists to keep a comment honest, and the fastest way to make a comment dishonest
+is to rewrite it without reading it.
 
 **The mirror image is worse, because coverage cannot see it at all.** A rule can be
 fully covered — every line of it executed by a test — while the code that actually

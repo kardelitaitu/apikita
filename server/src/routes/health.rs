@@ -16,7 +16,8 @@ use crate::routes::proxy::AppState;
 /// endpoint is unauthenticated (docs/server/api-spec.md:368), so serialising a
 /// raw `sqlx::Error` Display into the body would hand driver messages, host and
 /// port, errno, pool/connection state and possible SQL fragments to any caller
-/// (docs/error-model.md:168, rule 1). Same model as `AppError::client_message`
+/// (docs/error-model.md, "Response shape": the extractor's own detail text is
+/// deliberately NOT echoed into `message`). Same model as `AppError::client_message`
 /// in error.rs: the caller gets a fixed string, the operator keeps the detail -
 /// logged below at `error!` level.
 const DATABASE_UNAVAILABLE: &str = "database unavailable";
@@ -260,7 +261,8 @@ mod tests {
             .connect_lazy_with(options)
     }
 
-    /// docs/error-model.md:168 (rule 1) - never leak internals. The health
+    /// docs/error-model.md ("Response shape": the extractor's own detail text is
+    /// deliberately NOT echoed into `message`) - never leak internals. The health
     /// endpoint is unauthenticated (docs/server/api-spec.md:368), so ANY caller
     /// can read this body: a raw sqlx error Display there hands out driver
     /// messages, host and port, errno, pool state and possible SQL fragments to
@@ -456,7 +458,7 @@ mod tests {
         );
         assert_eq!(
             body["database"], DATABASE_UNAVAILABLE,
-            "docs/error-model.md:168 - the caller gets the fixed constant, never the driver error"
+            "docs/error-model.md, Response shape - the caller gets the fixed constant, never the driver error"
         );
         assert_eq!(
             body,
