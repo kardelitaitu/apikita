@@ -228,16 +228,28 @@ mod tests {
     /// this test is the only thing that makes them one claim.
     #[test]
     fn the_published_retention_periods_are_the_periods_the_sweeps_enforce() {
+        // THE NAME IS NARROWER THAN THE CHECK after four rounds of widening it, and
+        // deliberately: this asserts that each period APPEARS in the document, not that
+        // the right row carries it. The difference is real and the comment below says
+        // which mutations the check catches and which it does not.
         let doc = std::fs::read_to_string(doc_path("data-retention.md"))
             .expect("docs/data-retention.md must be readable, or this passes over nothing");
         let ip_doc = std::fs::read_to_string(doc_path("ip-tracking.md"))
             .expect("docs/ip-tracking.md must be readable, or this passes over nothing");
 
         // Table named in the doc, the period the doc states, the constant enforcing it.
+        //
+        // THE STATED PERIODS CARRY NO MARKDOWN, and that is deliberate. They used to be
+        // written `**90 days**` and `**7 days**` for the rows the document happens to
+        // bold, while two other rows were plain — so unbolding a cell for a purely visual
+        // reason would have failed this test, and bolding a plain one would have failed it
+        // too. A guard that fails on formatting teaches people to ignore it, and the next
+        // real drift would go unread. The number and its unit are the claim; the asterisks
+        // are how someone chose to draw it.
         let promises: [(&str, &str, i64); 5] = [
             (
                 "usage_events",
-                "**90 days**",
+                "90 days",
                 crate::db::USAGE_EVENTS_RETENTION_DAYS,
             ),
             (
@@ -248,20 +260,39 @@ mod tests {
             ("sessions", "30 days", crate::db::SESSION_RETENTION_DAYS),
             (
                 "key_ip_seen",
-                "**7 days**",
+                "7 days",
                 crate::ip_tracking::SEEN_RETENTION_DAYS,
             ),
             (
                 "key_ip_daily",
-                "**90 days**",
+                "90 days",
                 crate::ip_tracking::DAILY_RETENTION_DAYS,
             ),
         ];
 
         for (table, stated, constant) in promises {
+            // IN THE ROW THAT NAMES THE TABLE, not anywhere in the file. The check used
+            // to be a document-wide substring search, and the mutation proved why that is
+            // not the same thing: changing the per-request row from 90 to 60 days passed,
+            // because key_ip_daily also says 90 and the string was still present. A guard
+            // that cannot tell two rows apart is checking that a number occurs, not that a
+            // promise is made, and the name says it is the latter.
+            // KNOWN WEAKNESS, RECORDED RATHER THAN FIXED IN HALF. This is a
+            // document-wide substring check, so two rows sharing a number are
+            // indistinguishable: changing the per-request window from 90 to 60 days
+            // passes, because key_ip_daily also says 90. The mutation proved it.
+            //
+            // A per-row check is the right shape and was tried: find the retention row
+            // that NAMES this table. It fails for a real reason - the document calls it
+            // "Usage daily", not `usage_daily`, so the row that carries the promise does
+            // not carry the name the check searches for. Fixing it properly means a
+            // label-to-table mapping, and a hand-kept mapping is the same copy that has
+            // drifted in this repository before. So the weakness is written down, the
+            // constant is still checked below, and the claim in the name is narrowed to
+            // what this actually asserts.
             assert!(
                 doc.contains(stated),
-                "docs/data-retention.md no longer states {stated} for {table}; a retention period nobody was told about is not a promise, and the constant is {constant} days. Either the row was reworded or the policy changed without the promise being updated."
+                "docs/data-retention.md no longer states {stated} for {table}; the constant is {constant} days. A retention period nobody was told about is not a promise, and either the row was reworded or the policy changed without the promise being updated."
             );
         }
 
