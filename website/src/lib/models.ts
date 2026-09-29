@@ -7,6 +7,21 @@
 // source on purpose: the website does not read config/ at build time and adds
 // no TOML dependency.
 //
+// **AND THE SEPARATION IS ALSO A FILTER, which is the half of the decision that
+// matters and was recorded as a build constraint only.** `config/apikita.toml` describes
+// each model in prose - "1M context, vision capable" - and every capability in that
+// sentence is RECORDED, NOT ENFORCED: `max_context_tokens`, `supports_vision` and
+// `supports_thinking` are named nowhere in the code, and a vision request is not
+// refused because the model is marked `supports_vision = true`. If this module read
+// the config, a customer model card would inherit a context ceiling and a capability
+// the server never checks.
+//
+// So the hand-written card is a FILTER, not duplication to be automated away. The two
+// kinds of copy fail differently and one of them badly: a transcribed PRICE is a stale
+// number, corrected by the arithmetic below; a transcribed CAPABILITY is a promise the
+// product does not keep, and no amount of accuracy in the transcription prevents it.
+// Nothing customer-facing here should be sourced from a key the code does not read.
+//
 // **THE ARITHMETIC, so a reader can check this by eye in ten seconds** rather than
 // trust it, and so a drift is visible rather than silent. Each figure is the config's
 // `[models.rates]` PEAK value times the model's `price` multiplier (M = 1.50):
