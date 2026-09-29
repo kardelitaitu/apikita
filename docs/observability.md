@@ -207,12 +207,27 @@ the hold is gone from the wallet and no offsetting credit was written, so
 `balance_idr = SUM(ledger.delta_idr)` still holds and the query returns **no row**.
 Money is debited against a request that was never billed, and no alert fires.
 
-**Detection is a separate query with its own invariant.**
-`unpaired_hold_rows` (`server/src/db.rs`) counts `reserve_*` refs that have a negative
-row and **no positive row under the same ref**. **Zero rows is the invariant.** A
-non-zero count means a release failed to land — most often the fire-and-forget
-`ReservationGuard::drop` (`server/src/routes/proxy.rs`) never reached the database, or
-the process died between the response and the settlement commit.
+**Detection is a separate query with its own invariant.** It counts `reserve_*`
+refs that have a negative row and **no positive row under the same ref**. **Zero rows
+is the invariant.** A non-zero count means a release failed to land — most often the
+fire-and-forget `ReservationGuard::drop` (`server/src/routes/proxy.rs`) never reached
+the database, or the process died between the response and the settlement commit.
+
+**WHICH IMPLEMENTATION RUNS, because this paragraph used to name the wrong one.**
+It said `unpaired_hold_rows` (`server/src/db.rs`), and that function is **called by
+nothing except its own tests**. Three copies of this detector exist:
+
+| Implementation | Runs |
+| --- | --- |
+| `db::unpaired_hold_rows` (`server/src/db.rs`) | **never in production** — tests only |
+| `bin/hold-sweep.rs` | nightly, via the maintenance scheduler |
+| `tools/alert/check-alerts.sh` (`HOLDS_OVER`) | nightly, fires the `stranded_hold` alert |
+
+The two that run carry their own SQL rather than calling the Rust one, which is the
+same duplication that hid a second reservation rule until it was measured. The
+`db.rs` copy is left in place because it states the invariant in the place a reader
+looks for it — but it is not the detector, and an operator told to run it would find
+nothing scheduled.
 
 **The sweep now RUNS on a schedule.** The maintenance scheduler
 (`.docker/maintenance/`) runs `run_hold_sweep` every night, alongside the retention

@@ -96,4 +96,11 @@ cargo run --release --bin benchmark -- --concurrency 250 --duration 60s --scenar
 The benchmark runner outputs:
 - Summary table: Throughput (RPS), Latency percentiles ($p50, p90, p95, p99$), Error rate.
 - Resource telemetry: Peak RSS RAM, CPU user/system time.
-- Automated Ledger Invariant Check: Runs `verify_wallet_reconciliation` across all modified accounts at completion.
+- ~~Automated Ledger Invariant Check~~ — **not implemented.** This line claimed the
+  benchmark runs `verify_wallet_reconciliation` across all modified accounts at
+  completion. It does not: `bin/benchmark.rs` never calls that function, and the only
+  callers of it are its own tests in `db.rs`. The money invariant is checked by
+  `tools/reconcile/reconcile.sh` against the real database, which is where it belongs —
+  a benchmark process holds a synthetic wallet that the reconcile query would not
+  recognise. The claim is struck rather than deleted so the next reader knows it was
+  checked, not missed.

@@ -350,6 +350,67 @@ flagged it — the file looked like every other file, the suite was green, and t
 only test that touched the handler was `#[ignore]`d behind a live PocketBase. It
 is now at **98.2%** via a loopback stub, with the ignore removed.
 
+### A percentage cannot see unreachable code — coverage can
+
+Re-measured 2026-09-29, the question being: **can a test exist for a function no
+request ever calls?** The wiring guards in `config.rs` cannot answer it, because they
+see a name *referenced*, not a reference *reachable*. `max_context_tokens` read as
+wired for exactly this reason — its only reader was a second
+`worst_case_reservation_idr` on `UpstreamClient` that nothing outside its own tests
+called, and that carried six green tests of its own.
+
+The same run, after that function and the fields only it read were deleted:
+
+| Metric | 2026-09-27 | 2026-09-29 |
+| --- | ---: | ---: |
+| Region coverage | — | **97.07%** |
+| Line coverage | 96.64% | **98.02%** |
+| Function coverage | — | **94.36%** (100 of 1,773 not entered) |
+| **Named functions never entered by any test** | not measured | **0 of 1,841** |
+
+**Zero.** Every function in the crate that can be called by name is entered by at
+least one test. The 100 unentered "functions" are all **closures**, which llvm-cov
+records under their line number rather than a name.
+
+That last row is the one to keep, and **the trap is worth naming**: `config.rs`
+reports **62.64% function coverage** and looks like the worst-covered file in the
+crate by a distance — it is 34 closures, not 34 functions. Reading the per-file
+function column without separating closures from named functions sends you to
+investigate a file that has nothing wrong with it. The named-function figure is the
+one that means something, and it is a different question from the percentage: a
+percentage says how much of a file ran, and this says whether anything is
+**unreachable**.
+
+```bash
+cd server
+cargo llvm-cov --lib --no-clean                      # region/line/function table
+cargo llvm-cov report --lcov --output-path cov.lcov   # per-function FN/FNDA records
+# then: report every FNDA whose count is 0, ignoring names that are bare line numbers
+```
+
+Still not gated, and the reason is unchanged: a threshold would fail on a file of
+test scaffolding and pass on a file whose untested block is a money path. What a
+threshold *cannot* express is the question this section now answers by hand.
+
+**And coverage is not sufficient either — it answers a narrower question.**
+"Entered by a test" is not "reached by production": the deleted
+`UpstreamClient::worst_case_reservation_idr` was entered by six of its own tests and
+called by no request. Coverage narrows the field; it does not close it.
+
+The obvious completion — a source-walk test asserting every `pub fn` has a
+production call site — was measured before being dismissed, and it does not work:
+of 137 `pub fn`s examined, **37 have no production call site and every one is a false
+positive.** They are axum route handlers (`create_key`, `exchange_token`,
+`sse_events_handler`, …), which the ROUTER calls by path rather than by name, plus
+test helpers. A test built on that idea would carry a 37-entry exception list that is
+really a list of every endpoint in the product, and it would still miss the case that
+matters, because a handler reached by the router is by definition live while a helper
+reached by nothing is not distinguishable from it by any name-based rule.
+
+So the question stays manual, the way the four findings above were. What makes it
+tractable is that it is now a *narrow* question — zero named functions are unentered
+— rather than an open search through a 97%-covered crate.
+
 **The second measurement made the same point again, in a different file.** Reading
 the uncovered *ranges* rather than the percentages showed `routes/proxy.rs`'s
 remaining gap was not scaffolding: `MeteredStream` — the wrapper that decides
