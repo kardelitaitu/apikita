@@ -1349,6 +1349,61 @@ mod tests {
         );
     }
 
+    /// And the OTHER direction: every route the server MOUNTS is in the spec.
+    ///
+    /// The companion to the test above, and the half nobody checks. That one asks
+    /// whether the spec is honest about what it does not serve; this asks whether it
+    /// describes what it does. An endpoint that is mounted and undocumented is a
+    /// route an integrator cannot find and a maintainer cannot account for - and the
+    /// spec is a CONTRACT, so a silent addition is a contract that grew without
+    /// anyone agreeing to it.
+    ///
+    /// The spec writes a parameterised path with :id while the router needs a
+    /// concrete one, so the mounted path is normalised before the comparison. That
+    /// normalisation is asserted to be EXERCISED below: a test that quietly compared
+    /// nothing because every path failed to match would pass.
+    #[test]
+    fn every_mounted_route_is_documented_in_the_api_spec() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("server")
+                .join("api-spec.md"),
+        )
+        .expect("docs/server/api-spec.md must be readable, or this checks nothing");
+
+        const PLACEHOLDER: &str = "00000000-0000-0000-0000-000000000000";
+        let mut parameterised = 0usize;
+        for (_, path, _) in MOUNTED {
+            let documented = path.replace(PLACEHOLDER, ":id");
+            if documented.contains(":id") {
+                parameterised += 1;
+            }
+            assert!(
+                spec.contains(&documented),
+                "{path} is mounted by create_router but docs/server/api-spec.md does not \
+                 document it. An endpoint the contract does not mention is a route an \
+                 integrator cannot find, and a contract that grew without anyone \
+                 agreeing to it."
+            );
+        }
+
+        // The vacuity guards. A MOUNTED list that lost its entries, or a table that
+        // stopped using the placeholder, would make the loop above answer nothing.
+        assert!(
+            MOUNTED.len() >= 20,
+            "MOUNTED has {} entries, far fewer than the router mounts, so the comparison \
+             above is checking a list that no longer describes the surface",
+            MOUNTED.len()
+        );
+        assert!(
+            parameterised >= 4,
+            "only {parameterised} mounted paths contain the id placeholder, so the \
+             normalisation above is barely exercised and a mismatch in it would go \
+             unnoticed"
+        );
+    }
     #[tokio::test]
     async fn every_mounted_route_dispatches_and_every_near_miss_is_refused() {
         let app = table_app();
