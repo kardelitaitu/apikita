@@ -777,6 +777,104 @@ mod tests {
         assert!(reserve(2_000, 4096) >= reserve(1_000, 4096));
     }
 
+    /// The off-peak rates, asserted against the rates the config SHIPS and against
+    /// the property the money model actually needs.
+    ///
+    /// The two tests below pin peak and off-peak to LITERALS copied out of
+    /// config/apikita.toml. That is the weakness fixed for the cache rates two
+    /// rounds ago, in this same file: if the config is edited, they keep passing
+    /// while asserting a fiction.
+    ///
+    /// WHAT THIS ASSERTS, and why it is not the claim the neighbouring test's NAME
+    /// makes. That test says off-peak is "exactly half of peak", and for the model it
+    /// was copied from (flash) that is true. It is NOT true of the whole list: the
+    /// off-peak rates are half the provider's YUAN figure, and because the CNY to
+    /// IDR conversion is not exact, halving before converting and halving after
+    /// differ by a fraction of a rupiah per million tokens. Two of the six shipped
+    /// models show it - 6022.76 against a half of 12045.50, and 3212.14 against a
+    /// half of 6424.27 - and the other four land exactly. The config comment said
+    /// "exactly HALF" as a blanket statement; it now states the two exceptions.
+    ///
+    /// What the money model REQUIRES is weaker and is what is asserted here, over
+    /// every model and every class:
+    ///
+    ///   1. off-peak is never dearer than peak, so a hold taken at the peak rate can
+    ///      never be short for a request that settles off-peak;
+    ///   2. a reservation priced at peak is never below the same reservation priced
+    ///      off-peak, which is the same statement applied to the function the
+    ///      handler actually calls.
+    ///
+    /// Neither is currently asserted against the shipped config, and a config edit
+    /// that transposed a pair would pass every test in this file.
+    ///
+    /// What is NOT claimed: that any request settles off-peak. billing_basis is
+    /// unwired - every settlement prices from the peak rates - so this is a
+    /// guarantee that the hold is sized for the dearer case, not a description of a
+    /// path that runs. config.rs's unwired list and the decision register say so; the
+    /// repetition here keeps the money side honest too.
+    #[test]
+    fn off_peak_is_never_dearer_than_peak_in_any_shipped_model() {
+        use crate::config::AppConfig;
+
+        let config = AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load");
+        assert!(
+            !config.models.is_empty(),
+            "a config with no models would pass every assertion below over an empty set"
+        );
+
+        for model in &config.models {
+            for (name, peak, off_peak) in [
+                ("input", model.rates.input_peak, model.rates.input_offpeak),
+                (
+                    "cache-read",
+                    model.rates.cache_read_peak,
+                    model.rates.cache_read_offpeak,
+                ),
+                (
+                    "output",
+                    model.rates.output_peak,
+                    model.rates.output_offpeak,
+                ),
+            ] {
+                assert!(
+                    off_peak <= peak,
+                    "model {}: {name} off-peak {off_peak} is ABOVE peak {peak}, so a \
+                     hold taken at the peak rate would be short for a request that \
+                     settles off-peak",
+                    model.name
+                );
+            }
+
+            // The same statement applied to the function the handler calls.
+            for input in [0u64, 1, 1_000, 1_000_000, 7_777_777] {
+                for output in [0u64, 1_024, 384_000] {
+                    let at_peak = calculate_preflight_reservation_idr(
+                        model.price,
+                        input,
+                        model.rates.input_peak,
+                        output,
+                        model.rates.output_peak,
+                    );
+                    let at_off_peak = calculate_preflight_reservation_idr(
+                        model.price,
+                        input,
+                        model.rates.input_offpeak,
+                        output,
+                        model.rates.output_offpeak,
+                    );
+                    assert!(
+                        at_peak >= at_off_peak,
+                        "model {}: a hold for {input} input and {output} output is \
+                         {at_peak} at the peak rate and only {at_off_peak} off-peak, so \
+                         the hold is NOT the dearer of the two",
+                        model.name
+                    );
+                }
+            }
+        }
+    }
     /// config/apikita.toml:267-270: off-peak is exactly half of peak, and
     /// billing_basis="peak" reserves at the PEAK rate so a request can never
     /// lose money.

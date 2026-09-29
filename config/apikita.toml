@@ -296,10 +296,18 @@ max_context_tokens = 1000000
 #   SCOPE: flash only. deepseek-v4-pro is deliberately NOT offered -- it is
 #   7x the output cost of flash and the arbitrage there is unproven.
 #
-# Off-peak is exactly HALF of peak. Peak is 01:00-04:00 and 06:00-10:00 UTC,
-# Mon-Fri, excluding Chinese public holidays -- about 21% of the week.
-# billing_basis="peak" reserves at the PEAK rate so a request can never lose
-# money; adjust once real traffic shows the actual peak/off-peak split.
+# Off-peak is HALF OF THE PROVIDER'S YUAN FIGURE, which is not always exactly
+# half of the IDR figure below -- the CNY->IDR conversion is not exact, so halving
+# before converting and halving after differ by a fraction of a rupiah per million
+# tokens. Two of the six models show it: input_offpeak 6022.76 against a half of
+# 12045.50 (6022.75), and 3212.14 against a half of 6424.27 (3212.135). The other
+# four land exactly. Nothing depends on the difference, and the property that IS
+# required - off-peak never exceeds peak - is asserted by a test over every model.
+#
+# Peak is 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri, excluding Chinese public
+# holidays -- about 21% of the week. billing_basis="peak" reserves at the PEAK rate so
+# a request can never lose money; adjust once real traffic shows the actual
+# peak/off-peak split.
 #
 # Customer price = rate x price, per token class.
 
