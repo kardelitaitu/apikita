@@ -273,6 +273,7 @@ import Skeleton from '../../components/Skeleton.astro';
     canResume,
     canSuspend,
     describeAction,
+  describeActionTitle,
     errorRateBreached,
     formatAuditTime,
     formatErrorRate,
@@ -744,10 +745,11 @@ import Skeleton from '../../components/Skeleton.astro';
   function askConfirmFor(action: 'suspend' | 'resume', id: string): void {
     pending = { action, id };
     // The id is in the TITLE, so the consequence paragraph below can stay about the
-    // consequence. An operator reads the title first; this is the only place in the
-    // dialog that says which account is about to be changed.
-    confirmTitle.textContent =
-      (action === 'suspend' ? 'Suspend account ' : 'Resume account ') + id + '?';
+    // consequence. An operator reads the title first, and this is the only place in the
+    // dialog that says which account is about to be changed. Composed by
+    // `describeActionTitle` rather than inline, because the island's script is not
+    // something the website suite can reach - see that function for why it lives there.
+    confirmTitle.textContent = describeActionTitle(action, id);
     confirmBody.textContent = describeAction(action);
     confirmBox.hidden = false;
   }

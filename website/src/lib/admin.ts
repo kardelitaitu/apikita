@@ -60,6 +60,25 @@ export function actionLabel(action: 'suspend' | 'resume'): string {
  * otherwise will "resume" an account and believe the customer can use it again
  * when they cannot. The copy states the effect, not a euphemism.
  */
+/**
+ * The title of the confirmation dialog: the action, AND the account it names.
+ *
+ * It lives here, beside `describeAction` and for the same reason: the island composes
+ * the title, and the website suite cannot reach an island's inline script - it reads
+ * pages as TEXT, deliberately. So a title written in the island is a title nothing
+ * tests, and `this account?` came back once already, under a comment claiming the
+ * dialog named the account it was about to change.
+ *
+ * The id is the whole point. `describeAction` says what happens in detail, and an
+ * operator reads that as authoritative - which is exactly why nothing identifying the
+ * TARGET is worse here than in a terse dialog: the copy makes the dialog look
+ * considered, and a considered dialog that will not say which account is not one an
+ * operator can check before confirming an irreversible revocation.
+ */
+export function describeActionTitle(action: 'suspend' | 'resume', id: string): string {
+  return (action === 'suspend' ? 'Suspend account ' : 'Resume account ') + id + '?';
+}
+
 export function describeAction(action: 'suspend' | 'resume'): string {
   return action === 'suspend'
     ? 'This sets the account to suspended and revokes every live session and every live API key immediately. The customer is logged out everywhere and cannot mint new credentials. It does not move money.'

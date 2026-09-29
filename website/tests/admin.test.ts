@@ -32,6 +32,7 @@ import {
   canResume,
   canSuspend,
   describeAction,
+  describeActionTitle,
   hasNextPage,
   isAccountId,
   isSelfAction,
@@ -78,6 +79,32 @@ test('a suspend says it does not move money', () => {
   // docs/admin-surface.md: suspend is a security action, not a financial one.
   // An operator must not fear it debits the customer.
   assert.match(describeAction('suspend').toLowerCase(), /does not move money|not move money/);
+});
+
+// The consequence text above was always tested; the TITLE was not, because it lived in
+// the island's inline script where this suite cannot reach it - it reads pages as TEXT.
+// So a title could say "this account" indefinitely and every assertion here still passed.
+test('the confirmation title names the account it is about to change', () => {
+  const id = 'a3f1c2d4-5e6b-4a7c-8d9e-0f1a2b3c4d5e';
+  for (const action of ['suspend', 'resume'] as const) {
+    const title = describeActionTitle(action, id);
+    assert.ok(
+      title.includes(id),
+      `the ${action} confirmation title does not name the account: ${title}`
+    );
+    // The verb, so the title cannot degenerate into the bare id.
+    assert.ok(
+      title.toLowerCase().includes(action),
+      `the ${action} confirmation title does not say what it does: ${title}`
+    );
+  }
+  // Two different accounts must not produce the same prompt, which is the property
+  // that makes the title useful: an operator with a list in front of them is
+  // distinguishing accounts, not actions.
+  assert.notEqual(
+    describeActionTitle('suspend', 'a3f1c2d4-5e6b-4a7c-8d9e-0f1a2b3c4d5e'),
+    describeActionTitle('suspend', 'b7e9d3a5-6f7c-4b8d-9e0f-1a2b3c4d5e6f')
+  );
 });
 
 test('the action paths target the canonical routes', () => {
