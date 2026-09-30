@@ -16,11 +16,12 @@
     // guessing, and the per-account issuance cap on how many codes exist to guess.
     //
     // The third cap is the reason this file is worth fencing at all. The issuance
-    // cap counted link_codes, a table this very handler DELETEs from, so it could
-    // not fire at all; a cap that cannot fire is indistinguishable from a cap that is
-    // not being hit, and the suite was green throughout. It now counts
-    // link_code_issues. A module whose job is enforcing limits should not be the
-    // one place where a limit is quietly inert.
+    // cap once counted link_codes, a table this very handler DELETEs from, so it
+    // could not fire at all; a cap that cannot fire is indistinguishable from a cap
+    // that is not being hit, and the suite was green throughout. It now counts
+    // link_code_issues, which nothing deletes from, so the count is bounded by
+    // admissions rather than by surviving rows. A module whose job is enforcing
+    // limits should not be the one place where a limit is quietly inert.
     deny(clippy::arithmetic_side_effects)
 )]
 
@@ -37,9 +38,9 @@
 //! Two independent caps, because they defend against two different attacks:
 //!
 //! - **per ACCOUNT** (`limits.link_code_issuance_per_hour`) — bounds how many codes
-//!   one account can have in flight, reusing `abuse::enforce_creation_cap` over
-//!   `link_codes (account_id, created_at)`. This is the same guard `topups` and
-//!   `api_keys` use, not a second copy of the boundary rule.
+//!   one account may ISSUE in an hour, counting `link_code_issues`, the record that
+//!   survives the one-live-code DELETE. Reuses `abuse::enforce_creation_cap_in`, the
+//!   same boundary rule `topups` and `api_keys` use, not a second copy of it.
 //! - **per IP** (`limits.link_redemption_per_hour`) — bounds guessing from one
 //!   host. A single attacker must not be able to walk the code space by cycling
 //!   accounts, which the per-account cap would not notice at all.
@@ -376,22 +377,27 @@ pub async fn issue_link_code(
     // The transaction was already open for the DELETE below, so the COUNT joins it
     // for free.
     //
-    // NOT SUFFICIENT, and writing it up as a fix would be a false claim. This cap
-    // CANNOT FIRE AT ALL. It counts rows in link_codes for the account - and the
-    // DELETE immediately below removes every one of them before the INSERT, so the
-    // count is always 0 or 1. Against a cap of 10 the comparison is true forever.
-    // The guard is documented in docs/server/api-spec.md and docs/decisions.md as
-    // bounding how many codes an account may issue in an hour, and it bounds
-    // nothing. MEASURED by the test below: eighteen concurrent issues against a cap
-    // of ten produce eighteen successes and zero refusals.
+    // THIS PARAGRAPH USED TO SAY THE CAP CANNOT FIRE, and that is now false. It is
+    // kept as a record of the wrong answer rather than deleted, because the wrong
+    // answer is the one a reader is most likely to reach for: counting ISSUES
+    // rather than LIVE ROWS needs a record that survives the delete, and it is easy
+    // to conclude from there that no such record exists. One does, two lines below.
     //
-    // Nothing here makes the cap fire, and pretending otherwise is the easy
-    // mistake. Counting ISSUES rather than LIVE ROWS needs a record that survives
-    // the delete - a counter table, or superseding old rows instead of removing
-    // them - and superseding would break the one-live-code-per-account guarantee
-    // that doubles an attacker's chance per guess. So the fix is a schema and
-    // behaviour change, and this transaction move is the part that can be done now:
-    // correct, and necessary once the counting is.
+    // The counting is `link_code_issues`, a table nothing deletes from, so the
+    // number the cap compares against grows with every admission instead of being
+    // reset by the DELETE. The cap therefore FIRES, and holds under concurrency,
+    // because the COUNT and the INSERT and the issuance record commit in ONE
+    // transaction: a concurrent caller either sees the earlier row or waits on the
+    // lock. MEASURED by
+    // `the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests` below:
+    // a burst of cap+8 concurrent issues admits exactly `cap`, refuses the rest
+    // with 429, writes exactly one issuance row per admission, and leaves exactly
+    // one code alive.
+    //
+    // Superseding old rows instead of deleting them would have made the count work
+    // too, and was rejected: the DELETE is what expresses the one-live-code
+    // guarantee, and a second mechanism for the same guarantee is a second thing to
+    // get wrong.
     abuse::enforce_creation_cap_in(
         &mut tx,
         "link_code_issues",
