@@ -698,6 +698,22 @@ jobs:
       - name: Check the alert delivery contract
         run: sh tools/alert-check/check.sh
 
+      # The wind-down payout report must classify, divide and REFUSE correctly.
+      #
+      # It is the read-only half of the closure runbook, and every number it prints is a
+      # number an operator will act on by hand - there is no treasury and no automation
+      # downstream to catch a mistake. Three distinctions a tidy-up can collapse:
+      # the payout threshold is STRICTLY greater (a balance of exactly 2x the frozen rate
+      # is sub-threshold), stablecoin units FLOOR rather than round, and the frozen rate
+      # must be SUPPLIED - looking it up live at closure would price the runbook against a
+      # rate that has moved since the decision to close.
+      #
+      # The check asserts each refusal returns its OWN exit code, because a detector that
+      # cannot fail is not a detector. It runs against a scratch database and verifies the
+      # report leaves that database byte-identical.
+      - name: Check the wind-down payout report
+        run: sh tools/wind-down-check/check.sh
+
       # The CI document must describe the pipeline that actually runs.
       #
       # docs/ci-cd.md listed TEN stages while the workflow ran TWENTY-SIX: the seven

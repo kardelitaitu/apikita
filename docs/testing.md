@@ -378,12 +378,12 @@ help. It is that the question is answered by READING THE CHECK before choosing a
 delete, rather than by choosing a file and then asking. A note in a document does not
 change what a careless experiment does; only reading the thing you are about to test does.
 
-The audit itself is complete and the result is clean: every one of the seven tool checks
+The audit itself is complete and the result is clean: every one of the eight tool checks
 refuses a missing input. compose-check exits 2 on no `docker-compose.yml`, backup-check 1
 on no `backup.sh`, drill-check 1 on no `drill.sh`, reconcile-check 1 on no `reconcile.sql`,
-alert-check 1 on no `probe.sh`, ci-docs-check 3 on no `ci-cd.md`, and relay-check 2 on no
-`relay.conf`. **None of the seven can pass vacuously**, and until this was measured that
-was an assumption rather than a fact.
+alert-check 1 on no `probe.sh`, ci-docs-check 3 on no `ci-cd.md`, relay-check 2 on no
+`relay.conf`, and wind-down-check 3 on no `report.sh`. **None of the eight can pass
+vacuously**, and until this was measured that was an assumption rather than a fact.
 
 ### Read the code before writing a sentence about it
 

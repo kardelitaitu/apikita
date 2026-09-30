@@ -182,6 +182,35 @@ if sqlite3 -readonly -bail "$DB" "UPDATE wallets SET balance_idr = 0;" >/dev/nul
 fi
 cmp -s "$WORK/before.db" "$DB" || fail "the database file changed after the write-refusal probe"
 
+# THE ASSERTION THAT ACTUALLY BINDS THE REPORT. The two probes above test the sqlite3
+# CLI's own flag, NOT the report's invocation of it -- so a mutation that drops
+# `-readonly` from report.sh SURVIVED the first version of this check (measured: the
+# mutation was applied and the check still exited 0). The guarantee that matters is
+# that a WRITE INSIDE THE REPORT'S OWN SQL fails rather than moving money, because the
+# payout SQL is one careless edit away from being exactly that write.
+#
+# So: copy the report, inject a write into its SQL, and require the run to FAIL and the
+# database to be UNCHANGED. With `-readonly` in place the write errors out (exit 4);
+# without it the write succeeds, the balance moves, and this fails loudly.
+INJ="$WORK/report-injected.sh"
+sed 's/ORDER BY balance_idr DESC;/ORDER BY balance_idr DESC; UPDATE wallets SET balance_idr = 0;/' \
+    "$REPORT" > "$INJ"
+# Guard the fixture: if the anchor did not match, the injected file is identical to the
+# original and the assertion below would test nothing.
+cmp -s "$REPORT" "$INJ" && fail "could not inject a write into the report's SQL, so the read-only guarantee would be untested"
+
+env DATABASE_URL="$DSN" CLOSURE_USD_IDR_RATE="$RATE" sh "$INJ" >"$WORK/inj.out" 2>&1
+inj_rc=$?
+if [ "$inj_rc" -eq 0 ]; then
+    fail "a WRITE injected into the report's own SQL SUCCEEDED (exit 0) - the report is not read-only in practice"
+fi
+cmp -s "$WORK/before.db" "$DB" || fail "the injected write CHANGED the database - the report can move money"
+# And the refusal must be sqlite3's read-only error, not some unrelated failure that
+# would also have produced a non-zero code.
+if ! grep -qi 'readonly\|read-only' "$WORK/inj.out"; then
+    fail "the injected write failed, but not with a read-only error - the guarantee may be accidental (got: $(head -2 "$WORK/inj.out" | tr '\n' ' '))"
+fi
+
 # A second run must produce identical output: a report that drifts between runs on
 # unchanged data cannot be diffed against the payout it authorises.
 rc2=$(run_report)
