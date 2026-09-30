@@ -126,3 +126,36 @@ test('no doc still claims a superseded count', () => {
     }
   }
 });
+
+/**
+ * The format gate is described, not imagined.
+ *
+ * docs/testing.md claimed for as long as anyone could check that "The crate has no
+ * `cargo fmt --check` in CI". It has had one since the workflow was added, and the
+ * sentence was load-bearing: it was the stated reason the route inventory's
+ * `);`-terminated lines were considered safe from a formatter. A doc that says a check
+ * does not exist is a doc that tells the next reader not to run it.
+ *
+ * So the claim is now pinned against the workflow rather than against memory. This is
+ * deliberately a ONE-WAY check: it fails when the doc denies a gate the workflow has.
+ * It does not fail when the workflow gains a gate the doc never mentioned, because
+ * that is the ordinary case and pinning it would mean editing this test every time a
+ * stage is added.
+ */
+test('no doc denies a check that CI actually runs', () => {
+  const workflow = read('.github/workflows/ci.yml');
+  const fmtIsGated = workflow.includes('cargo fmt --check');
+  const doc = read('docs/testing.md');
+
+  if (fmtIsGated) {
+    for (const denial of [
+      'has no `cargo fmt --check` in CI',
+      'no `cargo fmt --check`',
+    ]) {
+      assert.ok(
+        !doc.includes(denial),
+        `docs/testing.md denies a gate ci.yml runs: it still says "${denial}"`,
+      );
+    }
+  }
+});

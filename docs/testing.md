@@ -162,7 +162,7 @@ axum offers no reflection — so deleting a `.post(...)` from a chain is caught 
 nothing. And these lines are format-sensitive: one `cargo fmt` run re-wraps them,
 and a re-wrap can swallow a semicolon and with it a route.
 
-This section used to say the crate had no `cargo fmt --check` in CI, and that was
+This section used to deny that the crate had a format gate in CI at all, and that was
 wrong in two ways at once. The step has been in `ci.yml` since the workflow was
 added. And the danger is *narrower than the warning implied but has a firmer floor*.
 Measured against `rustfmt 1.9.0-stable`, a full `cargo fmt` over `routes/mod.rs`
