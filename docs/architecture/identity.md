@@ -80,6 +80,43 @@ about who someone is.
 6. **Unlinking Telegram removes one row.** It must never delete the account or
    the wallet.
 
+## How the citations stay true
+
+Config fields carry doc comments that say where each one is consumed — the answer to
+"is this field used, and by what?". Those comments are cross-references, and a
+cross-reference is only worth having if the thing it names exists.
+
+It did not, for seven of them. `server/src/config.rs` named a `from_config`
+constructor on `EmailSender` at four sites and `EmailSender::send` at three more;
+the constructor is `new`, `send` takes an already-built message and reads no config
+at all, and no such thing as `from_config` was ever defined. A reader following one
+of those names finds nothing and draws the natural conclusion — **that the field is
+unused** — which is the exact opposite of what the comment was placed there to say.
+
+The guard is
+`doc_claims::tests::every_method_a_doc_comment_cites_is_a_method_this_crate_defines`.
+It walks every doc comment in `server/src`, extracts each type-member pair, and
+requires the member to be either a `fn` defined somewhere in the crate or a field
+declared on a type the crate defines. Two rules keep it from being noise, and both
+were arrived at by watching an earlier version fail:
+
+- **A citation of a type this crate does not define is skipped.** `Duration::from_secs`
+  and `SqliteConnectOptions::from_str` are correct prose; failing on them would make
+  the check fire on true statements until somebody disabled it.
+- **A field named through its type is accepted.** `EmailConfig::smtp_host` reads as a
+  method call but names a field, and the reader can find it. Roughly a dozen correct
+  comments say it that way; rejecting them would have been the checker's fault, not
+  theirs.
+
+The first version of the guard rejected any type preceded by `::`, which discarded
+the type segment of every *qualified* citation — `identity::email::EmailSender::new`
+is the form this codebase actually writes, so it extracted nothing and reported
+success over an empty set. That is worth recording because it is the failure mode
+the guard exists to prevent, reproduced inside the guard. The lesson generalises:
+**a mutation that survives is evidence about the check before it is evidence about
+the anchor.** The sweep that caught it seeded a citation naming a method that does
+not exist and found the suite still green.
+
 ## Email handling — the four pre-hijacking vectors
 
 The four classic vectors, and the defences as they now exist. All of them are

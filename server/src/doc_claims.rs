@@ -1544,6 +1544,261 @@ mod tests {
         }
     }
 
+    /// Every method a doc-comment cites is a method this crate defines.
+    ///
+    /// `server/src/config.rs` cited a `from_config` constructor on `EmailSender` at
+    /// four sites - on `smtp_host`, `smtp_port`, `smtp_password_env` and
+    /// `request_timeout_seconds` - and no such method exists anywhere. The
+    /// constructor is `new`. Three more citations in the same struct
+    /// (`from_address`, `from_name`, `reply_to`) named `EmailSender::send`, which
+    /// takes an already-built `Email` and reads no config at all.
+    ///
+    /// WHY A WRONG CITATION IS WORSE THAN NO CITATION. These comments exist to answer
+    /// one question: where is this field consumed? A reader who follows a name that
+    /// does not exist finds nothing, and the natural conclusion is that the field is
+    /// UNUSED - which is the exact opposite of what the comment was placed there to
+    /// say. Nothing compared the two, so seven citations sat wrong in a file whose
+    /// whole purpose is to describe configuration accurately.
+    ///
+    /// WHAT THIS CANNOT SEE, stated plainly. It checks only the `::` form, so a prose
+    /// mention ("the mailer's constructor") is out of scope. It checks that SOME item
+    /// with that name is defined anywhere in the crate, not that it is reachable from
+    /// the type named - `Parser::new` would pass if any `Parser` has a `new`, which is
+    /// the common case and the honest limit of a text scan. It does not check that the
+    /// cited method is the one that actually reads the field, which is the second half
+    /// of the defect above and is not mechanically decidable.
+    #[test]
+    fn every_method_a_doc_comment_cites_is_a_method_this_crate_defines() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![root.clone()];
+        let mut walked = 0usize;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    walked += 1;
+                    sources.push(path);
+                }
+            }
+        }
+        sources.sort();
+        // Slack below the real count, for the same reason as the walks above: a floor
+        // equal to the count is a tripwire that fires on a deletion and stays silent
+        // when the walk stops early.
+        assert!(
+            walked >= 18,
+            "only {walked} Rust files were walked, so this check is not looking at the whole crate"
+        );
+
+        // Every `fn NAME` in the crate, so a citation can be resolved. `fn ` anywhere
+        // in the line covers the pub, async and unsafe forms.
+        let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Every `pub NAME:` / `NAME:` struct field, because a doc comment that says
+        // "read by `EmailSender::new`" and one that says "see the `smtp_host` field"
+        // are the same kind of claim - a pointer to something the reader can go and
+        // find. A field named as `T::f` is loose, but it resolves: the reader finds
+        // `f` in `T`. Rejecting it would force thirteen correct comments to be
+        // rewritten to satisfy a checker, which is how a check gets disabled.
+        let mut fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cited: Vec<(String, usize, String, String)> = Vec::new();
+
+        for path in &sources {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let name = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            for (index, line) in text.lines().enumerate() {
+                if let Some(at) = line.find("fn ") {
+                    let rest = &line[at + 3..];
+                    let ident: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !ident.is_empty() {
+                        defined.insert(ident);
+                    }
+                }
+                // A struct field: an identifier followed by `:` at the start of a
+                // trimmed line, in the `pub NAME:` or bare `NAME:` form. Collected in
+                // the same walk so the two sets cannot describe two versions of the
+                // crate. Lowercase-initial and identifier-shaped, which excludes
+                // labels, match arms and `let x: T` (those are never at line start
+                // with the type after the colon alone on the line).
+                let declaration = line
+                    .trim_start()
+                    .strip_prefix("pub ")
+                    .unwrap_or(line.trim_start());
+                if let Some((candidate, _)) = declaration.split_once(':') {
+                    let candidate = candidate.trim();
+                    let identifier_shaped = !candidate.is_empty()
+                        && candidate.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        && candidate.starts_with(|c: char| c.is_ascii_lowercase() || c == '_');
+                    if identifier_shaped {
+                        fields.insert(candidate.to_string());
+                    }
+                }
+                // Only DOC COMMENTS are scanned. A path written as `Type::method`
+                // inside executable code is resolved by the compiler already, so
+                // checking it here would be a second, weaker copy of the borrow checker.
+                let trimmed = line.trim_start();
+                let doc = trimmed.starts_with("///")
+                    || trimmed.starts_with("//!")
+                    || trimmed.starts_with("//");
+                if !doc {
+                    continue;
+                }
+                for (ty, method) in cites_a_method(line) {
+                    cited.push((name.clone(), index + 1, ty, method));
+                }
+            }
+        }
+
+        // The vacuity guard. A pattern change that matched nothing would make every
+        // assertion below pass over an empty set, which is how a citation check
+        // silently stops checking anything.
+        assert!(
+            cited.len() >= 20,
+            "only {} method citation(s) were found in doc comments, so this check is not \
+             looking at the real set - and a citation check that finds nothing passes.",
+            cited.len()
+        );
+
+        // WHICH TYPES ARE OURS. The rule can only be applied to a type this crate
+        // defines: `Duration::from_secs` and `SqliteConnectOptions::from_str` name
+        // other people's methods, and failing on them would make the check fire on
+        // correct prose until somebody disabled it. So the crate's own type names
+        // are collected first, and a citation of anything else is skipped.
+        let ours = crate_type_names(&sources);
+
+        let mut bad: Vec<String> = Vec::new();
+        for (file, line, ty, method) in &cited {
+            // A citation may name the item by a path (`identity::email::EmailSender::new`),
+            // so the LAST segment is the type and the next is the method.
+            if !ours.contains(ty) {
+                continue;
+            }
+            if !defined.contains(method) && !fields.contains(method) {
+                bad.push(format!(
+                    "server/src/{file}:{line} cites `{ty}::{method}`, and `{ty}` is a type this \
+                     crate defines with no `{method}` field and no `fn {method}`"
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these doc comments cite a method this crate does not define. A reader \
+             following one finds nothing and concludes the field is unused, which is the \
+             opposite of what the comment is for:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// The name of every type this crate defines - `struct`, `enum`, `trait` and
+    /// `type`, in either the `Name` or the `pub Name` form.
+    ///
+    /// This is what separates a citation this crate must honour from a citation of
+    /// somebody else's method. `Duration::from_secs` is correct prose and must not
+    /// fail; `EmailConfig::smtp_host` names a type this crate owns, so the reader
+    /// can go and check it and the check does too.
+    fn crate_type_names(sources: &[std::path::PathBuf]) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        for path in sources {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                let rest = if let Some(rest) = trimmed.strip_prefix("pub(crate) ") {
+                    Some(rest)
+                } else if let Some(rest) = trimmed.strip_prefix("pub ") {
+                    Some(rest)
+                } else {
+                    Some(trimmed)
+                };
+                let Some(rest) = rest else { continue };
+                for keyword in ["struct ", "enum ", "trait ", "type "] {
+                    let Some(after) = rest.strip_prefix(keyword) else {
+                        continue;
+                    };
+                    let name: String = after
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        names.insert(name);
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The type-member pairs a line cites, if any - `T`, `::`, `m` with no spaces.
+    /// The shape is described rather than written because naming it literally would
+    /// make this guard flag its own documentation.
+    ///
+    /// Deliberately narrow, because a loose pattern here produces FALSE FAILURES on
+    /// ordinary prose and the fix for a noisy check is to disable it. It requires:
+    ///
+    ///   - an ACRONYM-CASE or CamelCase type immediately before `::` (`EmailSender`,
+    ///     `AppState`) - not a lowercase path segment, which is a module;
+    ///   - a LOWERCASE method after it, at least three characters, so `::new` and other
+    ///     very short names do not drag in `std::fmt::Debug`-style noise from elsewhere;
+    ///   - no `<`, `(`, `"` or a preceding `:::` on the pair, which excludes generic
+    ///     bounds, call expressions and prose quoting a signature.
+    fn cites_a_method(line: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let bytes: Vec<char> = line.chars().collect();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == ':' && i + 1 < bytes.len() && bytes[i + 1] == ':' {
+                // Walk back over the TYPE.
+                let mut start = i;
+                while start > 0 && (bytes[start - 1].is_alphanumeric() || bytes[start - 1] == '_') {
+                    start -= 1;
+                }
+                let ty: String = bytes[start..i].iter().collect();
+                // Walk forward over the METHOD.
+                let mut end = i + 2;
+                while end < bytes.len() && (bytes[end].is_alphanumeric() || bytes[end] == '_') {
+                    end += 1;
+                }
+                let method: String = bytes[i + 2..end].iter().collect();
+                let looks_like_a_type =
+                    ty.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && !ty.is_empty();
+                let looks_like_a_method = method.len() >= 4
+                    && method.starts_with(|c: char| c.is_ascii_lowercase() || c == '_');
+                // A preceding `::` does NOT disqualify the pair, and the first
+                // version of this function got that exactly backwards: it rejected
+                // any type preceded by `::`, which threw away the TYPE segment of
+                // every qualified citation - `identity::email::EmailSender::new` is
+                // the form this codebase actually writes, and it extracted NOTHING
+                // from it. The guard then passed over the real set while reporting
+                // success, which is the failure mode it exists to prevent. A
+                // qualified path in front is the normal case, not a disqualifier;
+                // the uppercase-initial test below is what separates a type from a
+                // module segment.
+                if looks_like_a_type && looks_like_a_method {
+                    found.push((ty, method));
+                }
+                i = end.max(i + 2);
+            } else {
+                i += 1;
+            }
+        }
+        found
+    }
+
     /// Every model's margin is the ONE the decision record states.
     ///
     /// `docs/decisions.md` says, in a table: Margin value = `1.5 per model - no

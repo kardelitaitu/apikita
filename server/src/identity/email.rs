@@ -17,7 +17,7 @@
 //!
 //! ## Why `smtp_host` being empty is a supported state
 //!
-//! `EmailConfig::smtp_host` defaults to empty, and empty means "no relay is
+//! `EmailConfig`'s `smtp_host` field defaults to empty, and empty means "no relay is
 //! configured". That is a real deployment — local development, and any environment
 //! where mail is not yet wired — and it must not be a startup failure, because a
 //! service that refuses to boot without a mail relay cannot be run by a

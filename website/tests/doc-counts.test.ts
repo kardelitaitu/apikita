@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 189;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 608;
+const SERVER_TESTS = 609;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -240,6 +240,19 @@ test('no doc still claims a superseded count', () => {
         // the fixture made the defect unreachable. The auth tests' own copy of the resolver
         // had the same omission while its comment claimed production parity.
         '607 tests', '607 passed', '607 / 0 / 0',
+        // Retired when the doc-comment method-citation guard landed. `server/src/config.rs`
+        // named a `from_config` constructor on `EmailSender` at four sites and
+        // `EmailSender::send` at three more; the constructor is `new`, `send` takes an
+        // already-built message and reads no config, and nothing called `from_config` ever
+        // existed. A reader following one of those names finds nothing and concludes the
+        // field is UNUSED, which is the opposite of what the comment was for. The first
+        // version of the guard then reproduced the same failure inside itself: it rejected
+        // any type preceded by `::`, so it extracted nothing from a QUALIFIED citation -
+        // `identity::email::EmailSender::new`, the form this codebase actually writes - and
+        // reported success over an empty set. The mutation sweep caught it by seeding a
+        // citation of a method that does not exist and finding the suite still green; a
+        // surviving mutant is evidence about the check before it is evidence about the anchor.
+        '608 tests', '608 passed', '608 / 0 / 0',
       ],
     },
     {

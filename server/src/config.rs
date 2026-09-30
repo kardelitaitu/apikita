@@ -25,7 +25,8 @@ pub struct AppConfig {
     pub auth: AuthConfig,
     /// Outbound transactional mail: the SMTP relay that carries verification
     /// and reset links. A separate section because it is a separate transport
-    /// with a separate failure mode - see `EmailConfig::smtp_host`.
+    /// with a separate failure mode - see the `smtp_host` field of
+    /// `EmailConfig`.
     ///
     /// `serde(default)` for the same reason as `auth`: an older config has no
     /// `[email]`, and the default is "no relay configured", which is a state
@@ -140,30 +141,53 @@ pub struct EmailConfig {
     /// signup still works without mail (the account is created unverified, which
     /// is inert - it cannot hold a balance), so a deployment without a relay is
     /// not a deployment that cannot register customers. Read by
-    /// `identity::email::EmailSender::from_config`.
+    /// `identity::email::EmailSender::new` through `listen_address`, which also
+    /// lets `APIKITA_EMAIL_BASE_URL` override it.
     pub smtp_host: String,
     /// SMTP submission port. 587 is submission with STARTTLS; 465 is implicit
     /// TLS. Both are accepted because relays differ. Read by
-    /// `identity::email::EmailSender::from_config`.
+    /// `identity::email::EmailSender::new` through `listen_address`.
     pub smtp_port: u16,
     /// SMTP username. Empty means the relay takes no authentication, which is
     /// the norm for a relay on the same private network.
     pub smtp_username: String,
     /// NAME of the environment variable holding the SMTP password - never the
     /// password. Same convention as the file header rule and `api_key_envs` on
-    /// the model endpoints. Read by `identity::email::EmailSender::from_config`
+    /// the model endpoints. Read by `identity::email::EmailSender::new`
     /// through `std::env::var`.
     pub smtp_password_env: String,
-    /// The envelope sender. Read by `identity::email::EmailSender::send`.
+    /// The envelope sender. Read by `identity::email::EmailSender::new`.
     pub from_address: String,
     /// The display name on the From header. Read by
-    /// `identity::email::EmailSender::send`.
+    /// `identity::email::EmailSender::new`.
     pub from_name: String,
-    /// Read by `identity::email::EmailSender::send` when non-empty.
+    /// Read by `identity::email::EmailSender::new` when non-empty, and carried on
+    /// every message it builds.
     pub reply_to: String,
-    /// Read by `identity::email::EmailSender::from_config`'s connect/IO timeout.
+    /// The connect/IO timeout, read by `identity::email::EmailSender::new`
+    /// through `timeout_of`, which floors it so a `0` cannot mean "wait forever".
     pub request_timeout_seconds: u64,
 }
+
+// THE CITATIONS ABOVE WERE WRONG IN TWO WAYS, and both are worth recording so
+// the shape is not reintroduced.
+//
+// First, they named a constructor `from_config` on `EmailSender` - a method that
+// does not exist, and never did. The constructor is `new`
+// (server/src/identity/email.rs:166). A doc-comment
+// naming a function nobody can find is worse than one naming none: it reads as
+// a verified cross-reference, so a reader who wants to know where a config field
+// is consumed follows it, finds nothing, and concludes the field is unused -
+// which is the exact question these comments exist to answer.
+//
+// Second, `from_address`, `from_name` and `reply_to` said `EmailSender::send`.
+// That is wrong too: `send` takes an already-built `Email` and reads no config
+// at all. All three are read in `new`, which parses the addresses once at
+// startup - `reply_to` at email.rs:210 and `from_address`/`from_name` at
+// email.rs:167-179 - so a rename here needs `new` looked at, not `send`.
+//
+// The citations are now the method that actually reads each field. Nothing
+// enforced them before; see the guard noted in `docs/architecture/`.
 
 /// The values `[auth]` has when a config file does not name them.
 ///
@@ -289,7 +313,7 @@ pub struct LimitsConfig {
     pub key_metadata_cache_seconds: u64,
 }
 
-/// Default for `LimitsConfig::login_per_hour_per_ip` when a config file predates
+/// Default for the `login_per_hour_per_ip` field of `LimitsConfig` when a config file predates
 /// the key.
 ///
 /// Twenty an hour. A person who has forgotten which password they used hits two
@@ -298,38 +322,38 @@ fn default_login_per_hour_per_ip() -> u32 {
     20
 }
 
-/// Default for `LimitsConfig::login_per_hour_per_account` when a config file
+/// Default for the `login_per_hour_per_account` field of `LimitsConfig` when a config file
 /// predates the key. Half the per-IP cap, and deliberately so - see the field.
 fn default_login_per_hour_per_account() -> u32 {
     10
 }
 
-/// Default for `LimitsConfig::signup_per_hour_per_ip` when a config file predates
+/// Default for the `signup_per_hour_per_ip` field of `LimitsConfig` when a config file predates
 /// the key. Five an hour: room for one office or household, not for a farm.
 fn default_signup_per_hour_per_ip() -> u32 {
     5
 }
 
-/// Default for `LimitsConfig::password_reset_per_hour_per_account` when a config
+/// Default for the `password_reset_per_hour_per_account` field of `LimitsConfig` when a config
 /// file predates the key.
 fn default_password_reset_per_hour_per_account() -> u32 {
     3
 }
 
-/// Default for `LimitsConfig::verification_resend_per_hour` when a config file
+/// Default for the `verification_resend_per_hour` field of `LimitsConfig` when a config file
 /// predates the key.
 fn default_verification_resend_per_hour() -> u32 {
     3
 }
 
-/// Default for `LimitsConfig::link_code_issuance_per_hour` when a config file
+/// Default for the `link_code_issuance_per_hour` field of `LimitsConfig` when a config file
 /// predates the key. Ten codes an hour is far more than a human needs and far
 /// less than a code farm wants.
 fn default_link_code_issuance_per_hour() -> u32 {
     10
 }
 
-/// Default for `LimitsConfig::link_redemption_per_hour` when a config file
+/// Default for the `link_redemption_per_hour` field of `LimitsConfig` when a config file
 /// predates the key.
 ///
 /// Twenty attempts an hour, matching the shipped `config/apikita.toml`. It is a
@@ -388,7 +412,7 @@ pub struct ModelConfig {
     pub name: String,
     pub description: String,
     pub price: f64,
-    /// NOT A CAP - see [`StreamingConfig::max_context_tokens`]. This is the MODEL's
+    /// NOT A CAP - see [the `max_context_tokens` field of `StreamingConfig`]. This is the MODEL's
     /// published context window, carried so the config matches the price list it was
     /// transcribed from. Neither this nor the streaming ceiling is ever compared
     /// against a prompt.
