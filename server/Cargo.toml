@@ -54,6 +54,38 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc", "pass
 # already compiled rather than a second crypto stack. It never touches OpenSSL,
 # and `use_pem` is deliberately NOT enabled because Google publishes JWK, not PEM.
 jsonwebtoken = "9"
+# The SMTP relay for verification and reset mail. Features are chosen to keep the
+# TLS backend on rustls: the DEFAULT features would pull native-tls, which links
+# OpenSSL - the one thing this workspace's rustls choice everywhere else exists to
+# avoid, and the reason a vendored OpenSSL would otherwise appear in the image.
+# `builder` and `smtp-transport` are the message and the transport; `tokio1*` are
+# the async integration, and `tokio1-rustls` is what makes the transport use the
+# same rustls stack as reqwest rather than its own.
+#
+# `ring` and `webpki-roots` are REQUIRED and are not optional extras: lettre 0.11
+# turns `rustls` on without a crypto provider or a trust store, and refuses to
+# compile without one of each ("feature `rustls` also requires either the
+# `aws-lc-rs`, the `ring` or the `rustls-no-provider` feature"; the second error,
+# for the roots, is the same shape). `ring` is the provider reqwest's
+# `rustls-tls` feature already pulls in - MEASURED in server/Cargo.lock, where
+# `ring` and `webpki-roots` are both present and `aws-lc-rs` is absent - so the
+# process installs one provider rather than linking two. `aws-lc-rs` was written
+# here first and rejected by cargo: rustls 0.23.45 requires `aws-lc-rs ^1.18` and
+# the newest published version is 1.17.0. `webpki-roots` bundles the roots into
+# the binary, which is what an image with no ca-certificates package needs.
+#
+# There is no pool, no queue and no retry feature here on purpose: mail is sent
+# inline from the request that caused it, and a failure is handled where it
+# happens (see identity/email.rs on why a signup survives an unreachable relay).
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls",
+    "rustls",
+    "ring",
+    "webpki-roots",
+] }
 
 [dev-dependencies]
 tokio-test = "0.4"
