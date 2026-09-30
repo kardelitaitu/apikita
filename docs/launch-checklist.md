@@ -46,12 +46,16 @@ recoverable.
 
 - [ ] A persistent volume provisioned for the SQLite database file (no database
       instance to provision), and a backup of it tested by restore.
-- [ ] Identity served by the Rust server itself, with no separate identity
-      instance running. **Phase 6 has landed**, so this is now the shipped state
-      rather than an end state to reach: `accounts.pb_user_id` is dropped, the
-      PocketBase HTTP client is gone from `server/`, and `accounts` + `identities`
-      are served natively with Argon2id. See
+- [x] Identity served by the Rust server itself, with no separate identity
+      instance running. **Phase 6 has landed.** The code half is done and is the
+      shipped state rather than an end state to reach: `accounts.pb_user_id` is
+      dropped, the PocketBase HTTP client is gone from `server/`, and `accounts` +
+      `identities` are served natively with Argon2id. See
       [`architecture/identity.md`](architecture/identity.md).
+      The tick is for the CODE half only. The operational half — *no separate
+      identity instance is running in the deployment* — is verified by deploying
+      and observing, which is Gate 1's remaining work; there is nothing left in
+      this repository that could make it true or false.
 - [ ] Edge relay deployed; nginx configured with `proxy_buffering off` on `/events`.
 - [ ] Automatic certificate renewal on the relay **and** on the backend.
 - [ ] Backend serves a valid certificate for the public hostname (required for
