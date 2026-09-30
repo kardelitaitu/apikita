@@ -212,10 +212,9 @@ the document in question did not.
 
 It is also a LOWER BOUND, and the reason is worth writing down so nobody trusts it
 for more than it is worth. A name that is mentioned is not necessarily a name that is
-used. `max_context_tokens` appears seven times in the crate - as a struct field on two
-config types, in three test fixtures, and in the parser key list - and is read by
-nothing. Every one of those seven is a declaration, a literal, or a string, and none is
-an expression that affects behaviour.
+used. `max_context_tokens` is declared on two config types, set by every model entry in
+`config/apikita.toml`, and read by nothing. Every one of those occurrences is a
+declaration, a literal, or a string, and none is an expression that affects behaviour.
 
 **THIS PARAGRAPH WAS WRONG AND WAS CORRECTED HERE, which is the whole reason it is
 worth reading.** It used to say the measurement cannot find PARSED BUT UNREAD
@@ -232,11 +231,45 @@ rather than only in a struct literal. A leading dot does. The measurement is sti
 heuristic - a key read through a macro or a generated accessor would be missed - and the
 honest description of its limit is that one, not the one this paragraph used to give.
 
-That is a heuristic and is described as one. Doing it properly means following uses of
-a field rather than searching for its name, which is what a call graph is for. Until
-then the honest statement is: this catches what is entirely unreferenced, and a
-configuration key that is referenced in a struct and nowhere else still looks healthy
-to it.
+**THE SECOND PARAGRAPH ABOVE WAS ALSO STALE, and stale in the direction that makes the
+tool look weaker than it is.** Until the sentence was replaced, this section ended by
+saying the measurement "catches what is entirely unreferenced, and a configuration key
+that is referenced in a struct and nowhere else still looks healthy to it" - which is
+exactly the behaviour the paragraph before it says was fixed. A reader who got this far
+was told the tool cannot do the thing the previous paragraph had just described it
+doing, and two paragraphs of a file about stale claims were themselves out of date in a
+way only a reader who read all of them would notice. What is true, and what the
+`config/apikita.toml` markings are produced by, is the field-access rule: a name a
+struct declares and no leading dot ever follows is reported.
+
+**AND THE FIELD-ACCESS RULE ITSELF WAS THEN CHECKED, which found two more things.**
+Requiring a dot was implemented and run, and its first two failures were both real.
+
+The first was a field it could not see. The corpus deliberately SKIPPED `config.rs`, on
+the reasoning that skipping the file where every field is declared removes the most
+obvious source of false "wired" answers. It does - and it also removes every field
+access that happens to live there, which is where the config types' own methods are.
+`max_output_tokens` is read by `reserved_output_tokens`, whose body is
+`self.max_output_tokens`, and the guard reported it as read by nothing. The test module
+is stripped before the corpus is used, so the strip was already what kept the fixtures
+from answering for every field; excluding the file was never doing that work. The file
+is now included.
+
+The second was a limit, not a bug, and it is the one worth remembering. Requiring a dot
+flagged the offpeak rate class - `input_offpeak`, `output_offpeak`, `cache_read_offpeak`
+- as now-read, because `validate()` reads all three: once in the finiteness loop, once
+in the peak/offpeak cache-discount comparison. Settlement prices from the PEAK rates
+only, so none of those reads prices anything. The dot rule cannot tell a read that
+DECIDES behaviour from a read that INSPECTS a value and moves on, and every startup
+VALIDATION takes the second shape. A source-level rule about reads therefore cannot
+decide wiring on its own for any field that validation touches.
+
+The resolution is an explicit exemption list, `READ_ONLY_FOR_VALIDATION`, rather than a
+widening of the rule - widening is how a check stops being able to fail. The honest
+statement of what the list now claims is narrower than it used to be: not "nothing reads
+this", but "nothing CHARGES on this". A field on it can be read all over `validate()`
+forever and nothing will object. That is the trade, and it is written at the exemption
+rather than inferred by the next reader.
 
 ### Six guards that passed when the thing they checked was wrong
 

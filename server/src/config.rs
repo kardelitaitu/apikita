@@ -133,6 +133,12 @@ pub struct CircuitBreakerConfig {
 pub struct StreamingConfig {
     pub mid_stream_cutoff: bool,
     pub hard_max_output_tokens: u64,
+    /// NOT A CAP. Nothing refuses a request whose prompt exceeds this, and the hold is
+    /// sized from the ACTUAL body (`estimated_input_tokens`), so an over-long prompt is
+    /// still covered - the ceiling simply bounds nothing. It is carried because the
+    /// wholesale price lists publish it and an operator reading a model page will look
+    /// for it; it is RECORDED, NOT ENFORCED. See the UNWIRED register in the tests
+    /// below and the "Not enforced" row in docs/decisions.md.
     pub max_context_tokens: u64,
 }
 
@@ -141,6 +147,10 @@ pub struct ModelConfig {
     pub name: String,
     pub description: String,
     pub price: f64,
+    /// NOT A CAP - see [`StreamingConfig::max_context_tokens`]. This is the MODEL's
+    /// published context window, carried so the config matches the price list it was
+    /// transcribed from. Neither this nor the streaming ceiling is ever compared
+    /// against a prompt.
     pub max_context_tokens: u64,
     pub max_output_tokens: u64,
     pub supports_vision: bool,
@@ -1694,11 +1704,25 @@ mod tests {
     /// forgotten appears here without anybody editing a list.
     ///
     /// AND THE LIMITATION, stated because a test that quietly under-reports is worse
-    /// than none: the search is a substring match on the source, so a field whose
-    /// name collides with an ordinary word (name, description) reads as wired
-    /// whether or not it is. That is why the list below is a judgement rather than a
-    /// measurement, and why every entry on it carries a reason - a name with no
-    /// reason is a claim nobody can check.
+    /// than none. The search requires a FIELD ACCESS - the name preceded by a dot - so
+    /// a struct declaration, a TOML literal and the parser key list stop counting as
+    /// uses. That is what found the parsed-but-unread keys, and it is why the exact
+    /// floor `leaves.len() > 40` below is pinned rather than left as a comment.
+    ///
+    /// Two things it still cannot see, both measured rather than assumed:
+    ///
+    /// A field read through a macro or a generated accessor has no dot in the source.
+    /// Nothing in this crate reads config that way, so this is a limit rather than a
+    /// live gap - but it is the limit a name search has, and it is the one to check
+    /// first if a field is reported dead and looks alive.
+    ///
+    /// And more importantly: a field read ONLY BY DEAD CODE is indistinguishable from
+    /// a wired one. That was measured too. `max_context_tokens` was reported as wired
+    /// because one production function read it - a second `worst_case_reservation_idr`
+    /// on `UpstreamClient` that no request ever called, so the read existed and never
+    /// ran. Deleting that function is what moved the field onto the register below.
+    /// No source-level check can close this one; a call graph could, which is what
+    /// docs/testing.md points at.
     #[test]
     fn every_config_field_is_read_by_production_code_or_explained() {
         /// DELIBERATELY NOT WIRED, each with the reason it is still here.
@@ -1803,15 +1827,15 @@ mod tests {
             // once finds what its author remembered to look for.
             (
                 "input_offpeak",
-                "the offpeak class is configured and never charged. Settlement prices\n                 every token from the PEAK rates, and the field that would select the\n                 class - billing_basis - is itself unwired. The only place this name\n                 appears outside the struct is validate()'s own finiteness and discount\n                 checks, which is validation, not behaviour - and a rate that is\n                 checked but never charged is a rate an operator believes is in effect.",
+                "the offpeak class is configured and never charged. Settlement prices\n                 every token from the PEAK rates, and the field that would select the\n                 class - billing_basis - is itself unwired. The name appears in\n                 validate() twice: read to reject a non-finite rate, and read again for\n                 the peak/offpeak cache-discount comparison, so a bad offpeak rate is\n                 caught at startup. NEITHER READ PRICES ANYTHING. That is exactly the\n                 shape the wiring check cannot see - both are reads with a dot in\n                 front, so this entry fails the stale assertion rather than passing\n                 it, and it is kept because deleting it would delete the disclosure. A\n                 rate that is validated but never charged is a rate an operator\n                 believes is in effect.",
             ),
             (
                 "output_offpeak",
-                "Same as input_offpeak: configured, checked, never charged.",
+                "Same as input_offpeak: validated, never charged. Read only by the\n                 finiteness loop, which is why the stale check flags it too.",
             ),
             (
                 "cache_read_offpeak",
-                "Same as input_offpeak. The cache discount validate() enforces is\n                 between the cache rate and the input rate of the SAME class, so checking\n                 the offpeak pair is meaningful even though charging it is not\n                 implemented.",
+                "Same as input_offpeak. Read by the finiteness loop and by the\n                 peak/offpeak cache-discount comparison, which is a real check and not\n                 a price. The discount validate() enforces is between the cache rate\n                 and the input rate of the SAME class, so checking the offpeak pair is\n                 meaningful even though charging it is not implemented.",
             ),
         ];
 
@@ -1828,13 +1852,28 @@ mod tests {
             leaves.len()
         );
 
-        // The production source of every module except this one, with each
+        // The production source of EVERY module, this one included, with each
         // cfg(test) block removed. Without the strip the answer is a uniform false
         // negative: the test fixtures build a whole AppConfig literal and every
         // field therefore appears read.
+        //
+        // THIS FILE IS NO LONGER SKIPPED, and that was a measured fix rather than a
+        // tidy-up. It used to be excluded, on the reasoning that skipping the module
+        // where every field is DECLARED removes the most obvious source of false
+        // "wired" answers. It does - and it also removes every field access that
+        // happens to live here, which is where the config types' own methods are.
+        // `max_output_tokens` is read in production, by
+        // `reserved_output_tokens` (`self.max_output_tokens`), and the guard could
+        // not see it because that method is in this file. The first run of the
+        // field-access rule below reported the field as read by nothing. Since the
+        // test module is stripped before the corpus is used, skipping this file was
+        // never what made the fixtures harmless - the strip was. The cost of
+        // including it is that a field named ONLY in a production doc comment in
+        // this file now counts as read, which is the under-reporting direction the
+        // note above the helper already warns about.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut corpus = String::new();
-        collect_rust_source(&root, "config.rs", &mut corpus);
+        collect_rust_source(&root, "", &mut corpus);
         assert!(
             !corpus.is_empty(),
             "no production source was read, so every field would look unwired"
@@ -1845,7 +1884,7 @@ mod tests {
 
         let mut missing: Vec<String> = Vec::new();
         for leaf in &leaves {
-            if corpus.contains(leaf.as_str()) {
+            if source_reads_field(&corpus, leaf) {
                 continue;
             }
             if unwired.binary_search(&leaf.as_str()).is_ok() {
@@ -1891,15 +1930,66 @@ mod tests {
         // And the other direction, which is what stops the list rotting into a
         // graveyard: a field that HAS been wired must come off it, or the list goes on
         // claiming things that are no longer true.
+        //
+        // "READ" HERE MEANS READ FOR SOMETHING, not merely fetched. Requiring only a
+        // dot in front flagged three fields that are genuinely unwired and are
+        // deliberately listed: the offpeak rate class. `validate()` reads all three -
+        // once in the finiteness loop and once in the peak/offpeak discount comparison
+        // - and none of those reads prices a token. Settlement prices from the PEAK
+        // rates only. So the dot rule was too blunt in this one direction: it cannot
+        // tell a read that decides behaviour from a read that inspects a value and
+        // moves on, and every startup VALIDATION takes that second shape.
+        //
+        // Those three are therefore EXEMPT rather than deleted, and the exemption is a
+        // short explicit list instead of a widening of the rule, because widening the
+        // rule is exactly how a check stops being able to fail. The cost is stated
+        // plainly: a field on this list can be read all over `validate()` forever, and
+        // nothing will object. What the list has to stay honest about is narrower than
+        // it used to be - these fields do not affect a CHARGE - and the UNWIRED entry
+        // for each says so in those words.
+        const READ_ONLY_FOR_VALIDATION: &[&str] =
+            &["input_offpeak", "output_offpeak", "cache_read_offpeak"];
         let stale: Vec<&str> = UNWIRED
             .iter()
             .map(|(field, _)| *field)
-            .filter(|field| corpus.contains(field))
+            .filter(|field| !READ_ONLY_FOR_VALIDATION.contains(field))
+            .filter(|field| source_reads_field(&corpus, field))
             .collect();
         assert!(
             stale.is_empty(),
             "these fields are on the UNWIRED list but are now read by production\n             code, so the list is claiming something untrue: {stale:?}"
         );
+    }
+
+    /// Does the production corpus READ this field, or merely NAME it?
+    ///
+    /// A bare `contains` answered the wrong question, and the difference was measured
+    /// twice rather than theorised once.
+    ///
+    /// The first correction was the `.` at the front. Without it, a name that appears
+    /// in prose counts as a use: the register below cites `min_monthly_tokens` in a
+    /// sentence, and a sentence is not a use. Comments are stripped before this runs,
+    /// which removed the whole-line case, but a doc comment is not the only place a
+    /// name appears without being read - a string literal is a name, an `assert!`
+    /// message is a name, and several of these names collide with ordinary English
+    /// (`name`, `description`, `weight`).
+    ///
+    /// The second correction was to stop skipping `config.rs` when the corpus is
+    /// built, and it was found by this rule rather than by looking for it: with the
+    /// dot required and this file still excluded, `max_output_tokens` was reported as
+    /// read by nothing, and it is read - by `reserved_output_tokens`, whose body is
+    /// `self.max_output_tokens`. The config types' own methods live in the file the
+    /// corpus skipped, so the guard could not see the single most natural way one of
+    /// these fields gets used. The strip of the test module is what keeps the fixtures
+    /// from answering for everything; excluding this file was never doing that work.
+    ///
+    /// Requiring a preceding dot is the cheap approximation of a field access, and it
+    /// errs in the direction that reports MORE fields as unwired, because the failure
+    /// this guard exists to prevent is a setting an operator believes is working. A
+    /// field read as `self.rate` still matches: only the dot has to precede it.
+    fn source_reads_field(corpus: &str, field: &str) -> bool {
+        let dotted = format!(".{field}");
+        corpus.contains(&dotted)
     }
 
     /// Every scalar leaf key in a TOML document, deduplicated by NAME rather than by
