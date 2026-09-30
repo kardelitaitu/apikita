@@ -206,65 +206,176 @@ pub async fn resolve_account_from_cookie(
     Ok(account_id)
 }
 
+/// The ROUTES constant, expanded into `create_router`'s method-router expressions.
+///
+/// WHY THIS IS A MACRO AND NOT A LOOP. axum's `MethodRouter` is CHAINED per route -
+/// `get(a).post(b)` - and axum guarantees `/api/topups` and `/api/keys` carry exactly
+/// two methods each. A `for` loop would have to `.merge()` two single-method routers
+/// per path, which would restate each method list in a second place. That is the
+/// duplicate-that-drifts-toward-the-weaker-reading defect this codebase already
+/// fights, traded for the one this macro closes, so the macro is the smaller evil.
+///
+/// The cost is real and belongs in writing rather than in an absence: ONE rustfmt
+/// invocation would re-wrap these `route(` lines and swallow the trailing `;` markers
+/// that `the_route_inventory_matches_the_mounted_table` reads, and the only other
+/// arm - a `cargo fmt` check in CI - is deliberately not taken, because this crate
+/// holds several deliberate mis-formattings that rustfmt undoes.
+macro_rules! routes {
+    ($($(#[$meta:meta])* .route($path:literal, $($m:ident($h:path)).+ $(,)?));+ $(;)?) => {
+        Router::new()
+        $(
+            $(#[$meta])*
+            .route($path, $($m($h)).+)
+        )+
+    };
+}
+
+/// THE ROUTE INVENTORY. The single source for what this server serves.
+///
+/// **BOTH ENDS OF THIS LIST ARE CHECKED, and neither check can see the other's
+/// subject.** `the_route_inventory_matches_the_mounted_table` reads THIS literal in
+/// the source and compares it to `MOUNTED`, so a route dropped from the list is a
+/// failure rather than the silent 404 it used to be. The method-router expressions
+/// themselves are read by no test: axum does not expose its route table
+/// (docs/testing.md:145), and the table test drives the ROUTER, which is built from
+/// the list. So a method removed here is caught by no automated check, and saying so
+/// is the point - it is the one link these checks cannot close.
+///
+/// WHAT THE TRAILING `;` MARKS ARE FOR. Each `.route(` line ends in `;`, which is a
+/// token rustfmt never emits. A `.route(` line deleted by hand takes its `;` with it,
+/// so the source literal and the built router fall out of step **detectably**. The
+/// markers do not make this tamper-proof and do not claim to: a deletion can still be
+/// made to read as consistent by removing the `;` too. They make the accidental
+/// version - the one that actually happens - loud.
+///
+/// THE PATH LITERALS ARE load-bearing strings, not comments. `$path:literal` expands
+/// into the method-router expression that axum receives, so the path a request is
+/// matched against IS the string this test reads. Before this list existed the paths
+/// were written here and mounted there, and the two could disagree with nothing to
+/// say so.
+///
+/// `{id}` is axum 0.8's parameter syntax. `MOUNTED` carries a concrete uuid for the
+/// same route, because it drives requests rather than parsing them.
+pub const ROUTES: &str = r#"
+.route("/health", get(health::health_check));
+// Operator-only operational counts. NOT on /health: that body is pinned
+// because the deploy gate parses it, and a leak test forbids ANY digit in an
+// unauthenticated health body. See health::operator_metrics.
+.route("/api/admin/metrics", get(health::operator_metrics));
+.route("/auth/exchange", post(auth::exchange_token));
+.route("/auth/logout", post(auth::logout));
+.route("/auth/logout-all", post(auth::logout_all));
+.route("/api/me", get(account::get_me));
+.route("/api/usage", get(account::get_usage));
+.route("/api/usage/recent", get(account::get_recent_usage));
+.route("/api/export", get(account::export_account_data));
+.route("/api/topups", get(account::get_topups).post(account::create_topup));
+.route("/api/keys", get(keys::list_keys).post(keys::create_key));
+.route("/api/keys/{id}", patch(keys::update_key));
+.route("/api/keys/{id}/revoke", post(keys::revoke_key));
+.route("/api/telegram/link-code", post(telegram::issue_link_code));
+.route("/api/telegram", delete(telegram::unlink_telegram));
+// The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN.
+.route("/api/bot/link", post(telegram::redeem_link_code));
+.route("/events", get(events::sse_events_handler));
+.route("/api/admin/accounts", get(admin::list_accounts));
+.route("/api/admin/audit", get(admin::list_recent_audit));
+.route("/api/admin/accounts/{id}", get(admin::get_account));
+.route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit));
+.route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
+.route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
+.route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
+// Webhooks
+.route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
+// Proxy
+.route("/v1/chat/completions", post(proxy::chat_completions));
+"#;
+
+/// **DEAD BY DESIGN.** The route table as a `const` array, which is the one thing
+/// that would make the inventory checkable WITHOUT reading source text.
+///
+/// `ROUTES` above is a source literal because Rust has no stable reflection over
+/// names, so `get(health::health_check)` cannot be assembled from an array of
+/// strings - `concat_idents!` is unstable and a `macro_rules` pass cannot build an
+/// identifier fragment-wise either. An array of paths can drive NOTHING in axum, so
+/// adding one would be a second hand-maintained list, which is the defect.
+///
+/// It is kept as a MEASURED, REFUTED PROPOSAL rather than deleted, because it looks
+/// obviously better to a first reader and "why not just use an array" is the first
+/// question this file's approach invites. It is `#[allow(dead_code)]` so this
+/// paragraph is tested against the compiler rather than trusted.
+#[allow(dead_code)]
+pub const ROUTE_ARRAY_SHAPE_IS_IMPOSSIBLE: &[&str] = &[
+    "/health",
+    "/api/admin/metrics",
+    "/auth/exchange",
+    "/auth/logout",
+    "/auth/logout-all",
+    "/api/me",
+    "/api/usage",
+    "/api/usage/recent",
+    "/api/export",
+    "/api/topups",
+    "/api/keys",
+    "/api/keys/{id}",
+    "/api/keys/{id}/revoke",
+    "/api/telegram/link-code",
+    "/api/telegram",
+    "/api/bot/link",
+    "/events",
+    "/api/admin/accounts",
+    "/api/admin/audit",
+    "/api/admin/accounts/{id}",
+    "/api/admin/accounts/{id}/audit",
+    "/api/admin/accounts/{id}/suspend",
+    "/api/admin/accounts/{id}/restore",
+    "/api/admin/accounts/{id}/resume",
+    "/webhooks/midtrans",
+    "/v1/chat/completions",
+];
+
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        // Ops
-        .route("/health", get(health::health_check))
+    routes!(
+        .route("/health", get(health::health_check));
         // Operator-only operational counts. NOT on /health: that body is pinned
         // because the deploy gate parses it, and a leak test forbids ANY digit in an
         // unauthenticated health body. See health::operator_metrics.
-        .route("/api/admin/metrics", get(health::operator_metrics))
+        .route("/api/admin/metrics", get(health::operator_metrics));
         // Auth
-        .route("/auth/exchange", post(auth::exchange_token))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/logout-all", post(auth::logout_all))
+        .route("/auth/exchange", post(auth::exchange_token));
+        .route("/auth/logout", post(auth::logout));
+        .route("/auth/logout-all", post(auth::logout_all));
         // Account & Wallet
-        .route("/api/me", get(account::get_me))
-        .route("/api/usage", get(account::get_usage))
-        .route("/api/usage/recent", get(account::get_recent_usage))
-        .route("/api/export", get(account::export_account_data))
-        .route(
-            "/api/topups",
-            get(account::get_topups).post(account::create_topup),
-        )
+        .route("/api/me", get(account::get_me));
+        .route("/api/usage", get(account::get_usage));
+        .route("/api/usage/recent", get(account::get_recent_usage));
+        .route("/api/export", get(account::export_account_data));
+        .route("/api/topups", get(account::get_topups).post(account::create_topup));
         // API Keys
-        .route("/api/keys", get(keys::list_keys).post(keys::create_key))
-        .route("/api/keys/{id}", patch(keys::update_key))
-        .route("/api/keys/{id}/revoke", post(keys::revoke_key))
+        .route("/api/keys", get(keys::list_keys).post(keys::create_key));
+        .route("/api/keys/{id}", patch(keys::update_key));
+        .route("/api/keys/{id}/revoke", post(keys::revoke_key));
         // Telegram
-        .route("/api/telegram/link-code", post(telegram::issue_link_code))
-        .route("/api/telegram", delete(telegram::unlink_telegram))
+        .route("/api/telegram/link-code", post(telegram::issue_link_code));
+        .route("/api/telegram", delete(telegram::unlink_telegram));
         // The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN
-        .route("/api/bot/link", post(telegram::redeem_link_code))
+        .route("/api/bot/link", post(telegram::redeem_link_code));
         // Live updates (SSE)
-        .route("/events", get(events::sse_events_handler))
+        .route("/events", get(events::sse_events_handler));
         // Admin (cookie + operator flag)
-        .route("/api/admin/accounts", get(admin::list_accounts))
-        .route("/api/admin/audit", get(admin::list_recent_audit))
-        .route("/api/admin/accounts/{id}", get(admin::get_account))
-        .route(
-            "/api/admin/accounts/{id}/audit",
-            get(admin::get_account_audit),
-        )
-        .route(
-            "/api/admin/accounts/{id}/suspend",
-            post(admin::suspend_account),
-        )
-        .route(
-            "/api/admin/accounts/{id}/restore",
-            post(admin::resume_account),
-        )
-        .route(
-            "/api/admin/accounts/{id}/resume",
-            post(admin::resume_account),
-        )
+        .route("/api/admin/accounts", get(admin::list_accounts));
+        .route("/api/admin/audit", get(admin::list_recent_audit));
+        .route("/api/admin/accounts/{id}", get(admin::get_account));
+        .route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit));
+        .route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
+        .route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
+        .route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
         // Webhooks
-        .route(
-            "/webhooks/midtrans",
-            post(webhooks::handle_midtrans_webhook),
-        )
+        .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
         // Proxy
         .route("/v1/chat/completions", post(proxy::chat_completions))
+    )
+        // The router-level fallback, so the 404 for an UNROUTED path is the documented JSON
         // The router-level fallback, so the 404 for an UNROUTED path is the documented JSON
         // rather than axum's empty-bodied default.
         //
@@ -1115,16 +1226,36 @@ mod tests {
     /// A concrete path parameter, used to prove {id} is a PARAMETER.
     const SOME_KEY_ID: &str = "00000000-0000-0000-0000-000000000000";
 
-    /// Every route `create_router` mounts: (method, path, body). One row per
-    /// route CALL, so /api/topups and /api/keys - each a SINGLE `.route()` with
-    /// two methods chained - appear per method. 13 route calls, 15 rows.
+    /// Every route `create_router` mounts: (method, path, body). One row per route
+    /// CALL, so /api/topups and /api/keys - each a SINGLE `.route()` with two
+    /// methods chained - appear per method. **26 route calls, 28 rows.**
+    ///
+    /// THIS COUNT WAS WRONG FOR SIX ROUTES AND NOTHING SAID SO, which is the gap
+    /// `the_route_inventory_matches_the_mounted_table` now closes. The header used to
+    /// read "13 route calls, 15 rows" against a router mounting 26 calls, and
+    /// `GET /api/admin/metrics`, `GET /api/usage/recent`, `GET /api/export`,
+    /// `GET /api/admin/accounts`, `GET /api/admin/audit` and
+    /// `GET /api/admin/accounts/{id}/audit` were mounted, documented in the api-spec,
+    /// and ABSENT here. Nothing failed: every check below starts from this table, so a
+    /// route missing from it was invisible. The direction is now checked in both
+    /// places - this table against the spec below, and this table against the route
+    /// inventory above.
+    ///
+    /// ROWS, not routes. The first attempt at this header said "30 rows" - a figure
+    /// arrived at by assuming each dual-method path contributes an extra row. It does
+    /// not: `/api/topups` and `/api/keys` are ONE `.route(` call each carrying both
+    /// `get` and `post`, and this table lists a request per METHOD, so each
+    /// contributes two rows in total, not three. 28 is the number the test pins.
     const MOUNTED: &[(&str, &str, &str)] = &[
         ("GET", "/health", ""),
+        ("GET", "/api/admin/metrics", ""),
         ("POST", "/auth/exchange", r#"{"pb_token":"probe"}"#),
         ("POST", "/auth/logout", ""),
         ("POST", "/auth/logout-all", ""),
         ("GET", "/api/me", ""),
         ("GET", "/api/usage", ""),
+        ("GET", "/api/usage/recent", ""),
+        ("GET", "/api/export", ""),
         ("GET", "/api/topups", ""),
         ("POST", "/api/topups", "{}"),
         ("GET", "/api/keys", ""),
@@ -1153,9 +1284,16 @@ mod tests {
         // Admin: cookie + operator flag. A credential-free request stops at the
         // guard (401), which is not 404/405 - so the router matched, which is all
         // this table asserts.
+        ("GET", "/api/admin/accounts", ""),
+        ("GET", "/api/admin/audit", ""),
         (
             "GET",
             "/api/admin/accounts/00000000-0000-0000-0000-000000000000",
+            "",
+        ),
+        (
+            "GET",
+            "/api/admin/accounts/00000000-0000-0000-0000-000000000000/audit",
             "",
         ),
         (
@@ -1441,6 +1579,164 @@ mod tests {
                  table does not declare is being matched (prefix matching, or an extra route)"
             );
         }
+    }
+
+    /// The number of DISTINCT paths in a MOUNTED-shaped list, for the count
+    /// cross-check in `the_route_inventory_matches_the_mounted_table`.
+    ///
+    /// `MOUNTED` is a table of REQUESTS, so a dual-method path appears twice. `ROUTES`
+    /// is a list of MOUNTS, so it appears once. Comparing `MOUNTED.len()` to the
+    /// inventory count was wrong by exactly the number of extra rows the dual-method
+    /// routes contribute - which is how this helper came to exist.
+    fn mounted_paths_distinct(mounted_set: &[&str]) -> usize {
+        let mut seen: Vec<&str> = Vec::new();
+        for path in mounted_set {
+            if !seen.contains(path) {
+                seen.push(path);
+            }
+        }
+        seen.len()
+    }
+
+
+    ///
+    /// Every other test in this module starts from `MOUNTED`. That is the direction
+    /// that happens to be safe against a route being *deleted* - the dispatch test
+    /// would fail - but it is blind in the direction a route is *added*: mount a new
+    /// route, forget the table, and all seven checks stay green while nothing
+    /// exercises the new endpoint. This test was written because that had ALREADY
+    /// happened four times (`GET /api/admin/metrics`, `GET /api/usage/recent`,
+    /// `GET /api/export`, `GET /api/admin/accounts/{id}/audit` were mounted,
+    /// documented, and absent from the table), which is why the fix is a check
+    /// rather than a correction.
+    ///
+    /// HOW IT CAN WORK AT ALL, given that axum exposes no route table and the naive
+    /// source scan is wrong (docs/testing.md:129-150). `create_router` no longer
+    /// writes its paths inline: it expands the `routes!` macro over an inventory
+    /// whose PATH LITERALS ARE THE STRINGS THE MSVC/AXUM ROUTER IS BUILT FROM.
+    /// So this test reads the same bytes the router consumed, and the two cannot
+    /// disagree by accident.
+    ///
+    /// THE TRAP IT MUST NOT FALL INTO is the one docs/testing.md documents: a
+    /// regex over `create_router` matches twenty of twenty-six `.route(` calls and
+    /// falsely reports `/webhooks/midtrans` as unmounted, because some calls put the
+    /// path on the following line. The parse below is line-oriented and requires the
+    /// path on the SAME line as `.route(`, and `ROUTES` is written so that is always
+    /// true - the assertion on the parsed count is what stops a future multi-line
+    /// entry from silently dropping out.
+    #[test]
+    fn the_route_inventory_matches_the_mounted_table() {
+        // The rendered inventory, as Rust sees it. `include_str!` would be a second
+        // copy of the bytes; `ROUTES` IS the bytes create_router expanded.
+        let inventory = ROUTES;
+
+        // A route line in ROUTES is exactly:  .route("<path>", <expr>);
+        // Anchored at both ends so a COMMENT that mentions `.route("...")` cannot be
+        // mistaken for a route - the comment above `/api/admin/metrics` mentions
+        // `/health`, and a looser match would collect it.
+        let mut declared: Vec<&str> = Vec::new();
+        for line in inventory.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix(".route(\"") else {
+                continue;
+            };
+            let Some(close) = rest.find('"') else {
+                continue;
+            };
+            let path = &rest[..close];
+            // The trailing `;` is the marker described on ROUTES: rustfmt never emits
+            // it, so its presence is evidence a human wrote this line and its absence
+            // is evidence something rewrote it.
+            assert!(
+                line.ends_with(");"),
+                "the route line for {path} does not end in `);`. That trailing `;` is what \
+                 makes a deleted route detectable: without it this test can no longer tell a \
+                 mounted route from a removed one. Restore the `;` (an editor or a formatter \
+                 removed it)."
+            );
+            declared.push(path);
+        }
+
+        // The count cross-check, placed before the set comparison because its failure
+        // message explains the mismatch the set loops would otherwise report as a
+        // mystery: a route added to `routes!` and not to MOUNTED is a COUNT difference
+        // before it is a set difference.
+        //
+        // NOT `MOUNTED.len()`: MOUNTED is a table of REQUESTS, so a dual-method path
+        // (/api/topups, /api/keys) appears twice while `ROUTES` lists it once. The
+        // first version of this test compared the two lengths and failed purely
+        // because 28 rows != 26 route calls - a false positive, which is the failure
+        // mode docs/testing.md:152-171 says costs more than a miss.
+        let mounted_set: Vec<&str> = MOUNTED.iter().map(|(_, path, _)| *path).collect();
+
+        // The parser must find the routes, not a fraction of them. If a route is
+        // ever written multi-line, or a line's shape changes, this count drops and
+        // the message names the cause rather than reporting a mystery mismatch
+        // below. The number itself is pinned separately at the end of this test;
+        // this assertion is the cross-check against the table.
+        assert_eq!(
+            declared.len(),
+            mounted_paths_distinct(&mounted_set),
+            "the inventory parse found {} route lines but MOUNTED declares {} distinct paths. \
+             Either a route was added to `routes!` and not to MOUNTED (which is the defect this \
+             test exists for), or the ROUTES line was rewritten into a shape this parser does \
+             not recognise (it requires the path on the same line as `.route(`). Check both: \
+             MOUNTED is the by-request table, `routes!` is what the router mounts.",
+            declared.len(),
+            mounted_paths_distinct(&mounted_set)
+        );
+
+        // The real comparison. MOUNTED uses a concrete uuid where the router uses {id},
+        // so the inventory path is normalised the same way
+        // `every_mounted_route_is_documented_in_the_api_spec` normalises MOUNTED.
+        let declared_set: Vec<String> = declared
+            .iter()
+            .map(|p| p.replace("{id}", SOME_KEY_ID))
+            .collect();
+
+        for path in &declared_set {
+            assert!(
+                mounted_set.contains(&path.as_str()),
+                "{path} is mounted by create_router and does NOT appear in MOUNTED, so no test \
+                 exercises it. Add a (method, path, body) row to MOUNTED - this is exactly the \
+                 hole the four admin/account routes sat in."
+            );
+        }
+        for path in &mounted_set {
+            assert!(
+                declared_set.iter().any(|d| d == path),
+                "{path} is in MOUNTED but create_router does NOT mount it. Either mount it or \
+                 delete the row: a row for a route that does not exist makes the dispatch test \
+                 assert something about a 404."
+            );
+        }
+
+        // POSITIVE CONTROL, because both loops above pass trivially against two empty
+        // lists and a parse that collected nothing would report a clean bill of health.
+        assert!(
+            declared.contains(&"/api/bot/link"),
+            "the inventory parse did not find /api/bot/link, so it is not reading the route \
+             list it thinks it is and every assertion above is vacuous"
+        );
+        // And the count the router actually expands, pinned: a hand-edit that drops a
+        // route is caught above; this catches a rewrite that drops one from BOTH and
+        // looks self-consistent.
+        assert_eq!(
+            declared.len(),
+            26,
+            "create_router mounts a different number of routes than the 26 this test was \
+             last reconciled against. If that is deliberate, update this number AND the \
+             count in MOUNTED's doc comment - both, or the next reader trusts a stale one."
+        );
+        assert_eq!(
+            mounted_set.len(),
+            28,
+            "MOUNTED declares a different number of ROWS than the 28 this test was last \
+             reconciled against. Rows, not routes: the four dual-method paths (/api/topups, \
+             /api/keys, /auth/logout, /auth/logout-all are single-method, but /api/topups and \
+             /api/keys each carry GET+POST) are one `.route(` call and two rows each. A \
+             mismatch here means a row was added or removed without updating this number."
+        );
     }
 
     /// The dual-method routes: /api/topups and /api/keys are ONE `.route()` call

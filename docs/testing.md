@@ -126,7 +126,7 @@ That is worth weighing when deciding what to close next: the chains that had gon
 unverified for the longest are the ones most likely to have drifted quietly, and
 "no test covers it" is not evidence that there is nothing to find.
 
-### One link in the route chain has no check, and a naive one is wrong
+### The link in the route chain that had no check, and why the naive one is wrong
 
 The API surface is guarded in three directions: every route `MOUNTED` lists is
 mounted by `create_router` (the table test drives the real router, not a test app),
@@ -135,19 +135,52 @@ built is mounted. What is **not** checked is the first link going the other way:
 route added to `create_router` and forgotten in `MOUNTED` would escape all three,
 because every check starts from the table rather than the router.
 
-It is empty today — the two agree. It is recorded because closing it is a trap,
-and one I fell into while writing this. A source-level parse of `create_router` looks
-trivial and is not: several `.route(` calls put the path on the NEXT line, so a
-regex of the form `route("PATH"` matches twenty of twenty-six and reports
-`/webhooks/midtrans` — the Midtrans webhook — as unmounted. It is mounted, and
-`webhooks.rs` has a test that routes it.
+It was empty when this paragraph was written; the two agreed. **It is closed now,
+and it was not empty when it was closed.** The route-inventory check
+(`the_route_inventory_matches_the_mounted_table`, in `server/src/routes/mod.rs`)
+found **six** routes that were mounted by `create_router`, documented in
+`docs/server/api-spec.md`, and absent from `MOUNTED`: `GET /api/admin/metrics`,
+`GET /api/usage/recent`, `GET /api/export`, `GET /api/admin/accounts`,
+`GET /api/admin/audit` and `GET /api/admin/accounts/{id}/audit`. Nothing had
+failed, because every check begins at the table. The module comment above
+`MOUNTED` had also said "13 route calls, 15 rows" against a router mounting 26
+calls; it had been wrong for long enough that nobody was reading it.
 
-axum does not expose its route table, so a sound check cannot be written by
-scraping the source. The honest options are to enumerate the routes in a macro or a
-constant that `create_router` itself consumes, or to leave the link unverified and
-**say so**, which is what this paragraph is. A check built on the regex would have
-reported a missing payment webhook, and that is worse than no check: it is a false
-alarm on the one route that moves money.
+How the link is closed, given that axum does not expose its route table:
+`create_router` no longer writes its paths inline. It expands a `routes!` macro
+over `pub const ROUTES`, a raw-string literal of `.route("PATH", expr);` lines,
+and the **path literals in that inventory are the same strings the router is built
+from** — so the test reads the bytes the router consumed. Each line ends in `);`
+rather than `)` because `rustfmt` never emits the semicolon, which makes a line
+rewritten by a formatter detectable. The check compares the inventory to `MOUNTED`
+in both directions, carries a positive control (`/api/bot/link` must be found, or
+the parse is vacuous), and pins both counts.
+
+Two costs are stated in the code rather than hidden. The method-router
+*expressions* are still read by no test — the inventory check reads only paths, and
+axum offers no reflection — so deleting a `.post(...)` from a chain is caught by
+nothing. And these lines are format-sensitive: one `cargo fmt` run re-wraps them
+and swallows the semicolons. The crate has no `cargo fmt --check` in CI, partly
+for that reason.
+
+The trap this check had to avoid is the one this section originally recorded: a
+source-level parse of `create_router` looks trivial and is not. Several `.route(`
+calls put the path on the NEXT line, so a regex of the form `route("PATH"` matches
+twenty of twenty-six and reports `/webhooks/midtrans` — the Midtrans webhook — as
+unmounted. It is mounted, and `webhooks.rs` has a test that routes it.
+
+So a check cannot be written by scraping the source, and a check built on the
+regex would have reported a missing payment webhook, which is worse than no check:
+it is a false alarm on the one route that moves money. The `routes!`/`ROUTES`
+arrangement is the first of the two honest options this paragraph originally
+listed — enumerate the routes in something `create_router` itself consumes — chosen
+over the second (leave the link unverified and say so) only because the inventory
+parse is now line-anchored and count-pinned, which is what stops it degenerating
+into the regex. The check's own first run failed on a **false positive** of a
+different kind: it compared the inventory's route count to `MOUNTED`'s row count,
+and those differ by design, because `MOUNTED` carries one row per request and the
+two dual-method paths are one route each. That is the failure mode described in
+the next section, and it is why the comparison now deduplicates paths first.
 
 ### Four false alarms, and what they had in common
 
