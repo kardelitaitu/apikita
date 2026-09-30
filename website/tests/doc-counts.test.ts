@@ -118,8 +118,9 @@ test('no doc still claims a superseded count', () => {
     'website: **171 tests**', 'passes **171 tests**', '**171 tests**',
     // Retired when the account-lifecycle tests landed: signup answered a known
     // address differently from an unknown one, the reset pair and resend were
-    // undriven, and google_sign_in had no test at all. THIRTEEN tests, and every
-    // one of them is a claim about what a stranger at /auth sees.
+    // undriven, and google_sign_in had no test at all. THIRTEEN tests over the
+    // five handlers that carry a new customer from an address to a working
+    // sign-in, and back in again when the password is lost.
     '566 tests', '566 passed', '566 / 0 / 0',
   ];
   for (const stale of superseded) {
