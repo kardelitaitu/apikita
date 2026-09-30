@@ -2805,4 +2805,867 @@ mod tests {
                 .unwrap_or_else(|err| err.into_inner()) = None;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // The account lifecycle: signup, Google, verification, reset, resend.
+    //
+    // THE HANDLERS THESE COVER HAD NO TEST THAT INVOKED THEM. `login`, `logout`,
+    // `logout_all`, `change_password` and `list_providers` were driven; the six
+    // below were reachable only through `MOUNTED` rows in `routes/mod.rs` that
+    // assert a STATUS, never a behaviour. They are the account lifecycle and the
+    // recovery path - signup mints the account, verify activates it, the reset
+    // pair is how a locked-out customer gets back in, and resend is the mailbox
+    // half of it - so an untested branch here is an untested way into an account.
+    //
+    // EVERY TEST BELOW ASSERTS A STATE CHANGE, NOT ONLY A STATUS. The neutral
+    // replies these endpoints return on purpose (see `NEUTRAL_SIGNUP_REPLY`) mean
+    // the status is deliberately uninformative, so a status-only test would pass
+    // against a handler that did nothing at all.
+    // -----------------------------------------------------------------------
+
+    fn signup_json(
+        email: &str,
+        password: &str,
+    ) -> Result<Json<SignupRequest>, axum::extract::rejection::JsonRejection> {
+        Ok(Json(SignupRequest {
+            email: email.to_string(),
+            password: password.to_string(),
+        }))
+    }
+
+    fn email_json(
+        email: &str,
+    ) -> Result<Json<EmailRequest>, axum::extract::rejection::JsonRejection> {
+        Ok(Json(EmailRequest {
+            email: email.to_string(),
+        }))
+    }
+
+    fn token_json(
+        token: &str,
+    ) -> Result<Json<TokenRequest>, axum::extract::rejection::JsonRejection> {
+        Ok(Json(TokenRequest {
+            token: token.to_string(),
+        }))
+    }
+
+    fn reset_json(
+        token: &str,
+        email: &str,
+        password: &str,
+    ) -> Result<Json<PasswordResetRequest>, axum::extract::rejection::JsonRejection> {
+        Ok(Json(PasswordResetRequest {
+            token: token.to_string(),
+            email: email.to_string(),
+            password: password.to_string(),
+        }))
+    }
+
+    /// How many identity rows an address has, counted through `normalize_email`
+    /// so the fixture's casing cannot make the count wrong.
+    async fn identity_count(pool: &SqlitePool, email: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM identities WHERE email = ?")
+            .bind(identity::accounts::normalize_email(email))
+            .fetch_one(pool)
+            .await
+            .expect("counting the identities must work")
+    }
+
+    /// How many outstanding verification links an account holds.
+    async fn verification_token_count(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM identity_tokens WHERE account_id = ? AND purpose = 'verification'",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_one(pool)
+        .await
+        .expect("counting the tokens must work")
+    }
+
+    /// A FRESH SIGNUP CREATES THE ACCOUNT, AN UNVERIFIED IDENTITY AND A LINK.
+    ///
+    /// Three separate creates, and all three matter: an account with no identity
+    /// cannot sign in, and an identity with no token can never be verified, which
+    /// would lock the customer out of their own account the moment they made it.
+    #[tokio::test]
+    async fn live_signup_creates_the_account_an_unverified_identity_and_a_link() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let email = "freshly-signed-up@example.com";
+        let response = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json(email, "a-real-enough-password"),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::ACCEPTED,
+            "signup accepts: {}",
+            response.body_text()
+        );
+
+        let account_id = crate::identity::accounts::account_for_email(&pool, email)
+            .await
+            .expect("the lookup must work")
+            .expect("signup created the account");
+        assert_eq!(
+            identity_count(&pool, email).await,
+            1,
+            "exactly one identity"
+        );
+        assert_eq!(
+            verification_token_count(&pool, account_id).await,
+            1,
+            "and exactly one link to verify it with"
+        );
+
+        let flag: i64 =
+            sqlx::query_scalar("SELECT email_verified FROM identities WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("reading the flag must work");
+        assert_eq!(
+            flag, 0,
+            "a fresh signup is NOT verified: nothing has proven the address yet, and an \
+             account that started verified would make the whole mail loop decorative"
+        );
+
+        db.close().await;
+    }
+
+    /// A SIGNUP FOR AN ADDRESS THAT ALREADY EXISTS REPLIES IDENTICALLY.
+    ///
+    /// THE ENUMERATION GUARD, and the test is written around the ONE thing that
+    /// makes it work: the two calls must take DIFFERENT BRANCHES. Comparing a
+    /// re-signup against the FIRST signup does not do that - both take the same
+    /// branch, so a difference the handler introduced in that branch is invisible
+    /// on both sides. (That is not hypothetical: it is how the first version of
+    /// this test was written, and a mutation proved it blind.)
+    ///
+    /// So the order is: create the address, then sign up for it AGAIN (the
+    /// existing branch), then sign up for an address that does not exist (the
+    /// create branch), and compare the last two.
+    #[tokio::test]
+    async fn live_signup_answers_a_known_address_exactly_like_an_unknown_one() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let known = "already-registered@example.com";
+        let first = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json(known, "a-real-enough-password"),
+        ))
+        .await;
+        assert_eq!(first.status, StatusCode::ACCEPTED);
+
+        let already = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json(known, "a-different-password"),
+        ))
+        .await;
+        let fresh = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json("brand-new@example.com", "a-real-enough-password"),
+        ))
+        .await;
+
+        assert_eq!(
+            already.status, fresh.status,
+            "a signup for an address that ALREADY EXISTS must be byte-identical to one \
+             for an address that does not, or the difference IS an enumeration oracle"
+        );
+        assert_eq!(
+            already.body_text(),
+            fresh.body_text(),
+            "and the BODIES must match too: a status that agrees while the message does \
+             not still tells an attacker which addresses are registered"
+        );
+        assert_eq!(
+            already.body_text(),
+            first.body_text(),
+            "the reply is the same one every signup gets, so it cannot be used to probe"
+        );
+
+        // AND THE SECOND SIGNUP DID NOT TOUCH THE FIRST ACCOUNT. A re-signup is
+        // refused by taking the neutral branch, NOT by overwriting the credential:
+        // otherwise anyone could take over an account by signing up for it again
+        // with their own password.
+        let identity = crate::identity::accounts::password_identity(&pool, known)
+            .await
+            .expect("the lookup must work")
+            .expect("the fixture address has an identity");
+        assert!(
+            !identity.email_verified,
+            "a re-signup must not verify the address either"
+        );
+        let stored = stored_password_hash(
+            &pool,
+            crate::identity::accounts::account_for_email(&pool, known)
+                .await
+                .expect("the lookup must work")
+                .expect("the account exists"),
+        )
+        .await;
+        assert!(
+            identity::password::verify_password(
+                auth_config_for_tests().expect("the shipped [auth] section parses"),
+                stored,
+                "a-real-enough-password".to_string(),
+            )
+            .await
+            .expect("verification must work"),
+            "the ORIGINAL password must still be the one on file: the neutral reply is \
+             what protects the account, not the reply plus an overwrite"
+        );
+
+        db.close().await;
+    }
+
+    /// A BODY THAT IS NOT AN ADDRESS OR NOT A PASSWORD IS REFUSED BY NAME.
+    #[tokio::test]
+    async fn live_signup_refuses_a_body_that_is_not_a_password_or_an_address() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let bad_address = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json("not-an-address", "a-real-enough-password"),
+        ))
+        .await;
+        assert_eq!(
+            bad_address.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a body that is not an address is a validation failure: {}",
+            bad_address.body_text()
+        );
+        assert_eq!(
+            bad_address.json()["error"]["details"]["field"],
+            json!("email"),
+            "and it names the field, so the page can point at the right input"
+        );
+
+        let weak_password = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json("a-real-address@example.com", "short"),
+        ))
+        .await;
+        assert_eq!(
+            weak_password.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a password under the floor is refused: {}",
+            weak_password.body_text()
+        );
+        assert_eq!(
+            weak_password.json()["error"]["details"]["field"],
+            json!("password")
+        );
+
+        assert_eq!(
+            identity_count(&pool, "a-real-address@example.com").await,
+            0,
+            "and a refused signup creates nothing"
+        );
+
+        db.close().await;
+    }
+
+    /// THE SIGNUP CAP RUNS BEFORE THE HASH, NOT AFTER IT.
+    ///
+    /// The handler's own comment: "hashing is the expensive part and a cap that
+    /// runs after it is a cap that lets an attacker spend our CPU." A test that
+    /// only asserted 429 would pass against a cap placed after the hash, so the
+    /// assertion that matters is that the REFUSED address left no account behind.
+    #[tokio::test]
+    async fn live_signup_spends_the_per_address_cap_before_hashing() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        let _limits = TestLimitsGuard::set(1, 100);
+
+        let first = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json("cap-one@example.com", "a-real-enough-password"),
+        ))
+        .await;
+        assert_eq!(first.status, StatusCode::ACCEPTED);
+
+        let second = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json("cap-two@example.com", "a-real-enough-password"),
+        ))
+        .await;
+        assert_eq!(
+            second.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the second from one address is refused: {}",
+            second.body_text()
+        );
+        assert_eq!(
+            identity_count(&pool, "cap-two@example.com").await,
+            0,
+            "a refused signup must not create the account, which is what proves the cap \
+             ran before the work rather than after it"
+        );
+
+        db.close().await;
+    }
+
+    /// VERIFYING A LINK ACTIVATES THE IDENTITY AND SPENDS THE TOKEN.
+    ///
+    /// The whole point of signup is that an account is inert until this runs, so the
+    /// test asserts the transition rather than the status: the flag goes 0 to 1, and
+    /// the same link cannot be redeemed twice.
+    #[tokio::test]
+    async fn live_verify_email_marks_the_identity_and_refuses_a_second_redemption() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let email = "needs-verifying@example.com";
+        let created = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json(email, "a-real-enough-password"),
+        ))
+        .await;
+        assert_eq!(created.status, StatusCode::ACCEPTED);
+
+        let account_id = crate::identity::accounts::account_for_email(&pool, email)
+            .await
+            .expect("the lookup must work")
+            .expect("signup created the account");
+
+        // The mail is not sent in tests, and the row stores only a HASH - which is
+        // the design working, and it means the fixture has to issue its own link.
+        let issued = identity::tokens::issue(
+            &pool,
+            account_id,
+            identity::tokens::Purpose::Verification,
+            Duration::hours(1),
+            Utc::now(),
+        )
+        .await
+        .expect("issuing a verification token must work");
+
+        let verified = call(verify_email(State(state.clone()), token_json(&issued.raw))).await;
+        assert_eq!(
+            verified.status,
+            StatusCode::NO_CONTENT,
+            "redeeming a real link verifies the address: {}",
+            verified.body_text()
+        );
+
+        let flag: i64 =
+            sqlx::query_scalar("SELECT email_verified FROM identities WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("reading the flag must work");
+        assert_eq!(flag, 1, "THE ADDRESS IS NOW VERIFIED, which is the point");
+
+        // A SECOND REDEMPTION IS REFUSED. `consume` marks and checks in one
+        // statement, so this is not a race the test can lose.
+        let again = call(verify_email(State(state.clone()), token_json(&issued.raw))).await;
+        assert_eq!(
+            again.status,
+            StatusCode::UNAUTHORIZED,
+            "a link is single-use: {}",
+            again.body_text()
+        );
+
+        db.close().await;
+    }
+
+    /// AN UNKNOWN VERIFICATION TOKEN IS REFUSED WITH THE ONE ANSWER.
+    #[tokio::test]
+    async fn live_verify_email_refuses_a_token_that_was_never_issued() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let response = call(verify_email(
+            State(state.clone()),
+            token_json("apk_verify_definitely-not-a-real-token"),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "every failure reason is one answer: {}",
+            response.body_text()
+        );
+
+        db.close().await;
+    }
+
+    /// A RESET LINK LETS ITS HOLDER SET A PASSWORD WITHOUT THE OLD ONE.
+    #[tokio::test]
+    async fn live_confirm_password_reset_sets_the_password_and_kills_every_session() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let email = "wants-a-reset@example.com";
+        let account_id = crate::identity::accounts::create_password_account(
+            &pool,
+            email,
+            &identity::password::hash_password(
+                auth_config_for_tests().expect("the shipped [auth] section parses"),
+                "the-old-password".to_string(),
+            )
+            .await
+            .expect("hashing must work"),
+            Utc::now(),
+        )
+        .await
+        .expect("creating the fixture account must work");
+
+        // A live session, so "every session dies" has something to kill.
+        let token = add_live_session(&pool, account_id, Utc::now() + Duration::days(1)).await;
+        assert_eq!(live_sessions(&pool, account_id).await, 1);
+
+        let issued = identity::tokens::issue(
+            &pool,
+            account_id,
+            identity::tokens::Purpose::Reset,
+            Duration::minutes(30),
+            Utc::now(),
+        )
+        .await
+        .expect("issuing a reset token must work");
+
+        let response = call(confirm_password_reset(
+            State(state.clone()),
+            reset_json(&issued.raw, email, "the-new-password"),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::NO_CONTENT,
+            "a real reset completes: {}",
+            response.body_text()
+        );
+
+        // THE NEW PASSWORD WORKS AND THE OLD ONE DOES NOT. Compared through the
+        // VERIFIER, not by string: Argon2id is salted, so two hashes of one password
+        // differ and a string comparison would fail on a correct implementation.
+        let stored = stored_password_hash(&pool, account_id).await;
+        let config = auth_config_for_tests().expect("the shipped [auth] section parses");
+        assert!(
+            identity::password::verify_password(
+                config.clone(),
+                stored.clone(),
+                "the-new-password".to_string(),
+            )
+            .await
+            .expect("verification must work"),
+            "the password the reset set must verify"
+        );
+        assert!(
+            !identity::password::verify_password(config, stored, "the-old-password".to_string(),)
+                .await
+                .expect("verification must work"),
+            "and the password it replaced must NOT - otherwise the reset did nothing"
+        );
+
+        // EVERY SESSION DIED with the password.
+        assert_eq!(
+            live_sessions(&pool, account_id).await,
+            0,
+            "a reset must revoke the sessions that were opened with the old password"
+        );
+        assert!(
+            crate::routes::resolve_account_from_cookie(&pool, &cookie_header(&token))
+                .await
+                .is_err(),
+            "and the specific token from before the reset must no longer resolve"
+        );
+
+        db.close().await;
+    }
+
+    /// THE TOKEN AND THE ADDRESS MUST AGREE, AND A MISMATCH CHANGES NOTHING.
+    ///
+    /// This is the decision `confirm_password_reset` documents: "The token authorises
+    /// one account and the body names an address on a different one. There is no
+    /// correct merge, so nothing happens." The assertion is that the OTHER account's
+    /// password is untouched, which a status-only check would miss.
+    #[tokio::test]
+    async fn live_confirm_password_reset_refuses_a_token_for_another_address() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let victim = "the-real-owner@example.com";
+        let other = "somebody-else@example.com";
+        let config = auth_config_for_tests().expect("the shipped [auth] section parses");
+        let victim_id = crate::identity::accounts::create_password_account(
+            &pool,
+            victim,
+            &identity::password::hash_password(config.clone(), "the-old-password".to_string())
+                .await
+                .expect("hashing must work"),
+            Utc::now(),
+        )
+        .await
+        .expect("creating the fixture account must work");
+        crate::identity::accounts::create_password_account(
+            &pool,
+            other,
+            &identity::password::hash_password(config.clone(), "the-other-password".to_string())
+                .await
+                .expect("hashing must work"),
+            Utc::now(),
+        )
+        .await
+        .expect("creating the second fixture account must work");
+
+        let issued = identity::tokens::issue(
+            &pool,
+            victim_id,
+            identity::tokens::Purpose::Reset,
+            Duration::minutes(30),
+            Utc::now(),
+        )
+        .await
+        .expect("issuing a reset token must work");
+
+        let response = call(confirm_password_reset(
+            State(state.clone()),
+            reset_json(&issued.raw, other, "a-stolen-new-password"),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "a token for one address used on another is refused: {}",
+            response.body_text()
+        );
+
+        // THE OTHER ACCOUNT IS UNCHANGED. This is load-bearing: a handler that
+        // verified the token, set the password and THEN noticed the mismatch would
+        // answer 401 with the damage already done.
+        let other_id = crate::identity::accounts::account_for_email(&pool, other)
+            .await
+            .expect("the lookup must work")
+            .expect("the second account exists");
+        let other_hash = stored_password_hash(&pool, other_id).await;
+        assert!(
+            identity::password::verify_password(
+                config,
+                other_hash,
+                "the-other-password".to_string(),
+            )
+            .await
+            .expect("verification must work"),
+            "the address named in the body must keep its own password"
+        );
+
+        db.close().await;
+    }
+
+    /// THE RESET REQUEST ANSWERS THE SAME WAY WHETHER OR NOT THE ADDRESS EXISTS.
+    ///
+    /// Same rule as signup, and the same failure mode: an asymmetric reply turns the
+    /// endpoint into "which addresses have accounts here?".
+    #[tokio::test]
+    async fn live_request_password_reset_answers_known_and_unknown_alike() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let known = "has-an-account@example.com";
+        let config = auth_config_for_tests().expect("the shipped [auth] section parses");
+        crate::identity::accounts::create_password_account(
+            &pool,
+            known,
+            &identity::password::hash_password(config, "a-real-enough-password".to_string())
+                .await
+                .expect("hashing must work"),
+            Utc::now(),
+        )
+        .await
+        .expect("creating the fixture account must work");
+
+        let for_known = call(request_password_reset(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            email_json(known),
+        ))
+        .await;
+        let for_unknown = call(request_password_reset(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            email_json("nobody-here@example.com"),
+        ))
+        .await;
+
+        assert_eq!(
+            for_known.status,
+            StatusCode::ACCEPTED,
+            "the reply is neutral and positive: {}",
+            for_known.body_text()
+        );
+        assert_eq!(
+            for_known.body_text(),
+            for_unknown.body_text(),
+            "an address WITH an account must get byte-identical copy to one WITHOUT, \
+             or the reply says which addresses are registered"
+        );
+
+        db.close().await;
+    }
+
+    /// A RESEND GOES ONLY TO AN UNVERIFIED ADDRESS.
+    ///
+    /// "Only an account that EXISTS and is still UNVERIFIED gets a mail. A verified
+    /// address asking again is not an error and does not get a link." The observable
+    /// is a NEW TOKEN ROW: the neutral reply means the status cannot tell the
+    /// difference, so the table is what proves the branch was taken.
+    #[tokio::test]
+    async fn live_resend_verification_issues_a_link_only_for_an_unverified_address() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let unverified = "not-yet-verified@example.com";
+        let config = auth_config_for_tests().expect("the shipped [auth] section parses");
+        let hash = identity::password::hash_password(config, "a-real-enough-password".to_string())
+            .await
+            .expect("hashing must work");
+        let pending = crate::identity::accounts::create_password_account(
+            &pool,
+            unverified,
+            &hash,
+            Utc::now(),
+        )
+        .await
+        .expect("creating the fixture account must work");
+
+        let before = verification_token_count(&pool, pending).await;
+        let response = call(resend_verification(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            email_json(unverified),
+        ))
+        .await;
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+        assert_eq!(
+            verification_token_count(&pool, pending).await,
+            before + 1,
+            "an UNVERIFIED address gets a fresh link"
+        );
+
+        // AND A VERIFIED ONE DOES NOT. The account is marked verified through the
+        // production helper, then asked again.
+        let identity = crate::identity::accounts::password_identity(&pool, unverified)
+            .await
+            .expect("the lookup must work")
+            .expect("the fixture has an identity");
+        crate::identity::accounts::mark_verified(&pool, identity.identity_id, Utc::now())
+            .await
+            .expect("marking verified must work");
+
+        let settled = verification_token_count(&pool, pending).await;
+        let response = call(resend_verification(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            email_json(unverified),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::ACCEPTED,
+            "the reply stays neutral even when nothing is sent"
+        );
+        assert_eq!(
+            verification_token_count(&pool, pending).await,
+            settled,
+            "a VERIFIED address gets NO new link: a working verification link for a \
+             proven address is a credential with nothing to do"
+        );
+
+        db.close().await;
+    }
+
+    /// A RESEND FOR AN UNKNOWN ADDRESS IS NEUTRAL AND WRITES NOTHING.
+    #[tokio::test]
+    async fn live_resend_verification_answers_an_unknown_address_neutrally() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let response = call(resend_verification(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            email_json("never-registered@example.com"),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::ACCEPTED,
+            "an unknown address is not an error: {}",
+            response.body_text()
+        );
+        assert_eq!(
+            identity_count(&pool, "never-registered@example.com").await,
+            0,
+            "and nothing is created for it"
+        );
+
+        db.close().await;
+    }
+
+    /// A TOKEN THAT IS NOT FROM GOOGLE IS REFUSED, AND IT COSTS NO BUDGET.
+    ///
+    /// THE ORDERING IS THE ASSERTION. `google_sign_in` verifies the token BEFORE it
+    /// records an attempt, so a caller who cannot possibly sign in does not spend the
+    /// address's rate-limit budget - and, more expensively, does not cost the server a
+    /// round trip to Google's JWKS endpoint. A handler that recorded first would pass
+    /// a status-only test and fail this one.
+    ///
+    /// HONEST LIMIT: the happy path of this handler CANNOT be driven from a test.
+    /// `identity::google::verify_id_token` offers no seam to inject claims - it always
+    /// fetches Google's key set - so no test here covers "a valid token creates or
+    /// finds the account and opens a session". What is covered is every branch that
+    /// runs before the signature is checked, which is all the code that does not depend
+    /// on live Google.
+    #[tokio::test]
+    async fn live_google_sign_in_refuses_a_forged_token_without_spending_the_budget() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        // A budget of ONE per address, so a single recorded attempt is detectable.
+        let _limits = TestLimitsGuard::set(1, 1);
+
+        let response = call(google_sign_in(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            Ok(Json(GoogleSignInRequest {
+                id_token: "not-a-jwt".to_string(),
+            })),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "a caller's rubbish token is 401, not 500: {}",
+            response.body_text()
+        );
+
+        let spent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login' AND account_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("counting the attempts must work");
+        assert_eq!(
+            spent, 0,
+            "a token that was never verified must not have spent the login budget: the \
+             check runs BEFORE the counter, so a forged token cannot exhaust a real \
+             user's allowance"
+        );
+
+        db.close().await;
+    }
+
+    /// A FORGED TOKEN LEAVES THE ROUTER AS 401, WITH THE DOCUMENTED SHAPE.
+    ///
+    /// This runs through the REAL router on purpose. `google_sign_in` is the one auth
+    /// handler whose failure the caller cannot act on (`verify_id_token` refuses before
+    /// the account is even looked up), and the contract pinned here is the HTTP
+    /// surface: a credential error is 401, it carries `code` and `request_id` the way
+    /// `docs/error-model.md` promises, and it is not a 500.
+    ///
+    /// HONEST LIMIT, and it is a real one: the UNCONFIGURED-CLIENT-ID branch is not
+    /// reachable from a test either. `auth_config()` (`:282`) reads the PROCESS-WIDE
+    /// `APP_CONFIG` `OnceLock`, not `state.config`, so a test cannot blank it without a
+    /// seam that does not exist. The coverage of this handler is its refusal path,
+    /// which is the branch a stranger can reach.
+    #[tokio::test]
+    async fn live_google_sign_in_refuses_a_forged_token_through_the_router() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let app = crate::routes::create_router(state_for(&pool)).layer(
+            axum::extract::connect_info::MockConnectInfo(SocketAddr::from((
+                [203, 0, 113, 40],
+                44321,
+            ))),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/auth/google")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"id_token":"not-a-jwt"}"#))
+            .expect("the request must build");
+        let response = app.oneshot(request).await.expect("the router must respond");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body must be readable");
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a token that is not from Google is a credential error, and the router must \
+             not turn it into a 500: {body}"
+        );
+        for required in ["\"code\"", "\"request_id\""] {
+            assert!(
+                body.contains(required),
+                "the error must carry {required} the way docs/error-model.md promises: {body}"
+            );
+        }
+
+        db.close().await;
+    }
 }
