@@ -2061,6 +2061,498 @@ mod tests {
         db.close().await;
     }
 
+    // --- POST /auth/password-change -----------------------------------------
+    //
+    // Six tests. This endpoint's whole reason to exist is the pair of guards a
+    // caller can try to skip - the current password, and the session revocation -
+    // so each test below fails if exactly one of them is removed. The set is a
+    // specification, not a smoke test.
+
+    /// A password identity for an account, written the way signup writes one.
+    async fn password_identity_for(
+        pool: &SqlitePool,
+        account_id: Uuid,
+        email: &str,
+        password: &str,
+    ) {
+        let hash = identity::password::hash_password(
+            auth_config().expect("auth config").clone(),
+            password.to_string(),
+        )
+        .await
+        .expect("hash the fixture password");
+        identity::accounts::upsert_password_identity(pool, account_id, email, &hash, true, Utc::now())
+            .await
+            .expect("create the password identity");
+    }
+
+    /// A Google identity row, written the way the Google path writes one. The
+    /// schema's CHECK refuses a google row whose flag is clear, so the flag is set
+    /// here rather than left to a column default that does not exist.
+    async fn google_identity_for(pool: &SqlitePool, account_id: Uuid, subject: &str, email: &str) {
+        sqlx::query(
+            "INSERT INTO identities (id, account_id, provider, subject, email, email_verified, \
+             created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        )
+        .bind(Uuid::new_v4().hyphenated().to_string())
+        .bind(account_id.hyphenated())
+        .bind("google")
+        .bind(subject)
+        .bind(email)
+        .bind(1_i64)
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(pool)
+        .await
+        .expect("create the google identity");
+    }
+
+    fn change_request(
+        current: &str,
+        next: &str,
+    ) -> Result<Json<PasswordChangeRequest>, axum::extract::rejection::JsonRejection> {
+        Ok(Json(PasswordChangeRequest {
+            current_password: current.into(),
+            new_password: next.into(),
+        }))
+    }
+
+    async fn stored_password_hash(pool: &SqlitePool, account_id: Uuid) -> String {
+        sqlx::query_scalar(
+            "SELECT password_hash FROM identities WHERE account_id = ? AND provider = 'password'",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_one(pool)
+        .await
+        .expect("read the stored password hash")
+    }
+
+    /// The happy path, and the two things it must actually do: store a hash of the
+    /// NEW password (not merely answer 204), and revoke EVERY session.
+    ///
+    /// The old password is checked to have stopped working. That is the assertion
+    /// which fails if `set_password` were ever handed the old hash: a change that
+    /// answered 204 while leaving the credential untouched would pass every
+    /// status-code assertion and leave the account on the compromised password.
+    #[tokio::test]
+    async fn live_password_change_replaces_the_hash_and_kills_every_session() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let victim = live_account(&pool).await;
+        let old_password = "the-original-password";
+        password_identity_for(&pool, victim.account_id, "change@example.com", old_password).await;
+
+        // A SECOND session on the same account, so the assertion below is about
+        // EVERY session rather than about the one cookie the change already had to
+        // kill to be a change at all.
+        let other_token =
+            add_live_session(&pool, victim.account_id, Utc::now() + Duration::days(30)).await;
+
+        let state = state_for(&pool);
+        let response = call(change_password(
+            State(state.clone()),
+            peer(),
+            cookie_header(&victim.token),
+            change_request(old_password, "the-replacement-password"),
+        ))
+        .await;
+
+        assert_eq!(
+            response.status,
+            StatusCode::NO_CONTENT,
+            "a correct current password must be accepted: {}",
+            response.body_text()
+        );
+        assert!(
+            response.body.is_empty(),
+            "api-spec.md: the change is a 204 with no body, got {}",
+            response.body_text()
+        );
+        assert_eq!(
+            response.cleared_token(),
+            None,
+            "the response must clear the cookie rather than hand back a live one"
+        );
+        assert_eq!(
+            live_sessions(&pool, victim.account_id).await,
+            0,
+            "EVERY session must be revoked, including the caller's and the sibling built above"
+        );
+
+        // Asserted through the VERIFIER rather than by comparing hashes: Argon2id is
+        // salted, so two hashes of one password differ, and a string comparison
+        // could only ever say the column changed, never what it holds.
+        let auth = auth_config().expect("auth config").clone();
+        let stored = stored_password_hash(&pool, victim.account_id).await;
+        assert!(
+            identity::password::verify_password(
+                auth.clone(),
+                stored.clone(),
+                "the-replacement-password".to_string(),
+            )
+            .await
+            .expect("verify the new password"),
+            "the new password must verify against the stored hash"
+        );
+        assert!(
+            !identity::password::verify_password(auth, stored, old_password.to_string())
+                .await
+                .expect("verify the old password"),
+            "THE OLD PASSWORD MUST STOP WORKING - this is the assertion that fails if the \
+             handler stored nothing and only revoked sessions"
+        );
+
+        // The sibling token is dead at the RESOLVER, not merely marked. That is the
+        // difference between a revocation and a column write.
+        assert!(
+            crate::routes::resolve_account_from_cookie(&pool, &cookie_header(&other_token))
+                .await
+                .is_err(),
+            "a revoked sibling session must no longer resolve to an account"
+        );
+
+        db.close().await;
+    }
+
+    /// THE TAKEOVER GUARD. A valid session cookie with a WRONG current password
+    /// must change nothing at all.
+    ///
+    /// This is the test that fails if the `verify_password` check is deleted: the
+    /// endpoint would then be reachable with a stolen cookie alone, which is the
+    /// exact takeover the handler's doc comment says it exists to prevent. Three
+    /// things are asserted UNCHANGED rather than only the status, because a handler
+    /// that verified and then proceeded anyway - or that revoked first and verified
+    /// second - would still earn a 401 while having already done the damage.
+    #[tokio::test]
+    async fn live_password_change_refuses_a_wrong_current_password_and_changes_nothing() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let victim = live_account(&pool).await;
+        let old_password = "the-original-password";
+        password_identity_for(&pool, victim.account_id, "guard@example.com", old_password).await;
+
+        let before = stored_password_hash(&pool, victim.account_id).await;
+
+        let state = state_for(&pool);
+        let response = call(change_password(
+            State(state.clone()),
+            peer(),
+            cookie_header(&victim.token),
+            change_request("not-the-current-password", "the-replacement-password"),
+        ))
+        .await;
+
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "a wrong current password is a 401, the same answer any refused credential earns: {}",
+            response.body_text()
+        );
+
+        let after = stored_password_hash(&pool, victim.account_id).await;
+        assert_eq!(
+            before, after,
+            "a refused change must not touch the stored hash, not even to re-hash the same password"
+        );
+        assert_eq!(
+            live_sessions(&pool, victim.account_id).await,
+            1,
+            "a refused change must not revoke the caller's session - being wrong once is not a reason to sign someone out"
+        );
+
+        // The customer-visible half: a failed change leaves the account exactly as
+        // it was found.
+        let auth = auth_config().expect("auth config").clone();
+        assert!(
+            identity::password::verify_password(auth, after, old_password.to_string())
+                .await
+                .expect("verify the original password"),
+            "the original password must still work after a refused change"
+        );
+
+        db.close().await;
+    }
+
+    /// A GOOGLE-ONLY account has no password to change, and is TOLD so rather than
+    /// given a 500 or a misleading 401.
+    ///
+    /// The distinction is not cosmetic: a 401 would tell a signed-in Google user
+    /// their credential was wrong when they have no credential, and the settings
+    /// panel's next step for a 401 is the reset flow - which would CREATE a password.
+    /// That is a different action from the one they asked for and one they did not
+    /// consent to.
+    #[tokio::test]
+    async fn live_password_change_tells_a_google_only_account_it_has_no_password() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let victim = live_account(&pool).await;
+        google_identity_for(&pool, victim.account_id, "google-subject-1", "g@example.com").await;
+
+        let state = state_for(&pool);
+        let response = call(change_password(
+            State(state.clone()),
+            peer(),
+            cookie_header(&victim.token),
+            change_request("anything-at-all", "the-replacement-password"),
+        ))
+        .await;
+
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a validation failure, not a 401: there is no password to have got wrong. 422 is \
+             what `ValidationFailed` carries (error.rs:116, pinned by its own test there): {}",
+            response.body_text()
+        );
+        assert_eq!(
+            response.json()["error"]["details"]["field"],
+            "current_password",
+            "the field named must be the one the caller can act on: {}",
+            response.body_text()
+        );
+        assert_eq!(
+            live_sessions(&pool, victim.account_id).await,
+            1,
+            "the session must survive a request that changed nothing"
+        );
+
+        db.close().await;
+    }
+
+    /// NO SESSION, NO BUDGET. An unauthenticated caller is refused BEFORE the
+    /// account's rate-limit budget is consulted.
+    ///
+    /// The ordering is the reason this is pinned: the budget protects a SIGNED-IN
+    /// account, so spending it before the cookie resolves would let an anonymous
+    /// caller exhaust a stranger's login allowance and turn the throttle into the
+    /// denial of service it exists to prevent.
+    #[tokio::test]
+    async fn live_password_change_refuses_an_anonymous_caller_without_spending_the_budget() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        // A budget of ONE for the account path. If the refusal below spent it, the
+        // signed-in attempt afterwards would be throttled and this test would see a
+        // 429 where it expects a 204.
+        let _caps = TestLimitsGuard::set(100, 1);
+        let state = state_for(&pool);
+
+        let victim = live_account(&pool).await;
+        let old_password = "the-original-password";
+        password_identity_for(&pool, victim.account_id, "anon@example.com", old_password).await;
+
+        let anonymous = call(change_password(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            change_request(old_password, "the-replacement-password"),
+        ))
+        .await;
+        assert_eq!(
+            anonymous.status,
+            StatusCode::UNAUTHORIZED,
+            "no cookie is a 401 before anything else happens: {}",
+            anonymous.body_text()
+        );
+
+        let recorded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login' AND account_id = ?",
+        )
+        .bind(victim.account_id.hyphenated())
+        .fetch_one(&pool)
+        .await
+        .expect("count the recorded attempts");
+        assert_eq!(
+            recorded, 0,
+            "an unauthenticated request must not have written an attempt against the account"
+        );
+
+        // The budget is intact, so a signed-in caller still reaches the credential
+        // check rather than the throttle. This is the assertion that fails if the
+        // handler records the attempt before resolving the cookie.
+        let signed_in = call(change_password(
+            State(state.clone()),
+            peer(),
+            cookie_header(&victim.token),
+            change_request(old_password, "the-replacement-password"),
+        ))
+        .await;
+        assert_eq!(
+            signed_in.status,
+            StatusCode::NO_CONTENT,
+            "the account's one attempt must still be available to the account itself: {}",
+            signed_in.body_text()
+        );
+
+        db.close().await;
+    }
+
+    /// A body that does not match the shape is a VALIDATION failure naming the
+    /// field, not a 404.
+    ///
+    /// This is why the handler takes `Result<Json<T>, JsonRejection>` instead of
+    /// `Json<T>`: axum answers `NOT_FOUND` for a rejected body, and a 404 from a
+    /// mounted route is indistinguishable from an unmounted one - which is exactly
+    /// how `POST /auth/password-change` stayed invisible while it was being mounted.
+    #[tokio::test]
+    async fn live_password_change_reports_a_malformed_body_as_validation_not_404() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let victim = live_account(&pool).await;
+
+        let state = state_for(&pool);
+        let rejected = call(change_password(
+            State(state.clone()),
+            peer(),
+            cookie_header(&victim.token),
+            Err(
+                axum::extract::rejection::JsonRejection::MissingJsonContentType(
+                    axum::extract::rejection::MissingJsonContentType::default(),
+                ),
+            ),
+        ))
+        .await;
+
+        assert_eq!(
+            rejected.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a malformed body is a 422, NEVER a 404 - that is the whole reason the handler \
+             maps the rejection itself. axum's own answer for a rejected body is NOT_FOUND, \
+             which is indistinguishable from an unmounted route: {}",
+            rejected.body_text()
+        );
+        assert_eq!(
+            rejected.json()["error"]["details"]["field"],
+            "body",
+            "the rejection must name the body, not a credential field: {}",
+            rejected.body_text()
+        );
+
+        db.close().await;
+    }
+
+    // --- GET /auth/providers ------------------------------------------------
+
+    /// The list reports the ACCOUNT'S OWN identity rows: a password-only account and
+    /// a Google-only account get different answers over the same database.
+    ///
+    /// TWO ACCOUNTS IN ONE DATABASE is the point. With a single account, a query
+    /// that forgot its `WHERE account_id = ?` would return the same one-element list
+    /// and the test would pass while the endpoint reported every identity in the
+    /// system to anyone holding a cookie.
+    #[tokio::test]
+    async fn live_providers_lists_only_this_accounts_identity_rows() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let password_account = live_account(&pool).await;
+        password_identity_for(
+            &pool,
+            password_account.account_id,
+            "pw@example.com",
+            "any-password",
+        )
+        .await;
+
+        let google_account = live_account(&pool).await;
+        google_identity_for(
+            &pool,
+            google_account.account_id,
+            "google-subject-2",
+            "g@example.com",
+        )
+        .await;
+
+        let state = state_for(&pool);
+
+        let mine = call(list_providers(
+            State(state.clone()),
+            cookie_header(&password_account.token),
+        ))
+        .await;
+        assert_eq!(mine.status, StatusCode::OK);
+        assert_eq!(
+            mine.json()["providers"],
+            serde_json::json!(["password"]),
+            "a password-only account must be told exactly that, and must NOT see the other account's google row"
+        );
+
+        let theirs = call(list_providers(
+            State(state.clone()),
+            cookie_header(&google_account.token),
+        ))
+        .await;
+        assert_eq!(theirs.status, StatusCode::OK);
+        assert_eq!(
+            theirs.json()["providers"],
+            serde_json::json!(["google"]),
+            "the google account must report google, which it cannot do if the query is not scoped by account"
+        );
+
+        db.close().await;
+    }
+
+    /// An account with BOTH sign-in methods reports both, once each.
+    ///
+    /// `SELECT DISTINCT` is load-bearing and this is the test that catches its
+    /// removal: an account that has signed in twice through one provider holds two
+    /// rows for it, and the panel would then be shown a repeated entry.
+    #[tokio::test]
+    async fn live_providers_reports_each_provider_once_for_an_account_that_has_both() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let account = live_account(&pool).await;
+        password_identity_for(&pool, account.account_id, "both@example.com", "any-password").await;
+        google_identity_for(&pool, account.account_id, "google-subject-3", "both@example.com").await;
+
+        let state = state_for(&pool);
+        let response = call(list_providers(
+            State(state.clone()),
+            cookie_header(&account.token),
+        ))
+        .await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        let mut providers: Vec<String> =
+            serde_json::from_value(response.json()["providers"].clone()).expect("a list of strings");
+        providers.sort();
+        assert_eq!(
+            providers,
+            vec!["google".to_string(), "password".to_string()],
+            "an account with both sign-in methods must be told both - and this is the answer \
+             the pair of booleans the response deliberately does not use could not express: {}",
+            response.body_text()
+        );
+
+        db.close().await;
+    }
+
+    /// No session is a 401 and NOT an empty list.
+    ///
+    /// An empty list would be a lie with a useful shape: the settings panel renders
+    /// "Not linked" for every provider, which reads as "this account has no sign-in
+    /// methods" rather than "you are not signed in".
+    #[tokio::test]
+    async fn live_providers_refuses_an_anonymous_caller_rather_than_answering_empty() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+
+        let anonymous = call(list_providers(State(state.clone()), HeaderMap::new())).await;
+        assert_eq!(
+            anonymous.status,
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated caller must be refused, not handed an empty provider list: {}",
+            anonymous.body_text()
+        );
+
+        db.close().await;
+    }
     /// States the `[limits]` caps a test wants, without touching the config file, and
 /// clears them again when the test ends.
 ///
