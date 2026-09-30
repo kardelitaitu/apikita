@@ -22,11 +22,51 @@
 
 import { API_BASE, ApiError } from './api.ts';
 
-/** What every native auth verb answers a success with. */
-export interface SessionResult {
-  account_id: string;
-  balance_idr: number;
-}
+/**
+ * The error envelope the API puts on a non-2xx body.
+ *
+ * Named, and used at the two places that read it, because the previous form was
+ * `let parsed: Envelope | null = null; ... parsed = (await res.json()) as typeof
+ * parsed;` — and `typeof parsed` there is the narrowed type at that point, which
+ * is `never`. The cast said "believe me, this is whatever `parsed` already is",
+ * and what `parsed` already was, on that line, was `null`. TypeScript took the
+ * assertion at its word and every later read of `parsed.error` became a read of
+ * `never`.
+ *
+ * It never misbehaved at runtime — an assertion is erased — which is exactly why
+ * it went unnoticed: the only symptom was two type errors the typecheck gate
+ * could not report because the gate was not passing for other reasons.
+ */
+type ErrorEnvelope = {
+  error?: {
+    code: string;
+    message: string;
+    request_id?: string;
+    details?: Record<string, unknown>;
+  };
+};
+
+/**
+ * What every native auth verb answers a success with: an empty object.
+ *
+ * It used to declare `account_id` and `balance_idr`, mirroring the server's
+ * `AuthSessionResponse`. Neither side read either field. The pages that call
+ * `login` and `googleSignIn` redirect on success and never touch the value, so
+ * the body was a shape nothing consumed — and a shape nothing consumes is a
+ * second definition of a fact free to drift from the one in use.
+ *
+ * The payload is the `Set-Cookie: session=...` beside the body. `account_id`
+ * comes from `GET /api/me` when a page needs it, and the balance has a live
+ * delivery path clients DO read: the SSE `balance` event in `lib/live.ts`.
+ *
+ * Deliberately NOT `Record<string, never>`: `never` for the VALUE makes the whole
+ * object uninhabitable and TS reports reading any property off it as
+ * "Property 'x' does not exist on type 'never'" at unrelated call sites, which is
+ * a worse error message than the one this type exists to give. `{}` is the honest
+ * shape — an empty object — and reading a field off it is still an error, named
+ * after the field.
+ */
+export type SessionResult = Record<string, unknown>;
 
 /**
  * The Google ID token's claim shape, as far as the page reads it.
@@ -158,9 +198,9 @@ async function postAuth<T>(path: string, body: unknown): Promise<T> {
   });
 
   if (!res.ok) {
-    let parsed: { error?: { code: string; message: string; request_id?: string; details?: Record<string, unknown> } } | null = null;
+    let parsed: ErrorEnvelope | null = null;
     try {
-      parsed = (await res.json()) as typeof parsed;
+      parsed = (await res.json()) as ErrorEnvelope;
     } catch {
       // A non-JSON body: fall through to the status line, exactly as apiFetch does.
     }
@@ -280,9 +320,9 @@ export async function listProviders(): Promise<{ providers: string[] }> {
   });
 
   if (!res.ok) {
-    let parsed: { error?: { code: string; message: string; request_id?: string; details?: Record<string, unknown> } } | null = null;
+    let parsed: ErrorEnvelope | null = null;
     try {
-      parsed = (await res.json()) as typeof parsed;
+      parsed = (await res.json()) as ErrorEnvelope;
     } catch {
       // A non-JSON body: fall through to the status line, exactly as postAuth does.
     }

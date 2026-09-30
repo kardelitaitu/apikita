@@ -267,8 +267,8 @@ import Skeleton from '../../components/Skeleton.astro';
         [];
       buckets = arr as UsageBucket[];
     }
-    // The server orders `day DESC` (account.rs:296), so "today" is the newest
-    // day, not the last element of the array.
+    // The server orders `day DESC` (server/src/routes/account.rs `get_usage`), so
+    // "today" is the newest day, not the last element of the array.
     return { buckets, today: newestBucket(buckets) };
   }
 

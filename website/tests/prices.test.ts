@@ -147,7 +147,7 @@ test('the deposit minimums are the config wallet minimums', async () => {
 // undercounts; if one is removed from the config and left here, the summary names a
 // model that cannot exist. Both are silent, because the number is a count.
 test('KNOWN_MODELS is the config model list, in file order', async () => {
-  const { KNOWN_MODELS, models } = await import('../src/lib/dashboard-form.ts');
+  const { KNOWN_MODELS } = await import('../src/lib/dashboard-form.ts');
   const lib = await import('../src/lib/models.ts');
 
   const declared = config

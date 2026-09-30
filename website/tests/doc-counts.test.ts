@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 189;
+const WEBSITE_TESTS = 193;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -353,6 +353,20 @@ test('no doc still claims a superseded count', () => {
         // that supplies every field cannot see a defect that consists of a field never being
         // supplied.
         'website: **187 tests**', 'passes **187 tests**', '**187 tests**',
+        // Retired when the two READMEs' counts were regenerated after a test-file sweep.
+        'website: **188 tests**', 'passes **188 tests**', '**188 tests**',
+        // Retired when the sign-in body was emptied. `POST /auth/login` and
+        // `POST /auth/google` used to answer `{ account_id, balance_idr }`, mirrored by
+        // `SessionResult` in website/src/lib/auth-api.ts, and NOTHING read either field on
+        // either side: website/src/pages/login.astro is the only caller and both handlers
+        // end `.then(() => window.location.assign(destination))`, discarding the value. The
+        // payload was always the HttpOnly `Set-Cookie: session=…` beside it. `balance_idr`
+        // was the costly half - it made the login route run a wallet SELECT no client
+        // consumed, while the balance has a delivery path clients DO read (the SSE `balance`
+        // event, consumed in lib/live.ts). The struct, the client type and the API spec were
+        // all emptied, and a new guard (all four assertions mutation-proved) now fails if any
+        // of the three grows a field back.
+        'website: **189 tests**', 'passes **189 tests**', '**189 tests**',
       ],
     },
   ];

@@ -109,15 +109,29 @@ fn hash_token(token: &str) -> String {
 
 /// The session body the native sign-in endpoints return.
 ///
-/// The same shape the exchange response had, under a name that does not mention
-/// the retired exchange: the website's client reads this, and naming a live
-/// response after a deleted flow is the kind of stale name that outlives the
-/// code it describes.
+/// It is EMPTY, and that is a correction rather than an oversight. It used to
+/// carry `account_id` and `balance_idr`, on the theory that "the website's client
+/// reads this". It did not: `website/src/lib/auth-api.ts` declared the matching
+/// `SessionResult`, passed it as the type argument to `postAuth`, and then every
+/// caller in `website/src/pages/login.astro` threw the value away —
+/// `.then(googleSignIn).then(() => window.location.assign(destination))`. Nothing
+/// read either field, on either side, since the response was written.
+///
+/// The contract the endpoints actually have is the `Set-Cookie: session=...`
+/// beside this body. That is what signs the caller in, and it is HttpOnly, so the
+/// body was never the credential. `account_id` is not a fact the caller needs to
+/// be told — it can ask `GET /api/me`. `balance_idr` was the more expensive
+/// mistake: it made the login path run a wallet SELECT whose result no client
+/// consumed, and the balance has a first-class delivery path that clients DO
+/// read, the SSE `balance` event
+/// (`server/src/routes/events.rs:455` -> `website/src/lib/live.ts:158`).
+///
+/// A field that is published but unread is not harmless: it is a second
+/// definition of a fact that can drift from the one in use, and the next reader
+/// of `docs/server/api-spec.md` writes a client against it. Making the body empty
+/// means there is nothing there to drift.
 #[derive(Debug, Serialize)]
-pub struct AuthSessionResponse {
-    pub account_id: Uuid,
-    pub balance_idr: i64,
-}
+pub struct AuthSessionResponse {}
 
 #[derive(Debug, Deserialize)]
 pub struct SignupRequest {
@@ -719,20 +733,10 @@ pub async fn login(
     .execute(&state.pool)
     .await?;
 
-    let balance: i64 =
-        sqlx::query_scalar("SELECT COALESCE(balance_idr, 0) FROM wallets WHERE account_id = ?")
-            .bind(identity_row.account_id.hyphenated())
-            .fetch_optional(&state.pool)
-            .await?
-            .unwrap_or(0);
-
     Ok((
         StatusCode::OK,
         session_cookie(token, sessions.absolute_days as i64)?,
-        Json(AuthSessionResponse {
-            account_id: identity_row.account_id,
-            balance_idr: balance,
-        }),
+        Json(AuthSessionResponse {}),
     ))
 }
 
@@ -827,20 +831,10 @@ pub async fn google_sign_in(
     .execute(&state.pool)
     .await?;
 
-    let balance: i64 =
-        sqlx::query_scalar("SELECT COALESCE(balance_idr, 0) FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_optional(&state.pool)
-            .await?
-            .unwrap_or(0);
-
     Ok((
         StatusCode::OK,
         session_cookie(token, sessions.absolute_days as i64)?,
-        Json(AuthSessionResponse {
-            account_id,
-            balance_idr: balance,
-        }),
+        Json(AuthSessionResponse {}),
     ))
 }
 

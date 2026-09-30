@@ -121,9 +121,23 @@ Errors: `422` malformed address or a password below `[auth] password_min_length`
 { "email": "you@example.com", "password": "..." }
 
 // 200 response
-{ "account_id": "uuid", "balance_idr": 50000 }
+{}
 // sets: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax
 ```
+
+**The body is empty, and it used to carry `account_id` and `balance_idr`.** It is
+not an oversight: neither field was read by anything. The website declared the
+matching `SessionResult`, passed it to its own `postAuth`, and then every caller
+threw the value away — `login.astro` redirects on success and never looks at it.
+The payload that signs a caller in is the `Set-Cookie` beside the body, which is
+HttpOnly and was always the real credential.
+
+`balance_idr` was the more expensive half: it made this route run a wallet
+`SELECT` whose result no client consumed, and the balance has a delivery path
+clients DO read — the SSE `balance` event, published by `events::stream` and
+consumed in `website/src/lib/live.ts`. A field that is published but unread is a
+second definition of a fact free to drift from the one in use, so a client
+wanting `account_id` asks `GET /api/me`.
 
 Errors: `401` wrong address or password (the same answer for both, and a missing
 account still pays for a hash so the timing does not distinguish them). `429`
@@ -137,7 +151,7 @@ which is the only thing that makes the cap worth having.
 { "id_token": "<Google Identity Services credential>" }
 
 // 200 response
-{ "account_id": "uuid", "balance_idr": 50000 }
+{}
 // sets: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax
 ```
 

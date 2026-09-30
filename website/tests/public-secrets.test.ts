@@ -33,7 +33,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 
 /** Every source file that the build can substitute a PUBLIC_ variable into. */
-function sourceFiles(dir = join(root, 'src'), out = []) {
+function sourceFiles(dir = join(root, 'src'), out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
     const path = join(dir, entry);
     if (statSync(path).isDirectory()) sourceFiles(path, out);
@@ -43,8 +43,8 @@ function sourceFiles(dir = join(root, 'src'), out = []) {
 }
 
 /** The PUBLIC_ names the source actually reads, which is the reachable set. */
-function referencedPublicNames() {
-  const names = new Set();
+function referencedPublicNames(): string[] {
+  const names = new Set<string>();
   for (const path of sourceFiles()) {
     for (const m of readFileSync(path, 'utf8').matchAll(/PUBLIC_([A-Z0-9_]+)/g)) {
       names.add(`PUBLIC_${m[1]}`);

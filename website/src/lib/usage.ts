@@ -28,8 +28,8 @@ export function toIsoDay(date: Date): string {
  * question the API actually answers; leaving `to` off would let a server-side
  * default decide how far forward the window reaches.
  *
- * Both bounds are INCLUSIVE (api-spec.md:304), so the span is 30 days *including*
- * today: `to - (USAGE_WINDOW_DAYS - 1)`.
+ * Both bounds are INCLUSIVE (docs/server/api-spec.md `GET /api/usage`), so the span
+ * is 30 days *including* today: `to - (USAGE_WINDOW_DAYS - 1)`.
  *
  * `Date.UTC` rolls impossible dates over (2025-02-30 becomes 2025-03-02), which
  * cannot arise from a real `Date`; the round trip is checked anyway so a
