@@ -3,8 +3,8 @@
 //! # Why this module exists at all
 //!
 //! `docs/telegram/README.md` specified reviews as a BOT-ONLY flow: the bot was
-//! "the only way to write a review" (`:169`), a cookie was answered with 403, and
-//! the website could read the aggregate and nothing else. The bot is not being
+//! "the only way to write a review", a cookie was answered with 403, and the
+//! website could read the aggregate and nothing else. The bot is not being
 //! built. The launch gate that hung off it (`docs/launch-checklist.md` L318) asked
 //! for three properties, and every one of them is a property of the DATA, not of
 //! the bot that happened to write it:

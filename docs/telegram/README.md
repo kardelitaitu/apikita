@@ -166,19 +166,29 @@ rely on the room to inform a user about their own money.
 
 ## Room #4 — review
 
-One review per user, editable. **The bot is the only way to write a review.**
+> **Superseded: reviews are written by the website, not by the bot.** This section
+> described the bot as the only writer, and a cookie as a `403`. The bot is deferred
+> (see the banner at the top of this file), so that flow was never built; the review
+> endpoints shipped under cookie-session auth instead ([`docs/server/api-spec.md`](../server/api-spec.md)).
+> What follows is kept as the record of the design and of what the bot would have
+> contributed if it were built. **Nothing here is current behaviour.**
 
-| Action | Telegram | Website |
+The original design: one review per user, editable, written only through the bot.
+
+| Action | Telegram (not built) | Website (shipped) |
 | --- | --- | --- |
-| Write / edit a review | **Yes** | **No** |
-| Withdraw | **Yes** | No |
-| Read an aggregate | Yes | Yes (read-only) |
-| Read one's own review | Yes (`/review show`) | No |
+| Write / edit a review | Yes | **Yes — cookie session** |
+| Withdraw | Yes | **Yes — cookie session** |
+| Read an aggregate | Yes | Yes |
+| Read one's own review | Yes (`/review show`) | **Yes** |
 
-**The website cannot create or edit a review.** It may display the aggregate only.
-Reviews are the Telegram channel's contribution, and allowing a second writer makes
-"who reviewed" ambiguous. The API returns `403` if a browser session tries to
-post one — see [`docs/server/api-spec.md`](../server/api-spec.md).
+The reason the bot-only rule was written is still worth reading, because it was
+about making "who reviewed" unambiguous: the bot had already authenticated the
+chat, so a `telegram_id` in the request body was safe there. **A cookie
+endpoint cannot do that** — an identity taken from its own body would let any
+caller write as anyone. The shipped endpoints therefore resolve the account from
+the session and take only the content from the body, which is strictly stronger on
+the point that mattered. A website session can write its own review and no other.
 
 ## Commands
 
