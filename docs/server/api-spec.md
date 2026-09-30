@@ -235,6 +235,17 @@ Revokes the current session row. `204`. Clears the cookie.
 Revokes **every** session for the account. `204`. This is real revocation, not
 just discarding a token — other devices are logged out immediately.
 
+**The caller's own cookie must be a live session, by the same rule every other
+route uses.** It is not enough that the row is unrevoked and unexpired: the idle
+bound applies too, so a session that has gone unused for longer than
+`sessions.idle_days` cannot authorise this call. That was false — the lookup
+filtered on `revoked_at IS NULL AND expires_at > ?` only — and the consequence ran
+in the dangerous direction: a cookie that no longer authenticated anything
+anywhere else could still sign every other device on the account out. The idle
+check now runs through the same `session_is_live_at` the shared resolver uses, so
+the two cannot disagree about what "live" means. An idle cookie gets the same
+`204` an expired one does: it is not an error, it is just not a credential.
+
 ### `POST /auth/password-change`
 
 Changes the password of the signed-in account. `204`, and clears the cookie:
@@ -912,6 +923,14 @@ Three consequences worth stating rather than discovering:
    *below* the absolute lifetime — the shipped 7 against 30 — changes behaviour,
    so a misconfiguration can never cut a session shorter than the register
    promises.
+
+**`POST /auth/logout-all` is the one endpoint that reads a session without
+touching it.** It is checked against this same rule — idle included — but it does
+not move `last_seen_at`, because it revokes the session it was given and the row
+is about to be dead; recording activity on the way out would order the writes
+pointlessly. It previously checked only `revoked_at` and `expires_at`, so an idle
+cookie was accepted there and nowhere else, and could revoke every other device on
+the account. See the endpoint's own section above.
 
 **403 is authorization, not authentication** — the caller is authenticated, we
 know who they are, and they may not do this ([error-model.md](../error-model.md),

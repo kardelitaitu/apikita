@@ -26,11 +26,24 @@ use crate::routes::{session_token_from_cookie_header, SESSION_COOKIE};
 /// SHA-256 hex of a session token, the value the sessions row stores.
 /// The account a request's session cookie resolves to, against SQLite.
 ///
+/// # This is a faithful mirror of production, and it is checked as one
+///
 /// The shared resolver in `crate::routes` takes a `SqlitePool` and works for the
 /// handlers; this test-side copy exists because the auth tests below drive the
-/// handler AND the resolver against the same pool, and the production one is the
-/// only other place that knows the hash-then-compare rule. Both are the same
-/// three lines, so a divergence would fail a test rather than pass silently.
+/// handler AND the resolver against the same pool.
+///
+/// **IT USED TO BE A DIFFERENT RULE, and this comment said it was the same one.**
+/// The doc here claimed "Both are the same three lines, so a divergence would
+/// fail a test rather than pass silently" - while this copy filtered only on
+/// `revoked_at IS NULL AND expires_at > ?` and production applied the idle half
+/// too, through `session_is_live_at`, and refreshed `last_seen_at`. So the
+/// divergence the comment promised a test would catch was, for the idle rule,
+/// invisible to every test in this file: the two disagreed and no assertion
+/// compared them. A comment asserting a property is not the property.
+///
+/// It now calls the SAME `session_is_live_at` the production resolver calls, with
+/// the same config, so the rule is shared rather than transcribed. The
+/// `last_seen_at` refresh below is the other half of that parity.
 #[cfg(test)]
 async fn resolve_account_from_cookie(
     pool: &SqlitePool,
@@ -43,18 +56,49 @@ async fn resolve_account_from_cookie(
 
     let token = session_token_from_cookie_header(cookie_hdr).ok_or(AppError::Unauthenticated)?;
 
+    let now = chrono::Utc::now();
+    let sessions = sessions_config()?;
+    let idle_days = sessions.idle_days as i64;
+    let absolute_days = sessions.absolute_days as i64;
+
     let session = sqlx::query(
-        "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+        "SELECT account_id, last_seen_at, expires_at FROM sessions \
+         WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
     )
     .bind(hash_token(token))
-    .bind(chrono::Utc::now())
+    .bind(now)
     .fetch_optional(pool)
     .await?;
 
-    match session {
-        Some(s) => Ok(s.get::<Hyphenated, _>("account_id").into_uuid()),
-        None => Err(AppError::Unauthenticated),
+    let Some(session) = session else {
+        return Err(AppError::Unauthenticated);
+    };
+
+    let account_id: Uuid = session
+        .try_get::<Hyphenated, _>("account_id")
+        .map_err(|_| AppError::Unauthenticated)?
+        .into_uuid();
+    let last_seen_at: chrono::DateTime<chrono::Utc> = session
+        .try_get("last_seen_at")
+        .map_err(|_| AppError::Unauthenticated)?;
+    let expires_at: chrono::DateTime<chrono::Utc> = session
+        .try_get("expires_at")
+        .map_err(|_| AppError::Unauthenticated)?;
+
+    if !crate::routes::session_is_live_at(now, last_seen_at, expires_at, idle_days, absolute_days) {
+        return Err(AppError::Unauthenticated);
     }
+
+    // A refusal above must NOT extend the session, so this write sits after the
+    // liveness check - the same ordering, and the same guard, as production.
+    sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ? AND last_seen_at < ?")
+        .bind(now)
+        .bind(hash_token(token))
+        .bind(now)
+        .execute(pool)
+        .await?;
+
+    Ok(account_id)
 }
 
 fn hash_token(token: &str) -> String {
@@ -1057,6 +1101,29 @@ pub async fn logout(
 
 /// Revoke every live session for the account - other devices are logged out
 /// immediately (docs/server/api-spec.md, auth).
+///
+/// # The caller's own session is judged by the WHOLE rule, not by half of it
+///
+/// This endpoint is a destructive act on other devices, so the credential that
+/// authorises it has to be one the rest of the server would also honour. The
+/// lookup below used to filter on `revoked_at IS NULL AND expires_at > ?` only -
+/// the two halves that are properties of the row - and omitted the idle half.
+/// Both the production resolver (`crate::routes::resolve_account_from_cookie`)
+/// and `session_is_live_at` apply all three, so an abandoned-but-unexpired
+/// session was refused everywhere else and still accepted HERE.
+///
+/// The consequence is narrow but real, and it is the direction that matters: a
+/// cookie that no longer authenticates anything could still sign every other
+/// device on the account out. That is a denial of service against a customer, by
+/// anyone holding a token they can no longer use - and it needs no password, no
+/// second factor and no live session, only a stale cookie and the ability to
+/// POST. The `expires_at` half has a test (`logout_all_ignores_dead_sessions`);
+/// the idle half was never part of the predicate at all.
+///
+/// The idle comparison is done in Rust by `session_is_live_at`, NOT in SQL, for
+/// the reason `crate::routes` gives for doing it that way in the resolver: the
+/// rule this crate ships is then the rule its tests exercise, and the two callers
+/// cannot drift into disagreeing about what "live" means.
 pub async fn logout_all(
     State(pool): State<SqlitePool>,
     headers: HeaderMap,
@@ -1066,16 +1133,43 @@ pub async fn logout_all(
         .and_then(|v| v.to_str().ok())
         .and_then(session_token_from_cookie_header)
     {
+        let now = Utc::now();
+        let sessions = sessions_config()?;
+        let idle_days = sessions.idle_days as i64;
+        let absolute_days = sessions.absolute_days as i64;
+
         let session = sqlx::query(
-            "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+            "SELECT account_id, last_seen_at, expires_at FROM sessions \
+             WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
         )
         .bind(hash_token(token))
-        .bind(Utc::now())
+        .bind(now)
         .fetch_optional(&pool)
         .await?;
 
-        if let Some(s) = session {
+        // The row's own timestamps decide whether this cookie is a credential at
+        // all. An unreadable row is not a reason to revoke: this endpoint is
+        // destructive, so its failures fall toward doing nothing. It answers 204
+        // rather than 500, matching how it already treats a cookie that resolves
+        // to nothing.
+        let caller = session.and_then(|s| {
             let account_id: Uuid = s.get::<Hyphenated, _>("account_id").into_uuid();
+            let last_seen_at: chrono::DateTime<chrono::Utc> = s.try_get("last_seen_at").ok()?;
+            let expires_at: chrono::DateTime<chrono::Utc> = s.try_get("expires_at").ok()?;
+            Some((account_id, last_seen_at, expires_at))
+        });
+
+        let caller = caller.filter(|(_, last_seen_at, expires_at)| {
+            crate::routes::session_is_live_at(
+                now,
+                *last_seen_at,
+                *expires_at,
+                idle_days,
+                absolute_days,
+            )
+        });
+
+        if let Some((account_id, _, _)) = caller {
             sqlx::query(
                 "UPDATE sessions SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL",
             )
@@ -1446,6 +1540,38 @@ mod tests {
         .bind(hash_token(&token))
         .bind(expires_at)
         .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("create session");
+        token
+    }
+
+    /// A session with an EXPLICIT `last_seen_at`, which `add_live_session` cannot
+    /// express because it always stamps "now".
+    ///
+    /// That helper's freshness is what made the idle rule untestable: every session
+    /// any test built was freshly touched, so `session_is_live_at`'s idle branch was
+    /// never the deciding one and `logout_all`'s missing idle check could not show.
+    /// Being able to say "this session has not been used for N days" is the whole
+    /// point.
+    async fn add_session_with_last_seen(
+        pool: &SqlitePool,
+        account_id: Uuid,
+        expires_at: DateTime<Utc>,
+        last_seen_at: DateTime<Utc>,
+    ) -> String {
+        let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(hash_token(&token))
+        .bind(expires_at)
+        .bind(last_seen_at)
         .bind(now)
         .execute(pool)
         .await
@@ -1903,6 +2029,130 @@ mod tests {
             ledger_drift_rows(&pool, account_id).await,
             0,
             "the fixture must not have manufactured ledger drift"
+        );
+    }
+
+    /// THE IDLE HALF OF THE SAME RULE, which the `expires_at` test above cannot
+    /// reach.
+    ///
+    /// An idle session is not expired - its `expires_at` is comfortably in the
+    /// future - so it passes the SQL predicate and, until this round, passed
+    /// `logout_all`'s check too. It has been refused by every other route the whole
+    /// time, because the shared resolver applies `session_is_live_at`. So the
+    /// cookie could not authenticate anything, and could still sign every other
+    /// device on the account out: a customer-facing denial of service available to
+    /// anyone holding a token they can no longer use.
+    ///
+    /// WHY NO EXISTING TEST COULD SEE IT: `add_live_session` always writes
+    /// `last_seen_at = now`, so every session any test builds is freshly touched.
+    /// The defect was unreachable by construction from the fixture - the third time
+    /// in this run of rounds that a fixture which always supplies a value could not
+    /// observe a defect consisting of that value being wrong. The helper below
+    /// exists to make the idle case expressible at all.
+    #[tokio::test]
+    async fn live_logout_all_ignores_an_idle_session_that_still_has_time_left() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = live_account(&pool).await;
+
+        // Expires in 30 days: NOT expired. Last seen long before the idle window.
+        let idle_days = sessions_config().expect("session config").idle_days as i64;
+        let idle_token = add_session_with_last_seen(
+            &pool,
+            account.account_id,
+            Utc::now() + Duration::days(30),
+            Utc::now() - Duration::days(idle_days + 1),
+        )
+        .await;
+
+        let outcome = tokio::spawn(logout_all_ignores_idle_sessions(
+            pool.clone(),
+            account.account_id,
+            account.token.clone(),
+            idle_token,
+            idle_days,
+        ));
+        let outcome = outcome.await;
+
+        db.close().await;
+        outcome.expect("the logout_all idle-session assertions panicked");
+    }
+
+    async fn logout_all_ignores_idle_sessions(
+        pool: SqlitePool,
+        account_id: Uuid,
+        live_token: String,
+        idle_token: String,
+        idle_days: i64,
+    ) {
+        // The fixture must be the case that matters: unexpired, but idle.
+        assert!(
+            resolve_account_from_cookie(&pool, &cookie_header(&idle_token))
+                .await
+                .is_err(),
+            "the fixture's idle session must not resolve: if it does, this test is \
+             not exercising the idle rule at all"
+        );
+        let expires_at: String =
+            sqlx::query_scalar("SELECT expires_at FROM sessions WHERE token_hash = ?")
+                .bind(hash_token(&idle_token))
+                .fetch_one(&pool)
+                .await
+                .expect("read the idle session's expiry");
+        assert!(
+            expires_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "the idle session must still be UNEXPIRED ({expires_at}), or this is just \
+             the expires_at test again"
+        );
+
+        let idle = call(logout_all(State(pool.clone()), cookie_header(&idle_token))).await;
+        assert_eq!(
+            idle.status,
+            StatusCode::NO_CONTENT,
+            "an idle cookie is not an error, it is just not a credential: {}",
+            idle.body_text()
+        );
+
+        // `live_sessions()` counts unrevoked-and-unexpired rows, and it does NOT
+        // apply the idle rule - an idle session is still "live" by that query. So
+        // the expected count is BOTH rows, and anything lower would mean the idle
+        // cookie revoked something it had no right to.
+        assert_eq!(
+            live_sessions(&pool, account_id).await,
+            2,
+            "an IDLE session (last seen {} days ago, expires_at in the future) must not sign \
+             the account's live sessions out. It cannot authenticate anything else - the shared \
+             resolver refuses it - so accepting it here would let a token that no longer works \
+             act destructively on every other device.",
+            idle_days + 1
+        );
+
+        // Neither row may be revoked, checked by name rather than by count, so this
+        // cannot pass because the two errors cancelled out.
+        for (label, token) in [
+            ("the idle caller's own", &idle_token),
+            ("the live one", &live_token),
+        ] {
+            let revoked_at: Option<String> =
+                sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
+                    .bind(hash_token(token))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read revoked_at");
+            assert_eq!(
+                revoked_at, None,
+                "{label} session was revoked by an idle cookie. That cookie resolves to no \
+                 account anywhere else in the server, so this would be a denial of service \
+                 available to anyone holding a stale token."
+            );
+        }
+
+        // ...and the live session still works, so nothing was silently killed.
+        assert_eq!(
+            resolve_account_from_cookie(&pool, &cookie_header(&live_token))
+                .await
+                .expect("the live session must survive"),
+            account_id
         );
     }
 

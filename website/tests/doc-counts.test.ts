@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 189;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 607;
+const SERVER_TESTS = 608;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -230,6 +230,16 @@ test('no doc still claims a superseded count', () => {
         // export read `token_limit` from the start, which is part of why the omission looked
         // deliberate. Both halves are pinned now.
         '606 tests', '606 passed', '606 / 0 / 0',
+        // Retired when `logout_all` was made to judge its caller by the whole session
+        // rule. Its lookup filtered on `revoked_at IS NULL AND expires_at > ?` only, so an
+        // IDLE-but-unexpired session was accepted there and refused everywhere else - and
+        // could then revoke every other device on the account. That is a denial of service
+        // against a customer, available to anyone holding a token they can no longer use.
+        // No existing test could see it: `add_live_session` always stamps
+        // `last_seen_at = now`, so every session any test built was freshly touched, and
+        // the fixture made the defect unreachable. The auth tests' own copy of the resolver
+        // had the same omission while its comment claimed production parity.
+        '607 tests', '607 passed', '607 / 0 / 0',
       ],
     },
     {

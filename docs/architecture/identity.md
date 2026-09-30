@@ -218,6 +218,14 @@ Server-side sessions in SQLite, not JWTs. This is what makes logout real.
   absolute bound is seeded at login; the idle bound is applied in Rust by
   `session_is_live_at`, and resolving a session moves `last_seen_at` — only a
   credential that was actually honoured counts as activity.
+- **Every place that asks "is this session live" must ask `session_is_live_at`.**
+  Two of them filtered on `revoked_at IS NULL AND expires_at > ?` by hand instead —
+  `POST /auth/logout-all`, which then accepted an idle cookie and let it revoke
+  every other device on the account, and the auth tests' own copy of the resolver,
+  which claimed in a comment to be "the same three lines" as production while
+  omitting the idle half. A hand-written predicate is a second definition of the
+  rule, and the two drift silently because nothing compares them. The test copy now
+  calls the same function for the same reason.
 - Expired and revoked rows are swept nightly, 30 days after the instant they
   stopped being usable.
 
