@@ -115,7 +115,7 @@ jobs:
       # Nothing is skipped or `#[ignore]`d: the former live-PocketBase exchange
       # test was replaced by a loopback stub, and the identity port has since
       # deleted that route and its stub entirely, so the suite reports
-      # 605 passed / 0 failed / 0 ignored (measured 2026-09-30). Identity is
+      # 606 passed / 0 failed / 0 ignored (measured 2026-09-30). Identity is
       # served natively by the crate - there is no PocketBase to reach at runtime.
       - name: Integration tests (bundled SQLite)
         working-directory: server

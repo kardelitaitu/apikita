@@ -147,7 +147,10 @@ Adding server capacity fixes nothing and doubles the bill.
 - **Running the proxy and the API as separate services** before it is necessary —
   two instances, two deploys, no benefit at this scale.
 - **Writing `last_used_at` on every request** — turns a read path into a write
-  path and pushes load onto the database.
+  path and pushes load onto the database. This one is deliberately avoided rather
+  than hypothetical: the write sits on the key-metadata cache MISS, so it happens
+  at most once per `limits.key_metadata_cache_seconds` per key instead of once per
+  request. See [website/02-data-model.md](website/02-data-model.md).
 - **A load balancer in front of one instance** — cost with no benefit.
 
 ## Open items

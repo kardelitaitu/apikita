@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 187;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 605;
+const SERVER_TESTS = 606;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -209,6 +209,16 @@ test('no doc still claims a superseded count', () => {
         // `doc_claims.rs`, which had been forbidding the PHRASE "kept indefinitely" across the
         // whole privacy file - a proxy for one bad row that rejected a different, honest one.
         '603 tests', '603 passed', '603 / 0 / 0',
+        // Retired when `send_link_mail` started addressing the mail it sends. It built every
+        // verification and reset message with `to: String::new()` - an empty recipient, with
+        // the address in scope and unused - so `EmailSender::send` failed to parse the mailbox
+        // and returned `EmailError::Build` before dialling anything. The caller logs that
+        // against the account id and never the address, so it read like a relay problem. No
+        // verification mail and no reset mail had ever been sent, and password reset is the
+        // only recovery path. Every test of the mailer built its own `Email` with a written-out
+        // address, so the module was covered and the route was not; the guard for it was itself
+        // vacuous at first, and the mutations said so.
+        '605 tests', '605 passed', '605 / 0 / 0',
       ],
     },
     {

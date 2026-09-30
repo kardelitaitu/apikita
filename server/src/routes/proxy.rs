@@ -697,6 +697,40 @@ async fn load_key_metadata(
             seen_generation,
         );
 
+    // LAST USED, WRITTEN HERE AND NOWHERE ELSE.
+    //
+    // `api_keys.last_used_at` is a column the schema defines, the data model
+    // documents ("updated lazily, not per request"), the key list publishes
+    // ("Updated lazily by proxy"), the dashboard renders ("Last used"), and the
+    // API SELECTs in three places - and NOTHING ever wrote it, so every key
+    // reported `null` and the dashboard column could only ever say "Never". A
+    // field whose only possible value is null is not a field.
+    //
+    // This is the one place it can be written without breaking the rule that
+    // forbids writing it per request: this function is the MISS path, so the
+    // write happens at most once per `limits.key_metadata_cache_seconds` per key
+    // - which is what "lazily" has to mean when the read path is cached. When the
+    // cache is disabled (`key_metadata_cache_seconds = 0`) this runs per request,
+    // but that setting is already documented as the trade that buys immediate
+    // revocation, and a caller who chose it chose the DB round-trip.
+    //
+    // It is deliberately NOT propagated as an error. A failure to record when a
+    // key was last used must not fail the request that is using it: the key is
+    // valid, the caller is authenticated, and the timestamp is an observability
+    // field. Failing closed here would turn a cosmetic write into an outage.
+    if let Err(err) = sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?")
+        .bind(chrono::Utc::now())
+        .bind(key_hash)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            key_id = %meta.key_id,
+            error = %err,
+            "could not record last_used_at; the request continues"
+        );
+    }
+
     Ok(meta)
 }
 
@@ -4597,9 +4631,75 @@ mod tests {
         db.close().await;
     }
 
+    /// THE COLUMN THE KEY LIST PUBLISHES MUST ACTUALLY GET WRITTEN.
+    ///
+    /// `api_keys.last_used_at` is defined by the schema, documented in the data
+    /// model ("updated lazily, not per request"), published in the key-list
+    /// contract as the "Last used" column, rendered by the dashboard, and SELECTed
+    /// by three endpoints - and NOTHING wrote it. Every key therefore reported
+    /// `null` forever and that column could only ever say "Never".
+    ///
+    /// The fixture leaves the column NULL, so this is a real before-and-after: the
+    /// assertion below is false on the code as it was, and the mutation that
+    /// removes the write makes it fail again.
+    ///
+    /// It drives `load_key_metadata` - the MISS path - because that is where the
+    /// write lives, and it asserts the value is a real instant rather than merely
+    /// non-null: a write of the wrong column, or of a sentinel, would satisfy
+    /// "not null" while leaving the dashboard lying.
+    #[tokio::test]
+    async fn resolving_a_key_records_when_it_was_last_used() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        create_api_key(&pool, account_id, &key, &["flash"]).await;
+        let digest = crate::routes::hash_token(&key);
+
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM api_keys WHERE key_hash = ?")
+                .bind(&digest)
+                .fetch_one(&pool)
+                .await
+                .expect("read the column before the request");
+        assert!(
+            before.is_none(),
+            "the fixture must start with an unused key, or this test proves nothing: got {before:?}"
+        );
+
+        let state = test_state(pool.clone());
+        let started = chrono::Utc::now();
+        load_key_metadata(key_cache(&state.config), &state.pool, &digest)
+            .await
+            .expect("the key resolves");
+
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM api_keys WHERE key_hash = ?")
+                .bind(&digest)
+                .fetch_one(&pool)
+                .await
+                .expect("read the column after the request");
+
+        let stamp = after
+            .as_deref()
+            .unwrap_or_else(|| panic!("resolving a key must record last_used_at; it is still NULL, so the dashboard can only ever say \"Never\""));
+        let parsed = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap_or_else(|e| {
+                panic!("last_used_at must be a real RFC3339 instant, got {stamp:?}: {e}")
+            })
+            .with_timezone(&chrono::Utc);
+        assert!(
+            parsed >= started - chrono::Duration::seconds(5),
+            "the recorded instant must be this request's, not a stale or placeholder value: {stamp}"
+        );
+
+        db.close().await;
+    }
+
     // -----------------------------------------------------------------------
     // THE STREAMING PATH, DRIVEN DIRECTLY.
     //
+
     // The handler's streaming half is exercised one layer down: a private
     // UpstreamClient (NOT the process-wide UPSTREAM static, which other tests
     // already initialise against the shipped config) points at a loopback SSE

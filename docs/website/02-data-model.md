@@ -174,6 +174,17 @@ CREATE INDEX api_keys_account_idx ON api_keys (account_id);
 - **`ON DELETE CASCADE`**: deleting an account should remove its keys.
 - Do not write `last_used_at` on every request — it turns a read path into a write
   path and will contend under load. Update lazily or in batches.
+  **This is implemented, and where it is implemented is the point.** The write lives
+  on the key-metadata cache MISS path in `server/src/routes/proxy.rs`: the key
+  resolves from an in-process cache on nearly every request, so the write happens at
+  most once per `limits.key_metadata_cache_seconds` per key — "lazily" in the exact
+  sense that matters. With the cache disabled (`key_metadata_cache_seconds = 0`) it
+  runs per request, but that setting is already the documented trade that buys
+  immediate revocation.
+  **The column was NULL for every key until this was written.** It was defined by the
+  schema, SELECTed by three endpoints and rendered by the dashboard, and nothing ever
+  wrote it, so the "Last used" column could only ever say `Never`. A field whose only
+  possible value is null is not a field.
 
 Full behaviour: [06-api-keys-and-limits.md](06-api-keys-and-limits.md).
 

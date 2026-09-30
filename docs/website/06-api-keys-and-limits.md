@@ -87,7 +87,7 @@ The `api_keys` table lives in SQLite (see [02-data-model.md](02-data-model.md)):
 | `token_limit` | bigint | 0 = unlimited |
 | `rate_limit_rpm` | integer | 0 = unlimited |
 | `expires_at` | timestamptz | null = never |
-| `last_used_at` | timestamptz | Updated lazily by proxy |
+| `last_used_at` | timestamptz | Updated lazily by proxy — on the key-metadata cache miss, so at most once per `limits.key_metadata_cache_seconds` per key |
 | `revoked_at` | timestamptz | null = active |
 | `created_at` | timestamptz | Audit timestamp |
 
@@ -196,7 +196,7 @@ click. Do not force a limit on a user who does not want one.
 | Prefix | `apk_live_a1b2…` |
 | Models | "All" or a count |
 | Spend | "12,340 / 50,000 IDR (30d)" or "Unlimited" |
-| Last used | |
+| Last used | `2026-01-01 14:32` or "Never" — written on the key-metadata cache miss, so it can lag by up to `limits.key_metadata_cache_seconds` |
 | Status | Active / Revoked / Expired |
 
 ### Detail / edit

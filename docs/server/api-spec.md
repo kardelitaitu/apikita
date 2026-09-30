@@ -383,6 +383,14 @@ List active and revoked keys. **Never returns `key_hash`.**
 `spend_used_idr` is computed over the configured window, from `usage_daily`.
 Returning it here saves the UI a second call.
 
+`last_used_at` is written on the key-metadata cache MISS in the proxy
+(`server/src/routes/proxy.rs`), so it lags a request by at most
+`limits.key_metadata_cache_seconds` and is `null` only for a key that has never been
+used. **It was `null` for every key, always**: the column was defined, selected and
+documented, and no code ever wrote it, so this field — and the dashboard's "Last used"
+column — could only ever report `Never`. A test now resolves a key and asserts the
+column is a real instant from that request.
+
 ### `POST /api/keys`
 
 ```json
