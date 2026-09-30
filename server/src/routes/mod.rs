@@ -1495,7 +1495,12 @@ mod tests {
     const ABSENT_PATH: &[(&str, &str)] = &[
         ("GET", "/api/nope"),
         ("GET", "/api/mex"),
+        // A NEAR MISS FOR THE PATH THAT REPLACED IT. `/auth/exchange` is gone from
+        // the crate entirely, so a plural `s` tests nothing about it; the useful
+        // sibling now is `/auth/password-change`, whose path is long enough to be
+        // mistyped and mounted only as POST.
         ("POST", "/auth/exchanges"),
+        ("POST", "/auth/password-changes"),
         ("GET", "/healt"),
         ("GET", "/api/me/"),
         ("GET", "/api/ME"),
