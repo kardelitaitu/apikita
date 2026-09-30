@@ -200,8 +200,10 @@ As of Phase 6 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
 - **The test suite runs, and it runs by default.** Phase 5 gave every database test
   its own migrated SQLite file in a temp directory, so no test needs
   `DATABASE_URL` and not one `#[ignore]` remains. It measured **134 passed / 0 failed /
-  0 ignored** when Phase 5 landed and **556 / 0 / 0** at Phase 6, after identity moved
-  in and the tests that drove the retired service were deleted with it. The money
+  0 ignored** when Phase 5 landed and **556 / 0 / 0** when Phase 6 first landed, after
+  identity moved in and the tests that drove the retired service were deleted with it.
+  It reads **565 / 0 / 0** now, the difference being the tests added for the
+  password-change and provider-list routes. The money
   tests — including the real
   concurrency proof of the overdraw fix,
   `concurrent_requests_cannot_overdraw_a_one_request_balance` — had been

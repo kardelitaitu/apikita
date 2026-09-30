@@ -113,9 +113,10 @@ jobs:
       # and no DATABASE_URL.
       #
       # Nothing is skipped or `#[ignore]`d: the former live-PocketBase exchange
-      # test was replaced by a loopback stub, so the suite reports
-      # 338 passed / 0 failed / 0 ignored (measured 2026-09-27). Identity still
-      # enters through PocketBase at runtime, but no test needs it to run.
+      # test was replaced by a loopback stub, and the identity port has since
+      # deleted that route and its stub entirely, so the suite reports
+      # 565 passed / 0 failed / 0 ignored (measured 2026-09-30). Identity is
+      # served natively by the crate - there is no PocketBase to reach at runtime.
       - name: Integration tests (bundled SQLite)
         working-directory: server
         run: cargo test --lib
@@ -290,12 +291,12 @@ jobs:
           # A 204 here is the contract; asserting 401 would be asserting a bug.
           check_route 204 POST /auth/logout
           check_route 204 POST /auth/logout-all
-          # /auth/exchange is the ONE route whose status depends on an external service.
-          # With no body it fails extraction (422) before PocketBase is ever called, so the
-          # assertion stays hermetic. Its 500-when-PocketBase-is-down is deliberately NOT
-          # asserted here: CI has no identity provider, and fixing that status in a test
-          # would pin a behaviour the spec does not yet promise.
-          check_route 422 POST /auth/exchange
+          # /auth/exchange was the ONE route whose status depended on an external
+          # service. The identity port deleted it along with the provider it spoke
+          # to, so it must now be an UNMOUNTED path: 404 is what pins the deletion.
+          # Asserting 422 here would assert that a route the server no longer
+          # serves still exists.
+          check_route 404 POST /auth/exchange
 
           # EVERY error must be the documented JSON - not just "it refused".
           #
@@ -303,9 +304,16 @@ jobs:
           # error pages, no empty bodies", with a shape of error.code/message/request_id.
           # Measured before this step existed, THREE paths returned something else: an
           # unrouted 404 and the two DESIGNED-NOT-BUILT 404s had EMPTY bodies (axum's default,
-          # because the router had no fallback), and a malformed body on /auth/exchange
-          # returned axum's PLAIN TEXT - on the one auth verb with no credential guard, so the
-          # one where a malformed body actually reaches the extractor.
+          # because the router had no fallback), and a malformed body on an auth verb returned
+          # axum's OWN statuses - 400 for a body that is not JSON, 422 for one whose shape does
+          # not match, 415 for a missing content type - instead of the documented error JSON.
+          #
+          # /auth/password-change is where that is now asserted, and it is the right route for
+          # it: its handler takes `Result<Json<T>, JsonRejection>` and maps the rejection
+          # itself, so those three axum responses all arrive as ONE shape. The mapping is
+          # pinned in the crate by
+          # routes::auth::tests::live_password_change_body_rejections_all_carry_the_documented_shape,
+          # which sends these same two bytes through the real router.
           #
           # The check asserts the SHAPE, which is what the contract is about. The `message`
           # text may change freely; `code` and `request_id` may not.
@@ -336,8 +344,8 @@ jobs:
           err_shape_ok GET  /api/reviews ""
           err_shape_ok GET  /api/me ""
           err_shape_ok GET  /api/admin/accounts ""
-          err_shape_ok POST /auth/exchange '{}'
-          err_shape_ok POST /auth/exchange '{,}'
+          err_shape_ok POST /auth/password-change '{}'
+          err_shape_ok POST /auth/password-change '{,}'
           check_route 404 GET  /api/reviews
           check_route 404 POST /api/bot/account
           check_route 404 POST /api/bot/notify-topup

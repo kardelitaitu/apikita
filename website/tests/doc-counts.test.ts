@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 171;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 556;
+const SERVER_TESTS = 565;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -105,6 +105,11 @@ test('no doc still claims a superseded count', () => {
     // every check above asserts the CURRENT constant is PRESENT somewhere and
     // none of them asserts a retired one is ABSENT.
     '509 tests', '168 tests',
+    // Retired on 2026-09-30 when the password-change and provider-list tests
+    // landed. 556 is the figure the Phase 6 register entry still names as the
+    // count AT that phase, which is why it is retired here and annotated rather
+    // than rewritten in docs/decisions.md.
+    '556 tests', '556 passed', '556 / 0 / 0',
   ];
   for (const stale of superseded) {
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so
