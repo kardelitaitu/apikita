@@ -41,10 +41,12 @@ recoverable.
 
 - [ ] A persistent volume provisioned for the SQLite database file (no database
       instance to provision), and a backup of it tested by restore.
-- [ ] Identity served by the Rust server itself, with no PocketBase instance
-      running. **Until migration Phase 6 lands PocketBase is temporarily still
-      required** — see [`plans/sqlite-migration.md`](plans/sqlite-migration.md)
-      §5.6; this box is the end state, not the current one.
+- [ ] Identity served by the Rust server itself, with no separate identity
+      instance running. **Phase 6 has landed**, so this is now the shipped state
+      rather than an end state to reach: `accounts.pb_user_id` is dropped, the
+      PocketBase HTTP client is gone from `server/`, and `accounts` + `identities`
+      are served natively with Argon2id. See
+      [`architecture/identity.md`](architecture/identity.md).
 - [ ] Edge relay deployed; nginx configured with `proxy_buffering off` on `/events`.
 - [ ] Automatic certificate renewal on the relay **and** on the backend.
 - [ ] Backend serves a valid certificate for the public hostname (required for
@@ -287,13 +289,11 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       jurisdiction, AND the ORDERING — because the claim is "before the first request",
       not "exists somewhere" (`privacy.astro` alone would not satisfy it).
       **Provisional:** the disclosure text and its test are independent of the identity
-      provider, and the FORM around it is being ported — the server no longer speaks to
-      PocketBase, but `signup.astro`'s script still calls `authWithOAuth2`,
-      `collection('users').create` and `requestVerification`, so this box only holds on
-      the page, not yet end to end. The port replaces that script with
-      `website/src/lib/auth-api.ts` and its callers; re-check the box then. Until every
-      auth page is off `pb.*` the signup FORM needs a PocketBase instance running, and
-      no PocketBase instance is part of this deployment.
+      provider, and the FORM around it has been ported — the signup script now calls
+      `website/src/lib/auth-api.ts` (`signupRequest`, `googleSignIn`) and
+      `website/src/lib/auth-flow.ts`, and `website/src/lib/pocketbase.ts` is deleted,
+      so this box holds end to end. No identity service is part of this deployment;
+      identity is served by the Rust crate.
 - [x] Top-up screen states the fee and the non-refundable policy before payment.
       The wallet page (`website/src/pages/dashboard/wallet.astro`) states the non-refundable policy
       and the 2-year expiry, and the header flags that first-deposit and top-up minimums

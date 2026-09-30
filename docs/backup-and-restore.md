@@ -7,18 +7,26 @@ procedure itself.
 **An untested backup is a belief.** The only backup that counts is one that has been
 restored and verified.
 
+> **Superseded: identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the
+> PocketBase HTTP client is gone from `server/`, and identity is served natively
+> by this crate (`accounts` + `identities`, Argon2id). Where the text below still
+> says PocketBase is the current identity provider, this notice governs;
+> [`architecture/identity.md`](architecture/identity.md) is the operative
+> description.
+
 ## What must be backed up
 
 | Data | Where | Loss impact |
 | --- | --- | --- |
-| **The SQLite database file** (ledger, wallets, keys, usage) | Northflank persistent volume | **Total loss of funds data — unrecoverable** |
-| **PocketBase** (identity, passwords, emails) | Northflank | Loss of logins; customers cannot sign in |
+| **The SQLite database file** (ledger, wallets, keys, usage, **and identity** — `accounts` + `identities`) | Northflank persistent volume | **Total loss of funds data — unrecoverable** |
 | Relay nginx config | VPS | Rebuildable by hand, but annoying |
 | Config (routing/pricing) | Git | Low — versioned already |
 
-**Ranked by consequence: the database file first.** Losing PocketBase breaks logins;
-losing the database file destroys the record of what customers are owed. They are
-not equivalent.
+**One file, and it is the whole system.** The database holds identity as well as
+money now, so losing it loses logins *and* the record of what customers are owed.
+There is no second store to rank against it and no separate identity service to
+back up: identity lives in the `identities` table beside the ledger.
 
 ## Backup strategy
 
@@ -196,8 +204,10 @@ silent failure.** Alert on size, not just exit code.
       five "Record the drill" fields: `date_utc`, `run_by`, `backup_age`, `restore_ms`, `result`,
       plus the dump sha256/size, TOC count, the row-count table, the spot-check pair and the drift
       verdict. Override with `--log-dir`/`DRILL_LOG_DIR` when the retention answer moves.
-- [ ] Whether PocketBase gets its own tested restore procedure.
-      **Still open.** Neither tool covers PocketBase: `backup.sh` backs up only the money database and
-      the drill restores only that, so identity data has no tested restore path today.
-- [ ] **Port `tools/backup` and `tools/drill` to the SQLite file.** Until then the tooling cannot
-      touch the shipped database — see the note under Backup tooling above.
+- [x] Whether the identity store gets its own tested restore procedure.
+      **Moot — there is no separate identity store.** The Phase 6 port moved identity
+      into the same SQLite file as money (`accounts` + `identities`), so the
+      procedure above *is* the identity restore procedure: `backup.sh` backs the file
+      up and `drill.sh` restores and reconciles it. Nothing else needs a restore path.
+- [x] **Port `tools/backup` and `tools/drill` to the SQLite file.** Done — the tools
+      implement the `.backup` + `integrity_check` + reconcile procedure described above.

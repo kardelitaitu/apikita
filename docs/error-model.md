@@ -11,15 +11,18 @@ status. Clients code against this, so it is a contract.
 
 This is **enforced against the running binary** by the CI smoke step, not merely asserted
 here. It was not always true: until recently an unrouted path returned an **empty body**
-(axum's default, because the router had no fallback) and a malformed body on
-`POST /auth/exchange` returned axum's **plain text** — on the one auth verb with no
-credential guard, and therefore the one where a malformed body actually reaches the
-extractor. Both now route through `AppError`, so the shape, the `code` vocabulary and the
-`request_id` come from the one place that defines them.
+(axum's default, because the router had no fallback) and a malformed body on the auth
+endpoints returned axum's **plain text** — on the auth verbs with no credential guard,
+where a malformed body actually reaches the extractor before any check can refuse it.
+Both now route through `AppError`, so the shape, the `code` vocabulary and the
+`request_id` come from the one place that defines them. (The endpoint this passage once
+named, `POST /auth/exchange`, is gone — the identity port deleted it and the provider it
+spoke to; `POST /auth/login` and `POST /auth/signup` are the unguarded auth verbs that
+exist today and carry the same property.)
 
-The extractor's own detail text is deliberately **not** echoed into `message`: on
-`/auth/exchange` the body being parsed is a PocketBase token, and `InvalidRequest` sends
-its string to the client verbatim.
+The extractor's own detail text is deliberately **not** echoed into `message`: the body
+being parsed is the caller's credential, and `InvalidRequest` sends its string to the
+client verbatim.
 
 ```json
 {

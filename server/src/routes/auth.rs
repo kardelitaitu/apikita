@@ -1278,8 +1278,8 @@ mod tests {
     /// it as "live" would make an expired cookie look like a valid session.
     ///
     /// `settle_topup` used to sit just above this. It was DELETED rather than left
-    /// as dead code: the two `live_*` PocketBase fixtures that called it went with
-    /// the provider they exercised, and none of the surviving tests here touch a
+    /// as dead code: the one `live_*` PocketBase fixture that called it went with
+    /// the provider it exercised, and none of the surviving tests here fund a
     /// wallet. `routes/account.rs` and `test_support` each keep their own funding
     /// fixture because their tests do fund accounts; a third copy here would
     /// compile, read as load-bearing, and silently drift from the ones that run.

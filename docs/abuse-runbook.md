@@ -8,6 +8,14 @@ procedure.
 termination, which ends the business's supply. Responding late is far more costly
 than responding over-cautiously.
 
+> **Superseded: identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the
+> PocketBase HTTP client is gone from `server/`, and identity is served natively
+> by this crate (`accounts` + `identities`, Argon2id). Where the text below still
+> says PocketBase is the current identity provider, this notice governs;
+> [`architecture/identity.md`](architecture/identity.md) is the operative
+> description.
+
 ## What abuse looks like here
 
 Cheap access to capable models attracts specific uses. Expected categories:
@@ -169,17 +177,21 @@ proof of abuse on its own.
 
 **Signal:** failed logins, link-code redemption failures, enumeration attempts.
 
-1. Rate limits should already contain it — **link-code redemption is ours**
-   (`limits.link_redemption_per_hour`, enforced in `routes/telegram.rs`), and **login is
-   NOT.** Nothing in `server/src/routes/auth.rs` calls a limiter: `POST /auth/exchange` has
-   no rate limit of ours, because login is PocketBase's decision and any limit on it is
-   configured there rather than in `config/apikita.toml`. This row used to name login
-   alongside link-code redemption as though both were contained, and an operator working a
-   credential attack would have had no reason to reach step 2 — which is the step that
-   actually stops one.
-   **So: confirm the limit exists on the PocketBase side before relying on it.** If it does
-   not, the answer to this incident is step 2 immediately, not after checking whether the
-   backend is "supposed" to be limiting it.
+1. Rate limits should already contain it — **both halves are ours.**
+   Link-code redemption is capped by `limits.link_redemption_per_hour`, enforced in
+   `routes/telegram.rs`, and login is capped by the five `[limits]` keys read and
+   enforced in `server/src/auth_attempts.rs`: `login_per_hour_per_ip` and
+   `login_per_hour_per_account` cover sign-in, and `signup_per_hour_per_ip`,
+   `password_reset_per_hour_per_account` and `verification_resend_per_hour` cover the
+   surrounding auth surface. Nothing in auth is PocketBase's decision any more, and
+   there is no `POST /auth/exchange` to limit.
+   This row used to say login was **NOT** contained — that nothing in
+   `server/src/routes/auth.rs` called a limiter and that any login limit was
+   "configured on the PocketBase side". That was true before the identity port and is
+   false now: the counters live in `auth_attempts`, the Rust server enforces them, and
+   an operator working a credential attack should confirm the cap in
+   `config/apikita.toml` rather than reach for a PocketBase admin UI that no longer has
+   anything to configure.
 2. If it is sustained, block the source at the **edge relay**, not in the backend.
 3. Alert the affected account if there is evidence of a successful attempt.
 
@@ -206,8 +218,9 @@ proof of abuse on its own.
 **The admin path is no longer a gap.** It was: suspending an account is a required
 capability, and at the time this table was written it had no endpoint at all. It now
 has one — auditable, in a single transaction, refusing self-action — so an operator
-responding to a live incident should use the console rather than the PocketBase admin
-UI. Reach for PocketBase only if the API itself is unreachable.
+responding to a live incident should use the operator console at `/admin` rather than
+any external admin UI. See [`admin-surface.md`](admin-surface.md). There is no
+PocketBase admin UI to reach for: that service does not exist.
 
 ## Open items
 

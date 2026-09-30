@@ -5,7 +5,8 @@ purpose is not dashboards — it is **noticing a billing or balance problem befo
 customer does**.
 
 > Stack: Cloudflare -> edge relay (nginx) -> Rust on Northflank with embedded
-> SQLite, plus PocketBase. See [`docs/architecture.md`](architecture.md) and
+> SQLite (money and identity in the same file — no second store). See
+> [`docs/architecture.md`](architecture.md) and
 > [`docs/edge-relay.md`](edge-relay.md).
 
 ## The principle
@@ -214,11 +215,15 @@ The `ledger` is authoritative; `wallets` is a cache of it. A mismatch means a bu
 in the credit/debit transaction, and it is the specific failure the append-only
 ledger exists to detect.
 
-### Plus the two cross-system checks
+### And the check that crosses the payment boundary
+
+Identity and money share one SQLite database, so there is no auth-side orphan to
+look for: a deleted identity cannot leave a funded wallet behind, because the
+wallet hangs off the account and accounts are never hard-deleted. The one check
+that still crosses a system boundary is the payment provider's.
 
 | Check | Why |
 | --- | --- |
-| `accounts.pb_user_id` exists in PocketBase | Orphans mean a deleted auth user with a funded wallet |
 | Midtrans settlements vs `topups` where `settled` | Catches a missed webhook |
 
 See [`docs/website/04-payments.md`](website/04-payments.md) for webhook details.

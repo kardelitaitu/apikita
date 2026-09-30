@@ -22,7 +22,7 @@ That is the budget. Everything below is sized against it.
 | --- | --- | --- |
 | **Rust API + proxy** | CPU-light, memory-light, I/O-bound | Streams bytes; the work is waiting, not computing |
 | **SQLite** (embedded) | **No instance, no extra CPU/RAM line item** | The wallet ledger is a file inside the API process; it needs the persistent volume below, not a server |
-| **PocketBase** | Tiny | One binary, SQLite, low traffic (logins only) |
+| **Identity** | **No line item** | Served in-process by the same Rust crate (`accounts` + `identities` in that same SQLite file). There is no separate identity service to run |
 | **Frontend** | **Free** | Cloudflare Pages static hosting |
 | **Edge relay** | Cheap VPS, ~2 vCPU / 4 GB | Absorbs connection load so Northflank stays small |
 
@@ -66,7 +66,7 @@ business will ever throw at it.** Do not size for imagined scale.
 | --- | --- | --- |
 | API/proxy instance | **1 vCPU / 1 GB** | I/O-bound; start here and measure |
 | Database | **in-process — $0, no separate line item** | Embedded SQLite. Tiny row counts: thousands of rows, not millions, and no server to size |
-| PocketBase | **smallest offering** | Logins only |
+| Identity | **in-process — $0, no separate line item** | No service to size: `accounts` + `identities` are tables in the same SQLite file |
 | Volume for the database file | **10-20 GB** | Ledger + usage; usage dominates |
 
 **Start smaller than you think.** A single 1 vCPU box with 1 GB is plausibly enough

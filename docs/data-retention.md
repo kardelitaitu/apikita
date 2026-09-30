@@ -10,13 +10,21 @@ size.
 > Schema: [`docs/website/02-data-model.md`](website/02-data-model.md)
 > Provider residency: [`docs/business/05-risk.md`](business/05-risk.md) R1
 
+> **Superseded: identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the
+> PocketBase HTTP client is gone from `server/`, and identity is served natively
+> by this crate (`accounts` + `identities`, Argon2id). Where the text below still
+> says PocketBase is the current identity provider, this notice governs;
+> [`architecture/identity.md`](architecture/identity.md) is the operative
+> description.
+
 ## What is stored
 
 | Data | Where | Sensitivity |
 | --- | --- | --- |
-| Email | PocketBase | **Personal** |
-| Password hash | PocketBase | Sensitive, but not usable if leaked (hashed) |
-| Google account link | PocketBase | Personal |
+| Email | Embedded SQLite (`identities` table) | **Personal** |
+| Password hash | Embedded SQLite (`identities` table) | Sensitive, but not usable if leaked (hashed) |
+| Google account link | Embedded SQLite (`identities` table) | Personal |
 | Telegram ID | Embedded SQLite (the database file) | Personal, pseudonymous |
 | Wallet balance + ledger | Embedded SQLite (the database file) | **Financial** |
 | Payout destination (wind-down only) | Embedded SQLite | **Deleted 30 days after payout** — see §Wind-down |
@@ -27,12 +35,12 @@ size.
 | Reviews + edit history | Embedded SQLite (the database file) | Opinion, published aggregate only |
 | Sessions | Embedded SQLite (the database file) | Contains IP hash and user agent |
 
-> **Wording change only — no retention fact moved.** The money store used to be a
-> managed PostgreSQL service; it is now **embedded SQLite**, a file the API opens.
-> Every row, every retention period and every "never stored" claim above is
-> unchanged. **This table is restated on the customer-facing
-> [`/privacy`](../website/src/pages/privacy.astro) page**, which must be updated
-> in the same change if any of it moves again.
+> **Wording change only — no retention fact moved.** Both stores are now **embedded
+> SQLite**, a file the API opens: the money store used to be a managed PostgreSQL
+> service, and identity used to be PocketBase. Every row, every retention period and
+> every "never stored" claim above is unchanged. **This table is restated on the
+> customer-facing [`/privacy`](../website/src/pages/privacy.astro) page**, which must
+> be updated in the same change if any of it moves again.
 
 ## What is NOT stored
 
@@ -118,15 +126,15 @@ means anonymisation, not deletion, is the right mechanism for a departing custom
 
 There is **no hard delete of an account.** From
 [`docs/website/02-data-model.md`](website/02-data-model.md): `ON DELETE RESTRICT` on
-anything holding money, and PocketBase users are never hard-deleted.
+anything holding money, and accounts are never hard-deleted.
 
 Closure means:
 
 1. `accounts.status = 'closed'` — set **only once the balance is zero** (step 6).
 2. **Revoke all sessions** — the user is out.
 4. **Retain the ledger and top-ups** (financial record).
-5. **Anonymise what can be anonymised** — email replaced with a tombstone in
-   PocketBase, Telegram link removed, review body cleared if requested.
+5. **Anonymise what can be anonymised** — email replaced with a tombstone in the
+   `identities` table, Telegram link removed, review body cleared if requested.
 6. **Keep the balance row at zero.** A closed account with a balance is unresolved
    money — do not close until it is zero.
 
@@ -215,10 +223,10 @@ export makes no new disclosure and needs no new policy decision:
 
 | **Excluded** | **Why** |
 | --- | --- |
-| `key_hash`, `token_hash`, `pb_user_id` | Credentials/internal ids. **Hashes are not the customer's data to hold** — handing them out is an attack surface for no user benefit |
+| `key_hash`, `token_hash` | Credentials/internal ids. **Hashes are not the customer's data to hold** — handing them out is an attack surface for no user benefit |
 | Session rows and IP hashes | Security records; `docs/ip-tracking.md` keeps IPs as salted hashes precisely so they are not exported |
 | `admin_audit` rows | Whether these reach the customer is a **separate open decision** (see [admin-surface.md](admin-surface.md) Open items). The export does not pre-empt it |
-| Password, Google identity | Held by the identity provider, not us (see §Security obligations) |
+| Password hash, Google identity (`identities` rows) | We hold these, but they are credentials: the password hash is never handed out, and the Google link is a provider subject, not the customer's data to export. See §Security obligations |
 
 **"Metadata, not secrets" is the rule.** The export is for the customer's own
 records (tax, accounting, migration); it is never a channel that reveals a

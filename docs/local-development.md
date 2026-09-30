@@ -6,13 +6,21 @@ real money.
 > Deployment: [`docs/deployment.md`](deployment.md). This document is for the
 > development loop.
 
+> **Superseded: identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the
+> PocketBase HTTP client is gone from `server/`, and identity is served natively
+> by this crate (`accounts` + `identities`, Argon2id). Where the text below still
+> says PocketBase is the current identity provider, this notice governs;
+> [`architecture/identity.md`](architecture/identity.md) is the operative
+> description.
+
 ## What must run locally
 
 | Component | Required? | Note |
 | --- | --- | --- |
 | Rust API + proxy | **Yes** | The thing under development |
 | SQLite | **No server** | A file at `data/server.db`, created by the migrate binary |
-| PocketBase | **Yes** | One binary, no install ceremony — until Phase 6 replaces it |
+| Mail relay (`[email]` in `config/apikita.toml`) | **No** | Identity's one external dependency. `smtp_host = ""` is a supported state: signup still works, the account is just unverified. See [`architecture/identity.md`](architecture/identity.md) and `server/src/identity/email.rs` |
 | Frontend dev server | Only for UI work | Pages Functions are not used |
 | Midtrans | **No** | Faked locally — see below |
 | Upstream providers | **No** | Faked locally |
@@ -26,7 +34,6 @@ file directly.
 | Service | Port |
 | --- | --- |
 | Rust API | 8080 |
-| PocketBase | 8090 |
 | Nginx edge relay | 8000 |
 | Frontend dev server | 4321 (Astro default) — **UI work only**, see below |
 
@@ -67,10 +74,6 @@ So local development resolves the trap **by construction** and deliberately does
 *not* answer the production subdomain question. One origin locally because it has
 to be, not because production will be.
 
-> PocketBase is **not** proxied by the relay. `PUBLIC_POCKETBASE_URL` stays
-> `http://127.0.0.1:8090`, so the login round-trip is still cross-origin and its
-> CORS must allow the relay origin. Proxying it is a separate change.
-
 ## First run
 
 ```
@@ -81,15 +84,12 @@ docker compose up -d
 # 2. database — a file, created and migrated by the migrate binary
 DATABASE_URL=sqlite://data/server.db cargo run --bin migrate
 
-# 3. pocketbase (download the binary, then)
-./pocketbase serve --http=127.0.0.1:8090
-
-# 4. api, on the HOST. The relay reaches it as host.docker.internal:8080, which
+# 3. api, on the HOST. The relay reaches it as host.docker.internal:8080, which
 #    is why it is not a compose service.
 cp .env.example .env    # fill in what you need; fakes need nothing
 cargo run --bin apikita-server
 
-# 5. the site, built for ONE ORIGIN
+# 4. the site, built for ONE ORIGIN
 #    PUBLIC_API_BASE_URL= is not cosmetic: it is a PUBLIC_* variable INLINED
 #    into the JS at build time. Empty makes every call relative, so the bundle
 #    calls whatever origin served it (:8000). Leave it unset and the bundle
@@ -97,9 +97,14 @@ cargo run --bin apikita-server
 #    the session cookie will never be sent. That is the whole trap.
 cd website && PUBLIC_API_BASE_URL= npm run build
 
-# 6. frontend (only for UI work) — do NOT use it to judge the dashboard
+# 5. frontend (only for UI work) — do NOT use it to judge the dashboard
 cd website && npm run dev
 ```
+
+There is no identity service to start: the Rust server owns `accounts` and
+`identities` in the same SQLite file, and verification and reset mail goes out
+through the `[email]` relay in `config/apikita.toml` — see
+[`architecture/identity.md`](architecture/identity.md).
 
 Then open **<http://localhost:8000>** — site and API, one origin.
 
@@ -219,12 +224,10 @@ the cheapest guard against the most expensive accounting error.
 | Variable | Local value |
 | --- | --- |
 | `DATABASE_URL` | `sqlite://data/server.db` — relative to `server/` |
-| `POCKETBASE_URL` | `http://127.0.0.1:8090` |
 | `MIDTRANS_SERVER_KEY` | a dev constant the fake signs with |
 | `MIDTRANS_ENV` | `sandbox` |
 | `RUST_LOG` | `debug` |
 | `PUBLIC_API_BASE_URL` | **empty** — set at `npm run build` time, makes the bundle same-origin |
-| `PUBLIC_POCKETBASE_URL` | `http://127.0.0.1:8090` — PocketBase is not proxied |
 
 **`.env` is gitignored and never contains production values.** See
 [`.env.example`](../.env.example).
@@ -250,5 +253,6 @@ the cheapest guard against the most expensive accounting error.
 - [ ] Seed script contents.
 - [x] CI needs **no** database service container — the suite builds its own SQLite
       file per test. See [`ci-cd.md`](ci-cd.md).
-- [ ] Whether PocketBase runs as a binary or in a container locally — moot after
-      Phase 6, which replaces it with a Rust implementation that runs in-process.
+- [x] Whether the identity service runs as a binary or in a container locally —
+      **moot.** Phase 6 landed and there is no separate service: identity is served
+      in-process by the Rust crate. See [`architecture/identity.md`](architecture/identity.md).

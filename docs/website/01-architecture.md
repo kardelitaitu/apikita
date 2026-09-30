@@ -2,6 +2,8 @@
 
 > **Superseded on stack — read [`docs/architecture.md`](../architecture.md) first.**
 > This document specified Cloudflare Pages Functions + PocketBase. The system now uses a Rust backend on Northflank with embedded SQLite. The frontend-internal sections below remain useful; the stack and backend sections are superseded.
+>
+> **Identity too is superseded here.** The Phase 6 identity port has landed: `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the PocketBase HTTP client is gone from `server/`, and identity is served natively by this crate over the `accounts` + `identities` tables. Where the text below still says PocketBase is the identity provider, [`architecture/identity.md`](../architecture/identity.md) governs.
 
 ## Requirement that drives the design
 
@@ -22,13 +24,15 @@ document covers the frontend's internal structure.
 | Edge relay | **nginx on a VPS** | TLS, filtering, flood absorption before Northflank. See [`../edge-relay.md`](../edge-relay.md) |
 | Backend | **Rust on Northflank** | Auth orchestration, wallet, keys, limits, webhook, SSE, proxy. |
 | Money | **SQLite** (embedded) | Transactions, constraints, the ledger. |
-| Identity | **PocketBase** | Google + password, verify, reset. Auth only. |
+| Identity | **Rust, over embedded SQLite** | Google + password, verify, reset. Auth only. |
 | Payments | **Midtrans Snap** | QRIS top-ups. |
 
-> **This table previously named Pages Functions as a BFF and PocketBase as the
-> database.** Both are gone: the Rust server is the backend, and money lives in
-> embedded SQLite. Superseded sections below are marked; the frontend internals
-> remain valid.
+> **This table previously named Pages Functions as a BFF, PocketBase as the
+> database and PocketBase as the identity provider.** All are gone: the Rust server
+> is the backend, money lives in embedded SQLite, and identity is served natively
+> by the same crate over the `accounts` + `identities` tables — see
+> [`architecture/identity.md`](../architecture/identity.md). Superseded sections
+> below are marked; the frontend internals remain valid.
 
 **Astro is decided** — reasoning and rejected alternatives are below.
 
@@ -44,8 +48,7 @@ Cloudflare  (DNS, TLS at edge, DDoS)
 Edge relay  (nginx on a VPS - TLS, rate limits, body caps)
   |
   v
-Northflank: Rust API + proxy  --->  SQLite file (money, sessions)
-                                --->  PocketBase  (identity only)
+Northflank: Rust API + proxy  --->  SQLite file (money, identity, sessions)
 ```
 
 **The full picture, including failover: [`docs/topology.md`](../topology.md).**
@@ -67,14 +70,14 @@ hold a password flow, a database transaction, or a long-lived SSE connection. Th
 
 ### Realtime
 
-**SSE from the Rust API.** PocketBase's realtime cannot help — the wallet and usage
-data live in SQLite, which PocketBase does not stream. Contract:
+**SSE from the Rust API.** No external identity service is involved — the wallet,
+identity and usage data all live in the one SQLite file the Rust API streams from.
+Contract:
 [`docs/realtime.md`](../realtime.md).
 ## Auth token handling
 
-- PocketBase handles initial authentication (password, Google OAuth2) and issues a short-lived token.
-- The browser immediately exchanges this token with the Rust backend via `POST /auth/exchange`.
-- The Rust server verifies the token, resolves or registers `accounts.pb_user_id`, and issues an **opaque server-side session cookie** (`HttpOnly, Secure, SameSite=Lax`) backed by SQLite.
+- Identity is handled natively by this crate: the browser posts a Google **ID token** to `POST /auth/google`, or an email and password to `/auth/login` / `/auth/signup`. There is no third-party auth service and no token exchange step.
+- The server verifies the credential (Google's JWKS, or Argon2id for a password), resolves the account over the `accounts` + `identities` tables, and issues an **opaque server-side session cookie** (`HttpOnly, Secure, SameSite=Lax`) backed by SQLite.
 - **Logout is explicit and immediate**: `POST /auth/logout` revokes the session row in SQLite; `POST /auth/logout-all` revokes all active sessions for the account.
 - Never put upstream provider keys, database URLs, or the Midtrans server key in client-visible config.
 
@@ -84,7 +87,7 @@ data live in SQLite, which PocketBase does not stream. Contract:
 | --- | --- | --- |
 | Midtrans server key | Northflank (Rust env) | **No** |
 | Midtrans client key | Pages env (`PUBLIC_MIDTRANS_CLIENT_KEY`) | Yes (by design) |
-| PocketBase admin / internal URL | Northflank (Rust env) | **No** |
+| Google client id (`[identity] google_client_id`) | Northflank (Rust env) | No — the audience the server checks, not a secret |
 | Upstream provider keys | Northflank (Rust env) | **No** |
 | Telegram bot token | Northflank (Rust / bot env) | **No** |
 | Database connection string | Northflank (Rust env) | **No** |
@@ -94,8 +97,7 @@ Only `PUBLIC_*` variables may reach the client. See `.env.example`.
 ## Deployment
 
 - **Static assets (Astro)** → Cloudflare Pages, built from the repo.
-- **API + Proxy (Rust) + embedded SQLite** → Northflank with a persistent volume for the database file. The wallet ledger lives in SQLite.
-- **PocketBase** → Northflank or container host with persistent volume (SQLite for identity only).
+- **API + Proxy (Rust) + embedded SQLite** → Northflank with a persistent volume for the database file. The wallet ledger **and identity** live in that one SQLite file; there is no separate identity service to deploy.
 - **Region:** keep Northflank and database geographically close to the Midtrans webhook receiver and Indonesian users (e.g. Singapore region).
 
 ## Frontend choice — decided
@@ -159,5 +161,5 @@ is why it is safe to make now rather than continue deferring.
       [05-security-decisions.md](05-security-decisions.md) D2.
 - [x] Session/token lifetime: **30d absolute / 7d idle** — [`decisions.md`](../decisions.md).
 - [x] Dashboard reads usage from the SSE stream (`GET /events`); polls `GET /api/me` as fallback only when SSE drops.
-- [ ] Backup and restore procedure for PocketBase.
+- [ ] Backup and restore procedure for the SQLite database file (money **and** identity — there is no separate identity service to back up any more).
 - [x] Wallet mutations: **10/min per account** (`decisions.md`).

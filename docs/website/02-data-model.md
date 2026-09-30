@@ -17,19 +17,24 @@
 Schema for everything except identity.
 
 > **Rewritten for the Postgres + PocketBase split.** The earlier version specified
-> PocketBase collections and API rules. Identity now lives in PocketBase; money and
-> usage live in the store. See [`docs/architecture.md`](../architecture.md).
+> PocketBase collections and API rules. Under that design identity lived in
+> PocketBase; money and usage lived in the store. **That split is now history** —
+> the Phase 6 identity port landed and identity is Rust-owned over the `accounts` +
+> `identities` tables in the same embedded SQLite database as money. See
+> [`docs/architecture.md`](../architecture.md) and
+> [`architecture/identity.md`](../architecture/identity.md).
 
 ## Division of ownership
 
 | Concern | Store |
 | --- | --- |
-| Accounts, passwords, Google login, verification, reset, MFA | **PocketBase** |
+| Accounts, passwords, Google login, verification, reset, MFA | **SQLite**, served natively by the Rust crate (was PocketBase) |
 | Wallet, keys, limits, top-ups, usage, ledger, sessions | **SQLite** (was Postgres) |
 
 **The golden rule:** the money store never becomes authoritative about *who* a
-user is, and PocketBase never holds money. Rust reads identity from PocketBase and
-writes money to SQLite — never the reverse.
+user is, and identity never holds money. Rust owns both sides now — the account and
+its identities live beside the wallet in one SQLite file, and money moves only
+through the ledger.
 
 ## Extensions
 
@@ -39,7 +44,10 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- gen_random_uuid()
 
 ## accounts
 
-The join point between the two systems.
+The join point between the two systems — **as designed for the PocketBase split**.
+`pb_user_id` is **not** a column in the shipped schema: the identity port dropped it,
+and the account is now joined to its login methods by `identities.account_id` in the
+same SQLite database. The DDL below is kept as the design record.
 
 ```sql
 CREATE TABLE accounts (
@@ -53,12 +61,13 @@ CREATE TABLE accounts (
 );
 ```
 
-**Why `pb_user_id` and not PocketBase's id as the PK.** Auth is the component most
+**Why `pb_user_id` and not PocketBase's id as the PK** *(the historical rationale;
+`pb_user_id` was dropped by the identity port)*. Auth is the component most
 likely to change; it must not own the primary key of the ledger. The cost is one
 extra lookup on login, paid once per session.
 
-**Never hard-delete a PocketBase user.** The wallet is here and nothing cascades
-across the boundary — deleting the auth record orphans the money. Set
+**Never hard-delete a user record.** The wallet is here and nothing cascades
+across the boundary — deleting the login orphans the money. Set
 `status = 'closed'` instead.
 
 ## wallets
@@ -485,7 +494,7 @@ its index:
 | Proxy key auth — `api_keys.key_hash` | explicit partial index |
 | Webhook idempotency — `topups.order_id` | `UNIQUE` (auto-indexed) |
 | Session resolve — `sessions.token_hash` | `UNIQUE` (auto-indexed) |
-| Login — `accounts.pb_user_id` | `UNIQUE` (auto-indexed) |
+| Login — `accounts.pb_user_id` *(historical: dropped by the identity port; login now resolves over `identities`)* | `UNIQUE` (auto-indexed) |
 | Dashboard usage — `usage_daily.account_id` | composite PK (leftmost) |
 | Keys per account — `api_keys.account_id` | explicit index |
 | Telegram resolve — `telegram_links.telegram_id` | `PRIMARY KEY` (auto-indexed) |
@@ -503,7 +512,8 @@ B-tree index for both, and a duplicate costs write throughput and storage for no
 read benefit. (True of SQLite too — it backs `UNIQUE` with an implicit index.)
 
 That covers `order_id`, `token_hash`, `telegram_id`, `code`, and
-`pb_user_id` in this schema — each is constrained, each already indexed.
+`pb_user_id` in this (historical) schema — each is constrained, each already indexed.
+(`pb_user_id` is not in the shipped schema; it was dropped by the identity port.)
 
 **A composite primary key is only useful leftmost-first.** `usage_daily` is keyed
 `(`account_id, api_key_id, day`)`, so a query filtering on `day` alone cannot
@@ -522,7 +532,10 @@ The wallet ledger is the business.
 
 - **PITR, or at minimum daily snapshots**, retained off-host.
 - **Verify restores.** An untested backup is a belief, not a backup.
-- PocketBase needs backing up too — losing it loses logins, though not money.
+- **Identity is no longer a second store to back up.** It lives in the same SQLite
+  file as the money, so the database backup covers logins too. (Under the historical
+  PocketBase split, PocketBase needed backing up separately — losing it lost logins,
+  though not money.)
 - **`ledger` is the authoritative record.** If `wallets.balance_idr` and the sum of
   `ledger.delta_idr` ever disagree, the ledger is right and the balance is a bug to
   investigate.
@@ -536,8 +549,10 @@ The wallet ledger is the business.
 5. Wallet mutations are transactional with their ledger row.
 6. `ON DELETE RESTRICT` for anything holding money; `CASCADE` only for derived
    data (sessions, keys, usage).
-7. Never hard-delete a PocketBase user.
-8. Reconcile `accounts.pb_user_id` against PocketBase on a schedule.
+7. Never hard-delete an account.
+8. ~~Reconcile `accounts.pb_user_id` against PocketBase on a schedule.~~ **Void** —
+   `pb_user_id` is dropped and identity lives in the same SQLite database as money,
+   so there are no two stores to reconcile.
 9. `reviews` is keyed on the account; one per user, enforced by a partial
    unique index, and edits are appended to `review_history`.
 10. **Admin actions write `admin_audit`, and money moves only via `ledger`** —

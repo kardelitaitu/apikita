@@ -161,11 +161,11 @@ state, checked against the tree rather than assumed:
 The page layer is largely written. What remains:
 
 1. ~~PocketBase collections and API rules~~ ([02-data-model.md](02-data-model.md)) —
-   **not work in this repository.** [`docs/decisions.md`](../decisions.md) settles the
-   *target* (identity Rust-owned, PocketBase id column dropped), but that is migration
-   Phase 6 and it has **not landed** — PocketBase is still the identity provider and
-   `auth.rs` still reads `POCKETBASE_URL`. Configuring PocketBase collections is
-   therefore still required to run the stack today, not superseded work.
+   **not work in this repository, and now moot.** The identity port has **landed**:
+   identity is Rust-owned over the `accounts` + `identities` tables in the same
+   embedded SQLite database as money, `accounts.pb_user_id` is dropped and
+   `POST /auth/exchange` is deleted. There are no PocketBase collections to
+   configure and no PocketBase instance to run.
 2. ~~Astro pages and the dashboard islands~~ — **built**; see "What exists today".
    No page gaps remain: every route in the spec's table has a file.
 3. **Proxy-side key enforcement and limit checks**
@@ -187,16 +187,15 @@ document used to list as open is settled there, or has been overtaken:
 - ~~First-deposit minimum (50k-100k under discussion)~~ — **decided: 50,000 IDR**; re-top-up 10,000 IDR (§Product behaviour and limits)
 - ~~Whether exceeding a spend limit returns 402 or 429~~ — **decided: 402** for a spend-limit breach, **429** for a rate-limit breach (§API behaviour)
 - ~~Proxy cache TTL for key metadata~~ — **decided: 60 seconds** (§API behaviour)
-- ~~Reconciliation job between Postgres and PocketBase~~ — **moot for money, live for
-  identity**: the money store is a single SQLite file, but identity is still
-  PocketBase until Phase 6, so `accounts.pb_user_id` can still drift from it. No
-  reconciliation decision is recorded; the orphan check in
-  [`../architecture/identity.md`](../architecture/identity.md) §Reconciliation is still
-  the outstanding work.
+- ~~Reconciliation job between Postgres and PocketBase~~ — **void**: identity and
+  money now live in one embedded SQLite database, `accounts.pb_user_id` is dropped,
+  so a row cannot exist on one side only. There is no reconciliation job to schedule
+  and no orphan check to build — see
+  [`../architecture/identity.md`](../architecture/identity.md) §Reconciliation.
 
-Nothing this document used to list as open is still undecided. The one live item above
-— identity/PocketBase reconciliation — is not a decision to make here: it is a
-consequence of migration Phase 6 not having landed. Genuinely open items are in the
+Nothing this document used to list as open is still undecided. The reconciliation
+item above is void rather than open: it was a consequence of two stores, and there is
+now one. Genuinely open items are in the
 register's §"Genuinely open"; build tasks are in
 [`launch-checklist.md`](../launch-checklist.md).
 

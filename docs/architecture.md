@@ -49,7 +49,7 @@ Deployment: **pushing to `main` deploys both** Cloudflare Pages and Northflank.
           |                                |
           v                                v
    VPS Relay  (primary)          Northflank  (fallback origin)
-   nginx + Docker                Rust API + proxy + SQLite + PocketBase
+   nginx + Docker                Rust API + proxy + SQLite
           |                                ^
           +--------------------------------+
              normal path: relay -> Northflank
@@ -210,23 +210,24 @@ a provider's token format.
 
 ### Password reset and email verification
 
-These stay in PocketBase, but **the emails must be branded and the links must land
-on your domain**, or customers receive mails that look like phishing. Configure
-PocketBase's templates and custom redirect URLs.
+These are served by this crate now — `identity::tokens` mints the links and
+`identity::email` sends them over the configured SMTP relay. **The emails must be
+branded and the links must land on your domain**, or customers receive mails that
+look like phishing. That is a template and `PUBLIC_SITE_URL` concern, not a
+third-party console.
 
 ### The risks accepted by this choice
 
+The two-system rows below were the cost of the PocketBase hybrid. With identity
+native, the first three are gone; the rest still hold.
+
 | Risk | Mitigation |
 | --- | --- |
-| Two systems to run and back up | PocketBase is small; treat it as infrastructure, not app data |
-| Identity and money could drift | SQLite is authoritative; reconcile `accounts.pb_user_id` against PocketBase on a schedule and alert on orphans |
-| A deleted PocketBase user leaves a funded wallet | **Never hard-delete PocketBase users.** Deactivate them. The wallet outlives the login. |
+| ~~Two systems to run and back up~~ | Resolved: one process, one SQLite file |
+| ~~Identity and money could drift~~ | Resolved: one store, so there is nothing to reconcile |
+| ~~A deleted auth user leaves a funded wallet~~ | Resolved: the account is the row; there is no second id to delete. The rule it produced survives — never hard-delete a funded account |
 | Auth outage blocks all logins | Existing sessions keep working — they live in SQLite |
-| Two deploy targets for the backend | PocketBase changes rarely; it is not on the `main` deploy path for app code |
-
-**The "deleted user leaves a funded wallet" row is the one to remember.** It is the
-concrete reason never to hard-delete an auth record: the money is in the other
-database, and nothing cascades across the boundary.
+| The identity tables hold credentials | They are in the same file as the money, so a database backup covers both |
 
 ## Database
 
@@ -235,15 +236,19 @@ SQLite, every table `STRICT`. Schema outline; the full field list is in
 definition is
 [`server/migrations/20260925000000_initial_schema.sql`](../server/migrations/20260925000000_initial_schema.sql).
 
-> **Where the port stands:** the tree is SQLite end to end, and PocketBase is still
-> the identity provider — it becomes Rust in Phase 6. The register's marker in
-> [`decisions.md`](decisions.md) and the plan in
-> [`plans/sqlite-migration.md`](plans/sqlite-migration.md) are the current boundary;
-> prefer them where this document has not yet caught up.
+> **Where the port stands:** the identity port has **landed**. `accounts.pb_user_id`
+> is dropped, there is no external auth service, and identity is served by this
+> crate. [`architecture/identity.md`](architecture/identity.md) is the operative
+> description; the phase narratives in
+> [`plans/sqlite-migration.md`](plans/sqlite-migration.md) are a log of what was
+> true when written.
 
 | Table | Purpose |
 | --- | --- |
-| `accounts` | Wallet owner. UUID PK + `pb_user_id` link. |
+| `accounts` | Wallet owner. The only key. |
+| `identities` | Provider rows — `password` (Argon2id) and `google`. |
+| `identity_tokens` | Verification and password-reset links. |
+| `auth_attempts` | The credential-guessing caps. |
 | `sessions` | Server-side sessions — real revocation |
 | `api_keys` | `key_hash`, prefix, model allowlist, limits |
 | `wallets` | `balance_idr` |
@@ -252,10 +257,9 @@ definition is
 | `link_codes` | Telegram binding, short TTL |
 | `ledger` | Append-only wallet movements (audit) |
 
-**Not in SQLite:** passwords, email verification, Google login — those live in
-PocketBase. There is no `credentials` table and no `identities` table; PocketBase
-*is* the identity store. See
-[Authentication](#authentication--pocketbase-for-auth-only).
+**Not in SQLite:** nothing. Passwords, email verification and Google login are
+`identities` rows in the same file as the money. See
+[Authentication](#authentication--served-by-this-crate).
 
 ### Rules
 
@@ -272,9 +276,8 @@ PocketBase. There is no `credentials` table and no `identities` table; PocketBas
 
 ## Live updates (no page refresh)
 
-PocketBase offers realtime, but it is scoped to its own collections — and the
-data we care about (wallet, usage) lives in **SQLite**, which PocketBase cannot
-stream. So realtime is ours regardless of the auth decision.
+The data we care about (wallet, usage) lives in **SQLite**, so realtime is ours to
+serve — there is no third-party collection stream to lean on.
 
 **Use Server-Sent Events (SSE)** from the Rust server:
 
@@ -323,20 +326,21 @@ to the browser** — it is not secret, and putting a real secret there leaks it.
 
 ## Consequences of this choice
 
-Honest accounting of the PocketBase-for-auth hybrid:
+Honest accounting of the native-identity design:
 
 | Gained | Taken on |
 | --- | --- |
-| Password hashing, verify, reset, OAuth2, OTP, MFA — all free | A **second system** to run, back up, and monitor |
-| Auth proven, not hand-rolled | Identity lives outside SQLite; the two can drift |
-| SQLite: transactions, constraints, real reporting | One **extra lookup on login** to resolve `pb_user_id` |
-| Server-side sessions: logout revokes immediately | Authorization logic in Rust (was PocketBase API rules) |
-| PocketBase is not on the request hot path | Hard-deleting a PB user would orphan a funded wallet |
+| One store: identity and money in the same SQLite file | Credential hashing is ours to get right (Argon2id) |
+| One deploy target, one backup, one thing to monitor | Email delivery is now a dependency (the SMTP relay) |
+| `accounts.id` is the only key; no resolution join | Authorization logic in Rust (was provider API rules) |
+| Server-side sessions: logout revokes immediately | The pre-hijacking rules are ours to hold (see `architecture/identity.md`) |
+| Nothing about auth is on a third party's hot path | Hard-deleting a funded account would orphan a wallet |
 
-**The rule that keeps this sound: PocketBase owns identity, SQLite owns money.**
-Cross the boundary in one direction only — Rust reads identity from PocketBase and
-writes money to SQLite. Nothing in SQLite should ever be authoritative about
-who a user is.
+**The rule that keeps this sound: one authority for money, and identity is a row
+in it.** There is no boundary to cross and nothing to reconcile. The earlier
+hybrid's rule — "nothing in SQLite should ever be authoritative about who a user
+is" — is now exactly inverted: SQLite *is* the authority, and the money tables
+still may not hold credentials.
 
 ## What this invalidates
 
@@ -344,8 +348,8 @@ Documents that must be revised:
 
 | Document | Status |
 | --- | --- |
-| [website/02-data-model.md](website/02-data-model.md) | **Rewrite for SQLite.** Money tables are SQLite; identity stays in PocketBase until Phase 6. PocketBase *API rules* are replaced by Rust authorization. |
-| [website/05-security-decisions.md](website/05-security-decisions.md) | **Update.** D1 (wallet immutability) still applies — enforced by Rust, not API rules. D2 (token revocation) is superseded by SQLite sessions. D3 (verification) still holds — it is now PocketBase's `verified` field being protected. |
+| [website/02-data-model.md](website/02-data-model.md) | **Historical.** It documents the retired PostgreSQL design. The shipped schema is `server/migrations/`; identity is in `accounts` + `identities`, not a provider. |
+| [website/05-security-decisions.md](website/05-security-decisions.md) | **Update.** D1 (wallet immutability) still applies — enforced by Rust, not API rules. D2 (token revocation) is superseded by SQLite sessions. D3 (verification) still holds — it is now the `identities.email_verified` column being protected. |
 | [website/01-architecture.md](website/01-architecture.md) | **Superseded** on stack; frontend internals still valid. |
 | [website/03-functional-spec.md](website/03-functional-spec.md) | Mostly valid — it specifies behaviour, not storage. |
 | [website/04-payments.md](website/04-payments.md) | Valid: the Midtrans flow is storage-agnostic. |

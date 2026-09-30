@@ -59,13 +59,17 @@ with the first ten customers, before any spend on growth.
 3,000,000 IDR/month (~$165) is assumed across Northflank, a VPS relay, Cloudflare,
 and CI. **No quotes have been obtained.** At $300 actual, break-even roughly doubles.
 
-### 5. Seven moving parts, one operator
+### 5. Six moving parts, one operator
+
+> **Since this audit:** the identity port landed. PocketBase is gone — identity is
+> served by the Rust API itself in the embedded SQLite database, so there is no
+> separate auth system to run. The count below is updated; the finding is not.
+> See [`architecture/identity.md`](architecture/identity.md).
 
 | Component | Why it exists |
 | --- | --- |
-| Rust API + proxy | The product |
-| SQLite (embedded) | Money |
-| PocketBase | Identity |
+| Rust API + proxy | The product, and now identity too |
+| SQLite (embedded) | Money and identity |
 | VPS relay | Flood absorption, cost |
 | Cloudflare Pages | Frontend |
 | Cloudflare edge | DDoS, DNS, TLS |
@@ -77,8 +81,9 @@ customer. The objective is *low cost server*; complexity is a cost even when eac
 component is cheap.
 
 **Candidates to defer at launch:** the edge relay (Cloudflare already absorbs
-volumetric attacks), and the PocketBase hybrid (it saves auth work but adds a second
-system to back up and reconcile).
+volumetric attacks). The PocketBase hybrid was once the other candidate — a second
+system to back up and reconcile — and it is no longer a choice: the identity port
+folded it into the API, which is why the surface above is six and not seven.
 
 ### 6. The whitepaper remains misleading
 

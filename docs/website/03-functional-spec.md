@@ -222,4 +222,4 @@ Not optional, and cheap if done from the start:
 
 - LLM request proxying → `server/`
 - Telegram bot UI → `telegram/`
-- Admin operations → PocketBase dashboard initially
+- Admin operations → the shipped `/admin` operator console over the Rust admin routes (account lookup, suspend/resume, audit trail, service metrics) — see [`../admin-surface.md`](../admin-surface.md). (This was previously "the PocketBase dashboard", which no longer exists.)

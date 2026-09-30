@@ -15,7 +15,7 @@ traffic. There is no back door.**
 | Anti-pattern | Why it breaks |
 | --- | --- |
 | `UPDATE wallets SET balance_idr = ...` by hand | The ledger no longer sums to the balance. Reconciliation fails forever |
-| Editing PocketBase records directly for money | Identity system holding money state; the two stores diverge |
+| Editing the identity tables (`accounts`, `identities`) directly for money | The identity rows are not the ledger; money state edited there is invisible to reconciliation and diverges from the wallet |
 | Deleting rows to "fix" data | Destroys the audit trail that makes disputes resolvable |
 
 **An adjustment is a ledger row, not an edit.** The `ledger.reason` enum has

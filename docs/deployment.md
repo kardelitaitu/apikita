@@ -268,7 +268,9 @@ The wallet ledger is the business.
 - **PITR, or at minimum daily snapshots**, retained off-host.
 - **Test a restore before launch.** An untested backup is a belief.
 - Back up **before every migration** — the cheapest rollback is a restore.
-- PocketBase needs backing up too: losing it loses logins, though not money.
+- There is no second store to back up: identity lives in the same SQLite file
+  (`accounts` + `identities`), so one tested restore covers money and logins
+  together — see [`backup-and-restore.md`](backup-and-restore.md).
 
 ## What can go wrong, and the response
 

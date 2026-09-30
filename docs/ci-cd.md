@@ -209,9 +209,12 @@ step is a plain `cargo test --lib`:
   run: cargo test --lib
 ```
 
-Identity still enters through PocketBase at runtime — migration Phases 6 and 7 are
-not done, so a deployed server requires a live `POCKETBASE_URL`. But no *test* needs
-one any more, which is why the exclusion flags could be deleted rather than named.
+**Identity enters through the Rust crate, not through any external service.** The
+Phase 6 identity port landed: `accounts.pb_user_id` is dropped, `POST /auth/exchange`
+is deleted, and `server/src/routes/auth.rs` no longer reads `POCKETBASE_URL`. A
+deployed server needs no `POCKETBASE_URL` and there is no PocketBase anywhere — see
+[`architecture/identity.md`](architecture/identity.md). No test needs one either,
+which is why the exclusion flags could be deleted rather than named.
 
 ## Schema validation in CI
 
@@ -325,7 +328,9 @@ The starting set was `auth.rs` 58.6%, `events.rs` 86.2%, `admin.rs` 86.6% and
 
 - **`auth.rs`** — the *entire* `exchange_token` handler was uncovered, hidden behind
   an `#[ignore]`d live-PocketBase test. Nothing flagged it: the file looked like
-  every other file. Now 98.3% via a loopback stub, with the ignore gone.
+  every other file. It reached 98.3% via a loopback stub, with the ignore gone — and
+  the handler has since been **deleted** along with `POST /auth/exchange` when the
+  Phase 6 identity port landed.
 - **`proxy.rs`** — not scaffolding but `MeteredStream`, the wrapper that decides
   whether a customer is **billed** and whether a key is **cooled down**, including a
   client-hangup path whose own comment records that dropping the body unread "is
@@ -348,7 +353,9 @@ measuring at all:** `routes/auth.rs` was at **58.6%**, by far the worst in the
 repo, and the uncovered block was the *entire* `exchange_token` handler. Nothing
 flagged it — the file looked like every other file, the suite was green, and the
 only test that touched the handler was `#[ignore]`d behind a live PocketBase. It
-is now at **98.2%** via a loopback stub, with the ignore removed.
+reached **98.2%** via a loopback stub, with the ignore removed; the handler itself
+was then deleted by the identity port, so there is no live PocketBase in the crate
+to ignore a test behind.
 
 ### A percentage cannot see unreachable code — coverage can
 

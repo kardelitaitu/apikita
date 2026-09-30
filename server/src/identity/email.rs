@@ -11,9 +11,9 @@
 //! constructed once, handed to the handlers that need it as a `&EmailSender`
 //! parameter — the injection point `routes/proxy.rs` uses for `UpstreamClient` —
 //! and the TESTS talk to a real SMTP server: a loopback `TcpListener` that answers
-//! one handshake, exactly like `routes/auth.rs::pocketbase_stub` did for
-//! PocketBase. A test that reads the bytes that arrived on the socket is testing
-//! the thing that ships.
+//! one handshake, exactly like the loopback upstream stubs in
+//! `routes/proxy.rs` and `upstream/client.rs`. A test that reads the bytes that
+//! arrived on the socket is testing the thing that ships.
 //!
 //! ## Why `smtp_host` being empty is a supported state
 //!
@@ -59,9 +59,16 @@ use tracing::{error, warn};
 ///
 /// This is not a config key, and that is the point: it exists so a TEST can point
 /// the sender at a loopback listener without editing the shipped config, and so an
-/// operator can redirect a deployment's mail without a rebuild. It follows
-/// `POCKETBASE_URL` in `routes/auth.rs`, which is the precedent for "a test needs
-/// to aim a collaborator at a socket it controls".
+/// operator can redirect a deployment's mail without a rebuild.
+///
+/// It used to cite `POCKETBASE_URL` in `routes/auth.rs` as the precedent for "a test
+/// needs to aim a collaborator at a socket it controls". That precedent is GONE — the
+/// identity port deleted the PocketBase client, and with it the only env var that
+/// aimed this crate at a third-party service — so the citation would now point at
+/// nothing. The pattern itself outlived it, and its nearest living relatives are
+/// `APIKITA_PUBLIC_URL` in `routes/auth.rs` (the origin a verification link points
+/// at) and `TEST_LIMITS_OVERRIDE` in the same module: env rather than config whenever
+/// the value is a property of where the code RUNS rather than of how it is configured.
 ///
 /// Shape: a full base, `http://`-free and scheme-less — `127.0.0.1:2525`. Bare
 /// host and port, because SMTP has no URL scheme and inventing one would mean

@@ -1,5 +1,13 @@
 # website
 
+> **Superseded: identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the
+> PocketBase HTTP client is gone from `server/`, and identity is served natively
+> by this crate (`accounts` + `identities`, Argon2id). Where the text below still
+> says PocketBase is the current identity provider, this notice governs;
+> [`architecture/identity.md`](../docs/architecture/identity.md) is the operative
+> description.
+
 The customer-facing web surface for the platform.
 
 **Responsibility:** landing/marketing page, account signup and login, API key
@@ -15,12 +23,13 @@ Two login methods:
 1. **Google sign-in**
 2. **Email + password**, with email verification and password reset
 
-Both are handled by **PocketBase**. The website is where the user signs in, but it
-is not the identity store — PocketBase is. The **account** owns the wallet and the
-API keys; the Telegram bot links to that account rather than holding its own
-identity.
+Both are handled natively by the **Rust API** over the `accounts` + `identities`
+tables in its embedded SQLite database. The website is where the user signs in, and
+the server is the identity store — there is no third-party auth service. The
+**account** owns the wallet and the API keys; the Telegram bot links to that account
+rather than holding its own identity.
 
-Design, including the account-takeover rules PocketBase already handles:
+Design, including the account-takeover rules the server enforces:
 [`docs/architecture/identity.md`](../docs/architecture/identity.md).
 
 ## Stack
@@ -62,7 +71,7 @@ page or a contract test lands. What exists today:
 - **Islands** — `islands/keys/KeyManagement.astro` (create, **edit**, revoke),
   `islands/usage/UsageAnalytics.astro`, `islands/wallet/TopUpForm.astro` and
   `islands/admin/AccountAdmin.astro`, each mounted by its page.
-- **Shared layer** — `lib/{admin,api,auth-flow,dashboard-form,errors,format,live,login-error,midtrans-env,models,pocketbase,privacy,recent-usage,retry-wait,service-status,usage,usage-trend}.ts`.
+- **Shared layer** — `lib/{admin,api,auth-api,auth-flow,dashboard-form,errors,format,live,login-error,midtrans-env,models,privacy,recent-usage,retry-wait,service-status,usage,usage-trend}.ts`.
 - **Components** — `components/{Nav,Skeleton}.astro`. The skeleton implements the
   spec's "skeleton, not a spinner" loading rule (03-functional-spec.md:121).
 
@@ -73,7 +82,9 @@ page or a contract test lands. What exists today:
 Design and the authoritative built-vs-planned inventory:
 [`docs/website/README.md`](../docs/website/README.md).
 
-> **Note on the identity description above.** `docs/decisions.md` settles identity as
-> **Rust-owned** (SQLite, no external auth service), but that migration is *decided, not
-> yet in the code* — see the register's "Migration in flight" marker. The running server
-> still calls PocketBase, so this folder still uses the PocketBase client.
+> **Note on the identity description above.** The identity port has **landed** —
+> identity is Rust-owned (SQLite, no external auth service). `lib/pocketbase.ts` is
+> deleted, the `pocketbase` npm dependency is gone from this package, and this folder
+> now reaches auth through `lib/auth-api.ts` (`/auth/signup`, `/auth/login`,
+> `/auth/google`). [`docs/architecture/identity.md`](../docs/architecture/identity.md)
+> is the operative description.
