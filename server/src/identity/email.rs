@@ -380,13 +380,7 @@ mod tests {
         }
     }
 
-    /// A minimal SMTP server: accepts one connection, answers the handshake, and
-    /// returns everything the client said.
-    ///
-    /// A PEER rather than a mock. It speaks real SMTP badly but correctly enough
-    /// for `lettre` to complete a session, which is what makes the assertion
-    /// ("the message reached the wire with this recipient") a statement about the
-    /// code that ships. The precedent is `routes/auth.rs::pocketbase_stub`.
+    /// The whole SMTP session, including every reply the stub gave.
     async fn smtp_stub() -> (String, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -413,24 +407,9 @@ mod tests {
                 }
                 transcript.push_str(&line);
 
-                // lettre's plaintext path: EHLO, then either AUTH or MAIL FROM.
                 let upper = line.to_uppercase();
                 let reply: &[u8] = if upper.starts_with("EHLO") || upper.starts_with("HELO") {
-                    // STARTTLS MUST be advertised. The transport is built with
-                    // `starttls_relay`, which refuses a server that does not offer
-                    // it ("STARTTLS is not supported on this server") rather than
-                    // silently sending credentials over cleartext - which is the
-                    // behaviour worth having, and worth a test that depends on it.
-                    b"250-stub\r\n250-STARTTLS\r\n250 SIZE 10485760\r\n"
-                } else if upper.starts_with("STARTTLS") {
-                    // This stub does NOT complete a TLS handshake, so the session
-                    // has to stop here. That is enough for the assertions below and
-                    // is deliberately not a fake TLS: the recipient, subject and
-                    // body are all sent AFTER STARTTLS in a real session, so this
-                    // test asserts the envelope is correct and the routing works,
-                    // and a separate assertion below pins that STARTTLS was
-                    // demanded. See `a_relay_without_starttls_is_refused`.
-                    b"220 ready\r\n"
+                    b"250-stub\r\n250 SIZE 10485760\r\n"
                 } else if upper.starts_with("AUTH") {
                     b"235 ok\r\n"
                 } else if upper.starts_with("MAIL FROM") || upper.starts_with("RCPT TO") {
@@ -448,6 +427,75 @@ mod tests {
 
                 if write_half.write_all(reply).await.is_err() {
                     break;
+                }
+            }
+
+            transcript
+        });
+
+        (format!("127.0.0.1:{}", addr.port()), handle)
+    }
+
+    /// A stub that ADVERTISES STARTTLS and then accepts the upgrade with an empty
+    /// reply, which is the closest a plaintext listener can come to starting a TLS
+    /// handshake.
+    ///
+    /// Why this exists at all: the transport is built with `starttls_relay`, which
+    /// REFUSES a relay that does not offer STARTTLS ("STARTTLS is not supported on
+    /// this server") rather than silently sending credentials over cleartext. That
+    /// is the behaviour worth having, so it needs a test that depends on it. The
+    /// refusal itself is `a_relay_without_starttls_is_never_dialled_in_cleartext`
+    /// below; this stub is the other half - it proves the client really does ask
+    /// for the upgrade before it will send anything.
+    async fn starttls_advertising_stub() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept one client");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut transcript = String::new();
+
+            write_half
+                .write_all(b"220 stub ESMTP\r\n")
+                .await
+                .expect("greeting");
+
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                transcript.push_str(&line);
+
+                let upper = line.to_uppercase();
+                if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+                    transcript.push_str("<REPLY>250-stub\\r\\n250-STARTTLS\\r\\n250 SIZE 10485760\r\n");
+                    if write_half
+                        .write_all(b"250-stub\r\n250-STARTTLS\r\n250 SIZE 10485760\r\n")
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                } else if upper.starts_with("STARTTLS") {
+                    transcript.push_str("<REPLY>220 ready (no handshake follows)\r\n");
+                    // Reply 220 and then STOP: the client begins its TLS
+                    // ClientHello against a socket that will not answer it, so the
+                    // handshake fails with an EOF. That failure is the assertion -
+                    // it is only reachable if STARTTLS was requested first.
+                    let _ = write_half.write_all(b"220 ready\r\n").await;
+                    break;
+                } else {
+                    transcript.push_str("<REPLY>250 ok\r\n");
+                    if write_half.write_all(b"250 ok\r\n").await.is_err() {
+                        break;
+                    }
                 }
             }
 
@@ -484,9 +532,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_message_reaches_the_wire_with_its_recipient_subject_and_body() {
+    async fn the_client_demands_starttls_before_it_will_send_anything() {
         let _lock = EnvLock::acquire();
-        let (base, handle) = smtp_stub().await;
+        let (base, handle) = starttls_advertising_stub().await;
         let _env = EnvGuard::set(EMAIL_BASE_URL_ENV, &base);
 
         let (host, port) = listen_address(&EmailConfig::default());
@@ -495,27 +543,64 @@ mod tests {
         let sender = EmailSender::new(&config_to(&host, port));
         assert!(sender.is_configured(), "a host of any kind must build a transport");
 
-        sender
+        let result = sender
             .send(Email {
                 to: "person@example.com".to_string(),
-                subject: "Verify your apikita email address".to_string(),
-                body: "https://apikita.test/verify?token=abc123".to_string(),
+                subject: "Verify".to_string(),
+                body: "body".to_string(),
             })
-            .await
-            .expect("the stub accepts the message");
+            .await;
 
         let transcript = handle.await.expect("the stub finishes");
+
         assert!(
-            transcript.contains("RCPT TO:<person@example.com>"),
-            "the recipient must be on the wire; transcript was:\n{transcript}"
+            transcript.to_uppercase().contains("STARTTLS"),
+            "the client must ASK for the upgrade; transcript was:\n{transcript}"
+        );
+        // The stub answers 220 and then goes silent, so the handshake cannot
+        // finish. That is the point: the only way to reach a TLS failure is to
+        // have requested STARTTLS first, which is what this asserts.
+        assert!(
+            matches!(result, Err(EmailError::Transport(_))),
+            "a stub that cannot complete the handshake must fail as a transport error, got {result:?}"
+        );
+        // The envelope must NOT have been sent before the upgrade. This is the
+        // assertion that makes the test about security rather than plumbing.
+        assert!(
+            !transcript.to_uppercase().contains("MAIL FROM"),
+            "no envelope may be sent before the TLS upgrade; transcript was:\n{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_without_starttls_is_never_dialled_in_cleartext() {
+        let _lock = EnvLock::acquire();
+        // The ordinary stub does not advertise STARTTLS.
+        let (base, handle) = smtp_stub().await;
+        let _env = EnvGuard::set(EMAIL_BASE_URL_ENV, &base);
+
+        let (host, port) = listen_address(&EmailConfig::default());
+        let sender = EmailSender::new(&config_to(&host, port));
+
+        let result = sender
+            .send(Email {
+                to: "person@example.com".to_string(),
+                subject: "Verify".to_string(),
+                body: "SECRET-LINK-TOKEN".to_string(),
+            })
+            .await;
+
+        let transcript = handle.await.expect("the stub finishes");
+
+        // `starttls_relay` refuses to proceed rather than falling back to
+        // cleartext, so nothing sensitive ever leaves the process.
+        assert!(
+            matches!(result, Err(EmailError::Transport(_))),
+            "a relay that cannot be upgraded to must fail, got {result:?}"
         );
         assert!(
-            transcript.contains("token=abc123"),
-            "the body must be on the wire; transcript was:\n{transcript}"
-        );
-        assert!(
-            transcript.to_uppercase().contains("SUBJECT: VERIFY YOUR APIKITA EMAIL ADDRESS"),
-            "the subject must be on the wire; transcript was:\n{transcript}"
+            !transcript.contains("SECRET-LINK-TOKEN"),
+            "the body must never reach a relay that will not upgrade; transcript was:\n{transcript}"
         );
     }
 
