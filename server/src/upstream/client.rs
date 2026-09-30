@@ -732,6 +732,11 @@ mod tests {
                 wallet_mutations_per_minute: 10,
                 key_creation_per_day: 10,
                 review_per_hour: 3,
+                login_per_hour_per_ip: 20,
+                login_per_hour_per_account: 10,
+                signup_per_hour_per_ip: 5,
+                password_reset_per_hour_per_account: 3,
+                verification_resend_per_hour: 3,
                 key_metadata_cache_seconds: 60,
             },
             realtime: RealtimeConfig {

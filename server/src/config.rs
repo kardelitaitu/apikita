@@ -78,7 +78,86 @@ pub struct LimitsConfig {
     /// config boots with the cap still ON.
     #[serde(default = "default_link_redemption_per_hour")]
     pub link_redemption_per_hour: u32,
+    /// How many sign-in ATTEMPTS one client IP may make within the hour.
+    ///
+    /// A sign-in is the one endpoint where an attacker controls the secret being
+    /// guessed, so a password list is only bounded by a count. This cap is per IP
+    /// and the one below is per ACCOUNT on purpose: they fail differently. A
+    /// distributed guesser defeats the IP cap without noticing it, and a guesser
+    /// walking a single account from one address is better caught by the account
+    /// cap, which no amount of proxying dilutes. FAILED attempts count - a cap
+    /// that only counts successes never fires. `0` disables, the project-wide
+    /// convention; `serde(default)` keeps an older config's cap ON.
+    #[serde(default = "default_login_per_hour_per_ip")]
+    pub login_per_hour_per_ip: u32,
+    /// How many sign-in ATTEMPTS may be made against ONE ACCOUNT within the hour,
+    /// from any address. See the field above for why both exist.
+    ///
+    /// Deliberately SMALLER than the per-IP cap: a human signing in normally needs
+    /// one or two, so a dozen is already generous, and the smaller the number the
+    /// less useful a leaked password list is. It is also the cap that makes an
+    /// account-enumeration sweep by email useless, because the refusal arrives at
+    /// the same speed whether or not the address exists.
+    #[serde(default = "default_login_per_hour_per_account")]
+    pub login_per_hour_per_account: u32,
+    /// How many accounts one client IP may CREATE within the hour.
+    ///
+    /// Signup is unauthenticated and sends mail, so it is the one place a caller
+    /// can spend our money and our sending reputation without an account. FIVE is
+    /// chosen against the real need: a household or an office behind one address
+    /// shares an IP, and a shared NAT is the case that must not break. `0`
+    /// disables; `serde(default)` keeps the cap ON for an older config.
+    #[serde(default = "default_signup_per_hour_per_ip")]
+    pub signup_per_hour_per_ip: u32,
+    /// How many PASSWORD RESET requests one ACCOUNT may make within the hour.
+    ///
+    /// Resets send mail, so this bounds both the mail bill and the use of the
+    /// reset endpoint as a way to flood somebody else's inbox. THREE an hour is
+    /// well beyond a person who mistyped their address twice. Per account, not per
+    /// IP, because the resource being protected is the victim's mailbox.
+    #[serde(default = "default_password_reset_per_hour_per_account")]
+    pub password_reset_per_hour_per_account: u32,
+    /// How many VERIFICATION EMAILS one ACCOUNT may be sent within the hour.
+    ///
+    /// The resend control is a button a user can hold down, and every press is a
+    /// message we pay for and a chance to be marked as a sender of unwanted mail.
+    /// `0` disables; `serde(default)` keeps the cap ON.
+    #[serde(default = "default_verification_resend_per_hour")]
+    pub verification_resend_per_hour: u32,
     pub key_metadata_cache_seconds: u64,
+}
+
+/// Default for `LimitsConfig::login_per_hour_per_ip` when a config file predates
+/// the key.
+///
+/// Twenty an hour. A person who has forgotten which password they used hits two
+/// or three; a list-driven attack wants thousands.
+fn default_login_per_hour_per_ip() -> u32 {
+    20
+}
+
+/// Default for `LimitsConfig::login_per_hour_per_account` when a config file
+/// predates the key. Half the per-IP cap, and deliberately so - see the field.
+fn default_login_per_hour_per_account() -> u32 {
+    10
+}
+
+/// Default for `LimitsConfig::signup_per_hour_per_ip` when a config file predates
+/// the key. Five an hour: room for one office or household, not for a farm.
+fn default_signup_per_hour_per_ip() -> u32 {
+    5
+}
+
+/// Default for `LimitsConfig::password_reset_per_hour_per_account` when a config
+/// file predates the key.
+fn default_password_reset_per_hour_per_account() -> u32 {
+    3
+}
+
+/// Default for `LimitsConfig::verification_resend_per_hour` when a config file
+/// predates the key.
+fn default_verification_resend_per_hour() -> u32 {
+    3
 }
 
 /// Default for `LimitsConfig::link_code_issuance_per_hour` when a config file
