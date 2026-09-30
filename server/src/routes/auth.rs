@@ -303,14 +303,49 @@ fn app_config() -> Result<&'static AppConfig, AppError> {
 /// Env, not config, for the reason `identity::email::EMAIL_BASE_URL_ENV` gives:
 /// the deployment's public origin is a property of where it runs, and a test
 /// needs to point links at a local listener without rebuilding.
-fn mail_link(purpose: identity::tokens::Purpose, raw: &str) -> String {
+///
+/// A RESET LINK ALSO CARRIES THE ADDRESS, because `/auth/password-reset/confirm`
+/// requires the token and the address to agree and the two may be minutes apart in
+/// two different browsers. The address is not a secret — it is the one the mail was
+/// sent to — and carrying it is what lets that page submit without asking the user
+/// to retype what they just typed. A verification link has no such requirement, so
+/// it carries only the token.
+fn mail_link(purpose: identity::tokens::Purpose, raw: &str, email: &str) -> String {
     let base = std::env::var("APIKITA_PUBLIC_URL")
         .unwrap_or_else(|_| "https://apikita.example".to_string());
-    let path = match purpose {
-        identity::tokens::Purpose::Verification => "verify",
-        identity::tokens::Purpose::Reset => "reset",
-    };
-    format!("{}/{}?token={}", base.trim_end_matches('/'), path, raw)
+    let base = base.trim_end_matches('/');
+    match purpose {
+        identity::tokens::Purpose::Verification => format!("{base}/verify?token={raw}"),
+        // Percent-encoding a whole address is the safe form: a `+`, `&` or `#` in
+        // a local part would otherwise truncate the query string or split it into
+        // extra parameters, and `%40` is what the page decodes back to `@`.
+        identity::tokens::Purpose::Reset => {
+            format!("{base}/reset/confirm?token={raw}&email={}", urlencode(email))
+        }
+    }
+}
+
+/// Percent-encode a query-string value with the RFC 3986 unreserved set.
+///
+/// Hand-rolled rather than pulled from a crate because this is the only place the
+/// crate needs it, and the set is short enough to be obviously correct: everything
+/// that is not `A-Za-z0-9-._~` becomes `%XX` over the UTF-8 bytes.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            other => {
+                out.push('%');
+                // Uppercase hex, the form every decoder accepts.
+                out.push(char::from(b"0123456789ABCDEF"[usize::from(other >> 4)]));
+                out.push(char::from(b"0123456789ABCDEF"[usize::from(other & 0x0f)]));
+            }
+        }
+    }
+    out
 }
 
 /// The neutral reply every signup-shaped branch returns.
@@ -359,6 +394,7 @@ async fn send_link_mail(
     account_id: Uuid,
     purpose: identity::tokens::Purpose,
     raw_token: &str,
+    email: &str,
 ) {
     let sender = match email_config() {
         Ok(config) => identity::email::EmailSender::new(config),
@@ -368,7 +404,7 @@ async fn send_link_mail(
         }
     };
 
-    let link = mail_link(purpose, raw_token);
+    let link = mail_link(purpose, raw_token, email);
     let (subject, body) = match purpose {
         identity::tokens::Purpose::Verification => (
             "Confirm your apikita address",
@@ -469,7 +505,16 @@ pub async fn signup(
         )
         .await?;
 
-        send_link_mail(&state, issued, identity::tokens::Purpose::Verification, &token.raw).await;
+        // The address here is the one the caller typed, which is the one the
+        // account was created with after normalization.
+        send_link_mail(
+            &state,
+            issued,
+            identity::tokens::Purpose::Verification,
+            &token.raw,
+            &email,
+        )
+        .await;
     }
 
     Ok((
@@ -783,7 +828,16 @@ pub async fn request_password_reset(
         )
         .await?;
 
-        send_link_mail(&state, account_id, identity::tokens::Purpose::Reset, &token.raw).await;
+        // The reset link carries the address so the confirmation page can submit
+        // without making the user retype it; see `mail_link`.
+        send_link_mail(
+            &state,
+            account_id,
+            identity::tokens::Purpose::Reset,
+            &token.raw,
+            &email,
+        )
+        .await;
     }
 
     Ok((
@@ -918,6 +972,7 @@ pub async fn resend_verification(
                 identity.account_id,
                 identity::tokens::Purpose::Verification,
                 &token.raw,
+                &email,
             )
             .await;
         }
@@ -1010,6 +1065,49 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .expect("set-cookie present");
         assert!(value.contains("Max-Age=0"), "got {value}");
+    }
+
+    /// The reset link must survive an address that would otherwise break the query
+    /// string. `+` is the interesting one: it is legal in a local part, it means
+    /// "space" to a naive query parser, and an `&` or `#` would truncate the link
+    /// or split it into a parameter the page never expected.
+    #[test]
+    fn a_reset_link_carries_the_address_encoded() {
+        let link = mail_link(
+            identity::tokens::Purpose::Reset,
+            "apk_rst_abc",
+            "a+b&c#d@example.com",
+        );
+        assert!(
+            link.starts_with("https://apikita.example/reset/confirm?token=apk_rst_abc&email="),
+            "got {link}"
+        );
+        // Exactly the `@` and the three metacharacters are escaped, and nothing else.
+        assert!(
+            link.ends_with("email=a%2Bb%26c%23d%40example.com"),
+            "got {link}"
+        );
+        // The address must not have leaked in raw form anywhere in the URL.
+        assert!(!link.contains("+"), "a bare + would decode as a space: {link}");
+    }
+
+    /// A verification link has no pair to name, so it carries the token alone.
+    #[test]
+    fn a_verification_link_does_not_carry_the_address() {
+        let link = mail_link(identity::tokens::Purpose::Verification, "apk_vfy_abc", "a@b.example");
+        assert_eq!(link, "https://apikita.example/verify?token=apk_vfy_abc");
+    }
+
+    /// The encoder is the round trip the page performs. Unreserved bytes must pass
+    /// through untouched — an encoder that escaped `example.com` to `example%2Ecom`
+    /// would still "work", and would still be wrong.
+    #[test]
+    fn the_query_encoder_leaves_unreserved_bytes_alone() {
+        assert_eq!(urlencode("a-b_c.d~e9Z"), "a-b_c.d~e9Z");
+        assert_eq!(urlencode("@"), "%40");
+        assert_eq!(urlencode("/"), "%2F");
+        assert_eq!(urlencode(" "), "%20");
+        assert_eq!(urlencode("é"), "%C3%A9");
     }
 
     // -----------------------------------------------------------------------
