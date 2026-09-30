@@ -78,6 +78,15 @@ Give at least 30 days. Tell customers to **confirm their payout destination**.
 
 ## Step 3 — The eligibility query
 
+**Run the tool rather than typing this by hand.** [`tools/wind-down/report.sh`](../tools/wind-down/report.sh)
+runs exactly the query below against a read-only connection, splits the threshold, classifies
+each rail and computes the stablecoin units. It pays nobody. It requires the frozen rate in
+`$CLOSURE_USD_IDR_RATE` and refuses rather than defaulting — see
+[`tools/wind-down/README.md`](../tools/wind-down/README.md).
+
+The SQL is kept here because it is the definition of the step: the tool implements this
+query, and a disagreement between them is a bug in the tool.
+
 The refundable figure is `wallets.balance_idr`, **whole**. Expiry is waived, and in any
 case the schema holds one un-aged integer — expired and live credit are not
 distinguishable at all today.
