@@ -122,6 +122,99 @@ absolute_days = 30
 idle_days = 7
 
 # ===========================================================================
+# AUTH
+# ===========================================================================
+#
+# Identity mechanics: how a password is hashed, what a password must be, and
+# how long a verification or reset link stays valid. The rate limits that bound
+# these endpoints live in [limits] with every other cap - the section that
+# already owns "how many per hour" keeps owning it.
+
+[auth]
+# Argon2id cost. Read on EVERY hash and EVERY verify
+# (server/src/identity/password.rs::hash_password and ::verify_password), so a
+# value changed here changes the work factor for new hashes immediately and for
+# the verification of an existing hash on the next sign-in.
+#
+# 19456 KiB (19 MiB) with 2 passes is the OWASP-recommended floor for Argon2id
+# and RFC 9106's second recommended option. memory_kib is the dominant knob and
+# the one to raise first; raising it multiplies sign-in latency, and the hash
+# runs on a blocking thread so a slow hash costs latency rather than throughput.
+argon2_memory_kib = 19456
+argon2_iterations = 2
+argon2_parallelism = 1
+
+# Password policy. Read by server/src/identity/password.rs::validate_password
+# before hashing, and that one function is the only gate on both signup and
+# password reset, so the two paths cannot drift.
+#
+# min_length is a FLOOR, not a composition rule: there is no character-class
+# requirement, because a length floor is the only password rule that measurably
+# helps and the signup page already states this number to the user. The loader
+# refuses a value below 8 for exactly that reason - the page would be describing
+# a rule we do not enforce.
+password_min_length = 8
+# max_length bounds the Argon2 INPUT, not its cost. Argon2's cost is set by the
+# parameters above, so a 1 MiB "password" buys an attacker nothing and costs us
+# the copy of it.
+password_max_length = 128
+
+# Link lifetimes. Read by server/src/identity/tokens.rs::issue, which computes
+# expires_at, and ::consume, which refuses a row past it.
+#
+# Verification is generous: the user may open the mail tomorrow.
+verification_ttl_minutes = 1440
+# Reset is short, and the reset page says so to the user.
+reset_ttl_minutes = 30
+
+# Google sign-in. The client id is the audience the ID token must name; it is
+# not a secret, so it lives here rather than in the environment. Read by
+# server/src/identity/google.rs::verify_id_token.
+google_client_id = "000000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com"
+
+# How long the Google JWKS response is reused in memory. Read by
+# server/src/identity/google.rs::jwks. Without a cache every sign-in is an
+# outbound request to Google, which makes Google's availability our sign-in
+# latency and our sign-in failure mode.
+google_jwks_cache_seconds = 3600
+
+# ===========================================================================
+# EMAIL
+# ===========================================================================
+#
+# The SMTP relay that carries verification and reset links.
+#
+# This is SMTP rather than a transactional vendor's HTTP API, deliberately: the
+# launch credentials must not pick the architecture. An operator points this at
+# whatever relay they already have, and swapping relays is four values here
+# rather than a code change.
+#
+# smtp_host = "" IS A SUPPORTED STATE, not a misconfiguration. With no relay,
+# signup still works: the account is created unverified, and an unverified
+# account cannot hold a balance, so it is inert. The operator sees one WARN at
+# startup and each failed send is logged against the account. See
+# docs/decisions.md (the identity row) for why a mail outage must not become a
+# signup outage.
+
+[email]
+# Hostname of the relay. Empty means no provider is configured.
+smtp_host = ""
+# 587 is submission with STARTTLS; 465 is implicit TLS. Both are accepted
+# because relays differ.
+smtp_port = 587
+# Empty means the relay takes no authentication, which is the norm for a relay
+# on the same private network.
+smtp_username = ""
+# NAME of the environment variable holding the SMTP password, never the
+# password itself. Same rule as this file's header and as api_key_envs on the
+# model endpoints.
+smtp_password_env = ""
+from_address = ""
+from_name = "apikita"
+reply_to = ""
+request_timeout_seconds = 10
+
+# ===========================================================================
 # RATE LIMITS
 # ===========================================================================
 
@@ -174,6 +267,50 @@ review_per_hour = 3
 # Telegram link codes the account may have ISSUED in an hour. Bounds codes in
 # flight per account; it does NOT stop guessing (see the redemption cap below).
 link_code_issuance_per_hour = 10
+
+# Sign-in ATTEMPTS one client IP may make in an hour. Read by
+# server/src/routes/identity.rs::login.
+#
+# A sign-in is the one endpoint where the caller controls the secret being
+# guessed, so only a count bounds a password list. This cap is per IP and the
+# one below is per ACCOUNT on purpose, because they fail differently: a
+# distributed guesser defeats the IP cap without noticing it, and a guesser
+# walking one account from one address is caught by the account cap, which no
+# amount of proxying dilutes. FAILED attempts count - a cap that only counts
+# successes never fires. 0 disables.
+login_per_hour_per_ip = 20
+
+# Sign-in ATTEMPTS against ONE ACCOUNT in an hour, from any address. Read by
+# server/src/routes/identity.rs::login. Deliberately SMALLER than the per-IP
+# cap: a person signing in normally needs one or two, so ten is already
+# generous, and the smaller the number the less a leaked password list is worth.
+login_per_hour_per_account = 10
+
+# Accounts one client IP may CREATE in an hour. Read by
+# server/src/routes/identity.rs::signup.
+#
+# Signup is unauthenticated and sends mail, so it is the one place a caller can
+# spend our money and our sending reputation without an account. FIVE is chosen
+# against the real need rather than against the abuser: a household or an office
+# behind one address shares an IP, and a shared NAT is the case that must not
+# break. 0 disables.
+signup_per_hour_per_ip = 5
+
+# PASSWORD RESET requests one account may make in an hour. Read by
+# server/src/routes/identity.rs::request_reset.
+#
+# Resets send mail, so this bounds both the mail bill and the use of the reset
+# endpoint to flood somebody else's inbox. Per ACCOUNT rather than per IP,
+# because the resource being protected is the victim's mailbox, not our edge.
+password_reset_per_hour_per_account = 3
+
+# VERIFICATION EMAILS one account may be sent in an hour. Read by
+# server/src/routes/identity.rs::resend_verification.
+#
+# The resend control is a button a user can hold down, and every press is a
+# message we pay for and one more chance to be marked as a sender of unwanted
+# mail. 0 disables.
+verification_resend_per_hour = 3
 
 # Redemption ATTEMPTS one client IP may make in an hour. This is the cap that
 # makes the endpoint safe: a 6-digit code is 10^6 possibilities and the endpoint

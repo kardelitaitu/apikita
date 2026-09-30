@@ -35,6 +35,25 @@ chrono = { version = "0.4", features = ["serde"] }
 cookie = "0.18"
 thiserror = "2.0"
 dotenvy = "0.15"
+# Argon2id for password hashing. RustCrypto, pure Rust, no C and no build script
+# beyond the usual. The `password-hash` feature provides PasswordHasher /
+# PasswordVerifier and SaltString, so salt generation, the PHC string format and
+# the parameter encoding are not ours to write - and getting any of those subtly
+# wrong is how a hash becomes unrecoverable. `alloc` and not `std`, because
+# nothing here needs the std-only paths.
+#
+# CPU-BOUND BY DESIGN: at 19 MiB x 2 passes a hash is roughly 40 ms, so callers
+# run it under `tokio::task::spawn_blocking` rather than on a runtime worker.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+# Google ID token verification. Chosen over a full OIDC crate deliberately:
+# `openidconnect` pulls oauth2, url and serde_with to re-implement a browser code
+# flow the browser already performs - Rust receives ONE ID token and must only
+# verify it. The decisive point is the crypto backend: jsonwebtoken 9 verifies
+# with `ring`, and ring 0.17 is ALREADY in this build transitively via rustls
+# (pulled by reqwest's rustls-tls), so this adds a thin JWT layer on a backend
+# already compiled rather than a second crypto stack. It never touches OpenSSL,
+# and `use_pem` is deliberately NOT enabled because Google publishes JWK, not PEM.
+jsonwebtoken = "9"
 
 [dev-dependencies]
 tokio-test = "0.4"

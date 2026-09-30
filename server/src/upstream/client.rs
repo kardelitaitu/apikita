@@ -630,9 +630,9 @@ fn keys_from_env(envs: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        CircuitBreakerConfig, KeyPoolConfig, LimitsConfig, ModelConfig, ModelEndpoint, ModelRates,
-        NetworkConfig, PricingConfig, RealtimeConfig, SessionsConfig, StreamingConfig,
-        WalletConfig,
+        AuthConfig, CircuitBreakerConfig, EmailConfig, KeyPoolConfig, LimitsConfig, ModelConfig,
+        ModelEndpoint, ModelRates, NetworkConfig, PricingConfig, RealtimeConfig, SessionsConfig,
+        StreamingConfig, WalletConfig,
     };
     use crate::routes::test_env::{EnvGuard, EnvLock};
     use crate::upstream::circuit_breaker::BreakerState;
@@ -724,6 +724,27 @@ mod tests {
             sessions: SessionsConfig {
                 absolute_days: 30,
                 idle_days: 7,
+            },
+            auth: AuthConfig {
+                argon2_memory_kib: 19456,
+                argon2_iterations: 2,
+                argon2_parallelism: 1,
+                password_min_length: 8,
+                password_max_length: 128,
+                verification_ttl_minutes: 1440,
+                reset_ttl_minutes: 30,
+                google_client_id: "test-client-id.apps.googleusercontent.com".to_string(),
+                google_jwks_cache_seconds: 3600,
+            },
+            email: EmailConfig {
+                smtp_host: String::new(),
+                smtp_port: 587,
+                smtp_username: String::new(),
+                smtp_password_env: String::new(),
+                from_address: String::new(),
+                from_name: "apikita".to_string(),
+                reply_to: String::new(),
+                request_timeout_seconds: 10,
             },
             limits: LimitsConfig {
                 link_code_issuance_per_hour: 10,

@@ -8,6 +8,30 @@ pub struct AppConfig {
     pub pricing: PricingConfig,
     pub wallet: WalletConfig,
     pub sessions: SessionsConfig,
+    /// Identity mechanics: how a password is hashed, what a password must be,
+    /// and how long a verification or reset link stays valid.
+    ///
+    /// Placed after `sessions` because the field order here is the TOML section
+    /// order and a reader of `config/apikita.toml` meets `[auth]` right after
+    /// `[sessions]`. The rate limits that bound these endpoints are NOT here:
+    /// they live in `[limits]`, which already owns every per-hour cap.
+    ///
+    /// `serde(default)` because this section was added after the first
+    /// deployments' configs were written, and a config that predates it must
+    /// still BOOT - a `[auth]`-less file is a config from before identity was
+    /// native, not a broken one. `AuthConfig::default` carries the SHIPPED
+    /// values, so the defaults are not a second set of numbers to keep in step.
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Outbound transactional mail: the SMTP relay that carries verification
+    /// and reset links. A separate section because it is a separate transport
+    /// with a separate failure mode - see `EmailConfig::smtp_host`.
+    ///
+    /// `serde(default)` for the same reason as `auth`: an older config has no
+    /// `[email]`, and the default is "no relay configured", which is a state
+    /// signup tolerates rather than a crash.
+    #[serde(default)]
+    pub email: EmailConfig,
     pub limits: LimitsConfig,
     pub realtime: RealtimeConfig,
     pub key_pool: KeyPoolConfig,
@@ -48,6 +72,144 @@ pub struct WalletConfig {
 pub struct SessionsConfig {
     pub absolute_days: u32,
     pub idle_days: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuthConfig {
+    /// Argon2id memory cost, KiB. The dominant knob, and the one to raise first.
+    ///
+    /// Read on EVERY hash and EVERY verify
+    /// (`identity::password::hash_password` and `::verify_password`), so a value
+    /// changed here changes the work factor for new hashes immediately and for
+    /// the verification of an existing hash on the next sign-in. 19456 KiB
+    /// (19 MiB) with 2 passes is the OWASP floor for Argon2id and RFC 9106's
+    /// second recommended option; raising it multiplies sign-in latency.
+    pub argon2_memory_kib: u32,
+    /// Argon2id time cost, in passes over memory.
+    pub argon2_iterations: u32,
+    /// Argon2id lanes. Argon2 DIVIDES by this, so the validator refuses 0.
+    pub argon2_parallelism: u32,
+    /// A FLOOR, not a composition rule: no character-class requirement, because
+    /// a length floor is the only password rule that measurably helps.
+    ///
+    /// Read by `identity::password::validate_password`, which is the only gate
+    /// on both signup and reset, so the two paths cannot drift. The signup page
+    /// states this same number to the user, so the validator refuses a value
+    /// below 8 - a server floor under the published one would make the page
+    /// describe a rule we do not enforce.
+    pub password_min_length: usize,
+    /// Bounds the Argon2 INPUT, not the cost.
+    ///
+    /// Argon2's cost is set by its parameters, not by the input length, so a
+    /// 1 MiB "password" buys an attacker nothing and costs us the copy and the
+    /// hash of it. Without this bound the endpoint is a free CPU burn.
+    pub password_max_length: usize,
+    /// How long a verification link stays usable.
+    ///
+    /// Read by `identity::tokens::issue`, which computes `expires_at`, and by
+    /// `::consume`, which refuses a row past it. Generous on purpose: the user
+    /// may open the mail tomorrow.
+    pub verification_ttl_minutes: u32,
+    /// How long a password-reset link stays usable. Short on purpose, and the
+    /// reset page says so to the user.
+    pub reset_ttl_minutes: u32,
+    /// The audience a Google ID token must name. Not a secret, so it is config
+    /// rather than an environment variable. Read by
+    /// `identity::google::verify_id_token`.
+    pub google_client_id: String,
+    /// How long a fetched Google JWKS is reused before refetching.
+    ///
+    /// Read by `identity::google::jwks`. Without a cache every sign-in is an
+    /// outbound request to Google, which makes Google's availability our
+    /// sign-in latency and our sign-in failure mode.
+    pub google_jwks_cache_seconds: u64,
+}
+
+/// The SMTP relay that carries a verification or reset link.
+///
+/// **SMTP, not a vendor's HTTP API.** The decision (docs/decisions.md, the
+/// identity row) is a generic seam so the launch credentials do not pick the
+/// architecture: an operator points this at whatever relay they already have,
+/// and swapping relays is four config values rather than a code change. A
+/// vendor-shaped client would have made the vendor part of the product.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmailConfig {
+    /// Hostname of the SMTP relay. `""` means NO provider is configured.
+    ///
+    /// The empty string is a supported, deliberate state rather than an error:
+    /// signup still works without mail (the account is created unverified, which
+    /// is inert - it cannot hold a balance), so a deployment without a relay is
+    /// not a deployment that cannot register customers. Read by
+    /// `identity::email::EmailSender::from_config`.
+    pub smtp_host: String,
+    /// SMTP submission port. 587 is submission with STARTTLS; 465 is implicit
+    /// TLS. Both are accepted because relays differ. Read by
+    /// `identity::email::EmailSender::from_config`.
+    pub smtp_port: u16,
+    /// SMTP username. Empty means the relay takes no authentication, which is
+    /// the norm for a relay on the same private network.
+    pub smtp_username: String,
+    /// NAME of the environment variable holding the SMTP password - never the
+    /// password. Same convention as the file header rule and `api_key_envs` on
+    /// the model endpoints. Read by `identity::email::EmailSender::from_config`
+    /// through `std::env::var`.
+    pub smtp_password_env: String,
+    /// The envelope sender. Read by `identity::email::EmailSender::send`.
+    pub from_address: String,
+    /// The display name on the From header. Read by
+    /// `identity::email::EmailSender::send`.
+    pub from_name: String,
+    /// Read by `identity::email::EmailSender::send` when non-empty.
+    pub reply_to: String,
+    /// Read by `identity::email::EmailSender::from_config`'s connect/IO timeout.
+    pub request_timeout_seconds: u64,
+}
+
+/// The values `[auth]` has when a config file does not name them.
+///
+/// These are the SHIPPED values from `config/apikita.toml`, stated once here and
+/// once there - deliberately, because the TOML is the operator's copy and this
+/// is the fallback for a config that predates the section. `Default` rather than
+/// per-field `#[serde(default = "fn")]` so the whole section has one home: an
+/// all-or-nothing default cannot half-apply, which a per-field set can (a
+/// section present with one key missing would take the file's value for the key
+/// and this default for the rest, and the two would not be recognisable as a
+/// pair).
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            argon2_memory_kib: 19456,
+            argon2_iterations: 2,
+            argon2_parallelism: 1,
+            password_min_length: 8,
+            password_max_length: 128,
+            verification_ttl_minutes: 1440,
+            reset_ttl_minutes: 30,
+            google_client_id: String::new(),
+            google_jwks_cache_seconds: 3600,
+        }
+    }
+}
+
+/// `smtp_host` empty IS the default, and it means "no relay configured".
+///
+/// That is the safe direction for a config that predates the section: a
+/// deployment that has not configured mail does not start sending, and the
+/// signup path tolerates it by creating an unverified - inert - account rather
+/// than refusing the request.
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password_env: String::new(),
+            from_address: String::new(),
+            from_name: "apikita".to_string(),
+            reply_to: String::new(),
+            request_timeout_seconds: 10,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -542,10 +704,112 @@ impl AppConfig {
             }
         }
 
+        // THE PASSWORD HASHER'S PARAMETERS ARE A SECURITY RULE, NOT A PREFERENCE.
+        //
+        // Argon2 refuses rather than degrades on an impossible parameter set, and
+        // every one of these would produce a hasher that FAILS ON EVERY SIGN-IN -
+        // a lockout with no symptom but "nobody can log in". Refusing the config
+        // at load names the field; the failure mode if this did not exist is a
+        // production login endpoint answering 500 for everyone.
+        //
+        // The minima are not style: 8 KiB is Argon2's own floor (it divides
+        // memory by the block size), a zero iteration count is not a work factor,
+        // and 0 lanes is a division by zero.
+        if self.auth.argon2_memory_kib < 8 {
+            return Err(format!(
+                "auth.argon2_memory_kib = {} is below the Argon2 minimum of 8 KiB: \
+                 hashing would fail on every sign-in rather than refuse one",
+                self.auth.argon2_memory_kib
+            )
+            .into());
+        }
+        if self.auth.argon2_iterations == 0 {
+            return Err("auth.argon2_iterations = 0 cannot be an iteration count: \
+                        a single pass is not a work factor"
+                .into());
+        }
+        if self.auth.argon2_parallelism == 0 {
+            return Err("auth.argon2_parallelism = 0 cannot be a lane count: \
+                        Argon2 divides by it"
+                .into());
+        }
+
+        // THE PUBLISHED PASSWORD LENGTH IS A CONTRACT WITH THE SIGNUP PAGE.
+        //
+        // `website/src/lib/auth-flow.ts` states a minimum to the user, and a
+        // server floor BELOW it means the page is describing a rule we do not
+        // enforce - the page would be right about a stricter rule than exists.
+        // The reverse (server stricter than published) is safe and legal, so only
+        // the downward divergence is refused. Hardcoded 8 rather than imported:
+        // the website is a separate package, and the number is stated in a doc
+        // comment on both sides with the guard below pinning the pair.
+        if self.auth.password_min_length < 8 {
+            return Err(format!(
+                "auth.password_min_length = {} is below 8: the signup page states 8 to \
+                 the user, and a server floor below the published one means the page is \
+                 describing a rule that is not enforced",
+                self.auth.password_min_length
+            )
+            .into());
+        }
+        if self.auth.password_max_length < self.auth.password_min_length {
+            return Err(format!(
+                "auth.password_max_length = {} is below auth.password_min_length = {}: \
+                 no password could satisfy both, so every signup would fail",
+                self.auth.password_max_length, self.auth.password_min_length
+            )
+            .into());
+        }
+
+        // TOKEN LIFETIMES REACH THE SAME CLOCK THE SESSION LIFETIME DOES.
+        //
+        // Same class as the session block above, and checked the same way for the
+        // same reason: `expires_at` is seeded by adding a duration to the clock
+        // when a link is minted, and a bare `DateTime + Duration` PANICS on an
+        // out-of-range result. A realistic typo here is a five-digit number of
+        // minutes, which is nowhere near the boundary - but the failure if it were
+        // reached is a panic on a public, unauthenticated endpoint.
+        for (field, minutes) in [
+            ("auth.verification_ttl_minutes", self.auth.verification_ttl_minutes),
+            ("auth.reset_ttl_minutes", self.auth.reset_ttl_minutes),
+        ] {
+            if now_utc
+                .checked_add_signed(chrono::Duration::minutes(i64::from(minutes)))
+                .is_none()
+            {
+                return Err(format!(
+                    "{field} = {minutes} cannot be a token lifetime: adding it to the \
+                     clock overflows the representable date range, and minting a link \
+                     would PANIC rather than refuse one"
+                )
+                .into());
+            }
+        }
+
+        // AN UNCONFIGURED RELAY IS A STATE; A HALF-CONFIGURED ONE IS A BUG.
+        //
+        // `smtp_host = ""` is how a deployment says "no mail" and it is supported:
+        // signup creates an inert, unverified account and the operator sees one
+        // WARN at startup. But a host WITH no from-address, or a port of 0, is a
+        // deployment that believes it sends mail and does not - every message
+        // would be refused by the relay, and the first person to discover it is a
+        // customer who never received a verification link.
+        if !self.email.smtp_host.trim().is_empty() {
+            if self.email.smtp_port == 0 {
+                return Err("email.smtp_port = 0 while email.smtp_host names a relay: \
+                            there is no port to connect to"
+                    .into());
+            }
+            if self.email.from_address.trim().is_empty() {
+                return Err("email.from_address is empty while email.smtp_host names a \
+                            relay: every message would be rejected by the relay"
+                    .into());
+            }
+        }
+
         if self.models.is_empty() {
             return Err("At least one model must be configured in models".into());
-        }
-        for model in &self.models {
+        }        for model in &self.models {
             // FINITENESS FIRST, and it is a separate check rather than a wider
             // comparison because no comparison catches it. NaN <= 0.0 is FALSE in
             // IEEE 754 - NaN is unordered, so it is greater than nothing, less
