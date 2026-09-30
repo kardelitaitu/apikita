@@ -130,8 +130,15 @@ legible, but the values are invented:
 
 ## Open items
 
-- [ ] Record the actual endpoint base URL.
-- [ ] Record the concurrency ceiling per key (flash allows 2500 concurrent on
-      DeepSeek's own API; a reseller key will differ).
+- [ ] Record the actual endpoint base URL. Still `https://api.abc.com/v1` in
+      `apikita.toml`, which is a placeholder — the account exists and is
+      approved, but where it is reached from has not been written down here.
+      Until it is, the routed config points at a host that is not the provider.
+- [ ] Record the concurrency ceiling per key **as a number**. The approval grants
+      10x an ordinary account, but "an ordinary account" is not a figure, and
+      `concurrency_per_key` is a count: the real endpoints in `apikita.toml`
+      still carry `0` ("unknown; learn from 429s"), which is honest but means the
+      router is still learning a limit that was already agreed. Ask the reseller
+      for the number and write it here, then into the TOML.
 - [ ] Record any account-level fees or minimums.
 - [ ] Confirm observed peak/off-peak behaviour against a real invoice.
