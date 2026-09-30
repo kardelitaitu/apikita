@@ -520,14 +520,13 @@ mod tests {
     async fn the_schema_refuses_a_timestamp_sqlite_would_have_written() {
         let db = TestDb::new().await;
 
-        let space_format = sqlx::query(
-            "INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)",
-        )
-        .bind(Uuid::new_v4().hyphenated())
-        .bind("2026-09-25 07:00:00")
-        .bind("2026-09-25 07:00:00")
-        .execute(&db.pool)
-        .await;
+        let space_format =
+            sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)")
+                .bind(Uuid::new_v4().hyphenated())
+                .bind("2026-09-25 07:00:00")
+                .bind("2026-09-25 07:00:00")
+                .execute(&db.pool)
+                .await;
 
         assert!(
             space_format.is_err(),

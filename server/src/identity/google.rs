@@ -148,8 +148,7 @@ pub async fn verify_id_token(
         ));
     }
 
-    let header = decode_header(id_token)
-        .map_err(|_| AppError::Unauthenticated)?;
+    let header = decode_header(id_token).map_err(|_| AppError::Unauthenticated)?;
 
     // Only Google's algorithm. A token that asks to be verified with `none` or an
     // HMAC is not a token from Google, and accepting the algorithm the token names
@@ -185,7 +184,10 @@ pub async fn verify_id_token(
         return Err(AppError::Unauthenticated);
     }
 
-    let email = claims.email.filter(|e| !e.trim().is_empty()).ok_or(AppError::Unauthenticated)?;
+    let email = claims
+        .email
+        .filter(|e| !e.trim().is_empty())
+        .ok_or(AppError::Unauthenticated)?;
 
     // `iss` is also checked by `validation.set_issuer`, but the value is re-read
     // here so the rule is visible in this function rather than only in a library

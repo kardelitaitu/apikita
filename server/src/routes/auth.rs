@@ -263,10 +263,17 @@ struct AttemptContext {
 /// derived for a specific DAY: a key computed after an `await` could be the hash
 /// of a different day's salt than the rows it is compared against, which would
 /// silently split one attacker's attempts across two counters.
-fn attempt_context(state: &AppState, peer: std::net::SocketAddr, headers: &HeaderMap) -> AttemptContext {
+fn attempt_context(
+    state: &AppState,
+    peer: std::net::SocketAddr,
+    headers: &HeaderMap,
+) -> AttemptContext {
     let ip = resolve_client_ip(peer.ip(), headers, &state.trusted_proxies);
     AttemptContext {
-        client_key: auth_attempts::ip_key(ip, &state.ip_salt.salt_for_day(crate::ip_tracking::today_utc())),
+        client_key: auth_attempts::ip_key(
+            ip,
+            &state.ip_salt.salt_for_day(crate::ip_tracking::today_utc()),
+        ),
         now: Utc::now(),
     }
 }
@@ -307,7 +314,8 @@ fn app_config() -> Result<&'static AppConfig, AppError> {
         return Ok(config);
     }
 
-    let path = std::env::var("APIKITA_CONFIG_PATH").unwrap_or_else(|_| "config/apikita.toml".into());
+    let path =
+        std::env::var("APIKITA_CONFIG_PATH").unwrap_or_else(|_| "config/apikita.toml".into());
     let loaded = AppConfig::load_from_file(&path)
         .or_else(|_| AppConfig::load_from_file("../config/apikita.toml"))
         .map_err(|e| AppError::Internal(format!("failed to load config: {e}")))?;
@@ -337,7 +345,10 @@ fn mail_link(purpose: identity::tokens::Purpose, raw: &str, email: &str) -> Stri
         // a local part would otherwise truncate the query string or split it into
         // extra parameters, and `%40` is what the page decodes back to `@`.
         identity::tokens::Purpose::Reset => {
-            format!("{base}/reset/confirm?token={raw}&email={}", urlencode(email))
+            format!(
+                "{base}/reset/confirm?token={raw}&email={}",
+                urlencode(email)
+            )
         }
     }
 }
@@ -376,8 +387,7 @@ fn urlencode(value: &str) -> String {
 const NEUTRAL_SIGNUP_REPLY: &str =
     "If that address can be registered, a confirmation link is on its way.";
 
-const NEUTRAL_RESET_REPLY: &str =
-    "If that address has an account, a reset link is on its way.";
+const NEUTRAL_RESET_REPLY: &str = "If that address has an account, a reset link is on its way.";
 
 /// Render the bodies for the two link-bearing mails.
 fn verification_body(link: &str) -> String {
@@ -426,10 +436,9 @@ async fn send_link_mail(
 
     let link = mail_link(purpose, raw_token, email);
     let (subject, body) = match purpose {
-        identity::tokens::Purpose::Verification => (
-            "Confirm your apikita address",
-            verification_body(&link),
-        ),
+        identity::tokens::Purpose::Verification => {
+            ("Confirm your apikita address", verification_body(&link))
+        }
         identity::tokens::Purpose::Reset => ("Reset your apikita password", reset_body(&link)),
     };
 
@@ -508,13 +517,9 @@ pub async fn signup(
     let existing = identity::accounts::account_for_email(&state.pool, &email).await?;
 
     if existing.is_none() {
-        let issued = identity::accounts::create_password_account(
-            &state.pool,
-            &email,
-            &hash,
-            ctx.now,
-        )
-        .await?;
+        let issued =
+            identity::accounts::create_password_account(&state.pool, &email, &hash, ctx.now)
+                .await?;
 
         let token = identity::tokens::issue(
             &state.pool,
@@ -677,9 +682,13 @@ pub async fn google_sign_in(
     )
     .await?;
 
-    let outcome =
-        identity::accounts::resolve_google_sign_in(&state.pool, &user.subject, &user.email, ctx.now)
-            .await?;
+    let outcome = identity::accounts::resolve_google_sign_in(
+        &state.pool,
+        &user.subject,
+        &user.email,
+        ctx.now,
+    )
+    .await?;
 
     let account_id = match outcome {
         identity::accounts::GoogleSignIn::Existing(id)
@@ -894,21 +903,11 @@ pub async fn confirm_password_reset(
     // identity here is the point of the decision: completing a reset already
     // required control of the mailbox, so this grants nothing that was not already
     // proven, and the alternative is a support ticket.
-    let identity_row = identity::accounts::password_identity(
-        &state.pool,
-        &payload.email,
-    )
-    .await?;
+    let identity_row = identity::accounts::password_identity(&state.pool, &payload.email).await?;
 
     match identity_row {
         Some(existing) if existing.account_id == redeemed.account_id => {
-            identity::accounts::set_password(
-                &state.pool,
-                existing.identity_id,
-                &hash,
-                now,
-            )
-            .await?;
+            identity::accounts::set_password(&state.pool, existing.identity_id, &hash, now).await?;
         }
         Some(_) => {
             // The token authorises one account and the body names an address on a
@@ -1169,12 +1168,11 @@ pub async fn list_providers(
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = crate::routes::resolve_account_from_cookie(&state.pool, &headers).await?;
 
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT provider FROM identities WHERE account_id = ?",
-    )
-    .bind(account_id.hyphenated())
-    .fetch_all(&state.pool)
-    .await?;
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT provider FROM identities WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_all(&state.pool)
+            .await?;
 
     Ok((StatusCode::OK, Json(ProvidersResponse { providers: rows })))
 }
@@ -1226,13 +1224,20 @@ mod tests {
             "got {link}"
         );
         // The address must not have leaked in raw form anywhere in the URL.
-        assert!(!link.contains("+"), "a bare + would decode as a space: {link}");
+        assert!(
+            !link.contains("+"),
+            "a bare + would decode as a space: {link}"
+        );
     }
 
     /// A verification link has no pair to name, so it carries the token alone.
     #[test]
     fn a_verification_link_does_not_carry_the_address() {
-        let link = mail_link(identity::tokens::Purpose::Verification, "apk_vfy_abc", "a@b.example");
+        let link = mail_link(
+            identity::tokens::Purpose::Verification,
+            "apk_vfy_abc",
+            "a@b.example",
+        );
         assert_eq!(link, "https://apikita.example/verify?token=apk_vfy_abc");
     }
 
@@ -1973,10 +1978,11 @@ mod tests {
         // cost is that a throttled caller does grow the table; the bound is that
         // the window is an hour and the growth is one row per REFUSED request,
         // which is the price of the two counters staying independent.
-        let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login'")
-            .fetch_one(&pool)
-            .await
-            .expect("count attempts");
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login'")
+                .fetch_one(&pool)
+                .await
+                .expect("count attempts");
         assert_eq!(
             recorded, 3,
             "every attempt must be on the books, the refused one included - the failure \
@@ -2094,9 +2100,16 @@ mod tests {
         )
         .await
         .expect("hash the fixture password");
-        identity::accounts::upsert_password_identity(pool, account_id, email, &hash, true, Utc::now())
-            .await
-            .expect("create the password identity");
+        identity::accounts::upsert_password_identity(
+            pool,
+            account_id,
+            email,
+            &hash,
+            true,
+            Utc::now(),
+        )
+        .await
+        .expect("create the password identity");
     }
 
     /// A Google identity row, written the way the Google path writes one. The
@@ -2302,7 +2315,13 @@ mod tests {
         let pool = db.pool.clone();
 
         let victim = live_account(&pool).await;
-        google_identity_for(&pool, victim.account_id, "google-subject-1", "g@example.com").await;
+        google_identity_for(
+            &pool,
+            victim.account_id,
+            "google-subject-1",
+            "g@example.com",
+        )
+        .await;
 
         let state = state_for(&pool);
         let response = call(change_password(
@@ -2478,8 +2497,9 @@ mod tests {
         // The real router, reached the way a caller reaches it. MockConnectInfo
         // supplies the peer address `change_password` extracts: without it that
         // extractor fails with 500, which would tell us nothing about the body map.
-        let app = crate::routes::create_router(state_for(&db.pool))
-            .layer(MockConnectInfo(SocketAddr::from(([203, 0, 113, 40], 44321))));
+        let app = crate::routes::create_router(state_for(&db.pool)).layer(MockConnectInfo(
+            SocketAddr::from(([203, 0, 113, 40], 44321)),
+        ));
 
         async fn send(app: &axum::Router, body: &str) -> (StatusCode, String) {
             use axum::http::Request;
@@ -2680,8 +2700,20 @@ mod tests {
         let pool = db.pool.clone();
 
         let account = live_account(&pool).await;
-        password_identity_for(&pool, account.account_id, "both@example.com", "any-password").await;
-        google_identity_for(&pool, account.account_id, "google-subject-3", "both@example.com").await;
+        password_identity_for(
+            &pool,
+            account.account_id,
+            "both@example.com",
+            "any-password",
+        )
+        .await;
+        google_identity_for(
+            &pool,
+            account.account_id,
+            "google-subject-3",
+            "both@example.com",
+        )
+        .await;
 
         let state = state_for(&pool);
         let response = call(list_providers(
@@ -2692,7 +2724,8 @@ mod tests {
 
         assert_eq!(response.status, StatusCode::OK);
         let mut providers: Vec<String> =
-            serde_json::from_value(response.json()["providers"].clone()).expect("a list of strings");
+            serde_json::from_value(response.json()["providers"].clone())
+                .expect("a list of strings");
         providers.sort();
         assert_eq!(
             providers,
@@ -2727,49 +2760,49 @@ mod tests {
         db.close().await;
     }
     /// States the `[limits]` caps a test wants, without touching the config file, and
-/// clears them again when the test ends.
-///
-/// A GUARD rather than a setter, because the override has to hold for every
-/// request the test sends: a cap is only observable by exhausting it, and
-/// exhausting one takes more than one call. The earlier take-on-read version
-/// covered exactly one request, so a three-request test against a cap of two was
-/// really testing a cap of two followed by the shipped twenty, and its assertions
-/// were about the timing of the override rather than about the cap.
-///
-/// BOTH HALVES ARE REQUIRED, exactly as `test_env`'s docs argue for environment
-/// variables: `EnvLock` stops two tests from interleaving, and `Drop` is what
-/// makes the window close on the success path and on an assertion panic alike. A
-/// panic that left a cap of two behind would silently throttle every auth test
-/// that ran afterwards in the same process, which is the failure mode this crate
-/// reserves for guards.
-#[cfg(test)]
-struct TestLimitsGuard;
+    /// clears them again when the test ends.
+    ///
+    /// A GUARD rather than a setter, because the override has to hold for every
+    /// request the test sends: a cap is only observable by exhausting it, and
+    /// exhausting one takes more than one call. The earlier take-on-read version
+    /// covered exactly one request, so a three-request test against a cap of two was
+    /// really testing a cap of two followed by the shipped twenty, and its assertions
+    /// were about the timing of the override rather than about the cap.
+    ///
+    /// BOTH HALVES ARE REQUIRED, exactly as `test_env`'s docs argue for environment
+    /// variables: `EnvLock` stops two tests from interleaving, and `Drop` is what
+    /// makes the window close on the success path and on an assertion panic alike. A
+    /// panic that left a cap of two behind would silently throttle every auth test
+    /// that ran afterwards in the same process, which is the failure mode this crate
+    /// reserves for guards.
+    #[cfg(test)]
+    struct TestLimitsGuard;
 
-#[cfg(test)]
-impl TestLimitsGuard {
-    fn set(per_ip: u32, per_account: u32) -> Self {
-        let mut current = crate::routes::auth::TEST_LIMITS_OVERRIDE
-            .lock()
-            .expect("the test override lock is never poisoned");
-        let mut limits = AppConfig::load_from_file("../config/apikita.toml")
-            .expect("the shipped config parses; every route module's fixture loads it")
-            .limits;
-        limits.login_per_hour_per_ip = per_ip;
-        limits.login_per_hour_per_account = per_account;
-        limits.signup_per_hour_per_ip = per_ip;
-        limits.password_reset_per_hour_per_account = per_account;
-        limits.verification_resend_per_hour = per_ip;
-        *current = Some(limits);
-        Self
+    #[cfg(test)]
+    impl TestLimitsGuard {
+        fn set(per_ip: u32, per_account: u32) -> Self {
+            let mut current = crate::routes::auth::TEST_LIMITS_OVERRIDE
+                .lock()
+                .expect("the test override lock is never poisoned");
+            let mut limits = AppConfig::load_from_file("../config/apikita.toml")
+                .expect("the shipped config parses; every route module's fixture loads it")
+                .limits;
+            limits.login_per_hour_per_ip = per_ip;
+            limits.login_per_hour_per_account = per_account;
+            limits.signup_per_hour_per_ip = per_ip;
+            limits.password_reset_per_hour_per_account = per_account;
+            limits.verification_resend_per_hour = per_ip;
+            *current = Some(limits);
+            Self
+        }
     }
-}
 
-#[cfg(test)]
-impl Drop for TestLimitsGuard {
-    fn drop(&mut self) {
-        *crate::routes::auth::TEST_LIMITS_OVERRIDE
-            .lock()
-            .unwrap_or_else(|err| err.into_inner()) = None;
+    #[cfg(test)]
+    impl Drop for TestLimitsGuard {
+        fn drop(&mut self) {
+            *crate::routes::auth::TEST_LIMITS_OVERRIDE
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()) = None;
+        }
     }
-}
 }

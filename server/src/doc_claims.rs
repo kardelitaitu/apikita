@@ -2058,7 +2058,10 @@ mod tests {
             // OUT of PocketBase and INTO `identities`; `privacy.ts` was updated in the
             // same change. Every row here is a phrase that must appear on the page.
             ("identities", "Email verification and password-reset links"),
-            ("identity_tokens", "Email verification and password-reset links"),
+            (
+                "identity_tokens",
+                "Email verification and password-reset links",
+            ),
         ];
 
         // Tables that exist and hold nothing. A reason is required, because an empty

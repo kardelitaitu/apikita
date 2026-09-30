@@ -806,7 +806,9 @@ async fn account_email(pool: &SqlitePool, account_id: Uuid) -> Option<String> {
     .await
     .ok()?;
 
-    email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty())
+    email
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
 }
 
 /// Creates the Snap transaction and returns (token, redirect_url).

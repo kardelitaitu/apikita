@@ -1525,8 +1525,7 @@ mod tests {
         let purged = purge_expired(&db.pool, today_utc()).await.expect("purge");
 
         assert_eq!(
-            purged.auth_attempts,
-            2,
+            purged.auth_attempts, 2,
             "the sweep must report the two stale rows it deleted, and the count must be its \
              own field - a count folded into `seen` is a table that stops being swept without \
              anyone noticing"
@@ -1570,7 +1569,12 @@ mod tests {
         let cutoff = today - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS);
 
         // AT the cutoff instant: must go (inclusive), on both keyings.
-        seed_auth_attempt(&db.pool, cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc(), None).await;
+        seed_auth_attempt(
+            &db.pool,
+            cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+            None,
+        )
+        .await;
         seed_auth_attempt(
             &db.pool,
             cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc(),
@@ -1579,7 +1583,12 @@ mod tests {
         .await;
         // One second INSIDE the window: must stay. This assertion fails if the
         // cutoff becomes exclusive.
-        seed_auth_attempt(&db.pool, cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(), None).await;
+        seed_auth_attempt(
+            &db.pool,
+            cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),
+            None,
+        )
+        .await;
         seed_auth_attempt(
             &db.pool,
             cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),

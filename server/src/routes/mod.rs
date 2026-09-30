@@ -215,10 +215,12 @@ pub async fn resolve_account_from_cookie(
         .try_get::<uuid::fmt::Hyphenated, _>("account_id")
         .map_err(unusable_session_store)?
         .into_uuid();
-    let last_seen_at: chrono::DateTime<chrono::Utc> =
-        session.try_get("last_seen_at").map_err(unusable_session_store)?;
-    let expires_at: chrono::DateTime<chrono::Utc> =
-        session.try_get("expires_at").map_err(unusable_session_store)?;
+    let last_seen_at: chrono::DateTime<chrono::Utc> = session
+        .try_get("last_seen_at")
+        .map_err(unusable_session_store)?;
+    let expires_at: chrono::DateTime<chrono::Utc> = session
+        .try_get("expires_at")
+        .map_err(unusable_session_store)?;
 
     if !session_is_live_at(now, last_seen_at, expires_at, idle_days, absolute_days) {
         return Err(AppError::Unauthenticated);
@@ -1755,7 +1757,6 @@ mod tests {
         }
         seen.len()
     }
-
 
     ///
     /// Every other test in this module starts from `MOUNTED`. That is the direction

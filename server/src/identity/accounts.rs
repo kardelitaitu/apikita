@@ -143,13 +143,12 @@ pub async fn resolve_google_sign_in(
     // 1. The subject is the identity, when it is already known. This is the
     //    ordinary repeat-sign-in path and it must come FIRST: it is the only step
     //    that is not about the address at all.
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT account_id FROM identities WHERE provider = ? AND subject = ?",
-    )
-    .bind(GOOGLE)
-    .bind(google_subject)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT account_id FROM identities WHERE provider = ? AND subject = ?")
+            .bind(GOOGLE)
+            .bind(google_subject)
+            .fetch_optional(&mut *tx)
+            .await?;
 
     if let Some(account_id) = existing {
         let account_id = parse_uuid(&account_id, "identities.account_id")?;
@@ -180,7 +179,8 @@ pub async fn resolve_google_sign_in(
     let outcome = match candidate {
         Some(row) => {
             let identity_id = parse_uuid(&row.get::<String, _>("id"), "identities.id")?;
-            let candidate_account = parse_uuid(&row.get::<String, _>("account_id"), "identities.account_id")?;
+            let candidate_account =
+                parse_uuid(&row.get::<String, _>("account_id"), "identities.account_id")?;
             let verified_at: Option<DateTime<Utc>> = row.get("verified_at");
 
             let adoptable = verified_at.is_some_and(|verified| verified < now);
@@ -339,10 +339,7 @@ pub async fn first_password_identity(
 
     Ok(Some(PasswordIdentity {
         identity_id: parse_uuid(&row.get::<String, _>("id"), "identities.id")?,
-        account_id: parse_uuid(
-            &row.get::<String, _>("account_id"),
-            "identities.account_id",
-        )?,
+        account_id: parse_uuid(&row.get::<String, _>("account_id"), "identities.account_id")?,
         password_hash,
         email_verified: row.get::<i64, _>("email_verified") != 0,
     }))
@@ -398,13 +395,12 @@ pub async fn upsert_password_identity(
 
     // The upsert may have updated an existing row rather than inserting this id, so
     // the id is read back rather than assumed.
-    let stored: String = sqlx::query_scalar(
-        "SELECT id FROM identities WHERE provider = ? AND email = ? LIMIT 1",
-    )
-    .bind(PASSWORD)
-    .bind(&normalized)
-    .fetch_one(pool)
-    .await?;
+    let stored: String =
+        sqlx::query_scalar("SELECT id FROM identities WHERE provider = ? AND email = ? LIMIT 1")
+            .bind(PASSWORD)
+            .bind(&normalized)
+            .fetch_one(pool)
+            .await?;
 
     parse_uuid(&stored, "identities.id")
 }
@@ -442,12 +438,11 @@ pub async fn mark_verified(
 pub async fn account_for_email(pool: &SqlitePool, email: &str) -> Result<Option<Uuid>, AppError> {
     let normalized = normalize_email(email);
 
-    let found: Option<String> = sqlx::query_scalar(
-        "SELECT account_id FROM identities WHERE email = ? LIMIT 1",
-    )
-    .bind(&normalized)
-    .fetch_optional(pool)
-    .await?;
+    let found: Option<String> =
+        sqlx::query_scalar("SELECT account_id FROM identities WHERE email = ? LIMIT 1")
+            .bind(&normalized)
+            .fetch_optional(pool)
+            .await?;
 
     match found {
         None => Ok(None),
@@ -513,14 +508,12 @@ pub async fn set_password(
     password_hash: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
-    sqlx::query(
-        "UPDATE identities SET password_hash = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(password_hash)
-    .bind(now)
-    .bind(identity_id.hyphenated())
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE identities SET password_hash = ?, updated_at = ? WHERE id = ?")
+        .bind(password_hash)
+        .bind(now)
+        .bind(identity_id.hyphenated())
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
@@ -540,13 +533,11 @@ async fn create_account_row(
         .execute(&mut **tx)
         .await?;
 
-    sqlx::query(
-        "INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?, 0, ?)",
-    )
-    .bind(account_id.hyphenated())
-    .bind(now)
-    .execute(&mut **tx)
-    .await?;
+    sqlx::query("INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?, 0, ?)")
+        .bind(account_id.hyphenated())
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
 
     Ok(())
 }
@@ -579,8 +570,7 @@ async fn insert_google_identity(
 }
 
 fn parse_uuid(raw: &str, column: &str) -> Result<Uuid, AppError> {
-    Uuid::parse_str(raw)
-        .map_err(|e| AppError::Internal(format!("{column} is not a uuid: {e}")))
+    Uuid::parse_str(raw).map_err(|e| AppError::Internal(format!("{column} is not a uuid: {e}")))
 }
 
 #[cfg(test)]
@@ -610,9 +600,10 @@ mod tests {
         .await
         .expect("the attacker registers");
 
-        let outcome = resolve_google_sign_in(&db.pool, "google-subject-1", "Victim@Example.com", now)
-            .await
-            .expect("the google sign-in resolves");
+        let outcome =
+            resolve_google_sign_in(&db.pool, "google-subject-1", "Victim@Example.com", now)
+                .await
+                .expect("the google sign-in resolves");
 
         match outcome {
             GoogleSignIn::CollisionCreated {
@@ -632,12 +623,16 @@ mod tests {
         }
 
         // And the attacker's row is untouched: still unverified, still theirs.
-        let verified: i64 = sqlx::query_scalar("SELECT email_verified FROM identities WHERE id = ?")
-            .bind(attacker_identity.hyphenated())
-            .fetch_one(&db.pool)
-            .await
-            .expect("read back");
-        assert_eq!(verified, 0, "the refusal must not verify the attacker's row");
+        let verified: i64 =
+            sqlx::query_scalar("SELECT email_verified FROM identities WHERE id = ?")
+                .bind(attacker_identity.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("read back");
+        assert_eq!(
+            verified, 0,
+            "the refusal must not verify the attacker's row"
+        );
     }
 
     /// R1's adopt branch: a VERIFIED password identity is the legitimate case, and
@@ -664,16 +659,20 @@ mod tests {
         .await
         .expect("the person signed up and verified");
 
-        let outcome = resolve_google_sign_in(&db.pool, "google-subject-2", "person@example.com", now)
-            .await
-            .expect("resolve");
+        let outcome =
+            resolve_google_sign_in(&db.pool, "google-subject-2", "person@example.com", now)
+                .await
+                .expect("resolve");
 
         match outcome {
             GoogleSignIn::Linked {
                 account_id,
                 identity_id,
             } => {
-                assert_eq!(account_id, account, "the sign-in must land in the same account");
+                assert_eq!(
+                    account_id, account,
+                    "the sign-in must land in the same account"
+                );
                 assert_eq!(identity_id, identity);
             }
             other => panic!("expected Linked, got {other:?}"),
@@ -701,9 +700,10 @@ mod tests {
         .await
         .expect("register");
 
-        let outcome = resolve_google_sign_in(&db.pool, "google-subject-3", "victim2@example.com", now)
-            .await
-            .expect("resolve");
+        let outcome =
+            resolve_google_sign_in(&db.pool, "google-subject-3", "victim2@example.com", now)
+                .await
+                .expect("resolve");
 
         assert!(
             matches!(outcome, GoogleSignIn::CollisionCreated { .. }),
@@ -728,9 +728,10 @@ mod tests {
 
         // The address CHANGED at Google - which is exactly why resolution is on the
         // subject. The second sign-in must still reach the same account.
-        let second = resolve_google_sign_in(&db.pool, "google-subject-4", "renamed@example.com", now)
-            .await
-            .expect("second");
+        let second =
+            resolve_google_sign_in(&db.pool, "google-subject-4", "renamed@example.com", now)
+                .await
+                .expect("second");
 
         match second {
             GoogleSignIn::Existing(id) => assert_eq!(
@@ -757,11 +758,12 @@ mod tests {
             other => panic!("expected Created, got {other:?}"),
         };
 
-        let balance: i64 = sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(&db.pool)
-            .await
-            .expect("a wallet must exist");
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("a wallet must exist");
         assert_eq!(balance, 0, "a new account starts empty");
     }
 
@@ -799,7 +801,10 @@ mod tests {
     /// that asserted more would encode a provider rule this code does not have.
     #[test]
     fn an_address_is_lowercased_and_trimmed_and_left_otherwise_alone() {
-        assert_eq!(normalize_email("  MixedCase@Example.COM "), "mixedcase@example.com");
+        assert_eq!(
+            normalize_email("  MixedCase@Example.COM "),
+            "mixedcase@example.com"
+        );
         assert_eq!(
             normalize_email("dots.are.kept@example.com"),
             "dots.are.kept@example.com",
@@ -819,9 +824,10 @@ mod tests {
         let db = TestDb::new().await;
         let now = Utc::now();
 
-        let outcome = resolve_google_sign_in(&db.pool, "google-subject-7", "googleonly@example.com", now)
-            .await
-            .expect("resolve");
+        let outcome =
+            resolve_google_sign_in(&db.pool, "google-subject-7", "googleonly@example.com", now)
+                .await
+                .expect("resolve");
         let account_id = match outcome {
             GoogleSignIn::Created(id) => id,
             other => panic!("expected Created, got {other:?}"),
@@ -877,14 +883,13 @@ mod tests {
 
         assert_eq!(first, second, "the two spellings are one identity");
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM identities WHERE provider = ? AND email = ?",
-        )
-        .bind(PASSWORD)
-        .bind("one@example.com")
-        .fetch_one(&db.pool)
-        .await
-        .expect("count");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM identities WHERE provider = ? AND email = ?")
+                .bind(PASSWORD)
+                .bind("one@example.com")
+                .fetch_one(&db.pool)
+                .await
+                .expect("count");
         assert_eq!(count, 1, "one address, one password identity");
     }
 
@@ -908,7 +913,9 @@ mod tests {
         .await
         .expect("create");
 
-        mark_verified(&db.pool, identity, later).await.expect("mark");
+        mark_verified(&db.pool, identity, later)
+            .await
+            .expect("mark");
         mark_verified(&db.pool, identity, later + Duration::hours(1))
             .await
             .expect("mark again");

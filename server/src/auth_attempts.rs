@@ -336,8 +336,13 @@ async fn check_after_recording(
     // Retry-After is measured from the oldest row the attacker can still blame.
     // The refusal itself is decided by the count INCLUDING the attempt, which is
     // why the two arguments differ by the one row written above.
-    match abuse::cap_outcome(already_on_the_books_before_this_attempt, limit, oldest, window(), now)
-    {
+    match abuse::cap_outcome(
+        already_on_the_books_before_this_attempt,
+        limit,
+        oldest,
+        window(),
+        now,
+    ) {
         None => Ok(()),
         Some(_) if used <= i64::from(limit) => Ok(()),
         Some(retry_after_secs) => Err(AppError::RateLimited { retry_after_secs }),

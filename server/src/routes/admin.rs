@@ -1983,9 +1983,7 @@ mod tests {
         let (status, body) = render_axum(
             crate::routes::auth::login(
                 State(state.clone()),
-                axum::extract::ConnectInfo(
-                    std::net::SocketAddr::from(([127, 0, 0, 1], 12345)),
-                ),
+                axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 12345))),
                 HeaderMap::new(),
                 Ok(Json(crate::routes::auth::LoginRequest {
                     email: "victim@example.com".to_string(),

@@ -103,7 +103,10 @@ impl std::fmt::Display for EmailError {
             // Deliberately says what to DO, because the only reader is an
             // operator looking at a log line wondering why nothing arrived.
             EmailError::NotConfigured => {
-                write!(f, "no mail relay is configured ([email] smtp_host is empty)")
+                write!(
+                    f,
+                    "no mail relay is configured ([email] smtp_host is empty)"
+                )
             }
             EmailError::Build(message) => write!(f, "could not build the message: {message}"),
             EmailError::Transport(message) => write!(f, "the relay refused the message: {message}"),
@@ -245,10 +248,8 @@ impl EmailSender {
             if !config.smtp_username.is_empty() {
                 match std::env::var(&config.smtp_password_env) {
                     Ok(password) => {
-                        builder = builder.credentials(Credentials::new(
-                            config.smtp_username.clone(),
-                            password,
-                        ));
+                        builder = builder
+                            .credentials(Credentials::new(config.smtp_username.clone(), password));
                     }
                     Err(_) => {
                         // The NAME is configured but the SECRET is missing. That is
@@ -517,7 +518,8 @@ mod tests {
 
                 let upper = line.to_uppercase();
                 if upper.starts_with("EHLO") || upper.starts_with("HELO") {
-                    transcript.push_str("<REPLY>250-stub\\r\\n250-STARTTLS\\r\\n250 SIZE 10485760\r\n");
+                    transcript
+                        .push_str("<REPLY>250-stub\\r\\n250-STARTTLS\\r\\n250 SIZE 10485760\r\n");
                     if write_half
                         .write_all(b"250-stub\r\n250-STARTTLS\r\n250 SIZE 10485760\r\n")
                         .await
@@ -580,10 +582,17 @@ mod tests {
         let _env = EnvGuard::set(EMAIL_BASE_URL_ENV, &base);
 
         let (host, port) = listen_address(&EmailConfig::default());
-        assert_eq!(format!("{host}:{port}"), base, "the override is what is dialled");
+        assert_eq!(
+            format!("{host}:{port}"),
+            base,
+            "the override is what is dialled"
+        );
 
         let sender = EmailSender::new(&config_to(&host, port));
-        assert!(sender.is_configured(), "a host of any kind must build a transport");
+        assert!(
+            sender.is_configured(),
+            "a host of any kind must build a transport"
+        );
 
         let result = sender
             .send(Email {

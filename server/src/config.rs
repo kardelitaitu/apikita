@@ -770,7 +770,10 @@ impl AppConfig {
         // minutes, which is nowhere near the boundary - but the failure if it were
         // reached is a panic on a public, unauthenticated endpoint.
         for (field, minutes) in [
-            ("auth.verification_ttl_minutes", self.auth.verification_ttl_minutes),
+            (
+                "auth.verification_ttl_minutes",
+                self.auth.verification_ttl_minutes,
+            ),
             ("auth.reset_ttl_minutes", self.auth.reset_ttl_minutes),
         ] {
             if now_utc
@@ -809,7 +812,8 @@ impl AppConfig {
 
         if self.models.is_empty() {
             return Err("At least one model must be configured in models".into());
-        }        for model in &self.models {
+        }
+        for model in &self.models {
             // FINITENESS FIRST, and it is a separate check rather than a wider
             // comparison because no comparison catches it. NaN <= 0.0 is FALSE in
             // IEEE 754 - NaN is unordered, so it is greater than nothing, less

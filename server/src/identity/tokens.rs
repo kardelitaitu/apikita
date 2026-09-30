@@ -186,8 +186,9 @@ pub async fn consume(
     };
 
     let account_id: String = row.get("account_id");
-    let account_id = Uuid::parse_str(&account_id)
-        .map_err(|e| AppError::Internal(format!("identity_tokens.account_id is unreadable: {e}")))?;
+    let account_id = Uuid::parse_str(&account_id).map_err(|e| {
+        AppError::Internal(format!("identity_tokens.account_id is unreadable: {e}"))
+    })?;
 
     Ok(RedeemedToken {
         account_id,
@@ -279,7 +280,9 @@ mod tests {
             .await
             .expect("issue");
 
-        assert!(consume(&db.pool, &issued.raw, Purpose::Reset, now).await.is_ok());
+        assert!(consume(&db.pool, &issued.raw, Purpose::Reset, now)
+            .await
+            .is_ok());
         assert!(
             matches!(
                 consume(&db.pool, &issued.raw, Purpose::Reset, now).await,
@@ -307,7 +310,11 @@ mod tests {
             .expect("read back");
 
         assert_ne!(stored, issued.raw, "the raw token must not be in the table");
-        assert_eq!(stored, hash_token(&issued.raw), "the stored value is its hash");
+        assert_eq!(
+            stored,
+            hash_token(&issued.raw),
+            "the stored value is its hash"
+        );
         assert_eq!(stored.len(), 64, "sha256 hex");
         assert_eq!(issued.raw.len(), 64, "32 bytes hex-encoded");
     }
@@ -450,7 +457,9 @@ mod tests {
             "a cleared token must not redeem"
         );
         assert!(
-            consume(&db.pool, &kept.raw, Purpose::Reset, now).await.is_ok(),
+            consume(&db.pool, &kept.raw, Purpose::Reset, now)
+                .await
+                .is_ok(),
             "another account's token must be untouched"
         );
     }

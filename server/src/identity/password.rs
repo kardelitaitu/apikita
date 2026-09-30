@@ -20,7 +20,9 @@
 //! requests behind its own hashing. The CPU work is the point of the algorithm,
 //! so it is moved off the async runtime rather than reduced.
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::{Algorithm, Argon2, Params, Version};
 
 use crate::config::AuthConfig;
@@ -99,9 +101,7 @@ pub async fn verify_password(
         let parsed = PasswordHash::new(&stored)
             .map_err(|e| AppError::Internal(format!("stored password hash is unreadable: {e}")))?;
 
-        match hasher(&auth)?
-            .verify_password(password.as_bytes(), &parsed)
-        {
+        match hasher(&auth)?.verify_password(password.as_bytes(), &parsed) {
             Ok(()) => Ok(true),
             // `password_hash::Error::Password` IS the mismatch case, and it is
             // matched BY NAME rather than by `is_err()` so a future error variant
@@ -215,9 +215,11 @@ mod tests {
         assert!(verify_password(auth.clone(), first, "same password".into())
             .await
             .expect("verification works"));
-        assert!(verify_password(auth.clone(), second, "same password".into())
-            .await
-            .expect("verification works"));
+        assert!(
+            verify_password(auth.clone(), second, "same password".into())
+                .await
+                .expect("verification works")
+        );
     }
 
     #[tokio::test]
@@ -255,10 +257,22 @@ mod tests {
     fn the_length_floor_is_the_configured_one() {
         let auth = AuthConfig::default();
 
-        assert!(validate_password(&auth, &"a".repeat(7)).is_err(), "7 is below the floor of 8");
-        assert!(validate_password(&auth, &"a".repeat(8)).is_ok(), "8 is AT the floor, not below it - the boundary is the point");
-        assert!(validate_password(&auth, &"a".repeat(129)).is_err(), "129 is above the ceiling of 128");
-        assert!(validate_password(&auth, &"a".repeat(128)).is_ok(), "128 is AT the ceiling");
+        assert!(
+            validate_password(&auth, &"a".repeat(7)).is_err(),
+            "7 is below the floor of 8"
+        );
+        assert!(
+            validate_password(&auth, &"a".repeat(8)).is_ok(),
+            "8 is AT the floor, not below it - the boundary is the point"
+        );
+        assert!(
+            validate_password(&auth, &"a".repeat(129)).is_err(),
+            "129 is above the ceiling of 128"
+        );
+        assert!(
+            validate_password(&auth, &"a".repeat(128)).is_ok(),
+            "128 is AT the ceiling"
+        );
     }
 
     #[test]
@@ -286,7 +300,10 @@ mod tests {
 
         match err {
             AppError::ValidationFailed { field, message } => {
-                assert_eq!(field, "password", "docs/error-model.md requires details.field so a UI can highlight the input");
+                assert_eq!(
+                    field, "password",
+                    "docs/error-model.md requires details.field so a UI can highlight the input"
+                );
                 assert!(
                     message.contains("8"),
                     "the message must state the number the page states, got {message}"
