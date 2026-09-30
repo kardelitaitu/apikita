@@ -98,10 +98,28 @@ SELECT w.account_id,
  ORDER BY w.balance_idr DESC;
 ```
 
-> **`topups.rail` does not exist yet.** Until it is added, **every customer is
-> Indonesian** — Midtrans QRIS is the only implemented rail — and the classification
-> query degenerates to `'bank_transfer'` for everyone. That is the correct answer today,
-> not a stub: there has never been a crypto top-up to classify.
+> **Every customer is Indonesian today**, so this query returns `'bank_transfer'` for
+> everyone. That is the correct answer, not a stub: there has never been a crypto top-up
+> to classify.
+>
+> **The reason is that no crypto rail is implemented, not that the column is missing.**
+> `topups.rail` exists and is load-bearing — it is `NOT NULL` with no `DEFAULT` and
+> `CHECK (rail IN ('midtrans','crypto'))`, in
+> `server/migrations/20260925000000_initial_schema.sql`, where the column comment also
+> records why it has no default: a `'midtrans'` default would silently mislabel a row
+> written by a path that forgot to name its rail. Every top-up writes it
+> (`server/src/routes/account.rs`, and the `INSERT` binds the literal `'midtrans'`), the
+> top-up list reads it back (same file, `get_topups`), and the test
+> `a_topup_must_name_its_rail_and_the_value_set_is_frozen`
+> (`server/src/test_support.rs`) asserts the column, the absence of a default, and that a
+> third value is refused. The `NOT NULL`-with-no-default shape exists precisely so that a
+> future second rail **cannot** inherit `'midtrans'` by omission.
+>
+> This runbook previously said the column did not exist. That was false when it was
+> written — and it mattered, because the paragraph it appeared in was the explanation an
+> operator would read while deciding whether the classification step was safe to run.
+> They would have been told a working query was a stub. The degenerate answer was always
+> right; only the stated cause was wrong.
 
 ## Step 4 — The sub-threshold list
 
