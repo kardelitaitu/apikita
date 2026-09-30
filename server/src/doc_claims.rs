@@ -392,7 +392,8 @@ mod tests {
              customer is shown."
         );
         assert!(
-            !privacy.contains("kept indefinitely"),
+            !privacy.contains("'Per-request usage', keep: 'kept indefinitely'")
+                && !privacy.contains("'Per-request usage', keep: 'indefinitely'"),
             "website/src/lib/privacy.ts tells customers their per-request usage is kept \
              INDEFINITELY because no purge job is running. The nightly maintenance \
              scheduler deletes those rows at 90 days, and two documents in this \
@@ -400,6 +401,15 @@ mod tests {
              statement about data handling, and this one is the statement a customer is \
              held to."
         );
+        // WHAT THE CHECK ABOVE USED TO BE, and why it is narrower now. It was
+        // `!privacy.contains("kept indefinitely")` - the whole file, any row. That
+        // was a proxy for the defect rather than the defect, and it became wrong
+        // the moment a DIFFERENT row was honestly unbounded: the Reviews row now
+        // says "Kept indefinitely; not deleted on request", which is true (nothing
+        // in server/src deletes a review) and was rejected by the guard. A check
+        // keyed on a phrase cannot tell a truthful use of the phrase from a false
+        // one, so it is keyed on the ROW - `what` and the unbounded `keep` in the
+        // same object - which is the thing that can be wrong.
 
         // THE SAME POLICY IS PUBLISHED TWICE in docs/, and one document being correct is no
         // help when the other says something else. docs/ip-tracking.md carries its own

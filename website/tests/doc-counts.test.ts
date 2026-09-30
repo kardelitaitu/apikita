@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 186;
+const WEBSITE_TESTS = 187;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -255,6 +255,15 @@ test('no doc still claims a superseded count', () => {
         // 730 as 24 months at a 365-day year - so the guard converts months by 365/12, not by
         // 30, or it would have reported a disagreement the code had deliberately avoided.
         'website: **185 tests**', 'passes **185 tests**', '**185 tests**',
+        // Retired when the review-retention claim was corrected. Three files published
+        // "Reviews: Until deleted by user" - website/src/lib/privacy.ts, docs/data-retention.md
+        // and server/src/db.rs - and NONE of them was true: there is no `DELETE FROM reviews`
+        // anywhere in server/src. The only act is `POST /api/reviews/withdraw`, which sets
+        // `withdrawn_at` on purpose and does not delete, because the row must keep occupying
+        // the account's one slot. `reviews.account_id` is `ON DELETE SET NULL`, so a review
+        // outlives its author and stays in the public aggregate attached to nobody. The new
+        // test pins the absence, so implementing deletion fails it and names all three files.
+        'website: **186 tests**', 'passes **186 tests**', '**186 tests**',
       ],
     },
   ];

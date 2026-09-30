@@ -548,7 +548,26 @@ pub struct PurgedUsage {
 ///
 /// What this deliberately does NOT touch:
 /// - `ledger` and `topups` — financial records, kept **forever**.
-/// - `reviews` / `review_history` — kept until the user deletes them.
+/// - `reviews` / `review_history` — kept **indefinitely**, and NOT "until the user
+///   deletes them".
+///
+///   **THAT SECOND SENTENCE USED TO READ "kept until the user deletes them", and it
+///   described a deletion that does not exist. It is corrected in place rather than
+///   removed because the shape of the mistake is the one this whole doc-comment is
+///   about.** There is no `DELETE FROM reviews` anywhere in
+///   `server/src`. The only user-facing act is `POST /api/reviews/withdraw`, which sets
+///   `withdrawn_at` and deliberately does not delete — the row has to keep occupying
+///   the account's single slot, which is what "one review per account" means. So a
+///   review is kept **indefinitely**, and the column that would bound it
+///   (`reviews.account_id`) is `ON DELETE SET NULL`, so a review outlives the account
+///   that wrote it and stays in the public aggregate with nobody attached. The one path
+///   that clears a body is account closure, and `status = 'closed'` is set by NO code
+///   in this crate (the schema allows it; `grep -rn closed server/src` is empty), so in
+///   practice nothing clears one either.
+///   A retention row that says "until the user deletes them" reads as a bounded window
+///   and is not one. `docs/data-retention.md` now says "forever, unless the account is
+///   closed", and that correction is the reason to keep this paragraph rather than
+///   quietly reword the line above.
 /// - `key_ip_*` and `link_redemption_attempts` — swept by `ip-purge`, which owns
 ///   the salted-hash retention and the salt-rotation contract.
 ///

@@ -79,6 +79,58 @@ function tableDefinition(table: string): string {
   return all;
 }
 
+/**
+ * Rust source with comments removed, so a check about what the code DOES is not
+ * satisfied or defeated by prose about what the code does.
+ *
+ * Handles the three shapes that matter here: `//` line comments, block comments
+ * (which NEST in Rust, unlike C - a naive scan ends the comment at the first
+ * closing marker and would treat a nested comment's tail as code), and `///`
+ * doc-comments, which are line comments and fall out of the same rule.
+ *
+ * It does NOT model string literals, so a `//` inside a string would truncate a
+ * line. That is acceptable for what this is for - the SQL here is written as
+ * multi-line string literals and the guards look for a statement, not for
+ * punctuation - and the alternative is a Rust lexer in a test. What it must not
+ * do is fail OPEN: the callers assert on the stripped text, and a stripper that
+ * returned "" would make every absence assertion pass, so each caller checks the
+ * stripped length is still substantial.
+ */
+function stripComments(source: string): string {
+  let out = '';
+  let i = 0;
+  let depth = 0;
+
+  while (i < source.length) {
+    if (depth > 0) {
+      if (source.startsWith('/*', i)) {
+        depth++;
+        i += 2;
+      } else if (source.startsWith('*/', i)) {
+        depth--;
+        i += 2;
+      } else {
+        i++;
+      }
+      continue;
+    }
+    if (source.startsWith('//', i)) {
+      // Drop to end of line, keeping the newline so line counts survive.
+      const nl = source.indexOf('\n', i);
+      i = nl === -1 ? source.length : nl;
+      continue;
+    }
+    if (source.startsWith('/*', i)) {
+      depth = 1;
+      i += 2;
+      continue;
+    }
+    out += source[i];
+    i++;
+  }
+  return out;
+}
+
 test('credit expiry is still unimplemented, so the pages must not say it works', () => {
   // --- 1. The absence is real. -------------------------------------------------
   const wallets = tableDefinition('wallets');
@@ -166,4 +218,118 @@ test('the expiry guard is reading the files it names', () => {
 
   const rust = rustFiles(join(REPO, 'server', 'src'));
   assert.ok(rust.length >= 10, `only ${rust.length} .rs files found under server/src; the walk is not reading the tree`);
+});
+
+// A SECOND claim of the same shape, found while fixing the first.
+//
+// "Reviews: Until deleted by user" was published in three places -
+// website/src/lib/privacy.ts, docs/data-retention.md:75 and server/src/db.rs:551 -
+// and all three described a deletion that DOES NOT EXIST. There is no
+// `DELETE FROM reviews` anywhere in server/src. The only user-facing act is
+// `POST /api/reviews/withdraw`, which sets `withdrawn_at` and deliberately does
+// not delete: the row has to keep occupying the account's one slot, which is what
+// "one review per account" means.
+//
+// So the window is not "until deleted by user", it is "forever". The phrase reads
+// as a bound and is not one, which is the same failure as the credit-expiry claim
+// above: a policy sentence that is grammatically a commitment and factually a
+// placeholder.
+//
+// The consequence is not only editorial. `reviews.account_id` is
+// `ON DELETE SET NULL`, so a review OUTLIVES the account that wrote it and stays
+// in the public aggregate attached to nobody. `account_id IS NULL` is also the
+// partial-index predicate for Telegram-authored reviews, so a row whose author
+// left becomes indistinguishable from one written through the bot.
+//
+// This test pins the ABSENCE, so implementing deletion deletes this test - which
+// is the design of the file it sits in. What it cannot check is the account
+// closure path, and the honest reason is that the path does not exist either:
+// the schema allows `accounts.status = 'closed'` and NO code in the crate sets
+// it. When closure is implemented, the retention rows must be revisited with it.
+test('nothing deletes a review, so the retention rows must not promise that it does', () => {
+  // COMMENTS ARE STRIPPED FIRST, and the first run of this test is why. The scan
+  // below looks for a `DELETE FROM reviews`, and the doc-comment recording the
+  // absence NAMES the statement it is denying ("There is no `DELETE FROM reviews`
+  // anywhere in server/src"). A raw text scan cannot tell a promise from a
+  // sentence that quotes one in order to say it does not exist, so the check
+  // fired on its own explanatory comment. The fix is to look only at executable
+  // text, which is what the claim is about.
+  const raw = rustFiles(join(REPO, 'server', 'src'))
+    .map((f) => readFileSync(f, 'utf8'))
+    .join('\n');
+  const executable = stripComments(raw);
+  assert.ok(executable.length > 1000, 'server/src was not read, so this guard is vacuous');
+  assert.ok(
+    executable.length < raw.length,
+    'stripping comments did not remove anything, so this check is not reading executable text and the guards below are unproven',
+  );
+
+  // The absence itself, in every spelling a deletion could take.
+  const deletes = executable.match(/DELETE\s+FROM\s+reviews?\b/gi) ?? [];
+  assert.equal(
+    deletes.length,
+    0,
+    `server/src now deletes from \`reviews\` (${deletes.join(', ')}). That is a real retention path, so website/src/lib/privacy.ts, docs/data-retention.md:75 and server/src/db.rs:551 must be rewritten to state the window it produces and this test deleted. docs/data-retention.md promises a body is "cleared if requested" when an account closes, which is the closest thing to a documented path - check whether that is what landed.`,
+  );
+  assert.ok(
+    !/DELETE\s+FROM\s+review_history\b/i.test(executable),
+    'server/src now deletes from `review_history` directly. The table was documented as bounded only by its `review_id ... ON DELETE CASCADE`, so a direct delete is a second, undocumented retention path.',
+  );
+
+  // The withdrawal path is a FLAG. If this ever becomes a delete, "withdraw" and
+  // "delete" have been conflated and the account's one slot is freed by an act
+  // that was supposed to keep it occupied.
+  const withdraw = executable.match(/UPDATE reviews SET withdrawn_at = \?[^"]*/);
+  assert.ok(
+    withdraw !== null,
+    'the withdrawal UPDATE was not found in server/src, so the check that it is a flag rather than a delete is not reading the code it was written for',
+  );
+
+  // The three documents, checked as text because they are three transcriptions of
+  // one policy and the whole defect was that they agreed with each other and with
+  // nothing else.
+  const documents: Array<[string, string]> = [
+    [join(SRC, 'lib', 'privacy.ts'), readFileSync(join(SRC, 'lib', 'privacy.ts'), 'utf8')],
+    [join(REPO, 'docs', 'data-retention.md'), readFileSync(join(REPO, 'docs', 'data-retention.md'), 'utf8')],
+    [join(REPO, 'server', 'src', 'db.rs'), readFileSync(join(REPO, 'server', 'src', 'db.rs'), 'utf8')],
+  ];
+
+  let corrected = 0;
+  for (const [name, text] of documents) {
+    // Look for the phrase as a PUBLISHED VALUE - `keep: 'Until deleted by user'`,
+    // a table cell, or a doc-comment line that asserts it - and not in prose that
+    // quotes it in order to say it was wrong. The correction comments all quote the
+    // retired phrase, exactly as they should, and a plain substring search fires on
+    // that. A sentence saying a claim is false is not itself the claim.
+    //
+    // The second pattern is the one that matters: it is the shape the claim had in
+    // `db.rs`, a bullet stating the window as fact. Matching that, and not merely
+    // mentioning the words, is the difference between checking the policy and
+    // checking the vocabulary.
+    assert.ok(
+      !/keep:\s*'[^']*Until deleted by user/i.test(text) &&
+        !/\|\s*Until deleted by user\s*\|/i.test(text) &&
+        !/`review_history`\s*[—-]\s*kept until the user deletes/i.test(text),
+      `${name} still publishes "Until deleted by user" for reviews, which describes a deletion nothing implements. Nothing in server/src issues a DELETE against \`reviews\`.`,
+    );
+    // Each must state that the row is kept without a user-triggered delete. The
+    // wordings differ deliberately - a privacy page, a policy table and a
+    // doc-comment should not read identically - so the patterns are per-meaning
+    // rather than one string, and the count below is what holds all three to it.
+    if (/kept indefinitely|forever, unless the account is closed|kept \*\*indefinitely\*\*/i.test(text)) {
+      corrected++;
+    } else {
+      assert.fail(
+        `${name} no longer states that a review is kept indefinitely. The correction has to land in ` +
+          `website/src/lib/privacy.ts, docs/data-retention.md and server/src/db.rs together, or the policy ` +
+          `is published differently depending on where a reader looks - which is how the original claim ` +
+          `survived three copies agreeing with each other.`,
+      );
+    }
+  }
+  assert.equal(
+    corrected,
+    3,
+    `only ${corrected} of the three transcriptions state that a review is kept indefinitely. The correction has to land in all three or the policy is published differently depending on where a reader looks - which is how the original claim survived three copies agreeing with each other.`,
+  );
 });

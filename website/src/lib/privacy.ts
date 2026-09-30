@@ -115,8 +115,14 @@ export const retention = [
   // any outstanding one of the same kind, so nothing needs a retention job to stop
   // being useful. The bound below is the configured TTL, not a cleanup interval.
   { what: 'Email verification and password-reset links', keep: 'Until used, or the link expires (24h for verification, 30m for a reset)', why: 'A single-use secret delivered to an address. It is stored as a hash only, it is deleted the moment it is redeemed, and the next request for the same kind replaces it — so an unredeemed link is inert at its TTL rather than lingering' },
-  { what: 'Reviews', keep: 'Until deleted by user', why: 'Published aggregate; individual text is theirs' },
-  { what: 'Review history', keep: 'Same as review', why: 'Needed to make an edit meaningful' },
+  // "Until deleted by user" described a deletion that does not exist, and it read as a
+  // bounded window when nothing bounds it. There is no DELETE of a review anywhere in
+  // the server: the only act is withdrawing, which flags the row and deliberately does
+  // not remove it, because the row must keep occupying the account's one slot. The
+  // honest statement is that it is kept indefinitely, and this page is the one a
+  // customer is entitled to read it from.
+  { what: 'Reviews', keep: 'Kept indefinitely; not deleted on request', why: 'Your words, and the aggregate is published from them. Withdrawing removes a review from the public numbers but keeps the row — that is what stops one account holding two. Ask us and a body is cleared when the account is closed' },
+  { what: 'Review history', keep: 'Same as the review', why: 'The previous text of an edited review, so an edit is auditable rather than silent. It goes when its review goes' },
   // WAS the raw table name `link_codes`, which is the one row on this page that showed
   // a schema identifier to a customer while every other row used a phrase. Internal
   // naming is not what a privacy notice is for, and a row that reads as a database dump
