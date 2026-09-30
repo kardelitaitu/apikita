@@ -68,6 +68,7 @@ relationship and becomes a liability the moment a breach occurs.
 | **Review history** | Same as review | Needed to make an edit meaningful |
 | **link_codes** | Until used or expired + 24h | Then delete |
 | **Link-redemption attempts** | **7 days** | Salted IP hashes, same class as `key_ip_seen`; enough to investigate a live credential attack, then gone. **The "then gone" was false until this round**: the promise was in this table from before the sweep existed, and nothing deleted a single row. The nightly sweep now covers this table too, through the same instant helper `usage_events` uses |
+| **`auth_attempts`** | **7 days** | The credential-guessing counter behind the five `[limits]` `_per_hour` caps. Its IP-keyed rows are salted hashes (the same class as `key_ip_seen`); its account-keyed rows hold no IP-derived data at all — the writer stores the empty string in `ip_hash`, which the column's NOT NULL requires — but they are still a per-account record of who tried to sign in and when, so they take the same 7 days rather than a longer one. Every cap reads a window of one HOUR, so a seven-day-old row is already inert for enforcement. Swept nightly through the same instant helper `usage_events` uses |
 | `key_ip_seen` | **7 days** | One salted hash per (key, day, address): enough to see one address spreading a key across many accounts. Purged nightly, and the salt is replaced at each UTC midnight so days cannot be linked |
 | `key_ip_daily` | **90 days** | One count per (key, day) — a **trend, not a history**. The individual hashes are gone after 7 days; what survives is a number per day, which is what makes a 90-day view possible without keeping anything linkable |
 | **Logs** | 30-90 days | Debugging window; not a database |
@@ -99,12 +100,15 @@ relationship and becomes a liability the moment a breach occurs.
 > It deliberately does **not** touch `ledger` or `topups` (financial records, kept
 > forever), `reviews`/`review_history` (kept until the user deletes them),
 > `link_codes` (its own "+24h after use/expiry" rule is a different shape), or
-> `key_ip_*`/`link_redemption_attempts` (swept by the maintenance scheduler in
-> inline SQL, which owns the salted-hash retention and the salt-rotation contract;
-> `bin/ip-purge.rs` states the same windows but is not shipped and does not run). The
-> link-redemption table was the one gap in that sentence, and it was my error: an earlier
-> round corrected a wrong claim here by replacing it with a different wrong claim rather
-> than reading the entrypoint. It is now swept, and the sentence is true.
+> `key_ip_*`/`link_redemption_attempts`/`auth_attempts` (swept by the maintenance
+> scheduler in inline SQL, which owns the salted-hash retention and the salt-rotation
+> contract; `bin/ip-purge.rs` states the same windows but is not shipped and does not
+> run). The link-redemption table was the one gap in that sentence, and it was my error:
+> an earlier round corrected a wrong claim here by replacing it with a different wrong
+> claim rather than reading the entrypoint. It is now swept, and the sentence is true.
+> `auth_attempts` was the second table to join it, and it arrived with no window in this
+> document at all — the counter behind the five `_per_hour` caps was written on every
+> failed sign-in while this page named neither the table nor a period for it.
 
 **The ledger is never deleted, even when a customer leaves.** It is the record of
 money that moved. That is normal accounting, not a retention violation — but it

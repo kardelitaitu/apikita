@@ -49,9 +49,15 @@ export interface RequestRow { request: string; how: string; }
 
 // docs/data-retention.md, "What is stored".
 export const stored = [
-  { what: 'Email', where: 'PocketBase', sensitivity: 'Personal' },
-  { what: 'Password hash', where: 'PocketBase', sensitivity: 'Sensitive, but not usable if leaked (hashed)' },
-  { what: 'Google account link', where: 'PocketBase', sensitivity: 'Personal' },
+  // These three rows said PocketBase until the identity port landed. They are the
+  // reason the port was worth doing for reasons other than engineering: a customer
+  // reading this page was told their email and password hash sat in a second
+  // system, and after the port they sit in the same embedded database as the rest
+  // of the account. Pointing them at PocketBase would now be the false statement.
+  { what: 'Email', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal' },
+  { what: 'Password hash', where: 'Embedded SQLite (the database file)', sensitivity: 'Sensitive, but not usable if leaked (Argon2id, salted per hash)' },
+  { what: 'Email verification and password-reset links', where: 'Embedded SQLite (the database file)', sensitivity: 'Stored only as a SHA-256 hash of the token, never the token itself. Single use, and deleted once redeemed and on the next request for the same purpose — the raw link exists only in the email we send' },
+  { what: 'Google account link', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal — the Google subject id and the verified address, not a Google password or a Google session' },
   { what: 'Telegram ID', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal, pseudonymous' },
   { what: 'Wallet balance + ledger', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
   { what: 'Top-up history (amounts, dates)', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
@@ -71,6 +77,13 @@ export const stored = [
   // into omission.
   { what: 'Salted IP hash of API-key traffic (per key, per day)', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, not anonymous — HMAC-SHA256 of the address under a salt replaced at each UTC midnight, so the same visitor is not linkable across days. Held 7 days per seen-address and 90 per day total' },
   { what: 'Salted IP hash of failed link-code attempts', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, same salt scheme, held 7 days and swept nightly. A credential-guessing attempt writes one hash per attempt, and the window is the limit on how long a breached salt would link them' },
+  // The sign-in and signup caps. This row was absent while the table was written on
+  // every attempt against those endpoints, which is the omission direction that matters:
+  // the page disclosed the key_ip tables and the link-code attempts, so a reader had no
+  // way to learn that the credential-guessing counter exists at all. It is stated here
+  // with BOTH keyings, because the account-keyed half holds no address and a page that
+  // implied it did would be overstating collection.
+  { what: 'Sign-in attempt counters', where: 'Embedded SQLite (the database file)', sensitivity: 'Stops credential-guessing against the sign-in, signup, password-reset and resend endpoints. The per-address half is the same salted hash scheme as the rows above; the per-account half holds the account id and the time and NO address at all. Both are held 7 days and swept nightly' },
   { what: 'Telegram link codes, and operator audit rows', where: 'Embedded SQLite (the database file)', sensitivity: 'A link code is deleted once used or 24h after expiry; an operator audit row records which operator did what to which account' },
 ];
 
@@ -91,6 +104,11 @@ export const retention = [
   { what: 'Usage daily', keep: '24 months', why: 'Billing disputes, then aggregate only' },
   { what: 'Per-request usage', keep: '90 days', why: 'Covers the 30-day spend window plus a dispute window. Deleted 90 days after the request by the nightly retention job' },
   { what: 'Sessions (expired/revoked)', keep: '30 days', why: 'Tidy up, but keep recent for security review' },
+  // The identity links are short-lived by construction rather than by a sweep: a
+  // verification or reset token is consumed once, and issuing a new one deletes
+  // any outstanding one of the same kind, so nothing needs a retention job to stop
+  // being useful. The bound below is the configured TTL, not a cleanup interval.
+  { what: 'Email verification and password-reset links', keep: 'Until used, or the link expires (24h for verification, 30m for a reset)', why: 'A single-use secret delivered to an address. It is stored as a hash only, it is deleted the moment it is redeemed, and the next request for the same kind replaces it — so an unredeemed link is inert at its TTL rather than lingering' },
   { what: 'Reviews', keep: 'Until deleted by user', why: 'Published aggregate; individual text is theirs' },
   { what: 'Review history', keep: 'Same as review', why: 'Needed to make an edit meaningful' },
   // WAS the raw table name `link_codes`, which is the one row on this page that showed
@@ -99,6 +117,7 @@ export const retention = [
   // makes the eleven around it harder to take seriously.
   { what: 'Telegram link codes', keep: 'Until used or expired + 24h', why: 'A link code is a short-lived secret for binding a Telegram account. It is deleted once used, and 24 hours after it expires otherwise, so an unused code never outlives its usefulness' },
   { what: 'Link-redemption attempts', keep: '7 days', why: 'Hashed source of failed link-code attempts; used only to stop credential attacks, then deleted' },
+  { what: 'Sign-in attempt counters', keep: '7 days', why: 'Stops credential-guessing against the sign-in, signup, password-reset and resend endpoints. Held only long enough to investigate a live attack; every cap reads a one-hour window, so anything older is already inert' },
   // The two salt rows were missing here while the nightly sweep deleted them, and the
   // omission is the one this page must never make: it is a disclosure of what is kept.
   // They were findable only in ip-tracking.md, which no customer reads, so a reader had

@@ -174,7 +174,7 @@ banner() {
     else
         log "CLIENT    sqlite3 IS NOT INSTALLED IN THIS IMAGE. Every database job below will FAIL, loudly, rather than report a clean sheet against a database it never opened. The scheduler image (`.docker/maintenance/Dockerfile`) must provide a sqlite3 binary."
     fi
-    log "WIRED     retention  - age-based sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md); usage_events > 90d, usage_daily > 730d, expired/revoked sessions > 30d (docs/data-retention.md)"
+    log "WIRED     retention  - age-based sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md); usage_events > 90d, usage_daily > 730d, expired/revoked sessions > 30d, link_redemption_attempts > 7d, auth_attempts > 7d (docs/data-retention.md)"
     log "WIRED     reconcile  - tools/reconcile/reconcile.sh, exit code preserved (1=drift 2=no DATABASE_URL 3=no sqlite3 4=sqlite3 failed 5=stranded hold 6=no such database file)"
     log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary NOT shipped in the server image; it does NOT run here. Its retention window IS enforced inline (see retention above)."
     log "NOT WIRED usage-purge - server/src/bin/usage-purge.rs, same: not shipped, does NOT run here. Its three sweeps ARE enforced inline (see retention above)."
@@ -298,6 +298,23 @@ link_attempts=$(retention_delete_instant "$DB_FILE" link_redemption_attempts att
   return 1
 }
 
+# auth_attempts: the credential-guessing counter behind the five [limits] _per_hour
+# caps. Its IP-keyed rows are the same class as key_ip_seen (a salted hash answering
+# "who was this") and its account-keyed rows are an account id and a timestamp; both
+# age out on the same 7 days, which is what docs/data-retention.md promises.
+#
+# SAME instant helper as link_redemption_attempts, because created_at carries the
+# same RFC3339 +00:00 form. Using the DATE form here would compare a bare
+# 'YYYY-MM-DD' as a STRING against that timestamp, and the shorter string sorts
+# FIRST - the DELETE would match nothing and the rows would survive forever.
+#
+# Deleting rows here is safe for the limiter: the window is one HOUR
+# (auth_attempts::window()), so a seven-day-old row was never going to be counted.
+auth_attempts=$(retention_delete_instant "$DB_FILE" auth_attempts created_at 7) || {
+  log "job retention: FAILED - the auth_attempts delete did not run (sqlite3 error above)"
+  return 1
+}
+
 # A blank count is not a zero count: `SELECT changes()` always returns a row, so
     # anything non-numeric means the delete did not do what this job claims.
     case "$seen" in ''|*[!0-9]*) log "job retention: FAILED - key_ip_seen returned '$seen', not a count"; return 1 ;; esac
@@ -305,9 +322,10 @@ link_attempts=$(retention_delete_instant "$DB_FILE" link_redemption_attempts att
     case "$usage_daily" in ''|*[!0-9]*) log "job retention: FAILED - usage_daily returned '$usage_daily', not a count"; return 1 ;; esac
     case "$usage_events" in ''|*[!0-9]*) log "job retention: FAILED - usage_events returned '$usage_events', not a count"; return 1 ;; esac
     case "$link_attempts" in ''|*[!0-9]*) log "job retention: FAILED - link_redemption_attempts returned '$link_attempts', not a number: the delete did not do what this job claims"; return 1 ;; esac
+    case "$auth_attempts" in ''|*[!0-9]*) log "job retention: FAILED - auth_attempts returned '$auth_attempts', not a number: the delete did not do what this job claims"; return 1 ;; esac
 case "$sessions" in ''|*[!0-9]*) log "job retention: FAILED - sessions returned '$sessions', not a count"; return 1 ;; esac
 
-    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d), link_redemption_attempts=$link_attempts (7d)"
+    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d), link_redemption_attempts=$link_attempts (7d), auth_attempts=$auth_attempts (7d)"
     return 0
 }
 

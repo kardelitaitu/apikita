@@ -60,6 +60,7 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
         seen_deleted = purged.seen,
         daily_deleted = purged.daily,
         link_attempts_deleted = purged.link_attempts,
+        auth_attempts_deleted = purged.auth_attempts,
         "IP-tracking retention sweep complete"
     );
 

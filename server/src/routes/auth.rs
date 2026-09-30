@@ -1024,7 +1024,6 @@ mod tests {
     // with logout.
     // -----------------------------------------------------------------------
 
-    use crate::db::{credit_topup_transaction, TopupCreditResult};
     use crate::test_support::{self, TestDb};
     use axum::body::to_bytes;
     use chrono::DateTime;
@@ -1051,37 +1050,16 @@ mod tests {
         .expect("reconciliation query")
     }
 
-    /// Money enters a wallet only through the REAL path: a topups row, then
-    /// credit_topup_transaction, which settles it and appends the matching +
-    /// ledger row in the same transaction. Writing wallets.balance_idr directly
-    /// would manufacture the very drift the drift assertion then reports.
-    async fn settle_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) {
-        let order_id = format!("test_topup_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at)
-             VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
-        )
-        .bind(Uuid::new_v4().hyphenated())
-        .bind(account_id.hyphenated())
-        .bind(amount_idr)
-        .bind(&order_id)
-        .bind(Utc::now())
-        .execute(pool)
-        .await
-        .expect("create topup");
-
-        let credited = credit_topup_transaction(pool, &order_id, amount_idr)
-            .await
-            .expect("credit the top-up through the real money path");
-        assert!(
-            matches!(credited, TopupCreditResult::Settled { .. }),
-            "the fixture must settle the top-up, got {credited:?}"
-        );
-    }
-
     /// Sessions that are actually usable: unrevoked AND unexpired. Both bounds
     /// matter - an expired-but-unrevoked row is not a credential, and counting
     /// it as "live" would make an expired cookie look like a valid session.
+    ///
+    /// `settle_topup` used to sit just above this. It was DELETED rather than left
+    /// as dead code: the two `live_*` PocketBase fixtures that called it went with
+    /// the provider they exercised, and none of the surviving tests here touch a
+    /// wallet. `routes/account.rs` and `test_support` each keep their own funding
+    /// fixture because their tests do fund accounts; a third copy here would
+    /// compile, read as load-bearing, and silently drift from the ones that run.
     async fn live_sessions(pool: &SqlitePool, account_id: Uuid) -> i64 {
         // Both bounds are bound: an earlier port bound only the account, leaving the
         // expiry comparison against NULL - which is never TRUE, so every count came
@@ -1859,9 +1837,8 @@ mod tests {
 
         db.close().await;
     }
-}
 
-/// States the `[limits]` caps a test wants, without touching the config file, and
+    /// States the `[limits]` caps a test wants, without touching the config file, and
 /// clears them again when the test ends.
 ///
 /// A GUARD rather than a setter, because the override has to hold for every
@@ -1906,4 +1883,5 @@ impl Drop for TestLimitsGuard {
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = None;
     }
+}
 }

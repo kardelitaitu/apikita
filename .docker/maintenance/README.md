@@ -41,7 +41,7 @@ and there is none.
 
 | Job | What it protects | How it runs |
 | --- | --- | --- |
-| **retention** | The `docs/ip-tracking.md` retention promise: `key_ip_seen` hashes live **7 days**, `key_ip_daily` counts live **90**. Compliance, not nicety - the surviving hashes are only "unlinkable after the salt is gone" if they are also *gone*. | Real SQL through the `sqlite3` CLI: `DELETE FROM key_ip_seen WHERE day <= date('now','-7 days')` and `DELETE FROM key_ip_daily WHERE day <= date('now','-90 days')`. |
+| **retention** | Every age-based retention promise: the `docs/ip-tracking.md` one (`key_ip_seen` hashes live **7 days**, `key_ip_daily` counts live **90**), the `docs/data-retention.md` ones (`usage_events` 90d, `usage_daily` 730d, expired/revoked `sessions` 30d, `link_redemption_attempts` 7d, `auth_attempts` 7d). Compliance, not nicety - the surviving hashes are only "unlinkable after the salt is gone" if they are also *gone*. | Real SQL through the `sqlite3` CLI, one `DELETE` per table: the two `key_ip_seen`/`key_ip_daily` DATE-keyed deletes, and the instant form for `usage_events`, `sessions`, `link_redemption_attempts` and `auth_attempts`. |
 | **reconcile** | The Gate 2 money-correctness invariant `wallets.balance_idr = SUM(ledger.delta_idr)`. `tools/reconcile/reconcile.sh` is the single best guard against silently wrong money. | `sh tools/reconcile/reconcile.sh` against the database file. Exit code preserved verbatim. |
 
 ### Why the retention job is SQL and not the binary
@@ -76,7 +76,7 @@ for the service itself to commit it.
 
 | Job | Status | Why it cannot run here |
 | --- | --- | --- |
-| **`ip-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/ip-purge.rs` is a **Rust binary**. A server image **does** exist (`server/Dockerfile`), but it ships only `apikita-server` and `migrate`, so no image in *this* compose file contains it. The **retention window IS enforced** — `run_retention` applies the same two `DELETE`s through sqlite3. It is the *binary* that does not run here. |
+| **`ip-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/ip-purge.rs` is a **Rust binary**. A server image **does** exist (`server/Dockerfile`), but it ships only `apikita-server` and `migrate`, so no image in *this* compose file contains it. The **retention window IS enforced** — `run_retention` applies the same `DELETE`s through sqlite3. It is the *binary* that does not run here. |
 | **`usage-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/usage-purge.rs`, same shape. `run_retention` applies all three of its sweeps — `usage_events` (90d), `usage_daily` (730d), expired/revoked `sessions` (30d) — so `docs/data-retention.md` is enforced here. |
 | **`hold-sweep`** | **WIRED — REPORT-ONLY** | `server/src/bin/hold-sweep.rs` still is not shipped, but `run_hold_sweep` applies its **detector** inline through `sqlite3`: the same predicate as the binary, the same 900s bound. It counts, names the accounts and refs, and exits non-zero. It **never moves money** — the binary's `--release` is the deliberate operator action. This matters most because a stranded hold is **invisible money**: the ledger still balances and reconciliation returns *nothing*. |
 | **`benchmark`** | **NOT WIRED** | `server/src/bin/benchmark.rs`. Not a maintenance promise; it is a measurement tool and has no business running on a timer. |

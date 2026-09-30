@@ -155,7 +155,24 @@ impl EmailSender {
     /// override must not take the service down when a working config is present.
     pub fn new(config: &EmailConfig) -> Self {
         let from = match config.from_address.parse::<Mailbox>() {
-            Ok(mailbox) => mailbox,
+            // The display name goes on HERE, and only here, so the two come from
+            // one place. `Mailbox::new(name, address)` rather than a second parse of
+            // a pre-composed string: the address has already been validated by the
+            // `parse` above, and re-parsing a formatted `"Name <addr>"` would put the
+            // name on a path that can fail, which is how a configured display name
+            // turns into a disabled mailer.
+            //
+            // An EMPTY `from_name` means `None` and NOT `Some("")`: an empty display
+            // name serialises as `"" <addr>`, which some relays reject outright and
+            // others render as a blank sender.
+            Ok(mailbox) => {
+                let name = config.from_name.trim();
+                if name.is_empty() {
+                    mailbox
+                } else {
+                    Mailbox::new(Some(name.to_string()), mailbox.email)
+                }
+            }
             Err(err) => {
                 // Startup, not a request: say exactly what is wrong and keep the
                 // shape valid so the process still builds its state. The sender
@@ -281,6 +298,20 @@ impl EmailSender {
         self.timeout
     }
 
+    /// The parsed From mailbox, so a test can assert the display name reached the
+    /// header without building a transport or a message.
+    ///
+    /// `#[cfg(test)]` rather than a public accessor: nothing in production needs to
+    /// read back what it just configured, and a public one would be a second way to
+    /// ask a question the config file already answers. Named `parsed_from` and not
+    /// `from_for_test` because clippy's `wrong_self_convention` reads a `from_*`
+    /// method as a constructor and wants it to take no `self` - a convention this
+    /// accessor is not following, and not one worth an `allow`.
+    #[cfg(test)]
+    fn parsed_from(&self) -> &Mailbox {
+        &self.from
+    }
+
     /// Sends one message.
     ///
     /// Does not retry. A retry here would be a second synchronous wait on the
@@ -328,7 +359,11 @@ impl EmailSender {
 
 /// The timeout, floored so a `0` in the config cannot mean "wait forever".
 fn timeout_of(config: &EmailConfig) -> Duration {
-    Duration::from_secs((config.request_timeout_seconds as u64).max(MIN_TIMEOUT_SECONDS))
+    // `request_timeout_seconds` is already a `u64`, so the cast clippy flagged here
+    // was a no-op — and a no-op cast is worse than noise: it reads as a narrowing
+    // conversion someone thought about, and invites the next reader to assume the
+    // field is signed.
+    Duration::from_secs(config.request_timeout_seconds.max(MIN_TIMEOUT_SECONDS))
 }
 
 /// The host and port to dial, with the environment override applied.
@@ -643,6 +678,54 @@ mod tests {
         let sender = EmailSender::new(&config);
 
         assert!(!sender.is_configured());
+    }
+
+    /// The display name reaches the From header, and an empty one is absent
+    /// rather than blank.
+    ///
+    /// This is the test for a setting that was read by NOTHING: `from_name` sat in
+    /// `[email]` with a doc comment saying it was read here, and the config guard
+    /// (`every_config_field_is_read_by_production_code_or_explained`) is what
+    /// finally noticed it was not. Pinning the OUTCOME rather than the field access
+    /// is the point - a `.from_name` somewhere would have satisfied the guard while
+    /// leaving the header wrong, which is the weaker reading this repo names.
+    #[test]
+    fn the_configured_display_name_reaches_the_from_header() {
+        let named = EmailConfig {
+            from_address: "no-reply@apikita.test".to_string(),
+            from_name: "Apikita Support".to_string(),
+            ..EmailConfig::default()
+        };
+
+        let sender = EmailSender::new(&named);
+        let from = sender.parsed_from();
+
+        assert_eq!(
+            from.name.as_deref(),
+            Some("Apikita Support"),
+            "the configured display name must be on the From header"
+        );
+        assert_eq!(
+            from.email.to_string(),
+            "no-reply@apikita.test",
+            "the address is the one that was validated, not a re-parse of the name"
+        );
+
+        // An empty name is ABSENT, not blank: `"" <addr>` is rejected by some
+        // relays and renders as a nameless sender in the rest.
+        let unnamed = EmailConfig {
+            from_name: String::new(),
+            ..named
+        };
+        assert_eq!(EmailSender::new(&unnamed).parsed_from().name, None);
+
+        // Whitespace is empty too - a config file with trailing spaces must not
+        // produce a sender whose name is a single space.
+        let blank = EmailConfig {
+            from_name: "   ".to_string(),
+            ..EmailConfig::default()
+        };
+        assert_eq!(EmailSender::new(&blank).parsed_from().name, None);
     }
 
     #[test]

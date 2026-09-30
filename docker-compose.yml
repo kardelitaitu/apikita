@@ -71,9 +71,10 @@ services:
   # green run; it states exactly what is wired and what is not.
   #
   #   retention  RUNS HERE, for real. The sqlite3 CLI plus the exact SQL of
-  #              server/src/bin/ip-purge.rs (server/src/ip_tracking.rs:298-316):
-  #              key_ip_seen > 7d, key_ip_daily > 90d. This is the
-  #              docs/ip-tracking.md retention promise actually being kept.
+  #              server/src/bin/ip-purge.rs: key_ip_seen > 7d, key_ip_daily > 90d,
+  #              link_redemption_attempts > 7d, auth_attempts > 7d. This is the
+  #              docs/ip-tracking.md and docs/data-retention.md retention promise
+  #              actually being kept.
   #   reconcile  RUNS HERE, for real. tools/reconcile/reconcile.sh, exit code
   #              preserved verbatim (1=drift 2=no DATABASE_URL 3=no sqlite3
   #              4=sqlite3 failed 5=stranded hold 6=no such database file).

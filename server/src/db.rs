@@ -511,23 +511,36 @@ pub struct PurgedUsage {
 /// window - i.e. the sweep has left a row it promised to delete. `None` is "inside
 /// the window", including the empty table.
 ///
-/// **THIS MEASURES THREE OF THE SIX TABLES THE SWEEP DELETES, and the three it misses
-/// are the ones with privacy promises.** The nightly job purges key_ip_seen (7 days),
-/// key_ip_daily (90) and link_redemption_attempts (7) as well as the three below, and
-/// nothing measures whether those are keeping up. `anything_behind` feeds the db_disk
-/// alert, whose stated condition was "any age-based table holding a row past its
-/// retention window" - false for half of them, and now corrected in alerts.tsv.
+/// **THIS MEASURES EVERY TABLE THE NIGHTLY SWEEP DELETES, and it did not always.**
+/// The nightly job purges key_ip_seen (7 days), key_ip_daily (90) and
+/// link_redemption_attempts (7) as well as the three below, and it once measured only
+/// the three below - so if the sweep broke on the IP-hash tables the rows grew without
+/// limit, the privacy page kept stating 7 and 90 days, and no alert, metric or log line
+/// said so. `anything_behind` feeds the db_disk alert, whose stated condition was "any
+/// age-based table holding a row past its retention window" - false for half of them,
+/// and now corrected in alerts.tsv.
 ///
-/// The consequence is specific. If the sweep breaks on the IP-hash tables the rows grow
-/// without limit, the privacy page keeps stating 7 and 90 days, and no alert, metric or
-/// log line says so. The sweep prints its own counts, so the only signal is a human
-/// reading a nightly log nobody is required to read.
+/// `auth_attempts` joins it on the same terms, and for the sharpest version of the same
+/// reason: it is the credential-guessing counter behind the five `_per_hour` caps, its
+/// IP-keyed half is a salted hash, and a sweep that stopped on it would leave that
+/// history in the database while every document still promised 7 days. The account-keyed
+/// half shares the window and therefore the field - see the field's doc.
 ///
-/// The fix is three fields here, three more in `oldest_days_by_table` (whose array
-/// length is a literal `3`, so the compiler points at each one), the lag query, and a
-/// constant for the link window, which today lives only in the entrypoint as a shell
-/// literal. That constant is the reason to do it carefully: once the number is in Rust,
-/// the sweep guard can require the shell to match it, and no such check exists today.
+/// `link_code_issues` is deliberately NOT here, and the reason is that it is not swept
+/// on this path at all: `ip_tracking::purge_expired` deletes it and that function is
+/// reachable only through `bin/ip-purge.rs`, which the maintenance entrypoint logs as
+/// NOT WIRED. So a field for it would measure a table nothing on the nightly path
+/// touches, and it would report "behind" forever the moment it held a row older than
+/// seven days. That the table has a documented 7-day window and no wired sweep is a
+/// real gap; it is recorded here rather than papered over with a measurement that would
+/// fire permanently and be learned as noise.
+///
+/// The fix for the measured tables was three fields here, three more in
+/// `oldest_days_by_table` (whose array length is a literal, so the compiler points at
+/// each one), the lag query, and a constant for the link window, which until then lived
+/// only in the entrypoint as a shell literal. That constant is the reason to do it
+/// carefully: once the number is in Rust, the sweep guard can require the shell to
+/// match it, and no such check existed before it.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RetentionLag {
     /// Age of the oldest `usage_events` row, when past the 90-day window.
@@ -542,6 +555,14 @@ pub struct RetentionLag {
     pub key_ip_daily: Option<i64>,
     /// Age of the oldest `link_redemption_attempts` row, when past the 7-day window.
     pub link_redemption_attempts: Option<i64>,
+    /// Age of the oldest `auth_attempts` row, when past the 7-day window.
+    ///
+    /// Both keyings share the one window and therefore the one field: the table
+    /// holds IP-keyed rows (a salted hash) and account-keyed rows (an account id
+    /// and a timestamp), and `purge_expired` deletes both on `created_at` against
+    /// `AUTH_ATTEMPT_RETENTION_DAYS`. A second field would have to measure the same
+    /// column against the same number and could only disagree with this one.
+    pub auth_attempts: Option<i64>,
 }
 
 /// The link-redemption window, which until now existed only as the `7` literal in the
@@ -559,6 +580,7 @@ impl RetentionLag {
             || self.key_ip_seen.is_some()
             || self.key_ip_daily.is_some()
             || self.link_redemption_attempts.is_some()
+            || self.auth_attempts.is_some()
     }
 
     /// Each table with the age of its oldest row, in the order the docs list them.
@@ -569,9 +591,9 @@ impl RetentionLag {
     /// The array LENGTH is a literal on purpose: adding a field to the struct without
     /// adding it here is a compile error rather than a silently shorter report, which is
     /// the failure this change exists to remove. It caught the one test that built a
-    /// `RetentionLag` literally, and that is the whole argument for writing 6 rather
-    /// than trimming the report to fit.
-    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 6] {
+    /// `RetentionLag` literally, and that is the whole argument for writing the count out
+    /// rather than trimming the report to fit.
+    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 7] {
         [
             ("usage_events", self.usage_events),
             ("usage_daily", self.usage_daily),
@@ -579,6 +601,7 @@ impl RetentionLag {
             ("key_ip_seen", self.key_ip_seen),
             ("key_ip_daily", self.key_ip_daily),
             ("link_redemption_attempts", self.link_redemption_attempts),
+            ("auth_attempts", self.auth_attempts),
         ]
     }
 }
@@ -720,9 +743,12 @@ pub async fn retention_lag(
     )
     .await?;
 
-    // The three IP-hash tables, each measured on the SAME column the sweep filters on.
-    // The two key_ip tables are DATE-keyed and take the branch added for usage_daily;
-    // link_redemption_attempts is an instant like usage_events.
+    // The four salted-hash-adjacent tables, each measured on the SAME column the sweep
+    // filters on. The two key_ip tables are DATE-keyed and take the branch added for
+    // usage_daily; link_redemption_attempts is an instant like usage_events, and
+    // auth_attempts is an instant for the same reason (`created_at` is an RFC3339 TEXT
+    // instant, not a date, and the sweep binds midnight UTC of the cutoff day to
+    // compare against it).
     let key_ip_seen = oldest_row_past_window(
         pool,
         "key_ip_seen",
@@ -747,6 +773,19 @@ pub async fn retention_lag(
         today,
     )
     .await?;
+    // The credential-guessing counter, on the SAME `created_at` column the sweep
+    // filters on. An INSTANT like `link_redemption_attempts` and unlike the two
+    // key_ip tables, because `auth_attempts.created_at` carries the same RFC3339
+    // `+00:00` form - so it takes the `day`-vs-instant branch's instant side, and
+    // the two keyings (IP and account) share the one window and the one field.
+    let auth_attempts = oldest_row_past_window(
+        pool,
+        "auth_attempts",
+        "created_at",
+        crate::ip_tracking::AUTH_ATTEMPT_RETENTION_DAYS,
+        today,
+    )
+    .await?;
 
     Ok(RetentionLag {
         usage_events,
@@ -755,6 +794,7 @@ pub async fn retention_lag(
         key_ip_seen,
         key_ip_daily,
         link_redemption_attempts,
+        auth_attempts,
     })
 }
 // SAFE for the same reason as `oldest_row_past_window`: chrono panics rather
@@ -3384,7 +3424,7 @@ mod tests {
 
         db.close().await;
     }
-    /// The three IP-hash tables are MEASURED, not merely declared.
+    /// The salted-hash tables are MEASURED, not merely declared.
     ///
     /// A field that exists and is always `None` is indistinguishable from a working
     /// one in every other test, and the privacy promise would be unmonitored exactly
@@ -3392,9 +3432,9 @@ mod tests {
     /// it. The negative control comes first, because an empty database reading clean
     /// is also what a broken measurement would report.
     ///
-    /// Two of the three are DATE-keyed, which is the branch the previous regression
-    /// added; the third is an instant. Between them they exercise both paths, so this
-    /// is also the test that would notice one of them being mis-keyed.
+    /// Two of the four are DATE-keyed, which is the branch the previous regression
+    /// added; the other two are instants. Between them they exercise both paths, so
+    /// this is also the test that would notice one of them being mis-keyed.
     #[tokio::test]
     async fn an_ip_hash_table_past_its_window_is_reported_as_behind() {
         let db = TestDb::new().await;
@@ -3402,16 +3442,16 @@ mod tests {
         let account = test_support::account(&db.pool).await;
         let key_id = test_support::api_key(&db.pool, account).await;
 
-        // NEGATIVE CONTROL: nothing seeded, nothing behind, all six named.
+        // NEGATIVE CONTROL: nothing seeded, nothing behind, every table named.
         let empty = retention_lag(&db.pool, today).await.unwrap();
         assert!(!empty.anything_behind(), "an empty database is not behind");
         assert_eq!(
             empty.oldest_days_by_table().len(),
-            6,
+            7,
             "the report names every table the sweep deletes, not the three it used to"
         );
 
-        // 200 days old: behind all three windows, which are 7, 90 and 7.
+        // 200 days old: behind all four windows, which are 7, 90, 7 and 7.
         let old = (today - chrono::Duration::days(200)).to_string();
         sqlx::query("INSERT INTO key_ip_seen (api_key_id, day, ip_hash) VALUES (?, ?, ?)")
             .bind(key_id.hyphenated())
@@ -3441,15 +3481,43 @@ mod tests {
             .execute(&db.pool)
             .await
             .expect("seed link_redemption_attempts");
+        // `auth_attempts` is the fourth, and the one this test was extended for. It is
+        // seeded ACCOUNT-keyed, which is the half whose retention is a deliberate
+        // decision rather than an inheritance from key_ip_seen: an account id and a
+        // timestamp is still a log of who tried to sign in, and it ages out on the
+        // same 7 days.
+        sqlx::query(
+            "INSERT INTO auth_attempts (id, ip_hash, account_id, kind, created_at) \
+             VALUES (?, '', ?, 'login', ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account.hyphenated())
+        .bind(
+            today
+                .checked_sub_signed(chrono::Duration::days(200))
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .to_rfc3339(),
+        )
+        .execute(&db.pool)
+        .await
+        .expect("seed auth_attempts");
 
         let lag = retention_lag(&db.pool, today)
             .await
             .expect("the lag query answers");
         assert!(
             lag.anything_behind(),
-            "three seeded tables are past their windows"
+            "four seeded tables are past their windows"
         );
-        for table in ["key_ip_seen", "key_ip_daily", "link_redemption_attempts"] {
+        for table in [
+            "key_ip_seen",
+            "key_ip_daily",
+            "link_redemption_attempts",
+            "auth_attempts",
+        ] {
             let named = lag
                 .oldest_days_by_table()
                 .into_iter()

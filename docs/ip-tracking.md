@@ -67,6 +67,7 @@ months.** The daily aggregate is what you keep.
 | --- | --- | --- |
 | `key_ip_seen` hashes | **7 days** | Enough to investigate a live incident |
 | `link_redemption_attempts` hashes | **7 days** | Same class as `key_ip_seen`: a salted hash answering "who was this". Kept only so a live credential attack can be investigated — the `link_redemption_per_hour` cap is a rolling 1-hour window, so anything older than an hour is already inert for enforcement |
+| `auth_attempts` rows | **7 days** | The credential-guessing counter behind the five `_per_hour` caps. Its **IP-keyed** rows are the same class as the two above: a salted hash answering "who was this", and every cap reads a one-hour window, so a seven-day-old hash is already inert. Its **account-keyed** rows hold the account id and the time and **no address at all** — the writer stores an empty string in `ip_hash`, which the column's NOT NULL requires and which no address produced — and they take the same 7 days because a per-account log of who tried to sign in is still a record about an identifiable person |
 | `key_ip_daily` counts | 90 days | Trend without history |
 | Daily salt | **deleted after the day** | Makes the hashes unlinkable forever |
 

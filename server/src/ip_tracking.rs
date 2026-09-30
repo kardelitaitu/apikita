@@ -121,6 +121,17 @@ pub const SEEN_RETENTION_DAYS: i64 = 7;
 /// `key_ip_daily` counts are kept this long: trend without history.
 pub const DAILY_RETENTION_DAYS: i64 = 90;
 
+/// `auth_attempts` rows are kept this long — the same seven days as
+/// [`SEEN_RETENTION_DAYS`], because they are the same privacy class.
+///
+/// A NAMED CONSTANT rather than a reuse of `seen_cutoff`, which is what the two
+/// link-code sweeps below do, and the difference is deliberate: those two have no
+/// separate measurement, while this window is read by `db::retention_lag` and by
+/// the metrics endpoint's `windows_days` map. A bare reuse would leave both of
+/// them with no name to read and a literal `7` to type, which is the drift the
+/// link window's constant was created to remove. One number, three readers.
+pub const AUTH_ATTEMPT_RETENTION_DAYS: i64 = 7;
+
 /// Distinct IPs on one key in one day above which the runbook says to look.
 ///
 /// A starting value from [`docs/ip-tracking.md`](../../docs/ip-tracking.md)
@@ -394,6 +405,14 @@ pub struct PurgedRows {
     /// be swept on a policy someone can see. A count that cannot be printed cannot
     /// be noticed when it silently stops moving.
     pub link_issues: u64,
+    /// `auth_attempts` rows deleted.
+    ///
+    /// A fourth field for the same reason as the second and third: this is the
+    /// credential-guessing counter behind the five `_per_hour` caps, it is keyed on
+    /// a salted IP hash, and an operator reading the sweep log has to be able to
+    /// see it moving. A count that cannot be printed cannot be noticed when it
+    /// silently stops moving.
+    pub auth_attempts: u64,
 }
 
 /// Deletes rows past their retention window.
@@ -435,6 +454,11 @@ pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<Purged
     let seen_cutoff = today - chrono::Duration::days(SEEN_RETENTION_DAYS);
     #[allow(clippy::arithmetic_side_effects)]
     let daily_cutoff = today - chrono::Duration::days(DAILY_RETENTION_DAYS);
+    // Its own constant rather than a reuse of `seen_cutoff`: see the doc on
+    // `AUTH_ATTEMPT_RETENTION_DAYS`. The two are both 7 today and are free to
+    // diverge, which is exactly why they are two names.
+    #[allow(clippy::arithmetic_side_effects)]
+    let auth_cutoff = today - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS);
 
     let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day <= ?")
         .bind(seen_cutoff)
@@ -497,11 +521,53 @@ pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<Purged
         .await?
         .rows_affected();
 
+    // The credential-guessing counter behind the five `_per_hour` caps. The same
+    // 7-day bound as `key_ip_seen`, for the same two reasons and one more of its
+    // own.
+    //
+    // The two shared reasons first. The IP-KEYED rows are the same privacy class
+    // (a salted hash answering "who was this"), and the whole point of the counter
+    // is a window measured in MINUTES - `auth_attempts::window()` is one hour - so
+    // a seven-day-old row can no longer move any cap and deleting it costs the
+    // limiter nothing. The second reason is the one this module keeps relearning:
+    // the table shipped with no retention policy at all, and a second job or a
+    // second period is a second place the policy can be forgotten.
+    //
+    // THE ACCOUNT-KEYED ROWS ARE THE NEW QUESTION, and the answer is that they take
+    // the SAME window rather than a longer one. They hold no IP-derived data -
+    // `auth_attempts::record` stores the empty-string sentinel in `ip_hash`, which
+    // the migration's NOT NULL requires and which no address produced - so they are
+    // not a privacy burden of the hashed-identifier kind. They are still a
+    // per-account LOG OF WHO TRIED TO SIGN IN AND WHEN, which is a linkable
+    // behavioural record about an identifiable person, and `docs/data-retention.md`
+    // puts that class at 7 days for the salted hashes beside it. Keeping them
+    // longer would buy nothing an operator can act on (the caps read one hour) and
+    // would grow a table keyed on an account id that never rotates.
+    //
+    // The cutoff is the SAME inclusive `<=` and the SAME midnight-UTC instant as
+    // the two sweeps above, for the reason documented there: `created_at` is a
+    // TIMESTAMP in a TEXT column, so binding a bare `NaiveDate` would compare
+    // `2026-09-27` as a STRING against `2026-09-27T03:04:05+00:00`, where the
+    // shorter string sorts FIRST - the DELETE would match nothing and the rows
+    // would survive forever. A silent retention failure in the direction that keeps
+    // data, and the one this file's tests pin in both directions.
+    let auth_attempts = sqlx::query("DELETE FROM auth_attempts WHERE created_at <= ?")
+        .bind(
+            auth_cutoff
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid")
+                .and_utc(),
+        )
+        .execute(pool)
+        .await?
+        .rows_affected();
+
     Ok(PurgedRows {
         seen,
         daily,
         link_attempts,
         link_issues,
+        auth_attempts,
     })
 }
 
@@ -1363,6 +1429,181 @@ mod tests {
             surviving,
             vec![cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc()],
             "the instant AT the cutoff must be deleted and one second later must survive - and if this deletes NOTHING, the cutoff is being compared as a DATE against a TIMESTAMP column"
+        );
+
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // The auth_attempts sweep.
+    //
+    // This table is the credential-guessing counter behind the five `_per_hour`
+    // caps. Its IP-keyed half is the same privacy class as key_ip_seen (a salted
+    // hash answering "who was this"), so it takes the same 7-day bound and the
+    // same sweep; its account-keyed half holds no IP-derived data but is a
+    // per-account log of who tried to sign in and when, which is the same
+    // retention question asked of a different key.
+    //
+    // BOTH KEYINGS ARE SEEDED AND BOTH ARE ASSERTED, rather than copying the
+    // link_redemption_attempts test: that table has one keying, so a copy would
+    // assert nothing about the half of this table that is new. A DELETE with an
+    // `account_id IS NOT NULL` predicate bolted on would pass a copy and fail
+    // here.
+    // -----------------------------------------------------------------------
+
+    /// Seeds one `auth_attempts` row at an explicit instant, IP-keyed or
+    /// account-keyed. The kind is `login` because that is the one kind written
+    /// under both keyings, so one helper can build either half.
+    async fn seed_auth_attempt(pool: &SqlitePool, at: DateTime<Utc>, account_id: Option<Uuid>) {
+        match account_id {
+            Some(id) => {
+                sqlx::query(
+                    "INSERT INTO auth_attempts (id, ip_hash, account_id, kind, created_at) \
+                     VALUES (?, '', ?, 'login', ?)",
+                )
+                .bind(Uuid::new_v4().hyphenated())
+                .bind(id.hyphenated())
+                .bind(at)
+                .execute(pool)
+                .await
+                .expect("seed an account-keyed attempt row");
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO auth_attempts (id, ip_hash, account_id, kind, created_at) \
+                     VALUES (?, ?, NULL, 'login', ?)",
+                )
+                .bind(Uuid::new_v4().hyphenated())
+                .bind(ip_hash(&[5u8; 32], &ip("203.0.113.77")))
+                .bind(at)
+                .execute(pool)
+                .await
+                .expect("seed an IP-keyed attempt row");
+            }
+        }
+    }
+
+    async fn auth_attempt_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_attempts")
+            .fetch_one(pool)
+            .await
+            .expect("count auth attempt rows")
+    }
+
+    /// RED FIRST: stale credential-guessing rows are DELETED by the sweep, under
+    /// BOTH keyings.
+    ///
+    /// Against the pre-fix code this fails for the real reason: nothing deletes
+    /// them, so a per-attempt history of who tried to sign in - from where, and
+    /// against which account - sits in the database forever, while the counters
+    /// that read it only ever look back one hour.
+    #[tokio::test]
+    async fn the_sweep_deletes_auth_attempt_rows_past_the_bound_and_keeps_recent_ones() {
+        let db = TestDb::new().await;
+        let now = Utc::now();
+        let account = test_support::account(&db.pool).await;
+
+        // Far outside the window, both keyings.
+        seed_auth_attempt(
+            &db.pool,
+            now - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS + 30),
+            None,
+        )
+        .await;
+        seed_auth_attempt(
+            &db.pool,
+            now - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS + 30),
+            Some(account),
+        )
+        .await;
+        // Just inside it, both keyings - a live attack must still be investigable.
+        seed_auth_attempt(&db.pool, now - chrono::Duration::days(1), None).await;
+        seed_auth_attempt(&db.pool, now - chrono::Duration::days(1), Some(account)).await;
+
+        assert_eq!(auth_attempt_rows(&db.pool).await, 4, "all four rows seeded");
+
+        let purged = purge_expired(&db.pool, today_utc()).await.expect("purge");
+
+        assert_eq!(
+            purged.auth_attempts,
+            2,
+            "the sweep must report the two stale rows it deleted, and the count must be its \
+             own field - a count folded into `seen` is a table that stops being swept without \
+             anyone noticing"
+        );
+        assert_eq!(
+            auth_attempt_rows(&db.pool).await,
+            2,
+            "the IP-keyed AND the account-keyed rows past the retention bound must both be \
+             DELETED; before this fix they survived forever"
+        );
+
+        // The survivors are the RECENT ones, not merely two of the four: a sweep
+        // that deleted the wrong half would still leave two rows.
+        let oldest_surviving: DateTime<Utc> =
+            sqlx::query_scalar("SELECT MIN(created_at) FROM auth_attempts")
+                .fetch_one(&db.pool)
+                .await
+                .expect("read the oldest survivor");
+        assert!(
+            oldest_surviving > now - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS),
+            "the rows that survived must be the in-window ones, got oldest {oldest_surviving}"
+        );
+
+        db.close().await;
+    }
+
+    /// THE BOUNDARY, PINNED EXACTLY - both directions, and on BOTH keyings.
+    ///
+    /// "Old rows go" passes with BOTH `<` and `<=`, which is how the window quietly
+    /// becomes N+1 days. `created_at` is also a TIMESTAMP, not a DATE, so the cutoff
+    /// must compare instants: binding a NaiveDate would store `2026-09-27` and compare
+    /// it as a STRING against `2026-09-27T03:04:05+00:00`, where the shorter string
+    /// sorts FIRST and the DELETE would remove nothing at all. Both halves of the
+    /// boundary are asserted on both keyings, so neither the off-by-one nor the type
+    /// confusion can return on either one.
+    #[tokio::test]
+    async fn the_auth_attempt_cutoff_is_inclusive_of_the_boundary_instant_and_keeps_the_rest() {
+        let db = TestDb::new().await;
+        let today = today_utc();
+        let account = test_support::account(&db.pool).await;
+        let cutoff = today - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS);
+
+        // AT the cutoff instant: must go (inclusive), on both keyings.
+        seed_auth_attempt(&db.pool, cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc(), None).await;
+        seed_auth_attempt(
+            &db.pool,
+            cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+            Some(account),
+        )
+        .await;
+        // One second INSIDE the window: must stay. This assertion fails if the
+        // cutoff becomes exclusive.
+        seed_auth_attempt(&db.pool, cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(), None).await;
+        seed_auth_attempt(
+            &db.pool,
+            cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),
+            Some(account),
+        )
+        .await;
+
+        purge_expired(&db.pool, today).await.expect("purge");
+
+        let surviving: Vec<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT created_at FROM auth_attempts ORDER BY created_at")
+                .fetch_all(&db.pool)
+                .await
+                .expect("read surviving attempts");
+
+        assert_eq!(
+            surviving,
+            vec![
+                cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),
+                cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),
+            ],
+            "the instant AT the cutoff must be deleted on BOTH keyings and one second later \
+             must survive on both - and if this deletes NOTHING, the cutoff is being compared \
+             as a DATE against a TIMESTAMP column"
         );
 
         db.close().await;
