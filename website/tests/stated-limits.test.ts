@@ -359,4 +359,229 @@ test('the figures the website states are the figures the server enforces', async
   );
 });
 
+// ---------------------------------------------------------------------------
+// THE RETENTION PERIODS THE PRIVACY PAGE PUBLISHES
+// ---------------------------------------------------------------------------
+//
+// `website/src/lib/privacy.ts` is the disclosure a customer reads, and its
+// `retention` array states a period for every kind of data we keep. Fifteen rows
+// today. Every one of those periods is a promise, and eight of them are numbers
+// that also exist somewhere else in the repository as the thing that ACTUALLY
+// expires the data.
+//
+// Nothing compared the two halves. The Rust constants the sweep reads are pinned
+// by `db.rs`'s own tests (`an_ip_hash_table_past_its_window_is_reported_as_behind`
+// asserts the lag report names them), and the page's `keep:` strings are pinned by
+// `privacy.test.ts` - which checks that each is NON-EMPTY and, for one row, that
+// it matches `/90 days/`. Neither reads the other.
+//
+// THE FAILURE THIS PREVENTS is quiet and legal rather than loud and technical.
+// Raising `usage_events` to 180 days in `db.rs` keeps every Rust test green: the
+// sweep still deletes what the constant says, the lag report still names the
+// window, and the page still says "90 days" to a customer who is relying on it.
+// The disclosure would be wrong with no red anywhere. The mirror case is worse in
+// the other direction - a page promising "7 days" for a table the sweep holds for
+// 90 is a promise kept by the document and broken by the code, which is exactly
+// the shape of two earlier rounds: `identity_tokens` had a purge with no caller,
+// and `link_codes` had a published 24-hour window and no delete path at all.
+//
+// WHAT THIS CHECKS, and why it is a TABLE rather than a scan:
+//
+//   Each numeric period the page publishes is compared to the one source of
+//   truth that owns it - a `pub const` in the Rust, a config key, or a constant
+//   in another website lib module.
+//
+// The mapping is written out by hand, and that is deliberate. A scan that looked
+// for any number on the page and any number in the server would be guessing at
+// which rows the two describe; `7 days` appears four times in `privacy.ts` and
+// four times in the Rust, and matching them by value would connect the wrong
+// pairs and pass. Naming the pairs is work a person does once and the guard then
+// holds; a guess would be a check whose green means nothing.
+
+test('every numeric retention period the privacy page publishes is the one that expires it', async () => {
+  const privacy = await import('../src/lib/privacy.ts');
+
+  /** The `keep:` string of the one row matching, found FIRST so a rename fails. */
+  function published(fragment: string): string {
+    const row = privacy.retention.find((r: { what: string }) => r.what.includes(fragment));
+    assert.ok(
+      row !== undefined,
+      `website/src/lib/privacy.ts has no retention row mentioning "${fragment}". Either the row was renamed or removed - and a row that cannot be found is a silent pass, which is why this fails instead of skipping.`,
+    );
+    return row.keep;
+  }
+
+  /** The number of days a `keep:` string states, in days. */
+  //
+  // MONTHS ARE CONVERTED, and the conversion is the point rather than a
+  // convenience. `website/src/lib/privacy.ts` publishes "24 months" for
+  // `usage_daily`, while `db::USAGE_DAILY_RETENTION_DAYS` is 730 DAYS. Those
+  // describe the same window in two different units, and a comparison that
+  // could not read one of them would have had to skip the row - which is how
+  // the divergence survived every check that existed before this one.
+  //
+  // A MONTH IS 365/12 DAYS, NOT 30. That is not pedantry: the Rust constant's own
+  // doc says "730 days is 24 months to the day at the common 365-day year", so
+  // the two sides agree by construction and a 30-day month would report a
+  // mismatch that does not exist. 730 / 30 = 24.33, and a guard that failed on
+  // that would be wrong about a pair the code went out of its way to align.
+  const MONTH_DAYS = 365 / 12;
+
+  function daysIn(keep: string): number {
+    const days = keep.match(/(\d+)\s*days?/);
+    if (days !== null) return Number(days[1]);
+
+    const months = keep.match(/(\d+)\s*months?/);
+    if (months !== null) return Math.round(Number(months[1]) * MONTH_DAYS);
+
+    const years = keep.match(/(\d+)\s*years?/);
+    if (years !== null) return Math.round(Number(years[1]) * 365);
+
+    assert.fail(
+      `the period "${keep}" states no number of days, months or years, so it cannot be compared to a retention window. If this row genuinely has no period, it does not belong in this table.`,
+    );
+  }
+
+  // --- the sweep's own windows, read from the Rust ---------------------------
+  // `db::*` and `ip_tracking::*` hold one constant per swept table, and the
+  // sweep tests already prove the sweep reads them. This proves the PAGE does.
+  const pairs: Array<[string, string, RegExp, string]> = [
+    [
+      'Per-request usage',
+      'db.rs',
+      /const USAGE_EVENTS_RETENTION_DAYS:\s*i64\s*=\s*(\d+)/,
+      'the usage_events retention window',
+    ],
+    [
+      'Usage daily',
+      'db.rs',
+      /const USAGE_DAILY_RETENTION_DAYS:\s*i64\s*=\s*(\d+)/,
+      'the usage_daily retention window',
+    ],
+    [
+      'Sessions',
+      'db.rs',
+      /const SESSION_RETENTION_DAYS:\s*i64\s*=\s*(\d+)/,
+      'the sessions retention window',
+    ],
+    [
+      'Link-redemption attempts',
+      'db.rs',
+      /const LINK_ATTEMPT_RETENTION_DAYS:\s*i64\s*=\s*(\d+)/,
+      'the link_redemption_attempts retention window',
+    ],
+    [
+      'per address seen',
+      'ip_tracking.rs',
+      /const SEEN_RETENTION_DAYS:\s*i64\s*=\s*(\d+)/,
+      'the key_ip_seen retention window',
+    ],
+    [
+      'per day',
+      'ip_tracking.rs',
+      /const DAILY_RETENTION_DAYS:\s*i64\s*=\s*(\d+)/,
+      'the key_ip_daily retention window',
+    ],
+    [
+      'Sign-in attempt counters',
+      'ip_tracking.rs',
+      /const AUTH_ATTEMPT_RETENTION_DAYS:\s*i64\s*=\s*(\d+)/,
+      'the auth_attempts retention window',
+    ],
+  ];
+
+  for (const [fragment, file, anchor, describe] of pairs) {
+    const keep = published(fragment);
+    const stated = daysIn(keep);
+    const enforced = rustNumber(file, anchor, describe);
+    assert.equal(
+      stated,
+      enforced,
+      `website/src/lib/privacy.ts publishes "${keep}" for the row mentioning "${fragment}", but ${describe} in server/src/${file} is ${enforced} days. The page a customer relies on and the sweep that runs would disagree, and only this comparison can see both.`,
+    );
+  }
+
+  // --- the identity links, whose window is a CONFIG TTL, not a sweep --------
+  // These are the two figures the file header has been promising to check since
+  // the `minlength="8"` round, and they are the reason this test exists at all.
+  // A verification or reset link is not deleted N days after anything: it is
+  // inert the moment `expires_at` passes, and `identity::tokens::consume` refuses
+  // a row past it. So the number on the page has to equal the number the config
+  // hands `tokens::issue`.
+  //
+  // NOTE the two units. The config is in MINUTES; the page is in `h` and `m`.
+  // A guard that compared the bare integers would call 1440 and 24 equal only by
+  // accident of neither being read - so both sides are converted to minutes and
+  // the conversion is asserted, not assumed.
+  const linksKeep = published('Email verification and password-reset links');
+  const verificationMinutes = configNumber('verification_ttl_minutes');
+  const resetMinutes = configNumber('reset_ttl_minutes');
+  assert.ok(
+    verificationMinutes !== null && resetMinutes !== null,
+    'config/apikita.toml no longer states verification_ttl_minutes and reset_ttl_minutes, so the two link lifetimes on the privacy page have no source to be checked against',
+  );
+
+  const statedVerification = linksKeep.match(/(\d+)\s*h\b/);
+  const statedReset = linksKeep.match(/(\d+)\s*m\b/);
+  assert.ok(
+    statedVerification !== null,
+    `the link row publishes "${linksKeep}", which states no HOURS for the verification link, so it cannot be compared to verification_ttl_minutes`,
+  );
+  assert.ok(
+    statedReset !== null,
+    `the link row publishes "${linksKeep}", which states no MINUTES for the reset link, so it cannot be compared to reset_ttl_minutes`,
+  );
+
+  // The config is minutes; the page is hours for one and minutes for the other.
+  // Comparing the page's "24" to the config's "1440" would fail, and comparing
+  // nothing at all is what this test was written to stop.
+  assert.equal(
+    Number(statedVerification[1]) * 60,
+    verificationMinutes,
+    `website/src/lib/privacy.ts publishes "${linksKeep}" for email links, so the verification window reads as ${Number(statedVerification[1])} hours, but config/apikita.toml sets verification_ttl_minutes = ${verificationMinutes} (= ${verificationMinutes / 60} hours). A verification link that really lived for ${Number(statedVerification[1])} hours would expire before the config says it does, and the page would be telling the customer the wrong lifetime.`,
+  );
+  assert.equal(
+    Number(statedReset[1]),
+    resetMinutes,
+    `website/src/lib/privacy.ts publishes "${linksKeep}" for email links, so the reset window reads as ${Number(statedReset[1])} minutes, but config/apikita.toml sets reset_ttl_minutes = ${resetMinutes}.`,
+  );
+
+  // --- the four rows that state NO period, checked for the right reason -----
+  // "Forever", "Until deleted by user", "Same as review" and "Keep record, drop
+  // personal data" have no number by design. They are listed here so that a
+  // period APPEARING on one of them is a failure rather than an unnoticed edit:
+  // a row that gains a number is a row the sweep may have to agree with, and
+  // nothing would say so.
+  const unnumbered = ['Ledger', 'Top-ups', 'Reviews', 'Review history', 'Accounts (closed)'];
+  for (const fragment of unnumbered) {
+    const keep = published(fragment);
+    assert.doesNotMatch(
+      keep,
+      /\d/,
+      `website/src/lib/privacy.ts publishes "${keep}" for the row mentioning "${fragment}", which used to state no period at all. A number here is a retention window the sweep does not necessarily have - add it to the table above once something backs it.`,
+    );
+  }
+
+  // --- vacuity --------------------------------------------------------------
+  // The pairs above are found by FRAGMENT, so a rename that left two fragments
+  // pointing at the SAME row would compare one row seven times and pass. The
+  // seven must be seven distinct rows.
+  const matched = pairs.map(([fragment]) => published(fragment));
+  assert.equal(
+    new Set(pairs.map(([fragment]) => privacy.retention.find((r: { what: string }) => r.what.includes(fragment))?.what)).size,
+    pairs.length,
+    'two of the fragments in the table above matched the same retention row, so this test is comparing one row against several constants. Fix the fragments before trusting any of it.',
+  );
+  assert.ok(
+    privacy.retention.length >= 15,
+    `privacy.ts publishes only ${privacy.retention.length} retention rows; this test's table was written against fifteen, so it is no longer reading the page it was written for`,
+  );
+  assert.equal(
+    matched.length,
+    pairs.length,
+    'the retention table did not yield one period per row it names',
+  );
+});
+
+
 

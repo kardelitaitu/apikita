@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 185;
+const WEBSITE_TESTS = 186;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -233,6 +233,18 @@ test('no doc still claims a superseded count', () => {
         // endpoint defaulting to 20 renders a short list and a "load more" that never
         // fires, with the suite green.
         'website: **184 tests**', 'passes **184 tests**', '**184 tests**',
+        // Retired when the retention periods the privacy page publishes were pinned. Every
+        // row of `website/src/lib/privacy.ts`'s `retention` array states a period, and eight
+        // of those periods are numbers that also exist elsewhere as the thing that actually
+        // expires the data - a `pub const` in the sweep, or a config TTL. The Rust constants
+        // were pinned by db.rs's own tests and the page's strings were pinned by
+        // privacy.test.ts as NON-EMPTY, and nothing read both. Raising `usage_events` to 180
+        // days would have kept every existing test green while the page still told a
+        // customer 90. Its first run settled a unit question too: the page says "24 months"
+        // for `usage_daily` where the Rust says 730 days, and the constant's own doc records
+        // 730 as 24 months at a 365-day year - so the guard converts months by 365/12, not by
+        // 30, or it would have reported a disagreement the code had deliberately avoided.
+        'website: **185 tests**', 'passes **185 tests**', '**185 tests**',
       ],
     },
   ];
