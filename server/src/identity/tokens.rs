@@ -64,18 +64,23 @@ impl Purpose {
     }
 }
 
-/// A freshly minted token: the value that goes in the link, and the row's id.
+/// A freshly minted token: the value that goes in the link.
 ///
 /// The raw value is returned ONCE, here, and never stored — the table holds only
 /// its hash. A caller that loses this value cannot recover it; it re-issues.
+///
+/// **It carries nothing else, and that is a correction.** It used to also return the
+/// row's `token_id` and its `expires_at`, and neither was ever read: the id's doc said
+/// it existed "for a log line that can name the row without naming the secret", but no
+/// such log line was written anywhere in the crate, and the expiry was already the
+/// caller's own argument for the TTL. Both values are still computed here — the id is
+/// bound into the INSERT and the expiry into both the INSERT and the DELETE that
+/// replaces a predecessor — they are simply not published. A field that is returned
+/// but unread is a second definition of a fact, free to drift from the one in use.
 #[derive(Debug)]
 pub struct IssuedToken {
     /// The token as it should appear in the emailed URL. Never logged.
     pub raw: String,
-    /// The `identity_tokens.id`, for a log line that can name the row without
-    /// naming the secret.
-    pub token_id: Uuid,
-    pub expires_at: DateTime<Utc>,
 }
 
 /// The fields a redemption needs from the token's row.
@@ -143,11 +148,7 @@ pub async fn issue(
 
     tx.commit().await?;
 
-    Ok(IssuedToken {
-        raw,
-        token_id,
-        expires_at,
-    })
+    Ok(IssuedToken { raw })
 }
 
 /// Redeem a token, exactly once.
@@ -232,6 +233,77 @@ mod tests {
 
     fn hour() -> Duration {
         Duration::hours(1)
+    }
+
+    /// THE ISSUED TOKEN IS THE RAW VALUE AND NOTHING ELSE.
+    ///
+    /// This pins a SHAPE, and the shape is a correction rather than a preference.
+    /// `IssuedToken` used to also return `token_id` and `expires_at`. Neither was ever
+    /// read: the id's own doc said it existed "for a log line that can name the row
+    /// without naming the secret", and no such log line was written anywhere in the
+    /// crate. A field returned but unread is a second definition of a fact, free to
+    /// drift from the one in use - and it is invisible, because the struct still
+    /// compiles and every test still passes.
+    ///
+    /// WHY THIS IS A TEXT CHECK RATHER THAN A TYPE CHECK. Rust will not tell you that
+    /// a `pub` field is unused: `dead_code` cannot fire on a field that is reachable
+    /// from outside the crate, which every `pub` field is. The compiler is silent, so
+    /// the rule has to be written down somewhere. Here it is.
+    ///
+    /// Declared here rather than in `config.rs`'s field-inventory guard because this is
+    /// not a config field and that guard's inventory is built by serialising the loaded
+    /// config. The mechanism that generalises - "search the corpus for a dot-prefixed
+    /// access" - is the same one, and `source_reads_field` records why it errs toward
+    /// reporting a field as unwired.
+    #[test]
+    fn the_issued_token_publishes_the_raw_value_and_nothing_else() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/identity/tokens.rs"),
+        )
+        .expect("tokens.rs is readable");
+
+        // The struct's own declaration, up to its closing brace.
+        let start = source
+            .find("pub struct IssuedToken {")
+            .expect("IssuedToken is declared in this file");
+        let body = &source[start..];
+        let end = body.find('}').expect("the struct has a closing brace");
+        let declaration = &body[..end];
+
+        // Field lines only: a `pub` declaration that is not the `pub struct` header
+        // itself. The header is skipped by name rather than by position, so moving the
+        // attribute above the struct cannot silently change what is counted.
+        let fields: Vec<&str> = declaration
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub ") && !line.starts_with("pub struct"))
+            .map(|line| line.trim_start_matches("pub ").trim_end_matches(','))
+            .collect();
+
+        assert_eq!(
+            fields,
+            vec!["raw: String"],
+            "IssuedToken gained a field: {fields:?}. It is the value that goes in the \
+             emailed link and nothing else - the row's id and its expiry are computed in \
+             `issue` and bound into the INSERT, which is where they belong, and the \
+             expiry is already the caller's own TTL argument. If a caller genuinely needs \
+             one of them back, return it deliberately and delete this test rather than \
+             letting it fail quietly."
+        );
+
+        // And the construction must set exactly that one field, so a field added here
+        // without being declared above cannot slip through.
+        let construction = source
+            .find("Ok(IssuedToken {")
+            .expect("issue returns an IssuedToken");
+        let tail = &source[construction..];
+        let close = tail.find('}').expect("the constructor call closes");
+        assert_eq!(
+            tail[..close].matches(':').count(),
+            0,
+            "the IssuedToken constructor sets a named field, but the struct declares only \
+             `raw`; construct it as `IssuedToken {{ raw }}`"
+        );
     }
 
     /// The round trip, with the negative control that makes it mean something: a

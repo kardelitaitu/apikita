@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 193;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 622;
+const SERVER_TESTS = 623;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -281,6 +281,22 @@ test('no doc still claims a superseded count', () => {
         // meant rewriting it to pin the presence and the four caveats the ToS section now
         // states rather than deleting it.
         '621 tests', '621 passed', '621 / 0 / 0',
+        // Retired with the sign-in body guard, which is also where three payload fields
+        // nothing read were removed, and the sharpest lesson of the three is in how the
+        // guard was FIRST written. It failed on two assertions and both were the test's
+        // fault, not the code's: the route slice ran to END OF FILE on the reasoning that
+        // "the assertions are about what does NOT appear, so a wider window can only make
+        // them stronger" - which is backwards. It swept in the `#[cfg(test)]` module,
+        // whose ledger-drift helper legitimately selects `w.balance_idr`, and reported
+        // the route for reading a column only a test reads; and the spec assertion
+        // matched a `\n` regex against a file stored with CRLF, so it never matched and
+        // blamed a spec that already said the right thing. A wider window is not a
+        // stronger claim, it is a wider one. The third wrong trial was the mutation
+        // rather than the test: it prepended the regression to the handler's DECLARATION,
+        // which the slice begins at, so the injected code landed outside the region under
+        // test and survived - and a surviving mutant is evidence about the check only
+        // after the mutation has been shown to be a real regression.
+        '622 tests', '622 passed', '622 / 0 / 0',
       ],
     },
     {

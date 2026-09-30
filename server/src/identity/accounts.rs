@@ -87,11 +87,13 @@ pub enum GoogleSignIn {
     Existing(Uuid),
     /// The address matched a VERIFIED password identity, which was adopted. This is
     /// the legitimate "I signed up with a password, now I am using Google" path.
-    Linked {
-        account_id: Uuid,
-        /// The password identity that was adopted, for the audit line.
-        identity_id: Uuid,
-    },
+    ///
+    /// **It carries only the account.** It used to also carry `identity_id` — "the
+    /// password identity that was adopted, for the audit line" — and there was no audit
+    /// line: the only production match binds it with `..` and logs nothing. The
+    /// COLLISION case below is the one that logs, which is right, because an adoption
+    /// is the ordinary path and a collision is the defended one.
+    Linked { account_id: Uuid },
     /// The address matched a password identity that was NOT verified (or not
     /// verified before this Google identity was created). R1/R3 say do not adopt
     /// it; a fresh account was created instead.
@@ -204,7 +206,6 @@ pub async fn resolve_google_sign_in(
 
                 GoogleSignIn::Linked {
                     account_id: candidate_account,
-                    identity_id,
                 }
             } else {
                 // R1: the colliding row exists but proves nothing about this
@@ -696,15 +697,24 @@ mod tests {
                 .expect("resolve");
 
         match outcome {
-            GoogleSignIn::Linked {
-                account_id,
-                identity_id,
-            } => {
+            GoogleSignIn::Linked { account_id } => {
                 assert_eq!(
                     account_id, account,
                     "the sign-in must land in the same account"
                 );
-                assert_eq!(identity_id, identity);
+                // The adopted identity is no longer returned on this variant, because
+                // nothing read it. Its presence is asserted where it matters instead:
+                // `identity` is still the password identity the account can use, and
+                // the assertions below in this module drive that path.
+                assert_eq!(
+                    password_identity(&db.pool, "person@example.com")
+                        .await
+                        .expect("lookup")
+                        .map(|i| i.identity_id),
+                    Some(identity),
+                    "the password identity the Google sign-in adopted must still be the \
+                     account's password identity"
+                );
             }
             other => panic!("expected Linked, got {other:?}"),
         }

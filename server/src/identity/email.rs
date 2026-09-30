@@ -22,9 +22,11 @@
 //! where mail is not yet wired — and it must not be a startup failure, because a
 //! service that refuses to boot without a mail relay cannot be run by a
 //! contributor who only wants to test the proxy. It is also not a silent one:
-//! [`EmailSender::is_configured`] exists so the caller can decide what to say, and
-//! [`EmailError::NotConfigured`] is returned rather than an `Ok(())` that would
-//! report mail as sent when nothing was dialled.
+//! [`EmailError::NotConfigured`] is returned by [`EmailSender::send`] rather than an
+//! `Ok(())` that would report mail as sent when nothing was dialled, so the caller
+//! learns the state from the operation it was already attempting. (An
+//! `EmailSender::is_configured` accessor used to be named here as the way a caller
+//! could ask first; nothing ever asked, and it is now `#[cfg(test)]`.)
 //!
 //! ## Why a signup survives a mail failure
 //!
@@ -152,7 +154,6 @@ pub struct EmailSender {
     from: Mailbox,
     /// `Reply-To`, when the config names one.
     reply_to: Option<Mailbox>,
-    timeout: Duration,
 }
 
 impl EmailSender {
@@ -202,7 +203,6 @@ impl EmailSender {
                             .expect("a literal RFC 5322 address parses"),
                     ),
                     reply_to: None,
-                    timeout: timeout_of(config),
                 };
             }
         };
@@ -265,7 +265,6 @@ impl EmailSender {
                             transport: None,
                             from,
                             reply_to,
-                            timeout: timeout_of(config),
                         };
                     }
                 }
@@ -287,24 +286,39 @@ impl EmailSender {
             transport,
             from,
             reply_to,
-            timeout: timeout_of(config),
         }
     }
 
     /// Whether a relay was configured AND could be built.
     ///
-    /// Exposed so a health report or a startup line can say "mail is off" without
-    /// attempting a send. Never used to decide whether a handler should say
-    /// something different to the customer — see the module docs on why the reply
-    /// is neutral either way.
+    /// **`#[cfg(test)]`, and that is a correction rather than a tidy-up.** It was a
+    /// `pub` accessor with a doc promising it existed "so a health report or a startup
+    /// line can say 'mail is off' without attempting a send" — and no health report and
+    /// no startup line ever asked. Its only callers were four assertions in this file's
+    /// own tests. The same doc said it must never decide what a handler tells a
+    /// customer, which is right, and left it with no production caller at all.
+    ///
+    /// It is also a SECOND way to ask a question `send` already answers: `send` returns
+    /// `EmailError::NotConfigured` when there is no transport (`email.rs:332`), from the
+    /// one place that has to know, and that path is asserted directly. Two ways to ask
+    /// one question can disagree.
+    ///
+    /// `#[cfg(test)]` follows `parsed_from` below, which is the same situation and was
+    /// gated for the same reason: nothing in production needs to read back what it just
+    /// configured.
+    #[cfg(test)]
     pub fn is_configured(&self) -> bool {
         self.transport.is_some()
     }
 
-    /// The transport timeout, for a caller that wants to size a budget around it.
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
+    // A `pub fn timeout(&self) -> Duration` accessor used to sit here. It was DELETED
+    // rather than gated: it had no caller anywhere, not even a test, while its doc
+    // promised one "that wants to size a budget around it". Removing it then exposed
+    // that the `timeout` FIELD it read was itself dead — the value is applied to the
+    // transport builder when the sender is built (`.timeout(Some(timeout_of(config)))`),
+    // so the field was a second copy of a value already handed over. The timeout is
+    // still enforced; only the read-back copy is gone. `timeout_of` and its
+    // `MIN_TIMEOUT_SECONDS` floor keep their own test.
 
     /// The parsed From mailbox, so a test can assert the display name reached the
     /// header without building a transport or a message.
