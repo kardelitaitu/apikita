@@ -99,7 +99,7 @@ suppliers is what makes the cost basis durable and the moat real.
 ## Status
 
 **Built locally; nothing deployed.** The server and website exist and pass their
-suites (server: **609 tests** — website: **189 tests**), but no environment is live
+suites (server: **622 tests** — website: **189 tests**), but no environment is live
 and no customer has been served. The operational gates in
 [`docs/launch-checklist.md`](docs/launch-checklist.md) — Gate 0 (legal) first —
 must clear before taking money.

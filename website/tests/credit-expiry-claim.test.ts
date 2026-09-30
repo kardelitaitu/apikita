@@ -131,35 +131,109 @@ function stripComments(source: string): string {
   return out;
 }
 
-test('credit expiry is still unimplemented, so the pages must not say it works', () => {
-  // --- 1. The absence is real. -------------------------------------------------
+test('credit expiry is implemented, and the pages state a window the code honours', () => {
+  // THIS TEST USED TO PIN AN ABSENCE. It asserted that no expiry mechanism existed
+  // anywhere in server/src, and it carried its own exit instructions: "a
+  // credit-expiry mechanism now exists in server/src, so the pages may be telling
+  // the truth and this file is out of date. Verify it, update the three documents,
+  // and delete this test." That is what happened - the mechanism was built - so the
+  // claim is inverted here rather than removed. Deleting it outright would leave the
+  // three documents free to say anything about expiry again, which is the failure
+  // the original test existed to prevent; keeping it as an absence check would fail
+  // on the code that was written to satisfy it.
+  //
+  // What it pins now is the part that can rot in either direction: the mechanism is
+  // still there, and the documents describe what it actually does rather than a
+  // tidier version of it.
   const wallets = tableDefinition('wallets');
   assert.ok(
     wallets.length > 0,
     'the `wallets` table definition was not found, so this guard is checking nothing about the schema',
   );
+
+  // The absence that is STILL true, and is the reason the reasoning in
+  // docs/decisions.md:69 holds: a wallet holds one un-aged balance. Expiry is
+  // recorded per deposit on `topups`, never split on the wallet itself. If this ever
+  // gains an expiry column, the model has changed and the documents must be re-read.
   assert.ok(
     !/expires_at|expiry|expires_on/i.test(wallets),
-    'wallets now HAS an expiry column, so credit expiry may be implemented - and this file is a claim that it is not. Verify the feature, update docs/decisions.md:77, docs/terms-of-service.md:122 and docs/launch-checklist.md:357, and delete this test.',
+    'wallets now HAS an expiry column. Expiry is supposed to be recorded per deposit on `topups` (topups.credit_expires_at), leaving one un-aged balance on the wallet - that is what makes docs/decisions.md:69 correct. A per-wallet expiry is a different model and the retirement logic in server/src/db.rs would have to be re-read against it.',
   );
-
-  const rust = rustFiles(join(REPO, 'server', 'src'))
-    .map((f) => readFileSync(f, 'utf8'))
-    .join('\n');
-  assert.ok(rust.length > 1000, 'server/src was not read, so this guard is vacuous');
-  assert.ok(
-    !/credit[_ ]?expir|expire[d]?[_ ]credit|aged[_ ]credit|CREDIT_EXPIRY/i.test(rust),
-    'a credit-expiry mechanism now exists in server/src, so the pages may be telling the truth and this file is out of date. Verify it, update the three documents, and delete this test.',
-  );
-
-  // Vacuity guard: the SCHEMA property that makes the feature impossible, not merely
-  // absent. docs/decisions.md:69 rests on this exact fact.
   assert.ok(
     /balance_idr/.test(wallets) && !/credited_at|deposit_date/i.test(wallets),
     'wallets no longer holds a single un-aged balance, so the reasoning in docs/decisions.md:69 ("expired and live credit are not distinguishable today") no longer applies and must be revisited',
   );
 
+  // --- 1. The mechanism is really there, in the shape the docs describe. --------
+  const rust = rustFiles(join(REPO, 'server', 'src'))
+    .map((f) => readFileSync(f, 'utf8'))
+    .join('\n');
+  assert.ok(rust.length > 1000, 'server/src was not read, so this guard is vacuous');
+
+  // The stamp and the retirement are two separate steps and both have to exist; a
+  // page claiming a window is only true if something writes the instant AND
+  // something acts on it. Checked by name rather than by behaviour, because the
+  // behaviour is covered by the crate's own tests - what this file can catch is
+  // the feature being deleted while the prose stays.
+  assert.ok(
+    /fn credit_expiry_instant/.test(rust),
+    'there is no longer a function that computes an expiry instant from a settlement date, so nothing stamps a deposit with a window and the pages that state one are unbacked again',
+  );
+  assert.ok(
+    /fn expire_credit\b/.test(rust),
+    'there is no longer an `expire_credit` sweep, so nothing acts on an aged deposit: the window would be computed and never applied, which is the same false promise in a new shape',
+  );
+
+  // The instant is stamped on the SETTLEMENT statement, not in a second write. The
+  // documented reason (docs/decisions.md:77) is that a crash between two writes
+  // would leave a deposit dated and unexpirable - assert the shape, since that is
+  // the claim.
+  //
+  // PARSED, not substring-matched, and the first version of this check is why. It
+  // looked for `settled_at = ?, credit_expires_at = ?` and survived a mutation that
+  // appended `/*x*/` between them - the substring was still there while the claim
+  // was not. What has to hold is that ONE `UPDATE topups SET ...` assigns both, with
+  // the settlement's own columns in the settlement's own statement.
+  const settlings = rust.match(/UPDATE topups SET [^"]*?settled_at[^"]*?"/gs) ?? [];
+  assert.ok(
+    settlings.length > 0,
+    'no `UPDATE topups SET ... settled_at ...` statement was found, so the check below is looking for a shape that is not there',
+  );
+  assert.ok(
+    settlings.some((s) => {
+      const assigned = (s.match(/\b([a-z_]+)\s*=\s*\?/g) ?? []).map((a) => a.split('=')[0].trim());
+      return assigned.includes('settled_at') && assigned.includes('credit_expires_at');
+    }),
+    'the settlement no longer assigns `settled_at` and `credit_expires_at` in ONE statement. They are documented as stamped together so a crash cannot make a deposit\'s date and its expiry disagree - splitting them into two writes reintroduces exactly that window.',
+  );
+
+  // A second sweep must not debit twice. `expire_credit` is not idempotent by
+  // nature, so the guard is a column rather than a re-check.
+  //
+  // The check names the STATEMENT, not the phrase, and a mutation is why. Looking
+  // for `credit_retired_at IS NULL` anywhere in the crate survived removing the
+  // guard from the MARK statement, because the sweep's candidate SELECT happens to
+  // contain the same predicate for a different reason (it is selecting rows not yet
+  // retired). One predicate, two jobs; a check that cannot tell them apart is
+  // checking the vocabulary.
+  const marks = rust.match(/UPDATE topups SET credit_retired_at[^"]*"/g) ?? [];
+  assert.ok(
+    marks.length > 0,
+    'no `UPDATE topups SET credit_retired_at ...` statement was found, so the check below is looking for a statement that is not there',
+  );
+  assert.ok(
+    marks.every((m) => /credit_retired_at IS NULL/.test(m)),
+    'the mark that retires a deposit is no longer guarded on `credit_retired_at IS NULL`. That guard is what makes a second sweep a no-op; without it, running the sweep twice appends two negative ledger rows for one deposit and destroys the balance while looking like a tidy-up. Note the sweep SELECT also tests that predicate - it is selecting unrestired rows - which is why this check reads the UPDATE and not the file.',
+  );
+
+  assert.ok(
+    rust.includes("expiry:"),
+    'the expiry ledger `ref` prefix is gone. The ledger reason is a frozen CHECK and is reused as `usage`, so the `ref` is the only thing distinguishing an expiry row from a spend - without it a customer reading their ledger cannot tell them apart.',
+  );
+
   // --- 2. The pages do not overstate it. ---------------------------------------
+  // These are unchanged and still the point: the pages may state the term, and may
+  // not describe it as more than it is.
   const pages = ['pages/dashboard/wallet.astro', 'pages/index.astro'];
   const overstated = [
     'expiry is applied',
@@ -178,7 +252,7 @@ test('credit expiry is still unimplemented, so the pages must not say it works',
     for (const phrase of overstated) {
       assert.ok(
         !text.toLowerCase().includes(phrase),
-        `${page} says "${phrase}", which claims the expiry is ENFORCED. Nothing implements it, and the schema cannot distinguish expired credit from live credit - see docs/decisions.md:69. A page may state the term; it may not describe it as working.`,
+        `${page} says "${phrase}". Expiry runs as a periodic sweep from the \`usage-purge\` binary, NOT at the point of use: a deposit that aged out after the last run is still spendable until the next one. A page may state the term and the window; it may not describe the sweep as instantaneous.`,
       );
     }
   }
@@ -187,18 +261,43 @@ test('credit expiry is still unimplemented, so the pages must not say it works',
     `only ${pagesMentioningExpiry} of the two pages still mention expiry; the term is deliberately disclosed, so a page silently dropping it is a different - and also unchecked - change`,
   );
 
-  // --- 3. The documents still record the gap. ----------------------------------
-  const recorded = [
-    ['decisions.md', /Not built|not built/],
-    ['terms-of-service.md', /Not implemented|not implemented/],
-    ['launch-checklist.md', /the code is not written/],
-  ] as const;
+  // --- 3. The documents describe what the code does. ---------------------------
+  // The three documents used to record the GAP. They now record the MECHANISM, and
+  // the failure mode being guarded is the reverse of the one the old test caught:
+  // a document that says "implemented" while describing a completeness the code
+  // does not have (a spend-time refusal that does not exist, say) is the same
+  // class of defect - a policy sentence the code does not keep.
+  const described: Array<[string, RegExp, string]> = [
+    [
+      'decisions.md',
+      /\*\*Built\*\*/,
+      'docs/decisions.md no longer records credit expiry as built. Either the feature was reverted (in which case the pages promise something the code does not do, which is the defect the original guard existed to catch) or the row was reworded - re-read it either way.',
+    ],
+    [
+      'terms-of-service.md',
+      /expire_credit/,
+      'docs/terms-of-service.md no longer names the sweep that applies the window. The section states a term customers rely on, so it has to describe the mechanism that honours it, not merely assert it.',
+    ],
+  ];
 
-  for (const [doc, pattern] of recorded) {
+  for (const [doc, pattern, message] of described) {
     const text = readFileSync(join(REPO, 'docs', doc), 'utf8');
+    assert.ok(pattern.test(text), message);
+  }
+
+  // The three things the ToS section says it does NOT claim, still said. Each is a
+  // real characteristic of the implementation and the reason a reader can trust the
+  // rest of the section; losing one would leave the paragraph reading as an
+  // unqualified promise.
+  const tos = readFileSync(join(REPO, 'docs', 'terms-of-service.md'), 'utf8');
+  for (const [what, pattern] of [
+    ['that nothing refuses a spend between sweeps', /Nothing refuses a spend against aged credit between sweeps/i],
+    ['that no notification is sent before expiry', /No notification is sent before credit expires/i],
+    ['that expired credit is not refunded', /Expired credit is not refunded/i],
+  ] as const) {
     assert.ok(
-      pattern.test(text),
-      `docs/${doc} no longer records that credit expiry is unimplemented. The code still does not implement it, so removing the warning is the silent version of the same false promise - see docs/decisions.md:77, which flags it precisely because "a policy the code does not keep is worse than no policy".`,
+      pattern.test(tos),
+      `docs/terms-of-service.md no longer records ${what}. That omission is the shape this whole file was written against: a terms section that reads as a clean promise while the caveat that makes it true has been edited away.`,
     );
   }
 });

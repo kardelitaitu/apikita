@@ -119,12 +119,26 @@ credit, which is not what was decided.
 > period but the interaction with the non-refundable clause is **not settled**. This
 > remains part of the Gate 0 legal review.
 
-**⚠️ Not implemented.** Nothing in the system currently expires credit. There is no
-`expires_at` on `wallets`, no sweep job, and no code that would refuse a spend
-against aged credit. **This section is a promise the system does not yet keep**, and
-per the warning at the end of this document a policy claiming something the code does
-not do is worse than no policy. Implementing it — schema, sweep job, and the
-disclosure on the top-up screen — is a build task, not a decision.
+**Implemented.** The system expires credit, per deposit, as of
+`topups.credit_expires_at`, which is stamped at settlement *in the same statement*
+that records the settlement — so a deposit's date and its expiry instant cannot be
+made to disagree by a crash. `db::expire_credit` retires each aged deposit (oldest
+first, capped by that deposit's own amount and by what the wallet holds) as a negative
+`usage`-reasoned ledger row plus a wallet decrement in a single transaction;
+`credit_retired_at` makes a second run a no-op rather than a second debit. It runs
+from the `usage-purge` binary. `credit_expiry_months = 0` disables the window and
+writes NULL, which the sweep reads as "nothing to retire" rather than as long overdue.
+
+Three things this section does **not** claim:
+
+- **Nothing refuses a spend against aged credit between sweeps.** Expiry is applied by
+  a periodic sweep (`usage-purge`), not at the point of use: a deposit that aged out
+  after the last run is still spendable until the next one. The window is honoured
+  to within the sweep's cadence, not to the instant.
+- **No notification is sent before credit expires.** The sweep retires it silently.
+  That is the part a customer is most likely to experience as a surprise.
+- **Expired credit is not refunded.** Which is what the open legal risk above is
+  about — implementing the mechanism does not resolve it.
 
 ## 4. Acceptable use
 

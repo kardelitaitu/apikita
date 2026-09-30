@@ -39,7 +39,7 @@
 -- launch Gate 2. An expiry therefore CANNOT be a flag, a side table, or a
 -- wallet-only decrement: it must be a negative `ledger` row written in the same
 -- transaction as the wallet decrement, exactly as `try_debit` does
--- (`server/src/db.rs:1263`). See `server/src/db.rs` `expire_credit_transaction`
+-- (`server/src/db.rs:1293`). See `server/src/db.rs` `expire_credit`
 -- for the writer.
 --
 -- `ledger.reason` is reused, not extended. The CHECK is frozen at
@@ -56,7 +56,23 @@
 -- Calendar arithmetic, not an interval: a deposit on 2026-03-15 expires on
 -- 2028-03-15. Written by `credit_topup_transaction` at the same instant it sets
 -- `settled_at`, so the two can never describe different events.
-ALTER TABLE topups ADD COLUMN credit_expires_at TEXT;
+--
+-- The GLOB CHECK is not decoration and it is why this column is not merely
+-- `TEXT`: every other timestamp in this schema carries one, and
+-- `tools/sqlite-probes/validate-migration-schema.py` asserts it by name suffix
+-- (`all 39 date/time columns have a GLOB CHECK`). A nullable timestamp is
+-- guarded as `IS NULL OR ... GLOB ...`, the same shape `reviews.withdrawn_at`
+-- uses (`server/migrations/20260925000000_initial_schema.sql:237-238`).
+-- Without it this column would be the one date in the schema that accepts any
+-- string, and the sweep's comparison would silently be a string comparison
+-- that happens to work for the format it is handed.
+--
+-- SQLite accepts a column-level CHECK on ADD COLUMN (verified before writing
+-- this, because the alternative is a migration that fails at run time): a
+-- table-level constraint cannot be added this way, a column-level one can.
+ALTER TABLE topups ADD COLUMN credit_expires_at TEXT
+    CHECK (credit_expires_at IS NULL
+           OR credit_expires_at GLOB '????-??-??T??:??:??*+00:00');
 
 -- The sweep and the spend-time refusal both ask "which settlements have aged
 -- out", and both ask it per account. Partial, because the NULL rows are the
@@ -79,7 +95,13 @@ CREATE INDEX topups_credit_expires_idx
 -- ON DELETE CASCADE, matching `review_history`: this table is a record of what
 -- the ledger already says, not money. The ledger row is the authority and is
 -- never deleted.
-ALTER TABLE topups ADD COLUMN credit_retired_at TEXT;
+--
+-- Guarded the same way and for the same reason as `credit_expires_at` above:
+-- `retired_at` matches the probe's `_at` suffix, so a bare `TEXT` here would be
+-- a date column with no format CHECK.
+ALTER TABLE topups ADD COLUMN credit_retired_at TEXT
+    CHECK (credit_retired_at IS NULL
+           OR credit_retired_at GLOB '????-??-??T??:??:??*+00:00');
 
 -- One retirement per deposit, enforced by the database rather than by a check
 -- in Rust that a second code path could forget to make.

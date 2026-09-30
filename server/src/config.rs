@@ -71,9 +71,9 @@ pub struct WalletConfig {
     /// deposit's own settlement date.
     ///
     /// Read by `db::credit_topup_transaction`, which stamps the resulting
-    /// `topups.credit_expires_at`, and by `db::expire_credit_transaction`, which
-    /// retires a deposit once the instant passes. Both read it from this one
-    /// field, so the stamp and the sweep cannot be stated over different windows.
+    /// `topups.credit_expires_at`, and by `db::expire_credit`, which retires a
+    /// deposit once the instant passes. Both read it from this one field, so the
+    /// stamp and the sweep cannot be stated over different windows.
     ///
     /// PER DEPOSIT, not per account and not from last activity. The distinction
     /// is the whole policy (`docs/decisions.md:76`): crediting time back on every

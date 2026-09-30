@@ -435,14 +435,45 @@ pub async fn mark_verified(
 /// Vector 4: a reset may land on a Google-only account, in which case there is no
 /// password identity to update and one must be created with the address as its
 /// subject. Returns the account so the caller can do that.
+///
+/// ## One address, TWO accounts — and why an ORDER BY is not optional here
+///
+/// `identities_provider_email_uniq` is `UNIQUE (provider, email)`, NOT
+/// `UNIQUE (email)`. That shape is deliberate (see the module docs and R1): an
+/// UNVERIFIED password identity and a Google identity are allowed to coexist on one
+/// address, because a Google sign-in over an unverified colliding row creates a
+/// SECOND account rather than adopting the attacker's. So "one address resolves to
+/// two accounts" is a state this system is DESIGNED to reach, not a corruption.
+///
+/// This function used to be `SELECT account_id ... WHERE email = ? LIMIT 1` with no
+/// ordering, which answers that state with whichever row SQLite happens to visit
+/// first — rowid order, not a decision. Two things went wrong, and neither was
+/// visible in a test, because every test had one identity on the address:
+///
+///   * `request_password_reset` mails the reset link to one arbitrary account of the
+///     two, and spends the per-account rate-limit budget on that one, so the other
+///     account's cap is never drawn down.
+///   * `signup` treats "found" as "this address is already registered", so the
+///     address became unregisterable even when the account holding it is a
+///     Google-only one the password user cannot sign in to.
+///
+/// The ordering below makes the answer a rule rather than a scan artifact: a
+/// GOOGLE identity wins, because a Google identity is always verified
+/// (`CHECK (provider <> 'google' OR email_verified = 1)`) while the password row that
+/// collides with it proves nothing about the caller — it is the row an attacker can
+/// create for any address they like without ever proving it. When both are Google,
+/// or both password, the oldest row wins so the answer cannot change under a
+/// re-scan, an `UPDATE` that moves a row, or a `VACUUM`.
 pub async fn account_for_email(pool: &SqlitePool, email: &str) -> Result<Option<Uuid>, AppError> {
     let normalized = normalize_email(email);
 
-    let found: Option<String> =
-        sqlx::query_scalar("SELECT account_id FROM identities WHERE email = ? LIMIT 1")
-            .bind(&normalized)
-            .fetch_optional(pool)
-            .await?;
+    let found: Option<String> = sqlx::query_scalar(
+        "SELECT account_id FROM identities WHERE email = ? \
+         ORDER BY (provider = 'google') DESC, created_at ASC, id ASC LIMIT 1",
+    )
+    .bind(&normalized)
+    .fetch_optional(pool)
+    .await?;
 
     match found {
         None => Ok(None),
@@ -817,8 +848,6 @@ mod tests {
         );
     }
 
-    /// Vector 4: a reset may land on a Google-only account, so the account has to
-    /// be findable by address alone.
     #[tokio::test]
     async fn an_account_is_findable_by_address_for_a_google_only_signup() {
         let db = TestDb::new().await;
@@ -849,6 +878,84 @@ mod tests {
             None,
             "and an unknown address finds nothing"
         );
+    }
+
+    /// One address on TWO accounts is a state this schema is DESIGNED to allow
+    /// (`UNIQUE (provider, email)`, not `UNIQUE (email)`), and the lookup must answer
+    /// it by a RULE rather than by whichever row SQLite scans first.
+    ///
+    /// The defect this pins: `account_for_email` was `... WHERE email = ? LIMIT 1`
+    /// with no ORDER BY, so the answer depended on rowid order - which changed with
+    /// insertion order, and could change again under a VACUUM. Both callers act on
+    /// the answer: password-reset mails a link to one of the two accounts and bills
+    /// the rate limit to it, and signup reads "found" as "already registered".
+    ///
+    /// WHY NO EXISTING TEST COULD SEE IT: every test in this file seeded ONE identity
+    /// on the address, and the fixture that built the collision case built it through
+    /// `resolve_google_sign_in`, which reads the same address back. A fixture that
+    /// supplies one row cannot observe a defect about which of two rows is chosen.
+    ///
+    /// A GOOGLE identity must win, because it is always verified while the colliding
+    /// password row proves nothing about the caller - it is the row anybody can
+    /// create for any address without ever proving it (R1). The test asserts the
+    /// answer both ways round, because the pre-fix code returned the FIRST-INSERTED
+    /// row: seeding the password row first is what made the wrong answer look right.
+    #[tokio::test]
+    async fn an_address_on_two_accounts_resolves_to_the_verified_identity() {
+        let db = TestDb::new().await;
+        let now = Utc::now();
+        let email = "both-providers@example.com";
+
+        // Seed the PASSWORD row first, so a scan-order answer would pick it.
+        let password_account = crate::test_support::account(&db.pool).await;
+        upsert_password_identity(
+            &db.pool,
+            password_account,
+            email,
+            "$argon2id$colliding",
+            false,
+            now,
+        )
+        .await
+        .expect("password identity");
+
+        // An UNVERIFIED colliding row: Google creates a SECOND account (R1) rather
+        // than adopting, so this really does leave two accounts on one address.
+        let google_account = match resolve_google_sign_in(&db.pool, "collide-sub", email, now)
+            .await
+            .expect("google")
+        {
+            GoogleSignIn::CollisionCreated { account_id, .. } => account_id,
+            other => panic!("expected CollisionCreated, got {other:?}"),
+        };
+        assert_ne!(
+            google_account, password_account,
+            "the collision must produce a second account, or this test is not seeding the state"
+        );
+
+        // The rows really do share the address: this is the state, not a mock.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identities WHERE email = ?")
+            .bind(email)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 2, "two identities on one address is the premise");
+
+        assert_eq!(
+            account_for_email(&db.pool, email).await.expect("lookup"),
+            Some(google_account),
+            "the GOOGLE identity must win: it is verified by CHECK constraint, while \
+             the colliding password row proves nothing about whoever is asking"
+        );
+
+        // And it must be the same answer when asked again, rather than a scan artifact.
+        for _ in 0..3 {
+            assert_eq!(
+                account_for_email(&db.pool, email).await.expect("lookup"),
+                Some(google_account),
+                "the answer must not wobble between calls"
+            );
+        }
     }
 
     /// The password identity's subject is the address, so the UNIQUE constraint on

@@ -587,7 +587,16 @@ pub async fn signup(
     // even though the bodies match.
     let hash = identity::password::hash_password(auth.clone(), payload.password.clone()).await?;
 
-    let existing = identity::accounts::account_for_email(&state.pool, &email).await?;
+    // The question is "does this address already have a PASSWORD identity", not
+    // "does any identity exist for it". `account_for_email` answers the broader
+    // question and is the wrong one here: it now prefers the GOOGLE identity (see
+    // its doc), so a Google-only address would read as "already registered" and a
+    // password signup would create nothing - leaving the caller with an address
+    // they cannot register and no account they can sign in to. The unique index is
+    // `UNIQUE (provider, email)`, so creating the password row here is legal and is
+    // the designed outcome: an unverified password identity coexisting with a
+    // Google one on the same address.
+    let existing = identity::accounts::password_identity(&state.pool, &email).await?;
 
     if existing.is_none() {
         let issued =
@@ -3243,6 +3252,95 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("counting the tokens must work")
+    }
+
+    /// A SIGNUP FOR AN ADDRESS THAT A GOOGLE-ONLY ACCOUNT HOLDS STILL CREATES THE
+    /// PASSWORD ACCOUNT.
+    ///
+    /// The caller-visible half of the ordering rule in `account_for_email`. Signup
+    /// reads "an account exists for this address" as "this address is already
+    /// registered" and creates nothing, so when the address is held by a Google-only
+    /// account, a password signup used to leave the person with no account they could
+    /// sign in to and no error to explain it.
+    ///
+    /// This is the R1 state the schema exists to allow: an unverified password
+    /// identity may coexist with a Google identity on one address. The rule that a
+    /// GOOGLE row wins is what makes this endpoint behave, because "the address is
+    /// taken" is then answered by the one identity that is always verified.
+    #[tokio::test]
+    async fn live_signup_over_a_google_only_account_still_creates_a_password_account() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        let now = Utc::now();
+
+        let email = "google-holds-this@example.com";
+
+        // A GOOGLE-ONLY account owns the address: one identity, no password.
+        let google_account = match crate::identity::accounts::resolve_google_sign_in(
+            &pool,
+            "google-holds-this-sub",
+            email,
+            now,
+        )
+        .await
+        .expect("google")
+        {
+            crate::identity::accounts::GoogleSignIn::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let response = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json(email, "a-real-enough-password"),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::ACCEPTED,
+            "signup answers neutrally whatever it did: {}",
+            response.body_text()
+        );
+
+        // The password identity must exist, on an account of its own: the Google
+        // account has no password, so adopting it would hand the caller nothing.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT provider, account_id FROM identities WHERE email = ? ORDER BY provider",
+        )
+        .bind(email)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "a password identity now joins the google one"
+        );
+        let password_row = rows
+            .iter()
+            .find(|(provider, _)| provider == "password")
+            .expect("the password identity must exist, or the signup did nothing");
+        let password_account = Uuid::parse_str(&password_row.1).expect("a uuid");
+
+        assert_ne!(
+            password_account, google_account,
+            "the new password identity belongs to a NEW account; the google account is \
+             not reachable with a password and must not be adopted"
+        );
+
+        // And the account_for_email answer that signup consulted is the GOOGLE one,
+        // which is the rule that made this deterministic.
+        assert_eq!(
+            crate::identity::accounts::account_for_email(&pool, email)
+                .await
+                .expect("lookup"),
+            Some(google_account),
+            "the verified identity is the one the address resolves to"
+        );
     }
 
     /// A FRESH SIGNUP CREATES THE ACCOUNT, AN UNVERIFIED IDENTITY AND A LINK.

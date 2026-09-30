@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 189;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 609;
+const SERVER_TESTS = 622;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -253,6 +253,34 @@ test('no doc still claims a superseded count', () => {
         // citation of a method that does not exist and finding the suite still green; a
         // surviving mutant is evidence about the check before it is evidence about the anchor.
         '608 tests', '608 passed', '608 / 0 / 0',
+        // Retired with credit expiry. Three separate rounds moved this number and only one
+        // of them was the feature: 609 -> 610 was `account_for_email` gaining its ORDER BY
+        // (`identities_provider_email_uniq` is UNIQUE (provider, email), so one address
+        // really can resolve to two accounts, and the pre-fix query answered that state in
+        // rowid order); 610 -> 611 was the SIGNUP GATE, the half the ORDER BY did not fix -
+        // signup read "an account exists" as "already registered", so a Google-only address
+        // became unregisterable for a password user, and the gate had to ask
+        // `password_identity` instead; and the rest was the credit-expiry sweep and its
+        // guards. Two lessons recorded here because they cost real time: the first mutation
+        // of the signup gate did not COMPILE (`password_identity` returns a struct,
+        // `account_for_email` an Option<Uuid>), and a mutation that does not compile is not
+        // evidence; and a parallel-run failure that passes in isolation is about shared
+        // state, not about the test - here the fixture accumulated three deposits through
+        // the one-argument `fund_through_topup`, whose whole job is asserting the balance
+        // equals that single deposit.
+        '609 tests', '609 passed', '609 / 0 / 0',
+        // Retired with the credit-expiry migration's own conformance check. The two new
+        // columns were added as bare `TEXT`, and `tools/sqlite-probes/
+        // validate-migration-schema.py` refused them: every timestamp in the schema carries
+        // a GLOB format CHECK, matched by name suffix, and these were the only two dates
+        // that would have accepted any string. SQLite cannot add a TABLE-level constraint
+        // by ALTER, but it can add a column-level one - verified before writing it, since
+        // the alternative is a migration that fails at run time. 622 was the same commit
+        // that inverted the credit-expiry claim test: it had pinned the ABSENCE of the
+        // mechanism and carried its own exit instructions, so implementing the feature
+        // meant rewriting it to pin the presence and the four caveats the ToS section now
+        // states rather than deleting it.
+        '621 tests', '621 passed', '621 / 0 / 0',
       ],
     },
     {
