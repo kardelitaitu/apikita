@@ -15,6 +15,11 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
     [`docs/plans/sqlite-migration.md`](docs/plans/sqlite-migration.md))
   - [x] Define HTTP API specification ([`docs/server/api-spec.md`](docs/server/api-spec.md))
   - [x] Audit cross-document consistency and patch obsolete PocketBase/Pages references
+        — **re-audited 2026-09-30** after the identity port landed: the register, the
+        runbooks, the website docs and both READMEs now describe the Rust-owned
+        identity system. The phase narratives in
+        [`docs/plans/sqlite-migration.md`](docs/plans/sqlite-migration.md) are kept as a
+        dated log, per that document's own status line.
   - [x] Confirm official Midtrans SHA-512 constant-time signature formula
   - [x] Adopt competitive $M = 1.50$ pricing model (zero fixed server overhead)
 - [x] **Repository & Version Control**
@@ -130,7 +135,12 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [ ] Deploy Astro frontend to **Cloudflare Pages**
   - [ ] Provision a **persistent volume** for the SQLite database file (not a
         database instance — there is none to provision)
-  - [ ] Deploy PocketBase auth instance on Northflank
+  - [x] ~~Deploy PocketBase auth instance on Northflank~~ — **VOID.** There is no
+        PocketBase to deploy: the identity port moved every credential check into the
+        Rust API over the `accounts` + `identities` tables in the same SQLite file
+        ([`docs/architecture/identity.md`](docs/architecture/identity.md)). The item
+        below it — the API container — is the whole deployment, and this entry was the
+        last place the roadmap still [planned a service that does not exist](docs/plans/sqlite-migration.md).
   - [ ] Deploy Rust API container to **Northflank** (0.2 vCPU developer tier)
   - [ ] Configure custom domain and SSL certificates on Cloudflare
 - [ ] **Operational Gating (Gates 0–5 from [`docs/launch-checklist.md`](docs/launch-checklist.md))**
