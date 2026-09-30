@@ -2168,7 +2168,7 @@ mod tests {
             ("testing.md", "describes the test suite; it is not a source of claims ABOUT the suite"),
             ("whitepaper.md", "marketing; nothing operational depends on it"),
             ("wind-down.md", "a plan for a state the service is not in"),
-            ("architecture/identity.md", "how a person becomes an account; it describes the four pre-hijacking defences as PocketBase behaviour, and the Rust port that re-derives them is not written yet, so its claims are about the current provider rather than this crate. When Phase 6 lands the defences move into Rust and this reason stops being true"),
+            ("architecture/identity.md", "how a person becomes an account. It describes mechanisms rather than citing source lines - the four pre-hijacking defences, the writer set for `email_verified`, and the collision index shape - and it names the files and functions that implement each, so a reader can check a claim without a line number to drift. It is excluded for the reason the citation check cannot express: the claims are about a SET of call sites (who may write a column), which no single line citation can carry"),
             ("business/00-overview.md", "the business case, not a contract"),
             ("business/01-market.md", "market analysis; no code claim to check"),
             ("business/02-pricing.md", "unit economics; the money rules themselves are tested in money.rs"),
