@@ -20,7 +20,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Backend | **Rust on Northflank** | I/O-bound proxy; one service does API + proxy |
 | Money store | **SQLite (embedded, WAL)** | Transactions, constraints, the ledger — on the same host as the API, so a ledger write is a local file write rather than a network round trip |
 | SQL driver | **`sqlx` with the `sqlite` feature** | Not `rusqlite`. The port is a 106-site dialect change, not an API rewrite; `sqlx migrate` is already settled below; and the bottleneck is the single writer, not the binding. Reasoning: [`plans/proxy-hot-path-audit.md`](plans/proxy-hot-path-audit.md) §3 |
-| Identity store | **Rust-owned** — the `accounts` + `identities` tables (target) | Auth only — never money. **Status: PocketBase still authenticates at runtime** — the Rust session flow resolves a PocketBase token into a local session and the `identities` table is created but empty. Migration Phase 6 drops `pb_user_id` and retires PocketBase; until it lands the external service *does* remain, so `architecture/identity.md` is the operative description |
+| Identity store | **Rust-owned** — the `accounts` + `identities` tables | Auth only — never money. **Phase 6 LANDED:** this crate verifies every credential — Argon2id password hashes, Google ID tokens, verification and reset tokens — and mints its own sessions. There is no PocketBase service, no `POCKETBASE_URL`, and no `/auth/exchange`; the `identities` table is populated and is the only identity record. The operative description is [`architecture/identity.md`](architecture/identity.md) |
 | Payments | **Midtrans, QRIS only** | Card excluded: a flat fee is ~20% of a small top-up |
 | Relay | **nginx on a VPS, L7** | TLS + filtering; absorbs load before the backend |
 | CDN / edge | **Cloudflare** | Free tier; also where Pages lives |
@@ -35,7 +35,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Second relay | **No** | The backend is already the fallback; a second relay is cost without benefit |
 | Session storage | **Server-side rows in the local SQLite database** | Makes logout revoke immediately |
 | SSE auth | **Session cookie, same-site subdomain** | A token in a query string lands in logs and history |
-| Account key | **`accounts.id` is the only key (target); the PocketBase id column is dropped at Phase 6** | Auth is the component most likely to change, so it must not own the identity. **Status: `accounts.pb_user_id` is still present as `TEXT NOT NULL UNIQUE`** — it links to the live PocketBase user and is dropped only when Phase 6 retires the link |
+| Account key | **`accounts.id` is the only key** | Auth is the component most likely to change, so it must not own the identity. **Phase 6 LANDED:** `accounts.pb_user_id` is GONE — migration `20260930000000_identity_port.sql` dropped it. An account is addressed by its own `id` from the moment it is minted; there is no external id to link through and no column that could disagree with it |
 | Proxy/API split | **One service for now** | They share the database, key lookup, and usage accounting |
 
 ### Money
@@ -95,8 +95,8 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Decision | Value | Rationale |
 | --- | --- | --- |
 | Session lifetime | **30 days absolute, 7 days idle** | Rare re-login; bounded exposure on a stolen token |
-| Password hashing | **Argon2id, owned by the Rust API (target)** | **Status: PocketBase hashes passwords today**; the `identities.password_hash` column is created but empty. Once Phase 6 lands, Rust owns Argon2id outright and nothing else can. Parameters and the rehash-on-login policy become ours to set |
-| Login methods | **Google + email/password, with reset** | Unchanged as a product decision; **today PocketBase implements both**, and once Phase 6 moves identity into Rust the Rust API implements all of it, including the pre-hijacking defences in [`architecture/identity.md`](architecture/identity.md) |
+| Password hashing | **Argon2id, owned by the Rust API** | **Phase 6 LANDED:** Rust owns Argon2id outright — `identity/password.rs` hashes and verifies, and the parameters come from the `[auth]` section rather than from a service's config. Nothing else can hash a password for this crate, which is what makes the rehash-on-login policy ours to set |
+| Login methods | **Google + email/password, with reset** | Unchanged as a product decision, and now implemented entirely by this crate: `/auth/google`, `/auth/signup`, `/auth/login`, the verification and reset routes, and `/auth/password-change`. The pre-hijacking defences are in [`architecture/identity.md`](architecture/identity.md) |
 | Telegram | **A linked surface, not an identity provider** | One wallet, two surfaces |
 | Review writes | **Telegram only** | A second writer makes "who reviewed" ambiguous |
 | Review identity | **Keyed on the account, re-attributed on link** | Otherwise linking creates a second review slot |
@@ -178,24 +178,31 @@ open. Do not re-open a settled decision in a document — change it here instead
 | RPO | **15 minutes** | The ledger is the business |
 | RTO | **4 hours** | Achievable by restoring to a new host |
 
-### Migration in flight — the direction is chosen, and the tree has partly moved
+### Migration landed — the tree matches the register
 
-The entries this changes — Money store, SQL driver, Identity store, Account key,
-Money type, Backup tooling, and the Operations additions — are **decided**.
+The entries this changed — Money store, SQL driver, Identity store, Account key,
+Money type, Backup tooling, and the Operations additions — are **decided AND shipped**.
 
-As of Phases 0–5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
+As of Phase 6 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
 
 - **`server/` no longer builds against Postgres.** The dependency, the config, the
   compose file, the schema, the migration binary and every SQL statement in `src/`
   are SQLite. `cargo check --all-targets` is clean.
-- **`server/` still calls PocketBase** for `auth-refresh`, and `accounts.pb_user_id`
-  is still present and `NOT NULL`. Identity is Phase 6, and the column survives
-  deliberately: `auth.rs` creates accounts through it, so dropping it earlier would
-  break login while claiming the intermediate phases shipped intact.
+- **`server/` no longer calls any identity service, and the column that linked to one
+  is gone.** `accounts.pb_user_id` was dropped by migration
+  `20260930000000_identity_port.sql`, and the PocketBase HTTP client was deleted from
+  the crate — the breaking change is `19e04a3 refactor(auth)!: delete the PocketBase
+  client path`. Identity is verified here: Argon2id in `identity/password.rs`, Google
+  ID tokens in `identity/google.rs`, and sessions minted by `routes/auth.rs`. Phase 6
+  is why the earlier version of this entry said the column "survives deliberately";
+  that reason expired with the phase, and a register that kept it would be describing
+  a login path that no longer exists.
 - **The test suite runs, and it runs by default.** Phase 5 gave every database test
   its own migrated SQLite file in a temp directory, so no test needs
-  `DATABASE_URL` and not one `#[ignore]` remains: measured
-  **134 passed / 0 failed / 0 ignored**. The money tests — including the real
+  `DATABASE_URL` and not one `#[ignore]` remains. It measured **134 passed / 0 failed /
+  0 ignored** when Phase 5 landed and **556 / 0 / 0** at Phase 6, after identity moved
+  in and the tests that drove the retired service were deleted with it. The money
+  tests — including the real
   concurrency proof of the overdraw fix,
   `concurrent_requests_cannot_overdraw_a_one_request_balance` — had been
   `#[ignore = "requires live Postgres"]` and were therefore never executed
@@ -232,11 +239,12 @@ As of Phases 0–5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
   session's `expires_at` is seeded `login + absolute_days`; only a value BELOW the
   absolute lifetime (the shipped 7 against 30) changes any outcome.
 
-This marker exists so the register does not lie in either direction. Here,
-**settled means the direction is chosen, not that the tree matches it** — the register
-is read by agents working in parallel with the port, and a value flipped ahead of the
-code is the same failure as a value left behind it. The list above is the current
-boundary between the two.
+This marker exists so the register does not lie in either direction. The list above is
+the boundary, and at Phase 6 the boundary and the tree agree — every "target" in this
+register is now the description of shipped code. The register is read by agents working
+in parallel, and a value flipped ahead of the code is the same failure as a value left
+behind it; the failure mode that remains is a NEW decision made in code and not
+recorded here.
 
 ## Genuinely open
 
