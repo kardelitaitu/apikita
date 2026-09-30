@@ -160,6 +160,25 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
+/// The documents an operator acts on. Every one of them is either run by hand under
+/// time pressure or is the reference an operator reads while doing so, which is what
+/// makes a line citation here expensive rather than untidy: the reader follows it,
+/// lands on the wrong line, and is looking at code that has nothing to do with what
+/// they were told.
+///
+/// THE FOUR RUNBOOKS BELOW WERE MISSING, and that was measured rather than suspected.
+/// Planting `server/src/routes/admin.rs:44` in `wind-down.md` left this file's guard
+/// PASSING, which is the whole failure: the rule was enforced over seventeen documents
+/// and the four most operationally loaded ones were outside it. `wind-down.md` is the
+/// clearest case - it is "the operator procedure for closing the service and paying
+/// balances back", its SQL is meant to be run by hand, and a citation that re-points
+/// after an unrelated edit is worst exactly there.
+///
+/// A doc earns its place here by being ACTED ON, not by being long or by mentioning
+/// code. `testing.md` runs commands but is read while developing rather than while
+/// closing the service, and the business plans are neither. The list is a judgement;
+/// what is checkable is that the judgement is written down where the next person will
+/// find it.
 const OPERATIONAL_DOCS: &[&str] = &[
     "launch-checklist.md",
     "observability.md",
@@ -178,6 +197,12 @@ const OPERATIONAL_DOCS: &[&str] = &[
     "topology.md",
     "server/api-spec.md",
     "website/06-api-keys-and-limits.md",
+    // Runbooks an operator works from, added after a planted citation proved the rule
+    // did not reach them.
+    "wind-down.md",
+    "backup-and-restore.md",
+    "abuse-runbook.md",
+    "architecture/identity.md",
 ];
 
 /// Every line-number citation in the documents above, as `(document, line)`.
