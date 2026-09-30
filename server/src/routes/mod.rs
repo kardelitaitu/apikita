@@ -262,10 +262,9 @@ pub const ROUTES: &str = r#"
 // because the deploy gate parses it, and a leak test forbids ANY digit in an
 // unauthenticated health body. See health::operator_metrics.
 .route("/api/admin/metrics", get(health::operator_metrics));
-.route("/auth/exchange", post(auth::exchange_token));
-// Native identity. These are what the website calls; nothing here needs a
-// PocketBase instance. `/auth/exchange` remains only until the PocketBase
-// client is deleted, and is the last route that does.
+// Auth. These are what the website calls, and none of them needs a PocketBase
+// instance: the identity provider is this crate's own `identity` module, over
+// the `identities` table.
 .route("/auth/signup", post(auth::signup));
 .route("/auth/login", post(auth::login));
 .route("/auth/google", post(auth::google_sign_in));
@@ -318,7 +317,6 @@ pub const ROUTES: &str = r#"
 pub const ROUTE_ARRAY_SHAPE_IS_IMPOSSIBLE: &[&str] = &[
     "/health",
     "/api/admin/metrics",
-    "/auth/exchange",
     "/auth/signup",
     "/auth/login",
     "/auth/google",
@@ -358,11 +356,9 @@ pub fn create_router(state: AppState) -> Router {
         // because the deploy gate parses it, and a leak test forbids ANY digit in an
         // unauthenticated health body. See health::operator_metrics.
         .route("/api/admin/metrics", get(health::operator_metrics));
-        // Auth
-        .route("/auth/exchange", post(auth::exchange_token));
-        // Native identity. These are what the website calls; nothing here needs a
-        // PocketBase instance. `/auth/exchange` remains only until the PocketBase
-        // client is deleted, and is the last route that does.
+        // Auth. These are what the website calls, and none of them needs a
+        // PocketBase instance: the identity provider is this crate's own
+        // `identity` module, over the `identities` table.
         .route("/auth/signup", post(auth::signup));
         .route("/auth/login", post(auth::login));
         .route("/auth/google", post(auth::google_sign_in));
@@ -1229,8 +1225,8 @@ mod tests {
 
     /// Sends one credential-free request through the real router and returns the
     /// status. The body is supplied where a handler parses one BEFORE checking a
-    /// credential (auth::exchange_token validates pb_token first): a 400 there
-    /// still proves the route matched, which is all this asserts.
+    /// credential (auth::login validates its payload first): a 400 there still
+    /// proves the route matched, which is all this asserts.
     async fn route_status(app: &Router, method: &str, uri: &str, body: &str) -> StatusCode {
         use axum::http::Request;
         use tower::ServiceExt;
@@ -1272,7 +1268,7 @@ mod tests {
     /// arrived at by assuming each dual-method path contributes an extra row. It does
     /// not: `/api/topups` and `/api/keys` are ONE `.route(` call each carrying both
     /// `get` and `post`, and this table lists a request per METHOD, so each
-    /// contributes two rows in total, not three. 35 is the number the test pins.
+    /// contributes two rows in total, not three. 34 is the number the test pins.
     ///
     /// The native identity routes each contribute ONE row: they are all
     /// single-method (POST), so `/auth/logout` and `/auth/logout-all` are not the
@@ -1281,9 +1277,8 @@ mod tests {
     const MOUNTED: &[(&str, &str, &str)] = &[
         ("GET", "/health", ""),
         ("GET", "/api/admin/metrics", ""),
-        ("POST", "/auth/exchange", r#"{"pb_token":"probe"}"#),
-        // Native identity. The bodies are the smallest shape each handler accepts,
-        // so a credential-free request reaches the handler and stops at its own
+        // The bodies are the smallest shape each handler accepts, so a
+        // credential-free request reaches the handler and stops at its own
         // validation rather than at axum's extractor - which is all this table
         // asserts (the router matched).
         (
@@ -1380,7 +1375,6 @@ mod tests {
 
     /// Near misses that MUST be 405: the PATH is mounted, the method is not.
     const WRONG_METHOD: &[(&str, &str)] = &[
-        ("GET", "/auth/exchange"),
         ("POST", "/health"),
         ("GET", "/auth/logout"),
         ("GET", "/auth/logout-all"),
@@ -1786,15 +1780,15 @@ mod tests {
         // looks self-consistent.
         assert_eq!(
             declared.len(),
-            33,
-            "create_router mounts a different number of routes than the 33 this test was \
+            32,
+            "create_router mounts a different number of routes than the 32 this test was \
              last reconciled against. If that is deliberate, update this number AND the \
              count in MOUNTED's doc comment - both, or the next reader trusts a stale one."
         );
         assert_eq!(
             mounted_set.len(),
-            35,
-            "MOUNTED declares a different number of ROWS than the 35 this test was last \
+            34,
+            "MOUNTED declares a different number of ROWS than the 34 this test was last \
              reconciled against. Rows, not routes: /api/topups and /api/keys each carry \
              GET+POST, so each contributes two rows from one `.route(` call, while the rest \
              including /auth/logout and /auth/logout-all are single-method. A mismatch here \

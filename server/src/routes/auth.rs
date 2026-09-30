@@ -63,32 +63,12 @@ fn hash_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// PocketBase collection whose auth tokens are accepted. Identity lives in
-/// PocketBase; Sqlite holds only the pb_user_id reference
-/// (docs/architecture/identity.md).
-const PB_USERS_COLLECTION: &str = "users";
-
-/// Local-development default. .env.example and docs/local-development.md both
-/// pin PocketBase to this address; production sets POCKETBASE_URL.
-const DEFAULT_POCKETBASE_URL: &str = "http://127.0.0.1:8090";
-
-#[derive(Debug, Deserialize)]
-pub struct AuthExchangeRequest {
-    pub pb_token: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AuthExchangeResponse {
-    pub account_id: Uuid,
-    pub balance_idr: i64,
-}
-
 /// The session body the native sign-in endpoints return.
 ///
-/// The same shape `AuthExchangeResponse` has, under a name that does not mention
-/// the retired exchange: this response is what the website's client reads, and
-/// naming it after a flow the port deleted would be the kind of stale name that
-/// outlives the code it describes.
+/// The same shape the exchange response had, under a name that does not mention
+/// the retired exchange: the website's client reads this, and naming a live
+/// response after a deleted flow is the kind of stale name that outlives the
+/// code it describes.
 #[derive(Debug, Serialize)]
 pub struct AuthSessionResponse {
     pub account_id: Uuid,
@@ -131,138 +111,6 @@ pub struct EmailRequest {
 }
 
 // ---------------------------------------------------------------------------
-// PocketBase token verification
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct PbAuthRefreshResponse {
-    record: PbRecord,
-}
-
-#[derive(Debug, Deserialize)]
-struct PbRecord {
-    id: String,
-}
-
-/// Endpoint that re-validates a PocketBase auth token and returns the current
-/// record. PocketBase answers 401 for a token that is invalid, expired, or
-/// belongs to a deleted user.
-fn pb_refresh_url(base: &str) -> String {
-    format!(
-        "{}/api/collections/{}/auth-refresh",
-        base.trim_end_matches('/'),
-        PB_USERS_COLLECTION
-    )
-}
-
-/// Trust-boundary validation of the id PocketBase hands back: it becomes
-/// accounts.pb_user_id, so refuse anything that is not a plausible record id.
-fn normalize_pb_user_id(raw: &str) -> Option<String> {
-    let id = raw.trim();
-    if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    Some(id.to_string())
-}
-
-/// Extract the record id from a PocketBase auth-refresh body.
-fn parse_pb_user_id(body: &str) -> Option<String> {
-    let parsed: PbAuthRefreshResponse = serde_json::from_str(body).ok()?;
-    normalize_pb_user_id(&parsed.record.id)
-}
-
-fn pocketbase_base_url() -> String {
-    std::env::var("POCKETBASE_URL").unwrap_or_else(|_| DEFAULT_POCKETBASE_URL.to_string())
-}
-
-/// Shared client so PocketBase connections are pooled rather than rebuilt per
-/// login. Built once, on first exchange.
-fn pb_http_client() -> Result<&'static reqwest::Client, AppError> {
-    if let Some(client) = PB_HTTP_CLIENT.get() {
-        return Ok(client);
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| AppError::Internal(format!("failed to build PocketBase client: {e}")))?;
-    Ok(PB_HTTP_CLIENT.get_or_init(|| client))
-}
-
-static PB_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-/// What a PocketBase auth-refresh HTTP status means for OUR caller.
-///
-/// Extracted from `verify_pb_token` because it is the whole of the contract and
-/// it needs no network to state: the function below cannot be driven without a
-/// live PocketBase (which is why two tests in this crate carry `#[ignore]`), but
-/// this decision can be, and that is precisely the part that was wrong.
-///
-/// The distinction is between an upstream that is BROKEN and one that ANSWERED:
-///
-/// - **2xx** - the token is good; the caller parses the record id out of the body,
-///   so a 2xx with an unreadable body is still a rejection (`parse_pb_user_id`)
-///   rather than a retryable outage: PocketBase answered, we just cannot use it.
-/// - **any other status with a 5xx or 429 shape** - PocketBase is down, restarting,
-///   or throttling us. `AppError::Internal` -> 500, so the client retries instead
-///   of throwing the session away (docs/architecture/identity.md: an auth outage
-///   must not lock users out). Before this mapping existed, every one of these was
-///   collapsed into 401 by `!status.is_success()`, and a 30-second PocketBase
-///   restart logged every signed-in customer out.
-/// - **any remaining 4xx** - PocketBase actively refused this credential. That is
-///   the only shape that may be `Unauthenticated`.
-///
-/// Classified by `is_server_error() || TOO_MANY_REQUESTS` rather than by an
-/// explicit 4xx list on purpose: a 5xx shape PocketBase grows later is treated as
-/// an outage by default, which is the safe direction - the cost of a wrong "retry"
-/// is a wasted request, and the cost of a wrong "your token is dead" is a
-/// customer logged out mid-use.
-fn pb_status_to_error(status: reqwest::StatusCode) -> Result<(), AppError> {
-    if status.is_success() {
-        return Ok(());
-    }
-
-    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(AppError::Internal(format!(
-            "PocketBase auth-refresh returned {status} (outage, retryable)"
-        )));
-    }
-
-    Err(AppError::Unauthenticated)
-}
-
-/// Verify a PocketBase auth token and return the real record id behind it.
-///
-/// A rejected token is 401. A PocketBase outage is *not* a rejected token: it
-/// returns 500 so the client retries instead of discarding a good session
-/// (docs/architecture/identity.md - an auth outage must not lock users out).
-/// The status split lives in `pb_status_to_error`, which is unit-tested; only the
-/// round trip to PocketBase is untestable without a live provider.
-async fn verify_pb_token(token: &str) -> Result<String, AppError> {
-    let auth_value =
-        reqwest::header::HeaderValue::from_str(token).map_err(|_| AppError::Unauthenticated)?;
-
-    let url = pb_refresh_url(&pocketbase_base_url());
-
-    let response = pb_http_client()?
-        .post(&url)
-        .header(reqwest::header::AUTHORIZATION, auth_value)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("PocketBase auth-refresh unreachable: {e}")))?;
-
-    // An outage and a rejection are different answers, and only the second one
-    // may end a customer's session - see `pb_status_to_error`.
-    pb_status_to_error(response.status())?;
-
-    let body = response
-        .text()
-        .await
-        .map_err(|e| AppError::Internal(format!("PocketBase auth-refresh body unreadable: {e}")))?;
-
-    parse_pb_user_id(&body).ok_or(AppError::Unauthenticated)
-}
-
-// ---------------------------------------------------------------------------
 // Session config
 // ---------------------------------------------------------------------------
 
@@ -301,6 +149,11 @@ static LIMITS_CONFIG: OnceLock<LimitsConfig> = OnceLock::new();
 /// accessor behaves exactly as `sessions_config` does. It is a `Mutex` rather than
 /// another `OnceLock` because a test has to be able to put it back.
 ///
+/// WHO CLEARS IT: `TestLimitsGuard`, which only test code can construct. It is a
+/// guard rather than a plain setter because the window has to cover the WHOLE
+/// test, not one request - and it has to close on the assertion-panic path too,
+/// or a failing test would leave its cap behind for every test that ran after it.
+///
 /// Not a `#[cfg(test)]` item: the accessor below reads it on every path, and a
 /// field that exists only in test builds would need a second copy of the accessor.
 static TEST_LIMITS_OVERRIDE: std::sync::Mutex<Option<LimitsConfig>> = std::sync::Mutex::new(None);
@@ -314,14 +167,17 @@ static TEST_LIMITS_OVERRIDE: std::sync::Mutex<Option<LimitsConfig>> = std::sync:
 /// asked for would then be loaded anyway - which is how a config file gets a
 /// key nobody reads without anyone noticing.
 pub(crate) fn limits_config() -> Result<&'static LimitsConfig, AppError> {
-    // TAKEN, not read: a leaked clone of the override, so the return type stays
-    // `&'static`. Only tests ever populate it, a test populates it with one small
-    // struct of five integers, and taking it means the next call runs the normal
-    // path - so a test cannot leak its cap into another test that way.
+    // READ, not taken: a test that wants to observe a cap being exhausted needs
+    // the cap to hold for EVERY request it sends, not just the first. Taking it
+    // meant the override covered exactly one call, so a test that sent three
+    // requests against a cap of two was really testing a cap of two followed by
+    // two calls against the shipped twenty - and it passed or failed for reasons
+    // that had nothing to do with the cap. A guard handle (`TestLimitsGuard`)
+    // clears it instead, on the success path and on a panic alike.
     let overridden = TEST_LIMITS_OVERRIDE
         .lock()
         .expect("the test override lock is never poisoned")
-        .take();
+        .clone();
     if let Some(config) = overridden {
         return Ok(Box::leak(Box::new(config)));
     }
@@ -374,214 +230,6 @@ pub(crate) fn session_cookie(value: String, max_age_days: i64) -> Result<HeaderM
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
-
-pub async fn exchange_token(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: HeaderMap,
-    // Taken as a Result so a malformed body becomes OUR JSON, not axum's plain-text
-    // extractor rejection. docs/error-model.md:10 promises "every error returns the same
-    // JSON. No bare HTML error pages, no empty bodies", and the codebase already applies
-    // that rule per-handler (account.rs:74-78, admin.rs:280) - this route was the one that
-    // did not, and being the only auth verb with NO credential guard it is the route where
-    // a malformed body actually reaches the extractor. Measured before the fix: a body of
-    // `{}` returned `422 Failed to deserialize the JSON body into the target type: missing
-    // field ...`, which is both the wrong shape AND axum's internal text echoed to a client
-    // that cannot parse it.
-    payload: Result<Json<AuthExchangeRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<impl IntoResponse, AppError> {
-    // A FIXED message, deliberately. axum's rejection carries `body_text()`, which for a
-    // deserialization failure names the offending field and value - and on THIS endpoint the
-    // body is a PocketBase token. `AppError::InvalidRequest` sends its string to the client
-    // verbatim (error.rs `client_message`), so echoing the rejection would trade a shape
-    // violation for a credential leak in a response body and in the log. The detail is not
-    // needed: the client learns their JSON was malformed, and the request_id ties the rest to
-    // the server log.
-    let Json(payload) = payload.map_err(|_rejection| {
-        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
-    })?;
-
-    if payload.pb_token.trim().is_empty() {
-        return Err(AppError::InvalidRequest("pb_token is required".into()));
-    }
-
-    let limits = limits_config()?;
-    let pool = state.pool.clone();
-
-    // The address is resolved HERE and the key derived from it, because the salt
-    // must be read for THIS day at THIS moment: a key derived after an await
-    // could be the hash of a different day's salt than the row it counts.
-    let ip = resolve_client_ip(peer.ip(), &headers, &state.trusted_proxies);
-    let client_key =
-        auth_attempts::ip_key(ip, &state.ip_salt.salt_for_day(crate::ip_tracking::today_utc()));
-
-    // Identity comes from PocketBase, never from the token's shape.
-    let pb_user_id = verify_pb_token(payload.pb_token.trim()).await?;
-
-    // THE LOGIN CAP, before anything is written to the ledger of sessions and
-    // before the transaction that writes it is opened.
-    //
-    // Both counters are written and then both are read, in one call, because the
-    // two caps fail in different directions and neither implies the other. The
-    // per-IP cap bounds a guesser from one address, and a distributed guesser who
-    // spreads across a thousand addresses never reaches it at any single one; the
-    // per-account cap bounds a guesser walking ONE account through proxies, and no
-    // amount of proxying dilutes it — every attempt lands on this account's rows
-    // however many hosts it came from.
-    //
-    // IT IS CALLED WITH THE ACCOUNT ID ALREADY RESOLVED, which is why it reads
-    // the accounts row directly rather than waiting for the upsert below: the
-    // cap has to run BEFORE the transaction opens, and the upsert is inside it.
-    // A first-ever sign-in resolves `None` and spends only the per-IP budget.
-    // `auth_attempts` is written from the POOL, never from `tx`, so the row
-    // outlives a rolled-back session transaction: a refusal on the next line, or
-    // a failure committing the session, must not refund the attacker a guess.
-    let cap_now = Utc::now();
-    // Decoded through `Hyphenated` rather than as a `Uuid` directly: the column is
-    // TEXT in this schema (the Postgres original's `uuid` type is gone), and
-    // `Hyphenated` is how every other read of an id in this module decodes one.
-    let existing_account: Option<Uuid> =
-        sqlx::query("SELECT id FROM accounts WHERE pb_user_id = ?")
-            .bind(&pb_user_id)
-            .fetch_optional(&pool)
-            .await?
-            .map(|row| row.get::<Hyphenated, _>("id").into_uuid());
-
-    auth_attempts::record_and_check_login(
-        &pool,
-        Some(&client_key),
-        existing_account,
-        limits.login_per_hour_per_ip,
-        limits.login_per_hour_per_account,
-        cap_now,
-    )
-    .await?;
-
-    let sessions = sessions_config()?;
-
-    // `BEGIN IMMEDIATE`, not sqlx's default deferred `BEGIN`: this transaction
-    // writes, and taking the write lock up front means no lock upgrade can fail
-    // with SQLITE_BUSY_SNAPSHOT (plan section 4.3, trap 2).
-    let mut tx = crate::db::begin_immediate(&pool).await?;
-
-    // `id`, `created_at` and `updated_at` are all bound. The Postgres schema
-    // defaulted them to `gen_random_uuid()` and `now()`; both defaults were
-    // deliberately removed so no SQL-side time can be written (plan section 4.6).
-    // On conflict the freshly generated `id` is discarded and only `updated_at`
-    // moves — the same semantics the Postgres `DO UPDATE SET updated_at = now()`
-    // had, expressed through `excluded` so one instant serves the whole insert.
-    let now = Utc::now();
-    let account = sqlx::query(
-        r#"
-        INSERT INTO accounts (id, pb_user_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT (pb_user_id) DO UPDATE SET updated_at = excluded.updated_at
-        RETURNING id, status
-        "#,
-    )
-    .bind(Uuid::new_v4().hyphenated())
-    .bind(&pb_user_id)
-    .bind(now)
-    .bind(now)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    let account_id: Uuid = account.get::<Hyphenated, _>("id").into_uuid();
-    let account_status: String = account.get("status");
-
-    if account_status != "active" {
-        return Err(AppError::Unauthenticated);
-    }
-
-    // `updated_at` had a Postgres `now()` default and is now bound.
-    let wallet = sqlx::query(
-        r#"
-        INSERT INTO wallets (account_id, balance_idr, updated_at)
-        VALUES (?, 0, ?)
-        ON CONFLICT (account_id) DO NOTHING
-        RETURNING balance_idr
-        "#,
-    )
-    .bind(account_id.hyphenated())
-    .bind(now)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let balance_idr = match wallet {
-        Some(w) => w.get("balance_idr"),
-        None => {
-            let existing = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = ?")
-                .bind(account_id.hyphenated())
-                .fetch_one(&mut *tx)
-                .await?;
-            existing.get("balance_idr")
-        }
-    };
-
-    let session_token = format!("apk_sess_{}", Uuid::new_v4().simple());
-    let token_hash = hash_token(&session_token);
-    // Absolute lifetime from config. The idle bound (7d) is measured from
-    // `last_seen_at`, which the schema now carries and this insert seeds. The
-    // expiry is derived from the same instant as the row's other timestamps.
-    //
-    // SAFE because config.rs refuses a lifetime the clock cannot represent, at load,
-    // naming the field. A bare `DateTime + Duration` PANICS on an out-of-range
-    // result rather than saturating, and this runs on the login path. Measured
-    // boundary: fine to ten million days, panic at a hundred million - and a lifetime
-    // is in DAYS, so nine digits is enough to reach it. The allow records the
-    // dependency rather than re-deriving the bound here.
-    #[allow(clippy::arithmetic_side_effects)]
-    let expires_at = now + Duration::days(sessions.absolute_days as i64);
-
-    // WRITTEN AND NEVER READ, deliberately, and recorded here so nobody discovers it as
-    // a bug. A session's user agent is captured for incident review - "was this the same
-    // browser that logged in" - and is purged with the row on the 30-day sweep. It is
-    // NOT compared on use, so it is not a second factor and must not be described as
-    // one: a user agent is trivially forgeable and a session that required one to
-    // match would lock out legitimate users for no security gain.
-    //
-    // The sibling column `sessions.ip_hash` is the opposite case: it is in the schema and
-    // NOTHING writes it, because the IP hash belongs to the key-scoped key_ip_seen and
-    // key_ip_daily tables where abuse correlation is the point. The column is left in
-    // place because the schema is the schema, but the privacy page has been corrected -
-    // it claimed sessions carried an IP hash, which was false and is the kind of
-    // overstatement a disclosure must not make even in the safe direction.
-    let user_agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    // `id` had a Postgres `gen_random_uuid()` default; `last_seen_at` and
-    // `created_at` had `now()`. All three are bound now. Seeding `last_seen_at`
-    // with the login instant means an unused session dies on the idle bound.
-    sqlx::query(
-        "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, user_agent, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(Uuid::new_v4().hyphenated())
-    .bind(account_id.hyphenated())
-    .bind(token_hash)
-    .bind(expires_at)
-    .bind(now)
-    .bind(user_agent)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    let response_headers = session_cookie(session_token, sessions.absolute_days as i64)?;
-
-    Ok((
-        StatusCode::OK,
-        response_headers,
-        Json(AuthExchangeResponse {
-            account_id,
-            balance_idr,
-        }),
-    ))
-}
-
-// ---------------------------------------------------------------------------
 // Native identity handlers
 // ---------------------------------------------------------------------------
 
@@ -609,6 +257,19 @@ fn attempt_context(state: &AppState, peer: std::net::SocketAddr, headers: &Heade
 /// Build the `[auth]` and `[email]` config for this request's process.
 fn auth_config() -> Result<&'static AuthConfig, AppError> {
     Ok(&app_config()?.auth)
+}
+
+/// The `[auth]` section, for tests in OTHER route modules that need to hash a
+/// password with the shipped Argon2 parameters.
+///
+/// `pub` rather than `pub(crate)` for the same reason the handlers are: the
+/// admin tests create a real password identity through the production helper and
+/// then log in with it, and a hash written under a second, test-only parameter
+/// set would not be the hash the verifier has to accept. Returning a clone keeps
+/// the `OnceLock` cache private to this module.
+#[cfg(test)]
+pub fn auth_config_for_tests() -> Result<AuthConfig, AppError> {
+    Ok(auth_config()?.clone())
 }
 
 fn email_config() -> Result<&'static EmailConfig, AppError> {
@@ -1329,109 +990,6 @@ pub async fn logout_all(
 mod tests {
     use super::*;
 
-    /// The documented promise the code does not keep: "A PocketBase outage is
-    /// *not* a rejected token: it returns 500 so the client retries instead of
-    /// discarding a good session (docs/architecture/identity.md - an auth outage
-    /// must not lock users out)" (the doc comment on `verify_pb_token` itself).
-    ///
-    /// Only the TRANSPORT-error branch upheld that. A PocketBase that ANSWERED with
-    /// a 500 - a crashed collection, a proxy error page, a restarted instance -
-    /// was collapsed by `!response.status().is_success()` into
-    /// `AppError::Unauthenticated`, i.e. a 401. The client then DISCARDS the user's
-    /// token and sends them to the login page: the outage is reported as "your
-    /// credential is bad", which is both false and unrecoverable by retrying.
-    ///
-    /// Written RED FIRST against the pre-fix code, which returned `Unauthenticated`
-    /// for every one of the 5xx/429 cases below.
-    ///
-    /// The platform vendors the mapping into a pure function deliberately: no
-    /// network seam is needed to pin it, which is the reason the two remaining
-    /// `#[ignore]`d tests in this crate have to exist at all.
-    #[test]
-    fn a_pocketbase_outage_is_retryable_and_only_a_rejection_is_unauthenticated() {
-        use reqwest::StatusCode as Pb;
-
-        // The upstream is BROKEN, not the credential. 500/502/503/504 are outage
-        // shapes; 429 is "try again shortly" and explicitly not a bad token.
-        for status in [
-            Pb::INTERNAL_SERVER_ERROR,
-            Pb::BAD_GATEWAY,
-            Pb::SERVICE_UNAVAILABLE,
-            Pb::GATEWAY_TIMEOUT,
-            Pb::TOO_MANY_REQUESTS,
-        ] {
-            assert!(
-                matches!(pb_status_to_error(status), Err(AppError::Internal(_))),
-                "a PocketBase {status} is an OUTAGE: it must be Internal (500, retryable), never Unauthenticated, or a customer's good session is thrown away and they cannot retry their way back in"
-            );
-        }
-
-        // The upstream ANSWERED and rejected the credential. This is the only
-        // shape that may tell the client its token is dead.
-        for status in [
-            Pb::UNAUTHORIZED,
-            Pb::FORBIDDEN,
-            Pb::NOT_FOUND,
-            Pb::BAD_REQUEST,
-        ] {
-            assert!(
-                matches!(pb_status_to_error(status), Err(AppError::Unauthenticated)),
-                "a PocketBase {status} is a REJECTED credential and must stay a 401 - changing this would let a dead token look like a transient failure"
-            );
-        }
-
-        // The positive control: success is not an error at all, so the mapping
-        // cannot be "everything is Internal" or "everything is Unauthenticated".
-        assert!(
-            pb_status_to_error(Pb::OK).is_ok(),
-            "a 2xx must map to Ok, or nothing above measures a real boundary"
-        );
-    }
-
-    #[test]
-    fn refresh_url_trims_trailing_slash() {
-        assert_eq!(
-            pb_refresh_url("http://127.0.0.1:8090"),
-            "http://127.0.0.1:8090/api/collections/users/auth-refresh"
-        );
-        assert_eq!(
-            pb_refresh_url("https://id.example.com/"),
-            "https://id.example.com/api/collections/users/auth-refresh"
-        );
-    }
-
-    #[test]
-    fn parses_record_id_from_auth_refresh_body() {
-        let body = r#"{"token":"new.jwt.value","record":{"id":"a1b2c3d4e5f6g7h","email":"u@example.com"}}"#;
-        assert_eq!(parse_pb_user_id(body).as_deref(), Some("a1b2c3d4e5f6g7h"));
-    }
-
-    #[test]
-    fn rejects_unparseable_or_empty_record_id() {
-        assert_eq!(parse_pb_user_id("not json"), None);
-        assert_eq!(parse_pb_user_id("{}"), None);
-        assert_eq!(parse_pb_user_id(r#"{"record":{}}"#), None);
-        assert_eq!(parse_pb_user_id(r#"{"record":{"id":""}}"#), None);
-        // An error body is not an identity.
-        assert_eq!(
-            parse_pb_user_id(r#"{"code":401,"message":"Failed to authenticate."}"#),
-            None
-        );
-    }
-
-    #[test]
-    fn normalizes_pb_user_id() {
-        assert_eq!(
-            normalize_pb_user_id("  abc123  ").as_deref(),
-            Some("abc123")
-        );
-        assert_eq!(normalize_pb_user_id(""), None);
-        assert_eq!(normalize_pb_user_id("   "), None);
-        assert_eq!(normalize_pb_user_id("has space"), None);
-        assert_eq!(normalize_pb_user_id("has-dash"), None);
-        assert_eq!(normalize_pb_user_id(&"a".repeat(65)), None);
-    }
-
     #[test]
     fn session_cookie_carries_expected_attributes() {
         let headers = session_cookie("apk_sess_abc".into(), 30).expect("a valid token parses");
@@ -1455,19 +1013,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // LIVE-DATABASE TESTS - the three auth handlers
+    // LIVE-DATABASE TESTS - the session handlers
     //
-    // Everything above is pure: pb_refresh_url, normalize_pb_user_id,
-    // parse_pb_user_id and session_cookie. None of the three handlers -
-    // exchange_token, logout, logout_all - had ever been executed by any test.
-    // The tests below run them against a real, migrated Postgres, and
-    // exchange_token against the real local PocketBase (docker-compose.yml),
-    // because verify_pb_token has no seam to fake: mocking the network would
-    // test the mock. They are #[ignore]d so the default suite stays green
-    // without a database:
-    //
-    //   DATABASE_URL=postgres://postgres:dev@localhost:5432/apikita \
-    //     cargo test --lib -- --ignored --test-threads=1 routes::auth
+    // The tests below run the handlers against a real, migrated SQLite file, and
+    // against a real loopback TCP peer where a peer is needed at all: nothing
+    // here reaches for an external service, and nothing is #[ignore]d for
+    // want of one. Sessions are minted directly in the database where the test
+    // is about session handling rather than about logging in - a logout test
+    // that had to sign up first would fail for reasons that have nothing to do
+    // with logout.
     // -----------------------------------------------------------------------
 
     use crate::db::{credit_topup_transaction, TopupCreditResult};
@@ -1610,11 +1164,19 @@ mod tests {
 
     /// An `AppState` over the database under test.
     ///
-    /// `exchange_token` takes the whole state, not just the pool, because the
-    /// sign-in caps need the daily salt and the trusted-proxy list - the same
-    /// reason `proxy::chat_completions` does. The salt is built fresh per test
-    /// and never persisted, matching production (`main.rs` builds one per
-    /// process) and every other route module's fixture.
+    /// `login` takes the whole state, not just the pool, because the sign-in caps
+    /// need the daily salt and the trusted-proxy list - the same reason
+    /// `proxy::chat_completions` does. The salt is built fresh per test and never
+    /// persisted, matching production (`main.rs` builds one per process).
+    ///
+    /// **CALL IT ONCE PER TEST AND REUSE THE STATE.** The salt is what turns a
+    /// client address into the `auth_attempts.ip_hash` a cap counts against, so
+    /// two states built by two calls are two salts, hence two keys, hence two
+    /// separate budgets - and a test that built a state per request would watch a
+    /// cap of two allow a hundred attempts while looking like it measured the cap.
+    /// That is not hypothetical: it is exactly how the first version of the
+    /// login-cap tests below passed while asserting nothing. Production has one
+    /// salt per process, so one state per test is the faithful fixture.
     fn state_for(pool: &SqlitePool) -> AppState {
         let config = std::sync::Arc::new(
             AppConfig::load_from_file("../config/apikita.toml")
@@ -1692,507 +1254,46 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // PocketBase identity fixtures. exchange_token verifies its token against
-    // PocketBase over the network, so the fixture is a REAL PocketBase record
-    // with a real auth token - never a stub.
-    // -----------------------------------------------------------------------
-
-    // The former live-PocketBase fixtures (PbIdentity, pocketbase_test_identity,
-    // delete_pb_identity and their URL helpers) stood here. They are DELETED with
-    // the test that needed them: the loopback stub above replaces the whole
-    // approach, and a fixture that creates real PocketBase records is not merely
-    // unused now, it would imply this suite still depends on an external service.
-
-    async fn account_for_pb_user(pool: &SqlitePool, pb_user_id: &str) -> Option<Uuid> {
-        use sqlx::Row;
-        let row = sqlx::query("SELECT id FROM accounts WHERE pb_user_id = ?")
-            .bind(pb_user_id)
-            .fetch_optional(pool)
-            .await
-            .expect("query accounts");
-        row.map(|r| r.get::<Hyphenated, _>("id").into_uuid())
-    }
-
-    // -----------------------------------------------------------------------
-    // 1. exchange_token
-    // -----------------------------------------------------------------------
-
-    // The ONLY remaining exception in this module, and it is not about the database:
-    // `verify_pb_token` has no seam to fake, so this test drives a real local
-    // PocketBase (POCKETBASE_URL) end to end. Its database half is now the same
-    // per-test migrated SQLite file every other test uses, so what is missing is
-    // the identity provider, not Postgres.
-    // -----------------------------------------------------------------------
-    // exchange_token, driven against a LOOPBACK PocketBase.
-    //
-    // These tests exist because `exchange_token` was the single worst-covered
-    // block in the crate (58.6% file coverage; the handler itself uncovered) and
-    // the only test that touched it was `#[ignore]`d behind a live PocketBase.
-    //
-    // NO MOCK IS INVOLVED. `verify_pb_token` builds its URL from
-    // `pocketbase_base_url()`, which reads POCKETBASE_URL on EVERY call, so
-    // pointing that variable at a loopback listener drives the real client, the
-    // real status handling and the real handler. Only the PEER is a stub - the
-    // code under test is the code that ships. Same technique tools/fake-midtrans
-    // uses for Snap, chosen for the same reason.
-    // -----------------------------------------------------------------------
-
-    /// A one-shot local HTTP stub standing in for PocketBase auth-refresh.
-    ///
-    /// Answers the next request with the given status and body, then closes.
-    /// Returns the base URL to put in POCKETBASE_URL.
-    async fn pocketbase_stub(status_line: &str, body: &str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the PocketBase stub");
-        let addr = listener.local_addr().expect("stub address");
-
-        let response = format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 8192];
-                let _ = socket.read(&mut buf).await;
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.flush().await;
-                let _ = socket.shutdown().await;
-            }
-        });
-
-        format!("http://{addr}")
-    }
-
-    /// A successful auth-refresh body, shaped exactly as PocketBase sends it.
-    fn auth_refresh_body(record_id: &str) -> String {
-        format!(
-            r#"{{"token":"new.jwt.value","record":{{"id":"{record_id}","email":"u@example.com"}}}}"#
-        )
-    }
-
-    /// Point POCKETBASE_URL at the stub for the duration of the test.
-    ///
-    /// Uses the shared env lock and guard, so this cannot interleave with another
-    /// test reading the same process-global.
-    fn point_pocketbase_at(
-        base: &str,
-    ) -> (
-        crate::routes::test_env::EnvLock,
-        crate::routes::test_env::EnvGuard,
-    ) {
-        let lock = crate::routes::test_env::EnvLock::acquire();
-        let guard = crate::routes::test_env::EnvGuard::set("POCKETBASE_URL", base);
-        (lock, guard)
-    }
-
-    fn exchange_headers(user_agent: Option<&str>) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        if let Some(ua) = user_agent {
-            headers.insert(header::USER_AGENT, ua.parse().unwrap());
-        }
-        headers
-    }
-
-    /// A FRESH identity: the handler must create the account, create the wallet,
-    /// write the session, and return only the hash of the token.
-    #[tokio::test]
-    async fn live_a_fresh_pocketbase_identity_creates_account_wallet_and_session() {
-        let db = TestDb::new().await;
-        let pool = db.pool.clone();
-        let pb_id = format!("pb{}", Uuid::new_v4().simple());
-
-        let base = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
-        let (_lock, _guard) = point_pocketbase_at(&base);
-
-        let response = call(exchange_token(
-            State(state_for(&pool)),
-            peer(),
-            exchange_headers(Some("apikita-test-agent")),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-valid-token".into(),
-            })),
-        ))
-        .await;
-
-        assert_eq!(
-            response.status,
-            StatusCode::OK,
-            "body: {}",
-            response.body_text()
-        );
-        let body = response.json();
-        let account_id = Uuid::parse_str(
-            body["account_id"]
-                .as_str()
-                .expect("the response carries the account id"),
-        )
-        .expect("account id parses");
-        // The account is linked to the id PocketBase reported.
-        assert_eq!(
-            account_for_pb_user(&pool, &pb_id).await,
-            Some(account_id),
-            "the account must be keyed by the id PocketBase returned, never by the token"
-        );
-
-        // A wallet exists because the handler created one.
-        let wallets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(&pool)
-            .await
-            .expect("count wallets");
-        assert_eq!(wallets, 1, "a fresh login must create exactly one wallet");
-
-        // THE SECURITY PROPERTY: the stored value is the HASH, never the token.
-        let rows: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT token_hash, user_agent FROM sessions WHERE account_id = ?")
-                .bind(account_id.hyphenated())
-                .fetch_all(&pool)
-                .await
-                .expect("read the session rows");
-        assert_eq!(rows.len(), 1, "one session per exchange");
-
-        let cookie = response.set_cookie();
-        let token = response
-            .cleared_token()
-            .expect("the response sets a session cookie");
-        assert!(token.starts_with("apk_sess_"), "got {token}");
-        assert_ne!(
-            rows[0].0, token,
-            "the plaintext token must NEVER be stored - only its hash"
-        );
-        assert_eq!(
-            rows[0].0,
-            hash_token(&token),
-            "the stored hash must be the hash of the token that was returned"
-        );
-        assert_eq!(
-            rows[0].1.as_deref(),
-            Some("apikita-test-agent"),
-            "the user agent must be persisted when sent"
-        );
-
-        // And the cookie the handler issued actually resolves back to the account.
-        let mut cookie_headers = HeaderMap::new();
-        cookie_headers.insert(header::COOKIE, cookie.parse().unwrap());
-        assert_eq!(
-            resolve_account_from_cookie(&pool, &cookie_headers)
-                .await
-                .expect("the issued cookie resolves"),
-            account_id,
-            "the session the login wrote must resolve through the shared resolver"
-        );
-
-        db.close().await;
-    }
-
-    /// A REPEAT exchange must not duplicate the wallet or the account.
-    #[tokio::test]
-    async fn live_a_repeat_exchange_does_not_duplicate_the_wallet_or_leave_drift() {
-        let db = TestDb::new().await;
-        let pool = db.pool.clone();
-        let pb_id = format!("pb{}", Uuid::new_v4().simple());
-
-        // Two stubs, because each one answers exactly one request. The env lock is
-        // taken ONCE for the whole test and the URL is RE-POINTED between calls:
-        // acquiring it a second time inside the same body would deadlock, since
-        // the first guard is still alive. (Written the wrong way first and caught
-        // before it could hang CI — a self-deadlock is the one failure mode a test
-        // suite cannot report, it just stops.)
-        let first = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
-        let (_lock, mut guard) = point_pocketbase_at(&first);
-        let first_response = call(exchange_token(
-            State(state_for(&pool)),
-            peer(),
-            HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-valid-token".into(),
-            })),
-        ))
-        .await;
-        assert_eq!(first_response.status, StatusCode::OK);
-
-        // Second exchange of the same identity, against a fresh stub.
-        let second = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
-        guard.also("POCKETBASE_URL", second.clone());
-        let second_response = call(exchange_token(
-            State(state_for(&pool)),
-            peer(),
-            HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-valid-token".into(),
-            })),
-        ))
-        .await;
-        assert_eq!(second_response.status, StatusCode::OK);
-
-        let account_id = account_for_pb_user(&pool, &pb_id)
-            .await
-            .expect("the account exists");
-
-        let wallets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(&pool)
-            .await
-            .expect("count wallets");
-        assert_eq!(wallets, 1, "a repeat login must NOT create a second wallet");
-
-        let accounts: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE pb_user_id = ?")
-                .bind(&pb_id)
-                .fetch_one(&pool)
-                .await
-                .expect("count accounts");
-        assert_eq!(
-            accounts, 1,
-            "a repeat login must NOT create a second account"
-        );
-
-        // Two logins, two sessions - a login on a second device is legitimate.
-        let sessions: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
-                .bind(account_id.hyphenated())
-                .fetch_one(&pool)
-                .await
-                .expect("count sessions");
-        assert_eq!(sessions, 2, "each exchange issues its own session");
-
-        // The wallet/ledger invariant still holds: creating a wallet writes no
-        // ledger row, so drift must be zero.
-        assert_eq!(
-            ledger_drift_rows(&pool, account_id).await,
-            0,
-            "balance_idr must still equal SUM(ledger.delta_idr)"
-        );
-
-        db.close().await;
-    }
-
-    /// An existing account with a real balance keeps it across a login.
-    #[tokio::test]
-    async fn live_exchange_returns_the_real_balance_of_an_existing_account() {
-        let db = TestDb::new().await;
-        let pool = db.pool.clone();
-
-        // A seeded account WITH money, credited through the REAL money path
-        // (credit_topup_transaction, which is what the Midtrans webhook calls)
-        // rather than by writing wallets.balance_idr directly. That is not
-        // pedantry: seeding a balance directly manufactures the very drift the
-        // reconciliation gate exists to catch, and this journal records it biting
-        // three separate times before the rule was written down.
-        let account_id = test_support::account_with_wallet(&pool).await;
-        settle_topup(&pool, account_id, 73_500).await;
-        let pb_id = format!("pb{}", Uuid::new_v4().simple());
-        sqlx::query("UPDATE accounts SET pb_user_id = ? WHERE id = ?")
-            .bind(&pb_id)
-            .bind(account_id.hyphenated())
-            .execute(&pool)
-            .await
-            .expect("link the seeded account to a PocketBase id");
-
-        let base = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
-        let (_lock, _guard) = point_pocketbase_at(&base);
-
-        let response = call(exchange_token(
-            State(state_for(&pool)),
-            peer(),
-            HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-valid-token".into(),
-            })),
-        ))
-        .await;
-
-        assert_eq!(response.status, StatusCode::OK);
-        let body = response.json();
-        assert_eq!(
-            body["account_id"].as_str(),
-            Some(account_id.hyphenated().to_string().as_str()),
-            "the login must resolve to the EXISTING account, not create a new one"
-        );
-        assert_eq!(
-            body["balance_idr"],
-            json!(73_500),
-            "the response must carry the real balance"
-        );
-
-        assert_eq!(
-            ledger_drift_rows(&pool, account_id).await,
-            0,
-            "balance_idr must still equal SUM(ledger.delta_idr)"
-        );
-
-        db.close().await;
-    }
-
-    /// THE W14 CONTRACT, PROVEN END TO END RATHER THAN ONLY AS A PURE FUNCTION:
-    /// a PocketBase 5xx is a 500, not a 401, so a client retries instead of
-    /// discarding a good session.
-    #[tokio::test]
-    async fn live_a_pocketbase_outage_answers_500_so_the_client_retries() {
-        let db = TestDb::new().await;
-        let pool = db.pool.clone();
-
-        let base = pocketbase_stub("500 Internal Server Error", r#"{"code":500}"#).await;
-        let (_lock, _guard) = point_pocketbase_at(&base);
-
-        let response = call(exchange_token(
-            State(state_for(&pool)),
-            peer(),
-            HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-valid-token".into(),
-            })),
-        ))
-        .await;
-
-        assert_eq!(
-            response.status,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "a PocketBase outage must be 500 (retryable), never 401 - a 401 makes the client discard a good session and lock the customer out"
-        );
-        assert_eq!(response.json()["error"]["code"], json!("internal_error"));
-
-        // And nothing was written: an outage must not half-create an account.
-        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
-            .fetch_one(&pool)
-            .await
-            .expect("count accounts");
-        assert_eq!(accounts, 0, "a failed exchange must create no account");
-
-        db.close().await;
-    }
-
-    /// A 4xx from PocketBase IS a rejected credential, and the case a customer
-    /// sees when their token has genuinely expired.
-    #[tokio::test]
-    async fn live_a_pocketbase_rejection_answers_401() {
-        let db = TestDb::new().await;
-        let pool = db.pool.clone();
-
-        let base = pocketbase_stub(
-            "401 Unauthorized",
-            r#"{"code":401,"message":"Failed to authenticate."}"#,
-        )
-        .await;
-        let (_lock, _guard) = point_pocketbase_at(&base);
-
-        let response = call(exchange_token(
-            State(state_for(&pool)),
-            peer(),
-            HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-dead-token".into(),
-            })),
-        ))
-        .await;
-
-        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-        assert_eq!(response.json()["error"]["code"], json!("unauthenticated"));
-
-        // No account for a credential that was refused.
-        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
-            .fetch_one(&pool)
-            .await
-            .expect("count accounts");
-        assert_eq!(accounts, 0);
-
-        db.close().await;
-    }
-
-    /// An empty pb_token is refused BEFORE any network call, so it cannot be used
-    /// to make the server dial an attacker-controlled POCKETBASE_URL.
-    #[tokio::test]
-    async fn live_an_empty_pb_token_is_refused_without_calling_pocketbase() {
-        let db = TestDb::new().await;
-        let pool = db.pool.clone();
-
-        // No stub at all: if the handler dialled, the connection would fail and
-        // the test would see a 500 instead of the 400 below.
-        let (_lock, _guard) = point_pocketbase_at("http://127.0.0.1:1");
-
-        let response = call(exchange_token(
-            State(state_for(&pool)),
-            peer(),
-            HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "   ".into(),
-            })),
-        ))
-        .await;
-
-        assert_eq!(
-            response.status,
-            StatusCode::BAD_REQUEST,
-            "an empty token must be refused as a bad request before any network call"
-        );
-        assert_eq!(response.json()["error"]["code"], json!("invalid_request"));
-
-        db.close().await;
-    }
-
-    /// A 200 whose body carries no usable record id is still a refusal.
-    #[tokio::test]
-    async fn live_a_200_with_no_usable_record_id_is_refused() {
-        let db = TestDb::new().await;
-        let pool = db.pool.clone();
-
-        let base = pocketbase_stub("200 OK", r#"{"token":"t","record":{"id":""}}"#).await;
-        let (_lock, _guard) = point_pocketbase_at(&base);
-
-        let response = call(exchange_token(
-            State(state_for(&pool)),
-            peer(),
-            HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-valid-token".into(),
-            })),
-        ))
-        .await;
-
-        assert_eq!(
-            response.status,
-            StatusCode::UNAUTHORIZED,
-            "PocketBase answered but gave no identity, so there is no one to log in"
-        );
-
-        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
-            .fetch_one(&pool)
-            .await
-            .expect("count accounts");
-        assert_eq!(accounts, 0, "an unusable body must create no account");
-
-        db.close().await;
-    }
-
     /// The session's absolute expiry is taken from config, not from a literal.
     #[tokio::test]
     async fn live_the_session_expiry_honours_the_configured_absolute_days() {
         let db = TestDb::new().await;
         let pool = db.pool.clone();
-        let pb_id = format!("pb{}", Uuid::new_v4().simple());
 
-        let base = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
-        let (_lock, _guard) = point_pocketbase_at(&base);
+        let email = "expiry-check@example.com";
+        let password = "a-real-enough-password";
+        let hash = identity::password::hash_password(
+            auth_config().expect("auth config").clone(),
+            password.to_string(),
+        )
+        .await
+        .expect("hash the fixture password");
+        let account_id = identity::accounts::create_password_account(
+            &pool,
+            email,
+            &hash,
+            Utc::now() - Duration::minutes(5),
+        )
+        .await
+        .expect("seed the account the login will find");
 
-        let response = call(exchange_token(
+        let response = call(login(
             State(state_for(&pool)),
             peer(),
             HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-valid-token".into(),
+            Ok(Json(LoginRequest {
+                email: email.into(),
+                password: password.into(),
             })),
         ))
         .await;
-        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "the fixture login must succeed: {}",
+            response.body_text()
+        );
 
-        let account_id = account_for_pb_user(&pool, &pb_id)
-            .await
-            .expect("the account exists");
         let expires_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT expires_at FROM sessions WHERE account_id = ?")
                 .bind(account_id.hyphenated())
@@ -2213,15 +1314,15 @@ mod tests {
         db.close().await;
     }
 
-    // The former live_exchange_token_... test stood here, #[ignore]d behind a live
-    // PocketBase. It is DELETED rather than kept: every assertion it made is now
-    // covered by the loopback-PocketBase tests above, which run BY DEFAULT in CI
-    // with no external service, and an #[ignore]d test that duplicates coverage
-    // is a liability - it reads as a safety net while never executing.
-    //
-    // The one thing worth preserving from it, and preserved: the seeded account is
-    // funded through credit_topup_transaction (the real webhook path), never by
-    // writing wallets.balance_idr directly.
+    // The former live-PocketBase identity fixtures and the eight tests that drove
+    // `exchange_token` against a loopback stub stood here. They are DELETED rather
+    // than kept: the identity provider they exercised is gone from this crate, and
+    // a test that stubs a service the code no longer talks to is not coverage, it
+    // is a description of a program that is not running. The properties those
+    // tests asserted that are STILL true of the native endpoints - a fresh signup
+    // creates the account and the wallet, the balance comes from the ledger, a
+    // refused credential is a 401 and not a 500 - now belong to the signup/login
+    // tests, and are asserted there.
 
     #[tokio::test]
     async fn live_logout_revokes_exactly_this_session_and_clears_the_cookie() {
@@ -2560,7 +1661,7 @@ mod tests {
 
     /// THE CAP FIRES, and it fires on FAILED attempts.
     ///
-    /// The second attempt below carries a token PocketBase REJECTS - so the
+    /// The second attempt below presents a password no account has - so the
     /// refusal under test is not "the budget ran out on a success", it is "the
     /// budget is spent by guessing", which is the only property that makes this
     /// cap worth having. A cap that counted successes would let a guesser try
@@ -2574,23 +1675,31 @@ mod tests {
         // The cap is what this test is about, and the shipped config sets it to 20
         // - unreachable without twenty round trips. The override below is how a
         // test states a different cap; see the note on it near `limits_config`.
-        set_test_limits_override(1, 100);
+        //
+        // The cap is TWO, not one, and that is not a softening. `login` records
+        // the attempt BEFORE it checks the budget (see `record_and_check_login`),
+        // so the first attempt's own row is already on the books when the count is
+        // read - a cap of one is spent by the very attempt it is counting and
+        // refuses it, which would make the 401 below unreachable and this test a
+        // statement about the wrong property. With a cap of two the attempt that
+        // is refused is unambiguously the one that arrived after the budget was
+        // full, which is what "the cap refuses a guesser" means.
+        let _caps = TestLimitsGuard::set(2, 100);
+        // ONE state for the whole test. See the note on `state_for`: the salt it
+        // carries is the key the per-IP counter is stored under, so a state per
+        // request would put every attempt in its own budget and the cap below
+        // could never fire however many attempts were sent.
+        let state = state_for(&pool);
 
-        let base = pocketbase_stub(
-            "401 Unauthorized",
-            r#"{"code":401,"message":"Failed to authenticate."}"#,
-        )
-        .await;
-        let (_pb_lock, _pb_guard) = point_pocketbase_at(&base);
-
-        // Attempt 1: refused by PocketBase, but the IP budget is now spent
-        // (per_ip = 1, and the attempt in hand is counted).
-        let first = call(exchange_token(
-            State(state_for(&pool)),
+        // Attempt 1: the credential is wrong, so this is a 401 - a guesser's first
+        // try is answered, not throttled. The IP budget is now one spent.
+        let first = call(login(
+            State(state.clone()),
             peer(),
             HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-wrong-token".into(),
+            Ok(Json(LoginRequest {
+                email: "nobody@example.com".into(),
+                password: "wrong-password".into(),
             })),
         ))
         .await;
@@ -2601,36 +1710,63 @@ mod tests {
             first.body_text()
         );
 
-        // Attempt 2 from the same address: out of budget, and it does NOT reach
-        // PocketBase at all, so the answer is the throttle rather than the 401.
-        let second = call(exchange_token(
-            State(state_for(&pool)),
+        // Attempt 2 from the same address: the second and last of the budget, still
+        // answered as a credential failure.
+        let second = call(login(
+            State(state.clone()),
             peer(),
             HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-wrong-token".into(),
+            Ok(Json(LoginRequest {
+                email: "nobody@example.com".into(),
+                password: "wrong-password".into(),
             })),
         ))
         .await;
         assert_eq!(
             second.status,
-            StatusCode::TOO_MANY_REQUESTS,
-            "the second attempt from one address must be throttled: {}",
+            StatusCode::UNAUTHORIZED,
+            "the last attempt inside the budget is still a credential answer: {}",
             second.body_text()
         );
-        assert_eq!(second.json()["error"]["code"], json!("rate_limited"));
 
-        // The attempt rows are the audit trail, and there are two of them: the
-        // one that was refused by PocketBase and the one refused by the cap. A
-        // cap that stopped recording once it started refusing would leave an
-        // operator unable to tell "one guess" from "a thousand".
+        // Attempt 3: out of budget. The handler refuses on the count BEFORE it
+        // looks the credential up, so this answer is the throttle and not a third
+        // 401 - which is what the status pins.
+        let third = call(login(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest {
+                email: "nobody@example.com".into(),
+                password: "wrong-password".into(),
+            })),
+        ))
+        .await;
+        assert_eq!(
+            third.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the attempt after the budget is spent must be throttled: {}",
+            third.body_text()
+        );
+        assert_eq!(third.json()["error"]["code"], json!("rate_limited"));
+
+        // The attempt rows are the audit trail, and there are THREE of them - every
+        // attempt, including the one the cap refused. That is not an oversight:
+        // `record_and_check_login` writes both counters BEFORE it checks either,
+        // because a caller already over the per-IP cap must still move the
+        // per-account counter, or a distributed guesser - over the per-IP cap by
+        // construction - would never touch the counter written to catch them. The
+        // cost is that a throttled caller does grow the table; the bound is that
+        // the window is an hour and the growth is one row per REFUSED request,
+        // which is the price of the two counters staying independent.
         let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login'")
             .fetch_one(&pool)
             .await
             .expect("count attempts");
         assert_eq!(
-            recorded, 2,
-            "both attempts must be on the books - the failure stream IS the signal"
+            recorded, 3,
+            "every attempt must be on the books, the refused one included - the failure \
+             stream IS the signal"
         );
 
         // No raw address anywhere, and the key is the salted hash.
@@ -2658,42 +1794,59 @@ mod tests {
         let pool = db.pool.clone();
 
         let _lock = crate::routes::test_env::EnvLock::acquire();
-        set_test_limits_override(1, 100);
+        let _caps = TestLimitsGuard::set(2, 100);
+        // ONE state for the whole test. See the note on `state_for`: the salt it
+        // carries is the key the per-IP counter is stored under, so a state per
+        // request would put every attempt in its own budget and the cap below
+        // could never fire however many attempts were sent.
+        let state = state_for(&pool);
 
-        let base = pocketbase_stub(
-            "401 Unauthorized",
-            r#"{"code":401,"message":"Failed to authenticate."}"#,
-        )
-        .await;
-        let (_pb_lock, _pb_guard) = point_pocketbase_at(&base);
+        // The first address spends its whole budget: the two attempts below are
+        // both answered as credential failures, and a third one would be the
+        // throttle. Pinning the exhausted state is what makes the next assertion
+        // about the OTHER address rather than about a budget nothing spent.
+        for _ in 0..2 {
+            let spent = call(login(
+                State(state.clone()),
+                peer(),
+                HeaderMap::new(),
+                Ok(Json(LoginRequest {
+                    email: "nobody@example.com".into(),
+                    password: "wrong-password".into(),
+                })),
+            ))
+            .await;
+            assert_eq!(spent.status, StatusCode::UNAUTHORIZED);
+        }
 
-        let first = call(exchange_token(
-            State(state_for(&pool)),
+        let exhausted = call(login(
+            State(state.clone()),
             peer(),
             HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-wrong-token".into(),
+            Ok(Json(LoginRequest {
+                email: "nobody@example.com".into(),
+                password: "wrong-password".into(),
             })),
         ))
         .await;
-        assert_eq!(first.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            exhausted.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first address must be out of budget, or the assertion below is vacuous"
+        );
 
-        // Same database, same instant, DIFFERENT peer address. A second stub
-        // because the first answered its one request.
+        // Same database, same instant, DIFFERENT peer address. If the limiter were
+        // counting every login in the process rather than per client, this one
+        // would be throttled too.
         let other = ConnectInfo("198.51.100.7:5555".parse().unwrap());
-        let base2 = pocketbase_stub(
-            "401 Unauthorized",
-            r#"{"code":401,"message":"Failed to authenticate."}"#,
-        )
-        .await;
-        let (_pb_lock2, _pb_guard2) = point_pocketbase_at(&base2);
 
-        let second = call(exchange_token(
-            State(state_for(&pool)),
+        let second = call(login(
+            State(state.clone()),
             other,
             HeaderMap::new(),
-            Ok(Json(AuthExchangeRequest {
-                pb_token: "a-wrong-token".into(),
+            Ok(Json(LoginRequest {
+                email: "nobody@example.com".into(),
+                password: "wrong-password".into(),
             })),
         ))
         .await;
@@ -2708,22 +1861,49 @@ mod tests {
     }
 }
 
-/// States the `[limits]` sign-in caps a test wants, without touching the config file.
+/// States the `[limits]` caps a test wants, without touching the config file, and
+/// clears them again when the test ends.
 ///
-/// Consumed ONCE by `limits_config`, which clones it out and clears it. That is
-/// what makes it safe to hold in a `static Mutex` across test threads: a test that
-/// sets it takes it back on the very next call, so the window in which another
-/// test could observe it is one request wide - and the `test_env::EnvLock` these
-/// tests already hold makes that window empty in practice.
+/// A GUARD rather than a setter, because the override has to hold for every
+/// request the test sends: a cap is only observable by exhausting it, and
+/// exhausting one takes more than one call. The earlier take-on-read version
+/// covered exactly one request, so a three-request test against a cap of two was
+/// really testing a cap of two followed by the shipped twenty, and its assertions
+/// were about the timing of the override rather than about the cap.
+///
+/// BOTH HALVES ARE REQUIRED, exactly as `test_env`'s docs argue for environment
+/// variables: `EnvLock` stops two tests from interleaving, and `Drop` is what
+/// makes the window close on the success path and on an assertion panic alike. A
+/// panic that left a cap of two behind would silently throttle every auth test
+/// that ran afterwards in the same process, which is the failure mode this crate
+/// reserves for guards.
 #[cfg(test)]
-fn set_test_limits_override(per_ip: u32, per_account: u32) {
-    let mut current = crate::routes::auth::TEST_LIMITS_OVERRIDE
-        .lock()
-        .expect("the test override lock is never poisoned");
-    let mut limits = AppConfig::load_from_file("../config/apikita.toml")
-        .expect("the shipped config parses; every route module's fixture loads it")
-        .limits;
-    limits.login_per_hour_per_ip = per_ip;
-    limits.login_per_hour_per_account = per_account;
-    *current = Some(limits);
+struct TestLimitsGuard;
+
+#[cfg(test)]
+impl TestLimitsGuard {
+    fn set(per_ip: u32, per_account: u32) -> Self {
+        let mut current = crate::routes::auth::TEST_LIMITS_OVERRIDE
+            .lock()
+            .expect("the test override lock is never poisoned");
+        let mut limits = AppConfig::load_from_file("../config/apikita.toml")
+            .expect("the shipped config parses; every route module's fixture loads it")
+            .limits;
+        limits.login_per_hour_per_ip = per_ip;
+        limits.login_per_hour_per_account = per_account;
+        limits.signup_per_hour_per_ip = per_ip;
+        limits.password_reset_per_hour_per_account = per_account;
+        limits.verification_resend_per_hour = per_ip;
+        *current = Some(limits);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLimitsGuard {
+    fn drop(&mut self) {
+        *crate::routes::auth::TEST_LIMITS_OVERRIDE
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = None;
+    }
 }

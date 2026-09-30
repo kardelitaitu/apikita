@@ -840,7 +840,6 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
-    use crate::routes::auth::{exchange_token, AuthExchangeRequest};
     use crate::routes::events::RealtimeHub;
     use crate::routes::hash_token;
     use crate::routes::keys::{create_key, CreateKeyRequest};
@@ -849,66 +848,19 @@ mod tests {
     use sqlx::SqlitePool;
 
     // -----------------------------------------------------------------------
-    // A loopback PocketBase, for the login-after-suspend test.
+    // The loopback PocketBase stub that used to live here is DELETED with the
+    // service it stood in for. It existed to drive `exchange_token` against a
+    // real `verify_pb_token` without a live PocketBase, and both of those are
+    // gone from this crate: identity is a local row now. Keeping the stub would
+    // leave a fixture that starts a listener nothing dials - a test-shaped
+    // object describing a program that is not running.
     //
-    // The test this replaces was `#[ignore]`d with the note "faking that would
-    // test the fake". That is true of faking the LOGIC, but the PEER can be a
-    // stub: `verify_pb_token` builds its URL from `pocketbase_base_url()`, which
-    // reads `POCKETBASE_URL` on every call. Pointing that variable at a loopback
-    // listener drives the REAL client, the REAL status handling and the REAL
-    // `exchange_token` handler - no mock, no trait object, no production change.
-    //
-    // This is the same technique that took `routes/auth.rs` from 58.6% to 98.2%,
-    // applied to the last remaining `#[ignore]` in the crate.
+    // The login-after-suspend test it served is now stronger for it: it signs in
+    // through the native `login` handler with a real Argon2id hash, so it needs
+    // no external service at all. It was THE LAST `#[ignore]` in the crate and
+    // it now runs by construction rather than by stubbing.
     // -----------------------------------------------------------------------
 
-    /// A one-shot local HTTP stub standing in for PocketBase auth-refresh.
-    async fn pocketbase_stub(status_line: &str, body: &str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the PocketBase stub");
-        let addr = listener.local_addr().expect("stub address");
-
-        let response = format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 8192];
-                let _ = socket.read(&mut buf).await;
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.flush().await;
-                let _ = socket.shutdown().await;
-            }
-        });
-
-        format!("http://{addr}")
-    }
-
-    /// A successful auth-refresh body, shaped as PocketBase sends it.
-    fn auth_refresh_body(record_id: &str) -> String {
-        format!(
-            r#"{{"token":"new.jwt.value","record":{{"id":"{record_id}","email":"u@example.com"}}}}"#
-        )
-    }
-
-    /// Point POCKETBASE_URL at the stub for the duration of the test. Takes the
-    /// shared env lock, so it cannot interleave with another test reading the
-    /// same process-global.
-    fn point_pocketbase_at(
-        base: &str,
-    ) -> (
-        crate::routes::test_env::EnvLock,
-        crate::routes::test_env::EnvGuard,
-    ) {
-        let lock = crate::routes::test_env::EnvLock::acquire();
-        let guard = crate::routes::test_env::EnvGuard::set("POCKETBASE_URL", base);
-        (lock, guard)
-    }
     // -----------------------------------------------------------------------
     // Fixtures. Same style as keys.rs/account.rs: a real, migrated database, the
     // real handlers, and the real money path - never a hand-written balance.
@@ -2007,24 +1959,22 @@ mod tests {
         let operator = create_operator(&pool).await;
         let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
 
-        let record_id = format!("pb{}", Uuid::new_v4().simple());
-        let base = pocketbase_stub("200 OK", &auth_refresh_body(&record_id)).await;
-        let (_lock, _guard) = point_pocketbase_at(&base);
-        // The stub answers ANY token with this record, so the token value is not
-        // what is under test here - the ACCOUNT STATUS is.
-        let pb_token = "a-valid-token".to_string();
-
-        // Every NOT NULL column is bound from Rust: the SQLite schema has no
-        // DEFAULT for id, created_at or updated_at.
-        let victim = Uuid::new_v4();
-        let victim_now = Utc::now();
-        sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)")
-            .bind(victim.hyphenated())
-            .bind(victim_now)
-            .bind(victim_now)
-        .execute(&pool)
+        // A real password identity, created through the same production helper the
+        // signup handler uses, so the credential the login below presents is a real
+        // Argon2id hash and not a fixture value the verifier happens to accept.
+        let auth = live_config().auth.clone();
+        let password = "correct horse battery staple".to_string();
+        let hash = crate::identity::password::hash_password(auth, password.clone())
+            .await
+            .expect("hash the fixture password");
+        let victim = crate::identity::accounts::create_password_account(
+            &pool,
+            "victim@example.com",
+            &hash,
+            Utc::now(),
+        )
         .await
-        .expect("create the account the login would have created");
+        .expect("create the account the login would have signed in to");
 
         let (status, _) = render(suspend_account(
             State(state.clone()),
@@ -2035,14 +1985,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let (status, body) = render_axum(
-            exchange_token(
+            crate::routes::auth::login(
                 State(state.clone()),
                 axum::extract::ConnectInfo(
                     std::net::SocketAddr::from(([127, 0, 0, 1], 12345)),
                 ),
                 HeaderMap::new(),
-                Ok(Json(AuthExchangeRequest {
-                    pb_token: pb_token.clone(),
+                Ok(Json(crate::routes::auth::LoginRequest {
+                    email: "victim@example.com".to_string(),
+                    password,
                 })),
             )
             .await,
