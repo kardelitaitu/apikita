@@ -132,6 +132,7 @@ mod doc_claims;
 #[cfg(test)]
 mod doc_schema;
 pub mod error;
+pub mod identity;
 pub mod ip_tracking;
 pub mod money;
 pub mod routes;
