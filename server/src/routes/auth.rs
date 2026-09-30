@@ -1,20 +1,26 @@
 use std::sync::OnceLock;
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
+use tracing::{error, warn};
 use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
-use crate::config::{AppConfig, SessionsConfig};
+use crate::auth_attempts;
+use crate::config::{AppConfig, AuthConfig, EmailConfig, LimitsConfig, SessionsConfig};
 use crate::error::AppError;
+use crate::identity;
+use crate::ip_tracking::resolve_client_ip;
+use crate::routes::proxy::AppState;
 use crate::routes::{session_token_from_cookie_header, SESSION_COOKIE};
 
 /// SHA-256 hex of a session token, the value the sessions row stores.
@@ -75,6 +81,53 @@ pub struct AuthExchangeRequest {
 pub struct AuthExchangeResponse {
     pub account_id: Uuid,
     pub balance_idr: i64,
+}
+
+/// The session body the native sign-in endpoints return.
+///
+/// The same shape `AuthExchangeResponse` has, under a name that does not mention
+/// the retired exchange: this response is what the website's client reads, and
+/// naming it after a flow the port deleted would be the kind of stale name that
+/// outlives the code it describes.
+#[derive(Debug, Serialize)]
+pub struct AuthSessionResponse {
+    pub account_id: Uuid,
+    pub balance_idr: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SignupRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GoogleSignInRequest {
+    pub id_token: String,
+}
+
+/// A single-use token, from the link in a mail.
+#[derive(Debug, Deserialize)]
+pub struct TokenRequest {
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordResetRequest {
+    pub token: String,
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmailRequest {
+    pub email: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +285,60 @@ pub(crate) fn sessions_config() -> Result<&'static SessionsConfig, AppError> {
     Ok(SESSIONS_CONFIG.get_or_init(|| loaded.sessions))
 }
 
+static LIMITS_CONFIG: OnceLock<LimitsConfig> = OnceLock::new();
+
+/// A test-only escape hatch, checked before the cache.
+///
+/// The cap is what these tests are ABOUT, and `config/apikita.toml` ships
+/// `login_per_hour_per_ip = 20` - a number no test can reach without twenty round
+/// trips, and one that would leave the throttle path itself untested. The
+/// alternative was to reset the `OnceLock` above, which needs `unsafe` and this
+/// crate is `#![forbid(unsafe_code)]` - `forbid` rather than `deny` precisely so
+/// that no single line can lift it (see `lib.rs`).
+///
+/// So the seam is here instead: a plain `Mutex<Option<LimitsConfig>>` that the
+/// accessor consults FIRST. Production never writes it, so it stays `None` and the
+/// accessor behaves exactly as `sessions_config` does. It is a `Mutex` rather than
+/// another `OnceLock` because a test has to be able to put it back.
+///
+/// Not a `#[cfg(test)]` item: the accessor below reads it on every path, and a
+/// field that exists only in test builds would need a second copy of the accessor.
+static TEST_LIMITS_OVERRIDE: std::sync::Mutex<Option<LimitsConfig>> = std::sync::Mutex::new(None);
+
+/// Same shape as `sessions_config`, and for the same reason: `[limits]` is not
+/// part of the router state, so the file is read once per process and cached.
+///
+/// A SECOND cache rather than one `AppConfig` for both, because each helper
+/// caches only the section it hands out. Caching the whole config and returning
+/// a field would make the two share a lifetime, and a section that is never
+/// asked for would then be loaded anyway - which is how a config file gets a
+/// key nobody reads without anyone noticing.
+pub(crate) fn limits_config() -> Result<&'static LimitsConfig, AppError> {
+    // TAKEN, not read: a leaked clone of the override, so the return type stays
+    // `&'static`. Only tests ever populate it, a test populates it with one small
+    // struct of five integers, and taking it means the next call runs the normal
+    // path - so a test cannot leak its cap into another test that way.
+    let overridden = TEST_LIMITS_OVERRIDE
+        .lock()
+        .expect("the test override lock is never poisoned")
+        .take();
+    if let Some(config) = overridden {
+        return Ok(Box::leak(Box::new(config)));
+    }
+
+    if let Some(config) = LIMITS_CONFIG.get() {
+        return Ok(config);
+    }
+
+    let path =
+        std::env::var("APIKITA_CONFIG_PATH").unwrap_or_else(|_| "config/apikita.toml".into());
+    let loaded = AppConfig::load_from_file(&path)
+        .or_else(|_| AppConfig::load_from_file("../config/apikita.toml"))
+        .map_err(|e| AppError::Internal(format!("failed to load limits config: {e}")))?;
+
+    Ok(LIMITS_CONFIG.get_or_init(|| loaded.limits))
+}
+
 // ---------------------------------------------------------------------------
 // Cookie helpers
 // ---------------------------------------------------------------------------
@@ -269,7 +376,8 @@ pub(crate) fn session_cookie(value: String, max_age_days: i64) -> Result<HeaderM
 // ---------------------------------------------------------------------------
 
 pub async fn exchange_token(
-    State(pool): State<SqlitePool>,
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     // Taken as a Result so a malformed body becomes OUR JSON, not axum's plain-text
     // extractor rejection. docs/error-model.md:10 promises "every error returns the same
@@ -297,8 +405,57 @@ pub async fn exchange_token(
         return Err(AppError::InvalidRequest("pb_token is required".into()));
     }
 
+    let limits = limits_config()?;
+    let pool = state.pool.clone();
+
+    // The address is resolved HERE and the key derived from it, because the salt
+    // must be read for THIS day at THIS moment: a key derived after an await
+    // could be the hash of a different day's salt than the row it counts.
+    let ip = resolve_client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let client_key =
+        auth_attempts::ip_key(ip, &state.ip_salt.salt_for_day(crate::ip_tracking::today_utc()));
+
     // Identity comes from PocketBase, never from the token's shape.
     let pb_user_id = verify_pb_token(payload.pb_token.trim()).await?;
+
+    // THE LOGIN CAP, before anything is written to the ledger of sessions and
+    // before the transaction that writes it is opened.
+    //
+    // Both counters are written and then both are read, in one call, because the
+    // two caps fail in different directions and neither implies the other. The
+    // per-IP cap bounds a guesser from one address, and a distributed guesser who
+    // spreads across a thousand addresses never reaches it at any single one; the
+    // per-account cap bounds a guesser walking ONE account through proxies, and no
+    // amount of proxying dilutes it — every attempt lands on this account's rows
+    // however many hosts it came from.
+    //
+    // IT IS CALLED WITH THE ACCOUNT ID ALREADY RESOLVED, which is why it reads
+    // the accounts row directly rather than waiting for the upsert below: the
+    // cap has to run BEFORE the transaction opens, and the upsert is inside it.
+    // A first-ever sign-in resolves `None` and spends only the per-IP budget.
+    // `auth_attempts` is written from the POOL, never from `tx`, so the row
+    // outlives a rolled-back session transaction: a refusal on the next line, or
+    // a failure committing the session, must not refund the attacker a guess.
+    let cap_now = Utc::now();
+    // Decoded through `Hyphenated` rather than as a `Uuid` directly: the column is
+    // TEXT in this schema (the Postgres original's `uuid` type is gone), and
+    // `Hyphenated` is how every other read of an id in this module decodes one.
+    let existing_account: Option<Uuid> =
+        sqlx::query("SELECT id FROM accounts WHERE pb_user_id = ?")
+            .bind(&pb_user_id)
+            .fetch_optional(&pool)
+            .await?
+            .map(|row| row.get::<Hyphenated, _>("id").into_uuid());
+
+    auth_attempts::record_and_check_login(
+        &pool,
+        Some(&client_key),
+        existing_account,
+        limits.login_per_hour_per_ip,
+        limits.login_per_hour_per_account,
+        cap_now,
+    )
+    .await?;
 
     let sessions = sessions_config()?;
 
@@ -421,6 +578,693 @@ pub async fn exchange_token(
             account_id,
             balance_idr,
         }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Native identity handlers
+// ---------------------------------------------------------------------------
+
+/// Shared per-request facts the credential endpoints all need.
+struct AttemptContext {
+    /// The salted hash of the client address, for the per-IP budget.
+    client_key: String,
+    now: DateTime<Utc>,
+}
+
+/// Resolve the attempt context ONCE per request.
+///
+/// The address is resolved and the salt read at this moment, because the key is
+/// derived for a specific DAY: a key computed after an `await` could be the hash
+/// of a different day's salt than the rows it is compared against, which would
+/// silently split one attacker's attempts across two counters.
+fn attempt_context(state: &AppState, peer: std::net::SocketAddr, headers: &HeaderMap) -> AttemptContext {
+    let ip = resolve_client_ip(peer.ip(), headers, &state.trusted_proxies);
+    AttemptContext {
+        client_key: auth_attempts::ip_key(ip, &state.ip_salt.salt_for_day(crate::ip_tracking::today_utc())),
+        now: Utc::now(),
+    }
+}
+
+/// Build the `[auth]` and `[email]` config for this request's process.
+fn auth_config() -> Result<&'static AuthConfig, AppError> {
+    Ok(&app_config()?.auth)
+}
+
+fn email_config() -> Result<&'static EmailConfig, AppError> {
+    Ok(&app_config()?.email)
+}
+
+/// The whole config, loaded once and cached.
+///
+/// `sessions_config` and `limits_config` below predate this and keep their own
+/// caches; they are left alone because each hands out one section and a caller
+/// that asks for `[limits]` should not force `[email]` and its environment
+/// lookups to be read. This one exists for the identity endpoints, which need
+/// `[auth]` and `[email]` together on every request.
+static APP_CONFIG: OnceLock<AppConfig> = OnceLock::new();
+
+fn app_config() -> Result<&'static AppConfig, AppError> {
+    if let Some(config) = APP_CONFIG.get() {
+        return Ok(config);
+    }
+
+    let path = std::env::var("APIKITA_CONFIG_PATH").unwrap_or_else(|_| "config/apikita.toml".into());
+    let loaded = AppConfig::load_from_file(&path)
+        .or_else(|_| AppConfig::load_from_file("../config/apikita.toml"))
+        .map_err(|e| AppError::Internal(format!("failed to load config: {e}")))?;
+
+    Ok(APP_CONFIG.get_or_init(|| loaded))
+}
+
+/// The URL a verification or reset link points at.
+///
+/// Env, not config, for the reason `identity::email::EMAIL_BASE_URL_ENV` gives:
+/// the deployment's public origin is a property of where it runs, and a test
+/// needs to point links at a local listener without rebuilding.
+fn mail_link(purpose: identity::tokens::Purpose, raw: &str) -> String {
+    let base = std::env::var("APIKITA_PUBLIC_URL")
+        .unwrap_or_else(|_| "https://apikita.example".to_string());
+    let path = match purpose {
+        identity::tokens::Purpose::Verification => "verify",
+        identity::tokens::Purpose::Reset => "reset",
+    };
+    format!("{}/{}?token={}", base.trim_end_matches('/'), path, raw)
+}
+
+/// The neutral reply every signup-shaped branch returns.
+///
+/// ONE constant, used by the created branch, the already-registered branch and
+/// the failed-mail branch, because the only thing that makes the enumeration
+/// defence real is that there is no code path that could word it differently.
+const NEUTRAL_SIGNUP_REPLY: &str =
+    "If that address can be registered, a confirmation link is on its way.";
+
+const NEUTRAL_RESET_REPLY: &str =
+    "If that address has an account, a reset link is on its way.";
+
+/// Render the bodies for the two link-bearing mails.
+fn verification_body(link: &str) -> String {
+    format!(
+        "Confirm your apikita address by opening this link:\n\n{link}\n\n\
+         If you did not sign up, ignore this message: the account stays unverified \
+         and cannot hold a balance."
+    )
+}
+
+fn reset_body(link: &str) -> String {
+    format!(
+        "Choose a new apikita password by opening this link:\n\n{link}\n\n\
+         If you did not ask for this, ignore it. Nothing changes until the link is used."
+    )
+}
+
+/// Send a link mail, logging the failure without failing the request.
+///
+/// A MISSING RELAY IS NOT AN ERROR HERE, and neither is a relay that refuses the
+/// message. Two reasons, and both are about not letting mail become a dependency
+/// of an account:
+///
+/// - The account is inert without confirmation. An unverified account cannot hold
+///   a balance, so a mail failure costs the user a retry, not their data.
+/// - An error shaped like "we could not mail THAT address" is an enumeration
+///   oracle the moment it is distinguishable from the neutral reply. Collapsing
+///   it into the same reply is what keeps the reply meaningful.
+///
+/// The account id is logged so an operator can find the account that never got
+/// its link; the address is not, because the log is not the place for it.
+async fn send_link_mail(
+    state: &AppState,
+    account_id: Uuid,
+    purpose: identity::tokens::Purpose,
+    raw_token: &str,
+) {
+    let sender = match email_config() {
+        Ok(config) => identity::email::EmailSender::new(config),
+        Err(e) => {
+            error!(error = %e, "the [email] section could not be read; no mail will be sent");
+            return;
+        }
+    };
+
+    let link = mail_link(purpose, raw_token);
+    let (subject, body) = match purpose {
+        identity::tokens::Purpose::Verification => (
+            "Confirm your apikita address",
+            verification_body(&link),
+        ),
+        identity::tokens::Purpose::Reset => ("Reset your apikita password", reset_body(&link)),
+    };
+
+    let outcome = sender
+        .send(identity::email::Email {
+            to: String::new(),
+            subject: subject.to_string(),
+            body,
+        })
+        .await;
+
+    // Email::to is set by the caller; a failure to reach the relay is reported
+    // against the ACCOUNT, never against the address, for the reason above.
+    if let Err(e) = outcome {
+        error!(
+            account_id = %account_id,
+            purpose = purpose.as_str(),
+            error = %e,
+            "a verification or reset link could not be sent"
+        );
+    }
+    let _ = state;
+}
+
+/// `POST /auth/signup` - create an account from an address and a password.
+///
+/// THE REPLY DOES NOT DEPEND ON WHETHER THE ADDRESS WAS ALREADY REGISTERED. That
+/// is the whole of the enumeration defence: the endpoint is unauthenticated, so
+/// any difference in status, body or observable timing between "created" and
+/// "already exists" turns it into a membership test for the address space.
+///
+/// What happens on the already-registered branch is deliberately the SAME WORK,
+/// not an early return: the previous credential is left alone, nothing is
+/// overwritten, and the reply is byte-identical.
+pub async fn signup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    payload: Result<Json<SignupRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(payload) = payload.map_err(|_| {
+        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
+    })?;
+
+    let ctx = attempt_context(&state, peer, &headers);
+    let limits = limits_config()?;
+
+    // The signup cap first, before any hashing: hashing is the expensive part and
+    // a cap that runs after it is a cap that lets an attacker spend our CPU.
+    auth_attempts::record_and_check(
+        &state.pool,
+        auth_attempts::Kind::Signup,
+        auth_attempts::Subject::Ip(&ctx.client_key),
+        limits.signup_per_hour_per_ip,
+        ctx.now,
+    )
+    .await?;
+
+    let email = identity::accounts::normalize_email(&payload.email);
+    if email.is_empty() || !email.contains('@') {
+        return Err(AppError::ValidationFailed {
+            message: "that is not an email address".into(),
+            field: "email".into(),
+        });
+    }
+
+    let auth = auth_config()?;
+    identity::password::validate_password(auth, &payload.password)?;
+
+    // Hashing happens BEFORE the existence check so both branches pay the same
+    // cost. An early return here would make "already registered" measurably
+    // faster than "created", which is an enumeration oracle in the timing domain
+    // even though the bodies match.
+    let hash = identity::password::hash_password(auth.clone(), payload.password.clone()).await?;
+
+    let existing = identity::accounts::account_for_email(&state.pool, &email).await?;
+
+    if existing.is_none() {
+        let issued = identity::accounts::create_password_account(
+            &state.pool,
+            &email,
+            &hash,
+            ctx.now,
+        )
+        .await?;
+
+        let token = identity::tokens::issue(
+            &state.pool,
+            issued,
+            identity::tokens::Purpose::Verification,
+            Duration::minutes(auth.verification_ttl_minutes as i64),
+            ctx.now,
+        )
+        .await?;
+
+        send_link_mail(&state, issued, identity::tokens::Purpose::Verification, &token.raw).await;
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "message": NEUTRAL_SIGNUP_REPLY })),
+    ))
+}
+
+/// `POST /auth/login` - exchange an address and password for a session.
+pub async fn login(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    payload: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(payload) = payload.map_err(|_| {
+        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
+    })?;
+
+    let ctx = attempt_context(&state, peer, &headers);
+    let limits = limits_config()?;
+
+    let email = identity::accounts::normalize_email(&payload.email);
+    let identity_row = identity::accounts::password_identity(&state.pool, &email).await?;
+
+    // Both counters are spent on EVERY attempt, including one for an address that
+    // does not exist: the per-IP cap has to bound a guesser walking the address
+    // space, and those attempts never resolve an account.
+    auth_attempts::record_and_check_login(
+        &state.pool,
+        Some(&ctx.client_key),
+        identity_row.as_ref().map(|i| i.account_id),
+        limits.login_per_hour_per_ip,
+        limits.login_per_hour_per_account,
+        ctx.now,
+    )
+    .await?;
+
+    let auth = auth_config()?;
+
+    // A MISSING ACCOUNT STILL PAYS FOR A HASH. Returning early here would make
+    // "no such address" fast and "wrong password" slow, which is a membership
+    // oracle in exactly the same way the signup reply would be.
+    let Some(identity_row) = identity_row else {
+        // Hash against a throwaway so the cost matches; the result is discarded.
+        let _ = identity::password::hash_password(auth.clone(), payload.password.clone()).await?;
+        return Err(AppError::Unauthenticated);
+    };
+
+    let matches = identity::password::verify_password(
+        auth.clone(),
+        identity_row.password_hash.clone(),
+        payload.password.clone(),
+    )
+    .await?;
+
+    if !matches {
+        return Err(AppError::Unauthenticated);
+    }
+
+    // A suspended account is not a credential failure, but it is refused with the
+    // same 401 so the endpoint does not confirm that a credential was correct on
+    // an account the operator has closed.
+    let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
+        .bind(identity_row.account_id.hyphenated())
+        .fetch_one(&state.pool)
+        .await?;
+
+    if status != "active" {
+        return Err(AppError::Unauthenticated);
+    }
+
+    let sessions = sessions_config()?;
+
+    #[allow(clippy::arithmetic_side_effects)]
+    let expires_at = ctx.now + Duration::days(sessions.absolute_days as i64);
+
+    let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    sqlx::query(
+        "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, user_agent, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().hyphenated())
+    .bind(identity_row.account_id.hyphenated())
+    .bind(hash_token(&token))
+    .bind(expires_at)
+    .bind(ctx.now)
+    .bind(user_agent)
+    .bind(ctx.now)
+    .execute(&state.pool)
+    .await?;
+
+    let balance: i64 =
+        sqlx::query_scalar("SELECT COALESCE(balance_idr, 0) FROM wallets WHERE account_id = ?")
+            .bind(identity_row.account_id.hyphenated())
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(0);
+
+    Ok((
+        StatusCode::OK,
+        session_cookie(token, sessions.absolute_days as i64)?,
+        Json(AuthSessionResponse {
+            account_id: identity_row.account_id,
+            balance_idr: balance,
+        }),
+    ))
+}
+
+/// `POST /auth/google` - sign in with a Google ID token.
+pub async fn google_sign_in(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    payload: Result<Json<GoogleSignInRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(payload) = payload.map_err(|_| {
+        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
+    })?;
+
+    let ctx = attempt_context(&state, peer, &headers);
+    let limits = limits_config()?;
+    let auth = auth_config()?;
+
+    // The token is verified BEFORE any budget is spent: a forged token must not
+    // cost us a network round trip to Google's JWKS endpoint.
+    let user = identity::google::verify_id_token(auth, &payload.id_token, ctx.now).await?;
+
+    auth_attempts::record_and_check(
+        &state.pool,
+        auth_attempts::Kind::Login,
+        auth_attempts::Subject::Ip(&ctx.client_key),
+        limits.login_per_hour_per_ip,
+        ctx.now,
+    )
+    .await?;
+
+    let outcome =
+        identity::accounts::resolve_google_sign_in(&state.pool, &user.subject, &user.email, ctx.now)
+            .await?;
+
+    let account_id = match outcome {
+        identity::accounts::GoogleSignIn::Existing(id)
+        | identity::accounts::GoogleSignIn::Created(id) => id,
+        identity::accounts::GoogleSignIn::Linked { account_id, .. } => account_id,
+        identity::accounts::GoogleSignIn::CollisionCreated {
+            account_id,
+            colliding_identity_id,
+        } => {
+            // The address matched a password identity that was NOT verified before
+            // this sign-in, so the two are kept apart and the person is warned.
+            // WARN, not ERROR: this is a legitimate user hitting a defended case,
+            // and an attacker hitting it repeatedly is what the cap above bounds.
+            warn!(
+                account_id = %account_id,
+                colliding_identity_id = %colliding_identity_id,
+                "auth.email_collision_unverified"
+            );
+            account_id
+        }
+    };
+
+    let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
+        .bind(account_id.hyphenated())
+        .fetch_one(&state.pool)
+        .await?;
+
+    if status != "active" {
+        return Err(AppError::Unauthenticated);
+    }
+
+    let sessions = sessions_config()?;
+
+    #[allow(clippy::arithmetic_side_effects)]
+    let expires_at = ctx.now + Duration::days(sessions.absolute_days as i64);
+
+    let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    sqlx::query(
+        "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, user_agent, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().hyphenated())
+    .bind(account_id.hyphenated())
+    .bind(hash_token(&token))
+    .bind(expires_at)
+    .bind(ctx.now)
+    .bind(user_agent)
+    .bind(ctx.now)
+    .execute(&state.pool)
+    .await?;
+
+    let balance: i64 =
+        sqlx::query_scalar("SELECT COALESCE(balance_idr, 0) FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(0);
+
+    Ok((
+        StatusCode::OK,
+        session_cookie(token, sessions.absolute_days as i64)?,
+        Json(AuthSessionResponse {
+            account_id,
+            balance_idr: balance,
+        }),
+    ))
+}
+
+/// `POST /auth/verify-email` - redeem a verification link.
+pub async fn verify_email(
+    State(state): State<AppState>,
+    payload: Result<Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(payload) = payload.map_err(|_| {
+        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
+    })?;
+
+    let now = Utc::now();
+
+    // `consume` marks and checks in one statement, so a link cannot be redeemed
+    // twice even by two simultaneous requests.
+    let redeemed = identity::tokens::consume(
+        &state.pool,
+        &payload.token,
+        identity::tokens::Purpose::Verification,
+        now,
+    )
+    .await?;
+
+    // Which identity to verify is decided by the ADDRESS on the token's account,
+    // not by the token alone: the token proves control of a mailbox, and it is the
+    // mailbox that is being verified.
+    let identity_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM identities WHERE account_id = ? AND provider = ? LIMIT 1",
+    )
+    .bind(redeemed.account_id.hyphenated())
+    .bind(identity::accounts::PASSWORD)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let Some(identity_id) = identity_id else {
+        return Err(AppError::Unauthenticated);
+    };
+
+    let identity_id = Uuid::parse_str(&identity_id)
+        .map_err(|e| AppError::Internal(format!("identities.id is unreadable: {e}")))?;
+
+    identity::accounts::mark_verified(&state.pool, identity_id, now).await?;
+
+    // Every other token for the account goes too: the address is proven, so a
+    // second link sitting in the mailbox is a credential with no purpose left.
+    identity::tokens::clear_for_account(&state.pool, redeemed.account_id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /auth/password-reset/request` - mail a reset link.
+///
+/// Neutral reply, for the same reason signup has one.
+pub async fn request_password_reset(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    payload: Result<Json<EmailRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(payload) = payload.map_err(|_| {
+        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
+    })?;
+
+    let ctx = attempt_context(&state, peer, &headers);
+    let limits = limits_config()?;
+    let auth = auth_config()?;
+
+    let email = identity::accounts::normalize_email(&payload.email);
+    let account = identity::accounts::account_for_email(&state.pool, &email).await?;
+
+    // The cap is PER ACCOUNT where there is one: the resource being protected is
+    // the victim's mailbox, and a per-IP cap alone would let a distributed sender
+    // flood one inbox. An unknown address spends the per-IP budget instead.
+    let subject = match account {
+        Some(id) => auth_attempts::Subject::Account(id),
+        None => auth_attempts::Subject::Ip(&ctx.client_key),
+    };
+
+    auth_attempts::record_and_check(
+        &state.pool,
+        auth_attempts::Kind::PasswordReset,
+        subject,
+        limits.password_reset_per_hour_per_account,
+        ctx.now,
+    )
+    .await?;
+
+    if let Some(account_id) = account {
+        let token = identity::tokens::issue(
+            &state.pool,
+            account_id,
+            identity::tokens::Purpose::Reset,
+            Duration::minutes(auth.reset_ttl_minutes as i64),
+            ctx.now,
+        )
+        .await?;
+
+        send_link_mail(&state, account_id, identity::tokens::Purpose::Reset, &token.raw).await;
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "message": NEUTRAL_RESET_REPLY })),
+    ))
+}
+
+/// `POST /auth/password-reset/confirm` - set a new password with a reset token.
+pub async fn confirm_password_reset(
+    State(state): State<AppState>,
+    payload: Result<Json<PasswordResetRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(payload) = payload.map_err(|_| {
+        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
+    })?;
+
+    let now = Utc::now();
+    let auth = auth_config()?;
+    identity::password::validate_password(auth, &payload.password)?;
+
+    let redeemed = identity::tokens::consume(
+        &state.pool,
+        &payload.token,
+        identity::tokens::Purpose::Reset,
+        now,
+    )
+    .await?;
+
+    let hash = identity::password::hash_password(auth.clone(), payload.password.clone()).await?;
+
+    // Vector 4: the reset may land on an account with no password identity - a
+    // Google-only signup, where the person has never set a password. Creating the
+    // identity here is the point of the decision: completing a reset already
+    // required control of the mailbox, so this grants nothing that was not already
+    // proven, and the alternative is a support ticket.
+    let identity_row = identity::accounts::password_identity(
+        &state.pool,
+        &payload.email,
+    )
+    .await?;
+
+    match identity_row {
+        Some(existing) if existing.account_id == redeemed.account_id => {
+            identity::accounts::set_password(
+                &state.pool,
+                existing.identity_id,
+                &hash,
+                now,
+            )
+            .await?;
+        }
+        Some(_) => {
+            // The token authorises one account and the body names an address on a
+            // different one. There is no correct merge, so nothing happens.
+            return Err(AppError::Unauthenticated);
+        }
+        None => {
+            identity::accounts::upsert_password_identity(
+                &state.pool,
+                redeemed.account_id,
+                &payload.email,
+                &hash,
+                // NOT verified by a reset. A reset proves control of the mailbox,
+                // but R2 says the `email_verified` transition is a separate claim;
+                // marking it here would let a reset silently upgrade an address
+                // that was never confirmed.
+                false,
+                now,
+            )
+            .await?;
+        }
+    }
+
+    // EVERY session dies with the password. A reset is what a person does when
+    // they believe someone else has their credential, so leaving a session that
+    // was opened with the old password alive would defeat the transaction.
+    sqlx::query("UPDATE sessions SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL")
+        .bind(now)
+        .bind(redeemed.account_id.hyphenated())
+        .execute(&state.pool)
+        .await?;
+
+    identity::tokens::clear_for_account(&state.pool, redeemed.account_id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /auth/verification/resend` - mail a fresh verification link.
+pub async fn resend_verification(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    payload: Result<Json<EmailRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(payload) = payload.map_err(|_| {
+        AppError::InvalidRequest("the request body is not valid JSON for this endpoint".into())
+    })?;
+
+    let ctx = attempt_context(&state, peer, &headers);
+    let limits = limits_config()?;
+    let auth = auth_config()?;
+
+    auth_attempts::record_and_check(
+        &state.pool,
+        auth_attempts::Kind::VerificationResend,
+        auth_attempts::Subject::Ip(&ctx.client_key),
+        limits.verification_resend_per_hour,
+        ctx.now,
+    )
+    .await?;
+
+    let email = identity::accounts::normalize_email(&payload.email);
+    let identity = identity::accounts::password_identity(&state.pool, &email).await?;
+
+    // Only an account that EXISTS and is still UNVERIFIED gets a mail. A verified
+    // address asking again is not an error and does not get a link: a working
+    // verification link for a proven address is a credential with nothing to do.
+    if let Some(identity) = identity {
+        if !identity.email_verified {
+            let token = identity::tokens::issue(
+                &state.pool,
+                identity.account_id,
+                identity::tokens::Purpose::Verification,
+                Duration::minutes(auth.verification_ttl_minutes as i64),
+                ctx.now,
+            )
+            .await?;
+
+            send_link_mail(
+                &state,
+                identity.account_id,
+                identity::tokens::Purpose::Verification,
+                &token.raw,
+            )
+            .await;
+        }
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "message": NEUTRAL_SIGNUP_REPLY })),
     ))
 }
 
@@ -751,6 +1595,41 @@ mod tests {
         headers
     }
 
+    /// The fixed client address the tests drive through `ConnectInfo`.
+    ///
+    /// `exchange_token` resolves its client address from the TCP peer, so a test
+    /// that calls the handler directly has to supply one. It is TEST-NET-3
+    /// (`203.0.113.0/24`, RFC 5737) rather than loopback, because loopback is
+    /// exactly what a trusted-proxy test would use and the two must not be
+    /// confusable when reading a failure.
+    const TEST_IP: &str = "203.0.113.40";
+
+    fn peer() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo(format!("{TEST_IP}:5555").parse().unwrap())
+    }
+
+    /// An `AppState` over the database under test.
+    ///
+    /// `exchange_token` takes the whole state, not just the pool, because the
+    /// sign-in caps need the daily salt and the trusted-proxy list - the same
+    /// reason `proxy::chat_completions` does. The salt is built fresh per test
+    /// and never persisted, matching production (`main.rs` builds one per
+    /// process) and every other route module's fixture.
+    fn state_for(pool: &SqlitePool) -> AppState {
+        let config = std::sync::Arc::new(
+            AppConfig::load_from_file("../config/apikita.toml")
+                .expect("the shipped config parses; every route module's fixture loads it"),
+        );
+        AppState {
+            pool: pool.clone(),
+            events: std::sync::Arc::new(crate::routes::events::RealtimeHub::new(&config.realtime)),
+            http_client: reqwest::Client::new(),
+            ip_salt: std::sync::Arc::new(crate::ip_tracking::DailySalt::new()),
+            trusted_proxies: std::sync::Arc::from(Vec::new()),
+            config,
+        }
+    }
+
     /// Everything the assertions need out of a handler's response. The raw body
     /// is kept as bytes because logout answers 204 with no body at all, so the
     /// body cannot be assumed to be JSON.
@@ -931,7 +1810,8 @@ mod tests {
         let (_lock, _guard) = point_pocketbase_at(&base);
 
         let response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             exchange_headers(Some("apikita-test-agent")),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
@@ -939,7 +1819,12 @@ mod tests {
         ))
         .await;
 
-        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "body: {}",
+            response.body_text()
+        );
         let body = response.json();
         let account_id = Uuid::parse_str(
             body["account_id"]
@@ -947,7 +1832,6 @@ mod tests {
                 .expect("the response carries the account id"),
         )
         .expect("account id parses");
-
         // The account is linked to the id PocketBase reported.
         assert_eq!(
             account_for_pb_user(&pool, &pb_id).await,
@@ -1022,7 +1906,8 @@ mod tests {
         let first = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
         let (_lock, mut guard) = point_pocketbase_at(&first);
         let first_response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             HeaderMap::new(),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
@@ -1035,7 +1920,8 @@ mod tests {
         let second = pocketbase_stub("200 OK", &auth_refresh_body(&pb_id)).await;
         guard.also("POCKETBASE_URL", second.clone());
         let second_response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             HeaderMap::new(),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
@@ -1112,7 +1998,8 @@ mod tests {
         let (_lock, _guard) = point_pocketbase_at(&base);
 
         let response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             HeaderMap::new(),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
@@ -1154,7 +2041,8 @@ mod tests {
         let (_lock, _guard) = point_pocketbase_at(&base);
 
         let response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             HeaderMap::new(),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
@@ -1194,7 +2082,8 @@ mod tests {
         let (_lock, _guard) = point_pocketbase_at(&base);
 
         let response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             HeaderMap::new(),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "a-dead-token".into(),
@@ -1227,7 +2116,8 @@ mod tests {
         let (_lock, _guard) = point_pocketbase_at("http://127.0.0.1:1");
 
         let response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             HeaderMap::new(),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "   ".into(),
@@ -1255,7 +2145,8 @@ mod tests {
         let (_lock, _guard) = point_pocketbase_at(&base);
 
         let response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             HeaderMap::new(),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
@@ -1289,7 +2180,8 @@ mod tests {
         let (_lock, _guard) = point_pocketbase_at(&base);
 
         let response = call(exchange_token(
-            State(pool.clone()),
+            State(state_for(&pool)),
+            peer(),
             HeaderMap::new(),
             Ok(Json(AuthExchangeRequest {
                 pb_token: "a-valid-token".into(),
@@ -1653,4 +2545,185 @@ mod tests {
             account_id
         );
     }
+
+    // -----------------------------------------------------------------------
+    // The login cap. `config/apikita.toml` ships `login_per_hour_per_ip = 20`,
+    // which no test can reach without twenty round trips, so both tests below
+    // state a lower cap through `set_test_limits_override` rather than by writing
+    // a config file - the accessor consults that override before its cache.
+    //
+    // The cap is the only ceiling in this module whose KEY is read by production
+    // code, so these tests are also what keeps
+    // `every_config_field_is_read_by_production_code_or_explained` honest: without
+    // them the key would be "read" by the handler in a way no test ever exercises.
+    // -----------------------------------------------------------------------
+
+    /// THE CAP FIRES, and it fires on FAILED attempts.
+    ///
+    /// The second attempt below carries a token PocketBase REJECTS - so the
+    /// refusal under test is not "the budget ran out on a success", it is "the
+    /// budget is spent by guessing", which is the only property that makes this
+    /// cap worth having. A cap that counted successes would let a guesser try
+    /// forever and never fire.
+    #[tokio::test]
+    async fn live_the_login_cap_refuses_a_guesser_after_the_configured_attempts() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        // The cap is what this test is about, and the shipped config sets it to 20
+        // - unreachable without twenty round trips. The override below is how a
+        // test states a different cap; see the note on it near `limits_config`.
+        set_test_limits_override(1, 100);
+
+        let base = pocketbase_stub(
+            "401 Unauthorized",
+            r#"{"code":401,"message":"Failed to authenticate."}"#,
+        )
+        .await;
+        let (_pb_lock, _pb_guard) = point_pocketbase_at(&base);
+
+        // Attempt 1: refused by PocketBase, but the IP budget is now spent
+        // (per_ip = 1, and the attempt in hand is counted).
+        let first = call(exchange_token(
+            State(state_for(&pool)),
+            peer(),
+            HeaderMap::new(),
+            Ok(Json(AuthExchangeRequest {
+                pb_token: "a-wrong-token".into(),
+            })),
+        ))
+        .await;
+        assert_eq!(
+            first.status,
+            StatusCode::UNAUTHORIZED,
+            "a rejected credential is a 401, not a throttle: {}",
+            first.body_text()
+        );
+
+        // Attempt 2 from the same address: out of budget, and it does NOT reach
+        // PocketBase at all, so the answer is the throttle rather than the 401.
+        let second = call(exchange_token(
+            State(state_for(&pool)),
+            peer(),
+            HeaderMap::new(),
+            Ok(Json(AuthExchangeRequest {
+                pb_token: "a-wrong-token".into(),
+            })),
+        ))
+        .await;
+        assert_eq!(
+            second.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the second attempt from one address must be throttled: {}",
+            second.body_text()
+        );
+        assert_eq!(second.json()["error"]["code"], json!("rate_limited"));
+
+        // The attempt rows are the audit trail, and there are two of them: the
+        // one that was refused by PocketBase and the one refused by the cap. A
+        // cap that stopped recording once it started refusing would leave an
+        // operator unable to tell "one guess" from "a thousand".
+        let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login'")
+            .fetch_one(&pool)
+            .await
+            .expect("count attempts");
+        assert_eq!(
+            recorded, 2,
+            "both attempts must be on the books - the failure stream IS the signal"
+        );
+
+        // No raw address anywhere, and the key is the salted hash.
+        let keys: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT ip_hash FROM auth_attempts WHERE kind = 'login'")
+                .fetch_all(&pool)
+                .await
+                .expect("read the attempt keys");
+        assert_eq!(keys.len(), 1, "one address, one key");
+        assert_eq!(keys[0].len(), 64, "a SHA-256 hex digest, not an address");
+        assert!(
+            !keys[0].contains(TEST_IP),
+            "the raw address must never appear in the stored key"
+        );
+
+        db.close().await;
+    }
+
+    /// A DIFFERENT address is a different budget: the cap is per client, not
+    /// global. Without this the first test would also pass if the limiter were
+    /// counting every login in the process.
+    #[tokio::test]
+    async fn live_the_login_cap_is_per_address_and_does_not_lock_everyone_out() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        set_test_limits_override(1, 100);
+
+        let base = pocketbase_stub(
+            "401 Unauthorized",
+            r#"{"code":401,"message":"Failed to authenticate."}"#,
+        )
+        .await;
+        let (_pb_lock, _pb_guard) = point_pocketbase_at(&base);
+
+        let first = call(exchange_token(
+            State(state_for(&pool)),
+            peer(),
+            HeaderMap::new(),
+            Ok(Json(AuthExchangeRequest {
+                pb_token: "a-wrong-token".into(),
+            })),
+        ))
+        .await;
+        assert_eq!(first.status, StatusCode::UNAUTHORIZED);
+
+        // Same database, same instant, DIFFERENT peer address. A second stub
+        // because the first answered its one request.
+        let other = ConnectInfo("198.51.100.7:5555".parse().unwrap());
+        let base2 = pocketbase_stub(
+            "401 Unauthorized",
+            r#"{"code":401,"message":"Failed to authenticate."}"#,
+        )
+        .await;
+        let (_pb_lock2, _pb_guard2) = point_pocketbase_at(&base2);
+
+        let second = call(exchange_token(
+            State(state_for(&pool)),
+            other,
+            HeaderMap::new(),
+            Ok(Json(AuthExchangeRequest {
+                pb_token: "a-wrong-token".into(),
+            })),
+        ))
+        .await;
+        assert_eq!(
+            second.status,
+            StatusCode::UNAUTHORIZED,
+            "a different address has its own budget and must reach the credential check: {}",
+            second.body_text()
+        );
+
+        db.close().await;
+    }
+}
+
+/// States the `[limits]` sign-in caps a test wants, without touching the config file.
+///
+/// Consumed ONCE by `limits_config`, which clones it out and clears it. That is
+/// what makes it safe to hold in a `static Mutex` across test threads: a test that
+/// sets it takes it back on the very next call, so the window in which another
+/// test could observe it is one request wide - and the `test_env::EnvLock` these
+/// tests already hold makes that window empty in practice.
+#[cfg(test)]
+fn set_test_limits_override(per_ip: u32, per_account: u32) {
+    let mut current = crate::routes::auth::TEST_LIMITS_OVERRIDE
+        .lock()
+        .expect("the test override lock is never poisoned");
+    let mut limits = AppConfig::load_from_file("../config/apikita.toml")
+        .expect("the shipped config parses; every route module's fixture loads it")
+        .limits;
+    limits.login_per_hour_per_ip = per_ip;
+    limits.login_per_hour_per_account = per_account;
+    *current = Some(limits);
 }

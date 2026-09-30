@@ -406,6 +406,76 @@ pub async fn account_for_email(pool: &SqlitePool, email: &str) -> Result<Option<
     }
 }
 
+/// Create an account with a password identity, in one transaction.
+///
+/// The account row, its wallet and its identity are one unit: an account without
+/// a wallet is a state every other read would have to defend against, and an
+/// account whose identity insert failed is an account nobody can sign in to.
+/// `BEGIN IMMEDIATE` for the reason `db.rs` gives.
+///
+/// The identity starts UNVERIFIED. Nothing in this function proves the address -
+/// only the redemption of a token delivered to it does (module rule 4).
+pub async fn create_password_account(
+    pool: &SqlitePool,
+    email: &str,
+    password_hash: &str,
+    now: DateTime<Utc>,
+) -> Result<Uuid, AppError> {
+    let normalized = normalize_email(email);
+    let account_id = Uuid::new_v4();
+    let identity_id = Uuid::new_v4();
+
+    let mut tx = crate::db::begin_immediate(pool).await?;
+
+    create_account_row(&mut tx, account_id, now).await?;
+
+    sqlx::query(
+        "INSERT INTO identities \
+         (id, account_id, provider, subject, email, email_verified, password_hash, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+    )
+    .bind(identity_id.hyphenated())
+    .bind(account_id.hyphenated())
+    .bind(PASSWORD)
+    .bind(&normalized)
+    .bind(&normalized)
+    .bind(password_hash)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(account_id)
+}
+
+/// Replace the stored hash of an existing password identity.
+///
+/// Used by the reset path, where the identity is already known to belong to the
+/// account the token authorised. It does NOT touch `email_verified`: a reset
+/// proves the mailbox was reachable at that moment, but R2 makes the verified
+/// transition its own claim, and a reset is not one of the three writers rule 4
+/// allows. Silently upgrading here would let a reset launder an unverified
+/// address into a linkable one.
+pub async fn set_password(
+    pool: &SqlitePool,
+    identity_id: Uuid,
+    password_hash: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE identities SET password_hash = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(password_hash)
+    .bind(now)
+    .bind(identity_id.hyphenated())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 async fn create_account_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: Uuid,

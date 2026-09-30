@@ -263,6 +263,16 @@ pub const ROUTES: &str = r#"
 // unauthenticated health body. See health::operator_metrics.
 .route("/api/admin/metrics", get(health::operator_metrics));
 .route("/auth/exchange", post(auth::exchange_token));
+// Native identity. These are what the website calls; nothing here needs a
+// PocketBase instance. `/auth/exchange` remains only until the PocketBase
+// client is deleted, and is the last route that does.
+.route("/auth/signup", post(auth::signup));
+.route("/auth/login", post(auth::login));
+.route("/auth/google", post(auth::google_sign_in));
+.route("/auth/verify-email", post(auth::verify_email));
+.route("/auth/password-reset/request", post(auth::request_password_reset));
+.route("/auth/password-reset/confirm", post(auth::confirm_password_reset));
+.route("/auth/verification/resend", post(auth::resend_verification));
 .route("/auth/logout", post(auth::logout));
 .route("/auth/logout-all", post(auth::logout_all));
 .route("/api/me", get(account::get_me));
@@ -309,6 +319,13 @@ pub const ROUTE_ARRAY_SHAPE_IS_IMPOSSIBLE: &[&str] = &[
     "/health",
     "/api/admin/metrics",
     "/auth/exchange",
+    "/auth/signup",
+    "/auth/login",
+    "/auth/google",
+    "/auth/verify-email",
+    "/auth/password-reset/request",
+    "/auth/password-reset/confirm",
+    "/auth/verification/resend",
     "/auth/logout",
     "/auth/logout-all",
     "/api/me",
@@ -343,6 +360,16 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/admin/metrics", get(health::operator_metrics));
         // Auth
         .route("/auth/exchange", post(auth::exchange_token));
+        // Native identity. These are what the website calls; nothing here needs a
+        // PocketBase instance. `/auth/exchange` remains only until the PocketBase
+        // client is deleted, and is the last route that does.
+        .route("/auth/signup", post(auth::signup));
+        .route("/auth/login", post(auth::login));
+        .route("/auth/google", post(auth::google_sign_in));
+        .route("/auth/verify-email", post(auth::verify_email));
+        .route("/auth/password-reset/request", post(auth::request_password_reset));
+        .route("/auth/password-reset/confirm", post(auth::confirm_password_reset));
+        .route("/auth/verification/resend", post(auth::resend_verification));
         .route("/auth/logout", post(auth::logout));
         .route("/auth/logout-all", post(auth::logout_all));
         // Account & Wallet
@@ -1245,11 +1272,47 @@ mod tests {
     /// arrived at by assuming each dual-method path contributes an extra row. It does
     /// not: `/api/topups` and `/api/keys` are ONE `.route(` call each carrying both
     /// `get` and `post`, and this table lists a request per METHOD, so each
-    /// contributes two rows in total, not three. 28 is the number the test pins.
+    /// contributes two rows in total, not three. 35 is the number the test pins.
+    ///
+    /// The native identity routes each contribute ONE row: they are all
+    /// single-method (POST), so `/auth/logout` and `/auth/logout-all` are not the
+    /// dual-method paths the previous note named - only `/api/topups` and
+    /// `/api/keys` are.
     const MOUNTED: &[(&str, &str, &str)] = &[
         ("GET", "/health", ""),
         ("GET", "/api/admin/metrics", ""),
         ("POST", "/auth/exchange", r#"{"pb_token":"probe"}"#),
+        // Native identity. The bodies are the smallest shape each handler accepts,
+        // so a credential-free request reaches the handler and stops at its own
+        // validation rather than at axum's extractor - which is all this table
+        // asserts (the router matched).
+        (
+            "POST",
+            "/auth/signup",
+            r#"{"email":"a@b.example","password":"correct-horse-battery"}"#,
+        ),
+        (
+            "POST",
+            "/auth/login",
+            r#"{"email":"a@b.example","password":"correct-horse-battery"}"#,
+        ),
+        ("POST", "/auth/google", r#"{"id_token":"probe"}"#),
+        ("POST", "/auth/verify-email", r#"{"token":"probe"}"#),
+        (
+            "POST",
+            "/auth/password-reset/request",
+            r#"{"email":"a@b.example"}"#,
+        ),
+        (
+            "POST",
+            "/auth/password-reset/confirm",
+            r#"{"token":"probe","email":"a@b.example","password":"correct-horse-battery"}"#,
+        ),
+        (
+            "POST",
+            "/auth/verification/resend",
+            r#"{"email":"a@b.example"}"#,
+        ),
         ("POST", "/auth/logout", ""),
         ("POST", "/auth/logout-all", ""),
         ("GET", "/api/me", ""),
@@ -1530,7 +1593,7 @@ mod tests {
         // The vacuity guards. A MOUNTED list that lost its entries, or a table that
         // stopped using the placeholder, would make the loop above answer nothing.
         assert!(
-            MOUNTED.len() >= 20,
+            MOUNTED.len() >= 30,
             "MOUNTED has {} entries, far fewer than the router mounts, so the comparison \
              above is checking a list that no longer describes the surface",
             MOUNTED.len()
@@ -1723,19 +1786,19 @@ mod tests {
         // looks self-consistent.
         assert_eq!(
             declared.len(),
-            26,
-            "create_router mounts a different number of routes than the 26 this test was \
+            33,
+            "create_router mounts a different number of routes than the 33 this test was \
              last reconciled against. If that is deliberate, update this number AND the \
              count in MOUNTED's doc comment - both, or the next reader trusts a stale one."
         );
         assert_eq!(
             mounted_set.len(),
-            28,
-            "MOUNTED declares a different number of ROWS than the 28 this test was last \
-             reconciled against. Rows, not routes: the four dual-method paths (/api/topups, \
-             /api/keys, /auth/logout, /auth/logout-all are single-method, but /api/topups and \
-             /api/keys each carry GET+POST) are one `.route(` call and two rows each. A \
-             mismatch here means a row was added or removed without updating this number."
+            35,
+            "MOUNTED declares a different number of ROWS than the 35 this test was last \
+             reconciled against. Rows, not routes: /api/topups and /api/keys each carry \
+             GET+POST, so each contributes two rows from one `.route(` call, while the rest \
+             including /auth/logout and /auth/logout-all are single-method. A mismatch here \
+             means a row was added or removed without updating this number."
         );
     }
 

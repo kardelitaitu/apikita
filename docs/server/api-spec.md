@@ -11,7 +11,7 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 
 | Group | Endpoints | Auth |
 | --- | --- | --- |
-| Auth | `POST /auth/exchange`, `POST /auth/logout`, `POST /auth/logout-all` | cookie / none |
+| Auth | `POST /auth/signup`, `POST /auth/login`, `POST /auth/google`, `POST /auth/verify-email`, `POST /auth/password-reset/request`, `POST /auth/password-reset/confirm`, `POST /auth/verification/resend`, `POST /auth/logout`, `POST /auth/logout-all`, `POST /auth/exchange` (pending removal) | cookie / none |
 
 **`POST /auth/exchange` is the one route whose failure mode depends on an EXTERNAL service.**
 It verifies the `pb_token` against PocketBase before creating a session, so with the identity
@@ -66,10 +66,150 @@ cookie on `/v1/*`, or a Bearer key on a cookie endpoint, returns 401
 
 ## Auth
 
-### `POST /auth/exchange`
+### `POST /auth/signup`
 
-Exchanges a PocketBase auth token for a Rust session cookie. Called once after
-login.
+```json
+// request
+{ "email": "you@example.com", "password": "at least 8 characters" }
+
+// 202 response — ALWAYS this, whatever happened
+{ "message": "If that address can be registered, a confirmation link is on its way." }
+```
+
+Creates an account with a password identity and mails a verification link.
+
+**The reply does not depend on whether the address was already registered.** The
+endpoint is unauthenticated, so any difference in status or body between
+"created" and "already exists" would make it a membership test for the address
+space. The already-registered branch does the same observable work — including
+the password hash — and returns the identical body.
+
+A mail failure does not fail the request: the account is created unverified,
+which is inert (it cannot hold a balance until a top-up, and a top-up needs a
+verified address), and the failure is logged against the account id. Mail is
+never a dependency of an account existing.
+
+Errors: `422` malformed address or a password below `[auth] password_min_length`.
+`429` beyond `[limits] signup_per_hour_per_ip`.
+
+### `POST /auth/login`
+
+```json
+// request
+{ "email": "you@example.com", "password": "..." }
+
+// 200 response
+{ "account_id": "uuid", "balance_idr": 50000 }
+// sets: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax
+```
+
+Errors: `401` wrong address or password (the same answer for both, and a missing
+account still pays for a hash so the timing does not distinguish them). `429`
+beyond the per-IP or per-account login cap — both are spent by FAILED attempts,
+which is the only thing that makes the cap worth having.
+
+### `POST /auth/google`
+
+```json
+// request
+{ "id_token": "<Google Identity Services credential>" }
+
+// 200 response
+{ "account_id": "uuid", "balance_idr": 50000 }
+// sets: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax
+```
+
+Verifies the ID token against Google's published keys (RS256 only; the algorithm
+is never taken from the token header) and resolves it to an account.
+
+A Google sign-in whose address matches an existing **password** identity links to
+it **only when that identity was verified before the Google identity was
+created** (`verified_at < google_identity.created_at`). Otherwise a separate
+account is created and `auth.email_collision_unverified` is logged. Without that
+ordering rule, an attacker could register the victim's address with a password of
+their own, wait for the victim to verify it, and then sign in with Google into
+the victim's account.
+
+Errors: `401` invalid, expired, or wrong-audience token; `500` when
+`[auth] google_client_id` is unset (a deployment misconfiguration, not a failed
+sign-in).
+
+### `POST /auth/verify-email`
+
+```json
+// request
+{ "token": "<from the emailed link>" }
+
+// 204
+```
+
+Marks the address verified. The mark and the validity check are one SQL
+statement, so a link cannot be redeemed twice. Every other outstanding token for
+the account is cleared.
+
+Errors: `401` for an unknown, expired, already-used, or wrong-purpose token — one
+answer for all four, so a caller holding a stale link cannot learn it was once
+real.
+
+### `POST /auth/password-reset/request`
+
+```json
+// request
+{ "email": "you@example.com" }
+
+// 202 — ALWAYS this, whatever happened
+{ "message": "If that address has an account, a reset link is on its way." }
+```
+
+Neutral reply, for the reason signup has one. The cap is applied per **account**
+where one exists, because the resource being protected is the victim's mailbox
+and a per-IP cap alone would let a distributed sender flood it.
+
+### `POST /auth/password-reset/confirm`
+
+```json
+// request
+{ "token": "<from the emailed link>", "email": "you@example.com", "password": "new password" }
+
+// 204
+```
+
+Sets the new password. This may land on an account with **no** password identity
+— a Google-only signup — in which case one is created: completing a reset already
+required control of the mailbox.
+
+**Every session for the account is revoked.** A reset is what a person does when
+they believe someone else has their credential, so leaving a session opened with
+the old password alive would defeat the point. The address is **not** marked
+verified by this route: a reset proves the mailbox was reachable, but the
+verified transition is its own claim.
+
+Errors: `401` for an invalid token, or when the token's account and the supplied
+address disagree (there is no correct merge, so nothing happens). `422` password
+policy.
+
+### `POST /auth/verification/resend`
+
+```json
+// request
+{ "email": "you@example.com" }
+
+// 202 — the same neutral reply as signup
+```
+
+Mails a fresh verification link, invalidating the previous one. A verified
+address asking again is not an error and does not get a link: a working
+verification link for an already-proven address is a credential with nothing left
+to do.
+
+Errors: `429` beyond `[limits] verification_resend_per_hour`.
+
+### `POST /auth/exchange` — pending removal
+
+Exchanges a PocketBase auth token for a Rust session cookie. **This route is
+being deleted**: it is the last one that needs a PocketBase instance, and it
+exists only until the client that calls it is removed. Use `POST /auth/login` or
+`POST /auth/google`.
 
 ```json
 // request
@@ -79,12 +219,6 @@ login.
 { "account_id": "uuid", "balance_idr": 50000 }
 // sets: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax
 ```
-
-Server verifies the token with PocketBase, resolves `pb_user_id` → `accounts`
-(creating the account on first login), inserts a `sessions` row, and returns the
-cookie. **The PocketBase token is not stored**; only the session is.
-
-Errors: `401` invalid token.
 
 ### `POST /auth/logout`
 
