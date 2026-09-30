@@ -122,7 +122,7 @@ Push to `main` deploys. The reasoning and the tradeoffs:
 
 | Folder | Function |
 | --- | --- |
-| [`server/`](server/README.md) | The Rust API + proxy: auth exchange, wallet, keys, limits, webhook, SSE |
+| [`server/`](server/README.md) | The Rust API + proxy: sign-in, wallet, keys, limits, webhook, SSE |
 | [`website/`](website/README.md) | Signup, API keys, wallet top-up, usage dashboards |
 | [`telegram/`](telegram/README.md) | Telegram channel (4 rooms) + bot — design only |
 | [`config/`](config/README.md) | Routing and pricing config; per-provider price records |

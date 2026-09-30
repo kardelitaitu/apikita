@@ -35,8 +35,8 @@ leaked session cannot spend money.
 
 ## Status
 
-**Implemented and green.** `cargo test --lib` → **509 passed / 0 failed / 0 ignored**
-(measured 2026-09-27),
+**Implemented and green.** `cargo test --lib` → **556 passed / 0 failed / 0 ignored**
+(measured 2026-09-30),
 against a migrated temp SQLite file per test (`src/test_support.rs`) — no database
 server to start and no `DATABASE_URL` needed. Nothing is `#[ignore]`d any more: the
 former live-PocketBase exchange tests were deleted with the provider they exercised,
