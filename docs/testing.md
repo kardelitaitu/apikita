@@ -159,9 +159,24 @@ the parse is vacuous), and pins both counts.
 Two costs are stated in the code rather than hidden. The method-router
 *expressions* are still read by no test — the inventory check reads only paths, and
 axum offers no reflection — so deleting a `.post(...)` from a chain is caught by
-nothing. And these lines are format-sensitive: one `cargo fmt` run re-wraps them
-and swallows the semicolons. The crate has no `cargo fmt --check` in CI, partly
-for that reason.
+nothing. And these lines are format-sensitive: one `cargo fmt` run re-wraps them,
+and a re-wrap can swallow a semicolon and with it a route.
+
+This section used to say the crate had no `cargo fmt --check` in CI, and that was
+wrong in two ways at once. The step has been in `ci.yml` since the workflow was
+added. And the danger is narrower than "one run swallows the semicolons": measured
+against `rustfmt 1.9.0-stable`, a full `cargo fmt` over `routes/mod.rs` **preserved
+all 231 `);`-terminated lines** and changed only indentation. So the semicolon
+convention survives the formatter this repository pins, and the reason it is
+format-*sensitive* is that any future formatter change lands exactly here, where the
+cost of a silent edit is a mounted route appearing to exist in the inventory while
+the router never received it — or the reverse.
+
+The guard that would catch that is not `cargo fmt --check`; it is the inventory test
+itself, which compares the literal to `MOUNTED` and pins both counts. What the format
+step does catch, and did, is everything else: the block above `.fallback(unrouted)`
+had been indented four spaces deeper than the paren closing the `routes!` call for
+as long as it had existed.
 
 The trap this check had to avoid is the one this section originally recorded: a
 source-level parse of `create_router` looks trivial and is not. Several `.route(`
