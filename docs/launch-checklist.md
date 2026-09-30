@@ -287,10 +287,13 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       jurisdiction, AND the ORDERING — because the claim is "before the first request",
       not "exists somewhere" (`privacy.astro` alone would not satisfy it).
       **Provisional:** the disclosure text and its test are independent of the identity
-      provider, but the signup FORM around it is not — `signup.astro`'s script still calls
-      PocketBase (`authWithOAuth2`, `collection('users').create`, `requestVerification`),
-      so this box only holds while a PocketBase instance is running. The port replaces
-      that script; re-check the box then.
+      provider, and the FORM around it is being ported — the server no longer speaks to
+      PocketBase, but `signup.astro`'s script still calls `authWithOAuth2`,
+      `collection('users').create` and `requestVerification`, so this box only holds on
+      the page, not yet end to end. The port replaces that script with
+      `website/src/lib/auth-api.ts` and its callers; re-check the box then. Until every
+      auth page is off `pb.*` the signup FORM needs a PocketBase instance running, and
+      no PocketBase instance is part of this deployment.
 - [x] Top-up screen states the fee and the non-refundable policy before payment.
       The wallet page (`website/src/pages/dashboard/wallet.astro`) states the non-refundable policy
       and the 2-year expiry, and the header flags that first-deposit and top-up minimums

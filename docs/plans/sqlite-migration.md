@@ -1,6 +1,6 @@
 # Plan: Retire PocketBase and PostgreSQL for Embedded SQLite
 
-**Status:** PARTLY COMPLETE - the database port is done and PostgreSQL is gone, but PocketBase is still the identity provider: Phase 6 ([§5.6](#56-phase-6--identity), [§6](#6-phase-2--identity-the-real-cost)) is not started, so `accounts.pb_user_id` and the `server/src/routes/auth.rs` PocketBase client are both still present
+**Status:** COMPLETE - PostgreSQL and PocketBase are both gone. Phase 6 (§5.6, §6) landed: identity is served natively by this crate, `accounts.pb_user_id` is dropped, and the `server/src/routes/auth.rs` PocketBase client is deleted. What remains is the plan's own historical record, which is why the phase narratives below still describe PocketBase as present - they say what was true when each phase was executed. Read them as a log, not as the current state.
 **Date:** 2026-09-25 (written) · **Branch at writing:** `0.0.1` · shipped and on `0.0.2`
 **Supersedes:** the untitled "Remove PocketBase and Migrate to Embedded SQLite + Custom Admin UI" draft
 **Amends:** [`decisions.md`](../decisions.md) — see [§3](#3-decisions-this-forces-the-register-to-change)
