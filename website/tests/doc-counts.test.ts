@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 180;
+const WEBSITE_TESTS = 184;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -203,6 +203,15 @@ test('no doc still claims a superseded count', () => {
         // declared `const topupPerHour = 5;` underneath it, so prices.test.ts
         // compared the CONSTANT against config while the page published the literal.
         'website: **174 tests**', 'passes **174 tests**', '**174 tests**',
+        // Retired when the claim guards landed: credit expiry is promised in the present
+        // tense on two pages and NOTHING implements it - the schema holds one un-aged
+        // `wallets.balance_idr`, so expired and live credit are not even distinguishable
+        // (docs/decisions.md:69). The guard pins that absence and makes the three documents
+        // that record it fail if their warning is dropped. Its sibling pins the numbers the
+        // pages state against the config and lib constants that own them: nine copies of
+        // the password floor across three pages, and three different "N seconds" figures
+        // belonging to three different mechanisms.
+        'website: **180 tests**', 'passes **180 tests**', '**180 tests**',
       ],
     },
   ];
