@@ -1,6 +1,6 @@
 # Server — API Specification
 
-The Rust service on Northflank. It is the **entire backend**: auth exchange,
+The Rust service on Northflank. It is the **entire backend**: native auth,
 wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 
 > Supersedes the scope in [`server/README.md`](../../server/README.md), which
@@ -329,7 +329,7 @@ requests". Scope is fixed by that document's IN/OUT table, and the rule is
 
 - **In**: account, wallet, ledger rows, top-ups, `usage_daily`, `usage_events`,
   and API-key **metadata** (prefix, label, models, limits, expiry).
-- **Out**: `key_hash`, `token_hash`, `pb_user_id`, `snap_token`, session rows,
+- **Out**: `key_hash`, `token_hash`, `snap_token`, session rows,
   IP hashes and the Telegram chat id. **`admin_audit` is also out** — whether
   operator actions reach the customer is a separate open decision
   ([admin-surface.md](../admin-surface.md) Open items), which this does not
@@ -613,7 +613,8 @@ data: {"input_tokens": 1200, "cache_read_tokens": 8000, "output_tokens": 400, "c
 : heartbeat        (every 20-30s, keeps proxies from closing it)
 ```
 
-- PocketBase's realtime is useless here — our data is in SQLite. This is ours.
+- Realtime is ours to serve — the data (balance, usage) is in the same embedded
+  SQLite file, so there is no third-party collection stream to lean on.
 - Emit on: webhook settlement, usage settlement, key changes.
 - **Heartbeat is required.** Cloudflare and intermediaries close idle streams, and
   a silently dropped stream looks like "the balance stopped updating".
@@ -736,7 +737,7 @@ with the same session cookie and every guard is enforced here, server-side.
 
 | Endpoint | Handler | Effect |
 | --- | --- | --- |
-| `GET /api/admin/accounts` | `admin::list_accounts` | Bounded listing. Query: `q` (matches account id / PocketBase id), `status`, `limit` (1–100, default 25), `offset`. Returns `{accounts, limit, offset}` |
+| `GET /api/admin/accounts` | `admin::list_accounts` | Bounded listing. Query: `q` (matches the account id), `status`, `limit` (1–100, default 25), `offset`. Returns `{accounts, limit, offset}` |
 | `GET /api/admin/accounts/:id` | `admin::get_account` | Read-only: `status`, `is_operator`, `created_at`, `balance_idr`, live session count, live key count. Never a credential hash |
 | `GET /api/admin/accounts/:id/audit` | `admin::get_account_audit` | The account's `admin_audit` trail, newest first. Same operator + self-action guard as the read-only view. Query: `limit` (1–200, default 50) |
 | `GET /api/admin/audit` | `admin::list_recent_audit` | **Cross-account** recent operator actions, newest first. Served by `admin_audit_recent_idx`. Query: `limit` (1–200, default 50) |
@@ -754,8 +755,8 @@ and the listing returns the same fields per row inside `accounts`.
 
 **The listing exists because lookup-by-id requires knowing a UUID.** It is the
 index the single-account routes assume. `q` is matched case-insensitively
-against the account id and the PocketBase id — **not email**, which lives in the
-identity provider and must not be duplicated here. `%` and `_` in `q` are
+against the account id — **not email**, which lives in the `identities` table and
+must not be duplicated into the operator listing. `%` and `_` in `q` are
 escaped with an explicit `ESCAPE` clause, so a literal percent sign searches for
 that sign rather than matching every row. An unknown `status` value matches
 nothing rather than erroring: an empty page is a normal answer, not a bad

@@ -39,14 +39,18 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 168;
+const WEBSITE_TESTS = 171;
 
 /**
  * The server count, and the same kind of literal for the same reason.
  *
- * Update WITH the run that changes it. **BOTH NUMBERS ARE CURRENTLY BEHIND**: the
- * website suite is at 168 and the server at 509, and the documents these two pin still say
- * 162 and 444 - the front page of this repository tells a reader there are 444 tests.
+ * Update WITH the run that changes it. Both numbers were bumped together on 2026-09-30,
+ * when the identity port finally made them stale in the same direction: the server went
+ * 509 -> 556 because Phase 6 added the native auth routes and their tests, and the website
+ * went 168 -> 171 with the auth-page migration. THE PREVIOUS NOTE SAID THEY WERE "CURRENTLY
+ * BEHIND" and left it there, which is the one state this guard cannot detect: it pins the
+ * documents to a number, and if the number itself is wrong then every document agrees on
+ * something false and the suite stays green.
  *
  * That is the design working as intended rather than a broken guard: this file exists so
  * that ONE edit cannot update four documents and miss the fifth, and the cost of that is
@@ -54,7 +58,7 @@ const WEBSITE_TESTS = 168;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 509;
+const SERVER_TESTS = 556;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
