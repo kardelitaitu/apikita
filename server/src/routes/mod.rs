@@ -22,6 +22,7 @@ pub mod events;
 pub mod health;
 pub mod keys;
 pub mod proxy;
+pub mod reviews;
 pub mod telegram;
 pub mod webhooks;
 
@@ -337,6 +338,15 @@ pub const ROUTES: &str = r#"
 .route("/api/keys/{id}/revoke", post(keys::revoke_key));
 .route("/api/telegram/link-code", post(telegram::issue_link_code));
 .route("/api/telegram", delete(telegram::unlink_telegram));
+// Reviews. Written by a COOKIE, not by a bot: the Telegram bot this was
+// originally specified for is not being built, and the three properties the
+// launch gate asked for (one per account, editable, withdrawal as a flag) are
+// properties of the table rather than of the client that writes it. The
+// aggregate is public; the write paths are the caller's own row and nothing
+// else.
+.route("/api/reviews", get(reviews::get_reviews).post(reviews::upsert_review));
+.route("/api/reviews/mine", get(reviews::get_my_review));
+.route("/api/reviews/withdraw", post(reviews::withdraw_review));
 // The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN.
 .route("/api/bot/link", post(telegram::redeem_link_code));
 .route("/events", get(events::sse_events_handler));
@@ -391,6 +401,9 @@ pub const ROUTE_ARRAY_SHAPE_IS_IMPOSSIBLE: &[&str] = &[
     "/api/keys/{id}/revoke",
     "/api/telegram/link-code",
     "/api/telegram",
+    "/api/reviews",
+    "/api/reviews/mine",
+    "/api/reviews/withdraw",
     "/api/bot/link",
     "/events",
     "/api/admin/accounts",
@@ -443,6 +456,11 @@ pub fn create_router(state: AppState) -> Router {
         // Telegram
         .route("/api/telegram/link-code", post(telegram::issue_link_code));
         .route("/api/telegram", delete(telegram::unlink_telegram));
+        // Reviews. Cookie-authenticated: the bot these were specified for is not
+        // being built, and the gate's three properties live in the table.
+        .route("/api/reviews", get(reviews::get_reviews).post(reviews::upsert_review));
+        .route("/api/reviews/mine", get(reviews::get_my_review));
+        .route("/api/reviews/withdraw", post(reviews::withdraw_review));
         // The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN
         .route("/api/bot/link", post(telegram::redeem_link_code));
         // Live updates (SSE)
@@ -538,6 +556,12 @@ pub const MOUNTED_BY_THE_MACRO: &[&str] = routes!(@paths
     // Telegram
     .route("/api/telegram/link-code", post(telegram::issue_link_code));
     .route("/api/telegram", delete(telegram::unlink_telegram));
+    // Reviews. This mirror is compared against ROUTES by
+    // `the_macro_body_lists_the_inventory_it_mounts`, so a route added to one and
+    // not the other fails there rather than silently drifting.
+    .route("/api/reviews", get(reviews::get_reviews).post(reviews::upsert_review));
+    .route("/api/reviews/mine", get(reviews::get_my_review));
+    .route("/api/reviews/withdraw", post(reviews::withdraw_review));
     // The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN
     .route("/api/bot/link", post(telegram::redeem_link_code));
     // Live updates (SSE)
@@ -1431,7 +1455,12 @@ mod tests {
     /// arrived at by assuming each dual-method path contributes an extra row. It does
     /// not: `/api/topups` and `/api/keys` are ONE `.route(` call each carrying both
     /// `get` and `post`, and this table lists a request per METHOD, so each
-    /// contributes two rows in total, not three. 36 is the number the test pins.
+    /// contributes two rows in total, not three. 40 is the number the test pins.
+    ///
+    /// The reviews routes add three paths and FOUR rows: `/api/reviews` is the
+    /// third dual-method path in the table (GET for the public aggregate, POST to
+    /// write), so it contributes two, while `/api/reviews/mine` and
+    /// `/api/reviews/withdraw` contribute one each.
     ///
     /// The native identity routes each contribute ONE row: they are all
     /// single-method (POST), so `/auth/logout` and `/auth/logout-all` are not the
@@ -1520,6 +1549,13 @@ mod tests {
         // so the router matched, which is all this table asserts.
         ("POST", "/api/telegram/link-code", ""),
         ("DELETE", "/api/telegram", ""),
+        // Reviews. GET is public, so a bodyless request must reach the handler
+        // and answer 200. The write paths are session-scoped and stop at the
+        // guard (401) - not 404/405, which is what says the router matched.
+        ("GET", "/api/reviews", ""),
+        ("POST", "/api/reviews", r#"{"rating":5}"#),
+        ("GET", "/api/reviews/mine", ""),
+        ("POST", "/api/reviews/withdraw", ""),
         (
             "POST",
             "/api/bot/link",
@@ -1640,7 +1676,6 @@ mod tests {
         // ever mounted, this test fails and forces the spec to be updated with it -
         // which is the point.
         const SPEC_ONLY: &[&str] = &[
-            "/api/reviews",
             "/api/bot/account",
             "/api/bot/reviews/mine",
             "/api/bot/notify-topup",
@@ -1704,12 +1739,11 @@ mod tests {
                      tell a documented route from a served one."
                 )
             });
-        // A generous window: the paragraph names all four and may grow a sentence.
+        // A generous window: the paragraph names all three and may grow a sentence.
         let end = (start + 700).min(spec.len());
         let promise = &spec[start..end];
 
         const SPEC_ONLY: &[&str] = &[
-            "/api/reviews",
             "/api/bot/account",
             "/api/bot/reviews/mine",
             "/api/bot/notify-topup",
@@ -1727,11 +1761,25 @@ mod tests {
         // The table carries the marker too, and that is the half a scanner sees: the
         // paragraph is four paragraphs below the table, so a reader skimming the table
         // meets the row before the warning.
+        //
+        // The marker MOVED to the Bot row when the reviews routes were mounted. It
+        // used to sit on Reviews, which was correct while the review endpoints were
+        // designed-only; now they are served, so the same marker on that row would be
+        // the opposite defect - a served route advertised as unbuilt. The three
+        // /api/bot/* routes are still designed-only, so the marker still has a row to
+        // live on and the test still asserts something true.
+        //
+        // The expected substring is the whole cell, `| **Bot** ⚠ |`, not a fragment of
+        // it: the row's label is bold because the bot row groups several routes and the
+        // others name one each. Asserting a loosely-matched fragment would pass on a
+        // row that merely CONTAINS those characters - including a future row where the
+        // marker no longer means what this test says it means.
         assert!(
-            spec.contains("| Reviews ⚠ |"),
-            "the api-spec route table no longer marks the Reviews row as designed-not-built. \
-             The warning paragraph is further down; the marker is what someone reading \
-             the table actually sees."
+            spec.contains("| **Bot** ⚠ |"),
+            "the api-spec route table no longer marks ANY row as designed-not-built, while the \
+             MARKED ROUTES ARE DESIGNED, NOT BUILT paragraph still names three routes. The \
+             warning paragraph is further down; the marker is what someone reading the table \
+             actually sees."
         );
     }
 
@@ -1977,18 +2025,18 @@ mod tests {
         // looks self-consistent.
         assert_eq!(
             declared.len(),
-            34,
-            "create_router mounts a different number of routes than the 34 this test was \
+            37,
+            "create_router mounts a different number of routes than the 37 this test was \
              last reconciled against. If that is deliberate, update this number AND the \
              MOUNTED doc comment that states the row count - both, or the next reader \
              trusts a stale one."
         );
         assert_eq!(
             mounted_set.len(),
-            36,
-            "MOUNTED declares a different number of ROWS than the 36 this test was last \
-             reconciled against. Rows, not routes: /api/topups and /api/keys each carry \
-             GET+POST, so each contributes two rows from one `.route(` call, while the rest \
+            40,
+            "MOUNTED declares a different number of ROWS than the 40 this test was last \
+             reconciled against. Rows, not routes: /api/topups, /api/keys and /api/reviews each \
+             carry GET+POST, so each contributes two rows from one `.route(` call, while the rest \
              including /auth/logout and /auth/logout-all are single-method. A mismatch here \
              means a row was added or removed without updating this number."
         );

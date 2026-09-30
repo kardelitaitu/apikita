@@ -28,25 +28,28 @@ so an anonymous call is a no-op rather than an error.
 | Keys | `GET/POST /api/keys`, `PATCH /api/keys/:id`, `POST /api/keys/:id/revoke` | cookie |
 | Wallet | `POST /api/topups` | cookie |
 | Telegram | `POST /api/telegram/link-code`, `DELETE /api/telegram` | cookie |
-| Reviews ⚠ | `GET /api/reviews` (read), `POST /api/reviews` (**bot token only**) | cookie / bot |
+| Reviews | `GET /api/reviews` (public), `GET /api/reviews/mine`, `POST /api/reviews`, `POST /api/reviews/withdraw` | none / cookie |
 | Webhooks | `POST /webhooks/midtrans` | **signature** |
 | Live | `GET /events` (SSE) | cookie |
 | Proxy | `POST /v1/chat/completions` | **API key** |
-| **Bot** | `POST /api/bot/link` ✅, `GET /api/bot/account` ⚠, `GET /api/bot/reviews/mine` ⚠, `POST /api/bot/notify-topup` ⚠ | **bot token** |
+| **Bot** ⚠ | `POST /api/bot/link` ✅, `GET /api/bot/account` ⚠, `GET /api/bot/reviews/mine` ⚠, `POST /api/bot/notify-topup` ⚠ | **bot token** |
 | **Admin** | `GET /api/admin/accounts/:id`; `POST /api/admin/accounts/:id/suspend`; `POST /api/admin/accounts/:id/resume` (**alias `/restore`**) | **cookie + operator flag** |
 | Ops | `GET /health` | none |
 
-**⚠ MARKED ROUTES ARE DESIGNED, NOT BUILT.** Four endpoints in the table above have a
-schema, a documented contract, and **no handler**: `GET`/`POST /api/reviews`,
-`GET /api/bot/account`, `GET /api/bot/reviews/mine` and `POST /api/bot/notify-topup`.
-They are not missing by accident — the whole reviews and top-up-feed flow is driven by
-the Telegram **bot**, and the launch checklist records that the bot itself is
-still design-only, so their HTTP halves have nothing to exercise them. The tables they
-need have existed since the initial migration (`reviews`, `review_history`,
-`review_sessions`).
+**⚠ MARKED ROUTES ARE DESIGNED, NOT BUILT.** Three endpoints in the table above have a
+schema, a documented contract, and **no handler**: `GET /api/bot/account`,
+`GET /api/bot/reviews/mine` and `POST /api/bot/notify-topup`. They are not missing by
+accident — the whole top-up-feed flow is driven by the Telegram **bot**, and the launch
+checklist records that the bot itself is still design-only, so their HTTP halves have
+nothing to exercise them.
+
+**The reviews routes are no longer in this list.** They were, while the review flow was
+bot-driven; they are now served by the customer's own session, which is why the ⚠ marker
+moved to the Bot row above. `/api/reviews/mine` likewise changed from a bot-token read of
+someone else's review to a cookie read of the caller's own.
 
 They are marked because this table describes the CURRENT surface, and an integrator who
-reads it would call `/api/reviews`, get a 404, and conclude the **server** was broken.
+reads it would call one of the three, get a 404, and conclude the **server** was broken.
 The distinction is enforced by a test
 (`the_spec_marks_exactly_the_designed_but_unbuilt_routes_as_designed` in
 `server/src/routes/mod.rs`), so an endpoint cannot be mounted without this document
@@ -488,14 +491,27 @@ closed. A cookie is not a bot credential.
 
 ## Reviews
 
-**Reviews are written from Telegram only.** The website may *display* an aggregate;
-it can never create or edit a review. Attempting to post one from a browser session
-must fail — reviews are the Telegram channel's contribution, and mixing writers
-makes "who reviewed" ambiguous.
+**Reviews are written by the customer's own session.** The website reads the
+aggregate publicly and writes its own review with its session cookie.
+
+> **This replaces a bot-only design.** This section previously read "Reviews are
+> written from Telegram only" and answered a cookie with `403`. The Telegram bot
+> was never built — `telegram/` holds a README and nothing else — so the only
+> writer the product ever had was a writer that did not exist, and the launch gate
+> that hung off it (one review per account, editable, withdrawal as a flag) was
+> blocked on code rather than on the data model: the `reviews` table has carried
+> all three properties since the initial migration. The bot is formally deferred;
+> the gate is closed by serving it here.
+>
+> The identity a review is attributed to now comes from the **session**, never
+> from the request body. That is strictly stronger than the bot shape it replaces:
+> a bot has already authenticated the chat, so a `telegram_id` in the body was
+> safe there and is an impersonation vector anywhere else.
 
 ### `GET /api/reviews`
 
-Public aggregate. Read-only, cookie-authenticated.
+Public aggregate. **No authentication.** A prospect decides whether to buy from
+this before signing up, so requiring a session would defeat its purpose.
 
 ```json
 {
@@ -505,40 +521,69 @@ Public aggregate. Read-only, cookie-authenticated.
 }
 ```
 
+`average` is `null`, never `0`, when nothing has been reviewed — "nobody has
+reviewed us" and "everybody gave us zero stars" are different facts and only one
+of them is representable in a number.
+
+Withdrawn reviews are excluded from all three figures.
+
 **Returns the aggregate, never the list.** Publishing individual reviews with
 usernames invites retaliation against reviewers — see
 [`docs/telegram/README.md`](../telegram/README.md).
 
-There is deliberately **no `"mine"` field** on this endpoint, and the dashboard
-cannot read an individual review.
+### `GET /api/reviews/mine`
 
-**The bot reads its user's own review through `GET /api/reviews/mine`** — a
-separate bot-token endpoint, so the dashboard's aggregate view stays aggregate.
+The caller's own review, so a form can open on what they already wrote.
+Cookie-authenticated; scoped to the session's account and nothing else.
+
+```json
+{ "has_review": true, "rating": 5, "body": "fast and cheap", "withdrawn": false }
+```
+
+Answers `has_review: false` rather than `404` when the account has not reviewed:
+not having reviewed yet is a new customer's normal state, not an error.
 
 ### `POST /api/reviews`
 
-**Bot token only. Never a cookie.** The dashboard must not reach this endpoint.
+Cookie-authenticated. Writes the session's own review. There is no path by which
+a caller names somebody else's account — the body carries only content.
 
 ```json
-{ "telegram_id": "...", "rating": 5, "body": "fast and cheap" }
+{ "rating": 5, "body": "fast and cheap" }
 ```
 
-- **Upsert**, not append. One review per user; a second submission edits the first.
-- `rating` required, 1-5. `body` optional, max 1000 chars.
-- **Never silently truncate `body`** — reject with an error the bot can show.
+- **Upsert**, not append. One review per account, enforced by
+  `reviews_account_uniq`; a second submission edits the first.
+- `rating` required, an integer 1-5. `body` optional, at most 1000 characters.
+- **Never silently truncate `body`** — reject with a `422` naming the field. A
+  truncated review publishes words the author did not write, and the author never
+  learns.
 - Before overwriting, copy the old values into `review_history` **in the same
   transaction**.
 - `is_customer` is computed server-side from whether a settled top-up exists.
-  **Never accept it from the caller.**
-- The account is resolved from `telegram_id`: `account_id` if linked, else
-  `telegram_id` alone.
+  **Never accept it from the caller** — `reviews.is_customer` has a `DEFAULT 0`,
+  so a self-awarded badge would not even fail loudly.
+- **Submitting a new review clears `withdrawn_at` in place.** The partial index
+  ignores withdrawn rows, so an INSERT after a withdrawal would create a SECOND
+  row and leave the account holding two reviews.
+- **Rate-limited** by `limits.review_per_hour` (shipped default `3`), counted per
+  account over a rolling hour and applied inside the write transaction so a burst
+  cannot slip past a stale read. `config/apikita.toml` frames this value as a
+  requirement rather than a setting: a review endpoint with no limit is a
+  moderation problem from its first request.
 
-Errors: `403` if called with a cookie instead of a bot token.
+Errors: `401` without a session; `422` for a rating outside 1-5 or an overlong
+body; `429` past the hourly cap.
 
 ### `POST /api/reviews/withdraw`
 
-Bot token only. Sets `withdrawn_at` — **does not delete**. A deleted row would
-free the unique slot and let the user submit a second review.
+Cookie-authenticated. Sets `withdrawn_at` — **does not delete**. A deleted row
+would free the unique slot and let the account submit a second review, which is
+exactly what "one review per account" forbids.
+
+Idempotent, and answers `204` whether or not the account had a review: a
+distinguishable error would reveal whether an account has reviewed us, which the
+aggregate deliberately does not.
 
 ## Webhooks
 
@@ -687,6 +732,13 @@ server and trigger a restart loop. Unauthenticated.
 
 **Called by the Telegram bot with a bot token, never by a browser.** These exist
 because the bot needs capabilities the dashboard deliberately does not have.
+
+> **Only `POST /api/bot/link` is built.** The Telegram bot is formally deferred, so
+> the three read/notify endpoints below are contracts without handlers — see the
+> MARKED ROUTES note under the route table. The review endpoints the dashboard
+> needs now live in the `## Reviews` section above, under **cookie** auth; this
+> table's `GET /api/bot/reviews/mine` is a separate, bot-token-authenticated
+> endpoint that would serve `/review show` if the bot is ever built.
 
 | Endpoint | Purpose |
 | --- | --- |

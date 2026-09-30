@@ -341,14 +341,29 @@ jobs:
             esac
           }
           err_shape_ok GET  /definitely-not-a-route ""
-          err_shape_ok GET  /api/reviews ""
+          err_shape_ok GET  /api/reviews/mine ""
           err_shape_ok GET  /api/me ""
           err_shape_ok GET  /api/admin/accounts ""
           err_shape_ok POST /auth/password-change '{}'
           err_shape_ok POST /auth/password-change '{,}'
-          check_route 404 GET  /api/reviews
+          err_shape_ok POST /api/reviews '{"rating":9}'
           check_route 404 POST /api/bot/account
           check_route 404 POST /api/bot/notify-topup
+
+          # The public reviews aggregate used to be asserted 404 here, because the review
+          # flow was bot-driven and the bot was not built. It is SERVED now: the customer's
+          # own session writes reviews and the aggregate is public, so the check is the
+          # opposite one. `average` must be JSON null rather than 0 on an empty database -
+          # "nobody has reviewed us" and "everybody gave us zero stars" are different facts
+          # and only one of them is representable in a number.
+          check_route 200 GET /api/reviews
+          out=$(curl -s "http://127.0.0.1:18080/api/reviews" 2>&1)
+          case "$out" in
+            *'"average":null'*) ;;
+            *) echo "::error::GET /api/reviews on an empty database must report a null average, got: $out"; fail=1 ;;
+          esac
+          # And the write path is session-scoped: no cookie must be 401, never a write.
+          check_route 401 POST /api/reviews
 
           # The BOT endpoint is BUILT, and it is the one route with a different auth
           # scheme (bot token, not cookie, not API key). It is also the endpoint

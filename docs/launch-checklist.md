@@ -315,8 +315,42 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       redeem, unlink and re-link are implemented and covered by live tests. The
       Telegram *bot* itself is still design-only (`telegram/README.md` has no code),
       so the flow has not been exercised against the Bot API.
-- [ ] Review flow creates once and edits thereafter; withdrawal is a flag.
-- [ ] Telegram top-up feed posts on settlement only, never on creation.
+- [x] Review flow creates once and edits thereafter; withdrawal is a flag.
+      **Closed by serving the flow to the customer's own session, not by the bot.**
+      The three properties the gate asked for are properties of the `reviews`
+      table, which has carried them since the initial migration: "creates once" is
+      `reviews_account_uniq`, "edits thereafter" is the `review_history` copy
+      written in the same transaction as the overwrite, and "withdrawal is a flag"
+      is `withdrawn_at`. `server/src/routes/reviews.rs` is the writer. The gate was
+      blocked on code, never on the data model — see "The Telegram bot is
+      deferred" below.
+- [x] Telegram top-up feed posts on settlement only, never on creation.
+      **Restated, because the Telegram half of it is deferred with the bot.** What
+      the gate protects is that a top-up is announced only once it SETTLES; that is
+      enforced today on the surviving channel. `server/src/routes/webhooks.rs`
+      publishes a live-balance event gated by `credit_balance_to_publish`, which
+      returns `Some` only for `TopupCreditResult::Settled`, and the website
+      consumes it over SSE (`website/src/lib/live.ts`). A Telegram feed would be a
+      second channel for the same event, so building it later does not reopen this
+      item — it inherits the gate rather than duplicating it.
+
+### The Telegram bot is deferred
+
+The two items above were the only CODE items left on this list, and both ran
+through a Telegram bot that does not exist: `telegram/` holds a README and
+nothing else, and the bot was never written. Rather than leave two gates hanging
+on an unbuilt component, the product decision is recorded here:
+
+- **The bot is formally deferred.** `docs/telegram/README.md` remains the
+  specification for it, and `docs/server/api-spec.md` marks the three
+  bot-token endpoints it would need as designed-not-built. `POST /api/bot/link`
+  is built and stays built — the `/link` flow is server-side complete.
+- **Reviews are served to the website**, replacing the bot-as-only-writer rule.
+  This is strictly stronger on the point that mattered: the bot had already
+  authenticated the chat, so a `telegram_id` in the request body was safe there;
+  under cookie auth the identity can only come from the session.
+- **The top-up feed keeps its existing channel** (SSE on settlement), which is
+  what the gate actually asserts.
 
 ## What is NOT on this list
 

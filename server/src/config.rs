@@ -2091,10 +2091,6 @@ mod tests {
                 "no wallet-mutation rate limit is implemented. The wallet is only\n                 mutated by settlement, webhook and topup paths, each with its own\n                 bound; there is no per-minute limiter in front of them.",
             ),
             (
-                "review_per_hour",
-                "no review endpoint exists to rate limit. The field parses and is\n                 carried all the way to the config struct for no effect.",
-            ),
-            (
                 "dormancy_days",
                 "no dormancy sweep reads it. purge_expired covers usage, sessions and\n                 the link-code counters; nothing ages a wallet out.",
             ),

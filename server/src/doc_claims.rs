@@ -472,15 +472,19 @@ mod tests {
     /// A third kind of promise, and the other two are the wrong shape for this one.
     /// The retention and lifetime checks tie a DOCUMENT to CODE. This one ties a
     /// document to the REPOSITORY TREE: telegram/README.md states that the folder
-    /// holds this README and nothing else, and docs/launch-checklist.md carries an
-    /// open item that depends on the same fact - that the bot is design-only, which is
-    /// a launch gate.
+    /// holds this README and nothing else.
     ///
-    /// Both are claims a reader trusts and nothing keeps honest. And this one has a
-    /// property the others do not: it goes STALE by someone doing ordinary work. Writing
-    /// the bot is not a defect, it is the next task - and the two documents that say
-    /// there is no bot would quietly become wrong, which for a launch gate is the
-    /// expensive direction to be wrong in.
+    /// THIS GUARD USED TO HAVE A SECOND SUBJECT and no longer does.
+    /// docs/launch-checklist.md carried an open item that depended on the same fact -
+    /// that the bot was design-only - and that item WAS a launch gate, which made this
+    /// the expensive direction to be wrong in. Both items are now closed: the review
+    /// flow is served to the website session and the top-up feed's settlement gate is
+    /// enforced on SSE, so nothing about a launch hangs on whether the bot exists.
+    /// The nudge is retained for the README's own claim.
+    ///
+    /// What is left still has the property the others do not: it goes STALE by someone
+    /// doing ordinary work. Writing the bot is not a defect, it is the next task, and
+    /// telegram/README.md would quietly become wrong.
     ///
     /// So the failure is deliberately a NUDGE rather than a veto, and it says what to
     /// do. -Force matters: without it a .gitkeep or an editor swap file would read as
@@ -501,7 +505,7 @@ mod tests {
 
         assert!(
             others.is_empty(),
-            "telegram/ now holds {others:?} besides its README. That is the NEXT TASK rather than a defect, but two documents now say otherwise: telegram/README.md states the folder holds this README and nothing else, and docs/launch-checklist.md carries an open item because the bot is design-only - which is a launch gate. Update both, and drop the checklist item if the bot is done enough to unblock a launch."
+            "telegram/ now holds {others:?} besides its README. That is the NEXT TASK rather than a defect, but telegram/README.md states the folder holds this README and nothing else, so it needs updating. Note what is NO LONGER part of this nudge: docs/launch-checklist.md used to carry an open item because the bot was design-only, and that item was a launch gate. It is CLOSED - the bot is formally deferred and the two gates that ran through it are closed by serving the review flow to the website session and by the existing settlement-gated SSE feed. So this now guards the README's claim about the folder and nothing else; building the bot is ordinary work with no launch gate hanging on it."
         );
 
         // The README is the other half of the claim, and it is worth asserting that the
@@ -966,6 +970,28 @@ mod tests {
                 "link_code_issues",
                 7,
                 crate::ip_tracking::LINK_CODE_ISSUE_RETENTION_DAYS,
+            ),
+            // THE THIRD TABLE TO ARRIVE WITH A PROMISE AND NO DELETE, and the one
+            // that shows how a gap hides: `link_codes` was the exception this sweep's
+            // own doc-comment used to name - "its own `+24h after use/expiry` rule is a
+            // different shape" - while `docs/data-retention.md:77` and
+            // `website/src/lib/privacy.ts` stated the window to customers. The
+            // exception had been overtaken by `identity_tokens` below, which is the
+            // same expires-then-delete shape, so it was a stale decision wearing a live
+            // one's clothes. The ONLY delete was `issue_link_code` removing the one code
+            // it superseded, so a code requested, never redeemed and never replaced had
+            // no delete path at all.
+            //
+            // The window is ONE day of grace, and the number is not a plain period: a
+            // code is terminal when it is redeemed OR when it expires unredeemed, and
+            // the grace runs from whichever came first - so the predicate is
+            // `COALESCE(used_at, expires_at)`, the shape `sessions` already uses for
+            // revoked-vs-expired. The entrypoint passes the same 1, and
+            // `docs/data-retention.md` states the window as "used or expired + 1 day".
+            (
+                "link_codes",
+                1,
+                crate::db::LINK_CODE_LAG_GRACE_DAYS,
             ),
             // THE EXPIRED-LINK SWEEP, and the only row here whose window is NOT a
             // period. A verification or reset link is not kept for N days; it is
