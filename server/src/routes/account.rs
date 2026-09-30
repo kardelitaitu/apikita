@@ -2808,10 +2808,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // account_email: best-effort BY CONTRACT, so every PocketBase failure mode
-    // must degrade to None and a real address must come back trimmed. The stub
-    // is the same one-shot listener the Snap tests use; account_email only ever
-    // reads the ORIGIN, so the path suffix is stripped.
+    // account_email: best-effort BY CONTRACT, so absence must degrade to None and
+    // a real address must come back trimmed. The source is a local `identities`
+    // row now, so there is no HTTP stub to stand up and no remote failure mode to
+    // simulate - the absence case is an account with no identity at all.
     // -----------------------------------------------------------------------
 
     /// The address is trimmed before it is used, so an identity row whose email

@@ -1816,26 +1816,22 @@ mod tests {
     /// auth.rs:204 already had, now asserted next to the suspension that makes it
     /// matter.
     ///
-    /// Driven against the REAL PocketBase, because verify_pb_token has no seam to
-    /// fake and mocking the network would test the mock. The identity is a real
-    /// PocketBase record; the account row is created here with that record's id
-    /// as its pb_user_id, exactly as the first login would.
-    // The database half of this fixture is now a per-test SQLite file, but the
-    // LOGIN half is not portable: exchange_token verifies its token against a
-    // real PocketBase over the network, and faking that would test the fake. So
-    // this is the one test here that still needs a live external service
-    // (POCKETBASE_URL); nothing about it needs Postgres.
+    /// Driven through the REAL login handler. There is no external identity
+    /// provider left to stand in for: the identity is a row this crate writes,
+    /// with a password hash this crate computes, so the test creates it directly
+    /// and then signs in with the password it chose.
+    ///
     /// THE LAST `#[ignore]` IN THE CRATE, now running by default.
     ///
     /// It proves the second half of Gate 3's suspension requirement: after an
     /// operator suspends an account, that account cannot log back in, the refusal
     /// is a 401 `unauthenticated`, and the refused login MINTS NOTHING (no session
     /// row) and leaves no ledger drift. `auth.rs` refuses a non-active status at
-    /// exchange time; this is the test that proves the refusal holds through the
+    /// login time; this is the test that proves the refusal holds through the
     /// real handler end to end - and until now it had never run in CI.
     ///
-    /// The identity is served by a loopback stub rather than a live PocketBase,
-    /// which is what makes it runnable. The code under test is unchanged.
+    /// The fixture is a real migrated SQLite file with a real password identity in
+    /// it, which is what makes it runnable: nothing here reaches the network.
     // -----------------------------------------------------------------------
     // The documented status contract for suspend/resume.
     //

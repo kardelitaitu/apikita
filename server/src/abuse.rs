@@ -188,10 +188,10 @@ pub async fn enforce_creation_cap(
 /// mistake. A transaction may only span the check and the insert if everything
 /// between them is local. On the key-creation path it is - key generation, hashing
 /// and three validations, all microseconds of CPU - so that path now holds one. On
-/// the top-up path it is a Midtrans Snap call and a PocketBase lookup, and a
-/// transaction spanning those would hold a SQLite WRITE LOCK across a network round
-/// trip to a payment provider, serialising every other top-up in the process behind
-/// it. That path keeps the pool variant, and its race is characterised by
+/// the top-up path it is a Midtrans Snap call, and a transaction spanning that
+/// would hold a SQLite WRITE LOCK across a network round trip to a payment
+/// provider, serialising every other top-up in the process behind it. That path
+/// keeps the pool variant, and its race is characterised by
 /// `the_creation_cap_is_enforced_against_a_stale_read_under_concurrency`.
 ///
 /// The fix for the paths that cannot close the gap is a reservation - claim the
@@ -345,13 +345,12 @@ mod tests {
     /// under, produced fourteen rows. The cap is enforced against a stale read.
     ///
     /// THE OBVIOUS FIX IS NOT AVAILABLE, and the reason matters more than the race.
-    /// On the top-up path the insert happens after a Midtrans Snap call and a
-    /// PocketBase lookup, so a transaction spanning check and insert would hold a
-    /// SQLite WRITE LOCK across a network round trip to a payment provider, and
-    /// every other top-up in the process would serialise behind it. The fix is a
-    /// reservation - claim the slot atomically at check time, by inserting the row
-    /// then, or by counting in a dedicated table - which is a schema and flow
-    /// change rather than a patch.
+    /// On the top-up path the insert happens after a Midtrans Snap call, so a
+    /// transaction spanning check and insert would hold a SQLite WRITE LOCK across
+    /// a network round trip to a payment provider, and every other top-up in the
+    /// process would serialise behind it. The fix is a reservation - claim the slot
+    /// atomically at check time, by inserting the row then, or by counting in a
+    /// dedicated table - which is a schema and flow change rather than a patch.
     ///
     /// So this pins what exists instead of pretending otherwise, and it fails if
     /// the cap is removed or stops bounding anything:

@@ -77,7 +77,7 @@ pub fn window() -> Duration {
 /// compile error, which is the worse of the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// A sign-in attempt: `POST /auth/exchange`.
+    /// A sign-in attempt: `POST /auth/login` and `POST /auth/google`.
     Login,
     /// An account creation.
     Signup,
@@ -260,12 +260,13 @@ async fn record(
 /// touch the counter written to catch them. Writing first and checking second is
 /// what makes the two counters independent of each other's refusals.
 ///
-/// `account_id` is `None` when the account is not known — and on the sign-in path
-/// it is not known until PocketBase has answered, because identity comes from
-/// there and not from the request body. That is why `auth_attempts.account_id` is
-/// nullable: a sign-in for an address that does not exist MUST still be counted
-/// against its IP, or the cap becomes a free oracle for which addresses are
-/// registered.
+/// `account_id` is `None` when the address in the request body names no account,
+/// and that is exactly the case the IP counter has to carry on its own: identity
+/// is read from this crate's own `identities` table, so an attempt on an address
+/// that was never registered resolves to nothing to attribute it to. That is why
+/// `auth_attempts.account_id` is nullable: a sign-in for an address that does not
+/// exist MUST still be counted against its IP, or the cap becomes a free oracle
+/// for which addresses are registered.
 ///
 /// THE BUDGET IS THEREFORE "N ATTEMPTS INCLUDING THIS ONE", and the Nth attempt
 /// against a cap of N is refused by its own row. That is a deliberate choice
@@ -332,7 +333,7 @@ async fn check_after_recording(
     let already_on_the_books_before_this_attempt = used.saturating_sub(1);
 
     // `cap_outcome` decides on what was on the books BEFORE the attempt, so the
-    // Retro-After is measured from the oldest row the attacker can still blame.
+    // Retry-After is measured from the oldest row the attacker can still blame.
     // The refusal itself is decided by the count INCLUDING the attempt, which is
     // why the two arguments differ by the one row written above.
     match abuse::cap_outcome(already_on_the_books_before_this_attempt, limit, oldest, window(), now)
