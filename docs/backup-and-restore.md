@@ -195,15 +195,20 @@ silent failure.** Alert on size, not just exit code.
       The drill is now executable: [`tools/drill/drill.sh`](../tools/drill/README.md) restores into a
       scratch database, reuses the reconciliation query as its verdict, spot-checks a balance,
       measures the restore time and writes a log. Measured on the local dev database:
-      **~1–6 s** to restore a ~126 KB dump — orders of magnitude under the 4-hour RTO, but that is a
-      **dev-sized** database, measured against **PostgreSQL** before the port; the production number
-      is unmeasured until the drill runs there, and the drill itself still needs the port above.
+      **~0.1–0.8 s** to restore a ~288 KB SQLite file — orders of magnitude under the 4-hour RTO,
+      but that is a **dev-sized** database. The drill HAS been ported: it is SQLite-native now
+      (there is no `pg_dump` and no server — the artifact *is* the database file, taken with
+      SQLite's online backup API), and it has been re-measured on SQLite across many runs. The
+      production number is still unmeasured, because that needs production data and a deployed
+      database — not because the tool has not been ported.
 - [x] Where the drill log lives.
       `tools/drill/drill.sh` writes `.agents/drill-logs/drill-<UTC-timestamp>-<target>.log` (that
       directory is gitignored, since a log names row counts and account ids). Each log carries all
       five "Record the drill" fields: `date_utc`, `run_by`, `backup_age`, `restore_ms`, `result`,
-      plus the dump sha256/size, TOC count, the row-count table, the spot-check pair and the drift
-      verdict. Override with `--log-dir`/`DRILL_LOG_DIR` when the retention answer moves.
+      plus the artifact sha256/size, the `PRAGMA integrity_check` verdict on the restored database,
+      the row-count table, the spot-check pair and the drift verdict. (There is no "TOC count":
+      that was a `pg_dump` field, and it went with the port — the current log carries no such line.)
+      Override with `--log-dir`/`DRILL_LOG_DIR` when the retention answer moves.
 - [x] Whether the identity store gets its own tested restore procedure.
       **Moot — there is no separate identity store.** The Phase 6 port moved identity
       into the same SQLite file as money (`accounts` + `identities`), so the
