@@ -9,6 +9,8 @@ use tracing::{error, info, warn};
 use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::db::SHIPPED_CREDIT_EXPIRY_MONTHS;
 use crate::db::{credit_topup_transaction, TopupCreditResult};
 use crate::error::AppError;
 use crate::money::{
@@ -161,7 +163,13 @@ pub async fn handle_midtrans_webhook(
     let action = evaluate_payment_status(&payload.transaction_status, gross_idr);
     match action {
         PaymentAction::Credit { amount_idr } => {
-            let result = credit_topup_transaction(pool, &payload.order_id, amount_idr).await;
+            let result = credit_topup_transaction(
+                pool,
+                &payload.order_id,
+                amount_idr,
+                state.config.wallet.credit_expiry_months,
+            )
+            .await;
 
             // Only a fresh settle moves the wallet, so only a fresh settle is
             // announced. The value is the POST-credit balance the transaction
@@ -1155,7 +1163,7 @@ mod tests {
         // very drift the reconciliation assertion below then reports.
         let order_id = pending_topup(&pool, account_id, AMOUNT).await;
         assert_eq!(
-            credit_topup_transaction(&pool, &order_id, AMOUNT)
+            credit_topup_transaction(&pool, &order_id, AMOUNT, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("settle the fixture topup"),
             TopupCreditResult::Settled {
@@ -1268,7 +1276,7 @@ mod tests {
 
         let first = pending_topup(&pool, account_id, STORED).await;
         assert_eq!(
-            credit_topup_transaction(&pool, &first, STORED)
+            credit_topup_transaction(&pool, &first, STORED, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("settle the first fixture topup"),
             TopupCreditResult::Settled {
@@ -1277,7 +1285,7 @@ mod tests {
         );
         let second = pending_topup(&pool, account_id, STORED).await;
         assert_eq!(
-            credit_topup_transaction(&pool, &second, STORED)
+            credit_topup_transaction(&pool, &second, STORED, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("settle the second fixture topup"),
             TopupCreditResult::Settled {

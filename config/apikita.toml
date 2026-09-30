@@ -78,6 +78,17 @@ min_monthly_tokens = 0
 # The model has no mechanism for this yet; see docs/business/03-financial-model.md.
 dormancy_days = 0
 
+# How long a deposit's credit stays spendable, in months, counted from that
+# deposit's own settlement date. Per deposit, NOT per account and NOT from last
+# activity - the last-activity reading would silently extend old credit every
+# time a customer spends, which is the reading docs/decisions.md:76 rejects.
+#
+# Read by the sweep (`expire_credit_transaction`) and by the top-up settlement
+# that stamps each row's `credit_expires_at`. Set to 0 to disable expiry, which
+# leaves the terms promising something the code does not do - so 0 is a
+# development setting, not a supported operator choice.
+credit_expiry_months = 24
+
 # Upstream prepaid float policy. Hold roughly one settlement cycle of
 # unpurchased liability so a provider outage does not stall paid customers.
 #

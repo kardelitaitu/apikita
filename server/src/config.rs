@@ -67,6 +67,31 @@ pub struct WalletConfig {
     pub reserve_settlement_cycles: u32,
     pub low_balance_threshold_idr: u64,
     pub low_balance_max_per_day: u32,
+    /// How long a deposit's credit stays spendable, in months, counted from that
+    /// deposit's own settlement date.
+    ///
+    /// Read by `db::credit_topup_transaction`, which stamps the resulting
+    /// `topups.credit_expires_at`, and by `db::expire_credit_transaction`, which
+    /// retires a deposit once the instant passes. Both read it from this one
+    /// field, so the stamp and the sweep cannot be stated over different windows.
+    ///
+    /// PER DEPOSIT, not per account and not from last activity. The distinction
+    /// is the whole policy (`docs/decisions.md:76`): crediting time back on every
+    /// spend would mean a customer who keeps using the service never has anything
+    /// expire, which is the opposite of what the terms promise.
+    ///
+    /// `serde(default)` because this key was added after the first configs were
+    /// written, and a config that predates it must still boot. 0 disables expiry,
+    /// which leaves the terms promising something the code does not do - so it is
+    /// a development setting, not an operator choice.
+    #[serde(default = "default_credit_expiry_months")]
+    pub credit_expiry_months: u32,
+}
+
+/// The shipped credit lifetime. Also the value in `config/apikita.toml`, so a
+/// config that omits the key behaves like one that states it.
+fn default_credit_expiry_months() -> u32 {
+    24
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -811,6 +836,35 @@ impl AppConfig {
                 )
                 .into());
             }
+        }
+
+        // AND SO DOES THE CREDIT EXPIRY.
+        //
+        // Same class again, and checked for the same reason: settlement adds
+        // this span to the clock when it stamps `credit_expires_at`, and a bare
+        // `DateTime + Months` PANICS on an out-of-range result. The realistic
+        // typo is a months value with one digit too many - `2400` instead of
+        // `24` - which is exactly far enough to reach the boundary, and the
+        // failure if it were reached is a panic inside the Midtrans webhook:
+        // the one endpoint where a crash means we cannot tell whether we were
+        // paid.
+        //
+        // `checked_add_months` rather than `checked_add_signed`, because the
+        // span is in calendar months and chrono clamps an end-of-month start
+        // (31 January + 1 month is 28/29 February). Checking with a flat
+        // duration would test a different arithmetic than the one that runs.
+        if self.wallet.credit_expiry_months > 0
+            && now_utc
+                .checked_add_months(chrono::Months::new(self.wallet.credit_expiry_months))
+                .is_none()
+        {
+            return Err(format!(
+                "wallet.credit_expiry_months = {} cannot be an expiry span: adding it to \
+                 the clock overflows the representable date range, and settling a deposit \
+                 would PANIC rather than refuse one",
+                self.wallet.credit_expiry_months
+            )
+            .into());
         }
 
         // AN UNCONFIGURED RELAY IS A STATE; A HALF-CONFIGURED ONE IS A BUG.

@@ -722,6 +722,7 @@ mod tests {
                 reserve_settlement_cycles: 1,
                 low_balance_threshold_idr: 10_000,
                 low_balance_max_per_day: 1,
+                credit_expiry_months: 24,
             },
             sessions: SessionsConfig {
                 absolute_days: 30,

@@ -796,6 +796,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::db::{
         credit_topup_transaction, debit_usage_transaction, TopupCreditResult, UsageSettlement,
+        SHIPPED_CREDIT_EXPIRY_MONTHS,
     };
     // Postgres keeps timestamptz at microsecond resolution, so the live tests
     // truncate a computed instant before comparing it to the stored value.
@@ -924,7 +925,7 @@ mod tests {
         .expect("create topup");
 
         assert_eq!(
-            credit_topup_transaction(pool, &order_id, opening_idr)
+            credit_topup_transaction(pool, &order_id, opening_idr, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("credit the opening balance"),
             TopupCreditResult::Settled {

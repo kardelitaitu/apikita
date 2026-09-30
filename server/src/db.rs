@@ -27,7 +27,7 @@
 )]
 
 use crate::error::AppError;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
@@ -144,6 +144,47 @@ pub fn topup_ledger_ref(topup_id: Uuid) -> String {
     topup_id.to_string()
 }
 
+/// The shipped credit lifetime, in months, for callers that are not exercising
+/// the window itself.
+///
+/// This mirrors `config::default_credit_expiry_months` and `config/apikita.toml`
+/// deliberately rather than reading them. A test that wants the window to matter
+/// passes its own value; a test that merely needs a settlement to happen passes
+/// this and states, in the call, that the window is not what it is testing. The
+/// alternative - loading the real config - would make a test's behaviour depend
+/// on a file an operator edits.
+#[cfg(test)]
+pub const SHIPPED_CREDIT_EXPIRY_MONTHS: u32 = 24;
+
+/// The instant a deposit's credit stops being spendable: `settled_at` plus
+/// `months`, as CALENDAR months.
+///
+/// Calendar, not `30 * months` days. A deposit on the 15th of March expires on
+/// the 15th of March two years later; 730 days later is a different day in a
+/// leap year, and "2 years from your deposit" is what the terms say. `chrono`'s
+/// `checked_add_months` clamps a 31st onto the shorter month's last day rather
+/// than rolling into the next month, which is the behaviour this wants: a
+/// January 31st deposit expires at the end of February's month, never in March.
+///
+/// `None` when `months` is 0 (expiry disabled) or when the result is outside the
+/// representable date range.
+///
+/// IT RETURNS `Option` AND THE CALLER CHECKS IT RATHER THAN STORING `None` FOR
+/// BOTH CASES. An unrepresentable instant and a disabled feature are different
+/// facts and are stored differently: disabled writes SQL NULL and the sweep
+/// ignores the row; unrepresentable is refused at config load
+/// (`config::AppConfig::validate`), so it cannot reach here in a shipped build.
+/// This function still returns `None` for it rather than panicking, because the
+/// alternative is a panic inside a settlement transaction.
+pub fn credit_expiry_instant(settled_at: DateTime<Utc>, months: u32) -> Option<DateTime<Utc>> {
+    if months == 0 {
+        return None;
+    }
+    // `u32 -> u32` for `Months::new`, which takes the count directly. No cast,
+    // so no `as` conversion and nothing for the arithmetic lint to flag.
+    settled_at.checked_add_months(chrono::Months::new(months))
+}
+
 /// Atomically settles a topup and credits the wallet, recording an append-only ledger row.
 ///
 /// The whole decision is one conditional `UPDATE`. The Postgres original took a
@@ -153,22 +194,35 @@ pub fn topup_ledger_ref(topup_id: Uuid) -> String {
 /// credit needs. This needs no lock at all and is correct under any isolation
 /// level: the write lock SQLite takes for the `UPDATE` is what serializes the
 /// check against the write.
+///
+/// `credit_expiry_months` stamps `topups.credit_expires_at`, which is what makes
+/// expiry PER DEPOSIT: the instant is fixed at this settlement and never
+/// recomputed, so a later spend cannot move it. 0 means the customer's `[wallet]`
+/// setting disables expiry; the column stays NULL and nothing ever ages out.
 pub async fn credit_topup_transaction(
     pool: &SqlitePool,
     order_id: &str,
     webhook_amount_idr: i64,
+    credit_expiry_months: u32,
 ) -> Result<TopupCreditResult, AppError> {
     let mut tx = begin_immediate(pool).await?;
 
     // 1. Settle the row in one statement. `status = 'pending'` and the amount
     //    check are the guard; `rows_affected()` decides whether it fired.
+    //
+    //    `credit_expires_at` is stamped HERE, in the same statement, so the
+    //    deposit's date and its expiry instant are one write and cannot be made
+    //    to disagree by a crash between them. `None` (expiry disabled) writes
+    //    NULL, which the sweep reads as "nothing to age out".
     let now = Utc::now();
+    let credit_expires_at = credit_expiry_instant(now, credit_expiry_months);
     let settled = sqlx::query(
-        "UPDATE topups SET status = 'settled', settled_at = ? \
+        "UPDATE topups SET status = 'settled', settled_at = ?, credit_expires_at = ? \
          WHERE order_id = ? AND status = 'pending' AND amount_idr = ? \
          RETURNING id, account_id",
     )
     .bind(now)
+    .bind(credit_expires_at)
     .bind(order_id)
     .bind(webhook_amount_idr)
     .fetch_optional(&mut *tx)
@@ -237,6 +291,229 @@ pub async fn credit_topup_transaction(
     tx.commit().await?;
 
     Ok(TopupCreditResult::Settled { new_balance })
+}
+
+/// What one pass of the expiry sweep did.
+#[derive(Debug, PartialEq, Eq, Default)]
+pub struct CreditExpirySweep {
+    /// Deposits whose credit was retired by this pass.
+    pub expired: u64,
+    /// The IDR retired across them.
+    pub expired_idr: i64,
+}
+
+/// Retires the credit of every deposit whose `credit_expires_at` has passed,
+/// one deposit at a time, each in its own transaction.
+///
+/// ## Why this cannot be a flag or a wallet decrement
+///
+/// `wallets.balance_idr` must equal `SUM(ledger.delta_idr)` for the account -
+/// `tools/reconcile/reconcile.sql`, launch Gate 2, and the invariant
+/// `debit_usage_transaction` and `try_debit` are both written to preserve. So
+/// retiring credit means appending a NEGATIVE ledger row and decrementing the
+/// wallet TOGETHER, exactly as `try_debit` does, with `balance_after` carrying
+/// the balance the row leaves behind.
+///
+/// ## Why `reason = 'usage'` and not a new value
+///
+/// The `ledger.reason` CHECK is frozen at
+/// `('topup','usage','adjustment','refund')` and widening a CHECK on SQLite is a
+/// table rebuild (`docs/decisions.md:70`). Expiry is not a refund (no money
+/// moves) and not an operator adjustment. That leaves `usage`, and the `ref`
+/// carries the distinction a customer or an auditor needs: it is
+/// `expiry:<topup id>`, so an expiry row is selectable by the deposit it retired
+/// and is never mistaken for a request that consumed credit.
+///
+/// ## Why each deposit is retired separately, oldest first
+///
+/// The amount retired is `topups.amount_idr` capped by what is left in the
+/// wallet. That cap is not a column: the schema holds ONE un-aged balance, so
+/// the sweep can only retire what remains. Ordering by `credit_expires_at` makes
+/// a partially-spent wallet give up its OLDEST credit first, which is the only
+/// case where "2 years from each deposit" and "2 years from the wallet" differ -
+/// and the oldest-first reading is the one the policy states.
+///
+/// A deposit with nothing left to retire writes NO ledger row and is still
+/// marked retired: the credit is already gone, and a zero-delta row would be a
+/// ledger entry for an event that moved no money.
+///
+/// `now` is bound from Rust, never SQLite's `now()`.
+pub async fn expire_credit(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<CreditExpirySweep, AppError> {
+    // Candidates: settled deposits past their instant and not yet retired,
+    // oldest first. `credit_expires_at IS NULL` is excluded, and that exclusion
+    // is the fail-closed choice made visible: a NULL means either "expiry was
+    // disabled at settlement" or "this row predates the column", and this sweep
+    // treats both as NOTHING TO RETIRE. The migration that added the column says
+    // the opposite (a NULL ages out into exclusion) - see the note on
+    // `credit_retired_at` there for why the sweep cannot be the one to enforce
+    // it without a second, distinct signal for "disabled".
+    let candidates = sqlx::query_as::<_, (String, i64)>(
+        "SELECT id, amount_idr FROM topups \
+         WHERE status = 'settled' \
+           AND credit_retired_at IS NULL \
+           AND credit_expires_at IS NOT NULL \
+           AND credit_expires_at <= ? \
+         ORDER BY credit_expires_at, id",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+
+    let mut sweep = CreditExpirySweep::default();
+
+    for (topup_id, amount_idr) in candidates {
+        let mut tx = begin_immediate(pool).await?;
+        let swept = expire_one_deposit(&mut tx, &topup_id, amount_idr, now).await?;
+        tx.commit().await?;
+
+        if let Some(retired) = swept {
+            // `checked_add` rather than `+=`: the crate denies
+            // `clippy::arithmetic_side_effects` and a counter is not an exception.
+            // These totals are reported to an operator, so they must be a fact
+            // rather than a wrapped number.
+            sweep.expired = sweep
+                .expired
+                .checked_add(1)
+                .ok_or_else(|| AppError::Internal("credit expiry count overflowed u64".into()))?;
+            sweep.expired_idr = sweep
+                .expired_idr
+                .checked_add(retired)
+                .ok_or_else(|| AppError::Internal("credit expiry total overflowed i64".into()))?;
+        }
+    }
+
+    Ok(sweep)
+}
+
+/// Retires one deposit's remaining credit inside an open transaction, returning
+/// the IDR retired, or `None` when there was nothing left to take.
+async fn expire_one_deposit(
+    tx: &mut Transaction<'_, Sqlite>,
+    topup_id: &str,
+    amount_idr: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>, AppError> {
+    // The account and its live balance, read in the same transaction that will
+    // debit it. `credit_retired_at IS NULL` in the predicate means a concurrent
+    // pass that retired this deposit first leaves nothing to find.
+    let row = sqlx::query(
+        "SELECT t.account_id AS account_id, COALESCE(w.balance_idr, 0) AS balance_idr \
+         FROM topups t LEFT JOIN wallets w ON w.account_id = t.account_id \
+         WHERE t.id = ? AND t.credit_retired_at IS NULL",
+    )
+    .bind(topup_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some(row) = row else {
+        // Another pass retired it first. Nothing to do, and not an error.
+        return Ok(None);
+    };
+
+    let account_id: Uuid = row.get::<Hyphenated, _>("account_id").into_uuid();
+    let balance: i64 = row.get("balance_idr");
+
+    // Retire at most the deposit's own amount, and at most what is left. The
+    // second bound is what stops this sweep from taking a LATER deposit's credit
+    // to satisfy an earlier one's expiry.
+    let retired = amount_idr.min(balance);
+
+    // Nothing left to take: mark it retired so the sweep stops revisiting it,
+    // and write no ledger row. `balance` cannot go below zero here because no
+    // debit is issued at all.
+    if retired <= 0 {
+        mark_credit_retired(tx, topup_id, now).await?;
+        return Ok(None);
+    }
+
+    // THE GUARDED DEBIT, the same shape `try_debit` uses: the floor is inside
+    // the statement, so a concurrent spend that emptied the wallet between the
+    // read above and this write turns into no row rather than a negative
+    // balance. `?1` is referenced twice so the debit and the floor cannot drift
+    // apart.
+    //
+    // The arithmetic is `retired`, not `-retired`: `retired >= 1` and
+    // `retired <= balance <= i64::MAX` were both just proved, so the only
+    // subtraction that could overflow is `balance - retired`, and that is
+    // between 0 and `i64::MAX`.
+    #[allow(clippy::arithmetic_side_effects)]
+    let debited = sqlx::query(
+        "UPDATE wallets SET balance_idr = balance_idr - ?1, updated_at = ?2 \
+         WHERE account_id = ?3 AND balance_idr >= ?1 RETURNING balance_idr",
+    )
+    .bind(retired)
+    .bind(now)
+    .bind(account_id.hyphenated())
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some(debited) = debited else {
+        // The wallet could not cover it after all - spent concurrently. Mark the
+        // deposit retired anyway: the credit is gone, and leaving it pending
+        // would make every future sweep retry an impossible debit.
+        mark_credit_retired(tx, topup_id, now).await?;
+        return Ok(None);
+    };
+
+    let new_balance: i64 = debited.get("balance_idr");
+
+    // `-retired` is safe for the reason stated above: `retired >= 1`, so the
+    // negated operand cannot be `i64::MIN`.
+    #[allow(clippy::arithmetic_side_effects)]
+    let delta = -retired;
+
+    sqlx::query(
+        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) \
+         VALUES (?, ?, 'usage', ?, ?, ?)",
+    )
+    .bind(account_id.hyphenated())
+    .bind(delta)
+    .bind(credit_expiry_ref(topup_id))
+    .bind(new_balance)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+
+    mark_credit_retired(tx, topup_id, now).await?;
+
+    Ok(Some(retired))
+}
+
+/// The ledger `ref` an expiry row is filed under: the TOPUP id it retired,
+/// prefixed so the row is never confused with a request batch id.
+///
+/// `topup_ledger_ref` deliberately does NOT do this. A deposit's own credit ref
+/// is its bare id; an expiry row has to be distinguishable from it while still
+/// being selectable by the same deposit, and the prefix is what gives both.
+pub fn credit_expiry_ref(topup_id: &str) -> String {
+    format!("expiry:{topup_id}")
+}
+
+/// Stamps `credit_retired_at`, guarded on it being NULL so a second attempt
+/// updates no row rather than moving the recorded instant.
+///
+/// It takes the TRANSACTION, not a bare connection, because that is what every
+/// caller holds: the mark and the ledger debit that accompanies it must commit
+/// together, and accepting a loose connection would let a caller mark a deposit
+/// retired outside the transaction that pays for it. Taking the wider type also
+/// keeps the call sites a plain reborrow instead of `&mut **tx`.
+async fn mark_credit_retired(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    topup_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE topups SET credit_retired_at = ? WHERE id = ? AND credit_retired_at IS NULL",
+    )
+    .bind(now)
+    .bind(topup_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
 }
 
 /// What a settlement attempt actually did.
@@ -1700,9 +1977,14 @@ mod tests {
 
         let order_id = test_support::pending_topup(&pool, account_id, opening_balance).await;
 
-        let credited = credit_topup_transaction(&pool, &order_id, opening_balance)
-            .await
-            .expect("credit the opening balance");
+        let credited = credit_topup_transaction(
+            &pool,
+            &order_id,
+            opening_balance,
+            SHIPPED_CREDIT_EXPIRY_MONTHS,
+        )
+        .await
+        .expect("credit the opening balance");
 
         assert_eq!(
             credited,
@@ -1796,9 +2078,14 @@ mod tests {
         //    create.
         let refill_order_id = test_support::pending_topup(&pool, account_id, opening_balance).await;
 
-        credit_topup_transaction(&pool, &refill_order_id, opening_balance)
-            .await
-            .expect("refill the wallet");
+        credit_topup_transaction(
+            &pool,
+            &refill_order_id,
+            opening_balance,
+            SHIPPED_CREDIT_EXPIRY_MONTHS,
+        )
+        .await
+        .expect("refill the wallet");
 
         let settled_cost: i64 = 250;
         let outcome = debit_usage_transaction(
@@ -1869,7 +2156,7 @@ mod tests {
         let order_id = test_support::pending_topup(&pool, account_id, RESERVATION).await;
 
         assert_eq!(
-            credit_topup_transaction(&pool, &order_id, RESERVATION)
+            credit_topup_transaction(&pool, &order_id, RESERVATION, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("fund the wallet"),
             TopupCreditResult::Settled {
@@ -1990,7 +2277,7 @@ mod tests {
         // is later masked is the failure mode this catches.
         for round in 0..5 {
             let refill = test_support::pending_topup(&pool, account_id, RESERVATION).await;
-            credit_topup_transaction(&pool, &refill, RESERVATION)
+            credit_topup_transaction(&pool, &refill, RESERVATION, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("refill through the real top-up path");
 
@@ -2210,7 +2497,7 @@ mod tests {
 
         let order_id = test_support::pending_topup(&pool, account_id, RESERVATION).await;
         assert_eq!(
-            credit_topup_transaction(&pool, &order_id, RESERVATION)
+            credit_topup_transaction(&pool, &order_id, RESERVATION, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("fund the wallet"),
             TopupCreditResult::Settled {
@@ -2390,16 +2677,52 @@ mod tests {
     /// so this is the same two-step fixture the module comment describes, with the
     /// INSERT shapes in one place.
     async fn fund_through_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) -> String {
-        test_support::wallet(pool, account_id).await;
+        fund_through_topup_expecting(pool, account_id, amount_idr, amount_idr).await
+    }
+
+    /// `fund_through_topup` for an account that already holds credit: the
+    /// resulting balance is the sum, not this deposit's amount.
+    ///
+    /// Kept separate rather than made a parameter of the common case, because the
+    /// one-argument version's assertion - "the balance after this deposit IS this
+    /// deposit" - is the assertion that catches a fixture that quietly skipped the
+    /// real path, and weakening it everywhere to support the second deposit would
+    /// retire that check.
+    async fn fund_through_topup_again(
+        pool: &SqlitePool,
+        account_id: Uuid,
+        amount_idr: i64,
+        expected_balance: i64,
+    ) -> String {
+        fund_through_topup_expecting(pool, account_id, amount_idr, expected_balance).await
+    }
+
+    async fn fund_through_topup_expecting(
+        pool: &SqlitePool,
+        account_id: Uuid,
+        amount_idr: i64,
+        expected_balance: i64,
+    ) -> String {
+        // Only create the wallet if it is not there: the login path creates it
+        // once, and `wallets.account_id` is the primary key, so a second INSERT
+        // is a UNIQUE violation rather than a second wallet.
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(pool)
+            .await
+            .expect("count the wallet");
+        if existing == 0 {
+            test_support::wallet(pool, account_id).await;
+        }
 
         let order_id = test_support::pending_topup(pool, account_id, amount_idr).await;
 
         assert_eq!(
-            credit_topup_transaction(pool, &order_id, amount_idr)
+            credit_topup_transaction(pool, &order_id, amount_idr, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("credit the opening balance"),
             TopupCreditResult::Settled {
-                new_balance: amount_idr
+                new_balance: expected_balance
             },
             "the fixture must open the wallet through the real top-up path"
         );
@@ -2517,7 +2840,7 @@ mod tests {
 
         // 1. A fresh credit moves the wallet and writes exactly ONE +ledger row.
         assert_eq!(
-            credit_topup_transaction(&pool, &order_id, AMOUNT)
+            credit_topup_transaction(&pool, &order_id, AMOUNT, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("a fresh top-up must settle"),
             TopupCreditResult::Settled {
@@ -2541,7 +2864,7 @@ mod tests {
         // 2. A REPLAY of the same order credits exactly once: idempotency is the
         //    unique order_id plus the settled status, not a second credit.
         assert_eq!(
-            credit_topup_transaction(&pool, &order_id, AMOUNT)
+            credit_topup_transaction(&pool, &order_id, AMOUNT, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("a replay is a recorded outcome, not an error"),
             TopupCreditResult::AlreadySettled,
@@ -2569,9 +2892,14 @@ mod tests {
         let ledger_before = ledger_row_count(&pool, account_id).await;
 
         assert_eq!(
-            credit_topup_transaction(&pool, &mismatch_order, OTHER - 1)
-                .await
-                .expect("a mismatch is a recorded outcome, not an error"),
+            credit_topup_transaction(
+                &pool,
+                &mismatch_order,
+                OTHER - 1,
+                SHIPPED_CREDIT_EXPIRY_MONTHS
+            )
+            .await
+            .expect("a mismatch is a recorded outcome, not an error"),
             TopupCreditResult::AmountMismatch,
             "an amount that disagrees with the stored topup must be refused"
         );
@@ -2605,7 +2933,7 @@ mod tests {
         // 4. An unknown order id is NotFound, with nothing written.
         let unknown = format!("test_topup_unknown_{}", Uuid::new_v4().simple());
         assert_eq!(
-            credit_topup_transaction(&pool, &unknown, AMOUNT)
+            credit_topup_transaction(&pool, &unknown, AMOUNT, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("an unknown order is a recorded outcome, not an error"),
             TopupCreditResult::NotFound,
@@ -3401,7 +3729,7 @@ mod tests {
         let order_id = test_support::pending_topup(&db.pool, account_id, AMOUNT).await;
 
         assert_eq!(
-            credit_topup_transaction(&db.pool, &order_id, AMOUNT)
+            credit_topup_transaction(&db.pool, &order_id, AMOUNT, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("settle"),
             TopupCreditResult::Settled {
@@ -3447,9 +3775,10 @@ mod tests {
 
         // The replayed SETTLEMENT. This is the defect: before the fix this
         // credited AMOUNT again and flipped the row back to `settled`.
-        let replay = credit_topup_transaction(&db.pool, &order_id, AMOUNT)
-            .await
-            .expect("a replay is a recorded outcome, not an error");
+        let replay =
+            credit_topup_transaction(&db.pool, &order_id, AMOUNT, SHIPPED_CREDIT_EXPIRY_MONTHS)
+                .await
+                .expect("a replay is a recorded outcome, not an error");
         assert!(
             matches!(&replay, TopupCreditResult::NotSettleable { status } if status == "refunded"),
             "a settlement replayed after a refund must be refused: {replay:?}"
@@ -4560,6 +4889,476 @@ mod tests {
             }
             other => panic!("expected a partial settlement, got {other:?}"),
         }
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Credit expiry (`docs/decisions.md:76-78`)
+    // -----------------------------------------------------------------------
+
+    /// Settles a deposit and then MOVES ITS EXPIRY into the past, so a test can
+    /// age a deposit without waiting two years.
+    ///
+    /// This writes `credit_expires_at` directly and that is the only place in
+    /// these tests that touches a money column outside the real path. There is no
+    /// alternative: the expiry instant is stamped from `Utc::now()` at
+    /// settlement, and no argument to the real path can put it in the past. The
+    /// fields being aged are TIMESTAMPS, not the balance, so the ledger/wallet
+    /// invariant the direct write could break is untouched - and
+    /// `the_sweep_keeps_the_ledger_equal_to_the_wallet` re-checks it anyway.
+    ///
+    /// `None` expires the deposit as of NOW; `Some(d)` as of `d`.
+    async fn age_the_deposit(
+        pool: &SqlitePool,
+        order_id: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Uuid {
+        let id = topup_id(pool, order_id).await;
+        sqlx::query("UPDATE topups SET credit_expires_at = ? WHERE id = ?")
+            .bind(expires_at.unwrap_or_else(Utc::now))
+            .bind(id.hyphenated())
+            .execute(pool)
+            .await
+            .expect("age the deposit");
+        id
+    }
+
+    /// The `ref` values of every `usage`-reasoned ledger row for the account,
+    /// oldest first.
+    async fn usage_refs(pool: &SqlitePool, account_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT ref FROM ledger WHERE account_id = ? AND reason = 'usage' ORDER BY id",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_all(pool)
+        .await
+        .expect("read usage refs")
+    }
+
+    async fn credit_retired_at(pool: &SqlitePool, topup_id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT credit_retired_at FROM topups WHERE id = ?")
+            .bind(topup_id.hyphenated())
+            .fetch_one(pool)
+            .await
+            .expect("read credit_retired_at")
+    }
+
+    /// Spends `amount_idr` out of the wallet the way a usage settlement does -
+    /// a `usage` ledger row and a matching wallet decrement, together - so the
+    /// expiry tests can start from a partly-spent wallet without going through
+    /// the whole request pipeline.
+    ///
+    /// This is the ONLY place in these tests that moves money outside the real
+    /// top-up and debit paths, and it preserves the invariant they preserve, so
+    /// `ledger_drift_rows` stays 0 across it. Reaching for it instead of letting
+    /// the wallet hold the full amount is what makes the "cannot take more than
+    /// is there" case testable at all: a wallet that always holds every deposit
+    /// in full can never be the constrained case.
+    async fn retire_balance(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) {
+        let mut tx = begin_immediate(pool).await.expect("begin the spend");
+        let debited = sqlx::query(
+            "UPDATE wallets SET balance_idr = balance_idr - ?1, updated_at = ?2 \
+             WHERE account_id = ?3 AND balance_idr >= ?1 RETURNING balance_idr",
+        )
+        .bind(amount_idr)
+        .bind(Utc::now())
+        .bind(account_id.hyphenated())
+        .fetch_optional(&mut *tx)
+        .await
+        .expect("read the debit")
+        .expect("the fixture must not spend more than the wallet holds");
+        let new_balance: i64 = debited.get("balance_idr");
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) \
+             VALUES (?, ?, 'usage', 'test-spend', ?, ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(-amount_idr)
+        .bind(new_balance)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await
+        .expect("record the spend");
+        tx.commit().await.expect("commit the spend");
+    }
+
+    #[tokio::test]
+    async fn expiry_disabled_stamps_no_instant_and_the_sweep_cannot_take_the_credit() {
+        // `credit_expiry_months = 0` is the "disabled" setting, and the point of
+        // this test is that disabled means UNREACHABLE rather than "expired
+        // immediately". A NULL that the sweep read as "long overdue" would turn
+        // the development setting into a nightly confiscation of every balance.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        test_support::wallet(&db.pool, account).await;
+
+        let order_id = test_support::pending_topup(&db.pool, account, 50_000).await;
+        credit_topup_transaction(&db.pool, &order_id, 50_000, 0)
+            .await
+            .expect("settle with expiry disabled");
+
+        let stored: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT credit_expires_at FROM topups WHERE order_id = ?")
+                .bind(&order_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read the stamped expiry");
+        assert_eq!(stored, None, "0 must stamp NULL, not now-plus-nothing");
+
+        // Run the sweep far in the future: NULL is still not a candidate.
+        let sweep = expire_credit(&db.pool, Utc::now() + chrono::Duration::days(3_650))
+            .await
+            .expect("sweep a disabled deposit");
+        assert_eq!(sweep.expired, 0);
+        assert_eq!(sweep.expired_idr, 0);
+
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            50_000,
+            "a disabled expiry must leave the money alone"
+        );
+        assert_eq!(
+            test_support::ledger_sum(&db.pool, account).await,
+            50_000,
+            "and must append no ledger row"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_retires_a_deposit_whose_credit_has_aged_out() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let order_id = fund_through_topup(&db.pool, account, 50_000).await;
+        let id = age_the_deposit(&db.pool, &order_id, None).await;
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+
+        assert_eq!(sweep.expired, 1, "one deposit aged out");
+        assert_eq!(sweep.expired_idr, 50_000, "and gave up its whole amount");
+
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            0,
+            "the wallet must not still hold retired credit"
+        );
+        assert_eq!(
+            test_support::ledger_sum(&db.pool, account).await,
+            0,
+            "the ledger is authoritative and must agree with the wallet"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        assert!(credit_retired_at(&db.pool, id).await.is_some());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_expiry_row_is_filed_under_the_deposit_it_retired() {
+        // The `ref` is what makes an expiry row auditable - and what keeps it
+        // distinguishable from the deposit's OWN credit row, which
+        // `topup_ledger_ref` files under the bare topup id. Without the prefix
+        // the two rows would be indistinguishable in the ledger, and both are
+        // `reason = 'usage'` because the CHECK set is frozen
+        // (`docs/decisions.md:70`).
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let order_id = fund_through_topup(&db.pool, account, 50_000).await;
+        let id = age_the_deposit(&db.pool, &order_id, None).await;
+
+        expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+
+        assert_eq!(
+            usage_refs(&db.pool, account).await,
+            vec![credit_expiry_ref(&id.hyphenated().to_string())],
+            "the retirement must be selectable by the deposit it retired"
+        );
+
+        // The credit row and the expiry row are two rows about the same deposit,
+        // so the deposit id alone does not identify one of them.
+        let credit_ref = topup_ledger_ref(id);
+        assert_ne!(
+            credit_expiry_ref(&id.hyphenated().to_string()),
+            credit_ref,
+            "the two rows about one deposit must not collide"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_leaves_credit_that_has_not_aged_out() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let order_id = fund_through_topup(&db.pool, account, 50_000).await;
+
+        // The real path stamped this two years out; the sweep runs today.
+        let expiry: DateTime<Utc> =
+            sqlx::query_scalar("SELECT credit_expires_at FROM topups WHERE order_id = ?")
+                .bind(&order_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read stamped expiry");
+        assert!(
+            expiry > Utc::now(),
+            "the real path must stamp a FUTURE expiry, not a past one"
+        );
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+        assert_eq!(sweep.expired, 0);
+        assert_eq!(test_support::balance(&db.pool, account).await, 50_000);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_boundary_is_inclusive_so_a_deposit_expiring_this_instant_is_retired() {
+        // `<=`, not `<`. A deposit expiring exactly now HAS expired; an exclusive
+        // bound would leave it spendable for one more scheduler interval.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let order_id = fund_through_topup(&db.pool, account, 50_000).await;
+
+        let now = Utc::now();
+        age_the_deposit(&db.pool, &order_id, Some(now)).await;
+
+        let sweep = expire_credit(&db.pool, now).await.expect("sweep");
+        assert_eq!(
+            sweep.expired, 1,
+            "a deposit whose expiry IS the sweep instant has expired"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_is_idempotent_and_does_not_move_the_recorded_instant() {
+        // The sweep runs nightly and will be re-run by hand after a failure, so
+        // "already retired" has to be a no-op rather than a second debit. The
+        // `credit_retired_at IS NULL` guard in both the candidate query and the
+        // stamp is what makes that true.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let order_id = fund_through_topup(&db.pool, account, 50_000).await;
+        let id = age_the_deposit(&db.pool, &order_id, None).await;
+
+        let first = expire_credit(&db.pool, Utc::now())
+            .await
+            .expect("first sweep");
+        assert_eq!(first.expired, 1);
+        let stamped = credit_retired_at(&db.pool, id).await;
+
+        let rows_after_first = usage_refs(&db.pool, account).await.len();
+
+        let second = expire_credit(&db.pool, Utc::now())
+            .await
+            .expect("second sweep");
+        assert_eq!(second.expired, 0, "a retired deposit is not a candidate");
+        assert_eq!(second.expired_idr, 0);
+        assert_eq!(
+            credit_retired_at(&db.pool, id).await,
+            stamped,
+            "the recorded instant must not move on a re-run"
+        );
+        assert_eq!(
+            usage_refs(&db.pool, account).await.len(),
+            rows_after_first,
+            "a re-run must append no second expiry row"
+        );
+        assert_eq!(test_support::balance(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_partly_spent_wallet_gives_up_its_oldest_credit_first() {
+        // Two deposits of the same size, the OLDER one expiring now. The wallet
+        // holds one un-aged balance, so the sweep can only choose what to take -
+        // and the policy is per-deposit, which means the older deposit's credit is
+        // the credit that has aged out.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        let older = fund_through_topup(&db.pool, account, 50_000).await;
+        let older_id = age_the_deposit(&db.pool, &older, None).await;
+        let newer = fund_through_topup_again(&db.pool, account, 50_000, 100_000).await;
+        let newer_id = topup_id(&db.pool, &newer).await;
+        // Pin the new deposit's expiry into the future explicitly, so this test
+        // cannot pass by both deposits having aged out.
+        sqlx::query("UPDATE topups SET credit_expires_at = ? WHERE id = ?")
+            .bind(Utc::now() + chrono::Duration::days(30))
+            .bind(newer_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("hold the newer deposit");
+
+        // Spend 60,000 of the 100,000 through the ledger, as a usage settlement
+        // would: 40,000 is left, and the aged deposit's own amount (50,000) no
+        // longer fits inside it. The sweep must take 40,000 rather than either
+        // going negative or reaching into the newer deposit.
+        retire_balance(&db.pool, account, 60_000).await;
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+        assert_eq!(sweep.expired, 1, "only the aged deposit is retired");
+        assert_eq!(
+            sweep.expired_idr, 40_000,
+            "the aged deposit gives up what is left, which no longer covers its \
+             own amount - and it must not reach into the newer deposit"
+        );
+
+        assert!(
+            credit_retired_at(&db.pool, older_id).await.is_some(),
+            "the OLDEST deposit is the one retired"
+        );
+        assert_eq!(
+            credit_retired_at(&db.pool, newer_id).await,
+            None,
+            "the un-aged deposit keeps its credit"
+        );
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            0,
+            "40,000 of the aged credit was taken and the other 40,000 is the newer \
+             deposit's, not this deposit's to give"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_cannot_take_more_than_the_wallet_holds() {
+        // The wallet has been spent down below the aged deposit's amount. The
+        // sweep takes what is there and marks the deposit retired - it must NOT
+        // go negative, and it must not take a LATER deposit's credit to make up
+        // the difference.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        let aged = fund_through_topup(&db.pool, account, 50_000).await;
+        let aged_id = age_the_deposit(&db.pool, &aged, None).await;
+        let held = fund_through_topup_again(&db.pool, account, 50_000, 100_000).await;
+
+        // Empty the wallet through the ledger, as a spend would - so the aged
+        // deposit has nothing left to retire and the un-aged one must not be
+        // reached into to make up the difference.
+        retire_balance(&db.pool, account, 100_000).await;
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+
+        assert_eq!(
+            sweep.expired, 0,
+            "a deposit with nothing left to retire is not an expiry event"
+        );
+        assert_eq!(sweep.expired_idr, 0, "and retires no money");
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            0,
+            "the wallet must never go negative to satisfy an expiry"
+        );
+        assert_eq!(
+            test_support::ledger_sum(&db.pool, account).await,
+            0,
+            "and it must not write a zero-delta ledger row for a no-op"
+        );
+        assert!(
+            credit_retired_at(&db.pool, aged_id).await.is_some(),
+            "the deposit is still marked retired, so the sweep stops revisiting it"
+        );
+        assert!(
+            credit_retired_at(&db.pool, topup_id(&db.pool, &held).await)
+                .await
+                .is_none(),
+            "the un-aged deposit is untouched"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_keeps_the_ledger_equal_to_the_wallet() {
+        // The one invariant every money path is written to preserve, re-checked
+        // after the sweep because the sweep is the newest path that debits. The
+        // reconciliation query is the same FULL OUTER JOIN
+        // `tools/reconcile/reconcile.sql` runs.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        // Three deposits, so the sweep has to keep the books straight across
+        // several retirements in a row rather than over one lucky case. The
+        // balance after each is the RUNNING total, which is what
+        // `fund_through_topup_again` is for - the one-argument form asserts the
+        // balance equals that single deposit, and would fail on the second call.
+        let mut running = 0;
+        for _ in 0..3 {
+            running += 50_000;
+            let order_id = fund_through_topup_again(&db.pool, account, 50_000, running).await;
+            age_the_deposit(&db.pool, &order_id, None).await;
+        }
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+        assert_eq!(sweep.expired, 3);
+        assert_eq!(sweep.expired_idr, 150_000);
+
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            test_support::ledger_sum(&db.pool, account).await,
+            "wallets is a cache of the ledger and the sweep must not break that"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_survives_a_second_account_and_leaves_it_alone() {
+        // Each deposit is retired in its own transaction, so one account's aged
+        // credit cannot be affected by another's. This also pins that the
+        // candidate query is account-agnostic (it sweeps the platform) while the
+        // DEBIT is per account.
+        let db = TestDb::new().await;
+        let aged_account = test_support::account(&db.pool).await;
+        let live_account = test_support::account(&db.pool).await;
+
+        let aged = fund_through_topup(&db.pool, aged_account, 50_000).await;
+        age_the_deposit(&db.pool, &aged, None).await;
+        fund_through_topup(&db.pool, live_account, 70_000).await;
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+        assert_eq!(sweep.expired, 1);
+        assert_eq!(sweep.expired_idr, 50_000);
+
+        assert_eq!(test_support::balance(&db.pool, aged_account).await, 0);
+        assert_eq!(
+            test_support::balance(&db.pool, live_account).await,
+            70_000,
+            "the other account's balance is not swept up"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, live_account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_ignores_a_deposit_that_never_settled() {
+        // Only settled deposits carry credit. A pending one has no
+        // `credit_expires_at` at all and must not be a candidate - if it were, a
+        // staff-side expiry could strike a deposit before the webhook that
+        // legitimises it.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        test_support::wallet(&db.pool, account).await;
+
+        let pending = test_support::pending_topup(&db.pool, account, 50_000).await;
+        let id = topup_id(&db.pool, &pending).await;
+        sqlx::query("UPDATE topups SET credit_expires_at = ? WHERE id = ?")
+            .bind(Utc::now() - chrono::Duration::days(1))
+            .bind(id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("age the unsettled deposit");
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+        assert_eq!(sweep.expired, 0, "an unsettled deposit has no credit");
+        assert_eq!(
+            credit_retired_at(&db.pool, id).await,
+            None,
+            "and is not marked retired either"
+        );
+        assert_eq!(topup_status(&db.pool, &pending).await, "pending");
         db.close().await;
     }
 }

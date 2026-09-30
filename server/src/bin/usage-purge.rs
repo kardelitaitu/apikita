@@ -32,6 +32,21 @@
 //! was left over from a design this file had outgrown — while holding a published
 //! 24-hour window that nothing implemented. A stale refusal is harder to find than
 //! a missing call, because it reads as a decision someone thought about.
+//!
+//! CREDIT EXPIRY IS IN HERE FOR THE SAME REASON, and it is the first entry that is
+//! NOT a deletion. `docs/decisions.md:76` sets credit expiry at 2 years from each
+//! deposit's own date and `:77` records that the code does not implement it — a
+//! promise the terms make and the ledger does not keep. It belongs in this binary
+//! rather than a fourth one because the argument at the top of this file is about
+//! retention jobs multiplying, and that argument does not care whether the job
+//! DELETEs a row or appends one: a scheduled thing that must happen is a scheduled
+//! thing that can be forgotten, and one binary is one place to look.
+//!
+//! It runs LAST, after every DELETE, because it is the only step that writes to
+//! `ledger` and `wallets`. If the sweep dies partway, the deletions are the ones
+//! already committed and the money-moving step is the one that reports zero — and
+//! the reverse ordering would have a failed run leave aged credit spendable while
+//! the log said the sweep completed.
 
 use std::env;
 
@@ -74,11 +89,19 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let today = ip_tracking::today_utc();
     let purged = db::purge_expired_usage(&pool, today).await?;
 
+    // The instant, not the date: expiry compares against `credit_expires_at`,
+    // which was stamped by adding a span to a `DateTime<Utc>` at settlement.
+    // `today` above is a date for the day-granular retention windows; using it
+    // here would expire credit up to 24 hours early.
+    let expired = db::expire_credit(&pool, chrono::Utc::now()).await?;
+
     info!(
         usage_events_deleted = purged.usage_events,
         usage_daily_deleted = purged.usage_daily,
         sessions_deleted = purged.sessions,
         identity_tokens_deleted = purged.identity_tokens,
+        deposits_expired = expired.expired,
+        credit_expired_idr = expired.expired_idr,
         events_retention_days = db::USAGE_EVENTS_RETENTION_DAYS,
         daily_retention_days = db::USAGE_DAILY_RETENTION_DAYS,
         session_retention_days = db::SESSION_RETENTION_DAYS,

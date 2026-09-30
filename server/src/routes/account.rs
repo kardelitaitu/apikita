@@ -1057,6 +1057,7 @@ mod tests {
             reserve_settlement_cycles: 1,
             low_balance_threshold_idr: 10_000,
             low_balance_max_per_day: 1,
+            credit_expiry_months: 24,
         }
     }
 
@@ -1299,7 +1300,9 @@ mod tests {
     //     cargo test --lib -- --ignored
     // -----------------------------------------------------------------------
 
-    use crate::db::{credit_topup_transaction, debit_usage_transaction};
+    use crate::db::{
+        credit_topup_transaction, debit_usage_transaction, SHIPPED_CREDIT_EXPIRY_MONTHS,
+    };
     use crate::routes::events::RealtimeHub;
     use crate::routes::test_env::{EnvGuard, EnvLock};
     use crate::test_support::{self, TestDb};
@@ -1401,9 +1404,10 @@ mod tests {
         .await
         .expect("create topup");
 
-        let credited = credit_topup_transaction(pool, &order_id, amount_idr)
-            .await
-            .expect("credit the top-up through the real money path");
+        let credited =
+            credit_topup_transaction(pool, &order_id, amount_idr, SHIPPED_CREDIT_EXPIRY_MONTHS)
+                .await
+                .expect("credit the top-up through the real money path");
         assert!(
             matches!(credited, crate::db::TopupCreditResult::Settled { .. }),
             "the fixture must settle the top-up, got {credited:?}"
@@ -3365,9 +3369,10 @@ mod tests {
 
         // The persisted row is real money: settle it through the documented
         // path (the webhook's own function) and check the ledger follows.
-        let credited = credit_topup_transaction(&pool, order_id, amount)
-            .await
-            .expect("the pending row must be settleable");
+        let credited =
+            credit_topup_transaction(&pool, order_id, amount, SHIPPED_CREDIT_EXPIRY_MONTHS)
+                .await
+                .expect("the pending row must be settleable");
         assert_eq!(
             credited,
             crate::db::TopupCreditResult::Settled {
@@ -3409,7 +3414,7 @@ mod tests {
 
         // A replayed webhook must not pay twice.
         assert_eq!(
-            credit_topup_transaction(&pool, order_id, amount)
+            credit_topup_transaction(&pool, order_id, amount, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("replay the settlement"),
             crate::db::TopupCreditResult::AlreadySettled,

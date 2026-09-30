@@ -38,7 +38,9 @@ use sqlx::SqlitePool;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use crate::db::{credit_topup_transaction, init_pool, TopupCreditResult};
+use crate::db::{
+    credit_topup_transaction, init_pool, TopupCreditResult, SHIPPED_CREDIT_EXPIRY_MONTHS,
+};
 
 /// Resolved at compile time from `CARGO_MANIFEST_DIR`, exactly as `bin/migrate.rs`
 /// does. The tests therefore apply the real migration rather than a transcription
@@ -375,7 +377,8 @@ pub async fn pending_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64)
 /// consistent. Never write `balance_idr` directly: see the module comment.
 pub async fn fund(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) {
     let order_id = pending_topup(pool, account_id, amount_idr).await;
-    match credit_topup_transaction(pool, &order_id, amount_idr).await {
+    match credit_topup_transaction(pool, &order_id, amount_idr, SHIPPED_CREDIT_EXPIRY_MONTHS).await
+    {
         Ok(TopupCreditResult::Settled { .. }) => {}
         other => panic!("the fixture must fund through the real top-up path: {other:?}"),
     }
