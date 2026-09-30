@@ -56,35 +56,41 @@ export const stored = [
   // of the account. Pointing them at PocketBase would now be the false statement.
   { what: 'Email', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal' },
   { what: 'Password hash', where: 'Embedded SQLite (the database file)', sensitivity: 'Sensitive, but not usable if leaked (Argon2id, salted per hash)' },
-  { what: 'Email verification and password-reset links', where: 'Embedded SQLite (the database file)', sensitivity: 'Stored only as a SHA-256 hash of the token, never the token itself. Single use, and deleted once redeemed and on the next request for the same purpose — the raw link exists only in the email we send' },
+  { covers: ['accounts'], what: 'Account record (id, status, sign-up time)', where: 'Embedded SQLite (the database file)', sensitivity: 'The account row itself. The address on it lives in the identity row below, so this row and that one describe the same account' },
+  { covers: ['identities', 'identity_tokens'], what: 'Email verification and password-reset links', where: 'Embedded SQLite (the database file)', sensitivity: 'Stored only as a SHA-256 hash of the token, never the token itself. Single use, and deleted once redeemed and on the next request for the same purpose — the raw link exists only in the email we send' },
   { what: 'Google account link', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal — the Google subject id and the verified address, not a Google password or a Google session' },
-  { what: 'Telegram ID', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal, pseudonymous' },
-  { what: 'Wallet balance + ledger', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
-  { what: 'Top-up history (amounts, dates)', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
-  { what: 'Token usage per day', where: 'Embedded SQLite (the database file)', sensitivity: 'Behavioural' },
-  { what: 'Per-request usage (model, token counts, cost, time)', where: 'Embedded SQLite (the database file)', sensitivity: 'Behavioural — never the prompt or the completion itself' },
-  { what: 'API keys', where: 'Embedded SQLite (the database file)', sensitivity: 'Credentials (hashed) — the plaintext is never stored' },
-  { what: 'Reviews + edit history', where: 'Embedded SQLite (the database file)', sensitivity: 'Opinion, published aggregate only' },
+  { covers: ['telegram_links'], what: 'Telegram ID', where: 'Embedded SQLite (the database file)', sensitivity: 'Personal, pseudonymous' },
+  // `covers` names the tables this ONE row speaks for, and it is here because this
+  // phrase is shared with `ledger`: a shared phrase is not evidence that either
+  // table is disclosed. `doc_claims.rs`'s
+  // `every_table_is_either_disclosed_to_the_customer_or_recorded_as_unused`
+  // requires each table to be named by the row that covers it.
+  { covers: ['wallets', 'ledger'], what: 'Wallet balance + ledger', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
+  { covers: ['topups'], what: 'Top-up history (amounts, dates)', where: 'Embedded SQLite (the database file)', sensitivity: 'Financial' },
+  { covers: ['usage_daily'], what: 'Token usage per day', where: 'Embedded SQLite (the database file)', sensitivity: 'Behavioural' },
+  { covers: ['usage_events'], what: 'Per-request usage (model, token counts, cost, time)', where: 'Embedded SQLite (the database file)', sensitivity: 'Behavioural — never the prompt or the completion itself' },
+  { covers: ['api_keys'], what: 'API keys', where: 'Embedded SQLite (the database file)', sensitivity: 'Credentials (hashed) — the plaintext is never stored' },
+  { covers: ['reviews', 'review_history', 'review_sessions'], what: 'Reviews + edit history', where: 'Embedded SQLite (the database file)', sensitivity: 'Opinion, published aggregate only' },
   // This row is a CUSTOMER-FACING disclosure and it previously claimed an IP hash the
   // sessions table does not hold: sessions.ip_hash is in the schema and NOTHING writes
   // it. Overstating collection is the safer direction to be wrong in and it is still a
   // false statement, so it is corrected rather than left because it errs conservatively.
-  { what: 'Sessions', where: 'Embedded SQLite (the database file)', sensitivity: 'Contains the user agent of the login request, and no IP address and no IP hash — the sessions row never had them' },
+  { covers: ['sessions'], what: 'Sessions', where: 'Embedded SQLite (the database file)', sensitivity: 'Contains the user agent of the login request, and no IP address and no IP hash — the sessions row never had them' },
   // The next three rows were ABSENT, and their absence is the serious direction. The
   // page listed no IP-derived data at all, while docs/data-retention.md has always
   // disclosed these windows — so a reader comparing the two documents would conclude
   // the privacy page had been corrected into silence. It had not; it had been corrected
   // into omission.
-  { what: 'Salted IP hash of API-key traffic (per key, per day)', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, not anonymous — HMAC-SHA256 of the address under a salt replaced at each UTC midnight, so the same visitor is not linkable across days. Held 7 days per seen-address and 90 per day total' },
-  { what: 'Salted IP hash of failed link-code attempts', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, same salt scheme, held 7 days and swept nightly. A credential-guessing attempt writes one hash per attempt, and the window is the limit on how long a breached salt would link them' },
+  { covers: ['key_ip_seen', 'key_ip_daily'], what: 'Salted IP hash of API-key traffic (per key, per day)', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, not anonymous — HMAC-SHA256 of the address under a salt replaced at each UTC midnight, so the same visitor is not linkable across days. Held 7 days per seen-address and 90 per day total' },
+  { covers: ['link_redemption_attempts'], what: 'Salted IP hash of failed link-code attempts', where: 'Embedded SQLite (the database file)', sensitivity: 'Pseudonymous, same salt scheme, held 7 days and swept nightly. A credential-guessing attempt writes one hash per attempt, and the window is the limit on how long a breached salt would link them' },
   // The sign-in and signup caps. This row was absent while the table was written on
   // every attempt against those endpoints, which is the omission direction that matters:
   // the page disclosed the key_ip tables and the link-code attempts, so a reader had no
   // way to learn that the credential-guessing counter exists at all. It is stated here
   // with BOTH keyings, because the account-keyed half holds no address and a page that
   // implied it did would be overstating collection.
-  { what: 'Sign-in attempt counters', where: 'Embedded SQLite (the database file)', sensitivity: 'Stops credential-guessing against the sign-in, signup, password-reset and resend endpoints. The per-address half is the same salted hash scheme as the rows above; the per-account half holds the account id and the time and NO address at all. Both are held 7 days and swept nightly' },
-  { what: 'Telegram link codes, and operator audit rows', where: 'Embedded SQLite (the database file)', sensitivity: 'A link code is deleted once used or 24h after expiry; an operator audit row records which operator did what to which account' },
+  { covers: ['auth_attempts'], what: 'Sign-in attempt counters', where: 'Embedded SQLite (the database file)', sensitivity: 'Stops credential-guessing against the sign-in, signup, password-reset and resend endpoints. The per-address half is the same salted hash scheme as the rows above; the per-account half holds the account id and the time and NO address at all. Both are held 7 days and swept nightly' },
+  { covers: ['link_codes', 'link_code_issues', 'admin_audit'], what: 'Telegram link codes, and operator audit rows', where: 'Embedded SQLite (the database file)', sensitivity: 'A link code is deleted once used or 24h after expiry; an operator audit row records which operator did what to which account' },
 ];
 
 // docs/data-retention.md, "What is NOT stored".

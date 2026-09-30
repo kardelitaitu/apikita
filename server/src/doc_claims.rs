@@ -2032,7 +2032,7 @@ mod tests {
     fn every_table_is_either_disclosed_to_the_customer_or_recorded_as_unused() {
         // table -> a phrase that must be present in website/src/lib/privacy.ts.
         const DISCLOSED: &[(&str, &str)] = &[
-            ("accounts", "Telegram ID"),
+            ("accounts", "Account record (id, status, sign-up time)"),
             ("wallets", "Wallet balance + ledger"),
             ("ledger", "Wallet balance + ledger"),
             ("topups", "Top-up history"),
@@ -2145,6 +2145,26 @@ mod tests {
         for table in &tables {
             if let Some((_, phrase)) = DISCLOSED.iter().find(|(t, _)| t == table) {
                 assert!(privacy.contains(phrase), "table `{table}` is recorded as disclosed under the phrase {phrase:?}, but that phrase is not in website/src/lib/privacy.ts. The map has drifted from the page it describes.");
+                // A PHRASE ALONE DOES NOT DISCLOSE A TABLE, and five groups proved
+                // it: wallets/ledger, reviews/review_history/review_sessions,
+                // key_ip_seen/key_ip_daily, link_codes/link_code_issues and
+                // identities/identity_tokens each carry a BYTE-IDENTICAL phrase, so
+                // the check above was answered by the twin that stayed. privacy.ts
+                // shows the trap: "Telegram link codes" sits in TWO different rows,
+                // so the check passed for both tables while neither row was tied to
+                // a table - and it would have gone on passing after either vanished.
+                //
+                // Requiring the phrase to be UNIQUE would not fix it: wallets and
+                // ledger are one story told in one row on purpose, and forcing a
+                // second row would make the page worse to satisfy a test. What each
+                // table needs is a row that NAMES it, so privacy.ts rows now declare
+                // a `covers` array, and the assertion below is that this table is in
+                // one. A row may then cover several tables and share one phrase,
+                // while every table still has a row that names it, and deleting one
+                // name is a failure instead of a coincidence.
+                let covered = privacy.contains(&format!("'{table}'"))
+                    || privacy.contains(&format!("\"{table}\""));
+                assert!(covered, "table `{table}` is disclosed only by a phrase it SHARES with another table, so the check above would keep passing after the table was removed from the page. Name it in the `covers` array of the row that discloses it: five phrases in DISCLOSED are byte-identical across eleven tables, and a shared phrase is not a disclosure of any single one of them.");
                 continue;
             }
             let Some((_, reason)) = UNUSED.iter().find(|(t, _)| t == table) else {
