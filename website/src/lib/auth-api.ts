@@ -181,10 +181,11 @@ async function postAuth<T>(path: string, body: unknown): Promise<T> {
  *
  * The caller is told NOTHING about whether the address was already registered:
  * the endpoint answers with the same neutral reply either way, and this function
- * has no branch that could distinguish them.
+ * has no branch that could distinguish them. It answers 202 with that message and
+ * NO session — a new account is unverified, so it cannot sign anyone in yet.
  */
-export function signup(email: string, password: string): Promise<SessionResult | null> {
-  return postAuth<SessionResult | null>('/auth/signup', { email, password });
+export function signup(email: string, password: string): Promise<{ message: string }> {
+  return postAuth<{ message: string }>('/auth/signup', { email, password });
 }
 
 /** POST /auth/login. A 401 here is a wrong email/password, not a missing session. */
@@ -197,22 +198,48 @@ export function googleSignIn(idToken: string): Promise<SessionResult> {
   return postAuth<SessionResult>('/auth/google', { id_token: idToken });
 }
 
-/** POST /auth/verify with the token from the link. */
+/** POST /auth/verify-email with the token from the link. Answers 204. */
 export function verifyEmail(token: string): Promise<void> {
-  return postAuth<void>('/auth/verify', { token });
+  return postAuth<void>('/auth/verify-email', { token });
 }
 
-/** POST /auth/reset — asks for a reset link. Neutral by construction. */
-export function requestPasswordReset(email: string): Promise<void> {
-  return postAuth<void>('/auth/reset', { email });
+/**
+ * POST /auth/password-reset/request — asks for a reset link. Neutral by construction.
+ *
+ * Answers 202 with the neutral message, never 204, so the return type records that
+ * the page has something it may show.
+ */
+export function requestPasswordReset(email: string): Promise<{ message: string }> {
+  return postAuth<{ message: string }>('/auth/password-reset/request', { email });
 }
 
-/** POST /auth/reset/confirm with the token and the new password. */
-export function confirmPasswordReset(token: string, password: string): Promise<void> {
-  return postAuth<void>('/auth/reset/confirm', { token, password });
+/**
+ * POST /auth/password-reset/confirm with the token, the address it was sent to, and
+ * the new password.
+ *
+ * THE ADDRESS IS REQUIRED, and it is not redundancy: the token identifies the
+ * account, and the body's address says which identity the caller believes they are
+ * resetting. The server refuses the pair when they disagree (`Some(_) => 401`)
+ * rather than merging them, so a page that omitted the address would be asking for
+ * a different operation than the one the endpoint performs. The page carries the
+ * address forward from the reset request, and falls back to asking for it when the
+ * link did not include one.
+ */
+export function confirmPasswordReset(
+  token: string,
+  email: string,
+  password: string,
+): Promise<void> {
+  return postAuth<void>('/auth/password-reset/confirm', { token, email, password });
 }
 
-/** POST /auth/verification/resend — asks for another verification link. */
-export function resendVerification(email: string): Promise<void> {
-  return postAuth<void>('/auth/verification/resend', { email });
+/**
+ * POST /auth/verification/resend — asks for another verification link.
+ *
+ * Answers 202 with the neutral message whether or not the address exists AND
+ * whether or not it is already verified: a page that branched on the reply would
+ * be the oracle the endpoint refuses to be.
+ */
+export function resendVerification(email: string): Promise<{ message: string }> {
+  return postAuth<{ message: string }>('/auth/verification/resend', { email });
 }
