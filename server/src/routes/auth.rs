@@ -110,6 +110,23 @@ pub struct EmailRequest {
     pub email: String,
 }
 
+/// `POST /auth/password-change`. The current password is required; see the handler.
+#[derive(Debug, Deserialize)]
+pub struct PasswordChangeRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// `GET /auth/providers` — the providers this account can sign in with.
+///
+/// A LIST rather than two booleans (`google`, `password`): the two providers that
+/// exist today are not the set that will exist, and a boolean per provider turns
+/// every addition into a schema change the client has to learn.
+#[derive(Debug, Serialize)]
+pub struct ProvidersResponse {
+    pub providers: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Session config
 // ---------------------------------------------------------------------------
@@ -339,9 +356,12 @@ fn urlencode(value: &str) -> String {
             }
             other => {
                 out.push('%');
-                // Uppercase hex, the form every decoder accepts.
-                out.push(char::from(b"0123456789ABCDEF"[usize::from(other >> 4)]));
-                out.push(char::from(b"0123456789ABCDEF"[usize::from(other & 0x0f)]));
+                // Uppercase hex, the form every decoder accepts. `%` then `{:02X}`
+                // rather than a lookup into a hex table: the table form needs an
+                // INDEX, and indexing is denied crate-wide (lib.rs:115) because a
+                // slice index is a panic path. `{:02X}` of a `u8` is total - it
+                // cannot be out of range for the type it formats.
+                out.push_str(&format!("{other:02X}"));
             }
         }
     }
@@ -1039,6 +1059,111 @@ pub async fn logout_all(
     }
 
     Ok((StatusCode::NO_CONTENT, session_cookie(String::new(), 0)?))
+}
+
+/// `POST /auth/password-change` - change the password of a signed-in account.
+///
+/// THE CURRENT PASSWORD IS REQUIRED, and that is the point of the endpoint rather
+/// than an annoyance: without it a stolen session cookie would be enough to take
+/// permanent ownership of the account. A cookie proves the caller can use this
+/// browser now; the password proves they are the person the account belongs to.
+///
+/// EVERY OTHER SESSION DIES with the change, and this one too. The reasoning is the
+/// reset path's, from the other direction: someone changing their password may be
+/// doing it precisely because they suspect another device holds a session, and
+/// leaving those alive would defeat the gesture. The caller is signed out and told
+/// to sign in again rather than handed a fresh cookie, because a change is exactly
+/// the moment a silent re-issue would be least welcome.
+pub async fn change_password(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    payload: Result<Json<PasswordChangeRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(payload) = payload.map_err(|_| AppError::ValidationFailed {
+        field: "body".into(),
+        message: "expected { current_password, new_password }".into(),
+    })?;
+
+    // Authenticated FIRST, so an unauthenticated guesser does not get to spend the
+    // account's rate-limit budget — the budget protects a signed-in account, and
+    // there is no account to protect until the cookie resolves.
+    let account_id = crate::routes::resolve_account_from_cookie(&state.pool, &headers).await?;
+
+    let ctx = attempt_context(&state, peer, &headers);
+    let limits = limits_config()?;
+    auth_attempts::record_and_check(
+        &state.pool,
+        auth_attempts::Kind::Login,
+        auth_attempts::Subject::Account(account_id),
+        limits.login_per_hour_per_account,
+        ctx.now,
+    )
+    .await?;
+
+    let auth = auth_config()?;
+
+    // Which identity's password is being changed: the one the session's account
+    // actually has. Not taken from the body, or a caller could name an address on
+    // another account.
+    let identity = identity::accounts::first_password_identity(&state.pool, account_id).await?;
+    let Some(identity) = identity else {
+        // A Google-only account has no password to change. Telling the caller that
+        // is not an enumeration leak — they are already signed in as this account.
+        return Err(AppError::ValidationFailed {
+            field: "current_password".into(),
+            message: "this account signs in with Google and has no password to change".into(),
+        });
+    };
+
+    // The current password is verified against the stored hash. A mismatch is a
+    // 401 and is NOT written back as an attempt, like every other refused
+    // credential check in this file.
+    if !identity::password::verify_password(
+        auth.clone(),
+        identity.password_hash.clone(),
+        payload.current_password.clone(),
+    )
+    .await?
+    {
+        return Err(AppError::Unauthenticated);
+    }
+
+    identity::password::validate_password(auth, &payload.new_password)?;
+    let hash = identity::password::hash_password(auth.clone(), payload.new_password).await?;
+    identity::accounts::set_password(&state.pool, identity.identity_id, &hash, ctx.now).await?;
+
+    // Every session, INCLUDING the caller's. The cookie is cleared in the response
+    // so the browser is not left holding a dead one.
+    sqlx::query("UPDATE sessions SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL")
+        .bind(ctx.now)
+        .bind(account_id.hyphenated())
+        .execute(&state.pool)
+        .await?;
+
+    Ok((StatusCode::NO_CONTENT, session_cookie(String::new(), 0)?))
+}
+
+/// `GET /auth/providers` - which sign-in methods this account has.
+///
+/// Answers with the providers that have a row in `identities` for the signed-in
+/// account, so the settings page can say "Linked" or "Not linked" without reading
+/// anything it is not entitled to. It reports the ACCOUNT'S OWN providers and takes
+/// no address or id, so it cannot be used to probe anyone else.
+pub async fn list_providers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let account_id = crate::routes::resolve_account_from_cookie(&state.pool, &headers).await?;
+
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT provider FROM identities WHERE account_id = ?",
+    )
+    .bind(account_id.hyphenated())
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok((StatusCode::OK, Json(ProvidersResponse { providers: rows })))
 }
 
 #[cfg(test)]

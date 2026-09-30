@@ -39,14 +39,15 @@ const { title } = Astro.props;
 <script>
   import { apiFetch } from '../lib/api';
   import { describeError, renderNotice } from '../lib/errors';
-  import { pb } from '../lib/pocketbase';
 
   const banner = document.getElementById('banner-error') as HTMLElement;
   const bannerText = document.getElementById('banner-error-text') as HTMLElement;
   const bannerId = document.getElementById('banner-error-id') as HTMLElement;
 
-  // Log out: revoke the session row, then drop the local token — the same two
-  // steps DashboardLayout performs, so the operator leaves the same way.
+  // Log out: revoke the session row. There is no local credential to drop — the
+  // session is an HttpOnly cookie the API revoked a moment ago, so clearing a
+  // client-side store would be theatre. The same step DashboardLayout performs,
+  // so the operator leaves the same way.
   document.getElementById('logout')?.addEventListener('click', () => {
     void apiFetch<void>('/auth/logout', { method: 'POST', redirectOn401: false })
       .catch((err) => {
@@ -54,7 +55,6 @@ const { title } = Astro.props;
         banner.hidden = false;
       })
       .finally(() => {
-        pb.authStore.clear();
         window.location.assign('/login');
       });
   });

@@ -201,7 +201,7 @@ import Skeleton from '../../components/Skeleton.astro';
   import { apiFetch, ApiError } from '../../lib/api';
   import type { Me } from '../../lib/api';
   import { describeError, renderNotice } from '../../lib/errors';
-  import { pb } from '../../lib/pocketbase';
+  import { changePassword, listProviders } from '../../lib/auth-api';
   import { describeAuthError } from '../../lib/auth-flow';
   import {
     linkCodeInstruction,
@@ -237,21 +237,19 @@ import Skeleton from '../../components/Skeleton.astro';
   }
 
   // --- Profile ------------------------------------------------------------
-  // The email and its verified flag come from the PocketBase record the session
-  // was exchanged from; everything the wallet owns comes from GET /api/me. Neither
-  // is guessed: a missing value shows a dash, never a zero.
-  function renderIdentity(): void {
-    const record = pb.authStore.record as { email?: unknown; verified?: unknown } | null;
+  // The email and its verified flag arrive on GET /api/me, from the account's own
+  // identity row. It used to be read off the PocketBase record, which is gone; the
+  // API is now the only source, and a missing value shows a dash, never a zero.
+  function renderIdentity(email: string | null, verified: boolean): void {
     $('profile-email').textContent =
-      typeof record?.email === 'string' && record.email.length > 0 ? record.email : '\u2014';
-    $('profile-verified').textContent =
-      typeof record?.verified === 'boolean' ? (record.verified ? 'Yes' : 'No') : '\u2014';
+      typeof email === 'string' && email.length > 0 ? email : '\u2014';
+    $('profile-verified').textContent = verified ? 'Yes' : 'No';
   }
 
   async function loadProfile(): Promise<void> {
-    renderIdentity();
     try {
       const me = await apiFetch<Me>('/api/me');
+      renderIdentity(me.email, me.email_verified);
       $('profile-account').textContent = me.account_id;
       $('profile-status').textContent = me.status;
       // The balance is not repeated here — the header already shows it live.
@@ -261,6 +259,8 @@ import Skeleton from '../../components/Skeleton.astro';
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
       // A failed fetch says so. The placeholders stay dashes, not stale values.
+      $('profile-email').textContent = '\u2014';
+      $('profile-verified').textContent = '\u2014';
       $('profile-account').textContent = '\u2014';
       $('profile-status').textContent = '\u2014';
       $('linked-telegram').textContent = '\u2014';
@@ -268,26 +268,21 @@ import Skeleton from '../../components/Skeleton.astro';
     }
   }
 
-  // --- Linked Google identity ---------------------------------------------
-  // listExternalAuths is the SDK's own wrapper over
-  // GET /api/collections/users/records/{id}/external-auths. It is marked
-  // @deprecated in favour of the _externalAuths collection, which needs a filter
-  // over a system collection; the wrapper endpoint is the stable one.
+  // --- Linked identity ----------------------------------------------------
+  // GET /auth/providers reports the providers this account actually has a row for,
+  // and takes no address or id, so it cannot be pointed at anyone else. It is a
+  // list rather than a google/password pair of booleans, so a provider added later
+  // does not need a new field here.
   async function loadLinkedGoogle(): Promise<void> {
-    const id = pb.authStore.record?.id;
-    if (typeof id !== 'string' || id.length === 0) {
-      $('linked-google').textContent = '\u2014';
-      return;
-    }
     try {
-      const auths = await pb.collection('users').listExternalAuths(id);
-      const providers = auths.map((a: { provider?: unknown }) => String(a.provider ?? ''));
+      const { providers } = await listProviders();
       $('linked-google').textContent = providers.includes('google')
         ? 'Linked'
         : 'Not linked';
     } catch {
-      // The identity service is not reachable, or the record is not readable.
-      // This is not a dashboard failure, so it does not raise the page banner.
+      // The request failed, or the session ended mid-page. This is not a dashboard
+      // failure, so it does not raise the page banner — a dash is honest, and the
+      // 401 path has already redirected.
       $('linked-google').textContent = 'Unknown';
     }
   }
@@ -313,26 +308,18 @@ import Skeleton from '../../components/Skeleton.astro';
       return;
     }
 
-    const id = pb.authStore.record?.id;
-    if (typeof id !== 'string' || id.length === 0) {
-      showPasswordError('Your session has ended. Sign in again.');
-      return;
-    }
-
     passwordSubmit.disabled = true;
     passwordSubmit.textContent = 'Changing\u2026';
-    // Password change is PocketBase-side (docs/architecture/identity.md line 38:
-    // password hashing is deliberately not ours). oldPassword is required, so a
-    // stolen session alone cannot set a new password.
-    void pb.collection('users')
-      .update(id, { oldPassword: current, password: next, passwordConfirm: confirmation })
+    // POST /auth/password-change, which REQUIRES the current password: a stolen
+    // session cookie alone must not be enough to take over the account. It revokes
+    // every session, including this one, so the page does not clear a cookie — it
+    // is already dead server-side — and it does not try to stay signed in. Sending
+    // the user to /login is the honest end state of a password change.
+    void changePassword(current, next)
       .then(() => {
         passwordForm.hidden = true;
         passwordDone.textContent = PASSWORD_CHANGED_MESSAGE;
         passwordDone.hidden = false;
-        // The change rotated the token key, so this device's token is already
-        // dead. Drop it here rather than leaving a token that will 401.
-        pb.authStore.clear();
         window.setTimeout(() => window.location.assign('/login'), 2500);
       })
       .catch((err: unknown) => showPasswordError(describeAuthError(err, 'That did not work.')))

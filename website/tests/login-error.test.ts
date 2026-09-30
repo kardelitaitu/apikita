@@ -1,7 +1,7 @@
 // Executable contract for the login page's failed-sign-in notice.
 //
-// Login is the one auth page whose failures come from the Rust API (the
-// PocketBase token is exchanged for a session there), so its 429 carries the API
+// Login is the one auth page whose failures come from the Rust API (the API issues
+// the session cookie itself), so its 429 carries the API
 // error shape: a Retry-After wait and a request_id. It used to build that line by
 // hand inside an `.astro` script block, which neither `tsc` nor this suite can
 // see — the format could drift with every 429 still green, and it had drifted

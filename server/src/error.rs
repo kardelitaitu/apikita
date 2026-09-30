@@ -80,6 +80,18 @@ pub enum AppError {
     #[error("No upstream available")]
     NoUpstreamAvailable { retry_after_secs: u64 },
 
+    /// A store this request needs could not be reached at all, as opposed to
+    /// answering a question with "no".
+    ///
+    /// DISTINCT FROM `Database`, which is a 500: that variant means a query THIS
+    /// code wrote failed against a database that answered, which is a bug and
+    /// belongs in the log as one. This one means the answer was never available -
+    /// the file is gone, the pool cannot connect, the disk is full - and the honest
+    /// thing to tell a client is "try again", not "something is broken here".
+    /// `NoUpstreamAvailable` is the same status for the same reason, one layer out.
+    #[error("Unavailable: {0}")]
+    Unavailable(String),
+
     // Display keeps the full inner detail on purpose: it is load-bearing for
     // server-side observability (every `error = %err` log site). The
     // customer-facing body does NOT use Display - see `client_message`.
@@ -103,7 +115,9 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::ValidationFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
-            Self::NoUpstreamAvailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoUpstreamAvailable { .. } | Self::Unavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -123,6 +137,7 @@ impl AppError {
             Self::ValidationFailed { .. } => "validation_failed",
             Self::RateLimited { .. } => "rate_limited",
             Self::NoUpstreamAvailable { .. } => "no_upstream_available",
+            Self::Unavailable(_) => "unavailable",
             Self::Database(_) | Self::Internal(_) => "internal_error",
         }
     }

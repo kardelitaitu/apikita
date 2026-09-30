@@ -59,13 +59,17 @@ function referencedPublicNames() {
 // in a diff, rather than discovered in a shipped asset.
 const REACHABLE = [
   'PUBLIC_API_BASE_URL',
+  // The Google client id, read by src/lib/auth-api.ts to initialise Google Identity
+  // Services. Public by design: it is sent in the page and identifies the app, not the
+  // user, and it carries no secret — the ID token it produces is verified against
+  // Google's JWKS by the server.
+  'PUBLIC_GOOGLE_CLIENT_ID',
   // Midtrans CLIENT keys are published in the page by design - the Snap.js integration
   // cannot work otherwise. `.env.example:100` says so explicitly: "The CLIENT key, not
   // the server key above: it is inlined into the browser bundle and is public by
   // design." The SERVER key must never appear here, which the test below enforces.
   'PUBLIC_MIDTRANS_CLIENT_KEY',
   'PUBLIC_MIDTRANS_ENV',
-  'PUBLIC_POCKETBASE_URL',
 ];
 
 test('the set of PUBLIC_ variables the build can inline is exactly the reviewed one', () => {

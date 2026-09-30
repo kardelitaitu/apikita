@@ -20,7 +20,7 @@ const steps = [
   {
     n: '1',
     title: 'Sign in',
-    body: 'Google or email + password, handled by PocketBase. The browser exchanges that token once for a session cookie via POST /auth/exchange. Your API keys never touch the browser session.',
+    body: 'Google or email + password, handled by the API itself. Signing in sets an opaque session cookie; there is no third-party identity service and no token to exchange. Your API keys never touch the browser session.',
   },
   {
     n: '2',

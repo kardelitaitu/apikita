@@ -97,7 +97,7 @@ const lead = 'Two ways in. Google creates the account on first sign-in and its e
 </AuthLayout>
 
 <script>
-  import { pb, exchangeForSession } from '../lib/pocketbase';
+  import { googleIdToken, googleSignIn, signup as signupRequest } from '../lib/auth-api';
   import { confirmationError, describeAuthError, DUPLICATE_SIGNUP_MESSAGE, isUnreachable, passwordRuleError, signupReply } from '../lib/auth-flow';
 
   const errorBox = document.getElementById('auth-error') as HTMLDivElement;
@@ -132,8 +132,8 @@ const lead = 'Two ways in. Google creates the account on first sign-in and its e
   googleButton.addEventListener('click', () => {
     clearError();
     setBusy(true);
-    void pb.collection('users').authWithOAuth2({ provider: 'google' })
-      .then(exchangeForSession)
+    void googleIdToken()
+      .then(googleSignIn)
       .then(() => window.location.assign('/dashboard'))
       .catch((err: unknown) => showError(describeAuthError(err, DUPLICATE_SIGNUP_MESSAGE)))
       .finally(() => setBusy(false));
@@ -156,18 +156,17 @@ const lead = 'Two ways in. Google creates the account on first sign-in and its e
     }
 
     setBusy(true);
-    void pb.collection('users').create({ email, password, passwordConfirm: confirmation })
-      .then(() => {
-        // Spec line 31: the verification email follows registration. Its failure
-        // does not change what the user is told — the reply stays neutral.
-        void pb.collection('users').requestVerification(email).catch(() => undefined);
-        showNeutralReply(signupReply(null));
-      })
+    // ONE request. The signup handler creates the account AND sends the
+    // verification mail itself, so the old follow-up `requestVerification` call is
+    // gone — and it answers 202 with a neutral reply for a fresh address and a
+    // taken one alike, which is exactly what this page must show.
+    void signupRequest(email, password)
+      .then(() => showNeutralReply(signupReply(null)))
       .catch((err: unknown) => {
         // Spec lines 38-43: a taken address must not be distinguishable from a
-        // free one. The server's 400 is not shown; the neutral reply is.
+        // free one. A server answer is replaced by the neutral reply; only a
+        // request that never arrived is admitted to be a failure.
         if (!isUnreachable(err)) {
-          void pb.collection('users').requestVerification(email).catch(() => undefined);
           showNeutralReply(signupReply(err));
           return;
         }

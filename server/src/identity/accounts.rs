@@ -299,6 +299,55 @@ pub struct PasswordIdentity {
     pub email_verified: bool,
 }
 
+/// The password identity belonging to `account_id`, when it has one.
+///
+/// The account-addressed sibling of [`password_identity`], which is addressed by
+/// email. A password change already knows its account from the session and must NOT
+/// take an address from the request body — a caller who could name the address
+/// could name one on a different account.
+///
+/// `ORDER BY created_at ASC LIMIT 1` because an account can in principle hold more
+/// than one password identity (a reset on a Google-only account creates one
+/// alongside nothing, but a future merge could leave two). The oldest is the one
+/// signup or the first reset created, which is the one the account holder
+/// recognises; picking arbitrarily would make the answer depend on row order.
+pub async fn first_password_identity(
+    pool: &SqlitePool,
+    account_id: Uuid,
+) -> Result<Option<PasswordIdentity>, AppError> {
+    let row = sqlx::query(
+        "SELECT id, account_id, password_hash, email_verified FROM identities \
+         WHERE provider = ? AND account_id = ? ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(PASSWORD)
+    .bind(account_id.hyphenated())
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let password_hash: Option<String> = row.get("password_hash");
+    let Some(password_hash) = password_hash else {
+        // The CHECK constraint makes this impossible for a password identity, so a
+        // row in this state is corrupt rather than a client error.
+        return Err(AppError::Internal(
+            "a password identity has no password_hash".into(),
+        ));
+    };
+
+    Ok(Some(PasswordIdentity {
+        identity_id: parse_uuid(&row.get::<String, _>("id"), "identities.id")?,
+        account_id: parse_uuid(
+            &row.get::<String, _>("account_id"),
+            "identities.account_id",
+        )?,
+        password_hash,
+        email_verified: row.get::<i64, _>("email_verified") != 0,
+    }))
+}
+
 /// A password identity attached to `account_id`, creating one when absent.
 ///
 /// Used by the reset path (vector 4) and by signup. It does NOT decide whether the

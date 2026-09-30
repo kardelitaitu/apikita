@@ -72,6 +72,24 @@ pub fn session_token_from_cookie_header(cookie_header: &str) -> Option<&str> {
     })
 }
 
+/// A session row that cannot be read is a store that is not there, not a credential
+/// that is wrong.
+///
+/// `resolve_account_from_cookie` answers `Unauthenticated` for every way a session can
+/// be unusable, and that is deliberate: a caller must not be able to tell "no session"
+/// from "dead session". A store that cannot be queried is a third case and does NOT
+/// belong in that bucket - answering 401 during an outage tells every signed-in
+/// customer their session is bad, and the web client acts on a 401 by redirecting to
+/// /login, so a database blip would log the whole site out. 503 says "try again",
+/// which is what is true.
+///
+/// The message is fixed rather than the sqlx text: a store error string can name the
+/// path or the schema, and this is returned on a route any authenticated caller
+/// reaches.
+fn unusable_session_store(_: sqlx::Error) -> AppError {
+    AppError::Unavailable("the session store is unreachable".into())
+}
+
 /// Whether a session is usable at `now`, given when it was last seen and when it
 /// absolutely expires.
 ///
@@ -182,11 +200,25 @@ pub async fn resolve_account_from_cookie(
         return Err(AppError::Unauthenticated);
     };
 
+    // A row that cannot be read at all is a store that is not there, not a credential
+    // that is wrong. Returning Unauthenticated would say "your session is bad" about
+    // every session during an outage, and the two callers that act on a 401 - the web
+    // client's redirectToLogin() and a customer deciding whether to sign in again -
+    // would both do the wrong thing. 503 says "try again", which is what is true.
+    //
+    // THIS WAS FOUND BY A TEST, not by reading: `table_state()` builds a pool pointing
+    // at a file that does not exist, so a route resolving a cookie reached this
+    // `?` and answered 500, which is not a status the mounted-route table test accepts
+    // as "the router matched". The routing question and the error mapping were the same
+    // question and only the table asked it.
     let account_id: Uuid = session
-        .try_get::<uuid::fmt::Hyphenated, _>("account_id")?
+        .try_get::<uuid::fmt::Hyphenated, _>("account_id")
+        .map_err(unusable_session_store)?
         .into_uuid();
-    let last_seen_at: chrono::DateTime<chrono::Utc> = session.try_get("last_seen_at")?;
-    let expires_at: chrono::DateTime<chrono::Utc> = session.try_get("expires_at")?;
+    let last_seen_at: chrono::DateTime<chrono::Utc> =
+        session.try_get("last_seen_at").map_err(unusable_session_store)?;
+    let expires_at: chrono::DateTime<chrono::Utc> =
+        session.try_get("expires_at").map_err(unusable_session_store)?;
 
     if !session_is_live_at(now, last_seen_at, expires_at, idle_days, absolute_days) {
         return Err(AppError::Unauthenticated);
@@ -274,6 +306,8 @@ pub const ROUTES: &str = r#"
 .route("/auth/verification/resend", post(auth::resend_verification));
 .route("/auth/logout", post(auth::logout));
 .route("/auth/logout-all", post(auth::logout_all));
+.route("/auth/password-change", post(auth::change_password));
+.route("/auth/providers", get(auth::list_providers));
 .route("/api/me", get(account::get_me));
 .route("/api/usage", get(account::get_usage));
 .route("/api/usage/recent", get(account::get_recent_usage));
@@ -326,6 +360,8 @@ pub const ROUTE_ARRAY_SHAPE_IS_IMPOSSIBLE: &[&str] = &[
     "/auth/verification/resend",
     "/auth/logout",
     "/auth/logout-all",
+    "/auth/password-change",
+    "/auth/providers",
     "/api/me",
     "/api/usage",
     "/api/usage/recent",
@@ -368,6 +404,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/auth/verification/resend", post(auth::resend_verification));
         .route("/auth/logout", post(auth::logout));
         .route("/auth/logout-all", post(auth::logout_all));
+        // The two the settings panel needs, and the reason each exists rather than a
+        // PocketBase SDK call: `change_password` replaces `users.update` with a verb
+        // that verifies the CURRENT password and kills every session, and
+        // `list_providers` replaces `listExternalAuths` by reporting the account's own
+        // identity rows and taking no address or id.
+        .route("/auth/password-change", post(auth::change_password));
+        .route("/auth/providers", get(auth::list_providers));
         // Account & Wallet
         .route("/api/me", get(account::get_me));
         .route("/api/usage", get(account::get_usage));
@@ -1228,6 +1271,25 @@ mod tests {
     /// credential (auth::login validates its payload first): a 400 there still
     /// proves the route matched, which is all this asserts.
     async fn route_status(app: &Router, method: &str, uri: &str, body: &str) -> StatusCode {
+        route_status_with_body(app, method, uri, body).await.0
+    }
+
+    /// The status AND the response body, for the callers that have to tell two
+    /// 404s apart.
+    ///
+    /// A 404 alone does not mean "not mounted". axum answers 404 for an unmatched
+    /// path AND for a request whose extractor rejected the body ("Failed to
+    /// deserialize the JSON body into the target type" carries `NOT_FOUND` in axum's
+    /// `JsonRejection`), so the status by itself cannot separate "this route is gone"
+    /// from "this row sends a body the handler refuses". The body text is what
+    /// separates them, and `POST /auth/password-change` sat on that ambiguity until
+    /// the response was read rather than the code.
+    async fn route_status_with_body(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
         use axum::http::Request;
         use tower::ServiceExt;
 
@@ -1239,11 +1301,16 @@ mod tests {
             .body(axum::body::Body::from(body.to_string()))
             .expect("build the request");
 
-        app.clone()
+        let res = app
+            .clone()
             .oneshot(req)
             .await
-            .expect("the router must respond")
-            .status()
+            .expect("the router must respond");
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("the response body must be readable");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// A concrete path parameter, used to prove {id} is a PARAMETER.
@@ -1268,12 +1335,22 @@ mod tests {
     /// arrived at by assuming each dual-method path contributes an extra row. It does
     /// not: `/api/topups` and `/api/keys` are ONE `.route(` call each carrying both
     /// `get` and `post`, and this table lists a request per METHOD, so each
-    /// contributes two rows in total, not three. 34 is the number the test pins.
+    /// contributes two rows in total, not three. 36 is the number the test pins.
     ///
     /// The native identity routes each contribute ONE row: they are all
     /// single-method (POST), so `/auth/logout` and `/auth/logout-all` are not the
     /// dual-method paths the previous note named - only `/api/topups` and
-    /// `/api/keys` are.
+    /// `/api/keys` are. `/auth/password-change` (POST) and `/auth/providers` (GET)
+    /// are likewise one row each, and they are the two the settings panel needs:
+    /// the password change the retired SDK did with `users.update`, and the linked
+    /// provider list it did with `listExternalAuths`.
+    ///
+    /// THE COUNT MOVED FROM 32 TO 36 IN TWO DIRECTIONS AT ONCE, which is why the
+    /// header names the intermediate number rather than only the endpoints. It was
+    /// 34, then 32 when the identity port deleted `/auth/exchange`, then 33 when
+    /// `/auth/google` was added to the inventory it had been missing from, and 36
+    /// now. A reader comparing two of those numbers without the sequence in
+    /// between would conclude a route was dropped that never existed.
     const MOUNTED: &[(&str, &str, &str)] = &[
         ("GET", "/health", ""),
         ("GET", "/api/admin/metrics", ""),
@@ -1310,6 +1387,19 @@ mod tests {
         ),
         ("POST", "/auth/logout", ""),
         ("POST", "/auth/logout-all", ""),
+        (
+            // HANDLED BEFORE THE GATE, which is why no extractor can turn it into a
+            // 404. `POST /auth/password-change` does this and NOTHING ELSE in the table
+            // does: every other handler takes `Json<T>` directly and therefore lets
+            // axum decide the status when a body does not parse, which axum reports as
+            // 404 - indistinguishable, from a status alone, from a route that is not
+            // mounted at all. Take a `Result<Json<T>, JsonRejection>` and map the
+            // rejection yourself; the table can then assert what it means to assert.
+            "POST",
+            "/auth/password-change",
+            r#"{"current_password":"probe","new_password":"probe"}"#,
+        ),
+        ("GET", "/auth/providers", ""),
         ("GET", "/api/me", ""),
         ("GET", "/api/usage", ""),
         ("GET", "/api/usage/recent", ""),
@@ -1604,18 +1694,25 @@ mod tests {
         let app = table_app();
 
         for (method, path, body) in MOUNTED {
-            let status = route_status(&app, method, path, body).await;
-            assert_ne!(
-                status,
-                StatusCode::NOT_FOUND,
-                "{method} {path} is mounted by create_router but the router did not match it \
-                 (404): the route was deleted or the path renamed"
-            );
+            let (status, response) = route_status_with_body(&app, method, path, body).await;
             assert_ne!(
                 status,
                 StatusCode::METHOD_NOT_ALLOWED,
                 "{method} {path} is mounted by create_router but the router refused the method \
                  (405): the handler was moved to a different method"
+            );
+            // A 404 IS NOT PROOF THAT THE PATH IS MISSING. axum answers 404 for an
+            // unmatched path AND for a rejected extractor, so a row whose body the
+            // handler will not accept is indistinguishable, from the status alone, from
+            // a route that was deleted. The RESPONSE TEXT is what separates the two, so
+            // it travels in the message: without it the next reader gets a 404 and no
+            // way to tell which of two very different repairs is the right one.
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} {path} answered 404 against a router built from create_router. Either \
+                 the route was deleted or renamed, or the request was rejected before it reached \
+                 the handler - axum reports both as 404. Body sent: {body}. Response: {response}"
             );
         }
 
@@ -1780,15 +1877,16 @@ mod tests {
         // looks self-consistent.
         assert_eq!(
             declared.len(),
-            32,
-            "create_router mounts a different number of routes than the 32 this test was \
+            34,
+            "create_router mounts a different number of routes than the 34 this test was \
              last reconciled against. If that is deliberate, update this number AND the \
-             count in MOUNTED's doc comment - both, or the next reader trusts a stale one."
+             MOUNTED doc comment that states the row count - both, or the next reader \
+             trusts a stale one."
         );
         assert_eq!(
             mounted_set.len(),
-            34,
-            "MOUNTED declares a different number of ROWS than the 34 this test was last \
+            36,
+            "MOUNTED declares a different number of ROWS than the 36 this test was last \
              reconciled against. Rows, not routes: /api/topups and /api/keys each carry \
              GET+POST, so each contributes two rows from one `.route(` call, while the rest \
              including /auth/logout and /auth/logout-all are single-method. A mismatch here \

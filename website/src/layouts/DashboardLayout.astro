@@ -88,7 +88,6 @@ const { title } = Astro.props;
   import { apiFetch, API_BASE } from '../lib/api';
   import { describeError, renderNotice } from '../lib/errors';
   import { formatIdr, formatCount } from '../lib/format';
-  import { pb } from '../lib/pocketbase';
   import {
     healthPath,
     statusDetail,
@@ -193,12 +192,15 @@ const { title } = Astro.props;
     banner.hidden = false;
   }
 
-  /** Log out of this device: revoke the session row, then drop the local token. */
+  /**
+   * Log out of this device: revoke the session row. The session is an HttpOnly
+   * cookie, so revoking it IS the whole logout — there is no client-side token to
+   * clear and nothing left in the browser to go stale.
+   */
   document.getElementById('logout')?.addEventListener('click', () => {
     void apiFetch<void>('/auth/logout', { method: 'POST', redirectOn401: false })
       .catch(showError)
       .finally(() => {
-        pb.authStore.clear();
         window.location.assign('/login');
       });
   });
@@ -208,7 +210,6 @@ const { title } = Astro.props;
     void apiFetch<void>('/auth/logout-all', { method: 'POST', redirectOn401: false })
       .catch(showError)
       .finally(() => {
-        pb.authStore.clear();
         window.location.assign('/login');
       });
   });

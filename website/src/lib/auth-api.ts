@@ -243,3 +243,51 @@ export function confirmPasswordReset(
 export function resendVerification(email: string): Promise<{ message: string }> {
   return postAuth<{ message: string }>('/auth/verification/resend', { email });
 }
+
+/**
+ * POST /auth/password-change — changes the signed-in account's password.
+ *
+ * Session-authenticated, and `currentPassword` is REQUIRED by the API: a stolen
+ * session cookie alone must not be enough to take permanent ownership of an
+ * account. On success the API revokes EVERY session including this one, so the
+ * caller is expected to send the user back to sign in — do not try to carry on as
+ * though the session survived.
+ */
+export function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  return postAuth<void>('/auth/password-change', {
+    current_password: currentPassword,
+    new_password: newPassword,
+  });
+}
+
+/**
+ * GET /auth/providers — which sign-in methods the signed-in account has.
+ *
+ * Answers the account's own rows and takes no address or id, so it cannot be used
+ * to probe anyone else. A list, not one boolean per provider: the providers that
+ * exist today are not the set that will exist.
+ */
+export async function listProviders(): Promise<{ providers: string[] }> {
+  const res = await fetch(API_BASE + '/auth/providers', {
+    method: 'GET',
+    // Same reason postAuth opts in: the session cookie is HttpOnly and only comes
+    // back if the request asks for credentials.
+    credentials: 'include',
+    headers: { Accept: 'application/json' },
+  });
+
+  if (!res.ok) {
+    let parsed: { error?: { code: string; message: string; request_id?: string; details?: Record<string, unknown> } } | null = null;
+    try {
+      parsed = (await res.json()) as typeof parsed;
+    } catch {
+      // A non-JSON body: fall through to the status line, exactly as postAuth does.
+    }
+    throw new ApiError(res.status, parsed?.error ?? null, res.statusText, null);
+  }
+
+  return (await res.json()) as { providers: string[] };
+}

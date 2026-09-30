@@ -11,15 +11,17 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 
 | Group | Endpoints | Auth |
 | --- | --- | --- |
-| Auth | `POST /auth/signup`, `POST /auth/login`, `POST /auth/google`, `POST /auth/verify-email`, `POST /auth/password-reset/request`, `POST /auth/password-reset/confirm`, `POST /auth/verification/resend`, `POST /auth/logout`, `POST /auth/logout-all`, `POST /auth/exchange` (pending removal) | cookie / none |
+| Auth | `POST /auth/signup`, `POST /auth/login`, `POST /auth/google`, `POST /auth/verify-email`, `POST /auth/password-reset/request`, `POST /auth/password-reset/confirm`, `POST /auth/verification/resend`, `POST /auth/logout`, `POST /auth/logout-all`, `POST /auth/password-change`, `GET /auth/providers` | cookie / none |
 
-**`POST /auth/exchange` is the one route whose failure mode depends on an EXTERNAL service.**
-It verifies the `pb_token` against PocketBase before creating a session, so with the identity
-provider unreachable it answers **500** (`code=internal_error`, a `request_id`, and the detail
-only in the log) — measured in a container with no PocketBase, logged as
-`PocketBase auth-refresh unreachable`. A client should treat that as "try again", not as a
-rejected credential: the request never reached the point of judging the token. The other auth
-verbs need no credential, and `logout`/`logout-all` are **intentionally idempotent** — they
+**The auth verbs need no external service, and that is a change.** Identity used to live in a
+separate PocketBase instance, and `POST /auth/exchange` (now deleted) was the one route whose
+failure mode depended on it: it verified a `pb_token` before creating a session, so an
+unreachable identity provider answered **500**. The identity port moved every credential check
+into this crate over the `identities` table, so a login either verifies locally or answers a
+credential error — the only outbound calls left in the auth path are the verification mail and
+Google's JWKS endpoint for `POST /auth/google`, and neither is consulted to decide a password.
+
+`logout`/`logout-all` are **intentionally idempotent** — they
 revoke the presented session if there is one and always answer **204** with a cleared cookie,
 so an anonymous call is a no-op rather than an error.
 | Account | `GET /api/me`, `GET /api/usage`, `GET /api/usage/recent`, `GET /api/topups`, `GET /api/export` | cookie |
@@ -204,22 +206,6 @@ to do.
 
 Errors: `429` beyond `[limits] verification_resend_per_hour`.
 
-### `POST /auth/exchange` — pending removal
-
-Exchanges a PocketBase auth token for a Rust session cookie. **This route is
-being deleted**: it is the last one that needs a PocketBase instance, and it
-exists only until the client that calls it is removed. Use `POST /auth/login` or
-`POST /auth/google`.
-
-```json
-// request
-{ "pb_token": "<pocketbase jwt>" }
-
-// 200 response
-{ "account_id": "uuid", "balance_idr": 50000 }
-// sets: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax
-```
-
 ### `POST /auth/logout`
 
 Revokes the current session row. `204`. Clears the cookie.
@@ -228,6 +214,44 @@ Revokes the current session row. `204`. Clears the cookie.
 
 Revokes **every** session for the account. `204`. This is real revocation, not
 just discarding a token — other devices are logged out immediately.
+
+### `POST /auth/password-change`
+
+Changes the password of the signed-in account. `204`, and clears the cookie:
+**every** session on the account is revoked, including the caller's own. A
+password change is something someone does when they suspect another device holds
+a session, so leaving those alive would defeat the gesture — the caller signs in
+again rather than being handed a fresh cookie.
+
+`current_password` is required. Without it a stolen session cookie alone would be
+enough to take permanent ownership of the account.
+
+```json
+// request
+{ "current_password": "...", "new_password": "..." }
+
+// 401 unauthenticated — no session cookie, or current_password is wrong
+// 422 validation_failed — new_password breaks the policy, or the account signs
+//                         in with Google and has no password to change
+```
+
+A mismatch on `current_password` is `401`, the same answer a bad sign-in
+credential earns, so the endpoint does not confirm which half of the pair was
+wrong.
+
+### `GET /auth/providers`
+
+Which sign-in methods the signed-in account has, for the settings panel.
+
+```json
+// 200 response
+{ "providers": ["google", "password"] }
+```
+
+A list, not a `google`/`password` pair of booleans: the providers that exist
+today are not the set that will exist, and a boolean per provider turns every
+addition into a schema change. Reports the account's own rows and takes no
+address or id, so it cannot be used to probe another account.
 
 ---
 
@@ -249,9 +273,17 @@ Everything the dashboard needs on load.
   },
   "telegram_linked": false,
   "status": "active",
-  "is_operator": false
+  "is_operator": false,
+  "email": "you@example.com",
+  "email_verified": true
 }
 ```
+
+`email` is `null` when the account holds no identity row at all, and `email_verified`
+is `false` then. Both come from the SAME identity row (`ORDER BY email_verified DESC,
+created_at ASC`), so the pair cannot describe two different identities, and the answer
+does not move when a second sign-in method is linked. A missing address renders as a
+dash, never as an empty string: "" and "we do not have one" are different answers.
 
 **This is the polling fallback** when SSE drops. Keep it cheap.
 

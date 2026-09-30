@@ -50,6 +50,24 @@ pub struct MeResponse {
     /// authorization: every admin route re-checks `accounts.is_operator` server
     /// side (admin.rs::require_operator), so a forged value here buys nothing.
     pub is_operator: bool,
+    /// The address this account signs in with, and whether it has been verified.
+    ///
+    /// Both are on THIS response rather than a second endpoint because the
+    /// settings page renders them beside the balance, and two round trips for one
+    /// panel is two chances to show a half-filled card.
+    ///
+    /// `None` when the account holds no identity row at all — which is possible:
+    /// the row is created by the sign-in that mints the account, so an account
+    /// this API has never seen sign in has none. The page shows a dash for a
+    /// missing address rather than an empty string, because "" and "we do not
+    /// have one" are different answers.
+    ///
+    /// This REPLACED a read of the PocketBase record's `email`/`verified` fields
+    /// after the identity port. The port is why the page had to ask twice: the
+    /// address used to arrive with the exchanged token, and it now lives in
+    /// `identities` like everything else.
+    pub email: Option<String>,
+    pub email_verified: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +181,38 @@ pub async fn get_me(
         .fetch_optional(&pool)
         .await?;
 
+    // The address and its verified flag, from the SAME row, so the pair cannot
+    // describe two different identities. `ORDER BY email_verified DESC, created_at
+    // ASC` and `LIMIT 1` are the preference the receipt path already uses (see
+    // `account_email`): a verified identity outranks an unverified one, and among
+    // equals the oldest wins, so the answer does not move when a second identity is
+    // linked. Without the ordering a customer with both a password and a Google
+    // identity would see the panel flip depending on which row SQLite happened to
+    // return first.
+    let identity = sqlx::query(
+        "SELECT email, email_verified FROM identities \
+         WHERE account_id = ? ORDER BY email_verified DESC, created_at ASC LIMIT 1",
+    )
+    .bind(account_id.hyphenated())
+    .fetch_optional(&pool)
+    .await?;
+
+    let (email, email_verified) = match identity {
+        Some(row) => {
+            let raw: String = row.try_get("email")?;
+            let trimmed = raw.trim();
+            // An empty address is "we have none", not an address that is the empty
+            // string - the same reading `account_email` applies before a receipt.
+            let email = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            (email, row.try_get::<i64, _>("email_verified")? != 0)
+        }
+        None => (None, false),
+    };
+
     Ok(Json(MeResponse {
         account_id,
         balance_idr,
@@ -175,6 +225,8 @@ pub async fn get_me(
         telegram_linked: tg_link.is_some(),
         status,
         is_operator,
+        email,
+        email_verified,
     }))
 }
 
@@ -1513,6 +1565,30 @@ mod tests {
         let opening = 73_500;
         settle_topup(&pool, account_id, opening).await;
 
+        // The address is an identity row, and it is written through the SAME
+        // production helper the signup path uses: `identities` carries
+        // `CHECK ((provider = 'password') = (password_hash IS NOT NULL))`, so a
+        // hand-written INSERT would either fail that check or store a flag the real
+        // writer cannot produce.
+        let address = "primary@example.com";
+        let hash = crate::identity::password::hash_password(
+            crate::routes::auth::auth_config_for_tests()
+                .expect("the shipped [auth] section parses"),
+            "not-a-real-password".to_string(),
+        )
+        .await
+        .expect("hash the fixture password");
+        crate::identity::accounts::upsert_password_identity(
+            &pool,
+            account_id,
+            address,
+            &hash,
+            true,
+            Utc::now(),
+        )
+        .await
+        .expect("create the password identity");
+
         // The second account carries a DIFFERENT balance, so a handler reading
         // the wrong row - or returning a constant - cannot satisfy both.
         let other_opening = 11_000;
@@ -1552,6 +1628,8 @@ mod tests {
             [
                 "account_id",
                 "balance_idr",
+                "email",
+                "email_verified",
                 "is_operator",
                 "status",
                 "telegram_linked",
@@ -1562,6 +1640,14 @@ mod tests {
         assert_eq!(body["account_id"], json!(account_id));
         assert_eq!(body["status"], json!("active"));
         assert_eq!(body["telegram_linked"], json!(false));
+        // The address and its flag come from the identity row, cross-checked
+        // against the table so a handler that returned a constant cannot pass.
+        assert_eq!(body["email"], json!(address));
+        assert_eq!(
+            body["email_verified"],
+            json!(true),
+            "the fixture verified the identity, so the panel must say so: {body}"
+        );
         // The fixture accounts are ordinary customers, so the operator flag the
         // admin UI gates on must read false. Cross-checked against the row.
         let stored_operator: bool =

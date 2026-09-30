@@ -3,9 +3,9 @@ import AuthLayout from '../layouts/AuthLayout.astro';
 
 // docs/website/03-functional-spec.md line 12: "Email verification landing".
 // Line 32: the user clicks the link, lands here, and the account becomes active.
-// PocketBase sends the token in the URL; the page consumes it once.
+// The link carries the token in the URL; this page consumes it once.
 const heading = 'Verifying your email';
-const lead = 'This is where the link in your verification email lands. We confirm the token with PocketBase, and the account becomes active the moment it is accepted.';
+const lead = 'This is where the link in your verification email lands. We confirm the token with the API, and the account becomes active the moment it is accepted.';
 ---
 
 <AuthLayout
@@ -30,7 +30,7 @@ const lead = 'This is where the link in your verification email lands. We confir
 </AuthLayout>
 
 <script>
-  import { pb } from '../lib/pocketbase';
+  import { verifyEmail } from '../lib/auth-api';
   import { isUnreachable, readAuthToken, UNREACHABLE_MESSAGE, VERIFICATION_FAILED_MESSAGE, withoutAuthToken } from '../lib/auth-flow';
 
   const pending = document.getElementById('verify-pending') as HTMLDivElement;
@@ -41,9 +41,9 @@ const lead = 'This is where the link in your verification email lands. We confir
 
   // Spec line 95: the token must not be echoed back in a URL that gets logged.
   // Dropped from the address bar before the request goes out, so it is gone from
-  // the history entry, from a copy of the link, and from the referrer of the
-  // next navigation. PocketBase keeps its own copy in localStorage — that is the
-  // SDK's store, not a URL.
+  // the history entry, from a copy of the link, and from the referrer of the next
+  // navigation. Nothing else keeps a copy: unlike the retired SDK, the API stores
+  // only a hash of the token and holds no client-side session.
   if (token !== null) {
     window.history.replaceState(null, '', withoutAuthToken(window.location.href));
   }
@@ -57,12 +57,12 @@ const lead = 'This is where the link in your verification email lands. We confir
   if (token === null) {
     finish(VERIFICATION_FAILED_MESSAGE);
   } else {
-    void pb.collection('users').confirmVerification(token)
+    void verifyEmail(token)
       .then(() => finish('Your email address is verified. Sign in to reach the dashboard.'))
       // One message for every unusable token: expired, already used, or simply
-      // wrong. PocketBase clears a token when it is redeemed, so "already
-      // verified" arrives here as an unusable token and lands on the same line,
-      // with the same next step.
+      // wrong. The API marks a token consumed in the same statement that checks it,
+      // so "already verified" arrives here as an unusable token and lands on the
+      // same line, with the same next step.
       .catch((err: unknown) => finish(isUnreachable(err) ? UNREACHABLE_MESSAGE : VERIFICATION_FAILED_MESSAGE));
   }
 </script>

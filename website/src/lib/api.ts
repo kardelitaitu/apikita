@@ -64,8 +64,10 @@ export function redirectToLogin(): void {
 
 export interface ApiFetchInit extends RequestInit {
   /**
-   * 401 -> redirect to /login. Off for /auth/exchange, which is called *from*
-   * the login page and legitimately returns 401 for a bad PocketBase token.
+   * 401 -> redirect to /login. Off for the calls made *from* an auth page — the
+   * signed-in probe on /login and the POSTs on /login, /signup, /reset and
+   * /verify — which legitimately answer 401 and must own that answer themselves
+   * rather than bounce the visitor back to the page they are already on.
    */
   redirectOn401?: boolean;
 }
