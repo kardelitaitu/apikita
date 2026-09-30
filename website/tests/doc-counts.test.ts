@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 171;
+const WEBSITE_TESTS = 172;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -113,6 +113,9 @@ test('no doc still claims a superseded count', () => {
     // Retired within the same session as the bump above, when the test for a
     // password change clearing outstanding reset links landed.
     '565 tests', '565 passed',
+    // Retired when the doc-denial guard landed below: it is one test, and it is the
+    // one that would otherwise let a document deny a gate CI runs.
+    'website: **171 tests**', 'passes **171 tests**', '**171 tests**',
   ];
   for (const stale of superseded) {
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so
