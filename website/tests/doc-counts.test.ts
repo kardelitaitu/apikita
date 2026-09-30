@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 172;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 566;
+const SERVER_TESTS = 579;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -116,6 +116,11 @@ test('no doc still claims a superseded count', () => {
     // Retired when the doc-denial guard landed below: it is one test, and it is the
     // one that would otherwise let a document deny a gate CI runs.
     'website: **171 tests**', 'passes **171 tests**', '**171 tests**',
+    // Retired when the account-lifecycle tests landed: signup answered a known
+    // address differently from an unknown one, the reset pair and resend were
+    // undriven, and google_sign_in had no test at all. THIRTEEN tests, and every
+    // one of them is a claim about what a stranger at /auth sees.
+    '566 tests', '566 passed', '566 / 0 / 0',
   ];
   for (const stale of superseded) {
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so
