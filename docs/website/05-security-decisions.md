@@ -3,13 +3,13 @@
 > **Superseded on stack — read [`docs/architecture.md`](../architecture.md) first.**
 >
 > The system is: Cloudflare Pages (frontend), **edge relay**, Rust on Northflank
-> (API + proxy), **embedded SQLite** (money), **PocketBase** (identity only).
+> (API + proxy), **embedded SQLite** (identity and money). There is no PocketBase.
 >
 > | # | Status | Implement from |
 > | --- | --- | --- |
 > | D1 — wallet not client-writable | **Applies** | This document, and the schema |
 > | D2 — token revocation | **Background only** | [`architecture.md`](../architecture.md) §Sessions — **not this section** |
-> | D3 — pre-hijacking / verification | **Applies** | This document |
+> | D3 — pre-hijacking / verification | **Applies** | This document, as **re-derived in Rust** — [`architecture/identity.md`](../architecture/identity.md) is the current description; the PocketBase recipe below is the design it was derived from |
 >
 > **D2 describes PocketBase's mechanism, which we do not use.** Read it to
 > understand why the earlier claim was wrong, not to implement.
@@ -21,13 +21,21 @@ Resolutions for three structural security issues raised during design.
 > does not rely on it (SQLite sessions are used instead), but the claim was
 > incorrect and is corrected here.
 
+> **The mechanism has since moved.** D3's defence was specified as a PocketBase
+> record hook; identity is now served by this crate, so the rule is a Rust
+> predicate over `identities` rather than a Go hook. The RULE is unchanged and
+> still binding — read the section below for its reasoning and
+> [`architecture/identity.md`](../architecture/identity.md) for what implements it
+> today. D2's narrative is retained as history because the correction notice above
+> depends on it.
+
 ### How the threats map to the new stack
 
 | Threat | Was handled by | Now handled by |
 | --- | --- | --- |
 | User sets their own balance | PocketBase API rules | **Rust authorization** + SQLite `CHECK` |
 | Stolen session token | PocketBase `tokenKey` rotation | **SQLite `sessions`** row revocation |
-| Account pre-hijacking | PocketBase's unverified-record logic | Unchanged — still PocketBase, still gated on `!Verified()` |
+| Account pre-hijacking | PocketBase's unverified-record logic | **Rust predicates over `identities`** — same rule, re-derived; see [`architecture/identity.md`](../architecture/identity.md) |
 ---
 
 ## D1 — Wallet balance must not be client-writable
@@ -201,42 +209,49 @@ account.
 The trigger is mundane: a bulk import, a migration, a support action, or an admin
 setting `verified = true` by hand.
 
-> **Still applies.** `verified` remains a PocketBase field and is still the
-> control that gates the pre-hijacking defenses. Nothing about the SQLite/Rust
-> split changes this.
+> **Still applies, with the mechanism re-derived.** The control that gates the
+> pre-hijacking defences is still "has this address been proven", and every rule
+> below still binds. What changed with the identity port is where it lives: the
+> field is `identities.email_verified`, the enforcement is Rust rather than a
+> PocketBase hook, and the function names below are the PocketBase recipe this
+> rule was derived from. [`architecture/identity.md`](../architecture/identity.md)
+> describes the implementation; this section is the reasoning behind it.
 
 ### Solution — treat verification as a security control, not a flag
 
-**Rule: `verified` may only be set by PocketBase's own verification flows.**
+**Rule: `verified` may only be set by the system's own verification flows.**
 
 Permitted:
 
-- The user clicking a verification link or entering an OTP.
-- PocketBase setting it on a matching OAuth2 email (`record_auth_with_oauth2.go`
-  sets it when the OAuth email matches the record email).
+- The user clicking a verification link (the redemption of a single-use,
+  short-lived token sent to that address).
+- The provider asserting it: a Google ID token whose `email_verified` claim is
+  true, where the token's signature has been checked against Google's keys.
+- Initial account creation, which sets it to **0**.
 
 Forbidden:
 
 - Bulk imports setting `verified = true`.
 - Admin/support toggling it to unblock a user.
 - Migrations backfilling it.
+- **A password reset**, which proves the mailbox was reachable at that moment and
+  nothing more. Setting `verified` here would let a reset launder an unconfirmed
+  address into a trustworthy one.
 
 ### How to enforce it
 
-**1. Block the direct write at the collection level.** Two layers, because neither
+**1. Make the transition unexpressible to a client.** Two layers, because neither
 is sufficient alone:
 
-**Layer 1 — API rules.** The strongest control is that the API cannot express the
-change at all. Users may update their own record, but **`verified` must not be
-client-writable**. PocketBase rules are row-level, not field-level, so the practical
-options are:
+**Layer 1 — the interface.** The strongest control is that no caller-facing
+endpoint can express the change at all. Profile edits are routed through our own
+endpoints rather than a generic collection update, and none of those endpoints
+accepts a verification flag. This is now literal in the schema as well:
+`identities.email_verified` is written by the three permitted flows and by nothing
+else.
 
-- Keep `verified` out of the update rule's reachable path by routing profile edits
-  through our own endpoint instead of the collection API, or
-- Use the hook below to reject the specific transition.
-
-**Layer 2 — a hook that rejects the transition.** PocketBase's record hook is
-`onRecordUpdate`, bound to the collection by name:
+**Layer 2 — a guard that rejects the transition.** The original recipe was a
+PocketBase record hook:
 
 ```js
 // Reject any transition from unverified -> verified outside PocketBase's own
@@ -254,30 +269,40 @@ onRecordUpdate((e) => {
 }, "users")   // bind to the auth collection only
 ```
 
+That hook is **history** — there is no PocketBase collection to bind it to. Its
+Rust descendant is the set of writers above: the transition happens in
+`server/src/identity/accounts.rs` and `server/src/identity/tokens.rs`, and a
+reviewer reading either can see whether a new writer was smuggled in. A Go hook
+was invisible to this repo's guards; the Rust predicate is not.
+
 > **Verified against PocketBase v0.40.4 docs.** The hook is `onRecordUpdate`, not
 > `onRecordUpdateRequest` (which does not exist). The event carries `e.app` and
 > `e.record` — **there is no `e.httpContext` in the JS hook API**, so 'did this
 > arrive over the API' cannot be read from the event directly. That is why layer 1
 > (making the field unreachable) matters more than the hook.
 
-**Do not rely on the hook alone.** Because the event cannot distinguish the
-caller, a hook is a guard against mistakes and bulk scripts, not a security
-boundary. The boundary is that the field is not client-writable.
+**Do not rely on the guard alone.** A guard that inspects a transition is a
+protection against mistakes and bulk scripts, not a security boundary. The boundary
+is that no caller-facing path can express the change.
 
-**2. Never import straight into the auth collection.** If migrating existing users,
-import them unverified and have them re-verify — or accept that the protections
-do not apply to imported accounts and record that explicitly.
+**2. Never import accounts straight in as verified.** If migrating existing users,
+import them unverified and have them re-verify — or accept that the protections do
+not apply to imported accounts and record that explicitly.
 
 **3. Audit `verified` transitions.** Log every change with actor and source
-(`otp`, `oauth2`, `link`, `admin`). An unexpected actor is an incident.
+(`verification link`, `google`, `signup`, `admin`). An unexpected actor is an
+incident.
 
-### Related: the third gap
+### Related: the third gap — now closed
 
-PocketBase matches an OAuth2 login on the returned email **without visibly
-checking the provider's `email_verified` claim**. Google always returns verified
-addresses, so this is fine for Google — but **only enable OAuth2 providers that
-guarantee verified email addresses.** If a provider can return an unverified
-address, an attacker could register it elsewhere and take the account.
+PocketBase matched an OAuth2 login on the returned email **without visibly checking
+the provider's `email_verified` claim**. In our own implementation that gap does not
+exist: `server/src/identity/google.rs` refuses a token whose `email_verified` claim
+is not `true` **before it touches the database**, and it fixes the accepted
+signature algorithm to RS256 rather than reading the algorithm from the token
+header (a token that names its own algorithm is a token that can choose a weaker
+one). The old mitigation still stands as policy: only enable providers that
+guarantee verified addresses.
 
 ---
 
@@ -287,13 +312,13 @@ address, an attacker could register it elsewhere and take the account.
 | --- | --- | --- | --- |
 | D1 | Client could write own balance | Money in SQLite, no client DB access, Rust authorization + `CHECK (balance_idr >= 0)` | Shipped schema: [`server/migrations/20260925000000_initial_schema.sql`](../../server/migrations/20260925000000_initial_schema.sql); design record: [`02-data-model.md`](02-data-model.md) |
 | D2 | Token revocation | **Superseded** — SQLite `sessions` rows; logout revokes immediately | [`docs/architecture.md`](../architecture.md) §Sessions |
-| D3 | Verification disables anti-hijacking | Unchanged — `verified` gated to PocketBase's own flows; hook rejects client writes | `apis/record_auth_with_oauth2.go:340-362` **in the PocketBase source**, not in this repository — PocketBase runs as a container and its Go source is not vendored here, so a reader looking in `server/` will not find it. The two prose citations above are to the same file |
+| D3 | Verification disables anti-hijacking | **Re-derived in Rust** — `email_verified` gated to the verification-link, Google-`email_verified` and signup paths, over `identities` | [`architecture/identity.md`](../architecture/identity.md); the PocketBase recipe it was derived from is `apis/record_auth_with_oauth2.go:340-362` **in the PocketBase source**, not in this repository — PocketBase ran as a container and its Go source was never vendored here, so a reader looking in `server/` will not find it |
 
 ## Open items
 
-- [ ] Implement the `verified`-guard hook in PocketBase.
+- [x] Implement the `verified`-guard. The identity port made it a Rust predicate rather than a PocketBase hook — see D3.
 - [x] Session lifetime: **30d absolute / 7d idle** — [`docs/decisions.md`](../decisions.md).
 - [x] "Sign out all devices" — `POST /auth/logout-all` revokes all active sessions; implemented and mutation-tested (b31d574).
-- [x] OAuth2: **only providers guaranteeing verified email** (`decisions.md`).
+- [x] OAuth2: **only providers guaranteeing verified email** (`decisions.md`). Now enforced in code, not only policy.
 - [ ] Wallet mutation audit: the `ledger` table is the record; decide review cadence.
-- [ ] Reconciliation job between `accounts.pb_user_id` and PocketBase.
+- [x] ~~Reconciliation job between `accounts.pb_user_id` and PocketBase.~~ **Void** — `pb_user_id` is dropped and there is one store, so there is nothing to reconcile.
