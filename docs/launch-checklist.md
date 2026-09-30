@@ -14,8 +14,13 @@ choices live in [`decisions.md`](decisions.md).
 **Cannot be skipped and cannot be deferred.** Two items here determine whether the
 business can operate at all.
 
-- [ ] Read the resale terms of the intended upstream provider, in full.
-- [ ] Record the outcome in [`config/provider1.md`](../config/provider1.md).
+- [x] Read the resale terms of the intended upstream provider, in full.
+      **Done by direct conversation with the reseller, not by reading a posted
+      document.** The provider is a reseller with no published resale-terms page, so
+      the terms were settled in the negotiation itself. The outcome is recorded in
+      [`config/provider1.md`](../config/provider1.md): resale is permitted, and the
+      account carries **10x the concurrency limit of an ordinary account** to start.
+- [x] Record the outcome in [`config/provider1.md`](../config/provider1.md).
 - [ ] Decide the contracting entity (personal or PT) — affects dispute posture,
       volume ceiling, and tax.
 > **Gate 0 partial — owner-deferred.** The legal review below is **deferred by decision**

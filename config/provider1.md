@@ -17,8 +17,25 @@
 | Role | Reseller (NOT DeepSeek direct) |
 | Price list currency | CNY per 1M tokens |
 | Endpoint URL | _not yet recorded_ |
-| Resale terms | **Confirmed permitted** `[per provider]` |
+| Resale terms | **Confirmed permitted** `[per provider]` — see below |
+| Concurrency allowance | **10x an ordinary account**, granted at approval |
 | Account/flat-fee notes | _not yet recorded_ |
+
+**How the resale terms were established.** By direct conversation with the
+reseller, not by reading a posted document — this provider publishes no
+resale-terms page, so the terms were settled in the negotiation itself and the
+outcome is the approval. Two things were confirmed:
+
+1. **Resale is permitted.** The `[per provider]` marker is the point that this
+   permission is scoped here and carries nowhere else: `config/README.md:28`
+   states that a permission at one provider is not a permission at another.
+2. **The account is approved for 10x the concurrency limit of an ordinary
+   account**, as a starting allowance.
+
+Recorded because a bare "Confirmed permitted" is a claim a reader cannot audit.
+The distinction matters for the same reason `weight = 0` does elsewhere in this
+tree: what a provider has actually agreed to and what the config assumes must be
+the same statement, or the config is asserting a permission nobody granted.
 
 ## Price list (CNY per 1M tokens)
 
