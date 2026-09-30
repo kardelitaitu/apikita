@@ -164,19 +164,23 @@ and a re-wrap can swallow a semicolon and with it a route.
 
 This section used to say the crate had no `cargo fmt --check` in CI, and that was
 wrong in two ways at once. The step has been in `ci.yml` since the workflow was
-added. And the danger is narrower than "one run swallows the semicolons": measured
-against `rustfmt 1.9.0-stable`, a full `cargo fmt` over `routes/mod.rs` **preserved
-all 231 `);`-terminated lines** and changed only indentation. So the semicolon
-convention survives the formatter this repository pins, and the reason it is
-format-*sensitive* is that any future formatter change lands exactly here, where the
-cost of a silent edit is a mounted route appearing to exist in the inventory while
-the router never received it — or the reverse.
+added. And the danger is *narrower than the warning implied but has a firmer floor*.
+Measured against `rustfmt 1.9.0-stable`, a full `cargo fmt` over `routes/mod.rs`
+**preserved all 231 `);`-terminated lines** and changed only indentation. And a
+swallowed semicolon is not a silent edit at all: removing one by hand turns the
+`routes!` macro inside out and the crate fails to build with `error: no rules
+expected `.``. There is no state in which a route disappears from the inventory while
+the router keeps serving it, because the literal and the router are expanded from
+the same bytes by the same macro.
 
-The guard that would catch that is not `cargo fmt --check`; it is the inventory test
-itself, which compares the literal to `MOUNTED` and pins both counts. What the format
-step does catch, and did, is everything else: the block above `.fallback(unrouted)`
-had been indented four spaces deeper than the paren closing the `routes!` call for
-as long as it had existed.
+So the semicolon convention is load-bearing for a different reason than the one
+first written here: it makes a hand-deleted line *visible in review*, and it fails
+loudly under a formatter rather than quietly. The guard that catches an inventory
+that drifts while still compiling is the inventory test, which compares the literal
+to `MOUNTED` in both directions and pins both counts. What the format step does
+catch, and did on its first honest run, is everything else: the block above
+`.fallback(unrouted)` had been indented four spaces deeper than the paren closing
+the `routes!` call for as long as it had existed.
 
 The trap this check had to avoid is the one this section originally recorded: a
 source-level parse of `create_router` looks trivial and is not. Several `.route(`
