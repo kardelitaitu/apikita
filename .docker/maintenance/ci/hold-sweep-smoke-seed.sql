@@ -2,13 +2,13 @@
 -- The distinction is the whole test: a detector that fires on both is noise, one
 -- that fires on neither is absent.
 
-INSERT INTO accounts (id, pb_user_id, is_operator, created_at, updated_at)
-VALUES ('acct-stranded', 'pb_stranded', 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+INSERT INTO accounts (id, is_operator, created_at, updated_at)
+VALUES ('acct-stranded', 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
 INSERT INTO wallets (account_id, balance_idr, updated_at)
 VALUES ('acct-stranded', 40000, '2026-01-01T00:00:00+00:00');
 
-INSERT INTO accounts (id, pb_user_id, is_operator, created_at, updated_at)
-VALUES ('acct-healthy', 'pb_healthy', 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+INSERT INTO accounts (id, is_operator, created_at, updated_at)
+VALUES ('acct-healthy', 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
 INSERT INTO wallets (account_id, balance_idr, updated_at)
 VALUES ('acct-healthy', 60000, '2026-01-01T00:00:00+00:00');
 

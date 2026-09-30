@@ -216,7 +216,6 @@ for whoever wires the cron job, not a default to invent here.
 | **Scheduling** | Nothing runs this yet: no cron, no compose service, no CI job. `tools/reconcile/` has the same gap. |
 | **PITR (RPO 15 minutes)** | **This tool does not meet the doc's RPO.** A daily snapshot loses up to 24 hours; the 15-minute RPO comes from continuous WAL archiving / managed PITR, which the doc's open item assigns to `wal-g` or a managed offering. Nothing here implements it. SQLite makes this *easier* than Postgres did - the `-wal` file can be archived - but nothing here does it. |
 | **The restore drill** | The doc's quarterly rehearsal, with the ledger-reconciliation gate, is `tools/drill/drill.sh`. This tool proves an artifact is *readable and intact*, not that it *restores*; the drill is what proves that. |
-| **PocketBase** | The doc ranks it below the money database but it is not backed up here at all. |
 
 ## Verified status
 

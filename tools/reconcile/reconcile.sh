@@ -126,7 +126,11 @@ trap 'rm -f "$ERR" "$HOLD_OUT" "$HOLD_ERR" "$HOLD_SQL"' EXIT HUP INT TERM
 # Timestamps are RFC3339 text (docs/architecture.md: every timestamp is written
 # from Rust, never by SQL), so the age is strftime('%s', ...) on both sides.
 cat > "$HOLD_SQL" <<'HOLDSQL'
-SELECT l.account_id, a.pb_user_id, l.ref AS reservation_ref,
+SELECT l.account_id,
+       (SELECT i.email FROM identities i
+         WHERE i.account_id = l.account_id
+         ORDER BY i.email_verified DESC, i.created_at ASC LIMIT 1) AS email,
+       l.ref AS reservation_ref,
        CAST(SUM(l.delta_idr) AS INTEGER) AS amount_idr,
        MIN(l.created_at) AS held_at,
        CAST(strftime('%s', 'now') - strftime('%s', MIN(l.created_at)) AS INTEGER) AS age_seconds
@@ -134,7 +138,7 @@ FROM ledger l
 JOIN accounts a ON a.id = l.account_id
 WHERE l.ref LIKE 'reserve_%'
   AND l.delta_idr < 0
-GROUP BY l.account_id, a.pb_user_id, l.ref
+GROUP BY l.account_id, l.ref
 HAVING NOT EXISTS (
     SELECT 1 FROM ledger m
     WHERE m.account_id = l.account_id
@@ -226,7 +230,7 @@ fi
 # check is clean.
 echo "reconcile: HOLD SWEEP - $HOLDS stranded reservation hold(s) (a negative reserve_ row with no positive row under the same ref); $OVER_BOUND older than ${HOLD_MAX_AGE_SECONDS}s"
 if [ "$HOLDS" -gt 0 ]; then
-    echo "reconcile:   account_id|pb_user_id|reservation_ref|amount_idr|held_at|age_seconds"
+    echo "reconcile:   account_id|email|reservation_ref|amount_idr|held_at|age_seconds"
     printf '%s\n' "$HOLD_ROWS"
 fi
 echo "reconcile: HOLD SWEEP REQUIRED - the drift query above is structurally blind to a stranded"

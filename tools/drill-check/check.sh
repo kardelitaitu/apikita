@@ -151,7 +151,14 @@ EXPECTED=0
 for f in "$MIGRATION_DIR"/*.sql; do
     # `head -1` because grep -c can emit more than one line if a file has no trailing
     # newline, and a multi-line value makes the arithmetic below fail with a syntax error.
-    n=$(grep -ci '^[[:space:]]*CREATE TABLE' "$f" 2>/dev/null | head -1)
+    #
+    # A `_`-prefixed name is a REBUILD STAGING TABLE, not a table that survives the
+    # migration. SQLite cannot DROP a UNIQUE column, so the identity port recreated
+    # `accounts` as `_accounts_rebuild_staging`, copied the rows and renamed it into
+    # place - it is gone by the time the migration commits, so counting it here would
+    # demand a table the built schema must NOT have. The `_` prefix is the same
+    # convention `doc_claims.rs` uses for its schema inventory.
+    n=$(grep -ci '^[[:space:]]*CREATE TABLE [^_]' "$f" 2>/dev/null | head -1)
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     EXPECTED=$((EXPECTED + n))
 done
@@ -163,8 +170,8 @@ elif [ "$ACTUAL" != "$EXPECTED" ]; then
 fi
 
 sqlite3 "$MIGRATED" "
-  INSERT INTO accounts (id, pb_user_id, is_operator, created_at, updated_at)
-    VALUES ('a1', 'pb_1', 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+  INSERT INTO accounts (id, is_operator, created_at, updated_at)
+    VALUES ('a1', 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
   INSERT INTO wallets (account_id, balance_idr, updated_at)
     VALUES ('a1', 1000, '2026-01-01T00:00:00+00:00');
   INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at)

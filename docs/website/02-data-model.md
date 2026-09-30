@@ -14,7 +14,8 @@
 > at the end. Read [`docs/architecture.md`](../architecture.md) §Database for
 > what ships today.
 
-Schema for everything except identity.
+Schema for everything except identity *(as it stood under the PocketBase split; in
+the shipped schema identity is in the same SQLite database — see the notice below)*.
 
 > **Rewritten for the Postgres + PocketBase split.** The earlier version specified
 > PocketBase collections and API rules. Under that design identity lived in

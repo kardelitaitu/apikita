@@ -57,12 +57,15 @@ DSN="sqlite://$DB"
 
 # The minimal shape the gate reads. A full migration would be more faithful but slower,
 # and these properties - drift detection, the hold predicate, the exit codes - do not
-# depend on the rest of the schema.
+# depend on the rest of the schema. `identities` is here because the hold query reports
+# an address in place of the dropped `accounts.pb_user_id`.
 sqlite3 "$DB" "
-  CREATE TABLE accounts (id TEXT PRIMARY KEY, pb_user_id TEXT);
+  CREATE TABLE accounts (id TEXT PRIMARY KEY);
+  CREATE TABLE identities (account_id TEXT, email TEXT, email_verified INTEGER, created_at TEXT);
   CREATE TABLE wallets (account_id TEXT PRIMARY KEY, balance_idr INTEGER NOT NULL, updated_at TEXT);
   CREATE TABLE ledger (id INTEGER PRIMARY KEY, account_id TEXT, delta_idr INTEGER, reason TEXT, ref TEXT, balance_after INTEGER, created_at TEXT);
-  INSERT INTO accounts VALUES ('acct-1', 'pb_1');
+  INSERT INTO accounts VALUES ('acct-1');
+  INSERT INTO identities VALUES ('acct-1', 'a@example.com', 1, '2026-01-01T00:00:00+00:00');
   INSERT INTO wallets VALUES ('acct-1', 5000, '2026-01-01T00:00:00+00:00');
   INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at)
     VALUES ('acct-1', 3000, 'topup', 'ref_1', 3000, '2026-01-01T00:00:00+00:00');
@@ -111,7 +114,7 @@ fi
 # the argument at the newline and sqlite3 never receives the INSERTs, so the assertion
 # below would silently test nothing. That mistake was in the first version of this file.
 sqlite3 "$DB" "\
-  INSERT INTO accounts VALUES ('acct-orphan', 'pb_orphan'); \
+  INSERT INTO accounts VALUES ('acct-orphan'); \
   INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) \
     VALUES ('acct-orphan', 7000, 'topup', 'ref_orphan', 7000, '2026-01-01T00:00:00+00:00');"
 
