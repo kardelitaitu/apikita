@@ -100,7 +100,17 @@ the fix.";
 /// One stranded hold, as reported.
 struct StrandedHold {
     account_id: Uuid,
-    pb_user_id: String,
+    /// The address on the account, or `None` when it holds no identity row.
+    ///
+    /// This field used to carry `accounts.pb_user_id`, which was the only handle
+    /// an operator had on the account. That column is gone (the identity port
+    /// retired it), and a bare account uuid is not something a human can check
+    /// against a support ticket, so the address takes its place. `Option` because
+    /// an account really can exist with no identity yet: the port creates the row
+    /// before the confirmation mail is delivered, and an interrupted signup leaves
+    /// exactly that. Reporting "no identity" is honest; inventing an address or
+    /// skipping the row would hide a stranded hold from the operator.
+    email: Option<String>,
     reservation_ref: String,
     amount_idr: i64,
     held_at: DateTime<Utc>,
@@ -174,7 +184,9 @@ async fn stranded_holds(pool: &SqlitePool) -> Result<Vec<StrandedHold>, sqlx::Er
         r#"
         SELECT
             l.account_id,
-            a.pb_user_id,
+            (SELECT i.email FROM identities i
+              WHERE i.account_id = l.account_id
+              ORDER BY i.email_verified DESC, i.created_at ASC LIMIT 1) AS email,
             l.ref AS reservation_ref,
             -- SUM over BIGINT is NUMERIC; cast back so it decodes as i64.
             CAST(SUM(l.delta_idr) AS INTEGER) AS amount_idr,
@@ -188,7 +200,7 @@ async fn stranded_holds(pool: &SqlitePool) -> Result<Vec<StrandedHold>, sqlx::Er
         JOIN accounts a ON a.id = l.account_id
         WHERE l.ref LIKE 'reserve_%'
           AND l.delta_idr < 0
-        GROUP BY l.account_id, a.pb_user_id, l.ref
+        GROUP BY l.account_id, l.ref
         HAVING NOT EXISTS (
             SELECT 1 FROM ledger m
             WHERE m.account_id = l.account_id
@@ -206,7 +218,7 @@ async fn stranded_holds(pool: &SqlitePool) -> Result<Vec<StrandedHold>, sqlx::Er
         .iter()
         .map(|row| StrandedHold {
             account_id: row.get("account_id"),
-            pb_user_id: row.get("pb_user_id"),
+            email: row.get("email"),
             reservation_ref: row.get("reservation_ref"),
             amount_idr: row.get("amount_idr"),
             held_at: row.get("held_at"),
@@ -316,7 +328,12 @@ fn print_summary(
             hold.row_count
         )
         .ok();
-        writeln!(out, "         pb_user_id={}", hold.pb_user_id).ok();
+        writeln!(
+            out,
+            "         email={}",
+            hold.email.as_deref().unwrap_or("(no identity)")
+        )
+        .ok();
     }
 
     let over: Vec<&StrandedHold> = holds
@@ -420,7 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // operator action has to be reconstructable from the log alone.
             info!(
                 account_id = %hold.account_id,
-                pb_user_id = %hold.pb_user_id,
+                email = hold.email.as_deref().unwrap_or("(no identity)"),
                 reservation_ref = %hold.reservation_ref,
                 amount_idr = hold.amount_idr.abs(),
                 age_seconds = hold.age_seconds,
@@ -437,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     released.push(StrandedHold {
                         account_id: hold.account_id,
-                        pb_user_id: hold.pb_user_id.clone(),
+                        email: hold.email.clone(),
                         reservation_ref: hold.reservation_ref.clone(),
                         amount_idr: hold.amount_idr,
                         held_at: hold.held_at,
@@ -513,7 +530,7 @@ mod tests {
     fn over_bound_is_strictly_greater() {
         let hold = StrandedHold {
             account_id: Uuid::nil(),
-            pb_user_id: "pb_test".into(),
+            email: Some("test@example.com".into()),
             reservation_ref: "reserve_test".into(),
             amount_idr: -1000,
             held_at: Utc::now(),
@@ -538,7 +555,7 @@ mod tests {
     fn sample_hold(age_seconds: i64, amount_idr: i64, over: bool) -> StrandedHold {
         StrandedHold {
             account_id: Uuid::nil(),
-            pb_user_id: "pb_test".into(),
+            email: Some("test@example.com".into()),
             reservation_ref: "reserve_test".into(),
             amount_idr,
             held_at: Utc::now() - chrono::Duration::seconds(age_seconds),

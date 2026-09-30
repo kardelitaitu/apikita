@@ -521,10 +521,9 @@ mod tests {
         let db = TestDb::new().await;
 
         let space_format = sqlx::query(
-            "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)",
         )
         .bind(Uuid::new_v4().hyphenated())
-        .bind("pb_space_format")
         .bind("2026-09-25 07:00:00")
         .bind("2026-09-25 07:00:00")
         .execute(&db.pool)

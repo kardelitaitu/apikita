@@ -158,6 +158,7 @@ fn retention_report(
         "key_ip_seen": crate::ip_tracking::SEEN_RETENTION_DAYS,
         "key_ip_daily": crate::ip_tracking::DAILY_RETENTION_DAYS,
         "link_redemption_attempts": crate::db::LINK_ATTEMPT_RETENTION_DAYS,
+        "auth_attempts": crate::ip_tracking::AUTH_ATTEMPT_RETENTION_DAYS,
     });
 
     // ONLY the tables that are behind, so an empty object reads as "retention is
@@ -498,11 +499,10 @@ mod tests {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         sqlx::query(
-            "INSERT INTO accounts (id, pb_user_id, is_operator, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO accounts (id, is_operator, created_at, updated_at)
+             VALUES (?, ?, ?, ?)",
         )
         .bind(id.hyphenated())
-        .bind(format!("test_pb_{}", id.simple()))
         .bind(if operator { 1 } else { 0 })
         .bind(now)
         .bind(now)
@@ -734,6 +734,7 @@ mod tests {
             key_ip_seen: None,
             key_ip_daily: None,
             link_redemption_attempts: None,
+            auth_attempts: None,
         };
         let report = retention_report(&behind, today);
         assert_eq!(report["behind"], json!(true));

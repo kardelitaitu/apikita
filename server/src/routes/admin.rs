@@ -306,9 +306,16 @@ pub async fn get_account(
 /// the same reasoning `account.rs`'s UsageQuery documents.
 #[derive(Debug, Deserialize)]
 pub struct AdminListQuery {
-    /// Free-text filter, matched case-insensitively against the account id and
-    /// the PocketBase id. Nothing else is searchable: email lives in PocketBase,
-    /// not here, and the admin surface must not become a second identity store.
+    /// Free-text filter, matched case-insensitively against the account id.
+    ///
+    /// The id is now the only handle a support operator has here, which is a real
+    /// regression against the PocketBase era - a record id was at least
+    /// recognisable to whoever had the PocketBase admin open. The honest fix is to
+    /// join `identities` and search the addresses, and it belongs in its own
+    /// change: it widens what an operator can enumerate from the account id space
+    /// to the address space, which is a privacy decision (docs/website) rather
+    /// than a query rewrite. Until then this filter does not silently pretend to
+    /// match an address by looking at a column that no longer exists.
     pub q: Option<String>,
     /// Optional status filter. A value outside the schema's vocabulary simply
     /// matches nothing rather than erroring: a filter with no rows is a normal
@@ -397,7 +404,7 @@ pub async fn list_accounts(
                 AS live_keys
         FROM accounts a
         LEFT JOIN wallets w ON w.account_id = a.id
-        WHERE (? IS NULL OR a.id LIKE ? ESCAPE '\' OR a.pb_user_id LIKE ? ESCAPE '\')
+        WHERE (? IS NULL OR a.id LIKE ? ESCAPE '\')
           AND (? IS NULL OR a.status = ?)
         ORDER BY a.created_at DESC
         LIMIT ? OFFSET ?
@@ -407,7 +414,6 @@ pub async fn list_accounts(
     // space-separated output sorts before the RFC3339 values every timestamp
     // column holds, so a SQL now() here would count expired sessions as live.
     .bind(Utc::now())
-    .bind(pattern.as_deref())
     .bind(pattern.as_deref())
     .bind(pattern.as_deref())
     .bind(status)
@@ -960,11 +966,10 @@ mod tests {
         let id = Uuid::new_v4();
         let now = Utc::now();
         sqlx::query(
-            "INSERT INTO accounts (id, pb_user_id, is_operator, created_at, updated_at)
-             VALUES (?, ?, 1, ?, ?)",
+            "INSERT INTO accounts (id, is_operator, created_at, updated_at)
+             VALUES (?, 1, ?, ?)",
         )
         .bind(id.hyphenated())
-        .bind(format!("test_op_{}", id.simple()))
         .bind(now)
         .bind(now)
         .execute(pool)
@@ -2013,13 +2018,10 @@ mod tests {
         // DEFAULT for id, created_at or updated_at.
         let victim = Uuid::new_v4();
         let victim_now = Utc::now();
-        sqlx::query(
-            "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(victim.hyphenated())
-        .bind(&record_id)
-        .bind(victim_now)
-        .bind(victim_now)
+        sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)")
+            .bind(victim.hyphenated())
+            .bind(victim_now)
+            .bind(victim_now)
         .execute(&pool)
         .await
         .expect("create the account the login would have created");
@@ -2034,7 +2036,10 @@ mod tests {
 
         let (status, body) = render_axum(
             exchange_token(
-                State(pool.clone()),
+                State(state.clone()),
+                axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 12345)),
+                ),
                 HeaderMap::new(),
                 Ok(Json(AuthExchangeRequest {
                     pb_token: pb_token.clone(),
@@ -2798,11 +2803,10 @@ mod tests {
         // is the first row the DESC-ordered listing hits.
         let now = Utc::now();
         sqlx::query(
-            "INSERT INTO accounts (id, pb_user_id, status, is_operator, created_at, updated_at)
-             VALUES (?, ?, 'active', 0, ?, ?)",
+            "INSERT INTO accounts (id, status, is_operator, created_at, updated_at)
+             VALUES (?, 'active', 0, ?, ?)",
         )
         .bind("not-a-uuid")
-        .bind("bad_pb_id")
         .bind(now)
         .bind(now)
         .execute(&pool)

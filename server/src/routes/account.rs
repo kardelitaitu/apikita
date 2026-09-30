@@ -728,25 +728,33 @@ fn build_snap_payload(order_id: &str, amount_idr: i64, customer_email: Option<&s
     Value::Object(payload)
 }
 
-/// The email Snap should attach to the transaction. The accounts table holds
-/// only the PocketBase record id, so the address is read from PocketBase itself
-/// (POCKETBASE_URL, the same address auth.rs uses). It is best-effort: a failure
-/// there degrades the receipt and must never block a top-up.
-async fn account_email(http: &reqwest::Client, pb_user_id: &str) -> Option<String> {
-    let base = env::var("POCKETBASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let url = format!(
-        "{}/api/collections/users/records/{}",
-        base.trim_end_matches('/'),
-        pb_user_id
-    );
+/// The email Snap should attach to the transaction.
+///
+/// This used to be a best-effort HTTP read of PocketBase, because the accounts
+/// table held only that service's record id and the address lived over there.
+/// After the identity port the address is a local row in `identities`, so the
+/// lookup is a single indexed query and the network dependency is gone: a
+/// PocketBase outage can no longer degrade a receipt.
+///
+/// Still best-effort in the sense that matters: this returns `None` rather than an
+/// error, and a caller without an address must send the transaction without one.
+/// A missing email degrades a receipt; failing here would block a top-up.
+async fn account_email(pool: &SqlitePool, account_id: Uuid) -> Option<String> {
+    // Order matters only for determinism: an account may hold several identities
+    // (a password one and a Google one), and any address on the account is the
+    // same person. `email_verified DESC` prefers a proven address, then the
+    // oldest row, so the answer is stable across runs rather than whatever the
+    // planner happened to return first.
+    let email: Option<String> = sqlx::query_scalar(
+        "SELECT email FROM identities WHERE account_id = ? \
+         ORDER BY email_verified DESC, created_at ASC LIMIT 1",
+    )
+    .bind(account_id.hyphenated())
+    .fetch_optional(pool)
+    .await
+    .ok()?;
 
-    let response = http.get(url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let body: Value = response.json().await.ok()?;
-    body.get("email")?.as_str().map(|e| e.trim().to_string())
+    email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty())
 }
 
 /// Creates the Snap transaction and returns (token, redirect_url).
@@ -877,12 +885,9 @@ pub async fn create_topup(
     let topup_id = Uuid::new_v4();
     let order_id = format!("topup_{}", topup_id);
 
-    // accounts stores only the PocketBase record id; the email lives in PocketBase.
-    let pb_user_id: String = sqlx::query("SELECT pb_user_id FROM accounts WHERE id = ?")
-        .bind(account_id.hyphenated())
-        .fetch_one(&state.pool)
-        .await?
-        .try_get("pb_user_id")?;
+    // The email now comes from the account's own identity rows, so this lookup is
+    // local and cannot be defeated by an upstream service being down.
+    let email = account_email(&state.pool, account_id).await;
 
     // Built per request: this path is one call per customer action, far too cold
     // to justify a process-wide pool, and SNAP_REQUEST_TIMEOUT is this call's
@@ -891,8 +896,6 @@ pub async fn create_topup(
         .timeout(SNAP_REQUEST_TIMEOUT)
         .build()
         .map_err(|e| AppError::Internal(format!("failed to build Snap HTTP client: {e}")))?;
-
-    let email = account_email(&snap_http, &pb_user_id).await;
     let snap_payload = build_snap_payload(&order_id, payload.amount_idr, email.as_deref());
 
     // Midtrans first. Any failure here returns before a row exists, so a rejected
@@ -2811,60 +2814,74 @@ mod tests {
     // reads the ORIGIN, so the path suffix is stripped.
     // -----------------------------------------------------------------------
 
-    /// A loopback PocketBase origin, derived from a `snap_stub` endpoint.
-    async fn pb_stub(response: String) -> String {
-        snap_stub(response)
-            .await
-            .trim_end_matches("/snap/v1/transactions")
-            .to_string()
-    }
-
+    /// The address is trimmed before it is used, so an identity row whose email
+    /// carries padding cannot put a padded address on a receipt. Formerly read
+    /// this from PocketBase; the source is local now.
     #[tokio::test]
-    async fn account_email_reads_the_address_from_pocketbase_and_trims_it() {
-        let _env = EnvLock::acquire();
-        let origin = pb_stub(http_response(
-            "200 OK",
-            r#"{"email":"  ada@example.com  "}"#,
-        ))
-        .await;
-        let _guard = EnvGuard::set("POCKETBASE_URL", &origin);
+    async fn account_email_reads_the_address_from_the_identity_and_trims_it() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = crate::test_support::account(&pool).await;
 
-        let email = account_email(&snap_client(), "pb_user_1").await;
+        sqlx::query(
+            "INSERT INTO identities (id, account_id, provider, subject, email, email_verified, \
+             password_hash, created_at, updated_at) VALUES (?, ?, 'password', ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().hyphenated())
+        .bind(account.hyphenated())
+        .bind("ada")
+        .bind("  ada@example.com  ")
+        .bind("$argon2id$fake")
+        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("seed an identity");
+
+        let email = account_email(&pool, account).await;
         assert_eq!(
             email.as_deref(),
             Some("ada@example.com"),
-            "the address must be the trimmed value PocketBase returned"
+            "the address must be the trimmed value the identity row holds"
         );
     }
 
+    /// An account with no `identities` row has no address, and the lookup says so
+    /// rather than failing. After the identity port the address is a LOCAL row, so
+    /// "there is none" is the only absence mode left and the one a receipt has to
+    /// survive. Replaces the PocketBase-failure-mode test, whose subject is gone.
     #[tokio::test]
-    async fn account_email_degrades_to_none_on_every_pocketbase_failure_mode() {
-        let _env = EnvLock::acquire();
-        let client = snap_client();
+    async fn account_email_is_none_when_the_account_has_no_identity_row() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = crate::test_support::account(&pool).await;
 
-        let refused = pb_stub(http_response("404 Not Found", r#"{"status":404}"#)).await;
-        let not_json = pb_stub(http_response("200 OK", "<html>not json</html>")).await;
-        let no_email_field = pb_stub(http_response("200 OK", r#"{"username":"ada"}"#)).await;
-
-        let mut env_vars = EnvGuard::set("POCKETBASE_URL", &refused);
         assert_eq!(
-            account_email(&client, "pb_user_1").await,
+            account_email(&pool, account).await,
             None,
-            "a non-2xx record response carries no address"
+            "no identities row carries no address"
         );
 
-        env_vars.also("POCKETBASE_URL", &not_json);
-        assert_eq!(
-            account_email(&client, "pb_user_1").await,
-            None,
-            "a non-JSON record response carries no address"
-        );
+        // Positive control: an address that IS on the account comes back, so the
+        // `None` above is the absence of a row and not a query that never matches.
+        sqlx::query(
+            "INSERT INTO identities (id, account_id, provider, subject, email, email_verified, \
+             password_hash, created_at, updated_at) VALUES (?, ?, 'password', ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().hyphenated())
+        .bind(account.hyphenated())
+        .bind("ada@example.com")
+        .bind("ada@example.com")
+        .bind("$argon2id$fake")
+        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("seed an identity");
 
-        env_vars.also("POCKETBASE_URL", &no_email_field);
         assert_eq!(
-            account_email(&client, "pb_user_1").await,
-            None,
-            "a record without an email field carries no address"
+            account_email(&pool, account).await,
+            Some("ada@example.com".to_string())
         );
     }
 
