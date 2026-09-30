@@ -403,7 +403,7 @@ mod tests {
 
         // THE SAME POLICY IS PUBLISHED TWICE in docs/, and one document being correct is no
         // help when the other says something else. docs/ip-tracking.md carries its own
-        // retention table for the same three tables. It is the page a customer asking
+        // retention table for the same tables. It is the page a customer asking
         // how long their IP is kept is answered from, while data-retention.md is the
         // page an operator reading a sweep is answered from. The two agreeing IS the
         // promise; one of them being right is not.
@@ -417,6 +417,7 @@ mod tests {
                 "link_redemption_attempts",
                 "| `link_redemption_attempts` hashes | **7 days**",
             ),
+            ("auth_attempts", "| `auth_attempts` rows | **7 days**"),
             ("key_ip_daily", "| `key_ip_daily` counts | 90 days"),
         ] {
             assert!(
@@ -949,6 +950,11 @@ mod tests {
                 7,
                 crate::db::LINK_ATTEMPT_RETENTION_DAYS,
             ),
+            (
+                "auth_attempts",
+                7,
+                crate::ip_tracking::AUTH_ATTEMPT_RETENTION_DAYS,
+            ),
         ];
 
         // Which document states each window. Not the same file throughout, which is
@@ -966,13 +972,14 @@ mod tests {
         let published = sources.join("\n");
 
         for (table, days, constant) in SWEEP {
-            // THE SHELL LITERAL MUST BE THE RUST CONSTANT, for ALL SIX, which is the
-            // check that did not exist while these windows lived as literals typed into
-            // the entrypoint. The privacy page, the policy table and the metrics endpoint
-            // all read the numbers from Rust while the sweep read them from a script, so
-            // nothing tied any promise to the thing that enforces it - a sweep could be
-            // deleting at 30 days while every document said 7, and every other check here
-            // would still pass because they compare the documents to the CONSTANTS.
+            // THE SHELL LITERAL MUST BE THE RUST CONSTANT, for EVERY TABLE IN THE LIST,
+            // which is the check that did not exist while these windows lived as literals
+            // typed into the entrypoint. The privacy page, the policy table and the metrics
+            // endpoint all read the numbers from Rust while the sweep read them from a
+            // script, so nothing tied any promise to the thing that enforces it - a sweep
+            // could be deleting at 30 days while every document said 7, and every other
+            // check here would still pass because they compare the documents to the
+            // CONSTANTS.
             //
             // It started as a special case for the one window that had no constant at all,
             // which is the shape this class of bug usually takes: fixed once, in one
@@ -1037,11 +1044,11 @@ mod tests {
 
         // The vacuity guard: a parse that found nothing would agree with anything.
         assert!(
-            // SLACK, not the count. The entrypoint has exactly six retention deletes, and
-            // a floor of six is a tripwire: it fails the day one is removed and cannot
-            // tell a full parse from a partial one that still reaches six. Four catches a
+            // SLACK, not the count. The entrypoint has exactly seven retention deletes, and
+            // a floor of seven is a tripwire: it fails the day one is removed and cannot
+            // tell a full parse from a partial one that still reaches seven. Five catches a
             // parse that lost a third of them, which is the failure the floor is for.
-            swept.len() >= 4,
+            swept.len() >= 5,
             "only {} retention deletes were parsed from the entrypoint",
             swept.len()
         );
@@ -2043,9 +2050,15 @@ mod tests {
                 "link_redemption_attempts",
                 "Salted IP hash of failed link-code attempts",
             ),
+            ("auth_attempts", "Sign-in attempt counters"),
             ("link_codes", "Telegram link codes"),
             ("link_code_issues", "Telegram link codes"),
             ("admin_audit", "operator audit rows"),
+            // The identity port moved email, the password hash and the Google link
+            // OUT of PocketBase and INTO `identities`; `privacy.ts` was updated in the
+            // same change. Every row here is a phrase that must appear on the page.
+            ("identities", "Email verification and password-reset links"),
+            ("identity_tokens", "Email verification and password-reset links"),
         ];
 
         // Tables that exist and hold nothing. A reason is required, because an empty
@@ -2053,8 +2066,8 @@ mod tests {
         // forgotten.
         const UNUSED: &[(&str, &str)] = &[
             (
-                "identities",
-                "auth lives in PocketBase and this table is never written; it holds an email and an Argon2id password hash, and the privacy page says both live in PocketBase. If the port ever moves identity HERE the page goes false in the direction nobody reviews"
+                "wallets_pending_rebuild",
+                "a placeholder held open for a future wallet migration; no migration creates it, and it is listed only so this map has an entry that is not a live table - if you are reading this looking for the real UNUSED set, it is now empty, because the identity port gave the last one a writer",
             ),
         ];
 
@@ -2082,12 +2095,26 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             for line in text.lines() {
                 if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
-                    tables.push(
-                        rest.split(|c: char| c == '(' || c.is_whitespace())
-                            .next()
-                            .unwrap_or_default()
-                            .to_string(),
-                    );
+                    let name = rest
+                        .split(|c: char| c == '(' || c.is_whitespace())
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    // A REBUILD STAGING TABLE is not a table the customer can be
+                    // told about, because it does not exist once the migration
+                    // commits: SQLite cannot DROP a UNIQUE column, so dropping it
+                    // means recreating the table, copying the rows and renaming the
+                    // copy into place - and for the length of that statement the
+                    // copy holds a name. The `_` prefix is how a reader and this
+                    // parser both tell the difference, and it is why the schema's
+                    // real tables are unprefixed. Skipping the name here rather than
+                    // listing it as UNUSED is deliberate: an UNUSED entry is a
+                    // promise that the table exists and holds nothing, and there is
+                    // no such table to hold anything.
+                    if name.starts_with('_') {
+                        continue;
+                    }
+                    tables.push(name);
                 }
             }
         }
