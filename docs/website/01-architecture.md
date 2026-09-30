@@ -87,7 +87,7 @@ Contract:
 | --- | --- | --- |
 | Midtrans server key | Northflank (Rust env) | **No** |
 | Midtrans client key | Pages env (`PUBLIC_MIDTRANS_CLIENT_KEY`) | Yes (by design) |
-| Google client id (`[identity] google_client_id`) | Northflank (Rust env) | No — the audience the server checks, not a secret |
+| Google client id (`[auth] google_client_id`) | Config file (`config/apikita.toml`), not the env | No — it is the audience the server checks, not a secret |
 | Upstream provider keys | Northflank (Rust env) | **No** |
 | Telegram bot token | Northflank (Rust / bot env) | **No** |
 | Database connection string | Northflank (Rust env) | **No** |

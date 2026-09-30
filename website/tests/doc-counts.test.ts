@@ -99,6 +99,12 @@ test('no doc still claims a superseded count', () => {
   const superseded = [
     '391 tests', '163 tests', '161 tests', '160 tests', '157 tests', '146 tests',
     '338 passed', '134 passed',
+    // The pair bumped on 2026-09-30. Without these two the guard only stops a
+    // number that was stale when it was WRITTEN from coming back; a number it
+    // has itself retired could reappear in one document unnoticed, because
+    // every check above asserts the CURRENT constant is PRESENT somewhere and
+    // none of them asserts a retired one is ABSENT.
+    '509 tests', '168 tests',
   ];
   for (const stale of superseded) {
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so
