@@ -5,7 +5,7 @@
 // type-checked nor loadable by `node --test`, which is exactly how /dashboard/usage
 // shipped calling `?from=-30d` — a bound the server has always rejected.
 //
-// Sources: docs/server/api-spec.md:97-108 (the endpoint) and
+// Sources: docs/server/api-spec.md:296-307 (the endpoint) and
 // server/src/routes/account.rs `parse_usage_day` / `get_usage`.
 
 /** The daily breakdown window the dashboard asks for: the last 30 days, inclusive. */
@@ -19,8 +19,8 @@ export function toIsoDay(date: Date): string {
 /**
  * The `?from=&to=` query string for the daily breakdown, ending `on` (inclusive).
  *
- * docs/server/api-spec.md:103: "Both bounds are ISO `YYYY-MM-DD`; **anything else is
- * a `422`** naming the field". server/src/routes/account.rs:142 parses with
+ * docs/server/api-spec.md:302: "Both bounds are ISO `YYYY-MM-DD`; **anything else is
+ * a `422`** naming the field". server/src/routes/account.rs:248-250 parses with
  * `%Y-%m-%d` and nothing else, so a relative shorthand like `-30d` — what this
  * island used to send — is a guaranteed 422 and the page never renders a row.
  *
@@ -28,7 +28,7 @@ export function toIsoDay(date: Date): string {
  * question the API actually answers; leaving `to` off would let a server-side
  * default decide how far forward the window reaches.
  *
- * Both bounds are INCLUSIVE (api-spec:105), so the span is 30 days *including*
+ * Both bounds are INCLUSIVE (api-spec.md:304), so the span is 30 days *including*
  * today: `to - (USAGE_WINDOW_DAYS - 1)`.
  *
  * `Date.UTC` rolls impossible dates over (2025-02-30 becomes 2025-03-02), which
@@ -57,7 +57,7 @@ export function usageWindowQuery(on: Date = new Date()): string {
 /** One bucket of `GET /api/usage`, in either field spelling. */
 export interface UsageBucket {
   /**
-   * The day, as the server names it. server/src/routes/account.rs:210 emits
+   * The day, as the server names it. server/src/routes/account.rs:324 emits
    * `"day"`; the island declared and read `date`, so every row rendered "—" under
    * a correct-looking table. Read through `bucketDay`, never directly.
    */
@@ -87,7 +87,7 @@ export function bucketDay(bucket: Pick<UsageBucket, 'day' | 'date'>): string | n
  * The newest bucket in a `GET /api/usage` response — the one the "Today" panel
  * shows.
  *
- * server/src/routes/account.rs:190 orders `day DESC`, so the NEWEST day is the
+ * server/src/routes/account.rs:296 orders `day DESC`, so the NEWEST day is the
  * FIRST bucket, not the last. The island took `buckets[buckets.length - 1]` and
  * so labelled the oldest day of the window "Today".
  *

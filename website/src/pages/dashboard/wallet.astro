@@ -18,7 +18,18 @@ import { minFirstDepositIdr, minTopupIdr, topupPerHour, idr } from '../../lib/mo
 // break: the page first rendered "at least10,000 IDR", and after moving the break it
 // rendered "10,000IDR". Neither was visible in the source and both were on the page a
 // customer reads before their first payment. Read the BUILT page, not the template.
-const topupPerHour = 5;
+//
+// REMOVED: `const topupPerHour = 5;` sat on this line and SHADOWED the import above.
+// The page published the local literal, and tests/prices.test.ts - which compares the
+// imported constant against config/apikita.toml - stayed green while checking a value
+// this page never rendered. Changing that line to 7 changed the built HTML to
+// "rate-limited to 7 per hour" with every test still passing.
+//
+// It is the failure the comment above describes, committed by the very edit that
+// describes it: the two minimums were consolidated into one constant and the rate cap
+// was left behind as a second copy. The declaration is DELETED rather than corrected -
+// a second copy that happens to agree today is still a second copy, and no test can
+// keep two copies agreeing. What renders now is the imported constant.
 ---
 
 <DashboardLayout title="Wallet">

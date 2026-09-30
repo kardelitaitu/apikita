@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 174;
+const WEBSITE_TESTS = 180;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -194,6 +194,15 @@ test('no doc still claims a superseded count', () => {
         // "Something was wrong with that request." for a specific, actionable failure. Two
         // tests now compare the case set to the document as a SET, in both directions.
         'website: **172 tests**', 'passes **172 tests**', '**172 tests**',
+        // Retired when the citation guard and the shadow guard landed. The citation
+        // guard was written because `website/src` cites code by line in nineteen
+        // places and doc_claims.rs's citation triage walks `docs/` only - so nothing
+        // verified any of them. Ten of the eleven that were checked by hand had
+        // drifted onto a login example, a closing brace, a blank line. The shadow
+        // guard was written because wallet.astro imported `topupPerHour` and then
+        // declared `const topupPerHour = 5;` underneath it, so prices.test.ts
+        // compared the CONSTANT against config while the page published the literal.
+        'website: **174 tests**', 'passes **174 tests**', '**174 tests**',
       ],
     },
   ];

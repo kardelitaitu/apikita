@@ -319,7 +319,7 @@ test('the instruction names the command and the server-stated TTL', () => {
 });
 
 // --- Editing a key's limits (PATCH /api/keys/:id) ---------------------------
-// docs/server/api-spec.md:187: "Raising takes effect immediately; lowering is
+// docs/server/api-spec.md:397-398: "Raising takes effect immediately; lowering is
 // subject to the proxy's metadata cache TTL (<=60s). The response should say so,
 // so the UI can warn honestly." These tests pin the trigger and the copy.
 

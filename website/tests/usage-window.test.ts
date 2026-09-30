@@ -67,7 +67,7 @@ test('the usage window is two real YYYY-MM-DD bounds, not the -30d shorthand the
 });
 
 test('a bucket is labelled from the server\'s "day" field, and "date" is still tolerated', () => {
-  // (b) server/src/routes/account.rs:210 emits `"day"`. The island declared
+  // (b) server/src/routes/account.rs:324 emits `"day"`. The island declared
   // `date` and rendered `b.date`, so every row's Date cell read "—" even once the
   // window was fixed.
   assert.equal(bucketDay({ day: '2026-03-15' }), '2026-03-15');
@@ -91,7 +91,7 @@ test('a bucket is labelled from the server\'s "day" field, and "date" is still t
 });
 
 test('the newest bucket is the one "day DESC" puts first, not the last row', () => {
-  // (c) account.rs:190 orders `day DESC`. The island took
+  // (c) account.rs:296 orders `day DESC`. The island took
   // `buckets[buckets.length - 1]` — the OLDEST day of the window — and labelled it
   // "Today".
   const descending = [

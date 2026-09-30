@@ -2,7 +2,7 @@
 // (src/lib/service-status.ts).
 //
 // The rule that matters most: the indicator may report REACHABILITY of the
-// platform, never the health of an upstream provider. docs/observability.md:193
+// platform, never the health of an upstream provider. docs/observability.md:313
 // forbids /health from checking upstreams, so a badge claiming "all systems
 // operational" of the model providers would be asserting something the endpoint
 // cannot know. The label/detail copy is pinned here so that stays true.

@@ -365,7 +365,7 @@ export type UpdateKeyFields = CreateKeyFields;
 /**
  * The `PATCH /api/keys/:id` body, or the first reason it must not be sent.
  *
- * Every field the API accepts is optional (server/src/routes/keys.rs:56-63), and
+ * Every field the API accepts is optional (server/src/routes/keys.rs:72-80), and
  * this always sends the full set the form shows rather than a diff: the form is
  * the source of truth for what the key should be, and sending only changed fields
  * would silently preserve a value the user deliberately cleared. It reuses
@@ -380,7 +380,7 @@ export function buildUpdateKeyRequest(fields: UpdateKeyFields): CreateKeyBuild {
  * Whether an edit LOWERS any limit, and therefore takes up to the metadata cache
  * TTL to apply.
  *
- * docs/server/api-spec.md:187 — "Raising takes effect immediately; lowering is
+ * docs/server/api-spec.md:397-398 — "Raising takes effect immediately; lowering is
  * subject to the proxy's metadata cache TTL (≤60s). The response should say so,
  * so the UI can warn honestly." This is that warning's trigger.
  *

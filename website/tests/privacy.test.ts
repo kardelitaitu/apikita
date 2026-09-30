@@ -1,6 +1,6 @@
 // Executable contract for the privacy disclosure (src/lib/privacy.ts).
 //
-// The rule this suite exists to enforce, from docs/data-retention.md:32-34: the
+// The rule this suite exists to enforce, from docs/data-retention.md:42-43: the
 // /privacy page "must be updated in the same change if any of it moves again".
 // The failure mode is silent — a new stored category (or a new long-lived table)
 // that the disclosure never mentions — so the guard is a coverage assertion, not

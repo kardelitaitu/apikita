@@ -37,7 +37,7 @@
 // limitation to apologise for - a test cannot decide whether every string in the
 // crate is prompt text - and the second half of the control is the other half of
 // this comment: if you add one, change this row and this comment together.
-// document's, restated in plain language. docs/data-retention.md:32-34 states the
+// document's, restated in plain language. docs/data-retention.md:42-43 states the
 // rule this file exists to honour: the /privacy page "must be updated in the same
 // change if any of it moves again". tests/privacy.test.ts enforces the coverage
 // that rule implies.

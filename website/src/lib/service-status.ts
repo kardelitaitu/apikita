@@ -5,14 +5,14 @@
 // and these are exactly the rules that must not silently invert.
 //
 // Scope, deliberately narrow and stated plainly: `/health` reports the PROCESS
-// and the DATABASE only. docs/observability.md:193 — "**/health must not check
+// and the DATABASE only. docs/observability.md:313 — "**/health must not check
 // upstream providers** — an upstream outage would then look like a dead server
 // and trigger a restart loop." So this indicator can honestly say "the platform
 // is reachable" and must NOT claim to know whether any upstream model provider is
 // healthy. The copy is written to that limit; overstating it would be a lie the
 // screen cannot support.
 
-/** The body `GET /health` returns, per docs/server/api-spec.md:25. */
+/** The body `GET /health` returns, per docs/server/api-spec.md:678. */
 export interface HealthBody {
   status: string;
   database: string;
