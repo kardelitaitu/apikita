@@ -441,23 +441,22 @@ pub fn create_router(state: AppState) -> Router {
         // Proxy
         .route("/v1/chat/completions", post(proxy::chat_completions))
     )
-        // The router-level fallback, so the 404 for an UNROUTED path is the documented JSON
-        // The router-level fallback, so the 404 for an UNROUTED path is the documented JSON
-        // rather than axum's empty-bodied default.
-        //
-        // docs/error-model.md:10 promises "Every error returns the same JSON. No bare HTML
-        // error pages, no empty bodies." Measured against the running binary, everything the
-        // HANDLERS answer already met that - eleven of fourteen error paths carried
-        // code/message/request_id - but a request that matches no route never reaches a
-        // handler, so axum's own 404 (empty body) was what a client actually got. That is the
-        // commonest client mistake there is, and the api-spec ADVERTISES two 404s of exactly
-        // this kind (the DESIGNED-NOT-BUILT routes), so the contract was broken on paths the
-        // documentation deliberately points at.
-        //
-        // NOT the same as METHOD_NOT_ALLOWED, which axum raises for a mounted path with the
-        // wrong verb; that keeps its own status and is asserted separately in the route table.
-        .fallback(unrouted)
-        .with_state(state)
+    // The router-level fallback, so the 404 for an UNROUTED path is the documented JSON
+    // rather than axum's empty-bodied default.
+    //
+    // docs/error-model.md:10 promises "Every error returns the same JSON. No bare HTML
+    // error pages, no empty bodies." Measured against the running binary, everything the
+    // HANDLERS answer already met that - eleven of fourteen error paths carried
+    // code/message/request_id - but a request that matches no route never reaches a
+    // handler, so axum's own 404 (empty body) was what a client actually got. That is the
+    // commonest client mistake there is, and the api-spec ADVERTISES two 404s of exactly
+    // this kind (the DESIGNED-NOT-BUILT routes), so the contract was broken on paths the
+    // documentation deliberately points at.
+    //
+    // NOT the same as METHOD_NOT_ALLOWED, which axum raises for a mounted path with the
+    // wrong verb; that keeps its own status and is asserted separately in the route table.
+    .fallback(unrouted)
+    .with_state(state)
 }
 
 /// The documented JSON for a path that matches no route.
