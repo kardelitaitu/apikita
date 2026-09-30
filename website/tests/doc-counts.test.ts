@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 172;
+const WEBSITE_TESTS = 174;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -141,8 +141,25 @@ test('no doc still claims a superseded count', () => {
     // no row for a developer to look it up in. The page is a third transcription of the
     // same table, and it was the only one nothing read.
     '581 tests', '581 passed', '581 / 0 / 0',
+    // Retired when the error-code CASE SET was pinned to the published contract. Every
+    // test in error-model.test.ts drives a code typed into the test, so none of them
+    // noticed a code with no `case` in describeError: it falls into `default` and renders
+    // "Something was wrong with that request." for a specific, actionable failure. Two
+    // tests now compare the case set to the document as a SET, in both directions.
+    'website: **172 tests**', 'passes **172 tests**', '**172 tests**',
+    '582 tests', '582 passed', '582 / 0 / 0',
   ];
+  // AN ENTRY THAT IS NOW A LIVE COUNT IS NOT SUPERSEDED, and this list has just
+  // crossed that line: the tables above and below it share a numeric space, so a
+  // server figure retired here can be the CURRENT website figure (or the reverse)
+  // and the check would demand one document not state the count it is supposed to
+  // state. Skipping rather than deleting, because the entry is still right about
+  // the pair it was retired from - deleting it would drop the protection for the
+  // three documents that no longer say it, to satisfy one that now must.
+  const liveCounts = [String(SERVER_TESTS), String(WEBSITE_TESTS)];
   for (const stale of superseded) {
+    const digits = stale.match(/\d+/)?.[0];
+    if (digits !== undefined && liveCounts.includes(digits)) continue;
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so
     // only the live-status documents are checked.
     const liveDocs = ['README.md', 'server/README.md', 'website/README.md', 'docs/website/README.md', 'docs/ci-cd.md'];
@@ -153,8 +170,12 @@ test('no doc still claims a superseded count', () => {
       );
     }
   }
+  // Vacuity: the skip above must not have swallowed the whole list.
+  assert.ok(
+    superseded.filter((s) => !liveCounts.includes(s.match(/\d+/)?.[0] ?? '')).length > 10,
+    'the superseded list is now mostly live counts, so this test is checking almost nothing',
+  );
 });
-
 /**
  * The format gate is described, not imagined.
  *
