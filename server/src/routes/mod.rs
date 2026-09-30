@@ -262,6 +262,23 @@ macro_rules! routes {
             .route($path, $($m($h)).+)
         )+
     };
+    // THE PATH LIST, CAPTURED FROM THE SAME INVOCATION. This arm is the second
+    // half of the guard: `stringify!` of a `$path:literal` is the LITERAL'S OWN
+    // TEXT, produced by the compiler from the tokens it actually expanded, so it
+    // reports what the router was built from rather than what a test hoped was
+    // there. Comments are stripped by the lexer and the `;` markers are not part
+    // of a single route's capture, so the result is a bare list of quoted paths -
+    // which is exactly what `the_macro_body_lists_the_inventory_it_mounts` needs
+    // to compare against `ROUTES`.
+    //
+    // A SEPARATE ARM rather than a second field on the first, because the first
+    // one is what `create_router` returns and every caller wants a `Router`, not
+    // a `(Router, &str)`. Two arms of one macro is the guarantee that the list
+    // cannot describe a different invocation than the router: both are expanded
+    // from the SAME tokens by the SAME macro.
+    (@paths $($(#[$meta:meta])* .route($path:literal, $($m:ident($h:path)).+ $(,)?));+ $(;)?) => {
+        &[$(stringify!($path)),+]
+    };
 }
 
 /// THE ROUTE INVENTORY. The single source for what this server serves.
@@ -460,6 +477,84 @@ pub fn create_router(state: AppState) -> Router {
     .fallback(unrouted)
     .with_state(state)
 }
+
+/// The path literals `create_router`'s `routes!` invocation actually expanded.
+///
+/// THE SECOND HALF OF THE INVENTORY GUARD, and it exists because the first half
+/// cannot see the macro body. `the_route_inventory_matches_the_mounted_table`
+/// compares `ROUTES` to `MOUNTED`, and BOTH of those are hand-written text: a
+/// route added to the macro and forgotten in `ROUTES` left every check green
+/// while the router served a path the inventory denied. The `;` markers catch a
+/// HAND-DELETED line; nothing caught an ADDED one.
+///
+/// This array is not written by hand. It is the same invocation `create_router`
+/// passes to `routes!`, run through the `@paths` arm, whose `stringify!($path)`
+/// is the compiler's rendering of the literal the router was built from - so the
+/// two cannot describe different invocations, because they are the same tokens.
+/// `the_macro_body_lists_the_inventory_it_mounts` compares this to `ROUTES`.
+///
+/// WHAT THIS STILL DOES NOT COVER: the METHOD. `@paths` captures `$path` only,
+/// so a `.route("/api/keys/{id}", get(...))` changed to `post(...)` moves in
+/// neither list. That gap is stated on `ROUTES` already ("the method-router
+/// expressions themselves are read by no test") and closing it is not possible
+/// from a `macro_rules` arm without capturing `$m` too - which would make this
+/// array carry method names no caller can check against anything.
+#[allow(dead_code)]
+pub const MOUNTED_BY_THE_MACRO: &[&str] = routes!(@paths
+    .route("/health", get(health::health_check));
+    // Operator-only operational counts. NOT on /health: that body is pinned
+    // because the deploy gate parses it, and a leak test forbids ANY digit in an
+    // unauthenticated health body. See health::operator_metrics.
+    .route("/api/admin/metrics", get(health::operator_metrics));
+    // Auth. These are what the website calls, and none of them needs a PocketBase
+    // instance: the identity provider is this crate's own `identity` module, over
+    // the `identities` table.
+    .route("/auth/signup", post(auth::signup));
+    .route("/auth/login", post(auth::login));
+    .route("/auth/google", post(auth::google_sign_in));
+    .route("/auth/verify-email", post(auth::verify_email));
+    .route("/auth/password-reset/request", post(auth::request_password_reset));
+    .route("/auth/password-reset/confirm", post(auth::confirm_password_reset));
+    .route("/auth/verification/resend", post(auth::resend_verification));
+    .route("/auth/logout", post(auth::logout));
+    .route("/auth/logout-all", post(auth::logout_all));
+    // The two the settings panel needs, and the reason each exists rather than a
+    // PocketBase SDK call: `change_password` replaces `users.update` with a verb
+    // that verifies the CURRENT password and kills every session, and
+    // `list_providers` replaces `listExternalAuths` by reporting the account's own
+    // identity rows and taking no address or id.
+    .route("/auth/password-change", post(auth::change_password));
+    .route("/auth/providers", get(auth::list_providers));
+    // Account & Wallet
+    .route("/api/me", get(account::get_me));
+    .route("/api/usage", get(account::get_usage));
+    .route("/api/usage/recent", get(account::get_recent_usage));
+    .route("/api/export", get(account::export_account_data));
+    .route("/api/topups", get(account::get_topups).post(account::create_topup));
+    // API Keys
+    .route("/api/keys", get(keys::list_keys).post(keys::create_key));
+    .route("/api/keys/{id}", patch(keys::update_key));
+    .route("/api/keys/{id}/revoke", post(keys::revoke_key));
+    // Telegram
+    .route("/api/telegram/link-code", post(telegram::issue_link_code));
+    .route("/api/telegram", delete(telegram::unlink_telegram));
+    // The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN
+    .route("/api/bot/link", post(telegram::redeem_link_code));
+    // Live updates (SSE)
+    .route("/events", get(events::sse_events_handler));
+    // Admin (cookie + operator flag)
+    .route("/api/admin/accounts", get(admin::list_accounts));
+    .route("/api/admin/audit", get(admin::list_recent_audit));
+    .route("/api/admin/accounts/{id}", get(admin::get_account));
+    .route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit));
+    .route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
+    .route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
+    .route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
+    // Webhooks
+    .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
+    // Proxy
+    .route("/v1/chat/completions", post(proxy::chat_completions))
+);
 
 /// The documented JSON for a path that matches no route.
 ///
@@ -1896,6 +1991,100 @@ mod tests {
              GET+POST, so each contributes two rows from one `.route(` call, while the rest \
              including /auth/logout and /auth/logout-all are single-method. A mismatch here \
              means a row was added or removed without updating this number."
+        );
+    }
+
+    /// THE MACRO BODY AND THE INVENTORY LIST THE SAME PATHS, AND NOTHING ELSE DID.
+    ///
+    /// THE HOLE THIS CLOSES. `ROUTES` and the `routes!(...)` invocation inside
+    /// `create_router` are two hand-written copies of the same list, and every
+    /// existing check reads ONE of them against `MOUNTED`:
+    ///
+    /// - `the_route_inventory_matches_the_mounted_table` reads `ROUTES` and compares
+    ///   it to `MOUNTED`. Both are text. A route present in the macro body and in
+    ///   `MOUNTED` but MISSING from `ROUTES` fails that test - correctly - but a
+    ///   route added to the MACRO and to `MOUNTED` while `ROUTES` was left alone
+    ///   fails nothing, and the inventory then denies a path the router serves.
+    /// - The `;` markers catch a line DELETED by hand. Nothing caught a line ADDED
+    ///   to one copy and not the other.
+    ///
+    /// The test's own history is the evidence this mattered: when the password-change
+    /// and provider routes were mounted, `ROUTES` was edited FIRST and the inventory
+    /// test passed while every request to those paths answered 404, because
+    /// `create_router` had not been touched. Four iterations were spent before the
+    /// response body, not the status, revealed it.
+    ///
+    /// `MOUNTED_BY_THE_MACRO` is not a third hand-written list - it is this same
+    /// invocation run through the macro's `@paths` arm, so its entries are the
+    /// compiler's rendering of the literals the router expanded. Comparing it to
+    /// `ROUTES` is therefore a real cross-check rather than two copies of one
+    /// mistake.
+    #[test]
+    fn the_macro_body_lists_the_inventory_it_mounts() {
+        // `stringify!` renders a STRING LITERAL as its source text INCLUDING the
+        // quotes, so this array holds `"\"/health\""` rather than `/health`. The
+        // quotes are stripped on the READING side because the macro arm cannot do
+        // it: `macro_rules` has no way to take `$path` and emit its value without
+        // the literal syntax, and `concat!`/`stringify!` combinations keep the
+        // quotes too. Stripping here still compares the COMPILER'S rendering of the
+        // literal rather than a re-typed copy of it, which is the property that
+        // makes this cross-check worth having.
+        let from_the_macro: Vec<&str> = MOUNTED_BY_THE_MACRO
+            .iter()
+            .map(|quoted| quoted.trim_matches('"'))
+            .collect();
+        let from_the_inventory: Vec<&str> = ROUTES
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix(".route(\"")?;
+                let close = rest.find('"')?;
+                Some(&rest[..close])
+            })
+            .collect();
+
+        // POSITIVE CONTROL. `stringify!` returning an empty-ish array, or the parse
+        // finding nothing, would make the comparison below pass against nothing at
+        // all - the same vacuity the sibling test guards against.
+        assert!(
+            from_the_macro.contains(&"/v1/chat/completions"),
+            "the macro capture did not find the last route, so it is not reading the \
+             invocation it thinks it is and every assertion here is vacuous"
+        );
+
+        // Every route the ROUTER expands must be in the inventory the test above
+        // trusts. This is the direction the missing-check bug took.
+        for path in &from_the_macro {
+            assert!(
+                from_the_inventory.contains(path),
+                "{path} is mounted by create_router's `routes!` invocation but is NOT in \
+                 the `ROUTES` inventory. The inventory is what `the_route_inventory_matches_\
+                 the_mounted_table` and `every_mounted_route_is_documented_in_the_api_spec` \
+                 both read, so this path is mounted, undocumented and unlisted - add it to \
+                 `ROUTES` (with its trailing `;`), and to MOUNTED, and to the api-spec."
+            );
+        }
+
+        // And the other direction, so the inventory cannot advertise a route the
+        // router does not serve - which is how a 404 gets documented as a 200.
+        for path in &from_the_inventory {
+            assert!(
+                from_the_macro.contains(path),
+                "{path} is in the `ROUTES` inventory but create_router does NOT mount it. \
+                 Every check downstream reads `ROUTES`, so the inventory claims a path a \
+                 client would get a 404 from - add the `.route(` line to the `routes!` \
+                 invocation in create_router, or remove this one from `ROUTES`."
+            );
+        }
+
+        assert_eq!(
+            from_the_macro.len(),
+            from_the_inventory.len(),
+            "the macro expands {} paths and `ROUTES` lists {}. The two loops above should \
+             already have named the offender; this count is the cross-check that they were \
+             not both empty or both truncated.",
+            from_the_macro.len(),
+            from_the_inventory.len()
         );
     }
 

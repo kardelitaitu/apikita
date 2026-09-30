@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 172;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 579;
+const SERVER_TESTS = 580;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -122,6 +122,12 @@ test('no doc still claims a superseded count', () => {
     // five handlers that carry a new customer from an address to a working
     // sign-in, and back in again when the password is lost.
     '566 tests', '566 passed', '566 / 0 / 0',
+    // Retired when the route-list guard landed: it compares the `routes!` macro
+    // invocation inside `create_router` against the `ROUTES` inventory, which the
+    // sibling check reads. It is the one test that catches a route added to the
+    // router and to MOUNTED while `ROUTES` was left alone - a 404 for a path the
+    // inventory does not admit exists.
+    '579 tests', '579 passed', '579 / 0 / 0',
   ];
   for (const stale of superseded) {
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so
