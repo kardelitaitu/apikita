@@ -523,6 +523,11 @@ mod tests {
 
     /// R1's adopt branch: a VERIFIED password identity is the legitimate case, and
     /// the Google identity joins that account.
+    ///
+    /// The verification is stamped BEFORE the sign-in, and that is not incidental:
+    /// R3's ordering rule is strict (`verified_at < now`), so a fixture that used
+    /// the same instant for both would be asserting the boundary case rather than
+    /// the ordinary one, and would fail for the right reason.
     #[tokio::test]
     async fn a_verified_collision_is_linked() {
         let db = TestDb::new().await;
@@ -535,7 +540,7 @@ mod tests {
             "person@example.com",
             "$argon2id$fake",
             true,
-            now,
+            now - Duration::minutes(5),
         )
         .await
         .expect("the person signed up and verified");

@@ -298,22 +298,22 @@ impl TestDb {
 /// `id`, `created_at` and `updated_at` are all bound from Rust because the SQLite
 /// schema has no `DEFAULT` for them (plan section 4.1, correction 1). This is the
 /// defect the compiler cannot see: removing a column default breaks INSERTs at
-/// runtime only, so the old fixture
-/// `INSERT INTO accounts (pb_user_id) VALUES (?)` still type-checked and failed at
-/// `NOT NULL constraint failed: accounts.id`.
+/// runtime only, so the old fixture `INSERT INTO accounts (pb_user_id) VALUES (?)`
+/// still type-checked and failed at `NOT NULL constraint failed: accounts.id`.
+///
+/// The `pb_user_id` fixture value went the same way in Phase 6, when the column
+/// itself was dropped: this INSERT named it explicitly, so the rebuild left the
+/// fixture rejected with `no such column: pb_user_id` rather than quietly wrong.
 pub async fn account(pool: &SqlitePool) -> Uuid {
     let id = Uuid::new_v4();
     let now = chrono::Utc::now();
-    sqlx::query(
-        "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind(id.hyphenated())
-    .bind(format!("pb_test_{}", id.simple()))
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("create the test account");
+    sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)")
+        .bind(id.hyphenated())
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("create the test account");
     id
 }
 

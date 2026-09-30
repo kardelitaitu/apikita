@@ -53,6 +53,61 @@ UPDATE identities SET verified_at = updated_at WHERE email_verified = 1;
 CREATE INDEX identities_verified_idx ON identities (provider, email, verified_at);
 
 -- ---------------------------------------------------------------------------
+-- accounts.pb_user_id goes away
+-- ---------------------------------------------------------------------------
+
+-- The column the whole port exists to remove. `accounts` is now keyed on its own
+-- id and identifies a person through the `identities` rows that reference it, so
+-- a PocketBase record id is not merely unused - keeping it would be the one thing
+-- that keeps PocketBase load-bearing.
+--
+-- DROPPED rather than left nullable. A nullable column that nothing reads is a
+-- column a future reader has to investigate, and the investigation ends at "the
+-- port retired this"; worse, the schema comment above it would have to claim it is
+-- still the identity link while nothing sets it.
+--
+-- THE TABLE IS REBUILT, not ALTERed. `ALTER TABLE accounts DROP COLUMN
+-- pb_user_id` is the obvious spelling and it does not work: SQLite refuses with
+-- "cannot drop UNIQUE column: pb_user_id", because the column carries an inline
+-- UNIQUE that DROP COLUMN cannot remove. (SQLite only permits DROP COLUMN when the
+-- column is not indexed, not part of a PRIMARY KEY, not UNIQUE, and not referenced
+-- by a CHECK or a partial index.) Rebuilding is therefore not a stylistic choice
+-- here, it is the only mechanism the engine offers.
+--
+-- The rebuild drops and recreates `accounts`, which 14 other tables reference with
+-- `ON DELETE CASCADE`. That is safe for the reason SQLite's own documentation
+-- gives for the recommended 12-step procedure: with `PRAGMA legacy_alter_table=OFF`
+-- (the default in modern SQLite) and `foreign_keys` on, `DROP TABLE` on a parent
+-- still runs the deferred foreign-key checks at COMMIT, and the rows are all
+-- present again by then because the new table is renamed into place inside the
+-- same transaction. `PRAGMA foreign_keys` cannot be toggled inside a transaction
+-- anyway, which is why this migration does not try.
+--
+-- Every constraint of the original table is reproduced exactly - the same
+-- `status` and `is_operator` check clauses, the same RFC3339 GLOB checks, the same
+-- `STRICT` - because this file is now the only definition of `accounts` a reader
+-- will find. `id` remains the only key, which is the point: the schema comment
+-- that said `pb_user_id` was the PocketBase link "STILL PRESENT ... Phase 6 drops
+-- it" is now satisfied rather than contradicted.
+CREATE TABLE accounts_rebuilt (
+  id          TEXT PRIMARY KEY,
+  status      TEXT NOT NULL DEFAULT 'active'
+              CHECK (status IN ('active','suspended','closed')),
+  is_operator INTEGER NOT NULL DEFAULT 0 CHECK (is_operator IN (0,1)),
+  created_at  TEXT NOT NULL CHECK (created_at GLOB '????-??-??T??:??:??*+00:00'),
+  updated_at  TEXT NOT NULL CHECK (updated_at GLOB '????-??-??T??:??:??*+00:00')
+) STRICT;
+
+-- Carry the rows over. Only the surviving columns are named, on both sides, so
+-- this statement cannot silently depend on column order in either table.
+INSERT INTO accounts_rebuilt (id, status, is_operator, created_at, updated_at)
+  SELECT id, status, is_operator, created_at, updated_at FROM accounts;
+
+DROP TABLE accounts;
+
+ALTER TABLE accounts_rebuilt RENAME TO accounts;
+
+-- ---------------------------------------------------------------------------
 -- Email tokens
 -- ---------------------------------------------------------------------------
 
