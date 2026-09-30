@@ -222,3 +222,141 @@ test('every stated seconds figure is the figure its own mechanism uses', () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// The figures whose only source is a Rust literal.
+//
+// These four are different in kind from the password floor and the seconds
+// figures above, and the difference is why they survived longer.
+//
+// The password floor has a CONFIG key, so the page, the loader and the config
+// file could be compared as three transcriptions of one setting. These four have
+// no config key at all: the number exists ONLY as a literal inside a Rust
+// function, and the website restates it in a TypeScript constant. Nothing
+// compared them, and every test that touched the constants was CIRCULAR:
+//
+//   tests/admin.test.ts:279        assert.equal(ERROR_RATE_THRESHOLD, 0.05)
+//   tests/recent-usage.test.ts:23  assert.equal(recentUsagePath(),
+//                                    `/api/usage/recent?limit=${RECENT_USAGE_LIMIT}`)
+//
+// The first restates the number beside the constant that defines it, so changing
+// both in one edit passes. The second interpolates the constant into its own
+// expected value, so it is true for any value the constant takes. Neither reads
+// the server. A dashboard that asked for 50 rows from an endpoint that defaults
+// to 20 would render a short list with a "load more" that never fires, and both
+// of those tests would stay green.
+//
+// So each of these is checked against the Rust that actually enforces it, by
+// reading the file and extracting the literal. The extraction is deliberately
+// narrow - an `unwrap_or(N)` or a `const NAME: T = N` on a named line - because a
+// pattern broad enough to survive any refactor is also broad enough to match the
+// wrong number, and silently matching the wrong number is the failure mode this
+// file exists to prevent.
+
+/** Read a file under the repository root. */
+function repoFile(...parts: string[]): string {
+  return readFileSync(join(here, '..', '..', ...parts), 'utf8');
+}
+
+/**
+ * The integer a Rust line carries, matched by a narrow, named anchor.
+ *
+ * `anchor` is a regular expression with ONE capture group, applied to the whole
+ * file. If it does not match, that is a FAILURE rather than a skipped check: the
+ * server may have refactored, and a guard that quietly stops measuring is worse
+ * than no guard.
+ */
+function rustNumber(file: string, anchor: RegExp, describe: string): number {
+  const text = repoFile('server', 'src', file);
+  assert.ok(text.length > 500, `server/src/${file} was not read, so this check is vacuous`);
+  const m = text.match(anchor);
+  assert.ok(
+    m !== null,
+    `server/src/${file} no longer matches the anchor for ${describe}. The server may have refactored - find the literal by hand and update the anchor, rather than deleting the check.`,
+  );
+  const value = Number(m[1]);
+  assert.ok(Number.isFinite(value), `the ${describe} anchor matched "${m[1]}", which is not a number`);
+  return value;
+}
+
+test('the figures the website states are the figures the server enforces', async () => {
+  // --- the account list page size -------------------------------------------
+  // server/src/routes/admin.rs:368  let limit = query.limit.unwrap_or(25).clamp(1, 100);
+  const listLimit = rustNumber(
+    'routes/admin.rs',
+    /fn list_accounts[\s\S]*?query\.limit\.unwrap_or\((\d+)\)/,
+    'the admin accounts list default page size',
+  );
+  const { ADMIN_LIST_LIMIT } = await import('../src/lib/admin.ts');
+  assert.equal(
+    ADMIN_LIST_LIMIT,
+    listLimit,
+    `website/src/lib/admin.ts asks for ${ADMIN_LIST_LIMIT} accounts per page but server/src/routes/admin.rs:368 defaults to ${listLimit}. The admin list would page at a size the server does not use.`,
+  );
+
+  // --- the dashboard's "last N metered calls" -------------------------------
+  // server/src/routes/account.rs:384  const RECENT_USAGE_DEFAULT_LIMIT: i64 = 20;
+  const recentLimit = rustNumber(
+    'routes/account.rs',
+    /const RECENT_USAGE_DEFAULT_LIMIT:\s*i64\s*=\s*(\d+)/,
+    'the recent-usage default row count',
+  );
+  const recent = await import('../src/lib/recent-usage.ts');
+  assert.equal(
+    recent.RECENT_USAGE_LIMIT,
+    recentLimit,
+    `website/src/lib/recent-usage.ts requests ${recent.RECENT_USAGE_LIMIT} recent calls but server/src/routes/account.rs:384 defaults to ${recentLimit}. RECENT_USAGE_LIMIT is also the threshold \`mayHaveMore\` uses to decide whether to offer "load more", so a mismatch shows a short list with a button that never fires.`,
+  );
+
+  // --- the usage window -----------------------------------------------------
+  // server/src/routes/account.rs:259  const USAGE_DEFAULT_LIMIT: i64 = 30;
+  const usageLimit = rustNumber(
+    'routes/account.rs',
+    /const USAGE_DEFAULT_LIMIT:\s*i64\s*=\s*(\d+)/,
+    'the usage-chart default bucket count',
+  );
+  const usage = await import('../src/lib/usage.ts');
+  assert.equal(
+    usage.USAGE_WINDOW_DAYS,
+    usageLimit,
+    `website/src/lib/usage.ts charts ${usage.USAGE_WINDOW_DAYS} days but server/src/routes/account.rs:259 returns ${usageLimit} buckets when no window is asked for. The chart would draw a period the server does not send.`,
+  );
+
+  // --- the error-rate threshold --------------------------------------------
+  // tools/alert/probe.sh:419  BREACH=$(awk -v r="$RATE" 'BEGIN { print (r > 0.05) ? "yes" : "no" }')
+  // This one lives in the alerting probe rather than the server, which is exactly
+  // why it drifted out of view: it is the number that decides whether an operator
+  // is paged, and the dashboard paints the same number red.
+  const probe = repoFile('tools', 'alert', 'probe.sh');
+  assert.ok(probe.length > 1000, 'tools/alert/probe.sh was not read, so this check is vacuous');
+  const probeAnchor = probe.match(/r > ([0-9]*\.?[0-9]+)\s*\)\s*\?\s*"yes"/);
+  assert.ok(
+    probeAnchor !== null,
+    'tools/alert/probe.sh no longer contains the error_rate comparison, so the dashboard threshold cannot be checked against the one that fires the alert',
+  );
+  const probeThreshold = Number(probeAnchor[1]);
+  const admin = await import('../src/lib/admin.ts');
+  assert.equal(
+    admin.ERROR_RATE_THRESHOLD,
+    probeThreshold,
+    `website/src/lib/admin.ts marks a series red above ${admin.ERROR_RATE_THRESHOLD} but tools/alert/probe.sh:419 fires the error_rate alert above ${probeThreshold}. The dashboard would colour a rate the pager ignores, or leave grey a rate that has just paged someone.`,
+  );
+
+  // Vacuity: the four values must be distinguishable from each other and from
+  // zero. If a regex matched a comment or a stale copy, several of these would
+  // collapse onto one number and every assertion above would still pass.
+  const seen = [listLimit, recentLimit, usageLimit, probeThreshold];
+  assert.ok(
+    seen.every((n) => n > 0),
+    `a server figure was read as ${JSON.stringify(seen)}; a zero or negative value means an anchor matched the wrong text`,
+  );
+  assert.ok(
+    new Set([listLimit, recentLimit, usageLimit]).size >= 2,
+    `the three row-count anchors returned ${listLimit}, ${recentLimit}, ${usageLimit} - too alike to tell whether each matched its own line. Check the anchors before trusting the comparisons above.`,
+  );
+  assert.ok(
+    probeThreshold > 0 && probeThreshold < 1,
+    `the probe threshold was read as ${probeThreshold}, which is not a plausible error RATE. The comparison in tools/alert/probe.sh is a percentage expressed as a fraction`,
+  );
+});
+
+

@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 184;
+const WEBSITE_TESTS = 185;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -212,6 +212,16 @@ test('no doc still claims a superseded count', () => {
         // the password floor across three pages, and three different "N seconds" figures
         // belonging to three different mechanisms.
         'website: **180 tests**', 'passes **180 tests**', '**180 tests**',
+        // Retired when the server-only figures were pinned. These four numbers have no
+        // config key - they exist only as a literal inside a Rust or shell function, and
+        // the website restated each one in a TypeScript constant that nothing compared
+        // to its source. Every test that touched those constants was circular: admin.test.ts
+        // asserted `ERROR_RATE_THRESHOLD === 0.05` beside the line defining it, and
+        // recent-usage.test.ts interpolated `RECENT_USAGE_LIMIT` into its own expected
+        // path, so both would hold for any value. A dashboard asking for 50 rows from an
+        // endpoint defaulting to 20 renders a short list and a "load more" that never
+        // fires, with the suite green.
+        'website: **184 tests**', 'passes **184 tests**', '**184 tests**',
       ],
     },
   ];
