@@ -2435,6 +2435,104 @@ mod tests {
         db.close().await;
     }
 
+    /// The two body shapes the CI shape probe sends at this route, pinned here so
+    /// the shell probe asserts something a Rust test already agrees with.
+    ///
+    /// REACHED THROUGH THE REAL ROUTER, not by handing the handler a `JsonRejection`:
+    /// `JsonDataError::from_err` and `JsonSyntaxError::from_err` are `pub(crate)` in
+    /// axum-core, so a test outside that crate can name the two variants and still
+    /// not construct them. Sending the bytes is the better question anyway - it is
+    /// what CI does, and it exercises the extractor order as well as the map.
+    ///
+    /// THE ORDER IS THE POINT. `Result<Json<T>, JsonRejection>` is the LAST extractor
+    /// in the signature, so it runs last, and the body is mapped to a 422 before
+    /// `resolve_account_from_cookie` is ever reached. These requests carry NO COOKIE,
+    /// so a handler that authenticated first would answer 401 and this test would say
+    /// so - which is why the assertion is a status equality and not a body match.
+    ///
+    /// Three different axum statuses collapse into one here, and that is the whole
+    /// reason the handler takes the rejection `Result` instead of `Json<T>`: a body
+    /// that is not JSON is axum's 400, a body whose shape does not match is its 422,
+    /// and a missing content type is its 415. Left alone, one caller mistake would
+    /// earn three statuses depending on how far it happened to get.
+    #[tokio::test]
+    async fn live_password_change_body_rejections_all_carry_the_documented_shape() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use std::net::SocketAddr;
+
+        let db = TestDb::new().await;
+
+        // The real router, reached the way a caller reaches it. MockConnectInfo
+        // supplies the peer address `change_password` extracts: without it that
+        // extractor fails with 500, which would tell us nothing about the body map.
+        let app = crate::routes::create_router(state_for(&db.pool))
+            .layer(MockConnectInfo(SocketAddr::from(([203, 0, 113, 40], 44321))));
+
+        async fn send(app: &axum::Router, body: &str) -> (StatusCode, String) {
+            use axum::http::Request;
+            use tower::ServiceExt;
+
+            let request = Request::builder()
+                .method("POST")
+                .uri("/auth/password-change")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("the request must build");
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("the router must respond");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the response body must be readable");
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        // Both shapes CI sends, in one pass, so the assertions below cannot drift
+        // apart from each other.
+        let mut responses = Vec::new();
+        for body in ["{}", "{,}"] {
+            let (status, text) = send(&app, body).await;
+            responses.push((body, status, text));
+        }
+
+        for (body, status, text) in &responses {
+            assert_eq!(
+                *status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "the body {body:?} must be a 422 whatever axum calls it: {text}"
+            );
+            assert!(
+                text.contains("\"code\""),
+                "every error carries a code (docs/error-model.md): {text}"
+            );
+            assert!(
+                text.contains("\"request_id\""),
+                "every error carries a request_id, and CI greps for this one: {text}"
+            );
+            assert!(
+                !text.contains("not_found"),
+                "a rejected body must not be reported as an unmounted route: {text}"
+            );
+        }
+
+        // The rejection names the BODY and not a credential field, on both. That is
+        // the field the settings page keys off to decide whether it is worth
+        // re-reading what the customer typed, and naming `current_password` here
+        // would send the panel looking at the wrong input.
+        for (body, _, text) in &responses {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(text)
+                    .expect("the error body must be JSON")["error"]["details"]["field"],
+                "body",
+                "the rejection for {body:?} must name the body: {text}"
+            );
+        }
+
+        db.close().await;
+    }
     // --- GET /auth/providers ------------------------------------------------
 
     /// The list reports the ACCOUNT'S OWN identity rows: a password-only account and
