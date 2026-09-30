@@ -348,6 +348,16 @@ mod tests {
         (503, "no_upstream_available"),
     ];
 
+    /// The published table is the whole API, and ONE code lives outside `AppError`:
+    /// `forbidden` is built by `admin.rs::forbidden_response` for a non-operator or a
+    /// self-action, because the operator surface needs a message that says WHICH, and
+    /// `AppError` has no variant that carries one.
+    ///
+    /// At MODULE scope rather than inside the test that first needed it, because a second
+    /// test now compares the quickstart page against the same complete set, and a second
+    /// copy of this row is the drift both of them exist to catch.
+    const OUTSIDE_APP_ERROR: &[(&str, u16)] = &[("forbidden", 403)];
+
     /// The published table, parsed from the document rather than trusted from
     /// memory.
     ///
@@ -489,8 +499,6 @@ mod tests {
         // named here rather than papered over by adding the row to DOCUMENTED, which
         // would break the sibling test asserting AppError's codes are exactly the
         // documented AppError codes.
-        const OUTSIDE_APP_ERROR: &[(&str, u16)] = &[("forbidden", 403)];
-
         let mut expected: Vec<(u16, String)> = DOCUMENTED
             .iter()
             .map(|(status, code)| (*status, (*code).to_string()))
@@ -1199,5 +1207,134 @@ mod tests {
                 "docs/error-model.md rule 5 requires details.field on a validation error so the UI can highlight the input without parsing the prose message",
             );
         assert_eq!(field, "amount_idr");
+    }
+
+    /// The quickstart page publishes the status-code table a DEVELOPER codes against.
+    ///
+    /// THIS IS THE COPY NOBODY RAN. `the_published_status_table_is_the_one_the_code_serves`
+    /// above reads docs/error-model.md, and the website suite pins the UI mapping in
+    /// website/tests/error-model.test.ts - so both halves of the contract are checked
+    /// against something. The page a developer actually copies curl from is a third
+    /// transcription of the same table, in TypeScript, and nothing read it: `errorCodes`
+    /// in website/src/pages/docs/quickstart.astro could name a code the server never
+    /// emits, or give a real code the wrong status, and every test in this repository
+    /// stayed green while the published quickstart was wrong.
+    ///
+    /// It is the same defect as the retention sweep in the previous round - a promise
+    /// written in a surface nothing compares to the thing that keeps it - and it is
+    /// worth saying that the marker comments in docs/ (`[ServerErrorCode]`) are NOT how
+    /// this is checked, deliberately. A marker is a hand-written string; the fourth
+    /// transcription of the table would then be checked by a fifth. This reads the row
+    /// literals out of the page and compares them to the same DOCUMENTED set the
+    /// document is compared to, so the page and the document agree because they agree
+    /// with the code, not with each other.
+    ///
+    /// The parse reads `status: '400', code: 'invalid_request'` rather than `| 400 |`
+    /// because the source is TypeScript. Anything it cannot parse is skipped, so the
+    /// vacuity guard below is what stops a reformat turning this into a check over an
+    /// empty set - which is the failure mode a parser this narrow invites.
+    #[test]
+    fn the_quickstart_publishes_the_status_table_the_code_serves() {
+        let page = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("website")
+                .join("src")
+                .join("pages")
+                .join("docs")
+                .join("quickstart.astro"),
+        )
+        .expect(
+            "website/src/pages/docs/quickstart.astro must be readable, or this passes over \
+             nothing. It is the page a developer copies their first request from.",
+        );
+
+        // The array literal that IS the table. Scoped to it so a `code:` in some
+        // unrelated object on the page cannot be read as a row.
+        let start = page.find("const errorCodes = [").unwrap_or_else(|| {
+            panic!(
+                "the quickstart no longer has an `errorCodes` array. That array is the \
+                 published status-code table; if it was renamed or inlined, this check is \
+                 looking at nothing and would pass whatever the page says."
+            )
+        });
+        let body = &page[start..];
+        let end = body.find("\n];").map(|at| at + 3).unwrap_or(body.len());
+        let table = &body[..end];
+
+        // `{ status: '400', code: 'invalid_request', ... }` - the two fields that
+        // constitute a contract row. `meaning` and `action` are prose and are not
+        // compared, for the reason the document's own check gives: the prose half is
+        // a judgement, and this suite has a documented history of false alarms from
+        // matchers that tried to read it.
+        let mut published: Vec<(u16, String)> = Vec::new();
+        for line in table.lines() {
+            let (Some(status_at), Some(code_at)) = (line.find("status: '"), line.find("code: '"))
+            else {
+                continue;
+            };
+            let rest_after = |at: usize, opener: &str| -> String {
+                let s = &line[at + opener.len()..];
+                s[..s.find('\'').unwrap_or(s.len())].to_string()
+            };
+            // `status` is a quoted decimal, `code` a quoted identifier.
+            let Ok(status) = rest_after(status_at, "status: '").parse::<u16>() else {
+                continue;
+            };
+            let code = rest_after(code_at, "code: '");
+            if code.is_empty() {
+                continue;
+            }
+            published.push((status, code));
+        }
+
+        // The vacuity guard. A page reformatted so that no row parses would otherwise
+        // compare nothing to nothing and pass.
+        assert!(
+            published.len() >= 10,
+            "only {} row(s) parsed out of the quickstart's error-code table, so the \
+             comparison below is not a comparison. The page publishes 14 codes; a renamed \
+             field or a reformat lands here rather than in a false PASS.",
+            published.len()
+        );
+
+        let mut expected: Vec<(u16, String)> = DOCUMENTED
+            .iter()
+            .map(|(status, code)| (*status, (*code).to_string()))
+            .collect();
+        for (code, status) in OUTSIDE_APP_ERROR {
+            expected.push((*status, (*code).to_string()));
+        }
+        expected.sort();
+        let mut published_sorted = published.clone();
+        published_sorted.sort();
+        assert_eq!(
+            published_sorted, expected,
+            "the quickstart's error-code table and the one the server serves have drifted. \
+             This is the page a developer codes against before they have an account, so a \
+             row that says one thing while the server does another sends them debugging a \
+             status they will never receive. Update the page and docs/error-model.md \
+             together."
+        );
+
+        // A SECOND ASSERTION, on the same parse: no row may name a code twice. The
+        // equality above cannot see a duplicate that also displaced a real code only if
+        // both are present - it can, and then the sets still match - so the page would
+        // publish 15 rows against 15 expected and still be wrong. Cheap, and it is the
+        // failure a hand-edited table actually makes.
+        let mut codes: Vec<&str> = published.iter().map(|(_, c)| c.as_str()).collect();
+        codes.sort_unstable();
+        let unique = {
+            let mut v = codes.clone();
+            v.dedup();
+            v
+        };
+        assert_eq!(
+            codes.len(),
+            unique.len(),
+            "the quickstart's error-code table lists a code more than once, so one of the \
+             codes the server can return is missing from the page while the row count still \
+             looks right: {codes:?}"
+        );
     }
 }

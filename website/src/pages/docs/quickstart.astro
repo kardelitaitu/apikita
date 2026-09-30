@@ -80,6 +80,7 @@ const errorCodes = [
   { status: '402', code: 'insufficient_balance', meaning: 'Wallet cannot cover the request.', action: 'Top up. Do not retry.' },
   { status: '402', code: 'key_limit_exceeded', meaning: "The key's own spend or token limit is hit.", action: 'Raise the limit or issue a new key. Do not retry.' },
   { status: '403', code: 'model_not_allowed', meaning: "Model absent from the key's allowlist.", action: 'Use an allowed model.' },
+  { status: '403', code: 'forbidden', meaning: 'Signed in, but not permitted — for example a non-operator calling an admin route, or an operator acting on their own account.', action: 'Do not retry; you do not have this permission.' },
   { status: '403', code: 'wrong_credential_type', meaning: 'Cookie where an API key is required, or the reverse.', action: 'Use the right credential.' },
   { status: '404', code: 'not_found', meaning: 'No such resource.', action: 'Check the id.' },
   { status: '409', code: 'conflict', meaning: 'Duplicate (for example, Telegram already linked).', action: 'Reconcile state.' },

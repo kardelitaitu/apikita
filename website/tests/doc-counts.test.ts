@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 172;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 581;
+const SERVER_TESTS = 582;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -135,6 +135,12 @@ test('no doc still claims a superseded count', () => {
     // the Rust sweep deleted from both. One test now drives each end of that pair, and a
     // shell guard compares the two table lists so neither can drift alone again.
     '580 tests', '580 passed', '580 / 0 / 0',
+    // Retired when the quickstart's error-code table was pinned to the code. The guard
+    // found a real drift on its FIRST run: the page published 14 rows against the
+    // contract's 15, so `403 forbidden` - which admin.rs::forbidden_response emits - had
+    // no row for a developer to look it up in. The page is a third transcription of the
+    // same table, and it was the only one nothing read.
+    '581 tests', '581 passed', '581 / 0 / 0',
   ];
   for (const stale of superseded) {
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so
