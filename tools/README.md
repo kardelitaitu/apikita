@@ -65,3 +65,11 @@ broke, and several found real defects — a buffered relay, a backup hook that r
 success while copying nothing, a money gate whose first half hid its second. Their READMEs
 list the mutations they were tested against, because a check that has never been mutated is
 a check whose blind spots are unknown.
+
+**That sentence was false for two of the eight until it was checked against them.**
+`relay-check` and `backup-check` listed no mutations at all — the same "documented but never
+verified" shape the checks themselves exist to catch. Both were then mutated and both
+refused correctly (`proxy_buffering on`, `gzip on`, a deleted `/events` block; and an offsite
+hook whose failure is swallowed), and the measured results are now in those two READMEs.
+Nothing tests this paragraph — it was found by reading it against the directory listing,
+which is why the finding is recorded here rather than assumed to stay true.

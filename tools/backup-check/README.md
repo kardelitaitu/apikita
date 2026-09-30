@@ -39,3 +39,17 @@ The fix it guards is a single-quoted artifact appended to the command string, wh
 satisfies both hook shapes exactly once. An earlier attempt (`"$OFFSITE_CMD \"$@\"" _
 "$ARTIFACT"`) repaired the script form but gave an **inline** hook the artifact twice —
 caught by running it, not by reading it.
+
+## Mutations the check was tested against
+
+`tools/README.md` says every `*-check` README lists these. This one did not, so the claim
+was false for this directory until the mutation below was run and written down. Mutated in
+`tools/backup/backup.sh`, reverted after:
+
+| Mutation | Result |
+| --- | --- |
+| the offsite invocation made non-fatal (`sh -c "$OFFSITE_CMD '$ARTIFACT'" \|\| true`) — a hook that fails and is ignored | **caught** (exit 1) |
+
+That is the defect this directory exists for: "a backup hook that reported success while
+copying nothing". The check notices because it asserts the hook's **failure** propagates,
+not merely that the tool exits 0 when everything works.

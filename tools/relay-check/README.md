@@ -60,6 +60,21 @@ arrival.
 **It skips LOUDLY (exit 3) when Docker is unavailable**, never 0. A silent pass on a
 machine that ran nothing is the failure mode this directory exists to catch.
 
+## Mutations the text check was tested against
+
+`tools/README.md` says every `*-check` README lists these. This one did not, so the claim
+was false for this directory until the mutations below were run and written down.
+Measured against `.docker/nginx/relay.conf`, each reverted after:
+
+| Mutation | Result |
+| --- | --- |
+| `proxy_buffering off` -> `on` | **caught** (exit 1) |
+| `gzip off` -> `on` — which buffers even with `proxy_buffering off` | **caught** (exit 1) |
+| the whole `location /events` block deleted | **caught** (exit 1) |
+
+The third is the one worth keeping: removing the block does not merely change a directive,
+it removes the endpoint, and the check still refuses.
+
 ## Running them by hand
 
 ```sh
