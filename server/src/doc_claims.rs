@@ -2177,7 +2177,7 @@ mod tests {
             ("business/05-risk.md", "a risk register"),
             ("business/README.md", "an index for the business set"),
             ("plans/proxy-hot-path-audit.md", "a HISTORICAL audit record; its findings are dated, and rewriting them would destroy the record of what was believed then"),
-            ("plans/sqlite-migration.md", "a HISTORICAL migration plan whose database phases are complete and whose identity phase (Phase 6) is not; the document says so itself, so the reason only has to stop contradicting it"),
+            ("plans/sqlite-migration.md", "a HISTORICAL migration plan, now COMPLETE: PostgreSQL, PocketBase and the identity port (Phase 6) have all landed, so every phase narrative in it is a record of what was true when that phase ran. The document says so in its own status line, and the citations check skips it because its line numbers are the content - the plan quotes `auth.rs:90` to say what was deleted there. The reason only has to stop contradicting the status line"),
             ("telegram/README.md", "the bot channel spec, for a bot that is not built; the folder guard covers the not-built claim"),
             ("website/01-architecture.md", "SUPERSEDED on stack by architecture.md, and it names frontend internals rather than claims an operator would act on"),
             ("website/02-data-model.md", "SUPERSEDED - it documents the PostgreSQL schema the port retired; marking it historical beats keeping it current"),
