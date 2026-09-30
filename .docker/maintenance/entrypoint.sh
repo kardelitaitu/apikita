@@ -45,10 +45,11 @@
 #
 #   usage-purge THE BINARY IS NOT WIRED; ITS WORK IS. Same shape as ip-purge:
 #               server/src/bin/usage-purge.rs, not shipped in the server image.
-#               `run_retention` applies all FOUR of its deletes -
+#               `run_retention` applies all FIVE of its deletes -
 #               usage_events (90d), usage_daily (730d), expired/revoked
-#               sessions (30d) and expired identity links - through sqlite3, so
-#               docs/data-retention.md is enforced here.
+#               sessions (30d), expired identity links, and terminal Telegram
+#               link codes - through sqlite3, so docs/data-retention.md is
+#               enforced here.
 #
 #               THE FOURTH IS THE ONE THAT WAS MISSING FOR LONGEST. Expired
 #               verification and password-reset links had a purge function with a
@@ -58,6 +59,16 @@
 #               delete below is what actually runs in production. Its cutoff has no
 #               interval (`expires_at <= datetime('now')`) because a link is stale
 #               when it expires, not N days later.
+#
+#               THE FIFTH WAS FOUND BY READING AN EXCUSE. `db.rs` listed `link_codes`
+#               among the tables the sweep "deliberately does NOT touch", on the
+#               grounds that its rule is "a different shape". By the time anyone
+#               checked, the fourth entry above had already brought an
+#               expires-then-delete table into the same sweep - so the exception
+#               described a design the sweep had outgrown, and it was holding a
+#               published 24-hour window that no code implemented. A STALE REFUSAL
+#               is harder to find than a missing call: it reads as a decision
+#               someone made after thinking about it.
 #
 #   hold-sweep  RUNS HERE, FOR REAL - report-only, and that is the point. A
 #               stranded reservation hold is INVISIBLE MONEY: the ledger still
@@ -183,10 +194,10 @@ banner() {
     else
         log "CLIENT    sqlite3 IS NOT INSTALLED IN THIS IMAGE. Every database job below will FAIL, loudly, rather than report a clean sheet against a database it never opened. The scheduler image (`.docker/maintenance/Dockerfile`) must provide a sqlite3 binary."
     fi
-    log "WIRED     retention  - age-based sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md); usage_events > 90d, usage_daily > 730d, expired/revoked sessions > 30d, link_redemption_attempts > 7d, auth_attempts > 7d, link_code_issues > 7d, expired identity_tokens (docs/data-retention.md)"
+    log "WIRED     retention  - age-based sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md); usage_events > 90d, usage_daily > 730d, expired/revoked sessions > 30d, link_redemption_attempts > 7d, auth_attempts > 7d, link_code_issues > 7d, expired identity_tokens, terminal link_codes > 1d (docs/data-retention.md)"
     log "WIRED     reconcile  - tools/reconcile/reconcile.sh, exit code preserved (1=drift 2=no DATABASE_URL 3=no sqlite3 4=sqlite3 failed 5=stranded hold 6=no such database file)"
     log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary NOT shipped in the server image; it does NOT run here. Its retention window IS enforced inline (see retention above)."
-    log "NOT WIRED usage-purge - server/src/bin/usage-purge.rs, same: not shipped, does NOT run here. Its three sweeps ARE enforced inline (see retention above)."
+    log "NOT WIRED usage-purge - server/src/bin/usage-purge.rs, same: not shipped, does NOT run here. Its five sweeps ARE enforced inline (see retention above)."
     log "WIRED     hold-sweep - REPORT-ONLY, SQL inline in this entrypoint, using the SAME predicate as server/src/bin/hold-sweep.rs (which warns that a different predicate would make the binary and the library disagree about what 'stranded' means). Bound ${HOLD_SWEEP_BOUND_SECONDS}s. It counts, names and exits non-zero; it NEVER moves money, because silently crediting a hold is the same invisible-money anti-pattern the sweep exists to catch. --release stays a deliberate host action."
     if [ -x "$ALERT_CHECK" ]; then
         if [ -n "${WEBHOOK_URL:-}" ] || [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || [ -n "${ALERT_SINK_FILE:-}" ] || [ -n "${ALERT_SINK_STDOUT:-}" ]; then
@@ -372,6 +383,41 @@ link_issues=$(retention_delete_instant "$DB_FILE" link_code_issues created_at 7)
   return 1
 }
 
+# link_codes: Telegram account-binding codes, published as "Until used or expired
+# + 24h" in docs/data-retention.md:77 and website/src/lib/privacy.ts.
+#
+# THE FOURTH TABLE TO ARRIVE WITH A PROMISE AND NO DELETE. `issue_link_code`
+# deletes the ONE code it is superseding, so the table was not untouched - it was
+# swept only by the act of asking for a new code. A code a customer requested and
+# never redeemed, and never replaced, had no delete path at all: every such row
+# ever issued was still on disk.
+#
+# The predicate is NOT the plain `expires_at <= ...` the row above uses. A code
+# reaches a terminal state two ways and they start the clock at different instants:
+#
+#   COALESCE(used_at, expires_at)   redeemed -> used_at; never redeemed -> expires_at
+#
+# Comparing only expires_at would retain a redeemed code for the rest of a TTL it
+# no longer has, and comparing only used_at would never delete an expired one. This
+# is the same COALESCE shape `sessions` uses a few lines up, and for the same
+# reason: both columns describe when the row STOPPED being usable.
+#
+# ONE DAY of grace, which is the published "+24h" and not a policy number invented
+# here. `routes::telegram::LINK_CODE_RETENTION_GRACE_DAYS` holds it on the Rust side
+# and the sweep guard compares the two, so the document, the constant and this
+# literal cannot drift apart.
+#
+# THE CUTOFF IS AN INSTANT, NOT A DATE, for a reason worth naming because this is
+# where it would be easiest to get wrong: the boundary is the code's OWN lifetime,
+# so a midnight cutoff would give a code that went terminal at 23:50 either a day's
+# grace too much or too little depending on what hour the container restarts at.
+# The two-argument `datetime('now', '-1 days')` form keeps it on the instant.
+link_codes=$(retention_delete_instant "$DB_FILE" link_codes "COALESCE(used_at, expires_at)" 1) || {
+  log "job retention: FAILED - the link_codes delete did not run (sqlite3 error above)"
+  [ -s "$SQL_ERR" ] && while IFS= read -r l; do log "job retention:   $l"; done < "$SQL_ERR"
+  return 1
+}
+
 # A blank count is not a zero count: `SELECT changes()` always returns a row, so
     # anything non-numeric means the delete did not do what this job claims.
     case "$seen" in ''|*[!0-9]*) log "job retention: FAILED - key_ip_seen returned '$seen', not a count"; return 1 ;; esac
@@ -382,9 +428,10 @@ link_issues=$(retention_delete_instant "$DB_FILE" link_code_issues created_at 7)
     case "$auth_attempts" in ''|*[!0-9]*) log "job retention: FAILED - auth_attempts returned '$auth_attempts', not a number: the delete did not do what this job claims"; return 1 ;; esac
     case "$identity_tokens" in ''|*[!0-9]*) log "job retention: FAILED - identity_tokens returned '$identity_tokens', not a number: the delete did not do what this job claims"; return 1 ;; esac
     case "$link_issues" in ''|*[!0-9]*) log "job retention: FAILED - link_code_issues returned '$link_issues', not a number: the delete did not do what this job claims"; return 1 ;; esac
+    case "$link_codes" in ''|*[!0-9]*) log "job retention: FAILED - link_codes returned '$link_codes', not a number: the delete did not do what this job claims"; return 1 ;; esac
 case "$sessions" in ''|*[!0-9]*) log "job retention: FAILED - sessions returned '$sessions', not a count"; return 1 ;; esac
 
-    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d), link_redemption_attempts=$link_attempts (7d), auth_attempts=$auth_attempts (7d), identity_tokens=$identity_tokens (expired), link_code_issues=$link_issues (7d)"
+    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d), link_redemption_attempts=$link_attempts (7d), auth_attempts=$auth_attempts (7d), identity_tokens=$identity_tokens (expired), link_code_issues=$link_issues (7d), link_codes=$link_codes (used/expired +1d)"
     return 0
 }
 

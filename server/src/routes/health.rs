@@ -165,6 +165,12 @@ fn retention_report(
         // the sweep deletes it the moment it expires, so the honest window is "no
         // grace period", and the number that expresses that is 0.
         "identity_tokens": crate::db::IDENTITY_TOKEN_LAG_DAYS,
+        // ONE, and it is a real day rather than a rounding artefact: the published
+        // rule is "used or expired + 24h", so a terminal code is stale one day after
+        // it stopped being usable - and the sweep is measured on the code's own
+        // lifetime rather than a midnight boundary, so there is no window beyond the
+        // grace itself to report.
+        "link_codes": crate::db::LINK_CODE_LAG_GRACE_DAYS,
     });
 
     // ONLY the tables that are behind, so an empty object reads as "retention is
@@ -743,6 +749,7 @@ mod tests {
             auth_attempts: None,
             identity_tokens: None,
             link_code_issues: None,
+            link_codes: None,
         };
         let report = retention_report(&behind, today);
         assert_eq!(report["behind"], json!(true));

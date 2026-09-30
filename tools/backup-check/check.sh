@@ -220,6 +220,20 @@ else
     #     somewhere else. That is the guard's own false positive, and the first run
     #     of it produced exactly that - which is the argument for reading each
     #     implementation rather than assuming one.
+    #   * `routes::telegram::purge_terminal` - `link_codes`. A third module, and it
+    #     is named for the RULE rather than for its table: the link-code window is
+    #     "used or expired + 24h", which is not an age-based period, so it does not
+    #     belong in `db.rs`'s list any more than `link_code_issues` belongs in
+    #     `ip_tracking`'s. Adding it here is what the guard's own failure message
+    #     asked for when this table first appeared on the shell side alone.
+    #
+    # NOTE that this extraction reads the SQL alphabetically after `sort -u`, and
+    # that the set is compared to the shell's. A table deleted by a function none of
+    # these four paragraphs names is a table this guard cannot see, which is why the
+    # list of sources is spelled out here rather than derived: the day a fifth purge
+    # function appears, the ONE thing to remember is to add its file to the block
+    # below, and the failure that omission produces is this guard reporting a table
+    # as "deleted in production but not in Rust" - a false alarm, not a miss.
     #
     # Read from the executable SQL, not from a doc or a struct field name: a field
     # named `identity_tokens` on `PurgedUsage` proves only that someone declared it,
@@ -227,11 +241,13 @@ else
     # it.
     TOKENSRS="$REPO/server/src/identity/tokens.rs"
     IPTRS="$REPO/server/src/ip_tracking.rs"
+    TELEGRAMRS="$REPO/server/src/routes/telegram.rs"
     RUST_TABLES=$(
         {
             sed -n '/^pub async fn purge_expired_usage(/,/^}/p' "$DBRS"
             [ -f "$TOKENSRS" ] && sed -n '/^pub async fn purge_expired(/,/^}/p' "$TOKENSRS"
             [ -f "$IPTRS" ] && sed -n '/^pub async fn purge_expired(/,/^}/p' "$IPTRS"
+            [ -f "$TELEGRAMRS" ] && sed -n '/^pub async fn purge_terminal(/,/^}/p' "$TELEGRAMRS"
         } \
         | grep -oE 'DELETE FROM [a-z_]+' \
         | awk '{print $3}' \

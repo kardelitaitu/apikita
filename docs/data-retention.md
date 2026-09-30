@@ -74,7 +74,7 @@ relationship and becomes a liability the moment a breach occurs.
 | **Sessions (expired/revoked)** (`sessions`) | 30 days | Tidy up, but keep recent for security review. The window runs from the instant the session STOPPED being usable — `revoked_at` for an early logout, else `expires_at`. Swept nightly by the maintenance scheduler in inline SQL |
 | **Reviews** | Until deleted by user | Published aggregate; individual text is theirs |
 | **Review history** | Same as review | Needed to make an edit meaningful |
-| **link_codes** | Until used or expired + 24h | Then delete |
+| **link_codes** | Until used or expired + 24h | Telegram account-binding codes. **The window was a promise with no code behind it.** `issue_link_code` deletes only the ONE code it is superseding (`DELETE FROM link_codes WHERE account_id = ?`), so a code a customer requested, never redeemed and never replaced had NO delete path at all — every such row ever issued was still on disk. The nightly sweep now calls `routes::telegram::purge_terminal`, which deletes on `COALESCE(used_at, expires_at)` plus one day (the SQL cutoff `datetime('now', '-1 days')`): the COALESCE is because a redeemed code ages from `used_at` and an unused one from `expires_at`, and comparing only one of them would either keep a redeemed code for a TTL it no longer has or never delete an expired one |
 | **Link-redemption attempts** | **7 days** | Salted IP hashes, same class as `key_ip_seen`; enough to investigate a live credential attack, then gone. **The "then gone" was false until this round**: the promise was in this table from before the sweep existed, and nothing deleted a single row. The nightly sweep now covers this table too, through the same instant helper `usage_events` uses |
 | **`auth_attempts`** | **7 days** | The credential-guessing counter behind the five `[limits]` `_per_hour` caps. Its IP-keyed rows are salted hashes (the same class as `key_ip_seen`); its account-keyed rows hold no IP-derived data at all — the writer stores the empty string in `ip_hash`, which the column's NOT NULL requires — but they are still a per-account record of who tried to sign in and when, so they take the same 7 days rather than a longer one. Every cap reads a window of one HOUR, so a seven-day-old row is already inert for enforcement. Swept nightly through the same instant helper `usage_events` uses |
 | `key_ip_seen` | **7 days** | One salted hash per (key, day, address): enough to see one address spreading a key across many accounts. Purged nightly, and the salt is replaced at each UTC midnight so days cannot be linked |
@@ -95,11 +95,12 @@ relationship and becomes a liability the moment a breach occurs.
 > is the opposite of the truth, and it is what `website/src/lib/privacy.ts` said
 > for months, to customers.
 >
-> It sweeps **nine** tables to the periods
+> It sweeps **ten** tables to the periods
 > above: `usage_events` (90 days), `usage_daily` (24 months), expired/revoked
 > `sessions` (30 days), `key_ip_seen` (7 days), `key_ip_daily` (90 days),
 > `link_redemption_attempts` (7 days), `auth_attempts` (7 days), `link_code_issues`
-> (7 days) and expired `identity_tokens` (no grace period). It is idempotent, and
+> (7 days), expired `identity_tokens` (no grace period) and terminal `link_codes`
+> (used or expired + 1 day). It is idempotent, and
 > deliberately NOT on the request
 > path — the settlement already writes a row per billed request, and a per-request
 > delete would add a second write to the money path to do work that has to happen
@@ -119,11 +120,15 @@ relationship and becomes a liability the moment a breach occurs.
 >
 > It deliberately does **not** touch `ledger` or `topups` (financial records, kept
 > forever), `reviews`/`review_history` (kept until the user deletes them),
-> `link_codes` (its own "+24h after use/expiry" rule is a different shape), or
+> or
 > `key_ip_*`/`link_redemption_attempts`/`auth_attempts` (swept by the maintenance
 > scheduler in inline SQL, which owns the salted-hash retention and the salt-rotation
 > contract; `bin/ip-purge.rs` states the same windows but is not shipped and does not
-> run). The link-redemption table was the one gap in that sentence, and it was my error:
+> run). `link_codes` USED to be on that exclusion list, with the reason "its own
+> '+24h after use/expiry' rule is a different shape" — that reason stopped being true
+> once `identity_tokens` brought an expires-then-delete table into the sweep, and the
+> stale exception was holding the published window while nothing implemented it. The
+> link-redemption table was the other gap in that sentence, and it was my error:
 > an earlier round corrected a wrong claim here by replacing it with a different wrong
 > claim rather than reading the entrypoint. It is now swept, and the sentence is true.
 > `auth_attempts` was the second table to join it, and it arrived with no window in this

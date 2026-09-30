@@ -988,11 +988,7 @@ mod tests {
             // `COALESCE(used_at, expires_at)`, the shape `sessions` already uses for
             // revoked-vs-expired. The entrypoint passes the same 1, and
             // `docs/data-retention.md` states the window as "used or expired + 1 day".
-            (
-                "link_codes",
-                1,
-                crate::db::LINK_CODE_LAG_GRACE_DAYS,
-            ),
+            ("link_codes", 1, crate::db::LINK_CODE_LAG_GRACE_DAYS),
             // THE EXPIRED-LINK SWEEP, and the only row here whose window is NOT a
             // period. A verification or reset link is not kept for N days; it is
             // stale when it expires, and the sweep deletes on `expires_at <= now`.

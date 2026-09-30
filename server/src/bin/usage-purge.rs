@@ -1,8 +1,9 @@
 //! Nightly retention sweep for the age-based tables: `usage_events` (90 days),
-//! `usage_daily` (24 months), expired/revoked `sessions` (30 days) and expired
-//! verification/password-reset links (as soon as they expire).
+//! `usage_daily` (24 months), expired/revoked `sessions` (30 days), expired
+//! verification/password-reset links (as soon as they expire) and terminal
+//! Telegram link codes (used or expired, plus one day).
 //!
-//! `docs/data-retention.md` states all four periods. They are only true if
+//! `docs/data-retention.md` states all five periods. They are only true if
 //! something deletes the rows, and nothing on the request path should: the
 //! settlement writes one row per billed request, and adding a per-request delete
 //! to it to do work that has to happen once a day would be the wrong trade.
@@ -23,6 +24,14 @@
 //! page said they were. It lives in this sweep rather than a third binary because
 //! this file's own doc-comment already argues the case: two retention jobs are two
 //! places the policy can be forgotten, and the gap proved it.
+//!
+//! THE LINK-CODE PURGE ARRIVED THE SAME WAY, one round later and from the other
+//! direction: `db.rs` listed `link_codes` among the tables the sweep deliberately
+//! did NOT touch, on the grounds that its rule was "a different shape". The link
+//! purge above had already made that shape this sweep's business, so the exclusion
+//! was left over from a design this file had outgrown — while holding a published
+//! 24-hour window that nothing implemented. A stale refusal is harder to find than
+//! a missing call, because it reads as a decision someone thought about.
 
 use std::env;
 

@@ -121,7 +121,7 @@ export const retention = [
   // a schema identifier to a customer while every other row used a phrase. Internal
   // naming is not what a privacy notice is for, and a row that reads as a database dump
   // makes the eleven around it harder to take seriously.
-  { what: 'Telegram link codes', keep: 'Until used or expired + 24h', why: 'A link code is a short-lived secret for binding a Telegram account. It is deleted once used, and 24 hours after it expires otherwise, so an unused code never outlives its usefulness' },
+  { what: 'Telegram link codes', keep: 'Until used or expired + 24h', why: 'A link code is a short-lived secret for binding a Telegram account. It is deleted by the nightly retention sweep a day after it stops being usable — a day after it is redeemed, or a day after it expires unredeemed — so an unused code never outlives its usefulness. Until this round the only delete was the supersede-on-reissue path, which removed just the one code a new request replaced: a code that was requested, never redeemed and never replaced had no delete path at all' },
   { what: 'Link-redemption attempts', keep: '7 days', why: 'Hashed source of failed link-code attempts; used only to stop credential attacks, then deleted' },
   { what: 'Sign-in attempt counters', keep: '7 days', why: 'Stops credential-guessing against the sign-in, signup, password-reset and resend endpoints. Held only long enough to investigate a live attack; every cap reads a one-hour window, so anything older is already inert' },
   // The two salt rows were missing here while the nightly sweep deleted them, and the

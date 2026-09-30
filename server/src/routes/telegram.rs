@@ -87,6 +87,32 @@ use crate::routes::proxy::AppState;
 /// accident.
 pub const LINK_CODE_TTL_MINUTES: i64 = 5;
 
+/// How long a link code outlives its own usefulness: a code the customer already
+/// redeemed, or one that hit `LINK_CODE_TTL_MINUTES` unused, is kept one more day
+/// and then deleted.
+///
+/// The number is a TRANSCRIPTION, not a discovery. `website/src/lib/privacy.ts` and
+/// `docs/data-retention.md:77` have both stated "Until used or expired + 24h" since
+/// before any code did it, and this constant exists so the two can be compared
+/// rather than trusted - the same reasoning as `ip_tracking`'s
+/// `LINK_CODE_ISSUE_RETENTION_DAYS`, which was named for the same purpose.
+///
+/// WHY +24h AND NOT "immediately", which would be simpler to implement and is what
+/// `identity_tokens` does: a link code is read by a HUMAN who may be holding it open
+/// in a chat window, and the page says a day. Deleting at expiry would also be a
+/// defensible policy, but it would make the published sentence false, and the
+/// published sentence is the thing this repository treats as the contract - the
+/// whole point of the retention sweep is that the document is what the code
+/// executes.
+///
+/// The grace applies to BOTH terminal states, and `used_at` is what tells them
+/// apart: an UNUSED code is stale once `expires_at` passed, a USED one once
+/// `used_at` did. Comparing only `expires_at` would retain a redeemed code for the
+/// whole grace period even though nothing can redeem it twice - which is precisely
+/// the window `issue_link_code`'s "issuing a code deletes this account's previous
+/// codes" already refuses to honour.
+pub const LINK_CODE_RETENTION_GRACE_DAYS: i64 = 1;
+
 /// How many digits a link code carries.
 const CODE_DIGITS: u32 = 6;
 
@@ -523,6 +549,48 @@ pub async fn redeem_link_code(
         status: "linked",
         account_id,
     }))
+}
+
+/// Removes link codes that are past their usefulness plus the published grace
+/// period, for the retention sweep.
+///
+/// `now` is an argument rather than read from the clock so the window can be
+/// tested at its boundaries - the same shape as `identity::tokens::purge_expired`,
+/// and the SQL is written once because `db::purge_expired_usage` calls THIS rather
+/// than restating the predicate.
+///
+/// THE `COALESCE` IS THE WHOLE RULE. A code reaches a terminal state two ways, and
+/// which way it went decides when its day starts:
+/// - redeemed -> `used_at` is set, and the day runs from there;
+/// - never redeemed -> `used_at` is NULL and the day runs from `expires_at`.
+///
+/// So the governing instant is `COALESCE(used_at, expires_at)` plus the grace, and
+/// it is compared against `now` rather than a midnight cutoff. A midnight cutoff
+/// would be wrong here for the same reason it would be wrong for `identity_tokens`:
+/// the boundary is the code's OWN lifetime, not a nightly policy boundary, so a code
+/// that became stale at 23:50 would get a grace a day short or a day long depending
+/// on what hour the container happens to restart at.
+///
+/// NOTHING ELSE DELETES FROM THIS TABLE except the one code being superseded
+/// (`DELETE FROM link_codes WHERE account_id = ?`, which reaches only that account's
+/// current attempt). An unused code a customer requested and never redeemed had no
+/// delete path at all: every row ever issued stayed on disk, and expired codes
+/// accumulated behind a page that said twenty-four hours. That is the third time a
+/// published retention window has had no code behind it, which is why the
+/// maintenance entrypoint's table list is now compared to Rust's in both directions.
+pub async fn purge_terminal(pool: &SqlitePool, now: DateTime<Utc>) -> Result<u64, AppError> {
+    // SAFE: `LINK_CODE_RETENTION_GRACE_DAYS` is a compile-time constant (1), and
+    // chrono panics rather than wraps on an out-of-range date - see the note on
+    // `db::oldest_row_past_window` for the full argument, which is the same shape.
+    #[allow(clippy::arithmetic_side_effects)]
+    let cutoff = now - Duration::days(LINK_CODE_RETENTION_GRACE_DAYS);
+
+    let result = sqlx::query("DELETE FROM link_codes WHERE COALESCE(used_at, expires_at) <= ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+
+    Ok(result.rows_affected())
 }
 
 /// `DELETE /api/telegram` — unlink the signed-in account's chat.

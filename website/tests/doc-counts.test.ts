@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 185;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 582;
+const SERVER_TESTS = 602;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -180,6 +180,17 @@ test('no doc still claims a superseded count', () => {
         // no row for a developer to look it up in. The page is a third transcription of the
         // same table, and it was the only one nothing read.
         '581 tests', '581 passed', '581 / 0 / 0',
+        // Retired when the Telegram link-code purge landed. `docs/data-retention.md:77` has
+        // always published "Until used or expired + 24h" for a link code, and the Rust sweep
+        // listed `link_codes` among the tables it "deliberately does NOT touch" - an exception
+        // written when it was true and left standing after a later round brought an
+        // expires-then-delete table into the same sweep. The only delete was the ONE code
+        // `issue_link_code` supersedes, so a code requested and never redeemed stayed on disk
+        // forever. The new test seeds FOUR rows so it pins the window from both sides: a
+        // terminal row 25 hours back (must go), a redeemed one whose `expires_at` is still in
+        // the future (must go, and only `used_at` finds it), one terminal two hours ago (must
+        // STAY, and this is the row that makes a zero-day grace fail), and one still live.
+        '582 tests', '582 passed', '582 / 0 / 0',
       ],
     },
     {

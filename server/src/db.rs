@@ -497,10 +497,40 @@ pub struct PurgedUsage {
     /// function already gives: two retention jobs are two places the policy can be
     /// forgotten, and this is the second time the same forgetting happened.
     pub identity_tokens: u64,
+    /// Rows removed from `link_codes` — terminal Telegram link codes past their
+    /// published day of grace.
+    ///
+    /// FOUND THE OPPOSITE WAY ROUND from `identity_tokens` above. That one was a
+    /// purge with no caller; this one was a caller-shaped hole with no purge, and
+    /// what pointed at it was this struct's own doc-comment two paragraphs down,
+    /// which listed `link_codes` among the tables the sweep "deliberately does NOT
+    /// touch" and gave the reason. The reason was that its rule is a different shape.
+    /// By the time this field was added that was no longer true, because
+    /// `identity_tokens` had already brought an expires-then-delete table into the
+    /// sweep - so the exception was left over from a design the sweep had since
+    /// outgrown, and it was holding a published window ("Until used or expired +
+    /// 24h", `docs/data-retention.md:77` and `website/src/lib/privacy.ts`) that
+    /// nothing implemented.
+    ///
+    /// A stale refusal is harder to find than a missing call, because it looks like
+    /// a decision. It reads as "someone thought about this" and it is filed next to
+    /// tables that genuinely do belong elsewhere.
+    pub link_codes: u64,
 }
 
 /// The whole nightly retention sweep: `usage_events`, `usage_daily`, expired
-/// `sessions` and expired verification/reset links. Returns what each table lost.
+/// `sessions`, expired verification/reset links, and terminal Telegram link
+/// codes. Returns what each table lost.
+///
+/// THAT SENTENCE ENUMERATES FIVE TABLES AND THE SWEEP DELETES FROM TEN. The other
+/// five (`key_ip_seen`, `key_ip_daily`, `link_redemption_attempts`, `auth_attempts`
+/// and `link_code_issues`) are swept by `ip_tracking::purge_expired`, which this
+/// function does not call — the maintenance entrypoint runs both, in inline SQL.
+/// The list above is what THIS function removes, and it has been wrong in the
+/// smaller direction twice: it once named three, and the two it gained were each a
+/// published window with no code behind it. It is written out rather than left
+/// vague because a doc-comment that overstates a sweep is how the next omission
+/// gets missed.
 ///
 /// ONE job sweeps every table with an age-based period, deliberately. Two
 /// retention jobs means two places the policy can be forgotten, and that is not
@@ -519,9 +549,18 @@ pub struct PurgedUsage {
 /// What this deliberately does NOT touch:
 /// - `ledger` and `topups` — financial records, kept **forever**.
 /// - `reviews` / `review_history` — kept until the user deletes them.
-/// - `link_codes` — its own "+24h after use/expiry" rule is a different shape.
 /// - `key_ip_*` and `link_redemption_attempts` — swept by `ip-purge`, which owns
 ///   the salted-hash retention and the salt-rotation contract.
+///
+/// `link_codes` USED to be on that list, with the reason "its own `+24h after
+/// use/expiry` rule is a different shape". That reason stopped being true when
+/// `identity_tokens` was folded in above — an expires-then-delete rule is exactly
+/// this sweep's shape, and it had been sitting out here while the privacy page and
+/// `docs/data-retention.md:77` stated a twenty-four-hour window that no code
+/// implemented. It is now swept by `routes::telegram::purge_terminal`, called below.
+/// The entry stayed in this document for a while AFTER it became false, which is the
+/// point: an exclusion list is read as a set of decisions, so a decision that has
+/// been overtaken looks exactly like a decision that still holds.
 ///
 /// Every cutoff is the same inclusive `<=` at midnight UTC of the cutoff day, for
 /// the reason documented on `purge_expired_usage`: an exclusive comparison
@@ -608,6 +647,24 @@ pub struct RetentionLag {
     /// An INSTANT on `created_at`, like `auth_attempts` and unlike the two `key_ip`
     /// tables: the column carries the same RFC3339 `+00:00` form.
     pub link_code_issues: Option<i64>,
+    /// Age of the oldest TERMINAL `link_codes` row, in days, when past the
+    /// 1-day grace.
+    ///
+    /// MEASURED ON `COALESCE(used_at, expires_at)`, the same expression
+    /// `routes::telegram::purge_terminal` filters on — see that function for why a
+    /// redeemed code ages from `used_at` and an unused one from `expires_at`. A
+    /// measurement on either column alone would call rows behind that the sweep had
+    /// already, correctly, deleted.
+    ///
+    /// That is not a hypothetical mismatch: it is the same mistake as the
+    /// `created_at`-vs-`expires_at` one this struct's `identity_tokens` field
+    /// documents, arrived at from the other direction. Both were caught by asking
+    /// what the SWEEP compares, rather than what the table records.
+    ///
+    /// The window is the grace plus nothing, because the sweep has no midnight
+    /// boundary to reach back to: an instant is stale once its own day of grace has
+    /// passed.
+    pub link_codes: Option<i64>,
 }
 
 /// The link-redemption window, which until now existed only as the `7` literal in the
@@ -630,6 +687,16 @@ pub const LINK_ATTEMPT_RETENTION_DAYS: i64 = 7;
 /// the intended value and not an oversight.
 pub const IDENTITY_TOKEN_LAG_DAYS: i64 = 0;
 
+/// How long a USED OR EXPIRED Telegram link code may linger before the lag report
+/// calls it a problem.
+///
+/// The grace — one day — is `routes::telegram::LINK_CODE_RETENTION_GRACE_DAYS`, and
+/// this constant exists so the measurement uses that same number rather than a `1`
+/// typed here. The two were separate on purpose: the purge owns the policy, and a lag
+/// report that carried its own copy could disagree with the job it is watching and
+/// say a table was behind while the sweep was running correctly.
+pub const LINK_CODE_LAG_GRACE_DAYS: i64 = crate::routes::telegram::LINK_CODE_RETENTION_GRACE_DAYS;
+
 impl RetentionLag {
     /// Whether ANY age-based table is holding a row past its retention period.
     pub fn anything_behind(&self) -> bool {
@@ -642,6 +709,7 @@ impl RetentionLag {
             || self.auth_attempts.is_some()
             || self.identity_tokens.is_some()
             || self.link_code_issues.is_some()
+            || self.link_codes.is_some()
     }
 
     /// Each table with the age of its oldest row, in the order the docs list them.
@@ -654,7 +722,7 @@ impl RetentionLag {
     /// the failure this change exists to remove. It caught the one test that built a
     /// `RetentionLag` literally, and that is the whole argument for writing the count out
     /// rather than trimming the report to fit.
-    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 9] {
+    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 10] {
         [
             ("usage_events", self.usage_events),
             ("usage_daily", self.usage_daily),
@@ -665,6 +733,7 @@ impl RetentionLag {
             ("auth_attempts", self.auth_attempts),
             ("identity_tokens", self.identity_tokens),
             ("link_code_issues", self.link_code_issues),
+            ("link_codes", self.link_codes),
         ]
     }
 }
@@ -877,6 +946,19 @@ pub async fn retention_lag(
     )
     .await?;
 
+    // TERMINAL LINK CODES, measured on the same `COALESCE(used_at, expires_at)` the
+    // purge filters on, with the same one-day grace. Not `expires_at` alone: a code
+    // redeemed immediately is stale from `used_at`, and measuring its `expires_at`
+    // would report it behind for the rest of a five-minute TTL it no longer has.
+    let link_codes = oldest_row_past_window(
+        pool,
+        "link_codes",
+        "COALESCE(used_at, expires_at)",
+        LINK_CODE_LAG_GRACE_DAYS,
+        today,
+    )
+    .await?;
+
     Ok(RetentionLag {
         usage_events,
         usage_daily,
@@ -887,6 +969,7 @@ pub async fn retention_lag(
         auth_attempts,
         identity_tokens,
         link_code_issues,
+        link_codes,
     })
 }
 // SAFE for the same reason as `oldest_row_past_window`: chrono panics rather
@@ -950,11 +1033,27 @@ pub async fn purge_expired_usage(
     // here rather than the SQL being written twice.
     let identity_tokens = crate::identity::tokens::purge_expired(pool, chrono::Utc::now()).await?;
 
+    // LINK CODES, on the same terms as the links above and for the same reason: the
+    // boundary is the code's own lifetime plus the published day of grace, not a
+    // midnight cutoff. `purge_terminal` owns the `COALESCE(used_at, expires_at)`
+    // predicate; the SQL is not restated here.
+    //
+    // This is the third table to be added to this sweep because a document promised
+    // a window and no code implemented it. The first two were found by grepping for
+    // callers of an orphaned purge; this one was found the other way round - by
+    // reading the doc-comment below that explained why `link_codes` was deliberately
+    // left out, and checking whether the reason was still true. It was not: the
+    // stated reason was that the rule "is a different shape", and by then
+    // `identity_tokens` had already established that an expires-then-delete rule
+    // belongs in this sweep rather than in one of its own.
+    let link_codes = crate::routes::telegram::purge_terminal(pool, chrono::Utc::now()).await?;
+
     Ok(PurgedUsage {
         usage_events,
         usage_daily,
         sessions,
         identity_tokens,
+        link_codes,
     })
 }
 
@@ -3552,13 +3651,15 @@ mod tests {
         assert!(!empty.anything_behind(), "an empty database is not behind");
         assert_eq!(
             empty.oldest_days_by_table().len(),
-            9,
+            10,
             "the report names every table the sweep deletes, not the three it used to. The \
              count moved 7 -> 8 when `identity_tokens` was added (a purge function, a unit \
-             test and NO caller), and 8 -> 9 when `link_code_issues` was added (swept since \
-             it existed, measured and published by nothing). Both were found by a guard that \
-             compares this list to another hand-kept list, which is the only way an omission \
-             here is visible at all."
+             test and NO caller), 8 -> 9 when `link_code_issues` was added (swept since \
+             it existed, measured and published by nothing), and 9 -> 10 when `link_codes` \
+             was added (measured by nothing AND swept by nothing, behind a published \
+             24-hour window). All three were found by a guard that compares this list to \
+             another hand-kept list, which is the only way an omission here is visible at \
+             all."
         );
 
         // 200 days old: behind all four windows, which are 7, 90, 7 and 7.
@@ -3671,12 +3772,50 @@ mod tests {
             .await
             .expect("seed link_code_issues");
 
+        // `link_codes` is the SEVENTH, and the only one on this list that was measured by
+        // nothing AND swept by nothing. It is an INSTANT, but on an EXPRESSION rather
+        // than a column: `COALESCE(used_at, expires_at)`, because a redeemed code stops
+        // being usable at `used_at` and an unredeemed one at `expires_at`. The seed
+        // below is REDEEMED 200 days ago with an `expires_at` far in the FUTURE, so a
+        // measurement that read `expires_at` would call it inside the window and this
+        // assertion would fail while the field looked wired.
+        sqlx::query(
+            "INSERT INTO link_codes (code, account_id, expires_at, used_at, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("seeded-old")
+        .bind(account.hyphenated())
+        .bind(
+            chrono::Utc::now()
+                .checked_add_signed(chrono::Duration::days(3))
+                .unwrap()
+                .to_rfc3339(),
+        )
+        .bind(
+            today
+                .checked_sub_signed(chrono::Duration::days(200))
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .to_rfc3339(),
+        )
+        .bind(
+            chrono::Utc::now()
+                .checked_sub_signed(chrono::Duration::days(1))
+                .unwrap()
+                .to_rfc3339(),
+        )
+        .execute(&db.pool)
+        .await
+        .expect("seed link_codes");
+
         let lag = retention_lag(&db.pool, today)
             .await
             .expect("the lag query answers");
         assert!(
             lag.anything_behind(),
-            "six seeded tables are past their windows"
+            "seven seeded tables are past their windows"
         );
         for table in [
             "key_ip_seen",
@@ -3685,6 +3824,7 @@ mod tests {
             "auth_attempts",
             "identity_tokens",
             "link_code_issues",
+            "link_codes",
         ] {
             let named = lag
                 .oldest_days_by_table()
@@ -4081,6 +4221,114 @@ mod tests {
             vec!["live".to_string()],
             "a link that has not expired must survive: deleting it would break a \
              verification in flight"
+        );
+
+        db.close().await;
+    }
+
+    /// Telegram link codes: a REDEEMED code ages from `used_at`, an UNUSED one from
+    /// `expires_at`, and both get the published day of grace. Three rows, and each
+    /// one exists to kill a different wrong implementation.
+    ///
+    /// The `COALESCE` is the rule, so the seeds are chosen so that reading EITHER
+    /// column alone gives the wrong answer:
+    /// - `redeemed` has `expires_at` in the FUTURE and `used_at` two days ago. A
+    ///   purge that read only `expires_at` keeps it, correctly, forever-until-TTL -
+    ///   so it must GO, and it only goes if `used_at` is consulted.
+    /// - `stale-unused` has `used_at` NULL and `expires_at` two days ago, so it must
+    ///   GO. A purge that read only `used_at` would never match a NULL and it would
+    ///   stay forever.
+    /// - `live` is inside its TTL and unused, so it must STAY. Deleting it would
+    ///   break a link code a customer has open in a chat window right now.
+    ///
+    /// `LINK_CODE_RETENTION_GRACE_DAYS` is 1, so the terminal rows are seeded 25
+    /// HOURS back: past the grace by one hour, and short of two days. Both margins
+    /// are deliberate. Seeded "two days ago" they would still be deleted by a purge
+    /// with a ZERO-day grace, so changing the constant to 0 would leave this test
+    /// green and the number would be decoration; seeded "one hour ago" a correct
+    /// purge would spare them and the test would have to assert the opposite. 25
+    /// hours is the only band that pins the value from both sides.
+    #[tokio::test]
+    async fn the_retention_sweep_ages_a_link_code_from_whichever_instant_ended_it() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let now = chrono::Utc::now();
+
+        // The tuple type is named rather than written inline: `clippy` flags the
+        // four-field spelling here as "very complex type", and a local alias is
+        // the honest fix - the shape is what this test is about.
+        type Seed = (
+            &'static str,
+            chrono::DateTime<chrono::Utc>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        );
+
+        let rows: [Seed; 4] = [
+            // A terminal row 25 HOURS back: past the one-day grace, and only just.
+            // The margin matters - see the doc-comment above for why these two are
+            // 25 hours and not "two days".
+            (
+                "redeemed",
+                now + chrono::Duration::days(3),
+                Some(now - chrono::Duration::hours(25)),
+            ),
+            ("stale-unused", now - chrono::Duration::hours(25), None),
+            // THE GRACE ITSELF. Terminal 2 hours ago: INSIDE the one-day grace, so a
+            // correct sweep spares it, and a sweep with a ZERO-day grace deletes it.
+            // This row is what pins `LINK_CODE_RETENTION_GRACE_DAYS` from below;
+            // without it the constant could be changed to 0 and every assertion here
+            // would still hold, which makes the number decoration rather than policy.
+            (
+                "recently-redeemed",
+                now + chrono::Duration::days(3),
+                Some(now - chrono::Duration::hours(2)),
+            ),
+            // Never redeemed, still inside its five-minute TTL.
+            ("live", now + chrono::Duration::minutes(4), None),
+        ];
+        for (code, expires_at, used_at) in rows {
+            sqlx::query(
+                "INSERT INTO link_codes (code, account_id, expires_at, used_at, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(code)
+            .bind(account.hyphenated())
+            .bind(expires_at.to_rfc3339())
+            .bind(used_at.map(|at| at.to_rfc3339()))
+            .bind((now - chrono::Duration::days(3)).to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("seed a link code");
+        }
+
+        // A FAR-PAST `created_at` on every row, deliberately: `created_at` is the
+        // column every OTHER table in this sweep ages from, so a purge that reached
+        // for it here would delete all three and the survivor assertion below would
+        // fail. The column this rule uses is not the column the sweep is named for.
+        let purged = purge_expired_usage(&db.pool, today).await.unwrap();
+        assert_eq!(
+            purged.link_codes, 2,
+            "a redeemed code and an expired unused one must both go, a terminal one \
+             inside its day of grace must stay, and a live one must stay. One deleted \
+             means only one of the two terminal states is handled - `used_at` or \
+             `expires_at`, not the COALESCE; zero means the call was dropped from the \
+             sweep; three means the grace is zero; four means it aged from `created_at`."
+        );
+
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT code FROM link_codes WHERE account_id = ? ORDER BY code")
+                .bind(account.hyphenated())
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining,
+            vec!["live".to_string(), "recently-redeemed".to_string()],
+            "the unused code inside its TTL must survive because a customer may be \
+             holding it in a chat window, and the code that became terminal 2 hours \
+             ago must survive because the page promises used or expired PLUS A DAY -  \
+             deleting either would make the published sentence false"
         );
 
         db.close().await;
