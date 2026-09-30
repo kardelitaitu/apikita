@@ -83,6 +83,23 @@ cookie on `/v1/*`, or a Bearer key on a cookie endpoint, returns 401
 
 Creates an account with a password identity and mails a verification link.
 
+**This sentence used to be false, and the code it described looked fine.** The route
+built the message with `to: String::new()` — an empty recipient, in a function that
+had the address in hand and did not use it. `EmailSender::send` parses that field as
+a `Mailbox`, so every message failed with `EmailError::Build` before anything was
+dialled, and the caller logged "a verification or reset link could not be sent"
+against an *account id and no address*. An operator reading those lines would look
+at the SMTP relay; the relay was never reached. Signup still answered
+`"a confirmation link is on its way"`, and password reset — the only recovery path —
+was dead for as long as the flow existed.
+
+Nothing caught it because every test of the mailer built its own `Email` with a
+written-out address. The module was covered; the one place in the program that
+assembles a message for a real customer was not. The route's message construction
+now lives in a pure `link_mail` function that a test calls, and three mutations
+(empty recipient, a different recipient, a link built from another address) each
+fail it.
+
 **The reply does not depend on whether the address was already registered.** The
 endpoint is unauthenticated, so any difference in status or body between
 "created" and "already exists" would make it a membership test for the address

@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 187;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 603;
+const SERVER_TESTS = 605;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -201,6 +201,14 @@ test('no doc still claims a superseded count', () => {
         // asserts all four facts at once - has_review true, withdrawn true, body returned,
         // rating returned - and then that the public aggregate still excludes it.
         '602 tests', '602 passed', '602 / 0 / 0',
+        // Retired when the review-retention windows were corrected. Three files published the
+        // same row - website/src/lib/privacy.ts, docs/data-retention.md and server/src/db.rs -
+        // and none was true: there is no `DELETE FROM reviews` anywhere in server/src, and
+        // `reviews.account_id` is `ON DELETE SET NULL`, so a review outlives its author and
+        // stays in the public aggregate attached to nobody. The correction also narrowed
+        // `doc_claims.rs`, which had been forbidding the PHRASE "kept indefinitely" across the
+        // whole privacy file - a proxy for one bad row that rejected a different, honest one.
+        '603 tests', '603 passed', '603 / 0 / 0',
       ],
     },
     {

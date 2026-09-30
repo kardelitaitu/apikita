@@ -419,6 +419,47 @@ fn reset_body(link: &str) -> String {
 ///
 /// The account id is logged so an operator can find the account that never got
 /// its link; the address is not, because the log is not the place for it.
+/// Builds the message a verification or reset flow sends.
+///
+/// A PURE FUNCTION, split out of [`send_link_mail`] so a test can assert on the
+/// message THIS ROUTE BUILDS rather than on one the test builds itself. That
+/// distinction is the entire point: the flow was dead for as long as it existed
+/// because the recipient was `String::new()`, and every test of the mailer
+/// supplied its own address, so the module was covered and the only place in the
+/// program that assembles a message for a real customer was not. A test that
+/// constructs its own `Email` cannot fail when this function does.
+///
+/// The address is taken as `&str` and passed in already normalized. It is
+/// deliberately not logged anywhere downstream - see the comment below.
+fn link_mail(
+    purpose: identity::tokens::Purpose,
+    raw_token: &str,
+    email: &str,
+) -> identity::email::Email {
+    let link = mail_link(purpose, raw_token, email);
+    let (subject, body) = match purpose {
+        identity::tokens::Purpose::Verification => {
+            ("Confirm your apikita address", verification_body(&link))
+        }
+        identity::tokens::Purpose::Reset => ("Reset your apikita password", reset_body(&link)),
+    };
+
+    // THE RECIPIENT IS THE WHOLE POINT OF THE PARAMETER, AND IT WAS EMPTY.
+    // This read `to: String::new()` from the commit that introduced the native
+    // identity flows and never worked: `EmailSender::send` parses the field as a
+    // `Mailbox` (identity/email.rs), an empty string does not parse, and the
+    // builder returns `EmailError::Build` before anything is dialled. Every call
+    // logged "a verification or reset link could not be sent" against an account
+    // id and no address, so the failure looked like a relay problem - and no test
+    // saw it, because every test in email.rs builds its own `Email` with a real
+    // address rather than going through the route that builds this one.
+    identity::email::Email {
+        to: email.to_string(),
+        subject: subject.to_string(),
+        body,
+    }
+}
+
 async fn send_link_mail(
     state: &AppState,
     account_id: Uuid,
@@ -434,24 +475,12 @@ async fn send_link_mail(
         }
     };
 
-    let link = mail_link(purpose, raw_token, email);
-    let (subject, body) = match purpose {
-        identity::tokens::Purpose::Verification => {
-            ("Confirm your apikita address", verification_body(&link))
-        }
-        identity::tokens::Purpose::Reset => ("Reset your apikita password", reset_body(&link)),
-    };
+    let outcome = sender.send(link_mail(purpose, raw_token, email)).await;
 
-    let outcome = sender
-        .send(identity::email::Email {
-            to: String::new(),
-            subject: subject.to_string(),
-            body,
-        })
-        .await;
-
-    // Email::to is set by the caller; a failure to reach the relay is reported
-    // against the ACCOUNT, never against the address, for the reason above.
+    // A failure to reach the relay is reported against the ACCOUNT, never against
+    // the address: this path is reached for an address that may not have an
+    // account, and the log is not the place for it - which is the other half of
+    // why an empty recipient survived so long.
     if let Err(e) = outcome {
         error!(
             account_id = %account_id,
@@ -1251,6 +1280,90 @@ mod tests {
         assert_eq!(urlencode("/"), "%2F");
         assert_eq!(urlencode(" "), "%20");
         assert_eq!(urlencode("é"), "%C3%A9");
+    }
+
+    /// THE MESSAGE THE ROUTE BUILDS MUST HAVE A RECIPIENT IN IT.
+    ///
+    /// This is the test for a link that never arrived. `send_link_mail` passed
+    /// `to: String::new()`, so every verification and reset mail failed to build
+    /// before anything was dialled - and `identity::email::send` reports that as
+    /// `EmailError::Build`, which the caller logs against the ACCOUNT with no
+    /// address. An operator reading those lines would look at the relay.
+    ///
+    /// It survived because every test in `identity::email` builds its own `Email`
+    /// with a written-out address, so the module was covered and the ROUTE - the
+    /// one place in the program that assembles the struct for a real customer -
+    /// was not. A test of the mailer cannot see this; only a test of the caller
+    /// can, which is why this one lives here rather than beside the mailer.
+    ///
+    /// IT CALLS `link_mail`, NOT A LOCAL COPY, and that is the whole reason that
+    /// function was split out. The first version of this test built its own
+    /// `Email` and passed with the defect reinstated - it asserted that a struct
+    /// it had just written had the field it had just written. A guard that does
+    /// not run the code under guard is a description, not a check.
+    #[test]
+    fn a_link_mail_is_addressed_to_the_account_it_is_about() {
+        let mail = link_mail(
+            identity::tokens::Purpose::Verification,
+            "apk_vfy_abc",
+            "customer@example.com",
+        );
+
+        // The recipient must PARSE, because a message whose recipient does not
+        // parse is one `send` refuses to build - which is what "no mail is ever
+        // sent" looked like from the outside.
+        let parsed = mail
+            .to
+            .parse::<lettre::message::Mailbox>()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the route addressed the mail to {:?}, which is not sendable: {e}",
+                    mail.to
+                )
+            });
+        assert_eq!(
+            parsed.email.to_string(),
+            "customer@example.com",
+            "the recipient must be the account's own address, not an empty or other field"
+        );
+
+        // The link is built from the SAME address, so a message that reached the
+        // right person could still carry a link for someone else. This is the
+        // RESET purpose on purpose: a verification link carries the token alone
+        // (see `a_verification_link_does_not_carry_the_address`), so the address
+        // can only be checked on the reset side.
+        let reset = link_mail(
+            identity::tokens::Purpose::Reset,
+            "apk_rst_abc",
+            "customer@example.com",
+        );
+        assert!(
+            reset.body.contains("email=customer%40example.com"),
+            "the address in the link must match the envelope recipient: {}",
+            reset.body
+        );
+        assert!(
+            !reset.body.contains("customer@example.com"),
+            "the address must not appear raw in a link: {}",
+            reset.body
+        );
+    }
+
+    /// The empty recipient the route used to build cannot be sent at all.
+    ///
+    /// This is the OTHER half, and it is the half that makes the fix testable: it
+    /// pins WHY the bug was fatal rather than cosmetic. If `lettre` ever accepted
+    /// an empty mailbox the first test would still pass while the real defect - an
+    /// unaddressed message being dialled to a relay - went unnoticed, so the
+    /// failure mode is asserted here rather than assumed.
+    #[test]
+    fn an_empty_recipient_cannot_be_built_and_that_is_why_it_was_fatal() {
+        assert!(
+            "".parse::<lettre::message::Mailbox>().is_err(),
+            "an empty recipient parsed successfully; the guard above no longer \
+             describes a fatal defect, and `send_link_mail`'s empty field would \
+             have been survivable rather than a dead flow"
+        );
     }
 
     // -----------------------------------------------------------------------
