@@ -383,13 +383,15 @@ impl UpstreamClient {
     /// it never records a failure and stays Closed forever.
     ///
     /// So a placeholder left at weight 1.0 with no keys votes "this model is
-    /// available" even when the one real provider is down. The shipped config has
-    /// exactly that: `secondary` on the flash model is documented as a placeholder
-    /// whose resale terms were never read, carries weight 1.0, and its two key
-    /// variables are empty in .env.example. `all_providers_unhealthy` therefore could
-    /// not fire for the only outage it was written to catch. An alert that is
-    /// structurally unable to fire is worse than no alert, because it reads as one
-    /// that is working.
+    /// available" even when the one real provider is down. The shipped config had
+    /// exactly that: `secondary` on the flash model was a placeholder whose resale
+    /// terms were never read, carried weight 1.0, and its two key variables are
+    /// empty in .env.example - so `all_providers_unhealthy` could not fire for the
+    /// only outage it was written to catch. An alert that is structurally unable to
+    /// fire is worse than no alert, because it reads as one that is working.
+    /// The placeholder has since been moved to weight 0, so the shipped file no
+    /// longer has this shape; the check stays because the next placeholder added at
+    /// a positive weight would reintroduce it.
     ///
     /// An EMPTY routed pool gives `false` too: with nothing routed there is no outage
     /// to report, and a vacuously-true "all zero endpoints are open" would fire an
@@ -1029,16 +1031,24 @@ mod tests {
     }
 
     /// A WEIGHTED endpoint with NO KEYS cannot mask a real outage on the endpoint
-    /// that can serve, and this is the shipped shape.
+    /// that can serve. The shipped config no longer HAS that shape - the flash
+    /// model's secondary placeholder was moved to weight 0 - so this test now
+    /// constructs the shape directly rather than relying on the shipped file.
     ///
-    /// config/apikita.toml leaves the flash model's secondary endpoint at weight 1.0 -
-    /// a placeholder whose resale terms were never read - with its two key variables
-    /// empty in .env.example. keys_from_env yields an empty pool, acquire returns
-    /// None, and the failover loop steps straight past it. Its breaker is never
-    /// exercised either, so it stays Closed and votes "this model is available".
+    /// That is deliberate, and it is the stronger position. The shipped config
+    /// could be fixed once; this guard has to hold for the NEXT placeholder anyone
+    /// adds at a positive weight, which is the shape that recurs every time a
+    /// second provider is sketched in. A test that read the shipped file would go
+    /// quiet the moment the file was corrected.
     ///
-    /// Before this test existed, that meant the all_providers_unhealthy alert could not
-    /// fire for the only outage it was written to catch: the one real provider goes
+    /// The scenario it pins: a placeholder endpoint carries weight 1.0 but none of
+    /// its key variables are set. keys_from_env yields an empty pool, acquire
+    /// returns None, and the failover loop steps straight past it. Its breaker is
+    /// never exercised either, so it stays Closed and would vote "this model is
+    /// available".
+    ///
+    /// Before the fix this meant the all_providers_unhealthy alert could not fire
+    /// for the only outage it was written to catch: the one real provider goes
     /// down, its breaker opens, and an unkeyed placeholder says everything is fine.
     #[test]
     fn a_weighted_endpoint_with_no_keys_cannot_mask_a_real_outage() {

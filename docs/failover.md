@@ -115,9 +115,16 @@ is genuinely added (its own company, its own terms), then:
 | All endpoints open | Return **503** with `Retry-After` |
 | Provider returns a model-not-found | Mark that endpoint unhealthy for that model |
 
-**A provider must not be used until its resale terms are read.** The config enforces
-this with `resale_permitted`; an unverified provider sits at `weight = 0` and is
-never selected. See [`docs/business/05-risk.md`](business/05-risk.md) R1.
+**A provider must not be used until its resale terms are read.** There is no
+`resale_permitted` flag — this line used to claim the config enforces the rule with
+one, and no such field exists. The convention is `weight = 0`: an unverified
+provider sits there and is never selected by the router. It is a convention, not a
+constraint, because nothing rejects an unverified entry that someone raises to a
+positive weight. `server/src/config.rs` pins the COUNT of routable endpoints against
+the header in `config/apikita.toml`, so a placeholder raised to a positive weight
+fails the test rather than drifting quietly — but the test cannot tell a verified
+endpoint from an unverified one. See [`docs/business/05-risk.md`](business/05-risk.md)
+R1 and `config/README.md`.
 
 ## What happens mid-stream
 
