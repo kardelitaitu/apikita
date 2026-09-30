@@ -1141,6 +1141,19 @@ pub async fn change_password(
         .execute(&state.pool)
         .await?;
 
+    // AND every outstanding link, which is the OTHER half of the same idea. A reset
+    // token lets its holder set a password without knowing the current one, so
+    // leaving one alive after a password change would leave a live credential that
+    // outranks the one just set - the change would revoke the sessions and not the
+    // link that can replace the password again. `confirm_password_reset` already
+    // clears them for the same reason; this handler did not, and the two now agree.
+    //
+    // This also clears VERIFICATION tokens, which `clear_for_account` does by
+    // design. That is harmless here - the address is already verified for any
+    // account that can sign in - and narrowing the delete by purpose would mean a
+    // second query to maintain for no gain.
+    identity::tokens::clear_for_account(&state.pool, account_id).await?;
+
     Ok((StatusCode::NO_CONTENT, session_cookie(String::new(), 0)?))
 }
 
@@ -2530,6 +2543,68 @@ mod tests {
                 "the rejection for {body:?} must name the body: {text}"
             );
         }
+
+        db.close().await;
+    }
+    /// A password change kills outstanding reset links, not only sessions.
+    ///
+    /// THIS IS THE OTHER HALF OF "every session dies". A reset token is a credential
+    /// that sets a password without knowing the current one, so a change that
+    /// revoked the sessions and left the link alive would still have a live way back
+    /// in - and the customer's reason for changing the password is usually that the
+    /// old one, or a mailbox, was not theirs alone any more.
+    ///
+    /// The reset token is ISSUED through `identity::tokens::issue`, the production
+    /// path, and redeemed through `identity::tokens::consume` afterwards: asserting
+    /// the row is gone by counting rows would pass against a delete that cleared the
+    /// wrong account, and what matters is whether the LINK still works.
+    #[tokio::test]
+    async fn live_password_change_kills_an_outstanding_reset_link() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = live_account(&pool).await;
+        let state = state_for(&pool);
+
+        let address = "reset-me@example.com";
+        let _ = password_identity_for(&pool, account.account_id, address, "old-password-123").await;
+
+        let issued = crate::identity::tokens::issue(
+            &pool,
+            account.account_id,
+            crate::identity::tokens::Purpose::Reset,
+            chrono::Duration::hours(1),
+            Utc::now(),
+        )
+        .await
+        .expect("the reset token is issued");
+
+        let changed = call(change_password(
+            State(state.clone()),
+            peer(),
+            cookie_header(&account.token),
+            change_request("old-password-123", "new-password-456"),
+        ))
+        .await;
+        assert_eq!(
+            changed.status,
+            StatusCode::NO_CONTENT,
+            "the change itself must succeed: {}",
+            changed.body_text()
+        );
+
+        // The link is dead: redeeming it now fails. This is the assertion that fails
+        // against a handler that only revoked the sessions.
+        let redeemed = crate::identity::tokens::consume(
+            &pool,
+            &issued.raw,
+            crate::identity::tokens::Purpose::Reset,
+            Utc::now(),
+        )
+        .await;
+        assert!(
+            redeemed.is_err(),
+            "a reset link issued before a password change must not redeem after it"
+        );
 
         db.close().await;
     }

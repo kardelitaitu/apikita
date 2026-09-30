@@ -456,7 +456,7 @@ pub async fn get_recent_usage(
 ///
 /// - IN: the account, wallet, ledger, top-ups, usage (daily and per-request) and
 ///   API-key METADATA - exactly what the customer can already see or act on.
-/// - OUT: `key_hash`, `token_hash`, `pb_user_id`, `snap_token`, session rows,
+/// - OUT: `key_hash`, `token_hash`, `snap_token`, session rows,
 ///   IP hashes and the Telegram chat id. Hashes and internal ids are not the
 ///   customer's to hold, and handing them out is an attack surface for no benefit.
 /// - OUT: `admin_audit`. Whether operator actions reach the customer is a
