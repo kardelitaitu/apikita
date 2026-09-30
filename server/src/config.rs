@@ -1116,15 +1116,16 @@ mod tests {
     /// The provider header's claim about routability must match the WEIGHTS.
     ///
     /// The config says how many providers are verified and asserts that unverified
-    /// entries are held at weight 0 so they are never routed. It also carried a
+    /// entries are held at weight 0 so they are never routed. It once carried a
     /// placeholder at weight 1.0 - so a reader taking the header at face value would
     /// believe the router only ever offers requests to the one real supplier, when
-    /// it would offer them to a URL that is not a provider.
+    /// it would offer them to a URL that is not a provider. That placeholder now
+    /// sits at weight 0 and the header says so.
     ///
     /// This pins the two together, because the comment is what an operator reads
-    /// before deploying and the weights are what the router obeys. Adding a second
-    /// routable placeholder - or fixing the existing one - makes one of the two
-    /// wrong, and the test names which.
+    /// before deploying and the weights are what the router obeys. Raising any
+    /// placeholder to a positive weight makes one of the two wrong, and the test
+    /// names which.
     ///
     /// WHAT IS NOT ASSERTED, because it is a deployment decision rather than a
     /// property of the file: that the routable endpoint is the VERIFIED one. The
@@ -1151,22 +1152,20 @@ mod tests {
             .collect();
 
         // The header names the first as verified and warns the rest are placeholders
-        // held at weight 0. Two routable entries means that warning is NOT being
-        // enforced, and the header now says so in as many words.
+        // held at weight 0. Exactly one routable entry means the warning and the
+        // weights agree; more than one means a placeholder has been raised without
+        // the header being updated to say which.
         assert_eq!(
             routable.len(),
-            2,
-            "routable flash endpoints are {routable:?}, but the header describes one verified provider and says the rest are held at weight 0. If a placeholder was correctly set to 0.0, update the header; if a real provider was added, update the header too. Either way the two must agree."
+            1,
+            "routable flash endpoints are {routable:?}, but the header describes one verified provider and says the rest are held at weight 0. If a placeholder was raised to a positive weight, the header must say so; if a real provider was added, the header must name it. Either way the two must agree."
         );
         assert!(
             routable.contains(&"primary"),
             "the verified provider must stay routable, got {routable:?}"
         );
-        assert!(
-            routable.contains(&"secondary"),
-            "the flash secondary is expected to be routable today, because setting it to weight 0 is the fix the header recommends and that decision has not been taken. If it has been, update this assertion AND the header in the same commit - that is the whole point of the test. Got {routable:?}"
-        );
     }
+
     use crate::money::calculate_preflight_reservation_idr;
 
     /// A config with NO per-endpoint rate overrides must load and validate
