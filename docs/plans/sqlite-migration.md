@@ -1,6 +1,6 @@
 # Plan: Retire PocketBase and PostgreSQL for Embedded SQLite
 
-**Status:** COMPLETE - PocketBase and PostgreSQL are both gone; this is the historical plan
+**Status:** PARTLY COMPLETE - the database port is done and PostgreSQL is gone, but PocketBase is still the identity provider: Phase 6 ([§5.6](#56-phase-6--identity), [§6](#6-phase-2--identity-the-real-cost)) is not started, so `accounts.pb_user_id` and the `server/src/routes/auth.rs` PocketBase client are both still present
 **Date:** 2026-09-25 (written) · **Branch at writing:** `0.0.1` · shipped and on `0.0.2`
 **Supersedes:** the untitled "Remove PocketBase and Migrate to Embedded SQLite + Custom Admin UI" draft
 **Amends:** [`decisions.md`](../decisions.md) — see [§3](#3-decisions-this-forces-the-register-to-change)

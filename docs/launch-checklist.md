@@ -41,7 +41,10 @@ recoverable.
 
 - [ ] A persistent volume provisioned for the SQLite database file (no database
       instance to provision), and a backup of it tested by restore.
-- [ ] PocketBase deployed and reachable.
+- [ ] Identity served by the Rust server itself, with no PocketBase instance
+      running. **Until migration Phase 6 lands PocketBase is temporarily still
+      required** — see [`plans/sqlite-migration.md`](plans/sqlite-migration.md)
+      §5.6; this box is the end state, not the current one.
 - [ ] Edge relay deployed; nginx configured with `proxy_buffering off` on `/events`.
 - [ ] Automatic certificate renewal on the relay **and** on the backend.
 - [ ] Backend serves a valid certificate for the public hostname (required for
@@ -283,6 +286,11 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       control` (`website/tests/landing-claims.test.ts`) asserts presence, the named
       jurisdiction, AND the ORDERING — because the claim is "before the first request",
       not "exists somewhere" (`privacy.astro` alone would not satisfy it).
+      **Provisional:** the disclosure text and its test are independent of the identity
+      provider, but the signup FORM around it is not — `signup.astro`'s script still calls
+      PocketBase (`authWithOAuth2`, `collection('users').create`, `requestVerification`),
+      so this box only holds while a PocketBase instance is running. The port replaces
+      that script; re-check the box then.
 - [x] Top-up screen states the fee and the non-refundable policy before payment.
       The wallet page (`website/src/pages/dashboard/wallet.astro`) states the non-refundable policy
       and the 2-year expiry, and the header flags that first-deposit and top-up minimums

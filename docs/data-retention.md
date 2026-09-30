@@ -224,7 +224,7 @@ credential or a security signal that was deliberately hashed.
 
 | Requirement | Where |
 | --- | --- |
-| Passwords hashed (bcrypt, via PocketBase) | [`docs/website/05-security-decisions.md`](website/05-security-decisions.md) |
+| Passwords hashed (Argon2id, owned by the Rust API) | [`docs/decisions.md`](decisions.md), [`docs/website/05-security-decisions.md`](website/05-security-decisions.md) |
 | API keys hashed (SHA-256) | [`docs/website/02-data-model.md`](website/02-data-model.md) |
 | Session tokens hashed, HttpOnly cookie | [`docs/architecture.md`](architecture.md) |
 | Backups encrypted, off-host | [`docs/deployment.md`](deployment.md) |

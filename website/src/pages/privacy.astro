@@ -154,7 +154,7 @@ const lastUpdated = '27 September 2026';
     <section>
       <h2 class="text-xl font-semibold tracking-tight">Security that follows from this</h2>
       <ul class="mt-4 max-w-2xl list-disc space-y-2 pl-5 text-ink-muted">
-        <li>Passwords are hashed (bcrypt, via PocketBase).</li>
+        <li>Passwords are stored only as a salted hash, never in a form we can read back.</li>
         <li>API keys are hashed (SHA-256).</li>
         <li>Session tokens are hashed and delivered in an HttpOnly cookie.</li>
         <li>Backups are encrypted and held off-host.</li>

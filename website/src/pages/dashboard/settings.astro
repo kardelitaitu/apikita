@@ -190,9 +190,9 @@ import Skeleton from '../../components/Skeleton.astro';
       here that could drift from them.
     </p>
     <p class="mt-2">
-      Logging out discards this device's token; the token itself stays
-      cryptographically valid until it expires. Only "Sign out everywhere" revokes
-      every token immediately.
+      Logging out revokes this device's session on the server, so the credential
+      stops working immediately rather than merely being discarded here. "Sign out
+      everywhere" revokes every session on the account at once.
     </p>
   </section>
 </DashboardLayout>

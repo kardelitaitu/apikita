@@ -51,23 +51,23 @@ avoids both account duplication and enumeration.
 
 ## Logout
 
-Simple, because there are no server-side sessions: "logout" is discarding the
-PocketBase auth token and clearing the cookie the BFF set.
+Sessions are server-side rows, so "logout" is real revocation rather than a
+local discard: the server revokes the session row and clears the cookie.
 
 - One control in the dashboard header. No confirmation dialog — logging out is
   not destructive.
-- Clears the token cookie server-side (BFF) **and** the client auth store, so a
-  back-button cannot restore an authenticated view.
-- **Token caveat:** the token itself remains cryptographically valid until it
-  expires; discarding it does not revoke it. A token copied off the device still
-  works. This is inherent to stateless tokens, not a bug.
+- Revokes the session server-side (BFF) **and** clears the client auth state, so
+  a back-button cannot restore an authenticated view.
+- **No token caveat.** A revoked session stops resolving immediately; a copy of
+  the credential taken off the device is dead the moment the row is revoked.
+  This is why the design moved off stateless tokens.
 
 ### Sign out of all devices
 
-A separate, deliberate action — this is real revocation.
+A separate, deliberate action — this is the broader revocation.
 
-- Calls the BFF, which rotates the record's `tokenKey` and saves.
-- **Invalidates every token for that user instantly**, on all devices.
+- Calls the BFF, which revokes **every** session row for that account.
+- **Invalidates every session for that user instantly**, on all devices.
 - Use after: password change (automatic), suspected compromise, or a "sign out
   everywhere" request.
 
