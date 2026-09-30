@@ -215,6 +215,10 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     label: string;
     models: string[];
     spend_limit_idr: number;
+    /** The token ceiling, 0 meaning unlimited. Mirrors ApiKeyDto in
+     *  server/src/routes/keys.rs. It was absent from both, which is why the edit
+     *  form could not populate the field and every save sent 0. */
+    token_limit: number;
     spend_used_idr: number;
     rate_limit_rpm: number;
     expires_at: string | null;
@@ -393,12 +397,18 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       id: k.id,
       before: {
         spend_limit_idr: k.spend_limit_idr ?? 0,
-        token_limit: 0,
+        token_limit: k.token_limit ?? 0,
         rate_limit_rpm: k.rate_limit_rpm ?? 0,
       },
     };
     ($('e-label') as HTMLInputElement).value = k.label ?? '';
     ($('e-spend') as HTMLInputElement).value = String(k.spend_limit_idr ?? 0);
+    // Read the token ceiling back, for the same reason the model boxes below are
+    // read back: the submit path sends the whole field set, so anything this form
+    // fails to populate is submitted as its blank default, and the blank default
+    // for a limit is 0 - unlimited. This line is the difference between an edit
+    // that keeps a key's ceiling and one that quietly removes it.
+    ($('e-token') as HTMLInputElement).value = String(k.token_limit ?? 0);
     ($('e-rate') as HTMLInputElement).value = String(k.rate_limit_rpm ?? 0);
     ($('e-expires') as HTMLInputElement).value = k.expires_at ? k.expires_at.slice(0, 10) : '';
     // Preselect the key's existing allowlist. Reading it back is what keeps an

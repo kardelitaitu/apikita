@@ -374,6 +374,7 @@ List active and revoked keys. **Never returns `key_hash`.**
 [{
   "id": "uuid", "prefix": "apk_live_a1b2", "label": "prod",
   "models": ["flash"], "spend_limit_idr": 50000,
+  "token_limit": 0,
   "spend_used_idr": 12340, "rate_limit_rpm": 60,
   "expires_at": null, "last_used_at": "2026-01-01T00:00:00Z",
   "revoked_at": null
@@ -382,6 +383,16 @@ List active and revoked keys. **Never returns `key_hash`.**
 
 `spend_used_idr` is computed over the configured window, from `usage_daily`.
 Returning it here saves the UI a second call.
+
+**`token_limit` is the stored ceiling, `0` meaning unlimited, and it must be
+returned for the edit form to be safe.** The dashboard's edit form submits the
+whole field set on every save rather than a diff — deliberately, so clearing a
+limit is expressible — which means any field this response omits is submitted as
+its blank default, and a blank limit parses to `0`, i.e. unlimited. This field
+was omitted, so the form opened with the token input blank and **renaming a key
+raised its token ceiling to no ceiling at all**, with nothing on screen to show
+it. The account export (`GET /api/account`) read `token_limit` from the start,
+which is part of why the omission looked deliberate.
 
 `last_used_at` is written on the key-metadata cache MISS in the proxy
 (`server/src/routes/proxy.rs`), so it lags a request by at most

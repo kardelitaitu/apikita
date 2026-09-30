@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 187;
+const WEBSITE_TESTS = 189;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 187;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 606;
+const SERVER_TESTS = 607;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -219,6 +219,17 @@ test('no doc still claims a superseded count', () => {
         // address, so the module was covered and the route was not; the guard for it was itself
         // vacuous at first, and the mutations said so.
         '605 tests', '605 passed', '605 / 0 / 0',
+        // Retired when `list_keys` started publishing `token_limit`. `ApiKeyDto` omitted the
+        // field and the SELECT did not read the column, while `CreateKeyRequest` and
+        // `UpdateKeyRequest` both accept it. The dashboard's edit form submits the WHOLE field
+        // set on every save rather than a diff - deliberately, so that clearing a limit is
+        // expressible - so a field the response omits is submitted as its blank default, and a
+        // blank limit parses to 0, which means UNLIMITED. The form also never wrote the
+        // `e-token` input, and hardcoded `token_limit: 0` into `before`, so it could not even
+        // warn: renaming a key silently raised its token ceiling to no ceiling. The account
+        // export read `token_limit` from the start, which is part of why the omission looked
+        // deliberate. Both halves are pinned now.
+        '606 tests', '606 passed', '606 / 0 / 0',
       ],
     },
     {
@@ -282,6 +293,15 @@ test('no doc still claims a superseded count', () => {
         // outlives its author and stays in the public aggregate attached to nobody. The new
         // test pins the absence, so implementing deletion fails it and names all three files.
         'website: **186 tests**', 'passes **186 tests**', '**186 tests**',
+        // Retired when the edit form was made to round-trip the limits it submits. Two tests
+        // were added: one fills the edit form from a stored key DTO that carries a non-zero
+        // ceiling and asserts the PATCH body keeps it, and one asserts that re-saving without
+        // touching a limit does not claim to lower one. The pair exists because the original
+        // bug was invisible to every test that came before it: `fields()` supplies a COMPLETE
+        // field set, so no test ever modelled "the form opened without this value". A fixture
+        // that supplies every field cannot see a defect that consists of a field never being
+        // supplied.
+        'website: **187 tests**', 'passes **187 tests**', '**187 tests**',
       ],
     },
   ];

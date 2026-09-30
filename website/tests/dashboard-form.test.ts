@@ -345,6 +345,115 @@ test('lowering any one limit triggers the warning', () => {
   assert.equal(lowersAnyLimit(BEFORE, { ...BEFORE, rate_limit_rpm: 30 }), true);
 });
 
+// --- The edit form must round-trip every limit it submits -------------------
+//
+// THE DEFECT THIS PINS. buildUpdateKeyRequest sends the WHOLE field set on every
+// save rather than a diff, which is correct only if the form was populated from
+// the stored values. It was not: `ApiKeyDto` carried no `token_limit`, so
+// `openEdit` hardcoded `token_limit: 0` and never wrote the `e-token` input. The
+// input therefore opened blank, a blank limit parses to 0 (see `wholeNumber`),
+// and 0 means UNLIMITED. Renaming a key raised its token ceiling to no ceiling.
+//
+// Every existing test above missed it for one reason: `fields()` supplies a
+// COMPLETE field set, so no test ever modelled "the form opened without this
+// value". A fixture that supplies every field cannot see a defect that consists
+// of a field never being supplied.
+//
+// These two tests close that gap from both ends - the server must publish the
+// ceiling, and the edit form must send back what it was given.
+
+/** A key DTO shaped exactly like ApiKeyDto in server/src/routes/keys.rs. */
+interface ApiKeyDtoLike {
+  id: string;
+  label: string;
+  models: string[];
+  spend_limit_idr: number;
+  token_limit: number;
+  rate_limit_rpm: number;
+  expires_at: string | null;
+}
+
+/**
+ * The edit form's fields, filled the way `openEdit` fills them from a stored key.
+ *
+ * This mirrors KeyManagement.astro's openEdit deliberately, including reading
+ * every limit back out of the DTO. If the island ever stops populating a field,
+ * the test below fails - which is the point: the bug was in the island, and the
+ * island is `openEdit` plus this builder.
+ */
+function editFieldsFrom(k: ApiKeyDtoLike): CreateKeyFields {
+  return {
+    label: k.label ?? '',
+    models: k.models ?? [],
+    spend_limit_idr: String(k.spend_limit_idr ?? 0),
+    token_limit: String(k.token_limit ?? 0),
+    rate_limit_rpm: String(k.rate_limit_rpm ?? 0),
+    expires_on: k.expires_at ? k.expires_at.slice(0, 10) : '',
+  };
+}
+
+test('editing a key sends back every limit it was given, clearing none', () => {
+  const stored: ApiKeyDtoLike = {
+    id: 'k1',
+    label: 'prod',
+    models: ['flash'],
+    spend_limit_idr: 50_000,
+    token_limit: 1_000,
+    rate_limit_rpm: 60,
+    expires_at: null,
+  };
+
+  const built = buildUpdateKeyRequest(editFieldsFrom(stored));
+  if (!built.ok) {
+    assert.fail('an edit filled from a stored key must build: ' + built.error);
+  }
+
+  assert.equal(
+    built.body.token_limit,
+    1_000,
+    'the token ceiling must survive an edit that did not mention it. It was 1000, and ' +
+      'anything else here means the edit form opened without the value and submitted ' +
+      'its blank default - 0, which this API reads as UNLIMITED. That is a silent ' +
+      'widening of the key: the user renamed it and lost the ceiling.',
+  );
+  assert.equal(built.body.spend_limit_idr, 50_000, 'the spend limit must survive');
+  assert.equal(built.body.rate_limit_rpm, 60, 'the rate limit must survive');
+});
+
+test('an unchanged edit lowers nothing, so it cannot warn about a reduction', () => {
+  // The companion failure mode: with token_limit hardcoded to 0 in `before`, the
+  // warning path could never fire for it either, because 0 was never lowered.
+  // A save that changes nothing must be silent.
+  const stored: ApiKeyDtoLike = {
+    id: 'k1',
+    label: 'prod',
+    models: ['flash'],
+    spend_limit_idr: 50_000,
+    token_limit: 1_000,
+    rate_limit_rpm: 60,
+    expires_at: null,
+  };
+  const built = buildUpdateKeyRequest(editFieldsFrom(stored));
+  if (!built.ok) {
+    assert.fail('an edit filled from a stored key must build: ' + built.error);
+  }
+  const after: ExistingKeyLimits = {
+    spend_limit_idr: built.body.spend_limit_idr,
+    token_limit: built.body.token_limit,
+    rate_limit_rpm: built.body.rate_limit_rpm,
+  };
+  const before: ExistingKeyLimits = {
+    spend_limit_idr: stored.spend_limit_idr,
+    token_limit: stored.token_limit,
+    rate_limit_rpm: stored.rate_limit_rpm,
+  };
+  assert.equal(
+    lowersAnyLimit(before, after),
+    false,
+    're-saving a key without touching a limit must not claim to lower one',
+  );
+});
+
 test('raising, or leaving limits unchanged, does NOT warn', () => {
   assert.equal(lowersAnyLimit(BEFORE, BEFORE), false);
   assert.equal(lowersAnyLimit(BEFORE, { ...BEFORE, spend_limit_idr: 90000 }), false);

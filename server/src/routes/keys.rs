@@ -41,6 +41,20 @@ pub struct ApiKeyDto {
     pub label: Option<String>,
     pub models: Value,
     pub spend_limit_idr: i64,
+    /// The token ceiling this key was created with, 0 meaning unlimited.
+    ///
+    /// THIS FIELD WAS MISSING, and its absence silently destroyed the value it
+    /// describes. `CreateKeyRequest` and `UpdateKeyRequest` both accept
+    /// `token_limit`, and the dashboard's edit form sends the WHOLE field set on
+    /// every save rather than a diff (`website/src/lib/dashboard-form.ts`, whose
+    /// own doc argues that sending only changed fields would preserve a value the
+    /// user deliberately cleared). That argument holds only if the form is
+    /// populated from the stored value - and this field is what would have
+    /// populated it. Without it the edit form opened with the token input blank,
+    /// a blank limit reads as 0, and 0 means unlimited: renaming a key or
+    /// toggling a model on it raised that key's token ceiling to no ceiling at
+    /// all, with nothing on screen or in the response to show it had happened.
+    pub token_limit: i64,
     pub spend_used_idr: i64,
     pub rate_limit_rpm: i32,
     pub expires_at: Option<DateTime<Utc>>,
@@ -304,7 +318,7 @@ pub async fn list_keys(
     let keys = sqlx::query(
         r#"
         SELECT
-            id, prefix, label, models, spend_limit_idr, rate_limit_rpm,
+            id, prefix, label, models, spend_limit_idr, token_limit, rate_limit_rpm,
             expires_at, last_used_at, revoked_at
         FROM api_keys
         WHERE account_id = ?
@@ -351,6 +365,7 @@ pub async fn list_keys(
                 label: k.get("label"),
                 models: k.get("models"),
                 spend_limit_idr: k.get("spend_limit_idr"),
+                token_limit: k.get("token_limit"),
                 spend_used_idr: spend_by_key.get(&id).copied().unwrap_or(0),
                 rate_limit_rpm: k.get("rate_limit_rpm"),
                 expires_at: k.get("expires_at"),
@@ -1029,6 +1044,40 @@ mod tests {
         )
     }
 
+    /// Create a key with a NON-ZERO token ceiling, via the same handler the
+    /// dashboard calls. The other helper hard-codes `token_limit: 0`, which is
+    /// exactly the value a defect of this shape is invisible behind.
+    async fn create_key_with_limit_via_handler(
+        state: &AppState,
+        headers: &HeaderMap,
+        label: &str,
+        token_limit: i64,
+    ) -> Uuid {
+        let res = create_key(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateKeyRequest {
+                label: Some(label.to_string()),
+                models: vec!["flash".into()],
+                spend_limit_idr: 0,
+                token_limit,
+                rate_limit_rpm: 0,
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("create_key must succeed")
+        .into_response();
+
+        assert_eq!(
+            res.status(),
+            StatusCode::CREATED,
+            "creation must answer 201"
+        );
+        let body: Value = json_body(res).await;
+        serde_json::from_value(body["id"].clone()).expect("id is a UUID")
+    }
+
     /// The whole application router, reached the way a caller reaches it: a real
     /// request through create_router, with the peer address mocked so
     /// ConnectInfo resolves. This is the only way to exercise the proxy's
@@ -1384,6 +1433,61 @@ mod tests {
             spend_of(unused_id),
             0,
             "a key with no usage in the window must report exactly 0"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        db.close().await;
+    }
+
+    /// LIST REPORTS THE TOKEN CEILING: every key the list returns carries the
+    /// `token_limit` it was created with, because the dashboard's edit form
+    /// submits the WHOLE field set on every save rather than a diff. A field
+    /// missing from this response is not merely absent from the UI - it is
+    /// submitted as its blank default, and the blank default for a limit is 0,
+    /// which means unlimited. So the omission this test pins did not hide a
+    /// value; it destroyed one, on the next unrelated save.
+    #[tokio::test]
+    async fn list_keys_publishes_the_token_ceiling_that_a_save_would_otherwise_clear() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let key_id = create_key_with_limit_via_handler(&state, &headers, "capped", 1_000).await;
+
+        let res = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("list keys")
+            .into_response();
+        let body: Value = json_body(res).await;
+        let row = body
+            .as_array()
+            .expect("a JSON array of keys")
+            .iter()
+            .find(|k| k["id"] == serde_json::to_value(key_id).expect("id serialises"))
+            .expect("the key just created must be listed");
+
+        assert_eq!(
+            row["token_limit"].as_i64(),
+            Some(1_000),
+            "the key was created with a ceiling of 1000 tokens and the list must say so. A \
+             missing or zero token_limit here is not a cosmetic gap: the dashboard reads \
+             this field to fill its edit form, and a form that opens blank submits 0 - \
+             unlimited - so the next rename would silently raise this key's ceiling to no \
+             ceiling at all."
+        );
+
+        // The field must be a number in the payload, not a string or null: the
+        // island types it `token_limit: number` and assigns it to a number input.
+        assert!(
+            row["token_limit"].is_i64(),
+            "token_limit must serialise as an integer, got {}",
+            row["token_limit"]
         );
 
         assert_eq!(

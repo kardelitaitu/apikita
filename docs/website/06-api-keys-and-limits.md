@@ -204,6 +204,18 @@ click. Do not force a limit on a user who does not want one.
 Show current-window usage against each limit. Allow raising limits immediately;
 **lowering** should warn that it may cut off in-flight usage within the TTL.
 
+**The edit form must be populated from the stored key, and it submits every
+limit, not just the changed ones.** Clearing a limit has to be expressible, so a
+diff is not enough — but that makes every unpopulated field a silent write of its
+blank default, and for a limit the blank default is `0`, which means unlimited.
+The token ceiling was the field this went wrong for: `GET /api/keys` did not
+return `token_limit`, the edit form therefore opened with its input blank, and
+saving an unrelated change raised that key's ceiling to no ceiling. Both halves
+are pinned by tests now — the server publishes the field
+(`list_keys_publishes_the_token_ceiling_that_a_save_would_otherwise_clear`) and
+the edit request cannot clear a limit it was handed
+(`editing a key sends back every limit it was given, clearing none`).
+
 ### Revoke
 
 Confirm, then immediate from the UI's perspective. State the TTL caveat in the
