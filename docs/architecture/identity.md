@@ -3,11 +3,11 @@
 How a person becomes an account, and how that account is reached from the website
 and the Telegram bot.
 
-> **Stack:** identity lives in **PocketBase** — still, until migration Phase 6
-> replaces it in Rust; money lives in **embedded SQLite** (a file the API opens,
-> not a service). See [`docs/architecture.md`](../architecture.md). This document
-> covers the identity side; the money schema is in
-> [`docs/website/02-data-model.md`](../website/02-data-model.md).
+> **Stack:** identity lives in **this crate's own embedded SQLite**, alongside
+> money. PocketBase is gone — there is one store, not two, and no service to run,
+> reach or back up for auth. See [`docs/architecture.md`](../architecture.md). This
+> document covers the identity side; the money schema is in the migrations under
+> `server/migrations/`.
 
 ## The shape of the thing
 
@@ -15,131 +15,211 @@ An **account** owns the wallet. Identities link to it. A person can have several
 identities and still have one balance.
 
 ```
-        PocketBase                    SQLite (embedded)
-   +---------------------+      +----------------------+
-   | users (auth)        |      | accounts             |
-   |   - google identity |<---->|   - pb_user_id       |
-   |   - password identity|     |   - wallet balance   |
-   +---------------------+      |   - api_keys         |
-                                |   - sessions         |
-   telegram_links (SQLite) -----+                      |
-   +---------------------+      +----------------------+
+                        SQLite (embedded)
+
+   identities ------>  +----------------------+  <--- wallets
+   (google|password)   | accounts             |  <--- api_keys
+   identity_tokens --> |   id (the only key)  |  <--- sessions
+   auth_attempts ----> |   status             |  <--- telegram_links
+                       +----------------------+
 ```
+
+`identities.account_id` references `accounts.id`. The account is the thing with a
+balance, a key set and a session; an identity is one way of proving you are that
+person.
 
 **Keys and wallet hang off the account, never off an identity.** That is what
 makes revocation account-wide by construction.
 
 ## Login methods
 
-| Method | Handled by |
-| --- | --- |
-| **Google sign-in** (OAuth2) | PocketBase |
-| **Email + password**, with verification and reset | PocketBase |
+| Method | Handled by | Routes |
+| --- | --- | --- |
+| **Google sign-in** (OIDC ID token, verified against Google's JWKS) | this crate — `identity::google` | `POST /auth/google` |
+| **Email + password** (Argon2id), with verification and reset | this crate — `identity::password`, `identity::tokens`, `identity::email` | `POST /auth/signup`, `/auth/login`, `/auth/verify-email`, `/auth/verification/resend`, `/auth/password-reset/request`, `/auth/password-reset/confirm` |
 
-PocketBase is used deliberately: password hashing, verification, reset, OAuth2,
-OTP, and MFA are solved problems, and re-implementing them in Rust would cost
-weeks and add new ways to get security wrong.
+The browser obtains a Google **ID token** through Google Identity Services and
+posts that one token; the server verifies the JWT and does not run an OAuth
+authorization-code flow, hold a client secret, or exchange a code. Both methods end
+in the same place: an opaque session cookie whose value is a row in the SQLite
+`sessions` table, so the identity provider is never on the request hot path after
+sign-in.
 
-**Rust issues its own session.** After PocketBase authenticates a user, the
-browser exchanges the PocketBase token with the Rust API, which resolves
-`pb_user_id` → `accounts` and issues an opaque session cookie (a row in
-the SQLite `sessions` table). The PocketBase token is not used as the API credential, so
-PocketBase stays off the request hot path.
+Endpoints in full: [`docs/server/api-spec.md`](../server/api-spec.md) §Auth. The
+authoritative route list is `pub const ROUTES` in `server/src/routes/mod.rs`.
 
 ## Table ownership
 
 | Table | Store | Purpose |
 | --- | --- | --- |
-| `users` | PocketBase | Email, password hash, Google link, `verified` |
-| `accounts` | SQLite | `pb_user_id` link, status |
-| `sessions` | SQLite | Server-side sessions |
+| `accounts` | SQLite | `id` is the only key; `status`, `is_operator` |
+| `identities` | SQLite | one row per way of proving who you are |
+| `identity_tokens` | SQLite | single-use verification and reset links, stored only as a hash |
+| `auth_attempts` | SQLite | the counters the `[limits]` caps are counted from |
+| `sessions` | SQLite | server-side sessions |
 | `telegram_links` | SQLite | `telegram_id` → account |
 | `link_codes` | SQLite | Telegram binding codes |
 
-There is deliberately **no `credentials` table in SQLite.** PocketBase *is* the
-identity store. Duplicating it would create two sources of truth about who
-someone is. (The schema does carry an empty `identities` table — created for
-Phase 6 and populated only when PocketBase is replaced. Until then it holds
-nothing and PocketBase stays authoritative.)
+**`identities` is the identity store.** It is populated on every signup and every
+Google sign-in — it is not a placeholder, and there is no second source of truth
+about who someone is.
 
 ## Invariants
 
 1. **One account, many identities.** A person may sign in with Google *and* a
    password; both resolve to the same wallet.
 2. **`api_keys.account_id` and `wallets.account_id` reference the account**, never
-   an identity or a PocketBase id directly.
-3. **SQLite is never authoritative about who a user is.** It stores a reference
-   (`pb_user_id`) and nothing else about identity.
-4. **Never hard-delete a PocketBase user.** The wallet is in SQLite and nothing
-   cascades across the boundary. Set `status = 'closed'`.
+   an identity directly.
+3. **SQLite is authoritative about who a user is.** `accounts.id` is the only key;
+   a person is identified by the `identities` rows that reference their account.
+4. **Never hard-delete an account.** The wallet, ledger and top-ups reference
+   `accounts.id` with `ON DELETE RESTRICT`, so money outlives the login. Closure is
+   `status = 'closed'`.
 5. **`link_codes` are single-use and expiring.** Binding happens on redemption
    only.
 6. **Unlinking Telegram removes one row.** It must never delete the account or
    the wallet.
 
-## Email handling — what PocketBase does for us
+## Email handling — the four pre-hijacking vectors
 
-The four cases below are the classic pre-hijacking vectors. **PocketBase already
-defends against them**, verified in `apis/record_auth_with_oauth2.go`
-(lines ~340–362). The attacks and the defenses:
+The four classic vectors, and the defences as they now exist. All of them are
+predicates over `identities` in `server/src/identity/accounts.rs` and
+`server/src/identity/google.rs`. The attacker has the victim's address but not
+their mailbox.
 
-### 1. Google first, then email+password with the same address
+The schema does real work here, so it is worth stating:
 
-PocketBase finds the record by email and links. If the record was **unverified**,
-the OAuth link **randomises its password** — so an attacker who pre-registered the
-address is evicted. Handled.
+- `CHECK ((provider = 'password') = (password_hash IS NOT NULL))` — a password
+  identity has a hash, a Google identity does not.
+- `CHECK (provider <> 'google' OR email_verified = 1)` — a Google identity is
+  **always** verified.
+- `UNIQUE (provider, subject)` — one Google subject maps to one row.
+- `CREATE UNIQUE INDEX identities_provider_email_uniq ON identities (provider, email)`
+  — one address per provider. **Note the shape: `(provider, email)`, not
+  `(email)`.** That is load-bearing (see below).
 
-### 2. Email+password first, then "Sign in with Google"
+### 1. A password identity registered first, then a Google sign-in
 
-Auto-links by email. If the record was **unverified**, it again randomises the
-password **and deletes other OAuth links**, so one unverified record can hold at
-most one OAuth link. Handled.
+The attacker registers the victim's address with a password of their own; the
+victim then signs in with Google. If that sign-in adopted the attacker's row, the
+attacker's password would open the victim's account.
 
-### 3. Google returns an unverified email
+**Rule: a Google sign-in may adopt an existing password identity ONLY IF that
+identity's `verified_at` is set AND predates the Google identity's creation**
+(`verified_at IS NOT NULL AND verified_at < now`). The comparison is against the
+moment the Google identity comes into existence, so the ordering is the rule and
+not merely the bit.
 
-**This is the one residual gap.** PocketBase matches on the returned email without
-visibly checking the provider's `email_verified` claim.
+**Why the ordering and not just `email_verified = 1`:** without it, an attacker
+could register the victim's address with a password, leave it unverified, wait for
+the victim to sign in with Google (correctly refused), and then let the victim's
+*own* verification retroactively authorise a link to the attacker's row. That is
+why `identities.verified_at` exists as a timestamp rather than a second bit.
 
-**Mitigation:** only enable OAuth2 providers that guarantee verified addresses.
-Google does. If a provider is added later that does not, this becomes an
-account-takeover path.
+When the rule refuses, **a new account is created** (`GoogleSignIn::CollisionCreated`)
+and `auth.email_collision_unverified` is logged at WARN with the colliding identity
+id — never shown to the caller. The attacker's row is left exactly as it was.
 
-### 4. Password reset on a Google-only account
+**Why create rather than refuse:** refusing would hand an attacker a denial of
+service on any address they like — register with it, never verify, and the real
+owner can never use Google. Creating gives the attacker nothing (their row is inert
+and unverified) and gives the victim a working account.
 
-PocketBase's reset flow can set a password on any record with an email — including
-one created via Google. So a Google-only account can gain a password.
+### 2. A verified password identity, then "Sign in with Google"
 
-**Practical risk is low** — resetting requires control of the email, and Google
-accounts have a verified one. Decide whether to accept it or block it. If blocked,
-it is app-level work: check for an existing password before honouring a reset.
+This is the legitimate case: the person signed up with a password, verified their
+address, and now uses Google. The Google identity joins the existing account
+(`GoogleSignIn::Linked`) — one wallet, two ways in.
+
+The refusal branch of vector 1 is what keeps this safe: an unverified colliding row
+is never adopted, so the legitimate path and the attack are told apart by whether
+the address was proven first.
+
+### 3. Google returns an unverified email — CLOSED
+
+`verify_id_token` requires the token's `email_verified` claim to be `true` **before
+touching the database**, and returns `Unauthenticated` otherwise. Without that
+check the INSERT would hit the raw `CHECK` constraint and surface as a 500 for what
+is the caller's problem.
+
+The schema constraint is the backstop; the Rust check is the check. Two further
+guards in the same function:
+
+- **The algorithm is fixed to RS256**, not read from the token header. Accepting
+  the algorithm a token names is the classic JWT confusion bug.
+- The signature is verified against Google's published JWKS, the issuer must be one
+  of Google's two real spellings, and the audience must be our client id — so a
+  valid Google token minted for any other site cannot be replayed here.
+
+### 4. Password reset on a Google-only account — DECIDED: allowed
+
+Completing a reset already requires control of the mailbox, and control of the
+mailbox is exactly what Google-ownership means. The reset therefore proves nothing
+new, so it is not an escalation. Blocking it would cost support load (the
+legitimate "I signed up with Google and want a password now" case) and buy nothing.
+
+`confirm_password_reset` creates the password identity when the account has none.
+Its `subject` is the normalised address, not a random id — `UNIQUE (provider,
+subject)` is what stops one address having two password identities, and a random
+subject would sail past it.
+
+**The reset does not set `email_verified`.** A reset proves the mailbox was
+reachable at that moment, but the verified transition is its own claim; marking it
+here would let a reset launder an unverified address into a linkable one.
 
 ### The trap that disables all of it
 
-Every defense above is gated on `!Verified()`. **If a record is marked verified
-before the owner proves the address, the protections stop applying.**
+Every defence above is gated on whether the address was proven, and when.
+**`email_verified` is written in a closed set of places:**
 
-**Rule: `verified` may only be set by PocketBase's own flows.**
+- signup writes `0` (`create_password_account`) — nothing in that path proves the
+  address,
+- the Google identity is inserted with `1`, and only after `verify_id_token` has
+  checked the claim,
+- `mark_verified` writes `1`, and its only caller is `verify_email`, which reaches
+  it by redeeming a token delivered to that address.
 
-- Permitted: the user clicking a verification link or entering an OTP; PocketBase
-  setting it on a matching OAuth email.
-- Forbidden: bulk imports setting it, admin/support toggling it to unblock
-  someone, migrations backfilling it.
+`set_password` — the reset path — deliberately does not write it.
 
-Enforcement (a hook rejecting client-sourced changes, plus auditing every
-transition) is specified in
+**Rule: nothing else may set `email_verified` to 1** — not an admin endpoint, not a
+migration backfill, not a support action, not a test fixture set for convenience.
+`upsert_password_identity` takes a `verified` flag for the paths that need one; the
+only production caller passes `false`.
+
+Enforcement is specified in
 [`docs/website/05-security-decisions.md`](../website/05-security-decisions.md) D3.
+
+### The collision index is `(provider, email)`, not `(email)`
+
+The unique index is `identities_provider_email_uniq ON identities (provider, email)`.
+That shape is what allows an **unverified** password identity and a Google identity
+to coexist on one address — the exact state the refusal branch relies on.
+"Simplifying" it to `UNIQUE (email)` would turn that branch into a constraint
+violation, which is a 500 on a user error.
+
+Addresses are compared after `normalize_email`: **lowercased and trimmed, and
+otherwise verbatim**. The residual risk is stated rather than hidden: two spellings
+a human reads as one mailbox can exist as two rows. That is a support case, not a
+security hole — the linking rule never infers account identity from an address that
+was not proven.
 
 ## Sessions
 
 Server-side sessions in SQLite, not JWTs. This is what makes logout real.
 
 - Login creates a `sessions` row; the cookie carries an opaque random value and
-  only its hash is stored.
+  only its SHA-256 is stored.
 - **Logout revokes the row** → immediate, on every surface.
 - **Sign out everywhere** revokes all rows for the account.
-- Expired rows are swept on a schedule.
-
-Schema and indexes: [`docs/website/02-data-model.md`](../website/02-data-model.md).
+- **A password reset revokes every live session for the account.** A reset is what
+  a person does when they believe someone else has their credential, so leaving a
+  session opened with the old password alive would defeat the transaction.
+- **30 days absolute / 7 days idle** ([`decisions.md`](../decisions.md)). The
+  absolute bound is seeded at login; the idle bound is applied in Rust by
+  `session_is_live_at`, and resolving a session moves `last_seen_at` — only a
+  credential that was actually honoured counts as activity.
+- Expired and revoked rows are swept nightly, 30 days after the instant they
+  stopped being usable.
 
 ## Telegram linking
 
@@ -147,8 +227,8 @@ Schema and indexes: [`docs/website/02-data-model.md`](../website/02-data-model.m
 > [`docs/telegram/README.md`](../telegram/README.md). This section covers the
 > linking mechanism only.
 
-Telegram is **not** an OAuth2 provider, so PocketBase cannot model it. It is a
-custom table in SQLite.
+Telegram is a custom table in SQLite, as it always was. It is not an OAuth2
+provider and has no place in `identities`.
 
 ### Flow
 
@@ -184,25 +264,23 @@ idempotency is per-order, not per-account.
 
 See [`docs/website/04-payments.md`](../website/04-payments.md).
 
-## Reconciliation — the hazard of two stores
+## Reconciliation — no longer a hazard
 
-Identity and money now live in different systems, so they can drift.
+The old section here was about two stores drifting. Identity and money now live in
+one SQLite database, so **there is no reconciliation job to schedule and no orphan
+detection to build**: a row cannot exist on one side only.
 
-- **Schedule a job** that checks every `accounts.pb_user_id` still exists in
-  PocketBase, and alerts on orphans.
-- **Never hard-delete a PocketBase user.** A deleted user with a funded wallet is
-  money nobody can reach.
-- An auth outage does **not** lock out existing users — sessions live in SQLite,
-  and a PocketBase that answers **5xx or 429** is treated as an outage (500,
-  retryable) rather than as a rejected token. Only a **4xx refusal** is a 401.
-  Collapsing the two would log every signed-in customer out during a 30-second
-  PocketBase restart.
+The fact that survives is still worth keeping: **an auth outage does not lock out
+existing users.** Sessions live in SQLite, so an existing cookie keeps working even
+if Google is unreachable — only a *new* Google sign-in needs Google's JWKS, and
+that is cached in memory between fills.
 
 ## Open questions
 
 - [x] Session lifetime: **30d absolute / 7d idle** — [`decisions.md`](../decisions.md).
-- [ ] Accept or block a password created by reset on a Google-only account (case 4).
+- [x] Accept or block a password created by reset on a Google-only account (case 4):
+      **allowed** — a completed reset already required control of the mailbox. See
+      §Email handling, vector 4.
 - [ ] Whether email is mandatory for a Telegram-linked account. Recommended: yes,
       or losing Telegram loses the wallet.
-- [ ] Reconciliation job: schedule, and where alerts go.
 - [ ] 2FA for accounts holding a large balance.
