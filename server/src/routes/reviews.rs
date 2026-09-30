@@ -170,6 +170,24 @@ pub async fn get_reviews(State(state): State<AppState>) -> Result<impl IntoRespo
 /// read anybody else's draft. Returns `has_review: false` rather than 404 when
 /// there is none: "you have not reviewed us yet" is the normal state of a new
 /// customer, not an error.
+///
+/// # A WITHDRAWN review is returned, and this is the point of `withdrawn`
+///
+/// This query does NOT filter `withdrawn_at IS NULL`, and it used to. The
+/// contract is stated twice outside this file - `docs/telegram/README.md:305`
+/// ("Withdrawn reviews are excluded from the public aggregate but remain visible
+/// to [the author]") and the response shape at `docs/server/api-spec.md:540` -
+/// and the old query made both unkeepable in one line: it hid the row, so a
+/// customer who withdrew could not see, edit or un-withdraw what they had
+/// written, and `has_review` answered `false` for an account that provably has a
+/// review. The row still occupies the account's one slot (`withdraw_review` is
+/// explicit that the flag is not a DELETE, precisely so the slot stays taken),
+/// so "no review" was also the wrong answer to the question the field asks.
+///
+/// The `withdrawn` field existed and was hard-coded `false` on every path,
+/// including the one that could not be reached. A field that cannot be true is
+/// not a field; it is a claim that the case cannot happen, and the case is one
+/// `withdraw_review` creates deliberately.
 pub async fn get_my_review(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -178,7 +196,7 @@ pub async fn get_my_review(
 
     let row = sqlx::query(
         "SELECT rating, body, withdrawn_at FROM reviews \
-         WHERE account_id = ? AND withdrawn_at IS NULL LIMIT 1",
+         WHERE account_id = ? LIMIT 1",
     )
     .bind(account_id.hyphenated())
     .fetch_optional(&state.pool)
@@ -195,12 +213,15 @@ pub async fn get_my_review(
 
     let rating: i64 = row.try_get("rating")?;
     let body: Option<String> = row.try_get("body")?;
+    // Read from the row rather than assumed. `try_get::<Option<_>>` because the
+    // column is nullable, and the NULL is the live case.
+    let withdrawn_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("withdrawn_at")?;
 
     Ok(Json(MyReviewResponse {
         has_review: true,
         rating: Some(rating),
         body,
-        withdrawn: false,
+        withdrawn: withdrawn_at.is_some(),
     }))
 }
 
@@ -992,6 +1013,100 @@ mod tests {
         assert!(body.contains("\"has_review\":true"), "got: {body}");
         assert!(body.contains("\"rating\":4"), "got: {body}");
         assert!(body.contains("good"), "got: {body}");
+        assert!(
+            body.contains("\"withdrawn\":false"),
+            "a review that was never withdrawn must report withdrawn:false. Got: {body}"
+        );
+    }
+
+    /// A WITHDRAWN review is still the author's, and this is the case the two
+    /// tests above both miss.
+    ///
+    /// `my_review_returns_what_this_account_wrote` and the isolation test beside
+    /// it only ever drive a LIVE review through this endpoint, which is how
+    /// `withdrawn` stayed hard-coded `false` on every path: the one input that
+    /// would have made it `true` was filtered out by the query before the flag
+    /// was written.
+    ///
+    /// Three things have to hold at once, and each is a different failure:
+    ///   - `has_review` is TRUE, because the row exists and occupies the
+    ///     account's one slot. Reporting `false` tells a customer who withdrew
+    ///     that they never wrote anything.
+    ///   - `withdrawn` is TRUE, which is the field's entire purpose.
+    ///   - the BODY is still returned. `docs/telegram/README.md:305` says a
+    ///     withdrawn review "remain[s] visible to" its author; hiding the text
+    ///     would make it impossible to re-read what you are about to rewrite,
+    ///     and the withdrawal is what removes it from the PUBLIC numbers, not
+    ///     from its author.
+    #[tokio::test]
+    async fn a_withdrawn_review_is_still_returned_to_its_own_author_as_withdrawn() {
+        let db = crate::test_support::TestDb::new().await;
+        let state = state_for(db.pool.clone());
+        let account_id = crate::test_support::account(&db.pool).await;
+        let token = session_for(&db.pool, account_id).await;
+
+        app(state.clone())
+            .oneshot(post(
+                "/api/reviews",
+                &token,
+                r#"{"rating":2,"body":"withdrawn words"}"#,
+            ))
+            .await
+            .expect("write");
+
+        let withdrawn = app(state.clone())
+            .oneshot(post("/api/reviews/withdraw", &token, ""))
+            .await
+            .expect("withdraw");
+        assert_eq!(withdrawn.status(), StatusCode::NO_CONTENT);
+
+        let body = body_text(
+            app(state.clone())
+                .oneshot(get("/api/reviews/mine", Some(&token)))
+                .await
+                .expect("request"),
+        )
+        .await;
+
+        assert!(
+            body.contains("\"has_review\":true"),
+            "an account that withdrew its review still HAS one - the row is flagged, not deleted, \
+             and it still occupies the account's single slot. Reporting has_review:false tells them \
+             they never wrote anything. Got: {body}"
+        );
+        assert!(
+            body.contains("\"withdrawn\":true"),
+            "the review is withdrawn and the field that says so is reporting false. This is the \
+             only input that can make `withdrawn` true, so if the query filters withdrawn rows out \
+             again, this assertion is the only thing that notices. Got: {body}"
+        );
+        assert!(
+            body.contains("withdrawn words"),
+            "a withdrawn review remains visible to its author - that is what lets them read what \
+             they are about to rewrite, and it is what docs/telegram/README.md:305 states. \
+             Withdrawal removes the review from the PUBLIC numbers, not from the person who wrote \
+             it. Got: {body}"
+        );
+        assert!(
+            body.contains("\"rating\":2"),
+            "the rating must survive the withdrawal for the same reason the body does. Got: {body}"
+        );
+
+        // The other half of the contract, in the same test so the two cannot
+        // drift: withdrawn means gone from the PUBLIC aggregate, and `has_review`
+        // being true must not have dragged it back in.
+        let public = body_text(
+            app(state)
+                .oneshot(get("/api/reviews", None))
+                .await
+                .expect("public"),
+        )
+        .await;
+        assert!(
+            public.contains("\"count\":0") && public.contains("\"average\":null"),
+            "a withdrawn review must not appear in the public aggregate, even though its author \
+             can still see it. Got: {public}"
+        );
     }
 
     // -----------------------------------------------------------------------

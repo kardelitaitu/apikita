@@ -543,6 +543,20 @@ Cookie-authenticated; scoped to the session's account and nothing else.
 Answers `has_review: false` rather than `404` when the account has not reviewed:
 not having reviewed yet is a new customer's normal state, not an error.
 
+**A withdrawn review is still returned, with `withdrawn: true`.** This is worth
+stating because the implementation got it wrong: the query filtered
+`withdrawn_at IS NULL`, so a customer who withdrew was told `has_review: false`
+stating they had never written anything, and `withdrawn` was hard-coded `false`
+on every reachable path — a field that could not be true. The row is flagged, not
+deleted (`POST /api/reviews/withdraw` below), and it still occupies the account's
+one slot, so `has_review: true` is the only honest answer. The **rating and body
+are returned too**: withdrawal removes the review from the public aggregate, not
+from its author, who needs to re-read what they are about to rewrite.
+
+```json
+{ "has_review": true, "rating": 2, "body": "withdrawn words", "withdrawn": true }
+```
+
 ### `POST /api/reviews`
 
 Cookie-authenticated. Writes the session's own review. There is no path by which

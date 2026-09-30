@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 186;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 602;
+const SERVER_TESTS = 603;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -191,6 +191,16 @@ test('no doc still claims a superseded count', () => {
         // the future (must go, and only `used_at` finds it), one terminal two hours ago (must
         // STAY, and this is the row that makes a zero-day grace fail), and one still live.
         '582 tests', '582 passed', '582 / 0 / 0',
+        // Retired when `GET /api/reviews/mine` started returning a withdrawn review. The query
+        // filtered `withdrawn_at IS NULL`, so an account that had withdrawn was told
+        // `has_review: false` - that it had never written anything - while its row sat in the
+        // table still occupying its one slot, and `withdrawn` was hard-coded `false` on every
+        // reachable path, making the field incapable of being true. Two documents stated the
+        // real contract and neither was checked: docs/telegram/README.md:305 ("remain visible
+        // to" the author) and the response shape at docs/server/api-spec.md:540. The new test
+        // asserts all four facts at once - has_review true, withdrawn true, body returned,
+        // rating returned - and then that the public aggregate still excludes it.
+        '602 tests', '602 passed', '602 / 0 / 0',
       ],
     },
     {
