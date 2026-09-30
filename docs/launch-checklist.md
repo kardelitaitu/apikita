@@ -397,7 +397,7 @@ That said, the ones that block *launch* specifically are:
 | **Legal review of the Terms of Service** | Gate 0 — cannot take money without it |
 | **Abuse-report contact** | Gate 5 — required to publish the terms |
 | **Support cost per customer** | Commercial model; not a launch blocker but the decisive business input |
-| **Wind-down runbook exercised** | Policy settled (balances above USD 2.00 paid out) and the runbook is written, but the payout is manual and has never been executed. It touches money and there is no treasury — so it is **not** a launch blocker on the same footing as a deployment, but it must be walked through against a scratch database before it is ever needed |
+| **Wind-down runbook exercised** | Policy settled (balances above USD 2.00 paid out) and the runbook is written, but the payout is manual and has never been executed. It touches money and there is no treasury — so it is **not** a launch blocker on the same footing as a deployment, but it must be walked through against a scratch database before it is ever needed. **The read-only half is now a tool** (`tools/wind-down/report.sh`, CI-checked): it runs Step 3's eligibility query, splits the threshold strictly and floors the stablecoin units. **What remains unexercised is Step 5 and after** — the manual transfer, the ledger row and the verification |
 
 The rest — Northflank prices, a second provider, a staging environment, review
 moderation policy, the second-operator threshold, the bot runtime — are open but
