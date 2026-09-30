@@ -45,10 +45,19 @@
 #
 #   usage-purge THE BINARY IS NOT WIRED; ITS WORK IS. Same shape as ip-purge:
 #               server/src/bin/usage-purge.rs, not shipped in the server image.
-#               `run_retention` now applies all THREE of its deletes -
-#               usage_events (90d), usage_daily (730d) and expired/revoked
-#               sessions (30d) - through sqlite3, so
+#               `run_retention` applies all FOUR of its deletes -
+#               usage_events (90d), usage_daily (730d), expired/revoked
+#               sessions (30d) and expired identity links - through sqlite3, so
 #               docs/data-retention.md is enforced here.
+#
+#               THE FOURTH IS THE ONE THAT WAS MISSING FOR LONGEST. Expired
+#               verification and password-reset links had a purge function with a
+#               unit test and NO caller anywhere - no binary, no scheduler entry,
+#               not even the inline SQL here - so they accumulated forever. The
+#               Rust side has now been folded into `purge_expired_usage` and the
+#               delete below is what actually runs in production. Its cutoff has no
+#               interval (`expires_at <= datetime('now')`) because a link is stale
+#               when it expires, not N days later.
 #
 #   hold-sweep  RUNS HERE, FOR REAL - report-only, and that is the point. A
 #               stranded reservation hold is INVISIBLE MONEY: the ledger still
@@ -174,7 +183,7 @@ banner() {
     else
         log "CLIENT    sqlite3 IS NOT INSTALLED IN THIS IMAGE. Every database job below will FAIL, loudly, rather than report a clean sheet against a database it never opened. The scheduler image (`.docker/maintenance/Dockerfile`) must provide a sqlite3 binary."
     fi
-    log "WIRED     retention  - age-based sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md); usage_events > 90d, usage_daily > 730d, expired/revoked sessions > 30d, link_redemption_attempts > 7d, auth_attempts > 7d (docs/data-retention.md)"
+    log "WIRED     retention  - age-based sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md); usage_events > 90d, usage_daily > 730d, expired/revoked sessions > 30d, link_redemption_attempts > 7d, auth_attempts > 7d, link_code_issues > 7d, expired identity_tokens (docs/data-retention.md)"
     log "WIRED     reconcile  - tools/reconcile/reconcile.sh, exit code preserved (1=drift 2=no DATABASE_URL 3=no sqlite3 4=sqlite3 failed 5=stranded hold 6=no such database file)"
     log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary NOT shipped in the server image; it does NOT run here. Its retention window IS enforced inline (see retention above)."
     log "NOT WIRED usage-purge - server/src/bin/usage-purge.rs, same: not shipped, does NOT run here. Its three sweeps ARE enforced inline (see retention above)."
@@ -315,6 +324,54 @@ auth_attempts=$(retention_delete_instant "$DB_FILE" auth_attempts created_at 7) 
   return 1
 }
 
+# identity_tokens: expired email-verification and password-reset links.
+#
+# THE THIRD TABLE TO ARRIVE WITH A PROMISE AND NO DELETE, and the longest-lived of
+# the three. `identity::tokens::purge_expired` was written with a unit test and NO
+# caller of any kind, so every expired link a customer ever asked for was still on
+# disk. Its own doc-comment says "the reason this runs at all is that the privacy
+# page promises expired links do not persist" - a promise kept in a comment.
+#
+# A ZERO-DAY OFFSET, which is the one thing that makes this row different from the
+# seven above it. Every other table answers "how long do we KEEP this after it
+# happens"; a link is not kept for a period at all - it is stale the moment it
+# expires, and `consume` already refuses a row past `expires_at`. So the cutoff is
+# `datetime('now')` with no interval, and the comparison mirrors the Rust
+# `purge_expired` (`expires_at <= now`) rather than a midnight boundary.
+#
+# Keeping an expired link would mean keeping a credential that either cannot be
+# redeemed or, worse, one whose expiry the verifier and the sweep came to disagree
+# about. `datetime('now')` is UTC, and `expires_at` is stored as RFC3339
+# (+00:00), so the string comparison is on the same instant form - the same
+# reasoning as the two instant helpers above.
+identity_tokens=$(sqlite3 -bail -noheader -separator '|' "$DB_FILE" \
+    "DELETE FROM identity_tokens WHERE expires_at <= datetime('now'); SELECT changes();" 2>"$SQL_ERR") || {
+  log "job retention: FAILED - the identity_tokens delete did not run (sqlite3 error above)"
+  [ -s "$SQL_ERR" ] && while IFS= read -r l; do log "job retention:   $l"; done < "$SQL_ERR"
+  return 1
+}
+
+# link_code_issues: the per-account record of Telegram link-code requests refused
+# by the cap. `ip_tracking::purge_expired` has swept this at SEVEN DAYS since the
+# table was added, and THIS SCRIPT NEVER DID.
+#
+# Found by the guard that now compares the Rust sweep to this one, on its first
+# real run - which is the argument for having it. The window matches
+# `key_ip_seen`'s for the reasoning recorded there: the cap counts over a window
+# measured in HOURS, so a seven-day-old row can no longer refuse anything, and the
+# row is a per-account record of who asked for a link code and when.
+#
+# `created_at` is an instant, so this takes the instant helper. The DATE form would
+# compare a bare 'YYYY-MM-DD' as a STRING against 'YYYY-MM-DDTHH:MM:SS+00:00', the
+# shorter string would sort FIRST, and the DELETE would match nothing - a silent
+# retention failure in the direction that keeps data, which is the failure mode
+# this file's helper comments keep naming.
+link_issues=$(retention_delete_instant "$DB_FILE" link_code_issues created_at 7) || {
+  log "job retention: FAILED - the link_code_issues delete did not run (sqlite3 error above)"
+  [ -s "$SQL_ERR" ] && while IFS= read -r l; do log "job retention:   $l"; done < "$SQL_ERR"
+  return 1
+}
+
 # A blank count is not a zero count: `SELECT changes()` always returns a row, so
     # anything non-numeric means the delete did not do what this job claims.
     case "$seen" in ''|*[!0-9]*) log "job retention: FAILED - key_ip_seen returned '$seen', not a count"; return 1 ;; esac
@@ -323,9 +380,11 @@ auth_attempts=$(retention_delete_instant "$DB_FILE" auth_attempts created_at 7) 
     case "$usage_events" in ''|*[!0-9]*) log "job retention: FAILED - usage_events returned '$usage_events', not a count"; return 1 ;; esac
     case "$link_attempts" in ''|*[!0-9]*) log "job retention: FAILED - link_redemption_attempts returned '$link_attempts', not a number: the delete did not do what this job claims"; return 1 ;; esac
     case "$auth_attempts" in ''|*[!0-9]*) log "job retention: FAILED - auth_attempts returned '$auth_attempts', not a number: the delete did not do what this job claims"; return 1 ;; esac
+    case "$identity_tokens" in ''|*[!0-9]*) log "job retention: FAILED - identity_tokens returned '$identity_tokens', not a number: the delete did not do what this job claims"; return 1 ;; esac
+    case "$link_issues" in ''|*[!0-9]*) log "job retention: FAILED - link_code_issues returned '$link_issues', not a number: the delete did not do what this job claims"; return 1 ;; esac
 case "$sessions" in ''|*[!0-9]*) log "job retention: FAILED - sessions returned '$sessions', not a count"; return 1 ;; esac
 
-    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d), link_redemption_attempts=$link_attempts (7d), auth_attempts=$auth_attempts (7d)"
+    log "job retention: OK - key_ip_seen=$seen (7d), key_ip_daily=$daily (90d), usage_daily=$usage_daily (730d), usage_events=$usage_events (90d), sessions=$sessions (30d), link_redemption_attempts=$link_attempts (7d), auth_attempts=$auth_attempts (7d), identity_tokens=$identity_tokens (expired), link_code_issues=$link_issues (7d)"
     return 0
 }
 

@@ -81,6 +81,8 @@ relationship and becomes a liability the moment a breach occurs.
 | `key_ip_daily` | **90 days** | One count per (key, day) — a **trend, not a history**. The individual hashes are gone after 7 days; what survives is a number per day, which is what makes a 90-day view possible without keeping anything linkable |
 | **Logs** | 30-90 days | Debugging window; not a database |
 | **Accounts (closed)** | Keep record, drop personal data | See below |
+| **`identity_tokens`** | **As soon as expired** | Verification and password-reset links. Not "kept for N days" — a link is stale the moment it expires, and the verifier already refuses a row past `expires_at`, so the sweep deletes on `expires_at <= now` with no grace period. **This row did not exist until the sweep did.** The purge function was written with a unit test and NO caller of any kind — no binary, no scheduler entry, not even the inline SQL in the maintenance entrypoint — so every expired link a customer ever asked for was still on disk while this page said otherwise |
+| **`link_code_issues`** | **7 days** | The per-account record of Telegram link-code requests refused by the cap. Short, because the cap counts over a window measured in HOURS: a seven-day-old row can no longer refuse anything. **This row did not exist either**, and the table had no production sweep: `ip_tracking::purge_expired` deleted from it, and the maintenance entrypoint — which is what actually runs — did not. Both gaps were found by a check that now compares the Rust sweep's table list to the entrypoint's |
 
 > **Age-based retention is enforced NIGHTLY, but NOT by that binary — and the
 > difference matters if you go looking.** `server/src/bin/usage-purge.rs` is not
@@ -93,12 +95,22 @@ relationship and becomes a liability the moment a breach occurs.
 > is the opposite of the truth, and it is what `website/src/lib/privacy.ts` said
 > for months, to customers.
 >
-> It sweeps **three** tables to the periods
-> above: `usage_events` (90 days), `usage_daily` (24 months) and expired/revoked
-> `sessions` (30 days). It is idempotent, and deliberately NOT on the request
+> It sweeps **nine** tables to the periods
+> above: `usage_events` (90 days), `usage_daily` (24 months), expired/revoked
+> `sessions` (30 days), `key_ip_seen` (7 days), `key_ip_daily` (90 days),
+> `link_redemption_attempts` (7 days), `auth_attempts` (7 days), `link_code_issues`
+> (7 days) and expired `identity_tokens` (no grace period). It is idempotent, and
+> deliberately NOT on the request
 > path — the settlement already writes a row per billed request, and a per-request
 > delete would add a second write to the money path to do work that has to happen
 > once a day.
+>
+> **That count is checked, and it is not a guess.** `tools/backup-check/check.sh`
+> extracts the table list from the Rust purges (`db::purge_expired_usage`,
+> `identity::tokens::purge_expired`, `ip_tracking::purge_expired`) and from this
+> entrypoint's own `run_retention`, and fails if the two sets differ in EITHER
+> direction. It found two real gaps on its first run, both described in the table
+> above, and it is why the count here can be trusted rather than remembered.
 >
 > **One job, not three.** Three retention jobs would mean three places the policy
 > can be forgotten, and that is not hypothetical: all three tables shipped with a

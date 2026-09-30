@@ -955,6 +955,29 @@ mod tests {
                 7,
                 crate::ip_tracking::AUTH_ATTEMPT_RETENTION_DAYS,
             ),
+            // ADDED WITH THE GUARD THAT FOUND IT. `link_code_issues` was swept by
+            // `ip_tracking::purge_expired` at seven days and deleted by NOTHING in
+            // production: the maintenance entrypoint, which is what actually runs,
+            // never mentioned the table, and neither did data-retention.md. So the
+            // window existed in the code, had no promise, and had no enforcement -
+            // and this list, which is the transcription of the sweep, was missing it
+            // in exactly the way that made both gaps invisible.
+            (
+                "link_code_issues",
+                7,
+                crate::ip_tracking::LINK_CODE_ISSUE_RETENTION_DAYS,
+            ),
+            // THE EXPIRED-LINK SWEEP, and the only row here whose window is NOT a
+            // period. A verification or reset link is not kept for N days; it is
+            // stale when it expires, and the sweep deletes on `expires_at <= now`.
+            // Zero is therefore the honest number and not a placeholder - see
+            // `db::IDENTITY_TOKEN_LAG_DAYS`, which is the same zero expressed for
+            // the lag report.
+            //
+            // ADDED WITH THE SAME GUARD. `identity::tokens::purge_expired` had a
+            // unit test and no caller of any kind, so this row's absence from the
+            // list was one of three places the gap went unmentioned.
+            ("identity_tokens", 0, crate::db::IDENTITY_TOKEN_LAG_DAYS),
         ];
 
         // Which document states each window. Not the same file throughout, which is

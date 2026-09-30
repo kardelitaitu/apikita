@@ -159,6 +159,12 @@ fn retention_report(
         "key_ip_daily": crate::ip_tracking::DAILY_RETENTION_DAYS,
         "link_redemption_attempts": crate::db::LINK_ATTEMPT_RETENTION_DAYS,
         "auth_attempts": crate::ip_tracking::AUTH_ATTEMPT_RETENTION_DAYS,
+        "link_code_issues": crate::ip_tracking::LINK_CODE_ISSUE_RETENTION_DAYS,
+        // ZERO, and it reads oddly beside the others, which is why the reason is
+        // here rather than only on the constant. A link is not kept for a period:
+        // the sweep deletes it the moment it expires, so the honest window is "no
+        // grace period", and the number that expresses that is 0.
+        "identity_tokens": crate::db::IDENTITY_TOKEN_LAG_DAYS,
     });
 
     // ONLY the tables that are behind, so an empty object reads as "retention is
@@ -735,6 +741,8 @@ mod tests {
             key_ip_daily: None,
             link_redemption_attempts: None,
             auth_attempts: None,
+            identity_tokens: None,
+            link_code_issues: None,
         };
         let report = retention_report(&behind, today);
         assert_eq!(report["behind"], json!(true));
@@ -749,6 +757,41 @@ mod tests {
         assert_eq!(
             report["windows_days"]["usage_events"],
             json!(crate::db::USAGE_EVENTS_RETENTION_DAYS)
+        );
+
+        // EVERY MEASURED TABLE HAS A WINDOW, and this is the check that keeps the
+        // `windows` map from silently falling behind the struct. The map is written
+        // by hand and `oldest_days_by_table` is written by hand, and they were
+        // allowed to disagree: `link_code_issues` and `identity_tokens` were added
+        // to the struct while the map still named seven tables, so the payload would
+        // have reported an age with no window to read it against - the operator sees
+        // "identity_tokens is 400 days behind" and has to open the source to learn
+        // that the answer is zero.
+        //
+        // Both lists are compared as sets, so a NEW field fails here until it is
+        // given a window, which is the point: adding a measurement is not finished
+        // until the promise it is measured against is in the payload too.
+        let windows = report["windows_days"]
+            .as_object()
+            .expect("windows_days is an object");
+        for (table, _) in crate::db::RetentionLag::default().oldest_days_by_table() {
+            assert!(
+                windows.contains_key(table),
+                "`{table}` is measured by retention_lag but has no entry in `windows_days`, \
+                 so the payload reports an age with no window to read it against"
+            );
+        }
+        assert_eq!(
+            windows.len(),
+            crate::db::RetentionLag::default()
+                .oldest_days_by_table()
+                .len(),
+            "the payload publishes {} windows and the sweep measures {} tables - one of the \
+             two lists was edited without the other",
+            windows.len(),
+            crate::db::RetentionLag::default()
+                .oldest_days_by_table()
+                .len()
         );
     }
 

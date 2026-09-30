@@ -483,10 +483,24 @@ pub struct PurgedUsage {
     pub usage_events: u64,
     pub usage_daily: u64,
     pub sessions: u64,
+    /// Expired verification and password-reset links.
+    ///
+    /// ADDED LAST, and it was the table this sweep had been missing. Its own
+    /// purge existed (`identity::tokens::purge_expired`) with a unit test and NO
+    /// PRODUCTION CALLER - no binary, no scheduler entry, nothing - so the
+    /// function's own doc-comment, "the reason this runs at all is that the
+    /// privacy page promises expired links do not persist", described a promise
+    /// nothing kept. Every expired link a customer ever asked for was still on
+    /// disk.
+    ///
+    /// It belongs HERE rather than in a third binary for the reason this struct's
+    /// function already gives: two retention jobs are two places the policy can be
+    /// forgotten, and this is the second time the same forgetting happened.
+    pub identity_tokens: u64,
 }
 
-/// The whole nightly retention sweep: `usage_events`, `usage_daily` and expired
-/// `sessions`. Returns what each table lost.
+/// The whole nightly retention sweep: `usage_events`, `usage_daily`, expired
+/// `sessions` and expired verification/reset links. Returns what each table lost.
 ///
 /// ONE job sweeps every table with an age-based period, deliberately. Two
 /// retention jobs means two places the policy can be forgotten, and that is not
@@ -494,6 +508,13 @@ pub struct PurgedUsage {
 /// `usage_daily`/`sessions` were in the same state, because the policy lived in
 /// a document and nothing connected it to the code. Sweeping them together makes
 /// the document's retention table the thing the code executes.
+///
+/// AND IT HAPPENED A SECOND TIME, which is why `identity_tokens` is in this list.
+/// The identity port gave expired links a purge function with a unit test and no
+/// caller of any kind, so an entire table the privacy page makes a promise about
+/// was written and never swept. Finding it required reading the purge function's
+/// doc-comment and then grepping for its callers, which is exactly the shape of
+/// check this sweep's design was supposed to make unnecessary.
 ///
 /// What this deliberately does NOT touch:
 /// - `ledger` and `topups` — financial records, kept **forever**.
@@ -563,6 +584,30 @@ pub struct RetentionLag {
     /// `AUTH_ATTEMPT_RETENTION_DAYS`. A second field would have to measure the same
     /// column against the same number and could only disagree with this one.
     pub auth_attempts: Option<i64>,
+    /// Age of the oldest EXPIRED verification/reset link, in days.
+    ///
+    /// MEASURED ON `expires_at`, NOT `created_at`, and that is the difference from
+    /// every other field here. A link is not stale N days after it was made - it is
+    /// stale the moment it expires, which is why `identity::tokens::purge_expired`
+    /// compares against `now` rather than a midnight cutoff. A `created_at`
+    /// measurement would report a yesterdays-created 30-minute reset link as
+    /// inside its window while the sweep correctly deleted it, so the alert would
+    /// disagree with the job it is watching.
+    ///
+    /// The window is therefore expressed as ZERO days past `expires_at`: anything
+    /// expired at all is lagging.
+    pub identity_tokens: Option<i64>,
+    /// Age of the oldest `link_code_issues` row, in days, when past the 7-day window.
+    ///
+    /// FOUND BY THE GUARD THAT COMPARES THIS STRUCT TO THE PAYLOAD'S `windows_days`
+    /// MAP, which is the kind of omission only a cross-check catches: the table WAS
+    /// swept (by `ip_tracking::purge_expired`), so a sweep that stopped would have
+    /// gone unnoticed, and it had no entry in the metrics payload either. Both ends
+    /// of that pair are now present, and either going missing fails a test.
+    ///
+    /// An INSTANT on `created_at`, like `auth_attempts` and unlike the two `key_ip`
+    /// tables: the column carries the same RFC3339 `+00:00` form.
+    pub link_code_issues: Option<i64>,
 }
 
 /// The link-redemption window, which until now existed only as the `7` literal in the
@@ -570,6 +615,20 @@ pub struct RetentionLag {
 /// number, and so the sweep guard can require the shell to agree with this constant rather
 /// than with whatever someone typed into a script.
 pub const LINK_ATTEMPT_RETENTION_DAYS: i64 = 7;
+
+/// How long an EXPIRED link may linger before the lag report calls it a problem.
+///
+/// ZERO, and it is the only window here that is not a policy number. The others
+/// answer "how long do we KEEP this?"; this one answers "how long after a link
+/// stops working may its row still exist?", and the answer the sweep implements is
+/// "none" - `identity::tokens::purge_expired` deletes on `expires_at <= now`, with
+/// no grace period at all.
+///
+/// Writing it as a constant rather than a bare `0` at the call site is what lets
+/// the two be compared: a `0` inline reads like a placeholder someone forgot to
+/// fill in, and the next reader would have to open the purge to learn that zero is
+/// the intended value and not an oversight.
+pub const IDENTITY_TOKEN_LAG_DAYS: i64 = 0;
 
 impl RetentionLag {
     /// Whether ANY age-based table is holding a row past its retention period.
@@ -581,6 +640,8 @@ impl RetentionLag {
             || self.key_ip_daily.is_some()
             || self.link_redemption_attempts.is_some()
             || self.auth_attempts.is_some()
+            || self.identity_tokens.is_some()
+            || self.link_code_issues.is_some()
     }
 
     /// Each table with the age of its oldest row, in the order the docs list them.
@@ -593,7 +654,7 @@ impl RetentionLag {
     /// the failure this change exists to remove. It caught the one test that built a
     /// `RetentionLag` literally, and that is the whole argument for writing the count out
     /// rather than trimming the report to fit.
-    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 7] {
+    pub fn oldest_days_by_table(&self) -> [(&'static str, Option<i64>); 9] {
         [
             ("usage_events", self.usage_events),
             ("usage_daily", self.usage_daily),
@@ -602,6 +663,8 @@ impl RetentionLag {
             ("key_ip_daily", self.key_ip_daily),
             ("link_redemption_attempts", self.link_redemption_attempts),
             ("auth_attempts", self.auth_attempts),
+            ("identity_tokens", self.identity_tokens),
+            ("link_code_issues", self.link_code_issues),
         ]
     }
 }
@@ -787,6 +850,33 @@ pub async fn retention_lag(
     )
     .await?;
 
+    // EXPIRED LINKS, measured on `expires_at` with a ZERO-day window: the sweep
+    // deletes a link the moment it expires, so "behind" means "expired and still
+    // here". A `created_at` measurement (what every other field uses) would call a
+    // 30-minute reset link made yesterday "inside its window" while the purge had
+    // already - correctly - removed it, and the alert would then disagree with the
+    // job it exists to watch.
+    let identity_tokens = oldest_row_past_window(
+        pool,
+        "identity_tokens",
+        "expires_at",
+        IDENTITY_TOKEN_LAG_DAYS,
+        today,
+    )
+    .await?;
+
+    // The link-code issuance counter, which the sweep has always covered and this
+    // report never did. An INSTANT on `created_at`, the same column and form as
+    // `auth_attempts` directly above, so the same helper path.
+    let link_code_issues = oldest_row_past_window(
+        pool,
+        "link_code_issues",
+        "created_at",
+        crate::ip_tracking::LINK_CODE_ISSUE_RETENTION_DAYS,
+        today,
+    )
+    .await?;
+
     Ok(RetentionLag {
         usage_events,
         usage_daily,
@@ -795,6 +885,8 @@ pub async fn retention_lag(
         key_ip_daily,
         link_redemption_attempts,
         auth_attempts,
+        identity_tokens,
+        link_code_issues,
     })
 }
 // SAFE for the same reason as `oldest_row_past_window`: chrono panics rather
@@ -846,10 +938,23 @@ pub async fn purge_expired_usage(
         .await?
         .rows_affected();
 
+    // EXPIRED LINKS, and this one compares against NOW rather than a midnight
+    // cutoff, because a link's lifetime is not a retention policy - it is the
+    // token's own expiry, and `consume` refuses a row past it. A token that
+    // expired an hour ago is already useless; keeping it would be keeping a
+    // credential that either cannot be redeemed or, worse, one whose expiry the
+    // verifier came to disagree with.
+    //
+    // Measured against the SAME instant `identity::tokens::purge_expired` uses, so
+    // the two cannot disagree about which rows are stale - that function is called
+    // here rather than the SQL being written twice.
+    let identity_tokens = crate::identity::tokens::purge_expired(pool, chrono::Utc::now()).await?;
+
     Ok(PurgedUsage {
         usage_events,
         usage_daily,
         sessions,
+        identity_tokens,
     })
 }
 
@@ -3447,8 +3552,13 @@ mod tests {
         assert!(!empty.anything_behind(), "an empty database is not behind");
         assert_eq!(
             empty.oldest_days_by_table().len(),
-            7,
-            "the report names every table the sweep deletes, not the three it used to"
+            9,
+            "the report names every table the sweep deletes, not the three it used to. The \
+             count moved 7 -> 8 when `identity_tokens` was added (a purge function, a unit \
+             test and NO caller), and 8 -> 9 when `link_code_issues` was added (swept since \
+             it existed, measured and published by nothing). Both were found by a guard that \
+             compares this list to another hand-kept list, which is the only way an omission \
+             here is visible at all."
         );
 
         // 200 days old: behind all four windows, which are 7, 90, 7 and 7.
@@ -3505,18 +3615,76 @@ mod tests {
         .await
         .expect("seed auth_attempts");
 
+        // `identity_tokens` is the FIFTH, and unlike the other four it is measured on
+        // `expires_at` rather than `created_at`. Seeding an expired link is therefore
+        // not enough on its own: the row below was CREATED a moment ago, so a
+        // `created_at` measurement would report it inside the window and this test
+        // would still pass with the field wired to the wrong column. The old-but-
+        // freshly-made shape is what makes the two distinguishable.
+        //
+        // The window is ZERO days past `expires_at` - the sweep deletes a link the
+        // moment it expires - so 200 days past expiry is unambiguously behind.
+        sqlx::query(
+            "INSERT INTO identity_tokens (id, account_id, purpose, token_hash, expires_at, created_at) \
+             VALUES (?, ?, 'verification', ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account.hyphenated())
+        .bind("h")
+        .bind(
+            today
+                .checked_sub_signed(chrono::Duration::days(200))
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .to_rfc3339(),
+        )
+        .bind(
+            chrono::Utc::now()
+                .checked_sub_signed(chrono::Duration::days(1))
+                .unwrap()
+                .to_rfc3339(),
+        )
+        .execute(&db.pool)
+        .await
+        .expect("seed identity_tokens");
+
+        // `link_code_issues` is the SIXTH, and the one this test was extended for last.
+        // It is an INSTANT on `created_at` like `auth_attempts` directly above, but it
+        // goes through `ip_tracking::purge_expired` rather than `db.rs`, which is why
+        // it was missing from this report for as long as it has existed: the table was
+        // swept correctly and measured by nothing, so a sweep that stopped would have
+        // been invisible.
+        sqlx::query("INSERT INTO link_code_issues (account_id, created_at) VALUES (?, ?)")
+            .bind(account.hyphenated())
+            .bind(
+                today
+                    .checked_sub_signed(chrono::Duration::days(200))
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .to_rfc3339(),
+            )
+            .execute(&db.pool)
+            .await
+            .expect("seed link_code_issues");
+
         let lag = retention_lag(&db.pool, today)
             .await
             .expect("the lag query answers");
         assert!(
             lag.anything_behind(),
-            "four seeded tables are past their windows"
+            "six seeded tables are past their windows"
         );
         for table in [
             "key_ip_seen",
             "key_ip_daily",
             "link_redemption_attempts",
             "auth_attempts",
+            "identity_tokens",
+            "link_code_issues",
         ] {
             let named = lag
                 .oldest_days_by_table()
@@ -3849,6 +4017,73 @@ mod tests {
     #[test]
     fn usage_events_retention_constant_is_documented() {
         assert_eq!(USAGE_EVENTS_RETENTION_DAYS, 90);
+    }
+
+    /// THE SWEEP DELETES EXPIRED LINKS, which for a while nothing did.
+    ///
+    /// `identity::tokens::purge_expired` existed with its own unit test and NO
+    /// production caller - no binary, no scheduler entry - so expired verification
+    /// and password-reset links accumulated forever while the privacy page said they
+    /// did not. Folding it into this sweep is the fix, and THIS test is what makes
+    /// the fold real: without it, deleting the call from `purge_expired_usage` would
+    /// leave every other test green, which is precisely how the gap survived the
+    /// first time.
+    ///
+    /// The boundary is `expires_at <= now`, an INSTANT rather than a midnight
+    /// cutoff - a link is stale the moment it expires, not at the end of some day.
+    /// Both sides are seeded so a comparison that ran the wrong way is visible: the
+    /// expired row must go, the live row must stay.
+    #[tokio::test]
+    async fn the_retention_sweep_deletes_expired_links_and_keeps_live_ones() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        // `expires_at` is the only column the purge reads, and it is seeded far in
+        // the past for one row and far in the future for the other. `created_at` is
+        // set to the SAME recent instant on both, so a purge that read `created_at`
+        // would delete neither and the assertion below would fail.
+        let created = chrono::Utc::now();
+        for (id, expires_at) in [
+            ("expired", created - chrono::Duration::days(7)),
+            ("live", created + chrono::Duration::days(7)),
+        ] {
+            sqlx::query(
+                "INSERT INTO identity_tokens (id, account_id, purpose, token_hash, expires_at, created_at) \
+                 VALUES (?, ?, 'verification', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(account.hyphenated())
+            .bind(format!("hash-{id}"))
+            .bind(expires_at.to_rfc3339())
+            .bind(created.to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("seed an identity token");
+        }
+
+        let purged = purge_expired_usage(&db.pool, today).await.unwrap();
+        assert_eq!(
+            purged.identity_tokens, 1,
+            "the sweep must delete the EXPIRED link and leave the live one. Zero here \
+             means the call was dropped from the sweep; two means it read the wrong \
+             column."
+        );
+
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM identity_tokens WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining,
+            vec!["live".to_string()],
+            "a link that has not expired must survive: deleting it would break a \
+             verification in flight"
+        );
+
+        db.close().await;
     }
 
     /// `usage_daily` is kept 24 months: a row at the cutoff DAY is deleted, one a

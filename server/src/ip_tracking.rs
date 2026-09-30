@@ -132,6 +132,24 @@ pub const DAILY_RETENTION_DAYS: i64 = 90;
 /// link window's constant was created to remove. One number, three readers.
 pub const AUTH_ATTEMPT_RETENTION_DAYS: i64 = 7;
 
+/// `link_code_issues` rows are kept this long: the same seven days as
+/// [`SEEN_RETENTION_DAYS`], for the same reason plus one of its own.
+///
+/// The shared reason: the cap counts issues over a window measured in HOURS, so a
+/// seven-day-old row can no longer refuse anything. The one of its own: the row is
+/// a per-account record of who asked for a Telegram link code and when, which is a
+/// weaker record than the hashes but still one nobody needs after the cap's window
+/// has closed.
+///
+/// NAMED RATHER THAN REUSING `seen_cutoff`, which is what the DELETE below did. The
+/// property that made it worth naming is not that it differs from the other windows,
+/// because it does not, but that THREE other places need to read it: the maintenance
+/// entrypoint passes it as a literal, `doc_claims`'s SWEEP list transcribes it, and
+/// docs/data-retention.md states it to a customer. A window with three transcriptions
+/// and no name is the drift this constant exists to remove, and the fact that two
+/// tables happen to share the number is not a reason for either to be anonymous.
+pub const LINK_CODE_ISSUE_RETENTION_DAYS: i64 = 7;
+
 /// Distinct IPs on one key in one day above which the runbook says to look.
 ///
 /// A starting value from [`docs/ip-tracking.md`](../../docs/ip-tracking.md)
@@ -459,6 +477,10 @@ pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<Purged
     // diverge, which is exactly why they are two names.
     #[allow(clippy::arithmetic_side_effects)]
     let auth_cutoff = today - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS);
+    // Its own cutoff, for the reason on the constant: three other places transcribe
+    // this window, so it needs a name to transcribe.
+    #[allow(clippy::arithmetic_side_effects)]
+    let link_issue_cutoff = today - chrono::Duration::days(LINK_CODE_ISSUE_RETENTION_DAYS);
 
     let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day <= ?")
         .bind(seen_cutoff)
@@ -504,15 +526,19 @@ pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<Purged
     // second place the policy can be forgotten, and the first version of that table
     // shipped with none at all.
     //
-    // The cutoff reuses seen_cutoff and the same midnight-UTC instant, which is
-    // correct here for the same reason as above: created_at is a TIMESTAMP in a TEXT
+    // The cutoff is its OWN constant now, not `seen_cutoff`. The two are both 7 and
+    // are free to diverge - a private counter and a salted hash answering different
+    // questions - and while the number was shared, nothing could tell a deliberate
+    // reuse from a copy that was never revisited when one of the two moved.
+    //
+    // The instant form is what `created_at` requires: it is a TIMESTAMP in a TEXT
     // column, so binding a bare date would compare 2026-09-27 as a string against
     // 2026-09-27T03:04:05+00:00 - the shorter sorts first, the DELETE matches
     // nothing, and the rows survive forever. A silent retention failure in the
     // direction that keeps data.
     let link_issues = sqlx::query("DELETE FROM link_code_issues WHERE created_at <= ?")
         .bind(
-            seen_cutoff
+            link_issue_cutoff
                 .and_hms_opt(0, 0, 0)
                 .expect("midnight is valid")
                 .and_utc(),

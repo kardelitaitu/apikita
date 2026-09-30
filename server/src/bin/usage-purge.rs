@@ -1,7 +1,8 @@
 //! Nightly retention sweep for the age-based tables: `usage_events` (90 days),
-//! `usage_daily` (24 months) and expired/revoked `sessions` (30 days).
+//! `usage_daily` (24 months), expired/revoked `sessions` (30 days) and expired
+//! verification/password-reset links (as soon as they expire).
 //!
-//! `docs/data-retention.md` states all three periods. They are only true if
+//! `docs/data-retention.md` states all four periods. They are only true if
 //! something deletes the rows, and nothing on the request path should: the
 //! settlement writes one row per billed request, and adding a per-request delete
 //! to it to do work that has to happen once a day would be the wrong trade.
@@ -15,6 +16,13 @@
 //! It deletes ONLY `usage_events`. `usage_daily` is the 24-month aggregate the
 //! spend window and reconciliation read, and it is deliberately not touched here;
 //! `ledger` and `topups` are financial records kept forever.
+//!
+//! THE LINK PURGE WAS ADDED BECAUSE IT HAD NO CALLER AT ALL. The identity port
+//! shipped `identity::tokens::purge_expired` with a unit test and nothing that
+//! invoked it, so expired links were written and never removed while the privacy
+//! page said they were. It lives in this sweep rather than a third binary because
+//! this file's own doc-comment already argues the case: two retention jobs are two
+//! places the policy can be forgotten, and the gap proved it.
 
 use std::env;
 
@@ -61,6 +69,7 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
         usage_events_deleted = purged.usage_events,
         usage_daily_deleted = purged.usage_daily,
         sessions_deleted = purged.sessions,
+        identity_tokens_deleted = purged.identity_tokens,
         events_retention_days = db::USAGE_EVENTS_RETENTION_DAYS,
         daily_retention_days = db::USAGE_DAILY_RETENTION_DAYS,
         session_retention_days = db::SESSION_RETENTION_DAYS,

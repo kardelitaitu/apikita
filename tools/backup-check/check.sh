@@ -180,6 +180,150 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# The Rust sweep and the production sweep must delete from the SAME tables.
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS, and it is the same defect class as the block above, one layer
+# lower. The retention policy is implemented TWICE: `purge_expired_usage` in
+# server/src/db.rs (and `identity::tokens::purge_expired`, which it calls) is what
+# the Rust tests exercise and what `bin/usage-purge` logs, while `run_retention` in
+# the maintenance entrypoint is what ACTUALLY RUNS in production - the binary is
+# not shipped in the server image.
+#
+# Nothing compared the two. So a table could be added to the Rust sweep, get a
+# passing test, get a log line, and still never be deleted in production, with
+# every check green. That is not hypothetical: it is exactly what happened to
+# `identity_tokens`. Its purge function was written with a unit test and NO caller
+# of any kind, and the table accumulated expired verification and password-reset
+# links for as long as the identity port has existed while the privacy page said
+# they do not persist.
+#
+# THE ASSERTION IS AGREEMENT, NOT MEMBERSHIP, so it survives a change in either
+# direction: the entrypoint may be missing a delete the Rust sweep performs, or it
+# may delete from a table the Rust sweep does not know about. Both are drift and
+# both fail. The comment on the block above gives the same reason for the same
+# shape.
+DBRS="$REPO/server/src/db.rs"
+if [ ! -f "$DBRS" ] || [ ! -f "$ENTRYPOINT" ]; then
+    fail "cannot read $DBRS and $ENTRYPOINT, so the Rust and production retention sweeps were not compared"
+else
+    # The tables the RUST sweep deletes from. THREE sources, because the policy is
+    # implemented across three functions and each owns a different class of table:
+    #
+    #   * `db::purge_expired_usage` - usage_events, usage_daily, sessions, and (via
+    #     the call added with the identity fix) identity_tokens.
+    #   * `identity::tokens::purge_expired` - identity_tokens' own SQL, in its own
+    #     file, reached from the function above.
+    #   * `ip_tracking::purge_expired` - the four salted-hash and counter tables.
+    #     They were ALWAYS swept here rather than in `db.rs` (the entrypoint comment
+    #     says so: "the runnable form of the ip-purge binary's SQL"), so reading only
+    #     `db.rs` reports them as missing from the Rust side when they are simply
+    #     somewhere else. That is the guard's own false positive, and the first run
+    #     of it produced exactly that - which is the argument for reading each
+    #     implementation rather than assuming one.
+    #
+    # Read from the executable SQL, not from a doc or a struct field name: a field
+    # named `identity_tokens` on `PurgedUsage` proves only that someone declared it,
+    # and the whole defect being guarded here was a declaration with no delete behind
+    # it.
+    TOKENSRS="$REPO/server/src/identity/tokens.rs"
+    IPTRS="$REPO/server/src/ip_tracking.rs"
+    RUST_TABLES=$(
+        {
+            sed -n '/^pub async fn purge_expired_usage(/,/^}/p' "$DBRS"
+            [ -f "$TOKENSRS" ] && sed -n '/^pub async fn purge_expired(/,/^}/p' "$TOKENSRS"
+            [ -f "$IPTRS" ] && sed -n '/^pub async fn purge_expired(/,/^}/p' "$IPTRS"
+        } \
+        | grep -oE 'DELETE FROM [a-z_]+' \
+        | awk '{print $3}' \
+        | sort -u
+    )
+
+    # The tables the PRODUCTION sweep deletes from. Two sources, because the entrypoint
+    # expresses them two ways: seven routes go through the `retention_delete*` HELPERS
+    # (whose `DELETE FROM $2` names the table only as a bound parameter, so the table
+    # name is at the CALL SITE), and `identity_tokens` is written out inline because
+    # its cutoff has no day offset.
+    #
+    # So both the call sites and the inline statement are read. Reading only the
+    # helpers finds no table names at all; reading only the call sites misses the
+    # inline one.
+    #
+    # NOT `sed -n '/^run_retention()/,/^}/p'`. That range stops at the FIRST line
+    # starting with `}`, and `run_retention`'s body contains nested `if`/`case` blocks
+    # whose closing brace sits at column 0 - so the extraction ended about a third of
+    # the way in and this guard's own positive control caught it as an empty set.
+    # An awk flag that clears when brace depth returns to zero walks the real body.
+    RETENTION_BODY=$(
+        awk '
+            /^run_retention\(\)/ { infn = 1 }
+            infn {
+                print
+                n = gsub(/\{/, "{")
+                m = gsub(/\}/, "}")
+                depth += n - m
+                if (depth <= 0 && n + m > 0) { infn = 0 }
+            }
+        ' "$ENTRYPOINT"
+    )
+
+    SHELL_TABLES=$(
+        {
+            # Call sites: `retention_delete "$DB_FILE" <table> <days>` and its instant
+            # sibling, whose table is the second argument after the file.
+            printf '%s\n' "$RETENTION_BODY" \
+                | grep -oE 'retention_delete(_instant)? "\$DB_FILE" [a-z_]+' \
+                | awk '{print $3}'
+            # Inline statements, for a table routed through no helper.
+            printf '%s\n' "$RETENTION_BODY" \
+                | grep -oE 'DELETE FROM [a-z_]+' \
+                | awk '{print $3}'
+        } | sort -u
+    )
+
+    # POSITIVE CONTROL. Two empty sets AGREE, and they agree for the reason
+    # `purge_expired_usage` might have been renamed: the extraction read the wrong
+    # region and found no SQL at all. Without this the check passes on a tree where
+    # it is measuring nothing.
+    if [ -z "$RUST_TABLES" ]; then
+        fail "no DELETE FROM was found in purge_expired_usage (or identity::tokens::purge_expired) in $DBRS - the retention comparison is measuring an empty set, so it can neither pass nor fail meaningfully"
+    fi
+    if [ -z "$SHELL_TABLES" ]; then
+        fail "no DELETE FROM was found inside run_retention in $ENTRYPOINT - the retention comparison is measuring an empty set"
+    fi
+
+    # Each side, one table per line, so the failure can name the offender instead of
+    # printing two jumbled lists.
+    MISSING_IN_SHELL=$(comm -23 <(printf '%s\n' "$RUST_TABLES") <(printf '%s\n' "$SHELL_TABLES"))
+    if [ -n "$MISSING_IN_SHELL" ]; then
+        fail "the Rust retention sweep deletes from these tables and the PRODUCTION sweep does not: $(printf '%s' "$MISSING_IN_SHELL" | tr '\n' ' '). server/src/bin/usage-purge.rs is NOT shipped in the server image, so the entrypoint is what runs: a table present only in the Rust sweep is swept in tests and NEVER in production, which is how expired identity links accumulated while every check stayed green."
+    fi
+
+    MISSING_IN_RUST=$(comm -13 <(printf '%s\n' "$RUST_TABLES") <(printf '%s\n' "$SHELL_TABLES"))
+    if [ -n "$MISSING_IN_RUST" ]; then
+        fail "the PRODUCTION sweep deletes from these tables and the Rust sweep does not: $(printf '%s' "$MISSING_IN_RUST" | tr '\n' ' '). A table the entrypoint deletes that no Rust code or test covers is a retention window with no measurement behind it - it cannot appear in the lag report, so a sweep that stopped would be invisible."
+    fi
+
+    # WHAT THIS CANNOT SEE, stated rather than left as an absence. The comparison is
+    # over TABLE NAMES, so it catches a table that exists on one side and not the
+    # other - which is the defect that prompted it, twice over. It does NOT catch a
+    # table whose DELETE is present but whose CALL was dropped: removing the call to
+    # `identity::tokens::purge_expired` from `purge_expired_usage` leaves the SQL in
+    # `tokens.rs`, so the union still names `identity_tokens` and this check stays
+    # green. That case is covered by a Rust test instead
+    # (`the_retention_sweep_deletes_expired_links_and_keeps_live_ones`, proved by
+    # deleting the call and watching it fail) - which is the right place for it,
+    # because "the function is still called" is a fact about Rust control flow that a
+    # shell grep cannot read.
+    #
+    # The WINDOW is not compared either: the shell passes 7 where Rust has
+    # SEEN_RETENTION_DAYS = 7, and a change to one would not move the other. That gap
+    # is older than this check and is recorded on docs/data-retention.md's nightly
+    # note and in the entrypoint's own helper comments, which name the Rust constant
+    # each literal mirrors.
+fi
+
+
+# ---------------------------------------------------------------------------
 # A privacy obligation marked "not written" must match whether the text exists.
 # ---------------------------------------------------------------------------
 # WHY THIS IS HERE, beside the IP-retention check: it is the same defect class in

@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 172;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 580;
+const SERVER_TESTS = 581;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -128,6 +128,13 @@ test('no doc still claims a superseded count', () => {
     // router and to MOUNTED while `ROUTES` was left alone - a 404 for a path the
     // inventory does not admit exists.
     '579 tests', '579 passed', '579 / 0 / 0',
+    // Retired when the retention-sweep gaps were closed. `identity::tokens::purge_expired`
+    // had a unit test and NO caller of any kind, so expired links were never deleted; the
+    // maintenance entrypoint - the thing that actually runs, since `bin/usage-purge.rs` is
+    // not shipped - never mentioned `identity_tokens` OR `link_code_issues` at all, while
+    // the Rust sweep deleted from both. One test now drives each end of that pair, and a
+    // shell guard compares the two table lists so neither can drift alone again.
+    '580 tests', '580 passed', '580 / 0 / 0',
   ];
   for (const stale of superseded) {
     // 134 is a HISTORICAL figure in docs/plans (a dated migration milestone), so
