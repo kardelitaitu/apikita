@@ -113,7 +113,7 @@ must clear before taking money.
 | API + proxy | Northflank | **Rust** |
 | Upstreams | Multiple providers | Provider-agnostic endpoint routing |
 | Money | *inside the API process* | **SQLite** (embedded — no separate service) |
-| Identity | Northflank | PocketBase, until Phase 6 folds it into Rust |
+| Identity | Northflank | **Rust** — the API's own embedded SQLite `accounts` + `identities` tables |
 
 Push to `main` deploys. The reasoning and the tradeoffs:
 [`docs/architecture.md`](docs/architecture.md).

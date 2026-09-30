@@ -1,9 +1,17 @@
 # Website Documentation
 
+> **Superseded: identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the
+> PocketBase HTTP client is gone from `server/`, and identity is served natively
+> by this crate (`accounts` + `identities`, Argon2id). Where the text below still
+> says PocketBase is the current identity provider, this notice governs;
+> [`architecture/identity.md`](../architecture/identity.md) is the operative
+> description.
+
 Design for the customer-facing web surface. **Parts of it are built** — the
 Status section below marks what exists and what is still design.
 
-**Stack lives in [`docs/architecture.md`](../architecture.md)** — Pages + Rust (Northflank) + embedded SQLite (money) + PocketBase (identity). That document is authoritative; the docs below cover design detail.
+**Stack lives in [`docs/architecture.md`](../architecture.md)** — Pages + Rust (Northflank) + embedded SQLite (money and identity). That document is authoritative; the docs below cover design detail.
 
 **The frontend's contract with the backend is
 [`docs/server/api-spec.md`](../server/api-spec.md)** — every endpoint the dashboard
@@ -78,17 +86,21 @@ They are plain `<script>` islands, not UI-framework components —
 `astro.config` has no integration and `package.json` has no framework dependency.
 
 **The frontend↔backend glue is written.** `website/src/lib/` holds `api.ts` (fetch
-client; base URL `PUBLIC_API_BASE_URL ?? http://localhost:8080`), `pocketbase.ts`
-(`POST /auth/exchange`), `live.ts` (`GET /events` SSE with polling fallback),
+client; base URL `PUBLIC_API_BASE_URL ?? http://localhost:8080`), `auth-api.ts`
+(the native auth verbs — `/auth/signup`, `/auth/login`, `/auth/google`), `live.ts` (`GET /events` SSE with polling fallback),
 plus `errors.ts`, `auth-flow.ts`, `format.ts`, `retry-wait.ts`. The auth pages and
 the islands call these; `website/tests/auth-flow.test.ts` and
 `rate-limit.test.ts` cover the auth and error paths.
 
 **The routes those pages call exist too.** `server/src/routes/mod.rs` mounts
-`/auth/exchange`, `/auth/logout`, `/auth/logout-all`, `/api/me`, `/api/usage`,
+`/auth/signup`, `/auth/login`, `/auth/google`, `/auth/verify-email`,
+`/auth/password-reset/request`, `/auth/password-reset/confirm`,
+`/auth/verification/resend`, `/auth/logout`, `/auth/logout-all`,
+`/auth/password-change`, `/auth/providers`, `/api/me`, `/api/usage`,
 `/api/topups`, `/api/keys`, `/api/keys/{id}`, `/api/keys/{id}/revoke`, `/events`,
 `/webhooks/midtrans`, `/v1/chat/completions`, and four `/api/admin/*` routes
-(see [admin-surface.md](../admin-surface.md)).
+(see [admin-surface.md](../admin-surface.md)). `pub const ROUTES` in that file is
+the authoritative list.
 
 **Both remaining spec'd routes are now built** (`/dashboard/keys/new`,
 `/dashboard/settings`), so the route table above is complete: every route in
@@ -114,14 +126,15 @@ repeating it.
 > account and balance untouched. The page previously described the flow read-only
 > on the false premise that no routes were mounted; that premise was stale.
 
-**Identity is still PocketBase — this is not an inconsistency.** `src/lib/pocketbase.ts`,
-`login.astro`, `signup.astro` and `verify.astro` speak to PocketBase, and so does the
-server: migration **Phases 6 (identity) and 7 (admin) are not done** and `auth.rs` still
-reads `POCKETBASE_URL`. (No test is `#[ignore]`d any more — the former
-live-PocketBase exchange test now runs against a loopback stub — but the runtime
-identity path still calls PocketBase, so nothing is deployed without it.) `docs/decisions.md` records the **target** — identity Rust-owned — but the
-shipped system is the PocketBase split. What the pages need is rework when Phase 6
-lands, not a fix now.
+**Identity is Rust-owned — the PocketBase split is history.** The pages
+(`login.astro`, `signup.astro`, `verify.astro`, `reset.astro`) speak to this
+crate's native auth routes through `src/lib/auth-api.ts`; `src/lib/pocketbase.ts`
+is deleted and the `pocketbase` npm dependency is gone from `website/package.json`.
+The server side of the migration (Phase 6) has **landed**: `routes/auth.rs` no
+longer reads `POCKETBASE_URL`, `accounts.pb_user_id` is dropped, and
+`POST /auth/exchange` is deleted. Phase 7 (admin) has also landed as the `/admin`
+operator console over the Rust admin routes. The operative description is
+[`architecture/identity.md`](../architecture/identity.md).
 
 **Not verified by this document:** that the islands' request and response shapes
 match `server/src/routes/` field-for-field. Both sides exist; the contract between

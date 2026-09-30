@@ -2,7 +2,8 @@
 
 The Rust API and routing proxy. **This is the entire backend.**
 
-**Responsibility:** auth exchange, wallet, API keys and limits, Midtrans webhook,
+**Responsibility:** native auth (signup, login, Google sign-in, verification,
+password reset), wallet, API keys and limits, Midtrans webhook,
 SSE live updates, and the LLM proxy — plus the reverse-proxy behaviour the retired
 whitepaper first sketched (endpoint resolution, streaming passthrough, wallet
 reservation, usage settlement). The code, not that document, defines what they do
@@ -13,10 +14,12 @@ and operator alerts (see [`telegram/`](../telegram/README.md)).
 
 ## Stack
 
-**Rust, deployed on Northflank.** Money lives in embedded SQLite — a file, not a
-service — and identity comes from PocketBase until Phase 6 replaces it in Rust. See
+**Rust, deployed on Northflank.** Money and identity both live in embedded SQLite —
+a file, not a service. Identity is served natively by this crate: the `accounts` and
+`identities` tables, with Argon2id password hashing owned by Rust. There is no
+PocketBase service and no `POCKETBASE_URL`. See
 [`docs/architecture.md`](../docs/architecture.md) and
-[`docs/plans/sqlite-migration.md`](../docs/plans/sqlite-migration.md).
+[`docs/architecture/identity.md`](../docs/architecture/identity.md).
 
 **Tokio + `axum`** for HTTP, **`sqlx`** (SQLite feature) for storage — the
 framework is fixed by the code, not assumed.
@@ -36,9 +39,10 @@ leaked session cannot spend money.
 (measured 2026-09-27),
 against a migrated temp SQLite file per test (`src/test_support.rs`) — no database
 server to start and no `DATABASE_URL` needed. Nothing is `#[ignore]`d any more: the
-former live-PocketBase exchange test was replaced by a loopback stub, so the whole
-suite runs by default. Identity still enters through PocketBase at runtime, where a
-live `POCKETBASE_URL` is required (migration Phase 6 moves it into Rust).
+former live-PocketBase exchange tests were deleted with the provider they exercised,
+so the whole suite runs by default. Identity is served natively by this crate — the
+`accounts` and `identities` tables in embedded SQLite — so there is no PocketBase to
+reach and no `POCKETBASE_URL` to set.
 
 Migrations are applied by the `migrate` binary, never on boot:
 

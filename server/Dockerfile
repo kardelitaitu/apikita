@@ -85,9 +85,9 @@ RUN touch src/main.rs src/lib.rs \
 # -----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
-# ca-certificates: the proxy and the auth exchange make outbound TLS calls to
-# upstream providers and to PocketBase, so the CA bundle is a hard requirement,
-# not a nicety. tini is the PID 1 init: the server is a tokio process that
+# ca-certificates: the proxy and the auth endpoints make outbound TLS calls to
+# upstream providers and to Google's JWKS (and SMTP), so the CA bundle is a hard
+# requirement, not a nicety. tini is the PID 1 init: the server is a tokio process that
 # spawns work, and without a real init a container stop signals only PID 1
 # instead of the process group - which turns a graceful shutdown into a timeout
 # and a SIGKILL. wget comes from busybox: a HEALTHCHECK needs an HTTP client,

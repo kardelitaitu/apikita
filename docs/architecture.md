@@ -3,7 +3,16 @@
 The system, end to end. This document **supersedes** the stack choices in
 [website/01-architecture.md](website/01-architecture.md); that file covers the
 frontend's internal structure and is still useful, but where it names
-PocketBase or Pages Functions, this document wins.
+Pages Functions or the retired PocketBase service, this document wins.
+
+> **Identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, and the
+> PocketBase HTTP client is gone from `server/`. Identity is served natively by
+> this crate (`accounts` + `identities`, Argon2id), in the same embedded SQLite
+> file as money. Sections below that still describe a PocketBase hybrid are kept
+> only as the reasoning that led here;
+> [`architecture/identity.md`](architecture/identity.md) is the operative
+> description.
 
 **Changing the code?** [testing.md](testing.md) is the one to read before you
 add a rule, a guard or a test — it records what this suite does check, the one
@@ -18,8 +27,8 @@ built here, measured, and rejected.
 | **Website** | Cloudflare Pages | **Astro** + islands | Marketing, signup, dashboard |
 | **Edge relay** | Cheap Linux VPS (2 vCPU / 4 GB) | nginx + Docker | TLS, filtering, flood absorption |
 | **API + proxy** | Northflank | **Rust** | Wallet, keys, LLM proxy, limits, webhooks |
-| **Database** | Northflank, inside the API process | **SQLite** | All persistent state except identity |
-| **Auth** | Northflank | **PocketBase** | Google + password, verify, reset. Auth ONLY. |
+| **Database** | Northflank, inside the API process | **SQLite** | All persistent state — money and identity |
+| **Identity** | Northflank, inside the API process | **Rust** | Google + password, verify, reset. `accounts` + `identities`, Argon2id. No separate service. |
 
 There is no database server to run, reach or secure. SQLite is a library: the API
 opens one file on its own persistent volume. That removes a container and a network
@@ -111,74 +120,74 @@ failure responses — is in [`deployment.md`](deployment.md).**
 the previous frontend version for at least one release; the frontend never
 assumes an endpoint exists without handling its absence.
 
-## Authentication — PocketBase for auth ONLY
+## Authentication — served by this crate
 
-**Decision:** PocketBase handles authentication. SQLite holds everything else.
+**Decision:** identity is served natively by the Rust server, in the same embedded
+SQLite file as money. `accounts` + `identities` are the store; Argon2id hashing is
+owned here. This is the **landed** state of the Phase 6 identity port: the
+`accounts.pb_user_id` column is dropped and there is no external auth service to
+run, reach or back up. The full description is
+[`architecture/identity.md`](architecture/identity.md).
 
-This is a deliberate tradeoff: PocketBase already solves password hashing, email
-verification, password reset, Google OAuth2, OTP, and MFA. Rebuilding those in
-Rust costs weeks and introduces new ways to get security wrong. Accepting a second
-system buys that back.
+The section that follows is kept as the reasoning that produced this shape. It
+described the earlier PocketBase hybrid — a deliberate tradeoff at the time:
+PocketBase already solved password hashing, email verification, password reset,
+Google OAuth2, OTP and MFA, and rebuilding those in Rust costs weeks. The port
+has since been paid for; the tradeoff is history, and the invariants it produced
+(one authority for money, Rust issues its own session, never hard-delete a
+funded account) are what survived.
 
-**The constraint that makes this work: PocketBase owns NOTHING but identity.**
+**The constraint that makes this work: the money store owns NOTHING but money.**
 
 | Concern | Owner |
 | --- | --- |
-| Accounts, passwords, Google login, verification, reset | **PocketBase** |
+| Accounts, passwords, Google login, verification, reset | **SQLite** (`accounts`, `identities`) |
 | Wallet, keys, limits, top-ups, usage, ledger | **SQLite** |
 | Authorization (who may spend what) | **Rust** |
 
-### What PocketBase must NOT hold
+### What the money tables must NOT hold
 
 - **No wallet balance.** Not a field, not a relation.
 - **No API keys.**
 - **No usage or billing data.**
 
-The moment money lives in PocketBase, the identity system and the ledger can
-diverge, and reconciling them becomes a manual job on every incident.
+The moment money lives in the identity tables, the identity system and the ledger
+can diverge, and reconciling them becomes a manual job on every incident.
 
 ### The account key — the decision that matters
 
-SQLite and PocketBase must agree on what an account *is*.
-
-**Chosen: SQLite owns the account ID; PocketBase's user id is a linked column.**
-Phase 6 drops the link — `accounts.id` becomes the only key, and the identity
-tables below it become the source.
+`accounts.id` is the only key. It is the account, and the identity rows below it
+(`identities.account_id`) point at it.
 
 ```sql
 -- Schema: server/migrations/20260925000000_initial_schema.sql (source of truth)
--- accounts: id (TEXT PK), pb_user_id (UNIQUE -> PocketBase), status,
---           is_operator, created_at, updated_at
+-- accounts: id (TEXT PK), status, is_operator, created_at, updated_at
+--           (pb_user_id was DROPPED by 20260930000000_identity_port.sql)
 ```
 
-**Why not reuse PocketBase's id as the primary key everywhere.** It would be one
-join key instead of two, which is genuinely simpler. But it makes every foreign
-key in the money schema depend on PocketBase's id format and its continued
-existence. Auth is the component **most likely to change** — you just changed it
-once already. Do not let it own the primary key of the ledger.
-
-The cost is one extra resolution on login: exchange a PocketBase token for
-`pb_user_id`, then look up `accounts`. That happens once per session, not per
-request.
+**Why the account id is not an identity-provider id.** Reusing an external id
+would be one join key instead of two, which is genuinely simpler. But it makes
+every foreign key in the money schema depend on that provider's id format and its
+continued existence. Auth is the component **most likely to change** — and it has
+now changed once already. It does not own the primary key of the ledger.
 
 ### The login flow
 
 ```
-1. browser -> PocketBase: authenticate (Google or email+password)
-2. PocketBase returns an auth token
-3. browser -> Rust: exchange that token
-4. Rust verifies the token with PocketBase, extracts pb_user_id
-5. Rust finds/creates accounts row, issues its OWN session cookie
-6. all further API calls use the Rust session cookie
+1. browser -> Rust: POST /auth/google (Google ID token) or /auth/login (email+password)
+2. Rust verifies the credential against its own `identities` rows (Argon2id)
+3. Rust finds/creates the accounts row and its wallet
+4. Rust issues its OWN opaque session cookie
+5. all further API calls use the Rust session cookie
 ```
 
-> **The concrete DDL lives in [`website/02-data-model.md`](website/02-data-model.md).** It is
-> reproduced here only as a field summary — a second copy of the schema drifted
-> once already (it was missing `is_operator` and the session audit columns).
+> **The concrete DDL lives in [`architecture/identity.md`](architecture/identity.md).**
+> The retired PostgreSQL design in [`website/02-data-model.md`](website/02-data-model.md)
+> is kept as history only — a second copy of the schema drifted once already.
 
-**Rust issues its own session.** The PocketBase token is exchanged once and not
-used as the API credential. That keeps PocketBase off the hot path and means the
-rest of the system never has to speak PocketBase's token format.
+**Rust issues its own session.** The upstream credential is checked once at sign-in
+and never used as the API credential, so the rest of the system never has to speak
+a provider's token format.
 
 ### Sessions (in SQLite)
 
