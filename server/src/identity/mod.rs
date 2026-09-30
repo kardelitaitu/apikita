@@ -51,6 +51,7 @@
 //!   unreviewed writer is the whole threat model.
 
 pub mod accounts;
+pub mod email;
 pub mod google;
 pub mod password;
 pub mod tokens;
