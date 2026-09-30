@@ -288,12 +288,14 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       control` (`website/tests/landing-claims.test.ts`) asserts presence, the named
       jurisdiction, AND the ORDERING — because the claim is "before the first request",
       not "exists somewhere" (`privacy.astro` alone would not satisfy it).
-      **Provisional:** the disclosure text and its test are independent of the identity
-      provider, and the FORM around it has been ported — the signup script now calls
-      `website/src/lib/auth-api.ts` (`signupRequest`, `googleSignIn`) and
-      `website/src/lib/auth-flow.ts`, and `website/src/lib/pocketbase.ts` is deleted,
-      so this box holds end to end. No identity service is part of this deployment;
-      identity is served by the Rust crate.
+      **Was provisional, and no longer is.** This box was ticked while the disclosure
+      text and its test were already correct but the FORM around them still belonged to
+      a different identity provider, so the claim "before the first request" was pinned
+      only for the disclosure. The port has since closed that gap: the signup script
+      calls `website/src/lib/auth-api.ts` (`signupRequest`, `googleSignIn`) and
+      `website/src/lib/auth-flow.ts`, `website/src/lib/pocketbase.ts` is deleted, and
+      the crate serves identity itself. No identity service is part of this deployment,
+      so the box holds end to end with nothing outstanding behind it.
 - [x] Top-up screen states the fee and the non-refundable policy before payment.
       The wallet page (`website/src/pages/dashboard/wallet.astro`) states the non-refundable policy
       and the 2-year expiry, and the header flags that first-deposit and top-up minimums
