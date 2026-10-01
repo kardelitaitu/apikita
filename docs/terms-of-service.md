@@ -295,9 +295,29 @@ function for.
 
 ## 10. Contact and complaints
 
+**NOT YET WRITTEN — this section is a requirements list, not a clause.** It says what must
+be true; it does not yet say it, and it names no channel. That distinction matters because
+the launch table below asserts an abuse contact is enforced by "Terms + an abuse contact",
+and today this document contains **no address, URL or named form anywhere** (checked, not
+assumed: a scan for any email or http URL in this file returns zero).
+
+Required before launch:
+
 - A real channel that is monitored.
 - Response expectation.
 - **A stated path for content or billing complaints**, since both will occur.
+
+**Why it cannot be written from this repository.** The address must be one that is actually
+monitored, and no mailbox exists — `docs/abuse-runbook.md` tracks the same item as open,
+and there is no `abuse@` anywhere in the tree (checked). Writing a plausible-looking
+address into a legal document would be worse than the gap, because the Terms would then
+make a promise no one is keeping — the same failure mode this document's own warning about
+"a policy claiming something the code does not do" describes.
+
+**The dependency is a decision plus a mailbox**, not code. Until both exist, the launch
+table row for the abuse contact is **unmet on the Terms half as well as the operational
+half**, and this heading is the place that says so out loud rather than reading as a
+finished clause.
 
 ## What must be true at launch
 
@@ -306,7 +326,7 @@ function for.
 | Cross-border forwarding disclosed before first use | Signup + pre-topup notice |
 | Non-refundable stated (no exception during operation) | Terms + top-up screen |
 | Wind-down payout stated | Terms + top-up screen |
-| Acceptable use published and linked | Terms + an abuse contact |
+| Acceptable use published and linked | Terms + an abuse contact — **the abuse contact half is NOT written**; see §10 |
 | Prompts genuinely not stored | Code review; see [`data-retention.md`](data-retention.md) |
 | Retention periods stated accurately | Matches the schema |
 
@@ -323,9 +343,20 @@ not do is worse than no policy, because it is a demonstrable false statement.
       *runbook* is written; the code is not, and there is no disbursement rail.
 - [x] ~~Credit expiry: yes or no, and for how long.~~ **Settled: 2 years from
 deposit date, per deposit** (see §Expiry). The *implementation* below is still open.
-- [ ] Credit expiry **implementation**: a schema field for per-deposit expiry, a
-      sweep job, and refusal of a spend against expired credit. The policy is settled;
-      the code is not written.
+- [x] ~~Credit expiry **implementation**: a schema field for per-deposit expiry, a
+      sweep job, and refusal of a spend against expired credit.~~ **Built, except the
+      last clause — and the last clause is deliberate.** `topups.credit_expires_at` is
+      stamped at settlement in the same statement that records it; `db::expire_credit`
+      retires aged deposits oldest-first and runs in the `usage-purge` binary. There is
+      **no spend-time refusal**: expiry is honoured to the sweep's cadence, so credit
+      that ages out after the last run stays spendable until the next one. That is a
+      decision, not an omission — `try_debit` checking expiry too would be a SECOND
+      definition of when credit dies, and two definitions is how a rule stops being
+      trusted. See `decisions.md`, "Credit expiry: implementation".
+      > **This line said "the code is not written" and was stale.** The column, the
+      > sweep and the binary wiring all exist and are tested; only the spend-time
+      > refusal is absent, on purpose. Corrected rather than deleted so the next reader
+      > can see which half was real.
 - [ ] Whether an entity (PT) exists to contract with, or a personal account — see
       [`business/05-risk.md`](business/05-risk.md) R1.
 - [ ] Complaint handling process, and who owns it.

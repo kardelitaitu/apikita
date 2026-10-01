@@ -36,6 +36,16 @@ business can operate at all.
       §"Genuinely open": outbound transfers without a PT, PP 55/2022 on refunded
       revenue, KYC/AML on a payee identified by email, and unclaimed balances.
 - [ ] Publish the Terms of Service, including the cross-border forwarding disclosure.
+      **The document cannot be published as it stands, and not only for legal reasons:**
+      §10 "Contact and complaints" is a requirements list rather than a clause, and the
+      document contains **no address, URL or named form anywhere** (checked — a scan for
+      any email or http URL in it returns zero). The abuse-contact row of its own "What
+      must be true at launch" table is therefore unmet on the ***Terms* half as well as
+      the operational half**. Writing a plausible address would make the published Terms
+      promise a channel nobody monitors, which is the failure that table's own warning
+      ("a policy claiming something the code does not do") describes. **Blocked on a
+      mailbox and an owner, not on code** — tracked in
+      [`abuse-runbook.md`](abuse-runbook.md) as well, so the two agree.
 - [ ] Publish a privacy policy matching [`data-retention.md`](data-retention.md).
 
 **Do not take a single deposit before this gate closes.** Wallet funds collected

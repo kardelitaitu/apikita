@@ -229,5 +229,13 @@ PocketBase admin UI to reach for: that service does not exist.
 - [ ] Thresholds for behavioural abuse signals — **starting values exist** in
       [`ip-tracking.md`](ip-tracking.md) §Abuse signals; they need tuning against real
       traffic before they are trusted.
-- [ ] An abuse-report contact, published in the terms.
+- [ ] An abuse-report contact, published in the terms. **Two halves, both missing.**
+      There is no mailbox (no `abuse@` anywhere in the tree — checked) and no page that
+      publishes one: [`terms-of-service.md`](terms-of-service.md) §10 "Contact and
+      complaints" is a requirements list, not a clause, and that document contains no
+      address, URL or named form at all. §10 now says so explicitly rather than reading
+      as a finished clause. Writing a plausible address would be worse than the gap —
+      the Terms would promise a channel nobody monitors, which is the exact failure the
+      doc's own warning about "a policy claiming something the code does not do" names.
+      **Neither half is code**, so this cannot be closed from this repository.
 - [ ] Whether abuse detection warrants a limited-retention prompt sampling policy.
