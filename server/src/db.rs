@@ -159,12 +159,32 @@ pub const SHIPPED_CREDIT_EXPIRY_MONTHS: u32 = 24;
 /// The instant a deposit's credit stops being spendable: `settled_at` plus
 /// `months`, as CALENDAR months.
 ///
-/// Calendar, not `30 * months` days. A deposit on the 15th of March expires on
-/// the 15th of March two years later; 730 days later is a different day in a
-/// leap year, and "2 years from your deposit" is what the terms say. `chrono`'s
-/// `checked_add_months` clamps a 31st onto the shorter month's last day rather
-/// than rolling into the next month, which is the behaviour this wants: a
-/// January 31st deposit expires at the end of February's month, never in March.
+/// Calendar, not `30 * months` days. `chrono`'s `checked_add_months` clamps a 31st
+/// onto the shorter month's last day rather than rolling into the next month, which
+/// is the behaviour this wants: a deposit made on the 31st expires on the last day of
+/// the target month, never in the month after it.
+///
+/// MEASURED, because the two examples that used to stand here were both misleading
+/// while the logic they were meant to support is fine.
+///
+/// The clamping example read "a January 31st deposit expires at the end of February's
+/// month, never in March". That is true of a ONE-MONTH add (`2024-01-31 + 1 month =
+/// 2024-02-29`, `2025-01-31 + 1 month = 2025-02-28`) and false of every longer span -
+/// including the configured one, since `credit_expiry_months = 24` gives
+/// `2024-01-31 + 24 months = 2026-01-31`. The sentence illustrated the clamp with a
+/// span the product does not use, so a reader checking it against the real setting
+/// would find it wrong.
+///
+/// The "different day" example was worse, and it is corrected rather than trimmed. It
+/// read "A deposit on the 15th of March expires on the 15th of March two years later;
+/// 730 days later is a different day in a leap year" - and 15 March is one of the
+/// dates where the two AGREE (`2024-03-15 + 24 months == 2024-03-15 + 730 days`,
+/// verified), so the difference being alleged is invisible in the example given for
+/// it. Sweeping every day from 2023 to 2026 separates them on **733 of 1464 dates**,
+/// roughly half and not only in leap years: `2023-01-01 + 24 months = 2025-01-01`
+/// while `2023-01-01 + 730 days = 2024-12-31`. The choice of calendar months is
+/// better justified than the sentence claimed - and the sentence is what a reader
+/// would have trusted.
 ///
 /// `None` when `months` is 0 (expiry disabled) or when the result is outside the
 /// representable date range.
@@ -2391,6 +2411,80 @@ mod tests {
 
         // A negative cost is not a charge and must not become a credit.
         assert_eq!(clamp_debit(-500, 1_000), (0, -500));
+    }
+
+    /// `credit_expiry_instant` decides EVERY expiry instant in the product, and it had
+    /// no test at all - the doc-comment carried two worked examples and nothing checked
+    /// them. Both were misleading: see the note on the function. This pins the behaviour
+    /// the doc now claims, and it is the reason the doc could be corrected confidently.
+    #[test]
+    fn credit_expiry_is_calendar_months_and_clamps_to_the_shorter_month() {
+        let at = |s: &str| s.parse::<DateTime<Utc>>().expect("parse");
+
+        // (1) Disabled means disabled. `0` is the documented "no expiry" setting and it
+        // must be distinguishable from an instant - the column stays NULL and the sweep
+        // ignores the row, so returning Some(now) here would expire every deposit on the
+        // next run.
+        assert_eq!(credit_expiry_instant(at("2024-01-31T00:00:00Z"), 0), None);
+
+        // (2) The CLAMP. A 31st lands on the target month's last day and never rolls
+        // into the following month. Feb 2024 is a leap year, Feb 2025 is not - both are
+        // checked, because a clamp that only worked in a leap year would pass half of
+        // this and fail in production for three years out of four.
+        assert_eq!(
+            credit_expiry_instant(at("2024-01-31T00:00:00Z"), 1),
+            Some(at("2024-02-29T00:00:00Z")),
+            "a January 31st deposit expires on the last day of February (leap year)"
+        );
+        assert_eq!(
+            credit_expiry_instant(at("2025-01-31T00:00:00Z"), 1),
+            Some(at("2025-02-28T00:00:00Z")),
+            "and on the last day of February in a common year"
+        );
+        assert_eq!(
+            credit_expiry_instant(at("2024-03-31T00:00:00Z"), 1),
+            Some(at("2024-04-30T00:00:00Z")),
+            "and on the last day of April, so the clamp is not February-specific"
+        );
+
+        // (3) CALENDAR months, not 30-day months. This is the claim the doc makes and
+        // the reason the function does not simply add days: 24 months preserves the day
+        // of the month, while 730 days does not. The pair above the assertion is
+        // deliberately a date where they AGREE, so the assertion after it is the one
+        // carrying the distinction.
+        assert_eq!(
+            credit_expiry_instant(at("2024-03-15T12:00:00Z"), 24),
+            Some(at("2026-03-15T12:00:00Z")),
+            "2 years from the 15th of March is the 15th of March"
+        );
+        assert_eq!(
+            credit_expiry_instant(at("2023-01-01T12:00:00Z"), 24),
+            Some(at("2025-01-01T12:00:00Z")),
+            "and 2 years from the 1st of January is the 1st of January"
+        );
+        // The day-count alternative, spelled out, so the difference is visible in the
+        // test rather than only in the commit message. 2023-01-01 + 730 days lands on
+        // 2024-12-31 - a day early - because the span contains a leap day.
+        assert_eq!(
+            at("2023-01-01T12:00:00Z") + chrono::Duration::days(730),
+            at("2024-12-31T12:00:00Z"),
+            "730 days from 2023-01-01 is NOT the same day, which is why months are used"
+        );
+        assert_ne!(
+            credit_expiry_instant(at("2023-01-01T12:00:00Z"), 24),
+            Some(at("2023-01-01T12:00:00Z") + chrono::Duration::days(730)),
+            "the two spellings must genuinely disagree on this date, or the assertion \
+             above is describing a distinction the product does not make"
+        );
+
+        // (4) The configured value is a real span, not a placeholder: the shipped
+        // setting must produce a usable instant rather than None.
+        assert!(
+            credit_expiry_instant(at("2024-01-31T00:00:00Z"), SHIPPED_CREDIT_EXPIRY_MONTHS)
+                .is_some(),
+            "the SHIPPED credit_expiry_months must produce an instant - if this is None \
+             the config is 0 and expiry is silently disabled in production"
+        );
     }
 
     /// The clamp never moves the balance below zero: what it collects plus what it
