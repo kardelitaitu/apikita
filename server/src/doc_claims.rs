@@ -2705,4 +2705,253 @@ mod tests {
             );
         }
     }
+
+    /// Every line citation OUTSIDE docs/ still points at a file that exists and is long
+    /// enough to contain the line.
+    ///
+    /// THE HOLE THIS CLOSES. `every_document_under_docs_is_either_citation_checked_or_triaged`
+    /// walks `docs/`, and `operational_docs_cite_code_by_name_and_never_by_line` checks the
+    /// documents on `OPERATIONAL_DOCS`. Both are scoped to `docs/` by their names, so a
+    /// markdown file ANYWHERE ELSE was covered by neither - and the rule the two of them
+    /// state, that a claim has to be checkable, does not stop applying because of a
+    /// directory. Measured when this was written: 31 such files, **10 carrying 35 line
+    /// citations**, including `config/provider1.md` (the file the reseller terms live in) and
+    /// `tools/wind-down/README.md` (13 on its own).
+    ///
+    /// WHY IT CHECKS EXISTENCE AND NOT CONTENT. Whether the cited line still says what the
+    /// document claims is a judgement no scanner can make - that is the whole argument for
+    /// citing by name. What a scanner CAN decide is whether the target exists and is long
+    /// enough, and that catches the drift that actually happens: a file renamed, deleted, or
+    /// shortened so the line number now points into the void. `tools/wind-down-check` and
+    /// `tools/alert-check` assert their own READMEs' claims; this covers the rest.
+    ///
+    /// A BARE FILENAME IS RESOLVED BY BASENAME, because that is how the documents write it -
+    /// `account.rs:388`, not `server/src/routes/account.rs:388` - and a reader resolves it the
+    /// same way. Ambiguity is accepted rather than flagged: the point is that the target is
+    /// reachable, not that it is unique.
+    #[test]
+    fn line_citations_outside_docs_point_at_files_that_can_contain_them() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+        // A RECURSIVE WALK NEEDS A FLOOR, per the note at the top of this module: if the
+        // walk silently reads nothing, every assertion below passes over an empty set. The
+        // floor is set with slack below the measured 35, so ordinary editing does not trip
+        // it but a broken walk does.
+        const MIN_CITATIONS_EXPECTED: usize = 25;
+
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_markdown_excluding_docs(&root, &root, &mut files);
+
+        let mut checked = 0usize;
+        let mut problems: Vec<String> = Vec::new();
+
+        for path in &files {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let shown = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            for line in text.lines() {
+                for (target, number) in citations_in(line) {
+                    checked += 1;
+                    // As written, then relative to the citing document's own directory.
+                    let mut candidates = vec![root.join(&target)];
+                    if let Some(dir) = path.parent() {
+                        candidates.push(dir.join(&target));
+                    }
+                    let resolved = candidates.into_iter().find(|c| c.is_file());
+
+                    let Some(resolved) = resolved else {
+                        // A bare `account.rs:388` names no directory. Resolve by basename,
+                        // the way the reader does.
+                        let base = std::path::Path::new(&target)
+                            .file_name()
+                            .map(|b| b.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        match find_by_name(&root, &base) {
+                            Some(found) => {
+                                check_length(&found, number, &shown, &target, &mut problems);
+                            }
+                            None => problems.push(format!(
+                                "{shown} cites `{target}:{number}`, and no file by that name \
+                                 or path exists anywhere in the repository"
+                            )),
+                        }
+                        continue;
+                    };
+                    check_length(&resolved, number, &shown, &target, &mut problems);
+                }
+            }
+        }
+
+        assert!(
+            checked >= MIN_CITATIONS_EXPECTED,
+            "only {checked} citation(s) were found outside docs/, below the floor of \
+             {MIN_CITATIONS_EXPECTED}. The walk is reading the wrong tree, and every \
+             assertion below it is vacuous."
+        );
+        assert!(
+            problems.is_empty(),
+            "these citations outside docs/ point somewhere that cannot hold them:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// Marks down a citation whose target exists but is shorter than the line it names.
+    fn check_length(
+        target: &std::path::Path,
+        number: usize,
+        shown: &str,
+        as_written: &str,
+        problems: &mut Vec<String>,
+    ) {
+        let Ok(text) = std::fs::read_to_string(target) else {
+            return;
+        };
+        let lines = text.lines().count();
+        if number > lines {
+            problems.push(format!(
+                "{shown} cites `{as_written}:{number}`, but that file has {lines} lines - \
+                 the citation points past the end, so the reader finds nothing"
+            ));
+        }
+    }
+
+    /// All `file.ext:N` citations on one line, as (path, line number) pairs.
+    fn citations_in(line: &str) -> Vec<(String, usize)> {
+        let mut found = Vec::new();
+        for ext in CITED_EXTENSIONS {
+            let needle = format!(".{ext}:");
+            let mut from = 0;
+            while let Some(at) = line[from..].find(&needle) {
+                let dot = from + at;
+                // The extension ENDS at the ':', so the path token is everything up to the
+                // ':' - NOT up to and including it. Walking back from `dot + needle.len()`
+                // starts on a ':' and stops immediately, yielding an empty path; that was
+                // the bug here, and it made this test find ZERO citations of 35.
+                let colon = dot + needle.len() - 1;
+                let digits: String = line[colon + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                let Ok(number) = digits.parse::<usize>() else {
+                    from = colon + 1;
+                    continue;
+                };
+                let stem: String = line[..colon]
+                    .chars()
+                    .rev()
+                    .take_while(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\')
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let path = stem.trim_end_matches('.').to_string();
+                if !path.is_empty() {
+                    found.push((path, number));
+                }
+                from = colon + 1 + digits.len();
+            }
+        }
+        found
+    }
+
+    /// `citations_in` finds what it is supposed to, including the shapes the documents
+    /// actually use. Written because the first version silently returned NOTHING for every
+    /// input - it walked back from the ':' rather than to it - and the floor on the caller
+    /// is the only reason that was visible.
+    #[test]
+    fn the_citation_extractor_finds_paths_with_and_without_directories() {
+        for (line, expected) in [
+            (
+                "see `server/src/db.rs:255-271` for the rule",
+                vec![("server/src/db.rs", 255)],
+            ),
+            (
+                "(account.rs:388) calls .basic_auth",
+                vec![("account.rs", 388)],
+            ),
+            (
+                "rule (03-functional-spec.md:121).",
+                vec![("03-functional-spec.md", 121)],
+            ),
+            (
+                "docs/launch-checklist.md:277",
+                vec![("docs/launch-checklist.md", 277)],
+            ),
+        ] {
+            let got = citations_in(line);
+            let want: Vec<(String, usize)> = expected
+                .into_iter()
+                .map(|(p, n)| (p.to_string(), n))
+                .collect();
+            assert_eq!(got, want, "extractor disagreed about: {line}");
+        }
+        // A line with no citation yields nothing, so the walk is not matching prose.
+        assert!(citations_in("Gate 5: the launch gates").is_empty());
+        assert!(citations_in("version 1.5: released").is_empty());
+    }
+
+    /// Every markdown file under `root`, skipping `docs/` (covered elsewhere) and any
+    /// directory that is not source.
+    fn collect_markdown_excluding_docs(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        out: &mut Vec<std::path::PathBuf>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if matches!(
+                    name.as_str(),
+                    "docs" | "node_modules" | "target" | ".git" | "dist" | ".astro"
+                ) {
+                    continue;
+                }
+                collect_markdown_excluding_docs(&path, root, out);
+            } else if name.ends_with(".md") {
+                out.push(path);
+            }
+        }
+        let _ = root;
+    }
+
+    /// A file with this basename, anywhere under `root`. Depth-first, and the shortest path
+    /// wins so a tie between two same-named files resolves deterministically.
+    fn find_by_name(root: &std::path::Path, base: &str) -> Option<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, base: &str, hits: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if matches!(
+                        name.as_str(),
+                        "node_modules" | "target" | ".git" | "dist" | ".astro"
+                    ) {
+                        continue;
+                    }
+                    walk(&path, base, hits);
+                } else if name == base {
+                    hits.push(path);
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        walk(root, base, &mut hits);
+        hits.sort_by_key(|p| p.as_os_str().len());
+        hits.into_iter().next()
+    }
 }
