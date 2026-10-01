@@ -54,7 +54,8 @@ Measured with a verified mutation battery (8 mutations, each confirmed to have l
 | exit-8 precondition | **yes** |
 | restored `integrity_check` | no |
 | restored-drift assertion | no |
-| wallet spot-check / row counts | no |
+| wallet spot-check | no -- reachable, and unpinned (see below) |
+| row-count comparison | no -- and unreachable in the desync scenario |
 | `LOW == LIVE_LOW` refusal branch | no |
 
 **Why the four are structural rather than missing tests:**
@@ -65,8 +66,31 @@ Measured with a verified mutation battery (8 mutations, each confirmed to have l
 - **restored drift, spot-check, row counts** -- all three compare the SNAPSHOT against the
   RESTORED COPY OF THE SAME SNAPSHOT, so they are equal by construction. The
   `ROLLBACK_INJECT_RESTORED` and `ROLLBACK_INJECT_SPOTCHECK` hooks *do* make the drill
-  fail, but they trip the restored-drift assertion first, so the later comparisons are
-  never reached.
+  fail, but they trip an EARLIER assertion first, so the later comparisons are never
+  reached.
+
+  **WHICH earlier assertion, corrected: it is the SPOT-CHECK, not the restored-drift.**
+  This paragraph used to say "they trip the restored-drift assertion first", which is wrong
+  in a way that changes the shape of the gap. The drill runs its three comparisons in the
+  order restored-drift, spot-check, row-count, and the `SPOTCHECK` hook edits the SNAPSHOT
+  (which only the spot-check and the row count read), so it fires the SPOT-CHECK and exits
+  from inside that block.
+
+  Measured one mutation at a time on a stable baseline, which separates the three rows of
+  this table from each other:
+
+      neuter `SRC_BAL != DST_BAL`   (spot-check)  -> check SURVIVED
+      neuter `SRC_ROWS != DST_ROWS` (row count)   -> check SURVIVED
+      neuter BOTH                                 -> check FAILED
+
+  So the spot-check is **reachable and unpinned** -- the desync injection also deletes a row,
+  so the `A|B` match in the desync block is satisfied by the row-count message while the
+  spot-check comparison is dead. The row count is **unreachable**. The two are not a pair
+  and this table previously listed them as one line; they are now stated separately above.
+
+  An attempt to "fix" the `A|B` match by requiring both messages was made and reverted: with
+  the spot-check binding, the row-count message is never printed, so requiring it asserts an
+  unreachable thing and the check goes red on a clean tree.
 - **the `LOW == LIVE_LOW` branch** -- the explicit live-looking refusals are separate code
   paths, so neutering this one leaves them working.
 
@@ -74,6 +98,25 @@ These are covered by **reading the drill**, not by this check. If that is not go
 the right fix is to **delete the redundant assertions** rather than to add a test that
 appears to cover them -- a check whose README implies total coverage is the exact defect
 this directory exists to catch.
+
+**AND NO OTHER GATE COVERS THEM EITHER, which was worth checking rather than assuming.**
+`tools/drill-check/` also exercises this drill, and its header claims to test that "a
+DRIFTED source FAILS" -- so it looked as though the restored-drift assertion might be pinned
+there even though it is not pinned here. It is not: neutering `if [ "$RESTORED_RC" -ne 0 ]`
+at `drill.sh:643` leaves **both** `rollback-check` and `drill-check` green.
+
+That makes the restored-drift the most consequential of the four. It is the assertion that
+fails when the RESTORED database does not reconcile, which is the failure the drill exists to
+catch; `docs/backup-and-restore.md` states the reconciliation result as a **pass criterion**
+("Zero rows from the reconciliation query is the gate"); and deleting the assertion is
+invisible to every automated gate. `drill-check`'s drifted-source test exercises the
+*precondition* path (step 5, on the damaged source), not this one (step 7, on the restored
+copy) -- two different checks that both read as "drift".
+
+Nothing here is broken. What this note is for is that a reader who greps for a guard on the
+restored-drift assertion finds two gate directories and, on both, a passing check. The
+protection is a sentence in this README, and it is now a sentence that says so explicitly.
+
 
 ## A note on measurement, because it cost two rounds
 
@@ -95,6 +138,35 @@ sh tools/rollback-check/check.sh     # exit 0 = all assertions held
 It builds throwaway databases under `.agents/` and removes them via `trap ... EXIT INT
 TERM`. Needs `sqlite3` and POSIX `sh`; no network, no service container, no `DATABASE_URL`,
 no Rust build.
+
+### Run ONE AT A TIME
+
+**This check is not safe to run concurrently with itself**, and the failure it produces does
+not look like a collision. Measured, twice, on a clean copy of the tree:
+
+| | result |
+| --- | --- |
+| two runs, serial | `0`, `0` |
+| two runs, started together | **`1`, `1`** |
+| serial again afterwards | `0` — it does not persist |
+
+Both concurrent runs fail, and they fail with *specific, alarming* diagnostics rather than an
+obvious resource error — for example *"the un-injected control run must PASS, got exit 4"* and
+*"the wrong-version run exited 7 but did not report a SCHEMA VERSION MISMATCH"*. A reader who
+sees that would reasonably conclude the drill is broken.
+
+**Why.** `check.sh` builds its scratch under one fixed root per repository
+(`ROLLBACK_CHECK_WORK`, defaulting to `.agents/rollback-check-work`), with no per-process
+isolation, so two runs share a working tree and each sees the other's half-built databases.
+The override exists — `ROLLBACK_CHECK_WORK=/some/other/dir` gives a run its own space — which
+is the way to parallelise if you must.
+
+**Why this is written here rather than left to the note above.** The note at
+["A note on measurement"](#a-note-on-measurement-because-it-cost-two-rounds) records what
+contention did to *one mutation battery's* numbers. This is the property itself, and it
+belongs beside "Running it", where someone about to run the check will see it. A check that
+fails under a parallel harness, with a message that blames the system under test, is worth one
+sentence of warning.
 
 ## CI
 
