@@ -311,12 +311,23 @@ The wallet ledger is the business.
       running it against the real schema**, the same prerequisite the restore drill has.
 - [ ] Staging environment, or deploy straight to production? (Currently no staging
       is specified anywhere.)
-- [ ] **The maintenance scheduler is not deployed, and this procedure does not mention it.**
-      Every recurring job the system relies on runs from **one container**: the `scheduler`
-      service (`.docker/maintenance/`, `maintenance-entrypoint.sh`), whose `run_wired_jobs`
-      calls `run_retention`, `run_reconcile`, `run_hold_sweep`, `run_alert_checks` and
-      `run_alert_probes`. It is **not** a step in the pipeline above, and **no section of this
-      document names it**. The word `scheduler` does not appear in this file at all.
+- [ ] **The maintenance scheduler is not deployed.** Every recurring job the system relies on
+      runs from **one container**: the `scheduler` service (`.docker/maintenance/`,
+      `maintenance-entrypoint.sh`), whose `run_wired_jobs` calls `run_retention`,
+      `run_reconcile`, `run_hold_sweep`, `run_alert_checks` and `run_alert_probes`. It is
+      **not** a step in the pipeline above, and **no other section of this document names
+      it** — this item is the only place it appears.
+      > **This item is also the correction of its own measurement, and the wording matters.**
+      > Before this was written, the word `scheduler` and the word `maintenance` appeared in
+      > this file **zero times** while `server` appeared 52 — which is what made the omission
+      > a deployment-step gap rather than a docs nit, and that count is what the sentence
+      > used to report. Left as written it became false the moment it was committed: a
+      > sentence asserting "the word `scheduler` does not appear in this file at all" IS the
+      > word appearing in the file, so a reader arriving after the fix finds the claim
+      > contradicted by the paragraph carrying it. The measurement is therefore stated in the
+      > past tense, as what was true of the file BEFORE, which is the only form a correction
+      > can take without refuting itself. Same shape as every other note in this repository
+      > that records a defect it also fixes.
       > **Why it is easy to miss.** The jobs are written, tested and CI-smoked, and several
       > documents describe the scheduler as *what enforces retention* — so every retention
       > and expiry claim reads as satisfied. But a job that is built and smoked is still a
