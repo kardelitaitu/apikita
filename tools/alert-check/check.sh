@@ -94,6 +94,13 @@ if [ "$first" = "0" ]; then
     # So a skip is only honest if the port really is occupied. Distinguish them: a live
     # port means a connection is ACCEPTED, so check for a listener before skipping, and
     # treat a delivered-but-failed alert as the failure it is.
+    #
+    # RE-VERIFIED after that fix, because a guard repaired in response to a mutation is
+    # exactly the kind that can be repaired into a different blind spot. Re-applying the
+    # same mutation to a clean tree (`if [ "$DELIVERED" -ne 1 ]` -> `if false` at
+    # alert.sh:276) now exits 1 and prints the message below, with the port genuinely
+    # unoccupied - so the branch was taken on the DEFECT and not on a fixture problem.
+    # Restoring the file byte-identically returns exit 0. Both directions, measured.
     if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 18999 >/dev/null 2>&1; then
         echo "alert-check: SKIPPED the ordering property - port 18999 accepted a connection" >&2
         echo "alert-check:   the exit-code assertions above DID run" >&2
