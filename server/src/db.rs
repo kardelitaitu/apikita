@@ -5237,6 +5237,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_sweep_retires_the_oldest_credit_even_when_its_id_sorts_last() {
+        // THE ORDERING WAS NOT PINNED, and this test is the one that pins it.
+        //
+        // Every other expiry test ages the FIRST-INSERTED deposit, so insertion order and
+        // age order coincide and `ORDER BY credit_expires_at, id` is indistinguishable
+        // from `ORDER BY id`. Measured: mutating the candidate query's ordering to
+        // `ORDER BY id` left the whole expiry suite GREEN.
+        //
+        // The shape that separates them needs the OLDER deposit to sort LAST by id. Then
+        // the two orderings name different first candidates, and the sweep's choice is
+        // observable:
+        //
+        //   ORDER BY credit_expires_at, id  ->  the older deposit  (correct)
+        //   ORDER BY id                     ->  the newer deposit  (the mutation)
+        //
+        // `order_id` is what makes the ids differ, since `topups.id` is derived from it.
+        // The wallet is then spent down to cover exactly one deposit, so which one is
+        // retired is the only thing that can differ.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        // Inserted FIRST, so this one takes the alphabetically-EARLIER id...
+        let newer = fund_through_topup(&db.pool, account, 50_000).await;
+        // ...and inserted SECOND, so this takes the LATER id, while being the OLDER
+        // deposit by expiry. `credit_expires_at` is what the ordering must honour.
+        let older = fund_through_topup_again(&db.pool, account, 50_000, 100_000).await;
+
+        let newer_id = topup_id(&db.pool, &newer).await;
+        let older_id = topup_id(&db.pool, &older).await;
+
+        // `topups.id` is a random UUID, so insertion order does NOT determine id order -
+        // the first attempt at this fixture asserted that it did and failed, correctly.
+        // Set the ids explicitly so the OLDER deposit sorts LAST, which is the whole point:
+        // it is the only shape in which `ORDER BY credit_expires_at, id` and `ORDER BY id`
+        // name different first candidates.
+        let low = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
+        let high = Uuid::from_u128(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fffe);
+        sqlx::query("UPDATE topups SET id = ? WHERE id = ?")
+            .bind(low.hyphenated())
+            .bind(newer_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("give the newer deposit the LOWER id");
+        sqlx::query("UPDATE topups SET id = ? WHERE id = ?")
+            .bind(high.hyphenated())
+            .bind(older_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("give the older deposit the HIGHER id");
+        let newer_id = low;
+        let older_id = high;
+        assert!(
+            newer_id < older_id,
+            "the fixture is only meaningful if the NEWER deposit's id sorts FIRST"
+        );
+
+        // Both expire, but at different instants: the one with the later id is the older
+        // deposit. Both are in the past, so both are candidates.
+        sqlx::query("UPDATE topups SET credit_expires_at = ? WHERE id = ?")
+            .bind(Utc::now() - chrono::Duration::days(60))
+            .bind(older_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("age the older deposit");
+        sqlx::query("UPDATE topups SET credit_expires_at = ? WHERE id = ?")
+            .bind(Utc::now() - chrono::Duration::days(1))
+            .bind(newer_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("age the newer deposit");
+
+        // Leave only enough for ONE of them, so the sweep's choice is visible.
+        retire_balance(&db.pool, account, 50_000).await;
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+        assert_eq!(sweep.expired_idr, 50_000, "the sweep takes what is left");
+        assert_eq!(
+            sweep.expired, 1,
+            "only ONE retirement is an expiry EVENT: the deposit that gave up money"
+        );
+
+        assert!(
+            credit_retired_at(&db.pool, older_id).await.is_some(),
+            "the OLDER deposit must be retired first; if the LATER-id one was taken \
+             instead, the candidate query is ordered by id rather than by expiry"
+        );
+        // The newer deposit is ALSO marked retired, with nothing taken - the documented
+        // `retired <= 0` path at `expire_one_deposit` (db.rs:424-430), which marks a
+        // deposit the sweep cannot pay out so it stops being revisited. That is not an
+        // expiry EVENT and writes no ledger row, which is what `sweep.expired == 1`
+        // above distinguishes. What matters for THIS test is that no MONEY moved for it.
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            0,
+            "exactly one deposit's worth was taken"
+        );
+        // The sweep's own ledger row is the one filed against the AGED deposit's id, so
+        // this checks both that it exists and that it names the OLDER deposit - which is
+        // the ordering claim itself. (`usage_refs` also returns the row `retire_balance`
+        // wrote to spend the wallet down, which is why this filters by ref rather than
+        // counting.)
+        let refs = usage_refs(&db.pool, account).await;
+        let expiry_refs: Vec<&String> = refs.iter().filter(|r| r.starts_with("expiry:")).collect();
+        assert_eq!(
+            expiry_refs.len(),
+            1,
+            "exactly ONE expiry row was written, so the second deposit gave up no money: {refs:?}"
+        );
+        assert_eq!(
+            expiry_refs.first().map(|s| s.as_str()),
+            Some(format!("expiry:{older_id}").as_str()),
+            "the expiry row must name the OLDER deposit"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn the_sweep_cannot_take_more_than_the_wallet_holds() {
         // The wallet has been spent down below the aged deposit's amount. The
         // sweep takes what is there and marks the deposit retired - it must NOT
