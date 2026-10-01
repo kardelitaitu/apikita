@@ -824,19 +824,29 @@ because the bot needs capabilities the dashboard deliberately does not have.
 
 ### `POST /api/bot/link`
 
-```json
-{ "telegram_id": "123456", "code": "482913" }
-```
+**Documented once, in full, in the `POST /api/bot/link — redemption (bot token)`
+section above.** This section used to restate it, and the restatement had drifted into
+contradicting both the code and the full section two ways:
 
-- **Rate-limited per Telegram user and per IP.** A 6-digit code is
-  brute-forceable and a guess attaches an attacker's Telegram to a funded wallet.
-  This is the highest-risk endpoint in the system.
-- Codes are single-use and expire in 5 minutes; issuing a new one invalidates the
-  previous code for that account.
-- **Re-attribution runs in the same transaction**: a review submitted before
-  linking is moved to the account, or the same person gets two review rows.
-- Errors: `404` unknown code, `409` account already linked to another Telegram,
-  `422` expired or used.
+- it gave the errors as "`404` unknown code, `409` account already linked to another
+  Telegram, `422` expired or used". The handler returns **`200` with
+  `{"status":"invalid_code"}` for every unsuccessful redemption** — wrong, expired, used,
+  malformed and unknown alike — and the only other success status is `linked`. A 4xx would
+  invite the bot's transport to retry a guess, which is the opposite of what the cap is
+  for. Pinned by `every_kind_of_bad_code_produces_the_same_refusal`, which drives all four
+  kinds and compares the bodies.
+- it said "rate-limited per Telegram user and per IP". The limit is **per IP**, over
+  attempts, counted by salted hash in `link_redemption_attempts`; there is no per-user
+  counter.
+
+Two descriptions of one endpoint in one document is a failure mode this file has hit
+before, and the reason it is fixed by deletion rather than by correcting the second copy:
+the second copy has nothing the first does not, so keeping it only creates another place
+to go stale.
+
+What is worth keeping from here, and is NOT in the full section: **re-attribution runs in
+the same transaction** — a review submitted before linking is moved to the account, so the
+same person does not end up with two review rows.
 
 ### Authentication
 
