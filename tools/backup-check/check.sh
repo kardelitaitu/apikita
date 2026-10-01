@@ -359,7 +359,29 @@ else
     # (`db::USAGE_EVENTS_RETENTION_DAYS`) is not a sweep, and `init_pool` is plumbing
     # that every binary needs; neither is in scope, and admitting them would make this
     # list long enough that a real omission would hide in it.
-    UNWIRED_CALLS=$(grep -oE 'db::[a-z_]+\(\)?|db::[a-z_]+\(&' "$REPO/server/src/bin/usage-purge.rs" \
+    #
+    # AND PRODUCTION CODE ONLY. This used to grep the whole file, so a `db::` call in the
+    # binary's own `#[cfg(test)] mod tests` was treated as a production dependency of the
+    # sweep. MEASURED: adding one test whose fixture settles a deposit through
+    # `db::credit_topup_transaction` - the real money-in path, exactly what a fixture SHOULD
+    # use - failed this check with "calls these db functions and NOTHING accounts for them",
+    # naming a function the BINARY never calls. The check was right to notice a new name and
+    # wrong about where it came from, and the fix is scope, not an allow-list entry: a sweep
+    # is what the shipped code path calls, and test code is not that path.
+    #
+    # Cut at the line beginning `mod tests`, which is the convention every binary here uses
+    # (`usage-purge.rs`, `hold-sweep.rs`, `migrate.rs`). If that line is ever absent the grep
+    # still runs over the whole file, so the failure mode is the old over-strict one rather
+    # than a silently empty set - and the emptiness guard below catches the other direction.
+    UNWIRED_TARGET="$REPO/server/src/bin/usage-purge.rs"
+    UNWIRED_TESTS_AT=$(grep -n '^mod tests' "$UNWIRED_TARGET" | head -n 1 | cut -d: -f1)
+    if [ -n "$UNWIRED_TESTS_AT" ]; then
+        UNWIRED_CODE=$(sed -n "1,$((UNWIRED_TESTS_AT - 1))p" "$UNWIRED_TARGET")
+    else
+        UNWIRED_CODE=$(cat "$UNWIRED_TARGET")
+    fi
+    UNWIRED_CALLS=$(printf '%s\n' "$UNWIRED_CODE" \
+        | grep -oE 'db::[a-z_]+\(\)?|db::[a-z_]+\(&' \
         | grep -oE 'db::[a-z_]+' | sort -u | grep -v 'db::init_pool')
     if [ -z "$UNWIRED_CALLS" ]; then
         fail "no db:: sweep call was found in server/src/bin/usage-purge.rs - the unwired-sweep comparison is measuring an empty set, so it can neither pass nor fail meaningfully"

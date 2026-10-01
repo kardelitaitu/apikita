@@ -154,4 +154,125 @@ mod tests {
             .expect("the sweep must complete against a migrated database");
         let _ = std::fs::remove_file(&path);
     }
+
+    /// THE SWEEP MUST PASS THE INSTANT, NOT THE DATE, and nothing held that until now.
+    ///
+    /// `run` above computes `today` for the day-granular retention windows and then deliberately
+    /// passes `Utc::now()` to `expire_credit`, with the comment: "using it here would expire
+    /// credit up to 24 hours early". MEASURED: swapping in a date-derived instant leaves BOTH
+    /// tests above passing, because neither seeds a deposit whose expiry falls inside the
+    /// current day - the only state where the two differ.
+    ///
+    /// WHAT THIS PINS, exactly, because "date granularity" is two different bugs and only one of
+    /// them is harmful - established by running both directions, not by reasoning:
+    ///
+    ///     an instant LATER than now() (end-of-day, or tomorrow's midnight)
+    ///         -> retires a deposit that is NOT YET DUE -> destroys credit EARLY
+    ///         -> CAUGHT here. Verified with two separate conversions: midnight-tomorrow, and
+    ///            hardcoded `now + 365 days`. Both fail this test and only this test.
+    ///     an instant EARLIER than now() (today's midnight)
+    ///         -> retires FEWER deposits, so it is less aggressive rather than more
+    ///         -> NOT caught here, and deliberately not claimed: the fixture's deposit expires
+    ///            an hour from now, so today's midnight genuinely does not reach it.
+    ///
+    /// The first draft of this comment asserted the second case was the harmful one, which is
+    /// backwards - midnight-of-today is EARLIER than now(), so it cannot retire a deposit that
+    /// is not yet due. Measured before rewriting; the test's own assertion had been right and
+    /// the prose was wrong.
+    ///
+    /// The fixture expires LATER TODAY rather than in the far future on purpose: the harmful
+    /// conversion is the one that crosses forward over a due date, and a fixture whose expiry is
+    /// days away would pass under both directions.
+    #[tokio::test]
+    async fn run_expires_against_the_instant_not_the_start_of_the_day() {
+        let (url, path) = migrated_temp_db().await;
+        let pool = db::init_pool(&url).await.expect("open the migrated db");
+
+        // The fixture is built inline because `test_support` is `#[cfg(test)]` and private to
+        // the lib, so a `bin` test cannot reach it. Same shape as `test_support::account` +
+        // `wallet` + `pending_topup`.
+        let account = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)")
+            .bind(account.hyphenated())
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("create the account");
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?, 0, ?)")
+            .bind(account.hyphenated())
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("create the wallet");
+
+        let order_id = format!("expiry_instant_{}", Uuid::new_v4().simple());
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+             VALUES (?, ?, ?, ?, 'pending', 'midtrans', ?)",
+        )
+        .bind(id.hyphenated())
+        .bind(account.hyphenated())
+        .bind(50_000_i64)
+        .bind(&order_id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("create the top-up");
+
+        db::credit_topup_transaction(&pool, &order_id, 50_000, 24)
+            .await
+            .expect("settle the deposit");
+
+        // Move the expiry to LATER TODAY: in the future relative to `now()`, but on the same
+        // date as `today`. A date-granular sweep reads it as already expired.
+        let later_today = chrono::Utc::now() + chrono::Duration::hours(1);
+        sqlx::query("UPDATE topups SET credit_expires_at = ? WHERE id = ?")
+            .bind(later_today)
+            .bind(id.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("set the expiry to later today");
+
+        let balance_before: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("read the balance");
+        pool.close().await;
+
+        run(&url).await.expect("the sweep must complete");
+
+        let pool = db::init_pool(&url).await.expect("reopen");
+        let balance_after: i64 =
+            sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("read the balance");
+        let retired: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT credit_retired_at FROM topups WHERE id = ?")
+                .bind(id.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("read credit_retired_at");
+        pool.close().await;
+
+        assert_eq!(
+            retired, None,
+            "a deposit expiring LATER TODAY is not yet due, so the sweep must not retire it. \
+             A sweep that passed midnight-of-today instead of the instant would read this \
+             deposit as expired and destroy up to 24 hours of the customer's credit early - \
+             which is exactly what the comment in `run` says must not happen."
+        );
+        assert_eq!(
+            balance_after, balance_before,
+            "and the wallet must be untouched, since nothing was due"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
