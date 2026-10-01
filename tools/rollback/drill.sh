@@ -652,6 +652,27 @@ SRC_BAL=$(sqlite3 -readonly -bail "$SNAPSHOT" \
 DST_BAL=$(sqlite3 -readonly -bail "$TARGET_PATH" \
     "SELECT COALESCE(SUM(balance_idr),0) FROM wallets;" 2>"$ERR")
 say "spot_check        wallets_total source=$SRC_BAL restored=$DST_BAL"
+
+# AN EMPTY READING IS NOT A MISMATCH. If a query fails, the variable is empty and the
+# comparison below would report "the totals differ", sending the reader after bad DATA
+# when the real fault is a broken MEASUREMENT. Those are different diagnoses and must not
+# share a message: the first means the restored database is wrong, the second means this
+# drill could not tell. Measured: the empty reading produced
+# `wallets_total source=5700 restored=` reported as a spot-check failure.
+for pair in "SRC_BAL:$SRC_BAL" "DST_BAL:$DST_BAL"; do
+    n=${pair%%:*}
+    v=${pair#*:}
+    case "$v" in
+        ''|*[!0-9-]*)
+            problem "SPOT-CHECK COULD NOT MEASURE: $n read '$v', which is not a number."
+            problem "  This is a broken MEASUREMENT, not bad data. The query against"
+            problem "  $( [ "$n" = "SRC_BAL" ] && printf 'the snapshot' || printf 'the restored database' ) failed or returned nothing."
+            [ -s "$ERR" ] && cat "$ERR" >&2
+            finish 4
+            ;;
+    esac
+done
+
 if [ "$SRC_BAL" != "$DST_BAL" ]; then
     problem "SPOT-CHECK FAILED: the restored wallet total ($DST_BAL) differs from the snapshot's ($SRC_BAL)"
     finish 1
@@ -660,6 +681,18 @@ fi
 SRC_ROWS=$(sqlite3 -readonly -bail "$SNAPSHOT" "SELECT COUNT(*) FROM accounts;" 2>"$ERR")
 DST_ROWS=$(sqlite3 -readonly -bail "$TARGET_PATH" "SELECT COUNT(*) FROM accounts;" 2>"$ERR")
 say "row_counts        accounts source=$SRC_ROWS restored=$DST_ROWS"
+for pair in "SRC_ROWS:$SRC_ROWS" "DST_ROWS:$DST_ROWS"; do
+    n=${pair%%:*}
+    v=${pair#*:}
+    case "$v" in
+        ''|*[!0-9-]*)
+            problem "ROW-COUNT COULD NOT MEASURE: $n read '$v', which is not a number."
+            problem "  A broken measurement, not a mismatch. The query returned nothing."
+            [ -s "$ERR" ] && cat "$ERR" >&2
+            finish 4
+            ;;
+    esac
+done
 if [ "$SRC_ROWS" != "$DST_ROWS" ]; then
     problem "ROW-COUNT MISMATCH: accounts source=$SRC_ROWS restored=$DST_ROWS"
     finish 1

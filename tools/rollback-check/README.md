@@ -26,6 +26,23 @@ sh tools/rollback-check/check.sh
 | A missing `sqlite3` skips **loudly (exit 3)**, never 0 | A silent pass on a machine that ran nothing |
 | Teardown is honest | The scratch file survives neither a passing nor a failing run |
 
+## An empty reading is not a mismatch
+
+A design point worth stating, because it was found in review rather than by a test.
+
+The drill's spot-check and row-count comparisons read a value from each of two databases
+and compare them. If one **query fails**, the variable is empty and a naive comparison
+reports *"the totals differ"* — sending the reader after bad **data** when the real fault
+is a broken **measurement**. Those are different diagnoses:
+
+- wrong reading → the restored database is wrong, which is what the drill exists to catch
+- empty reading → the drill could not tell, which is its own defect
+
+The drill now separates them: a non-numeric reading exits 4 with
+`SPOT-CHECK COULD NOT MEASURE`, and only a genuine difference exits 1 with
+`SPOT-CHECK FAILED`. Measured symptom that motivated this:
+`wallets_total source=5700 restored=` reported as a spot-check failure.
+
 ## What this check does NOT cover -- read this before trusting it
 
 Measured with a verified mutation battery (8 mutations, each confirmed to have landed).
