@@ -311,3 +311,23 @@ The wallet ledger is the business.
       running it against the real schema**, the same prerequisite the restore drill has.
 - [ ] Staging environment, or deploy straight to production? (Currently no staging
       is specified anywhere.)
+- [ ] **The maintenance scheduler is not deployed, and this procedure does not mention it.**
+      Every recurring job the system relies on runs from **one container**: the `scheduler`
+      service (`.docker/maintenance/`, `maintenance-entrypoint.sh`), whose `run_wired_jobs`
+      calls `run_retention`, `run_reconcile`, `run_hold_sweep`, `run_alert_checks` and
+      `run_alert_probes`. It is **not** a step in the pipeline above, and **no section of this
+      document names it**. The word `scheduler` does not appear in this file at all.
+      > **Why it is easy to miss.** The jobs are written, tested and CI-smoked, and several
+      > documents describe the scheduler as *what enforces retention* — so every retention
+      > and expiry claim reads as satisfied. But a job that is built and smoked is still a
+      > **deployment decision** away from running. What is actually at stake, in order:
+      > `data-retention.md`'s deletion windows (data kept longer than the page promises),
+      > credit expiry (which therefore never fires — see the checklist), the nightly
+      > reconcile (drift goes unnoticed), the hold sweep (stranded reservations accumulate),
+      > and both alert jobs (nobody is told).
+      > **What a fix looks like, as a deployment step rather than a code change:** build
+      > `.docker/maintenance/Dockerfile`, deploy it as a long-running service with the same
+      > mounts `docker-compose.yml` gives the local one, and give it the database plus the
+      > alert channel. This is deliberately not done here — it needs the provider and the
+      > channel, which are the same operator inputs the alert gate is blocked on.
+      > **Tracked** in the launch checklist as its own gate.

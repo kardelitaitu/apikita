@@ -381,6 +381,9 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       > **Overlaps the credit-expiry gate above but does not replace it.** That one asks
       > whether the expiry sweep is implemented *in the scheduler*; this one asks whether the
       > scheduler **runs at all**. Both have the same answer today, from opposite directions.
+      > **Also carried in [`deployment.md`](deployment.md)'s own open items**, because this
+      > checklist is not the document a deployer reads first and the omission is a missing
+      > DEPLOYMENT STEP rather than a missing line here.
 - [x] Deposit minimums enforced server-side (first vs re-top-up differ).
       `check_deposit_limit` in `server/src/routes/account.rs` selects
       `min_first_deposit` when `settled_topups == 0`, else `min_topup`, and returns a 422
