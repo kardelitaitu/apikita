@@ -1076,16 +1076,27 @@ mod tests {
 
     /// docs/observability.md's reconciliation, scoped to THIS fixture's account:
     /// wallets.balance_idr must equal SUM(ledger.delta_idr). Must return 0.
+    ///
+    /// FULL OUTER JOIN, matching `tools/reconcile/reconcile.sh`, the gate this
+    /// transcribes. A LEFT JOIN driven from `wallets` asks a weaker question: it sees
+    /// only accounts that HAVE a wallet row, while `ledger.account_id` references
+    /// `accounts(id)` and not `wallets`, so a ledger row with no wallet is permitted by
+    /// the schema and was invisible to the old form. Measured: 5000 IDR of ledger with
+    /// no wallet row reports drift=1 here and reported drift=0 before, so an assertion
+    /// built on this helper could pass on an account the shipped gate fails. It is a
+    /// sibling of `ledger_drift_rows` in `db.rs`, `routes/auth.rs` and
+    /// `routes/account.rs`, which carry the same note.
     async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
-                SELECT w.account_id
+                SELECT COALESCE(w.account_id, l.account_id) AS account_id
                 FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
+                WHERE COALESCE(w.account_id, l.account_id) = ?
+                GROUP BY w.account_id, l.account_id, w.balance_idr
+                HAVING w.account_id IS NULL
+                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
@@ -1093,6 +1104,50 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
+    }
+
+    /// A test OF THE HELPER ABOVE, because it is a transcription of the shipped gate and a
+    /// transcription that has quietly become weaker is invisible while it stays green.
+    ///
+    /// This is the same guard as
+    /// `routes::account::tests::the_reconciliation_helper_sees_ledger_money_with_no_wallet_row`,
+    /// and it exists in both places on purpose: the two helpers are separate definitions of
+    /// one rule (four, with `keys.rs` and `proxy.rs` and `webhooks.rs`), and the whole
+    /// reason this defect recurred is that a fix in one copy said nothing to the others.
+    /// Two guards is not the four it would take to check every copy, but it is the
+    /// difference between "the rule is pinned somewhere" and "one file is pinned".
+    #[tokio::test]
+    async fn the_admin_drift_helper_sees_ledger_money_with_no_wallet_row() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) \
+             VALUES (?, 5000, 'adjustment', 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the orphan ledger row");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count wallets"),
+            0,
+            "the fixture must have NO wallet row, or this test is not testing the case"
+        );
+
+        assert_eq!(
+            drift_rows(&db.pool, account).await,
+            1,
+            "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate says \
+             so. A helper returning 0 here has become a weaker rule than the one that ships."
+        );
+
+        db.close().await;
     }
 
     /// Every branch of every test ends here: the fixture must not have drifted.

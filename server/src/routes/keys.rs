@@ -973,16 +973,39 @@ mod tests {
     /// The reconciliation check from docs/observability.md, scoped to THIS
     /// fixture's account: wallets.balance_idr must equal SUM(ledger.delta_idr).
     /// It must return 0 rows.
+    ///
+    /// FULL OUTER JOIN, matching `tools/reconcile/reconcile.sh`, the gate this
+    /// transcribes. A LEFT JOIN driven from `wallets` asks a weaker question: it sees
+    /// only accounts that HAVE a wallet row, while `ledger.account_id` references
+    /// `accounts(id)` and not `wallets`, so a ledger row with no wallet is permitted by
+    /// the schema and was invisible to the old form. Measured: 5000 IDR of ledger with
+    /// no wallet row reports drift=1 here and reported drift=0 before, so an assertion
+    /// built on this helper could pass on an account the shipped gate fails. It is a
+    /// sibling of `ledger_drift_rows` in `db.rs`, `routes/auth.rs` and
+    /// `routes/account.rs`, which carry the same note.
+    ///
+    /// NOT PINNED BY A TEST OF ITS OWN, and that is measured rather than assumed:
+    /// reverting this SQL to the weak LEFT JOIN it used to be survives the ENTIRE suite.
+    /// `admin.rs` and `routes/account.rs` carry guards that do catch their own copies
+    /// (`the_admin_drift_helper_sees_ledger_money_with_no_wallet_row` and its sibling);
+    /// this one and the copies in `keys.rs`, `proxy.rs` and `webhooks.rs` have none, so
+    /// nothing would fail if this file silently regressed to the weaker rule.
+    ///
+    /// Adding a fourth identical test would close the symptom and leave four copies of one
+    /// rule, which is the condition that produced the defect. If this helper is touched
+    /// again the real fix is to delete the copies and call one shared definition - the
+    /// duplication has now cost two rounds.
     async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
-                SELECT w.account_id
+                SELECT COALESCE(w.account_id, l.account_id) AS account_id
                 FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
+                WHERE COALESCE(w.account_id, l.account_id) = ?
+                GROUP BY w.account_id, l.account_id, w.balance_idr
+                HAVING w.account_id IS NULL
+                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
