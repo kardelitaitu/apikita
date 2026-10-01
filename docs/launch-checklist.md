@@ -360,6 +360,27 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       > sweep inline in `run_retention` beside the others, or wire `usage-purge` into the
       > image and schedule it. Until one is done, the honest options are to do it, or to
       > stop promising the term on the page.
+- [ ] **The maintenance scheduler is deployed in production.**
+      Every retention promise in `data-retention.md`, the nightly reconcile, the hold sweep
+      and both alert jobs run from **one container** — the `scheduler` service in
+      `docker-compose.yml`, entrypoint `.docker/maintenance/entrypoint.sh`, calling
+      `run_wired_jobs` → `run_retention`, `run_reconcile`, `run_hold_sweep`,
+      `run_alert_checks`, `run_alert_probes`. **That container is not part of the production
+      deployment procedure.** `docs/deployment.md` describes three steps — Cloudflare Pages,
+      the edge relay VPS, and Northflank — and never mentions it; the image section names
+      *"one image containing two binaries"* (`apikita-server`, `migrate`), and the
+      maintenance scheduler is a **different image**.
+      > The `scheduler` service's own comment in `docker-compose.yml` says the jobs "were
+      > written and then never run by anything — this is the service that ends that." That is
+      > true of **local development**. It is not yet true of production, and nothing says so.
+      > **Why this belongs on the checklist even though the code is done.** The same
+      > distinction the alert gate above draws: a job that is written, tested and CI-smoked
+      > is still a **deployment decision** away from running. Left ungated, every retention
+      > and expiry claim in the docs reads as satisfied by the code, and the customer-facing
+      > consequence (data kept longer than promised, credit never expiring) is invisible.
+      > **Overlaps the credit-expiry gate above but does not replace it.** That one asks
+      > whether the expiry sweep is implemented *in the scheduler*; this one asks whether the
+      > scheduler **runs at all**. Both have the same answer today, from opposite directions.
 - [x] Deposit minimums enforced server-side (first vs re-top-up differ).
       `check_deposit_limit` in `server/src/routes/account.rs` selects
       `min_first_deposit` when `settled_topups == 0`, else `min_topup`, and returns a 422
