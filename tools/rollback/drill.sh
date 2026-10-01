@@ -250,6 +250,47 @@ if ! mkdir -p "$WORK" "$LOG_DIR" 2>/dev/null; then
     exit 2
 fi
 TARGET_PATH="$SCRATCH_DIR/$TARGET"
+
+# THE TEARDOWN GUARD. `cleanup` runs `rm -rf "$WORK"`, and this drill's history includes a
+# tree loss, so the one thing that must never happen is that `$WORK` resolves to something
+# broader than a directory this run created. `$WORK` is built by APPENDING to
+# `$SCRATCH_DIR`, so the danger is a scratch dir that is empty, root, or the repo root.
+#
+# The path is first made ABSOLUTE rather than required to be: `--scratch-dir .agents/x` is
+# a legitimate invocation, and refusing it would break the tool to satisfy a check. A
+# relative path is resolved against the current directory, which is where it already
+# pointed, so this changes nothing except that the remaining checks can reason about it.
+case "$WORK" in
+    /*) ;;
+    *) WORK="$(pwd)/$WORK" ;;
+esac
+
+case "$WORK" in
+    */rbwork.*)
+        ;;
+    *)
+        printf 'rollback: REFUSING to proceed: the scratch path is not a rbwork directory: %s\n' "$WORK" >&2
+        exit 2
+        ;;
+esac
+# Depth check: strip the last path component and require a real parent that is not "/".
+WORK_PARENT=${WORK%/*}
+case "$WORK_PARENT" in
+    ''|/|.)
+        printf 'rollback: REFUSING to proceed: the scratch path has no usable parent: %s\n' "$WORK" >&2
+        exit 2
+        ;;
+esac
+# And it must not be the repository root, or anything above it.
+if [ "$WORK_PARENT" = "$REPO_ROOT" ]; then
+    printf 'rollback: REFUSING to proceed: the scratch path would delete the repository root: %s\n' "$WORK" >&2
+    exit 2
+fi
+WORK_ABS=$(cd -- "$WORK" 2>/dev/null && pwd) || WORK_ABS="$WORK"
+case "$WORK_ABS" in
+    "$REPO_ROOT"/?) printf 'rollback: REFUSING to proceed: the scratch path resolves to the repository root: %s\n' "$WORK_ABS" >&2; exit 2 ;;
+esac
+
 rm -f "$TARGET_PATH" 2>/dev/null || true
 
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
