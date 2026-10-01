@@ -986,10 +986,16 @@ mod tests {
     ///
     /// NOT PINNED BY A TEST OF ITS OWN, and that is measured rather than assumed:
     /// reverting this SQL to the weak LEFT JOIN it used to be survives the ENTIRE suite.
-    /// `admin.rs` and `routes/account.rs` carry guards that do catch their own copies
-    /// (`the_admin_drift_helper_sees_ledger_money_with_no_wallet_row` and its sibling);
-    /// this one and the copies in `keys.rs`, `proxy.rs` and `webhooks.rs` have none, so
-    /// nothing would fail if this file silently regressed to the weaker rule.
+    /// `routes/admin.rs` and `routes/account.rs` carry guards that do catch their own
+    /// copies (`the_admin_drift_helper_sees_ledger_money_with_no_wallet_row` and its
+    /// sibling); **this file, `routes/keys.rs`, and the copies in `routes/proxy.rs` and
+    /// `routes/webhooks.rs`** have none, so nothing would fail if this file silently
+    /// regressed to the weaker rule.
+    ///
+    /// (The four notes were written from one text and each listed its own file among the
+    /// others, so `proxy.rs` listed `proxy.rs` as a sibling and so on. Every path here is
+    /// qualified because a reader arriving from any one of the four should not have to
+    /// work out which "this one" the sentence means.)
     ///
     /// Adding a fourth identical test would close the symptom and leave four copies of one
     /// rule, which is the condition that produced the defect. If this helper is touched
