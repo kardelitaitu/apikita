@@ -336,6 +336,53 @@ else
     # is older than this check and is recorded on docs/data-retention.md's nightly
     # note and in the entrypoint's own helper comments, which name the Rust constant
     # each literal mirrors.
+    #
+    # AND A THIRD BLIND SPOT, WHICH THIS PARAGRAPH USED TO OMIT AND WHICH HID A
+    # CUSTOMER-FACING GAP. The comparison above is over `DELETE FROM` table names. A
+    # sweep that retires credit by UPDATING a row and INSERTING a ledger entry has no
+    # `DELETE` in it, so it is not in either set and every assertion above passes
+    # without ever having considered it.
+    #
+    # That is not hypothetical: `db::expire_credit` - the sweep behind the credit-expiry
+    # clause in docs/terms-of-service.md - is called from `usage-purge.rs` and nowhere
+    # else, and `usage-purge.rs` contains NO `DELETE FROM` at all. It calls two library
+    # functions. So the whole credit-expiry mechanism was outside this comparison, and
+    # because `usage-purge` is not wired, NO credit ever expires in production while
+    # this check stayed green.
+    #
+    # The assertion below closes it without widening the table comparison, which would
+    # need SQL parsing and would rot. It asks the narrower question that the defect
+    # makes checkable: every SWEEP function the unwired binary calls must have an inline
+    # counterpart in `run_retention`, or be named here with a reason.
+    #
+    # SWEEP functions only, matched as `db::<name>(` - the call form. A constant
+    # (`db::USAGE_EVENTS_RETENTION_DAYS`) is not a sweep, and `init_pool` is plumbing
+    # that every binary needs; neither is in scope, and admitting them would make this
+    # list long enough that a real omission would hide in it.
+    UNWIRED_CALLS=$(grep -oE 'db::[a-z_]+\(\)?|db::[a-z_]+\(&' "$REPO/server/src/bin/usage-purge.rs" \
+        | grep -oE 'db::[a-z_]+' | sort -u | grep -v 'db::init_pool')
+    if [ -z "$UNWIRED_CALLS" ]; then
+        fail "no db:: sweep call was found in server/src/bin/usage-purge.rs - the unwired-sweep comparison is measuring an empty set, so it can neither pass nor fail meaningfully"
+    fi
+    # Sweeps the entrypoint genuinely reimplements inline. `purge_expired_usage` is the
+    # age-based DELETE sweep and is covered by the table comparison above.
+    INLINE_COVERED='purge_expired_usage'
+    # Sweeps that are NOT inline and are therefore not enforced in production. Each
+    # needs a reason, and the reason is what a reader needs to act on.
+    KNOWN_UNENFORCED=$(cat <<'KNOWN'
+db::expire_credit - the credit-expiry sweep. NOT reimplemented inline: it is an UPDATE of topups.credit_retired_at plus an INSERT of a negative ledger row, so the DELETE-based comparison above cannot see it. Effect: no credit expires in production. Recorded in docs/terms-of-service.md ("Built, and NOT RUNNING") and in docs/decisions.md. Wiring it is a launch blocker.
+KNOWN
+)
+    UNEXPLAINED=""
+    for fn in $UNWIRED_CALLS; do
+        case " ${INLINE_COVERED} " in *" ${fn#db::} "*) continue ;; esac
+        if ! printf '%s\n' "$KNOWN_UNENFORCED" | grep -qF "$fn "; then
+            UNEXPLAINED="$UNEXPLAINED $fn"
+        fi
+    done
+    if [ -n "$UNEXPLAINED" ]; then
+        fail "server/src/bin/usage-purge.rs calls these db functions and NOTHING accounts for them:$UNEXPLAINED. That binary is NOT shipped, so it does not run: either reimplement the work inline in run_retention, or add it to KNOWN_UNENFORCED here AND say so in docs/terms-of-service.md. The credit-expiry sweep went unenforced for exactly this reason, and the DELETE-based comparison above could not see it."
+    fi
 fi
 
 

@@ -119,15 +119,33 @@ credit, which is not what was decided.
 > period but the interaction with the non-refundable clause is **not settled**. This
 > remains part of the Gate 0 legal review.
 
-**Implemented.** The system expires credit, per deposit, as of
+**Built, and NOT RUNNING.** The system expires credit, per deposit, as of
 `topups.credit_expires_at`, which is stamped at settlement *in the same statement*
 that records the settlement — so a deposit's date and its expiry instant cannot be
 made to disagree by a crash. `db::expire_credit` retires each aged deposit (oldest
 first, capped by that deposit's own amount and by what the wallet holds) as a negative
 `usage`-reasoned ledger row plus a wallet decrement in a single transaction;
-`credit_retired_at` makes a second run a no-op rather than a second debit. It runs
-from the `usage-purge` binary. `credit_expiry_months = 0` disables the window and
-writes NULL, which the sweep reads as "nothing to retire" rather than as long overdue.
+`credit_retired_at` makes a second run a no-op rather than a second debit.
+`credit_expiry_months = 0` disables the window and writes NULL, which the sweep reads as
+"nothing to retire" rather than as long overdue.
+
+**But the sweep has exactly one caller, and it does not run.** `db::expire_credit` is
+called from `server/src/bin/usage-purge.rs` and from nowhere else — every other
+reference is a `#[cfg(test)]` test. That binary is NOT shipped in the server image, and
+`.docker/maintenance/entrypoint.sh` says so itself: `NOT WIRED usage-purge - ... not
+shipped, does NOT run here.` The entrypoint reimplements the retention sweeps inline;
+the credit-expiry sweep is not among them, because it is an `UPDATE` plus an `INSERT`
+rather than a `DELETE`, and the guard that compares the two
+(`tools/backup-check/check.sh`) compares `DELETE FROM` table names. Measured: that
+binary contains no `DELETE FROM` at all, so the sweep was never in the comparison — the
+guard's own comment lists two blind spots and this is a third.
+
+**So no credit has expired, and none will until the sweep is wired.** The window is
+stamped, the mechanism is tested, and nothing invokes it on a schedule. This paragraph
+previously read "It runs from the `usage-purge` binary", which is true of the CALL and
+misleading about the RUN — the same distinction this repository draws elsewhere between
+a mounted tool and a tool that runs. Wiring it is a launch blocker before any expiry
+term is enforced against a customer.
 
 Three things this section does **not** claim:
 
