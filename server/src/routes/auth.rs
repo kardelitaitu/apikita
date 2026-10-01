@@ -1491,6 +1491,17 @@ mod tests {
     /// invisible to it. Measured: an account with a 5000 IDR ledger row and no wallet
     /// row reports drift=1 here and reported drift=0 before, so an assertion using the
     /// old form could pass on an account the shipped Gate 2 reconcile fails.
+    ///
+    /// THIS COPY HAD NO DETECTING TEST FOR THREE ROUNDS, while both siblings did. Measured:
+    /// neutering this helper to report clean always leaves the whole suite GREEN, because its
+    /// only two callers assert `== 0` with the message "the fixture must not have manufactured
+    /// ledger drift" - a FIXTURE SANITY CHECK, which a helper that always returns 0 satisfies
+    /// perfectly. So the shape above was correct and nothing held it there: the same weak-form
+    /// regression the comment describes could return and every gate would stay green.
+    ///
+    /// `the_auth_drift_helper_sees_ledger_money_with_no_wallet_row` below is that detecting
+    /// test. It asserts the statement this comment already makes - 5000 IDR of ledger money
+    /// with no wallet row is drift=1 - which until now was prose with nothing checking it.
     async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
@@ -1509,6 +1520,78 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
+    }
+
+    /// THE DETECTING TEST for `ledger_drift_rows` above, which had none.
+    ///
+    /// Both of its callers assert `ledger_drift_rows(...) == 0` as a fixture sanity check
+    /// ("the fixture must not have manufactured ledger drift"). A helper that ALWAYS returns 0
+    /// satisfies that perfectly, so neither caller can catch the helper weakening - MEASURED:
+    /// replacing the `HAVING` clause with `HAVING 0` leaves all 632 tests green.
+    ///
+    /// This asserts the other direction, on the one case the schema permits and the old
+    /// `LEFT JOIN` form could not see: a `ledger` row whose account has NO `wallets` row.
+    /// `ledger.account_id` references `accounts(id)`, not `wallets`, so nothing forbids it -
+    /// and it is real money with no cache holding it, which is exactly what
+    /// `tools/reconcile/reconcile.sh` exists to find.
+    ///
+    /// Written as a direct assertion on the helper rather than through a handler, because no
+    /// auth route can create this state - which is why the gap survived three rounds.
+    #[tokio::test]
+    async fn the_auth_drift_helper_sees_ledger_money_with_no_wallet_row() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        // A ledger row with no wallets row. The account exists (the FK needs it); the
+        // wallet deliberately does not.
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) \
+             VALUES (?, 5000, 'adjustment', 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the orphan ledger row");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count wallets"),
+            0,
+            "the fixture must have NO wallet row, or this test is not testing the case"
+        );
+
+        assert_eq!(
+            ledger_drift_rows(&db.pool, account).await,
+            1,
+            "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate \
+             reports it (reconcile.sql is a FULL OUTER JOIN for this case). This helper \
+             returning 0 here means it has silently become a weaker rule than the one that \
+             ships, and both of its callers - which assert == 0 as a fixture check - would \
+             not notice."
+        );
+
+        // And it stops reporting drift once a wallet row agrees with the ledger, so this is a
+        // detector rather than a constant.
+        sqlx::query(
+            "INSERT INTO wallets (account_id, balance_idr, updated_at) \
+             VALUES (?, 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the wallet row");
+
+        assert_eq!(
+            ledger_drift_rows(&db.pool, account).await,
+            0,
+            "once the wallet holds the ledger's 5000 IDR there is no drift, so the helper \
+             must report 0 - otherwise this test would pass on a helper that always says 1"
+        );
+
+        db.close().await;
     }
 
     /// Sessions that are actually usable: unrevoked AND unexpired. Both bounds
