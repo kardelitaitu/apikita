@@ -332,6 +332,34 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       > **What remains operator-dependent:** the fee half (minimums, rate limit) is in the
       > page header and is above the form; the disclosure paragraph is now directly above
       > it. Both are in the composed page, so this half is verifiable and verified.
+- [ ] **Credit expiry actually runs.**
+      The wallet page tells every customer "Credit expires 2 years after each deposit", and
+      `docs/terms-of-service.md` states the term. **The mechanism exists and nothing invokes
+      it.** `db::expire_credit` has exactly one caller, `server/src/bin/usage-purge.rs`, and
+      that binary is **not shipped in the server image** —
+      `.docker/maintenance/entrypoint.sh` says so itself (`NOT WIRED usage-purge ... does
+      NOT run here`). The entrypoint reimplements the retention sweeps inline in
+      `run_retention`; the credit-expiry sweep is not among them. Measured: `credit_expires_at`
+      appears nowhere under `.docker/`, so the shipped sweep path never touches it.
+      > **Why this gate did not exist until now, which is the part worth keeping.** The
+      > promise is displayed on a page, tested in the suite, and documented — and **no gate
+      > tracked whether it runs**, so the checklist read as complete while a customer-facing
+      > term was inoperative. A term that extinguishes value has to be disclosed *and*
+      > enforced; the disclosure was gated, the enforcement was not.
+      > **How it hid.** `tools/backup-check/check.sh` already compared the Rust sweeps
+      > against the shell's, and fails when one side has a table the other lacks — a guard
+      > written for exactly this class ("a table present only in the Rust sweep is swept in
+      > tests and NEVER in production"). It compares `DELETE FROM` table names, and
+      > `expire_credit` retires credit with an `UPDATE` plus an `INSERT`; `usage-purge.rs`
+      > contains no `DELETE FROM` at all. The sweep was in neither set. That is now the third
+      > blind spot named in the guard, and it is closed: the guard asserts that every sweep
+      > function the unwired binary calls has an inline counterpart, or is listed with a
+      > reason. Verified falsifiable — adding a new unwired sweep call fails the check with
+      > the file and the function named.
+      > **Two acceptable resolutions, and the choice is the operator's:** reimplement the
+      > sweep inline in `run_retention` beside the others, or wire `usage-purge` into the
+      > image and schedule it. Until one is done, the honest options are to do it, or to
+      > stop promising the term on the page.
 - [x] Deposit minimums enforced server-side (first vs re-top-up differ).
       `check_deposit_limit` in `server/src/routes/account.rs` selects
       `min_first_deposit` when `settled_topups == 0`, else `min_topup`, and returns a 422
