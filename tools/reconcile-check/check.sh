@@ -29,22 +29,39 @@
 #
 # RE-RUN, all four, because a claim about which mutants a guard catches is exactly the kind
 # that rots: the guard keeps passing and nobody re-runs the mutants. Results on a clean tree,
-# restoring with `git checkout --` (see the trap below):
+# restoring with `git checkout --` (see the trap below). Every row names the anchor that
+# matches EXACTLY ONE place, which is not a stylistic preference - see the third trap below,
+# where the shorthand for the third row silently mutated a COMMENT:
 #
-#   reconcile.sql: HAVING w.account_id IS NULL   -> HAVING 0               exit 1, CAUGHT
-#   reconcile.sql: balance_idr <> SUM(...)       -> balance_idr = SUM(...) exit 1, CAUGHT
-#   reconcile.sql: FULL OUTER JOIN               -> LEFT JOIN              exit 1, CAUGHT
+#   reconcile.sql: HAVING w.account_id IS NULL              -> HAVING 0               exit 1, CAUGHT
+#   reconcile.sql: balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+#                                                          -> ... = COALESCE(...)    exit 1, CAUGHT
+#   reconcile.sql: FULL OUTER JOIN ledger l ON             -> LEFT JOIN ledger l ON  exit 1, CAUGHT
 #   reconcile.sh : `exit 1` inserted after the SQL_FILE assignment -> exit 1, caught by the
 #                  CONSISTENT-MUST-PASS control, with a message that NAMES that control
 #                  ("the fixture was not made consistent before the orphan test") rather
 #                  than failing for an unrelated reason.
 #
+# THE THIRD ROW WAS WRONG WHEN THIS BLOCK WAS FIRST WRITTEN, and the correction is the reason
+# it is spelled out rather than abbreviated. It read `FULL OUTER JOIN -> LEFT JOIN` and
+# reported "exit 1, CAUGHT". That string occurs TWICE in reconcile.sql - in the comment at
+# line 10 explaining why the join is a full outer one, and in the clause at line 35 - and a
+# `String.replace(from, to)` rewrites the FIRST occurrence, so the mutation landed on the
+# comment and the query was never weakened. Re-measured: the first-occurrence replacement
+# leaves `FULL OUTER JOIN ledger l ON` intact and the check exits 0, i.e. the mutant was
+# never injected. Anchored on the CLAUSE it exits 1 and the two NO-WALLET-ROW assertions
+# fire.
+#
+# AND THE ANCHOR-COUNT RULE BELOW DOES NOT CATCH THIS, which is worth stating because that
+# rule is the one this block used to lean on: the count is 2 either way, and the write
+# succeeds either way. What catches it is reading the file back and confirming the ORIGINAL
+# FORM IS GONE.
+#
 # AND THE MUTATION TARGET IS `tools/reconcile/reconcile.sql`, NOT `reconcile.sh`. The first
 # attempt at this re-run mutated the SHELL FILE, found all three anchors missing, and would
 # have read as "the header's claims are false" - the SQL it names lives in a sibling that
 # reconcile.sh invokes as $SQL_FILE. A mutation that does not apply proves nothing in either
-# direction, which is why the anchor count is asserted before every write. Same shape as the
-# trap below, one level over.
+# direction. Same shape as the trap below, one level over.
 #
 # ONE TRAP WORTH RECORDING, because it made a whole round of measurements meaningless:
 # an early mutation script copied the file it was about to mutate as its "original"
@@ -52,6 +69,27 @@
 # result was measured against a broken gate. Restore with `git checkout --` instead of a
 # copy. The assertions here also GUARD THEIR OWN FIXTURE (e.g. counting the seeded orphan
 # rows) so a seed that silently does nothing fails loudly rather than passing vacuously.
+#
+# A THIRD TRAP, FOUND RE-VERIFYING THE LINE ABOVE, AND IT IS FINER THAN THE OTHER TWO:
+# `FULL OUTER JOIN` occurs TWICE in reconcile.sql - once in the comment that explains why
+# the join is a full outer one, and once in the clause itself. A mutator that replaces the
+# first occurrence of the bare string therefore rewrites the COMMENT and leaves the query
+# untouched, and the check then reports SURVIVED for a mutant that was never injected. The
+# row above names the mutation in shorthand; the anchor that actually works is the CLAUSE
+# (`FULL OUTER JOIN ledger l ON l.account_id = ...`), which matches exactly one place
+# where the shorthand matches two.
+#
+# WHY THIS IS WORTH A PARAGRAPH. It is the same failure as mutating the wrong FILE, one
+# level down: the write succeeds, the anchor is present, and nothing about the result says
+# the target was not the one intended. Asserting the anchor COUNT before writing - the rule
+# stated two paragraphs up - does NOT catch it, because the count is the same either way: a
+# mutator checking for `FULL OUTER JOIN` finds 2 and is satisfied, then replaces the first
+# of them, which is the one in the comment. (This sentence said "the count is 1 either way",
+# which is the opposite of the truth and was the number that made the shorthand look safe:
+# the bare string occurs TWICE, so a count of 1 is not what a correct mutator would even
+# see. What catches it is reading the file back afterwards and confirming the ORIGINAL FORM
+# IS GONE - here, that `FULL OUTER JOIN ledger l ON` no longer appears, which is the check
+# this was verified with.)
 #
 # Skips LOUDLY (exit 3) when sqlite3 is absent, never 0.
 #
