@@ -39,6 +39,17 @@ import { minFirstDepositIdr, minTopupIdr, topupPerHour, idr } from '../../lib/mo
 </p>
 
 
+  <!-- THE non-refundable POLICY IS ABOVE THE FORM ON PURPOSE. It used to sit in the
+       "How crediting works" section BELOW <TopUpForm />, so a customer met the payment
+       form and only then read that the balance cannot be refunded. The launch gate
+       this page carries is about ORDER ("states the fee and the non-refundable policy
+       BEFORE PAYMENT"), and the test cited by that gate checked only that the phrases
+       EXISTED - so the ordering was wrong while the gate was ticked. The test now
+       asserts the order; see website/tests/landing-claims.test.ts. -->
+  <p class="mt-6 max-w-2xl text-sm text-ink-muted">
+    Balances are prepaid and <strong>non-refundable</strong>. Credit expires 2 years after each deposit.
+  </p>
+
   <div class="mt-8">
     <TopUpForm />
   </div>
@@ -53,9 +64,8 @@ import { minFirstDepositIdr, minTopupIdr, topupPerHour, idr } from '../../lib/mo
       <strong>pending</strong> here until the confirmation lands.
     </p>
     <p class="mt-2">
-      Balances are prepaid and non-refundable. Credit expires 2 years after each deposit. If a payment is
-      confirmed and the service cannot be delivered, contact support with the order
-      id above.
+      If a payment is confirmed and the service cannot be delivered, contact support with
+      the order id above.
     </p>
   </section>
 </DashboardLayout>

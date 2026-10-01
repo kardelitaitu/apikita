@@ -320,6 +320,18 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       and the 2-year expiry, and the header flags that first-deposit and top-up minimums
       differ. **Pinned by a test** (`the wallet states the non-refundable policy and the
       expiry before the top-up action`).
+      > **This gate was ticked while the ORDER was wrong, and the tick is what hid it.**
+      > The test cited above asserted only that the phrases were PRESENT, while this line
+      > claims they come "**before payment**" — a different claim. Measured: the page
+      > rendered `<TopUpForm />` at offset 2607 and the non-refundable policy at 3275, so
+      > a customer met the payment form and only then read that the balance cannot be
+      > refunded. The test now asserts the ordering, and it strips HTML comments first —
+      > the page explains the rule in a comment that NAMES `<TopUpForm />`, so a raw
+      > search matched prose about the fix rather than the fix. Verified falsifiable:
+      > moving the disclosure back below the form fails it.
+      > **What remains operator-dependent:** the fee half (minimums, rate limit) is in the
+      > page header and is above the form; the disclosure paragraph is now directly above
+      > it. Both are in the composed page, so this half is verifiable and verified.
 - [x] Deposit minimums enforced server-side (first vs re-top-up differ).
       `check_deposit_limit` in `server/src/routes/account.rs` selects
       `min_first_deposit` when `settled_topups == 0`, else `min_topup`, and returns a 422

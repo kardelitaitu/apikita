@@ -160,6 +160,53 @@ test('the wallet states the non-refundable policy and the expiry before the top-
     text.includes('minimums differ'),
     'the wallet must flag that the first deposit and later top-ups have different minimums',
   );
+
+  // ---------------------------------------------------------------------------
+  // THE ORDERING, WHICH THIS TEST'S NAME PROMISED AND ITS BODY DID NOT CHECK.
+  //
+  // It asserted PRESENCE only, while the launch gate it is cited by
+  // (docs/launch-checklist.md, "Top-up screen states the fee and the non-refundable
+  // policy before payment") is about POSITION. The two are different claims, and the
+  // difference was live: measured, the wallet page rendered `<TopUpForm />` at offset
+  // 2607 and the non-refundable policy at 3275, so the customer met the payment form
+  // BEFORE the policy saying the money is not refundable.
+  //
+  // `wallet.astro` composes the action as <TopUpForm />, so the ordering that reaches
+  // the customer is decided HERE, not in the form island.
+  //
+  // HTML COMMENTS ARE STRIPPED FIRST, and that is not tidiness - it is the same defect
+  // this assertion exists to catch, one level up. The page explains the rule in a
+  // comment that NAMES <TopUpForm />, so a search on the raw text finds the comment
+  // before the element and the test passes on prose about the fix rather than on the
+  // fix. Measured: that is exactly what happened on the first run of this assertion.
+  //
+  // The comparison is on raw text, not a lowercased copy: lowercasing is not
+  // length-preserving for every Unicode string, and an index is only meaningful in the
+  // string it came from (see the signup test above for the long version).
+  // ---------------------------------------------------------------------------
+  const withoutComments = read('dashboard/wallet.astro').replace(/<!--[\s\S]*?-->/g, '');
+  const low = withoutComments.toLowerCase();
+  const form = low.indexOf('<topupform');
+  const policy = low.indexOf('non-refundable');
+  const expiry = low.indexOf('expires 2 years');
+
+  assert.ok(
+    form > -1,
+    'the wallet page must compose the top-up action (<TopUpForm />), or the ordering below is vacuous',
+  );
+  assert.ok(policy > -1 && expiry > -1, 'both disclosures must be present for an ordering claim');
+
+  assert.ok(
+    policy < form,
+    'the non-refundable policy must be stated BEFORE the top-up action. A customer who ' +
+      'reaches the payment form first is asked to pay before being told the balance ' +
+      'cannot be refunded, which is the disclosure failing at the only moment it matters',
+  );
+  assert.ok(
+    expiry < form,
+    'the 2-year expiry must be stated BEFORE the top-up action, for the same reason: a ' +
+      'term that extinguishes value has to be read before the money is committed',
+  );
 });
 
 test('the new-key screen warns that the plaintext key is shown only once', () => {
