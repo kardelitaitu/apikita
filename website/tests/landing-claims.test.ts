@@ -68,7 +68,27 @@ test('the landing page never discloses the cost basis', () => {
 // ---------------------------------------------------------------------------
 
 test('signup discloses where prompts are forwarded, and does so before the submit control', () => {
-  const text = read('signup.astro').toLowerCase();
+  const raw = read('signup.astro');
+
+  // THE LOWERCASING MUST NOT MOVE CHARACTERS, and that is asserted rather than assumed
+  // because the whole ordering check below rests on it. `toLowerCase()` is
+  // length-preserving for ASCII, but NOT for every Unicode string - a few characters
+  // change length or expand. If the page ever contained one, the indices below would be
+  // positions in a DIFFERENT string from the one read, and the comparison would still run,
+  // still look meaningful, and compare the wrong things.
+  //
+  // Found while mutation-testing this guard: a probe searched the RAW file for the marker
+  // and got -1 while the test passed, because the test searches the lowercased text. That
+  // cost a round to diagnose and is exactly the confusion this assertion prevents for the
+  // next reader.
+  assert.equal(
+    raw.length,
+    raw.toLowerCase().length,
+    'lowercasing signup.astro changed its length, so the ordering indices below are ' +
+      'positions in a different string than the one read. Compare the raw positions, or ' +
+      'normalise with an index-preserving fold.',
+  );
+  const text = raw.toLowerCase();
 
   // (a) The disclosure is on THIS page at all.
   assert.ok(
