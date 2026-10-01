@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 193;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 627;
+const SERVER_TESTS = 628;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -312,6 +312,13 @@ test('no doc still claims a superseded count', () => {
         // is 24, and the calendar-month argument demonstrated on 15 March, a date where
         // months and days AGREE). The behaviour was correct; nothing checked it.
         '626 tests', '626 passed', '626 / 0 / 0',
+        // Retired the round after, when the two weak reconciliation helpers were brought
+        // back into agreement with the shipped gate. `ledger_drift_rows` exists in three
+        // files; `db.rs` had been corrected to a FULL OUTER JOIN and `auth.rs` and
+        // `account.rs` had not, so those two reported zero drift for an account whose
+        // ledger holds money and whose wallets row is missing - the case the schema
+        // permits and the gate catches. The new test pins the helper directly.
+        '627 tests', '627 passed', '627 / 0 / 0',
       ],
     },
     {
