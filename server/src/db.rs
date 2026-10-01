@@ -5318,6 +5318,67 @@ mod tests {
         db.close().await;
     }
 
+    /// `credit_expires_at IS NOT NULL` in the CANDIDATE query, isolated the same way.
+    ///
+    /// A NULL means expiry was DISABLED at settlement. The existing disabled-expiry test
+    /// asserts the stamp is NULL and that a sweep takes nothing - but with the clause deleted
+    /// the row still fails `credit_expires_at <= ?` (NULL compares as neither true nor false),
+    /// so nothing is taken either way. MEASURED: dropping the clause leaves the suite green,
+    /// i.e. that test is satisfied by a different clause than the one it names.
+    ///
+    /// This runs the sweep with `now` far in the FUTURE, so time cannot be what excludes the
+    /// NULL row, and asserts the NULL deposit is untouched while an expired sibling is retired.
+    #[tokio::test]
+    async fn a_null_expiry_deposit_is_invisible_to_the_sweep() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        let expiring = fund_through_topup(&db.pool, account, 50_000).await;
+        let expiring_id = age_the_deposit(&db.pool, &expiring, None).await;
+
+        let disabled_order = test_support::pending_topup(&db.pool, account, 40_000).await;
+        credit_topup_transaction(&db.pool, &disabled_order, 40_000, 0)
+            .await
+            .expect("settle with expiry disabled");
+        let disabled_id = topup_id(&db.pool, &disabled_order).await;
+        let stored: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT credit_expires_at FROM topups WHERE id = ?")
+                .bind(disabled_id.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("read the instant");
+        assert!(
+            stored.is_none(),
+            "the fixture must hold a NULL expiry instant"
+        );
+        assert_eq!(
+            credit_retired_at(&db.pool, disabled_id).await,
+            None,
+            "the fixture must be un-retired, or this tests the wrong clause"
+        );
+
+        let sweep = expire_credit(&db.pool, Utc::now() + chrono::Duration::days(3_650))
+            .await
+            .expect("sweep far in the future, so time cannot excuse the NULL");
+
+        assert_eq!(
+            sweep.expired, 1,
+            "ONLY the expired deposit is a candidate - a NULL instant is not 'long overdue'"
+        );
+        assert_eq!(
+            sweep.expired_idr, 50_000,
+            "and it retires only that deposit's credit, never the disabled one's"
+        );
+        assert!(
+            credit_retired_at(&db.pool, disabled_id).await.is_none(),
+            "the NULL-expiry deposit must be untouched: expiry disabled means unreachable, \
+             not 'expired immediately'"
+        );
+        assert!(credit_retired_at(&db.pool, expiring_id).await.is_some());
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
     #[tokio::test]
     async fn a_partly_spent_wallet_gives_up_its_oldest_credit_first() {
         // Two deposits of the same size, the OLDER one expiring now. The wallet
