@@ -1021,6 +1021,80 @@ mod tests {
         .expect("reconciliation query")
     }
 
+    /// THE DETECTING TEST for `drift_rows` above, which had none.
+    ///
+    /// All 14 of this file's call sites assert `drift_rows(...) == 0` as a fixture sanity
+    /// check ("fixture must not drift"). A helper that ALWAYS returns 0 satisfies that
+    /// perfectly, so none of them can catch the helper weakening - MEASURED: replacing the
+    /// `HAVING` clause with `HAVING 0` leaves every test in the suite passing.
+    ///
+    /// This asserts the other direction, on the case the schema permits and the old `LEFT JOIN`
+    /// form could not see: a `ledger` row whose account has NO `wallets` row.
+    /// `ledger.account_id` references `accounts(id)`, not `wallets`, so nothing forbids it -
+    /// and it is real money with no cache holding it, which is what
+    /// `tools/reconcile/reconcile.sh` exists to find.
+    ///
+    /// Written as a direct assertion on the helper rather than through a handler, because no
+    /// route in this file can create this state - which is why the gap survived. The same guard
+    /// exists in `routes/account.rs`, `routes/admin.rs` and `routes/auth.rs`; this copy is the
+    /// fourth of four and was the last one unpinned.
+    #[tokio::test]
+    async fn the_drift_helper_sees_ledger_money_with_no_wallet_row() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        // A ledger row with no wallets row. The account exists (the FK needs it); the
+        // wallet deliberately does not.
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) \
+             VALUES (?, 5000, 'adjustment', 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the orphan ledger row");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count wallets"),
+            0,
+            "the fixture must have NO wallet row, or this test is not testing the case"
+        );
+
+        assert_eq!(
+            drift_rows(&db.pool, account).await,
+            1,
+            "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate \
+             reports it (reconcile.sql is a FULL OUTER JOIN for this case). This helper \
+             returning 0 here means it has silently become a weaker rule than the one that \
+             ships, and this file's callers - which assert == 0 as a fixture check - would \
+             not notice."
+        );
+
+        // And it stops reporting drift once a wallet row agrees, so this is a detector rather
+        // than a constant.
+        sqlx::query(
+            "INSERT INTO wallets (account_id, balance_idr, updated_at) \
+             VALUES (?, 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the wallet row");
+
+        assert_eq!(
+            drift_rows(&db.pool, account).await,
+            0,
+            "once the wallet holds the ledger's 5000 IDR there is no drift, so the helper \
+             must report 0 - otherwise this test would pass on a helper that always says 1"
+        );
+
+        db.close().await;
+    }
+
     async fn json_body<T: serde::de::DeserializeOwned>(res: axum::response::Response) -> T {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
