@@ -39,7 +39,22 @@ fi
 # Scratch lives under .agents/ and is removed on EVERY exit path, failure included.
 WORK="${ROLLBACK_CHECK_WORK:-$REPO_ROOT/.agents/rollback-check-work}"
 rm -rf "$WORK" 2>/dev/null || true
-mkdir -p "$WORK" || { printf 'rollback-check: cannot create %s\n' "$WORK" >&2; exit 3; }
+# scratch/ and logs/ are created HERE, not by the drill, and that is the fix for a
+# check that could not pass on a clean tree. `$WORK` is removed on the line above and
+# these two paths are handed to the drill at every invocation (`--scratch-dir
+# "$WORK/scratch" --log-dir "$WORK/logs"`); the drill writes its log through `say()`
+# and its work files through a redirect, so with the directories absent BOTH fail with
+# "No such file or directory" - the first `sqlite3` redirect loses its `out` file and
+# the run dies at "applying 20260925000000_initial_schema.sql failed", exit 4.
+#
+# MEASURED, and the reason this is a fix rather than a tidy-up: the check reported OK
+# for several runs, and it was passing on RESIDUE. An earlier interrupted run had left
+# scratch/ and logs/ behind, so the directories existed without anybody creating them.
+# Deleting the work directory made the check fail immediately and identically every
+# time. A harness that depends on a previous run's leftovers is the exact defect this
+# repository writes guards against, so the directory creation belongs here, in the
+# setup, where a clean tree gets it too.
+mkdir -p "$WORK/scratch" "$WORK/logs" || { printf 'rollback-check: cannot create %s\n' "$WORK" >&2; exit 3; }
 
 cleanup() {
     rm -rf "$WORK" 2>/dev/null || true
@@ -59,8 +74,21 @@ fail() {
 # stays internally plausible rather than carrying an obviously synthetic number.
 INJECT_VERSION="11111111111111"
 
+# The drill DELETES the scratch tree it is handed when it finishes, and `$WORK` lives
+# under the repository's `.agents/`, so the structure must be re-established before EVERY
+# invocation rather than once in the setup. See the note on `run_drill` below for the
+# measurement that identified this. One helper, called from every call site, so a new
+# invocation cannot forget it.
+ensure_work() {
+    mkdir -p "$WORK/scratch" "$WORK/logs" || {
+        printf 'rollback-check: cannot create %s\n' "$WORK" >&2
+        exit 3
+    }
+}
+
 # Run the drill with its own private scratch and log dirs, capturing output and rc.
 run_drill() {
+    ensure_work
     OUT=$(sh "$DRILL" --scratch-dir "$WORK/scratch" --log-dir "$WORK/logs" "$@" 2>&1)
     RC=$?
 }
@@ -113,6 +141,7 @@ if [ "$RC" -ne 0 ]; then
     fail "the un-injected control run must PASS, got exit $RC"
 fi
 
+ensure_work
 OUT=$(ROLLBACK_INJECT_SNAPSHOT_VERSION="$INJECT_VERSION" sh "$DRILL" \
     --scratch-dir "$WORK/scratch" --log-dir "$WORK/logs" \
     --target rollback_check_inject2_scratch.db 2>&1)
@@ -150,7 +179,26 @@ for bad in apikita.db server.db prod-backup.db apikita; do
     esac
 done
 
+# And the unnamed case: a name that is neither live-looking nor scratch-looking. This is
+# what the ALLOW-LIST actually guards, and it is the assertion that makes relaxing the
+# list observable. Measured: without it, widening the allow-list to accept every name left
+# this check green, because the explicit live-looking refusals above still fired and the
+# positive controls below still passed.
+for vague in mystery.db data.db backup.db; do
+    run_drill --target "$vague"
+    if [ "$RC" -ne 5 ]; then
+        fail "a name that is neither live-looking nor scratch-looking ('$vague') must be REFUSED with exit 5, got $RC - the allow-list is what separates a rehearsal from an accident"
+    fi
+done
+
 # --- 4. a bad migration that damages NOTHING exits 8 -------------------------
+# The fixtures are written to $WORK, and the drill is invoked many times above. Re-create
+# the directory here rather than assuming the setup's mkdir still holds: MEASURED, this
+# exact line failed with "No such file or directory" on a clean tree while the identical
+# script passed from a copy, because $WORK is the repository's `.agents/` subtree and a
+# concurrent run of the drill in another shell removes directories beneath it. The
+# harness must not depend on the absence of a neighbour's teardown.
+mkdir -p "$WORK" || { printf 'rollback-check: cannot create %s\n' "$WORK" >&2; exit 3; }
 NOOP="$WORK/noop.sql"
 printf 'CREATE INDEX IF NOT EXISTS rb_check_noop ON wallets (account_id);\n' >"$NOOP"
 grep -q 'CREATE INDEX' "$NOOP" || fail "the no-op fixture does not contain the harmless statement it is supposed to"
@@ -162,12 +210,33 @@ fi
 # --- 4b. a bad migration that FAILS LOUDLY is not this scenario --------------
 # The drill rehearses the SILENT failure. A migration that errors never ships, so there
 # is nothing to roll back, and the drill must say so rather than pretending to rehearse.
+mkdir -p "$WORK" || { printf 'rollback-check: cannot create %s\n' "$WORK" >&2; exit 3; }
 BADSQL="$WORK/loud.sql"
 printf 'THIS IS NOT VALID SQL;\n' >"$BADSQL"
 run_drill --target rollback_check_loud_scratch.db --bad-migration "$BADSQL"
 if [ "$RC" -eq 0 ]; then
     fail "a bad migration that fails LOUDLY was accepted as a rehearsal - a migration that errors never ships"
 fi
+
+# --- 4c. the STEP 7 assertions are binding too -------------------------------
+# Step 7's assertions (restored drift, schema version, spot-check) were unfalsifiable in
+# the same way the version comparison was: the restored copy is by construction a faithful
+# copy of a clean snapshot, so drift is ALWAYS zero and the spot-check ALWAYS matches.
+# Neutering them survived every earlier check design (measured). The fix is the same shape
+# as assertion 2: force the input to be wrong and require a non-zero exit.
+#
+#   drift -> breaks the wallet/ledger invariant in the RESTORED database only
+#   drop  -> removes rows, so the row-count and spot-check comparisons must differ
+for inj in drift drop; do
+    ensure_work
+OUT=$(ROLLBACK_INJECT_RESTORED="$inj" sh "$DRILL" \
+        --scratch-dir "$WORK/scratch" --log-dir "$WORK/logs" \
+        --target "rollback_check_inj_${inj}_scratch.db" 2>&1)
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+        fail "a RESTORED database deliberately corrupted ('$inj') PASSED the drill - a step-7 assertion is not binding"
+    fi
+done
 
 # --- 5. it skips LOUDLY without sqlite3 --------------------------------------
 # Built from the real PATH with the directory holding sqlite3 removed. Shadowing with a
@@ -183,6 +252,7 @@ for d in ${PATH:-}; do
     NEWPATH="${NEWPATH}${NEWPATH:+:}$d"
 done
 IFS=$OLDIFS
+ensure_work
 NOPATH_OUT=$(PATH="$NEWPATH" sh "$DRILL" --target rollback_check_nosqlite_scratch.db 2>&1)
 NOPATH_RC=$?
 if [ "$NOPATH_RC" -eq 0 ]; then

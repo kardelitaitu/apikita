@@ -149,11 +149,15 @@ native_path() {
 }
 say() {
     printf 'rollback: %s\n' "$*"
-    [ -n "$LOG_FILE" ] && printf 'rollback: %s\n' "$*" >>"$LOG_FILE"
+    if [ -n "$LOG_FILE" ]; then
+        printf 'rollback: %s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true
+    fi
 }
 problem() {
     printf 'rollback: %s\n' "$*" >&2
-    [ -n "$LOG_FILE" ] && printf 'rollback: %s\n' "$*" >>"$LOG_FILE"
+    if [ -n "$LOG_FILE" ]; then
+        printf 'rollback: %s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true
+    fi
 }
 
 # --- the live-looking guard, BEFORE anything is read, created or deleted ------
@@ -234,7 +238,13 @@ if [ "$GUARD_RC" -ne 0 ]; then
 fi
 
 # --- scratch area ------------------------------------------------------------
-WORK="$SCRATCH_DIR/rbwork.$$"
+# UNIQUE PER RUN. `$$` alone is NOT enough: the check runs the drill several times in
+# quick succession, and a shell's PID can be reused (and on this platform `$$` inside
+# `sh -c` collides across invocations). When that happened, one run's cleanup deleted a
+# concurrent run's work directory, so a later run lost its log file mid-write and the
+# check saw a failure that was not the drill's. The timestamp suffix makes the collision
+# impossible in practice.
+WORK="$SCRATCH_DIR/rbwork.$$.$(date -u +%H%M%S 2>/dev/null || echo x)"
 if ! mkdir -p "$WORK" "$LOG_DIR" 2>/dev/null; then
     printf '%s\n' "rollback: could not create the scratch directory: $WORK" >&2
     exit 2
@@ -555,6 +565,38 @@ say "integrity ok (PRAGMA integrity_check on the RESTORED database)"
 # --- step 7: the assertions --------------------------------------------------
 say "step 7 - asserting the rollback is real"
 
+# FAULT INJECTION, for the check only. Corrupts the RESTORED database AFTER the integrity
+# check has passed, so the step-7 assertions (restored drift, schema version, spot-check)
+# are exercised against a database that is genuinely wrong. Without this the step-7
+# assertions are unfalsifiable in the same way step 7's comparison was: the restored copy
+# is by construction a faithful copy of a clean snapshot, so drift is always zero and the
+# spot-check always matches. Measured: neutering the restored-drift assertion survived
+# every check design until this hook existed.
+#
+# `corrupt` breaks the wallet/ledger invariant; `drop` removes rows; both are confined to
+# the scratch target, whose name the step-1 guard has already vetted.
+if [ -n "${ROLLBACK_INJECT_RESTORED:-}" ]; then
+    say "FAULT INJECTION - corrupting the RESTORED database ($ROLLBACK_INJECT_RESTORED)"
+    say "  (this makes step 7's assertions FALSE on purpose; only the check sets this)"
+    case "$ROLLBACK_INJECT_RESTORED" in
+        drift)
+            INJECT_SQL="UPDATE wallets SET balance_idr = balance_idr + 12345;"
+            ;;
+        drop)
+            INJECT_SQL="DELETE FROM wallets;"
+            ;;
+        *)
+            problem "ROLLBACK_INJECT_RESTORED must be 'drift' or 'drop', got '$ROLLBACK_INJECT_RESTORED'"
+            finish 2
+            ;;
+    esac
+    if ! sqlite3 -bail "$TARGET_PATH" "$INJECT_SQL" >"$OUT" 2>"$ERR"; then
+        problem "the restored-database fault injection itself failed:"
+        [ -s "$ERR" ] && cat "$ERR" >&2
+        finish 4
+    fi
+fi
+
 RESTORED_OUT=$(DATABASE_URL="sqlite://$TARGET_PATH" sh "$RECONCILE" 2>&1)
 RESTORED_RC=$?
 if [ "$RESTORED_RC" -ne 0 ]; then
@@ -604,3 +646,4 @@ fi
 
 say "result            PASS (exit 0)"
 finish 0
+
