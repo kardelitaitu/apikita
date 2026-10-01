@@ -83,9 +83,23 @@ attempt() {
 
 first=$(attempt)
 if [ "$first" = "0" ]; then
-    # Something IS listening on the test port, so the scenario cannot run as designed.
-    echo "alert-check: SKIPPED the ordering property - port 18999 accepted a connection" >&2
-    echo "alert-check:   the exit-code assertions above DID run" >&2
+    # MEASURED, and this branch used to hide a real defect. It assumed exit 0 could only
+    # mean "something is listening on the test port". It cannot: exit 0 is ALSO what a tool
+    # returns when a FAILED delivery falls through to the success path. Removing the
+    # `if [ "$DELIVERED" -ne 1 ]` guard at alert.sh:276 makes a dead-port webhook exit 0 AND
+    # write a cooldown -- precisely the "a failed delivery silences its own retry" defect
+    # this block exists to catch -- and the old skip branch reported it as a port conflict
+    # and skipped the assertions. The whole ordering property was green under that mutation.
+    #
+    # So a skip is only honest if the port really is occupied. Distinguish them: a live
+    # port means a connection is ACCEPTED, so check for a listener before skipping, and
+    # treat a delivered-but-failed alert as the failure it is.
+    if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 18999 >/dev/null 2>&1; then
+        echo "alert-check: SKIPPED the ordering property - port 18999 accepted a connection" >&2
+        echo "alert-check:   the exit-code assertions above DID run" >&2
+    else
+        fail "a failing webhook exited 0 rather than 3, and nothing is listening on the test port. Exit 0 here means a FAILED delivery took the success path: it reported delivery and recorded a cooldown, so this incident is silenced for the whole window and will not be retried"
+    fi
 else
     [ "$first" = "3" ] || fail "a failing webhook must exit 3 (delivery failed), got $first"
 
@@ -105,6 +119,35 @@ else
     ALERT_COOLDOWN_SECONDS=900 ALERT_STATE_DIR="$ORDER" ALERT_SINK_FILE="$WORK/ok.sink" \
         sh "$REPO/tools/alert/alert.sh" --alert ledger_drift --observed "x" >/dev/null 2>&1
     [ -f "$ORDER/ledger_drift.last" ] || fail "a SUCCESSFUL delivery did not record a cooldown, so the throttle would never engage and every run would page"
+fi
+
+# --- a delivery that FAILED must not take the success path ---------------------
+# The block above proves the ORDERING (no cooldown after a failure). This proves the
+# report: a failed delivery must say so and exit 3, on EVERY channel, not just the webhook
+# the block above uses. It uses the FILE channel pointed at a path whose parent does not
+# exist, which fails without needing a port or a network.
+#
+# WHY IT IS SEPARATE. Measured: removing the `if [ "$DELIVERED" -ne 1 ]` guard at
+# alert.sh:276 makes a failed file delivery exit 0, print "DELIVERED ... cooldown 900s",
+# and WRITE the cooldown. The webhook block above was no protection -- it took its
+# "something is listening" skip branch and reported nothing.
+BADFILE="$WORK/badfile"
+rm -rf "$BADFILE"; mkdir -p "$BADFILE"
+badfile_out=$(ALERT_COOLDOWN_SECONDS=900 ALERT_STATE_DIR="$BADFILE" \
+    ALERT_SINK_FILE="$WORK/does-not-exist-dir/sink" \
+    sh "$REPO/tools/alert/alert.sh" --alert ledger_drift --observed "x" 2>&1)
+badfile_rc=$?
+[ "$badfile_rc" -ne 0 ] || fail "a FILE-channel delivery that could not be written exited 0. A failed delivery that reports success is the defect this check exists for"
+case "$badfile_out" in
+    *"DELIVERED"*)
+        case "$badfile_out" in
+            *"NOT delivered"*) : ;;
+            *) fail "a failed file delivery printed DELIVERED without saying the alert was NOT delivered: $badfile_out" ;;
+        esac
+        ;;
+esac
+if [ -f "$BADFILE/ledger_drift.last" ]; then
+    fail "a FAILED file delivery recorded a cooldown, so the incident is silenced for the whole window and will not be retried"
 fi
 
 
