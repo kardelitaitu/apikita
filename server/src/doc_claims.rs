@@ -529,17 +529,37 @@ mod tests {
     /// So the failure is deliberately a NUDGE rather than a veto, and it says what to
     /// do. -Force matters: without it a .gitkeep or an editor swap file would read as
     /// a bot, and the check would cry wolf the first time someone opened the folder.
+    ///
+    /// THE FILTERING IS THE IMPLEMENTATION, not a note beside it. Measured: the first
+    /// version of this test read the directory with no filter at all while this comment
+    /// claimed a .gitkeep would be ignored, so dropping a `.gitkeep` in `telegram/` --
+    /// the ordinary act this paragraph exists to tolerate -- FAILED the test. A comment
+    /// promising tolerance the code does not provide is worse than saying nothing, so
+    /// the dot- and editor-suffix rules below are the ones this paragraph describes.
     #[test]
     fn the_telegram_folder_is_still_the_scaffolding_its_readme_claims() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("telegram");
 
+        /// Names an ordinary visit to the folder leaves behind: version-control
+        /// placeholders and editor swap/backup files. None of them is a bot.
+        fn is_incidental(name: &str) -> bool {
+            if name.starts_with('.') {
+                return true;
+            }
+            // vim (.swp/.swo), emacs (#x#, x~), and the usual backup suffixes.
+            name.ends_with(".swp")
+                || name.ends_with(".swo")
+                || name.ends_with('~')
+                || (name.starts_with('#') && name.ends_with('#'))
+        }
+
         let mut others: Vec<String> = std::fs::read_dir(&dir)
             .expect("telegram/ must be readable")
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name != "README.md")
+            .filter(|name| name != "README.md" && !is_incidental(name))
             .collect();
         others.sort();
 
