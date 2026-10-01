@@ -448,6 +448,64 @@ So the discipline for prose is the one for code that this file keeps arriving at
 that cannot drift is the config value itself - which is why the note is now paired with a
 test that reads `config/apikita.toml` rather than restating what it contains.
 
+### A scanner is prose that executes
+
+The rule above is about sentences a person writes. It applies with more force to a scanner -
+a regex over source that a person writes to ANSWER a question about other code - because a
+wrong scanner does not merely read badly, it produces a confident verdict that gets acted on.
+
+MEASURED OVER EIGHT ROUNDS, auditing this repository's money paths. In twelve cases a
+hand-rolled scan and the code disagreed, and **the code was right in all twelve**:
+
+- a text scan for "a non-reserve ledger row" counted rows that a `delta_idr < 0` filter
+  excludes anyway, so its conclusion named the wrong mechanism;
+- a doc-comment extractor walked backwards from the wrong position and found zero
+  candidates in a file full of them;
+- the same idea then missed `SET balance_idr = balance_idr + 1` because it looked for the
+  column in an expression form it did not expect, and reported a correct test as a false
+  positive;
+- a call-site counter matched `drift_rows(` without a word boundary, so it also counted
+  `db::unpaired_hold_rows(` - a different helper, imported into `proxy.rs` - and produced a
+  wrong total;
+- the same counter read only the lines AFTER each call, so the single-line form
+  `assert_eq!(drift_rows(...).await, 0);` fell outside its window;
+- an "insert a test here" script anchored on the first `\n    }\n` after the function
+  signature, which matched the closing brace of a call CHAIN inside the helper, so the
+  text landed mid-expression and the crate did not compile;
+- a scan reported that `db.rs`'s test-only `DELETE FROM` statements polluted a table
+  comparison - but that comparison reads only the body of `purge_expired_usage` via
+  `sed -n '/^pub async fn purge_expired_usage(/,/^}/p'` and never touches `mod tests`.
+
+**Why this repo is unusually hostile to scanners, which is the useful part.** These sources
+mix the following properties *across the tree rather than uniformly*, which is what makes a
+pattern learned in one file wrong in the next: two line endings (`auth.rs` and `account.rs`
+are CRLF; `keys.rs`, `proxy.rs`, `webhooks.rs` and `db.rs` are LF), `#[cfg(test)]` regions
+interleaved with production code, `DELETE FROM` appearing in doc-comments and in test bodies
+as well as in production SQL, and multi-line `r#"..."#` raw SQL. A regex that is obviously
+correct against one of those is wrong about another, and the failure is silent in both
+directions: it over-reports (a false positive that sends the reader after a non-defect) or
+under-reports (a missed finding).
+
+**AND THIS PARAGRAPH ITSELF WAS WRONG ON FIRST WRITING**, which is the best available
+demonstration of the point. Its opening draft asserted that the three `drift_rows` files were
+CRLF and that all eleven `DELETE FROM` sites in `db.rs` were test-only. Both were written from
+memory of earlier rounds. Checked before committing: those three files are LF (only `auth.rs`
+and `account.rs` are CRLF), and `db.rs`'s eleven sites are five in production SQL, two inside
+doc-comments and six in test bodies. The prose was corrected by the same discipline the rest of
+this section argues for - a second, independent reading of the thing being described.
+
+**So a scan is only evidence after it has been shown to fail on a known-bad input.** Every
+finding in this file that survived scrutiny was confirmed a second way - by mutating the code
+and running the suite, or by reproducing the extraction and printing what it actually read.
+The mutation harness has been reliable across all of it for one reason: it compiles and runs
+the real thing. Text that only resembles the thing is not a measurement of it.
+
+The operational form, since "be careful" is not one:
+
+> When a scan and a mutation disagree, the mutation is right.
+> When only a scan is available, run it against a case whose answer you already know, before
+> believing a single one of its findings.
+
 ### A hand-kept copy is not always the same bug
 
 The guards above all read the file they describe rather than keeping a copy. That
