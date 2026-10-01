@@ -1198,6 +1198,79 @@ mod tests {
                 "the ledger is append-only (docs/launch-checklist.md ticks it), but these statements mutate it: {offenders:#?}. Every customer money movement is recorded there and wallets is only a cache of it. Correct a mistake with an OFFSETTING entry, never an edit."
             );
         }
+
+        /// `docs/launch-checklist.md` ticks "**No client-reachable path can write
+        /// `balance_idr`**", and that claim was held by NOTHING - the same state the
+        /// ledger claim above was in before its test existed ("true by inspection").
+        ///
+        /// MEASURED: planting a direct `UPDATE wallets SET balance_idr = balance_idr + ?` in a
+        /// ROUTE module left all 636 tests passing. The route modules are where
+        /// client-reachability comes from, so that is the one place this has to be watched.
+        ///
+        /// The neighbouring ledger scan does not cover this and cannot: its needles are
+        /// `UPDATE LEDGER` and `DELETE FROM LEDGER`, and its own failure message says
+        /// "wallets is only a cache of it" - so it knows the two are linked while guarding
+        /// exactly one. That gap is why this scan exists next to it rather than inside it.
+        ///
+        /// The rule being protected: money enters a wallet only through the money module's
+        /// transaction, which writes the matching ledger row in the same transaction. A route
+        /// that writes `balance_idr` directly manufactures the drift Gate 2 exists to catch,
+        /// and does it from a path a customer can reach.
+        #[test]
+        fn no_route_writes_the_wallet_balance_directly() {
+            // Only the route modules. A binary (`bin/hold-sweep.rs`) legitimately updates the
+            // balance, in a transaction that also writes the ledger row, and it is not
+            // client-reachable; `identity/accounts.rs` inserts a wallet at zero at signup.
+            // Neither is what this claim is about, so scoping to `routes/` is the assertion
+            // rather than an omission.
+            let routes = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("routes");
+            let sources: Vec<PathBuf> = rust_sources()
+                .into_iter()
+                .filter(|p| p.starts_with(&routes))
+                .collect();
+
+            // Non-vacuity, the same control the sibling test uses and for the same reason: a
+            // scan that found no files would pass without reading anything.
+            assert!(
+                sources.len() > 5,
+                "the route scan found only {} .rs file(s), so it is not reading the real tree and the assertion below would pass vacuously",
+                sources.len()
+            );
+
+            let this_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("money.rs");
+            let mut offenders = Vec::new();
+            for path in sources {
+                if path == this_file {
+                    continue;
+                }
+                let text = fs::read_to_string(&path).expect("a source file is UTF-8");
+                // A TEST in a route module may write the balance directly; several fixtures do,
+                // and they are not shipped code. Cut at the test module, the same scope rule
+                // `tools/backup-check` needed for its `db::` scan.
+                let shipped = match text.find("#[cfg(test)]") {
+                    Some(at) => &text[..at],
+                    None => text.as_str(),
+                };
+                let upper = shipped.to_uppercase();
+                for (needle, label) in [
+                    ("UPDATE WALLETS", "UPDATE wallets"),
+                    ("INSERT INTO WALLETS", "INSERT INTO wallets"),
+                ] {
+                    if let Some(at) = upper.find(needle) {
+                        let line = upper[..at].matches('\n').count() + 1;
+                        offenders.push(format!("{}:{} contains {}", path.display(), line, label));
+                    }
+                }
+            }
+            assert!(
+                offenders.is_empty(),
+                "no client-reachable path may write `balance_idr` (docs/launch-checklist.md ticks it), but a ROUTE writes the wallet table directly: {offenders:#?}. Money enters a wallet only through the money module's transaction, which writes the matching ledger row in the same one - a route writing the cache directly manufactures the drift Gate 2 catches."
+            );
+        }
     }
     /// Every IDR price in `config/apikita.toml` must be its CNY price x the documented
     /// factor.

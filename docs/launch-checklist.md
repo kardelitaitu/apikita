@@ -140,7 +140,19 @@ opinion.
 
 ### Ledger and balance
 
-- [x] **No client-reachable path can write `balance_idr`.**
+- [x] **No client-reachable path can write `balance_idr`.** **Enforced** by
+  `money::tests::ledger_is_append_only::no_route_writes_the_wallet_balance_directly`, which
+  scans every `.rs` under `server/src/routes/` and fails on an `UPDATE wallets` or
+  `INSERT INTO wallets` in shipped code. Scoped to the route modules because that is where
+  client-reachability comes from: `bin/hold-sweep.rs` legitimately updates the balance in a
+  transaction that also writes the ledger row, and `identity/accounts.rs` inserts a wallet at
+  zero at signup - neither is reachable from a request, so neither is what the claim says.
+  The scan cuts at `#[cfg(test)]`, which is load-bearing rather than tidiness: four route
+  modules write wallets directly in their FIXTURES, so without the cut it would fail on a
+  clean tree. It asserts it read more than five files, the same non-vacuity control the
+  ledger scan beside it uses. Before this existed the claim was true by inspection and held
+  by nothing - MEASURED: planting a direct `UPDATE wallets` in a route left all 636 tests
+  green.
 - [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase. **Enforced** by
   `money::tests::ledger_is_append_only::no_source_statement_mutates_the_ledger`, which scans
   every `.rs` under `server/src` and fails on either statement. It was true by inspection
