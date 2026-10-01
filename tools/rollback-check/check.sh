@@ -12,13 +12,42 @@
 #   2. THE DRILL CAN FAIL. A snapshot whose schema VERSION is genuinely wrong must make
 #      the drill exit non-zero on the version comparison specifically. This is the
 #      assertion that binds the drill's defining claim; without it, a neutered
-#      comparison passes every other test (measured: it did, in an earlier version of
-#      this file that only checked the drill PRINTS a match).
-#   3. The guard REFUSES every live-looking target and touches nothing (exit 5).
-#   4. A bad migration that damages NOTHING exits 8, never 0 - the drill announcing it
-#      proved nothing rather than rubber-stamping.
+#      comparison passes every other test (measured).
+#   3. The guard REFUSES live-looking targets, ACCEPTS scratch-looking ones, and refuses
+#      ambiguous names that are neither. All three directions are asserted, because a
+#      guard that refuses everything is not a guard.
+#   4. A bad migration that damages NOTHING exits 8, never 0.
+#   4b. A bad migration that fails LOUDLY is not accepted as a rehearsal.
+#   4c. A deliberately corrupted RESTORED database makes the drill fail.
 #   5. It skips LOUDLY (exit 3) when a required tool is missing, never 0.
 #   6. Teardown is honest: the scratch file survives neither a passing nor a failing run.
+#
+# KNOWN-UNCOVERED ASSERTIONS IN THE DRILL -- stated rather than implied, because a check
+# whose README suggests total coverage is the defect this directory exists to catch.
+# Measured with a verified mutation battery (8 mutations, each confirmed to land):
+#
+#   COVERED:   the schema-version comparison, and the exit-8 precondition.
+#
+#   UNCOVERED: (a) the restored-database integrity_check
+#              (b) the restored-DRIFT assertion
+#              (c) the wallet spot-check and the row-count comparison
+#              (d) the `LOW == LIVE_LOW` refusal branch
+#
+#   Why, in each case, this is structural rather than a missing test:
+#
+#   (a) The drill checks integrity on a file `.restore` just wrote from a snapshot the
+#       drill itself produced. Nothing in its interface can make integrity fail, so the
+#       assertion is defensive and cannot be driven from outside.
+#   (b)-(c) All three compare the SNAPSHOT against the RESTORED COPY OF THE SAME
+#       SNAPSHOT, so they are equal by construction. The ROLLBACK_INJECT_RESTORED and
+#       ROLLBACK_INJECT_SPOTCHECK hooks DO make the drill fail, but they trip the
+#       restored-drift assertion first, so the later comparisons are never reached.
+#   (d) The explicit live-looking refusals are separate branches from the
+#       `LOW = LIVE_LOW` comparison, so neutering it leaves them working.
+#
+#   These are covered by READING the drill, not by this check. If that is not good
+#   enough, the fix is to delete the redundant assertions rather than to add a test that
+#   appears to cover them.
 #
 # Usage: sh tools/rollback-check/check.sh
 # Exit: 0 all hold, 1 a violation, 3 a prerequisite is missing.
@@ -237,6 +266,26 @@ OUT=$(ROLLBACK_INJECT_RESTORED="$inj" sh "$DRILL" \
         fail "a RESTORED database deliberately corrupted ('$inj') PASSED the drill - a step-7 assertion is not binding"
     fi
 done
+
+# The spot-check and row-count comparisons need their OWN injection, because the two
+# above trip the restored-DRIFT assertion first and never reach them. Measured: neutering
+# both spot-check comparisons survived until this existed. The `desync` injection edits
+# the SNAPSHOT after the restore was already taken from it, so source and destination
+# genuinely differ and the comparisons have something that can fail.
+ensure_work
+OUT=$(ROLLBACK_INJECT_SPOTCHECK=desync sh "$DRILL" \
+    --scratch-dir "$WORK/scratch" --log-dir "$WORK/logs" \
+    --target rollback_check_spot_scratch.db 2>&1)
+RC=$?
+if [ "$RC" -eq 0 ]; then
+    fail "a DESYNCHRONISED snapshot PASSED the drill - the spot-check/row-count comparisons are not binding"
+else
+    case "$OUT" in
+        *"SPOT-CHECK FAILED"*|*"ROW-COUNT MISMATCH"*)
+            ;;
+        *) fail "the desynchronised run exited $RC without naming a spot-check or row-count mismatch, so it may have failed for an unrelated reason" ;;
+    esac
+fi
 
 # --- 5. it skips LOUDLY without sqlite3 --------------------------------------
 # Built from the real PATH with the directory holding sqlite3 removed. Shadowing with a

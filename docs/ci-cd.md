@@ -66,7 +66,7 @@ anyway, so the check below can demand an exact match:
 
 #### The contracts that fail SILENTLY
 
-These eight are CI stages rather than local scripts because each guards a failure that
+These nine are CI stages rather than local scripts because each guards a failure that
 produces **no error**: the thing looks like it works and does not. A local script only
 helps someone who already suspects a problem.
 
@@ -77,6 +77,7 @@ helps someone who already suspects a problem.
 | Check the backup contract | An offsite hook that copies nothing | The script prints "hook succeeded" and exits 0 |
 | Check the reconciliation gate | A money gate that cannot fail | A drift check that never runs still looks like a green tick |
 | Check the restore drill | Deletion of a live-looking target | Teardown deletes whatever it was pointed at |
+| Check the rollback drill | A "rollback" that certifies a schema the old binary cannot run | The rehearsal proves nothing while printing PASS |
 | Check the alert delivery contract | A failed delivery that silences its own retry | Alerts stop arriving and nothing says so |
 | Check the wind-down payout report | A payout figure that is off by one IDR, or priced at a rate nobody froze | Closure is done by hand, so nothing downstream catches the mistake |
 | **Check the CI documentation** | This table going stale | An understated pipeline sends people around CI |

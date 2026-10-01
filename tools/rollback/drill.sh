@@ -626,6 +626,27 @@ if [ "$POST_RESTORE_VERSION" != "$PRE_MIGRATION_VERSION" ]; then
 fi
 
 # row/money spot-check against the snapshot
+#
+# NOTE ON FALSIFIABILITY. `SRC_BAL` reads the SNAPSHOT and `DST_BAL` reads the RESTORED
+# COPY OF THAT SAME SNAPSHOT, so on a clean run they are equal by construction and these
+# two comparisons cannot fail. Measured: neutering both survived every check design until
+# the injection below existed. The `spot` injection desynchronises the comparison inputs
+# (it edits the SNAPSHOT after the restore has already been taken from it) so the
+# assertions have something that can genuinely differ.
+if [ "${ROLLBACK_INJECT_SPOTCHECK:-}" = "desync" ]; then
+    say "FAULT INJECTION - desynchronising the snapshot AFTER the restore (spot-check inputs)"
+    if ! sqlite3 -bail "$SNAPSHOT" "UPDATE wallets SET balance_idr = balance_idr + 7;" >"$OUT" 2>"$ERR"; then
+        problem "the spot-check fault injection itself failed:"
+        [ -s "$ERR" ] && cat "$ERR" >&2
+        finish 4
+    fi
+    if ! sqlite3 -bail "$SNAPSHOT" "DELETE FROM accounts WHERE id = 'rb-a2';" >"$OUT" 2>"$ERR"; then
+        problem "the spot-check fault injection itself failed:"
+        [ -s "$ERR" ] && cat "$ERR" >&2
+        finish 4
+    fi
+fi
+
 SRC_BAL=$(sqlite3 -readonly -bail "$SNAPSHOT" \
     "SELECT COALESCE(SUM(balance_idr),0) FROM wallets;" 2>"$ERR")
 DST_BAL=$(sqlite3 -readonly -bail "$TARGET_PATH" \

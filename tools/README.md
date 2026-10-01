@@ -23,6 +23,8 @@ here must appear, and every name listed must exist.
 | [`backup-check/`](backup-check/README.md) | Proves the artifact **reaches the offsite hook**, and that the artifact is encrypted. | Yes |
 | [`drill/`](drill/README.md) | The restore drill: proves a backup restores and reconciles. *"An untested backup is a belief."* | No — run before launch and on a cadence |
 | [`drill-check/`](drill-check/README.md) | Proves the drill **refuses every live-looking target before deleting anything**. | Yes |
+| [`rollback/`](rollback/README.md) | The bad-migration rollback drill: snapshots before a migration, proves the damage is **detectable**, restores, and asserts the schema came **back**. Fills the open item in [`docs/deployment.md`](../docs/deployment.md) — *"Restore from the snapshot; do not hand-write a reverse migration."* | No — run before launch and after a migration scare |
+| [`rollback-check/`](rollback-check/README.md) | Proves the rollback drill **can fail** — and states plainly which of its assertions are **not** mutation-covered. | Yes |
 | [`wind-down/`](wind-down/README.md) | The read-only half of the wind-down runbook: who is owed what, and in which rail. **It pays nobody.** | No — run at closure, before Step 5 |
 | [`wind-down-check/`](wind-down-check/README.md) | Proves the payout report splits the threshold **strictly**, floors the stablecoin units, and refuses a missing or implausible frozen rate. | Yes |
 

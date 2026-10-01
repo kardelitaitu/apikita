@@ -685,6 +685,23 @@ jobs:
       - name: Check the restore drill
         run: sh tools/drill-check/check.sh
 
+      # The ROLLBACK drill must refuse live-looking targets, must FAIL on a deliberately
+      # wrong schema version, and must exit 8 - not 0 - when the bad migration it applies
+      # damages nothing a check can see.
+      #
+      # The restore drill proves a BACKUP restores. It restores a matched source/artifact
+      # pair, so it cannot show the thing a rollback depends on: that a snapshot taken
+      # BEFORE a migration still yields a usable database AFTER that migration went wrong,
+      # on the schema the old binary expects. That is the whole content of the last
+      # rollback row in docs/ci-cd.md, and until this tool existed nothing exercised it.
+      #
+      # Its check is honest about its own limits: read the KNOWN-UNCOVERED block at the top
+      # of check.sh. Four of the drill's assertions are covered by reading, not by this
+      # step, and saying so is the point - a check whose README implied total coverage
+      # would be the defect these directories exist to catch.
+      - name: Check the rollback drill
+        run: sh tools/rollback-check/check.sh
+
       # The alert tool must DELIVER, and must not silence its own retry.
       #
       # Every other gate detects a problem; this one has to tell someone. It had no CI

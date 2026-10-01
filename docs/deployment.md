@@ -295,5 +295,12 @@ The wallet ledger is the business.
       see [`ci-cd.md`](ci-cd.md).
 - [ ] Rollback drill: rehearse a bad deploy and a restore before launch — procedure
       in [`backup-and-restore.md`](backup-and-restore.md).
+      **The rehearsal is now executable**: [`tools/rollback/drill.sh`](../tools/rollback/README.md)
+      snapshots a migrated database, applies a deliberately destructive migration, proves
+      `tools/reconcile/reconcile.sh` **detects** the damage, restores, and asserts the
+      restored file carries the **pre-migration** `_sqlx_migrations` version — the
+      assertion that distinguishes a rollback from a restore. It is CI-checked, and its
+      check states which of its assertions are *not* mutation-covered. **What remains is
+      running it against the real schema**, the same prerequisite the restore drill has.
 - [ ] Staging environment, or deploy straight to production? (Currently no staging
       is specified anywhere.)
