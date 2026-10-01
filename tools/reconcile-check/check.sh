@@ -27,6 +27,25 @@
 # exits 1 unconditionally - is caught by the CONSISTENT-MUST-PASS control, which is what
 # that control is for.
 #
+# RE-RUN, all four, because a claim about which mutants a guard catches is exactly the kind
+# that rots: the guard keeps passing and nobody re-runs the mutants. Results on a clean tree,
+# restoring with `git checkout --` (see the trap below):
+#
+#   reconcile.sql: HAVING w.account_id IS NULL   -> HAVING 0               exit 1, CAUGHT
+#   reconcile.sql: balance_idr <> SUM(...)       -> balance_idr = SUM(...) exit 1, CAUGHT
+#   reconcile.sql: FULL OUTER JOIN               -> LEFT JOIN              exit 1, CAUGHT
+#   reconcile.sh : `exit 1` inserted after the SQL_FILE assignment -> exit 1, caught by the
+#                  CONSISTENT-MUST-PASS control, with a message that NAMES that control
+#                  ("the fixture was not made consistent before the orphan test") rather
+#                  than failing for an unrelated reason.
+#
+# AND THE MUTATION TARGET IS `tools/reconcile/reconcile.sql`, NOT `reconcile.sh`. The first
+# attempt at this re-run mutated the SHELL FILE, found all three anchors missing, and would
+# have read as "the header's claims are false" - the SQL it names lives in a sibling that
+# reconcile.sh invokes as $SQL_FILE. A mutation that does not apply proves nothing in either
+# direction, which is why the anchor count is asserted before every write. Same shape as the
+# trap below, one level over.
+#
 # ONE TRAP WORTH RECORDING, because it made a whole round of measurements meaningless:
 # an early mutation script copied the file it was about to mutate as its "original"
 # restore point, so after one run the SAVED copy was itself mutated and every later
