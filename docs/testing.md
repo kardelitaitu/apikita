@@ -325,11 +325,16 @@ this name matters, a failed assertion says this value does.
 test ran" look identical from outside.** Measured twice in one session while proving the
 route counts guarded. The first attempt filtered on a test name that did not exist, so
 `cargo test --lib <name>` reported `test result: ok. 0 passed; 0 failed; 0 ignored;
-625 filtered out` - and the harness read `ok` as PASS. Both pinned counts appeared to
+<the rest> filtered out` - and the harness read `ok` as PASS. Both pinned counts appeared to
 survive mutation, which would have been reported as "the count is not enforced"; the pins
 were fine and the runner was wrong. The second attempt hit the same class one level down:
 the file is CRLF, so an anchor written with a bare `\n` matched nothing, the mutation was
 never applied, and the unmutated tree passed - again indistinguishable from a survivor.
+
+The filtered-out figure is written as `<the rest>` rather than as the number it was - the
+number is incidental to the point (Zero, not the total, is what makes `ok` a lie) and a
+literal here would be stale within a round, which is a small version of the restatement
+this section is about.
 
 So a mutation result is only evidence once three things hold, and each is cheap:
 
