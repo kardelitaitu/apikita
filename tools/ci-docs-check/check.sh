@@ -66,21 +66,74 @@ fi
 rm -f "$MISSING_LIST"
 
 # Guard the other direction too: the document must not claim a step that does not exist.
-# Only the `- name:`-derived contract rows are checked, since the doc also describes
-# local commands on purpose.
-for claimed in \
-    "Check the edge relay streams SSE" \
-    "Check the compose deployment definition" \
-    "Check the backup contract" \
-    "Check the reconciliation gate" \
-    "Check the restore drill" \
-    "Check the alert delivery contract" \
-    "Validate the schema against the plan"; do
-    grep -qF "$claimed" "$WORKFLOW" || {
-        echo "ci-docs-check: FAIL - $DOC describes a step the workflow does not run: $claimed" >&2
-        exit 1
+#
+# THIS USED TO BE A HAND-KEPT LIST OF SEVEN NAMES, and that left a hole measured this
+# round: deleting `Check the rollback drill` from the workflow while `docs/ci-cd.md` kept
+# describing it left this check GREEN. The workflow runs 28 steps and the list named 7, so
+# 21 step names were unprotected - including the three newest tool checks
+# (`Check the rollback drill`, `Check the wind-down payout report`, `Check the CI
+# documentation`), which are exactly the ones most likely to be renamed or dropped.
+#
+# The fix derives the names from the DOCUMENT's own stage tables rather than from a list
+# beside them. Every row whose first cell is a step name is extracted, and each must appear
+# in the workflow.
+#
+# SCOPE, which the first attempt at this got wrong and the failure was informative. That
+# attempt scanned every table and immediately reported eight legitimate rows: "Build the
+# release artifact", "Run migrations", "Deploy the server" and friends. Those are real and
+# correct - they describe the pipeline that runs ON MERGE TO MAIN, which is not
+# `.github/workflows/ci.yml` and is not what this check is about. So the extraction STOPS
+# at the deployment heading: only the tables a reader would read as "what runs on my PR"
+# are in scope. A blanket scan is not a stricter check, it is a check about a different
+# document.
+# The vacuity floor is the reason this is safe to derive: if the extraction finds too few
+# rows, the tables moved or the parse failed, and the check refuses rather than passing
+# over an empty set - the W38/W41/W43 failure.
+CLAIMED_LIST="${TMPDIR:-/tmp}/apikita-ci-claimed.$$"
+awk '
+    # The deployment pipeline is a different document concern; stop there.
+    /^### On merge/ { exit }
+    # A header row naming a CI table.
+    /^\| *(Stage|Setup step) *\|/ { in_table = 1; next }
+    in_table && /^\| *---/ { next }
+    in_table && /^\| / {
+        line = $0
+        sub(/^\| */, "", line)
+        sub(/ *\|.*$/, "", line)
+        gsub(/^\*\*/, "", line)
+        gsub(/\*\*$/, "", line)
+        if (line != "") print line
+        next
     }
-done
+    in_table { in_table = 0 }
+' "$DOC" > "$CLAIMED_LIST"
+
+CLAIMED_COUNT=$(grep -c . "$CLAIMED_LIST" || true)
+if [ "$CLAIMED_COUNT" -lt 15 ]; then
+    echo "ci-docs-check: only $CLAIMED_COUNT stage name(s) were extracted from $DOC," >&2
+    echo "ci-docs-check:   so the inverse assertion below would pass over almost nothing." >&2
+    echo "ci-docs-check:   Expected the stage tables; if their headers changed, update the" >&2
+    echo "ci-docs-check:   extractor rather than deleting this floor." >&2
+    rm -f "$CLAIMED_LIST"
+    exit 3
+fi
+
+STALE_LIST="${TMPDIR:-/tmp}/apikita-ci-stale.$$"
+while IFS= read -r claimed; do
+    [ -n "$claimed" ] || continue
+    grep -qF "$claimed" "$WORKFLOW" || echo "$claimed"
+done < "$CLAIMED_LIST" > "$STALE_LIST"
+
+if [ -s "$STALE_LIST" ]; then
+    while IFS= read -r step; do
+        echo "ci-docs-check: FAIL - $DOC describes a step the workflow does not run: $step" >&2
+    done < "$STALE_LIST"
+    rm -f "$CLAIMED_LIST" "$STALE_LIST"
+    echo "ci-docs-check: a stage the document presents as running, and CI does not run, is" >&2
+    echo "ci-docs-check:   the reader's map of their own gate. Delete the row or restore the step." >&2
+    exit 1
+fi
+rm -f "$CLAIMED_LIST" "$STALE_LIST"
 
 # --- the tools INDEX ---------------------------------------------------------
 # tools/README.md is the only page that says what the tools ARE, and an unchecked index is
