@@ -288,8 +288,15 @@ The wallet ledger is the business.
 
 ## Open items
 
-- [ ] CI provider — GitHub Actions assumed. Stages specified in
-      [`ci-cd.md`](ci-cd.md).
+- [x] CI provider — **GitHub Actions**, settled. The stages are this repository's
+      `.github/workflows/ci.yml` (28 steps); see [`ci-cd.md`](ci-cd.md).
+      > **This box said `[ ]` "GitHub Actions assumed" and was stale.** Two other
+      > documents already recorded it as decided — `ci-cd.md`'s own open items list it
+      > `[x]`, and `decisions.md` carries the row "CI provider | **GitHub Actions** |
+      > Assumed; only changes if the repo moves". The workflow has been the CI in
+      > practice for the whole life of this file. A settled decision left as open in the
+      > one document a deployer reads first is how a working pipeline gets treated as
+      > unproven.
 - [x] Migration tool: **sqlx migrate** — [`ci-cd.md`](ci-cd.md).
 - [x] Migrations run in CI, after a snapshot and before the server deploy —
       see [`ci-cd.md`](ci-cd.md).
