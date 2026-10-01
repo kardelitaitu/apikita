@@ -132,7 +132,7 @@ opinion.
 > | Item | Evidence |
 > | --- | --- |
 > | Signature verified | `verify_midtrans_signature` in `money.rs` compares with `ct_eq` over SHA-512, pinned by known-vector tests |
-> | Stored-amount validation | the `find_by_order_id` lookup in `db.rs` matches `order_id AND status AND amount_idr`, and `handle_midtrans_webhook` handles `AmountMismatch` |
+> | Stored-amount validation | the `SELECT status, amount_idr FROM topups WHERE order_id = ?` inside `credit_topup_transaction` (`db.rs`) tests status BEFORE the amount, so a `settled` row with a mismatched amount is a replay rather than a mismatch; `handle_midtrans_webhook` handles `AmountMismatch` |
 > | Idempotent crediting | the conditional UPDATE above is the claim; replay test asserts exactly one credit |
 > | Atomic credit | one `BEGIN IMMEDIATE` covers the status change, the wallet and the ledger row |
 > | Refunds refused | `evaluate_payment_status` in `money.rs` returns `PaymentAction::RefundRefused`; two live tests, incl. an inflated amount |
