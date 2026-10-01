@@ -416,9 +416,39 @@ async fn expire_one_deposit(
     let account_id: Uuid = row.get::<Hyphenated, _>("account_id").into_uuid();
     let balance: i64 = row.get("balance_idr");
 
-    // Retire at most the deposit's own amount, and at most what is left. The
-    // second bound is what stops this sweep from taking a LATER deposit's credit
-    // to satisfy an earlier one's expiry.
+    // Retire at most the deposit's own amount, and at most what is left in the
+    // wallet - so the debit can never exceed the balance and can never go negative.
+    //
+    // THE SECOND BOUND DOES *NOT* PROTECT A LATER DEPOSIT, and this comment used to
+    // claim it did: "The second bound is what stops this sweep from taking a LATER
+    // deposit's credit to satisfy an earlier one's expiry." It cannot, because
+    // `balance` is the WHOLE un-aged wallet. Worked example, two deposits of 50,000,
+    // the older one expiring now and the newer one held 30 days, then a 50,000 spend:
+    // the wallet holds 50,000, ALL of it the newer deposit's, and `min(50_000,
+    // 50_000)` takes every IDR of it.
+    //
+    // The reason is the schema, not this line, and `docs/decisions.md:69` already
+    // says so: there is ONE un-aged `wallets.balance_idr` and no per-deposit
+    // consumption record, so expired and live credit are NOT DISTINGUISHABLE. The
+    // attribution this comment promised is not computable, and `try_debit` confirms
+    // it - it debits the wallet and never names a deposit.
+    //
+    // So what the cap actually guarantees is bounded and worth stating exactly:
+    //   - the debit never exceeds the wallet (no negative balance), and
+    //   - it never exceeds the aged deposit's own amount, so a single expiry cannot
+    //     take more than one deposit's worth even when the wallet holds several.
+    // Which deposit a spend consumed is resolved by the OLDEST-FIRST POLICY above,
+    // not by a recorded fact. Under that reading the cap is exact when the spend is
+    // at least the aged deposit's amount (its remaining credit is 0, and 0 is what
+    // is taken - see `the_sweep_cannot_take_more_than_the_wallet_holds` and
+    // `a_partly_spent_wallet_gives_up_its_oldest_credit_first`, both of which spend
+    // past that point), and it OVER-TAKES when the spend is smaller, because the
+    // aged deposit's remaining credit is then unknowable.
+    //
+    // This is a disclosure of a bounded limitation, not a bug report: with one
+    // un-aged balance there is no better cap available to this function. It matters
+    // because the old wording told a reader a protection existed that does not, and
+    // a reader who believes it will not look for the case where it fails.
     let retired = amount_idr.min(balance);
 
     // Nothing left to take: mark it retired so the sweep stops revisiting it,
@@ -5229,9 +5259,93 @@ mod tests {
         assert_eq!(
             test_support::balance(&db.pool, account).await,
             0,
-            "40,000 of the aged credit was taken and the other 40,000 is the newer \
-             deposit's, not this deposit's to give"
+            "40,000 was taken. In THIS scenario the spend (60,000) exceeded the aged \
+             deposit (50,000), so the aged deposit's remaining credit really is 0 and \
+             the cap is exact - the wording here used to claim the 40,000 taken was \
+             'the aged credit' and the rest 'the newer deposit's, not this deposit's \
+             to give', which the cap cannot know. See \
+             the_sweep_over_takes_when_the_spend_is_smaller_than_the_aged_deposit"
         );
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_over_takes_when_the_spend_is_smaller_than_the_aged_deposit() {
+        // PINS A LIMITATION RATHER THAN A DESIRE, and it is written as an assertion on
+        // purpose: `expire_one_deposit` used to claim its `balance` bound "stops this
+        // sweep from taking a LATER deposit's credit", and TWO tests were cited as
+        // proving it. Neither does. Both spend PAST the aged deposit's amount, which is
+        // the one region where the cap and the aged deposit's remaining credit agree,
+        // so a reader checking the claim found it apparently confirmed.
+        //
+        // This is the region they miss. Two deposits of 50,000; the older expires now,
+        // the newer is held 30 days; then a spend of exactly 50,000. Under the
+        // oldest-first policy the entire spend consumed the OLDER deposit, so its
+        // remaining credit is 0 and the newer deposit's 50,000 is untouched - yet the
+        // wallet holds 50,000 and `min(amount_idr, balance)` takes all of it.
+        //
+        // WHY THIS IS ASSERTED AS CORRECT RATHER THAN AS BUGS. `docs/decisions.md:69`
+        // records the constraint that makes it unavoidable: there is ONE un-aged
+        // `wallets.balance_idr` and no per-deposit consumption record, so expired and
+        // live credit are NOT DISTINGUISHABLE. `try_debit` confirms it - it debits the
+        // wallet and never names a deposit. No better cap is available to this
+        // function, so the test's job is to make the boundary VISIBLE: if a future
+        // migration adds per-deposit attribution, this test fails and points at the
+        // code that can then be fixed. A limitation nothing asserts is a limitation
+        // nobody knows the shape of.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        let older = fund_through_topup(&db.pool, account, 50_000).await;
+        let older_id = age_the_deposit(&db.pool, &older, None).await;
+        let newer = fund_through_topup_again(&db.pool, account, 50_000, 100_000).await;
+        let newer_id = topup_id(&db.pool, &newer).await;
+        sqlx::query("UPDATE topups SET credit_expires_at = ? WHERE id = ?")
+            .bind(Utc::now() + chrono::Duration::days(30))
+            .bind(newer_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("hold the newer deposit");
+
+        // Spend exactly the aged deposit's amount: oldest-first says this consumed all
+        // of it, so 50,000 of live newer credit is what remains.
+        retire_balance(&db.pool, account, 50_000).await;
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            50_000,
+            "the fixture must leave exactly the newer deposit's credit in the wallet"
+        );
+
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+        assert_eq!(sweep.expired, 1, "the aged deposit is retired");
+        assert_eq!(
+            sweep.expired_idr, 50_000,
+            "THE OVER-TAKE: the wallet held only the newer deposit's credit, and the \
+             sweep took all of it. This is the cap being unable to attribute a spend, \
+             not a regression - see the disclosure on expire_one_deposit"
+        );
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            0,
+            "and the newer deposit's credit is gone while its own expiry is 30 days away"
+        );
+        assert_eq!(
+            credit_retired_at(&db.pool, newer_id).await,
+            None,
+            "the newer deposit is NOT marked retired, which is the inconsistency this \
+             test exists to make visible: its credit was taken and its row still says \
+             it has some"
+        );
+        assert!(
+            credit_retired_at(&db.pool, older_id).await.is_some(),
+            "the AGED deposit is the one marked retired, so the sweep did attribute the \
+             take to it - the problem is only that the amount it took came from the \
+             wallet, which is not attributable"
+        );
+
+        // The ledger invariant holds throughout - the money moved coherently, which is
+        // why this is a disclosure about attribution and not a money bug.
         assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
         db.close().await;
     }
@@ -5356,10 +5470,19 @@ mod tests {
 
     #[tokio::test]
     async fn the_sweep_cannot_take_more_than_the_wallet_holds() {
-        // The wallet has been spent down below the aged deposit's amount. The
-        // sweep takes what is there and marks the deposit retired - it must NOT
-        // go negative, and it must not take a LATER deposit's credit to make up
-        // the difference.
+        // The wallet has been emptied entirely. The sweep takes nothing and marks the
+        // deposit retired - it must NOT go negative, and it writes no zero-delta row.
+        //
+        // WHAT THIS DOES AND DOES NOT PROVE, because its old header claimed more: it
+        // said the sweep "must not take a LATER deposit's credit to make up the
+        // difference". With the wallet at exactly 0 that claim is untested - there is
+        // no LATER credit left to take, so the assertion cannot distinguish a correct
+        // cap from one that would reach into a live deposit. The case that DOES
+        // separate them is a PARTIAL spend, where the wallet still holds the newer
+        // deposit's money; `a_partly_spent_wallet_gives_up_its_oldest_credit_first`
+        // covers a spend large enough to exhaust the aged deposit, and the remaining
+        // case (a spend smaller than the aged deposit) is genuinely unknowable from
+        // this schema - see the disclosure on `expire_one_deposit`.
         let db = TestDb::new().await;
         let account = test_support::account(&db.pool).await;
 
