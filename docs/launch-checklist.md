@@ -147,6 +147,17 @@ opinion.
   before that test existed, and the scan asserts it read the tree so it cannot pass
   vacuously.
 - [x] The reconciliation query returns **zero rows** on production data.
+      **The tick is for the CODE half only**, in the sense this file uses elsewhere. What is
+      established here, and guarded: the query is a `FULL OUTER JOIN` that reports drift in
+      both directions (`tools/reconcile/reconcile.sql`), and `tools/reconcile-check`
+      mutation-tests it against a migrated database — a consistent fixture passes, a drifted
+      one fails and names the account, and the stranded-hold predicate is checked separately.
+      What is **NOT** established, and no repository change can establish: that the *live*
+      database returns zero rows. That is a reading of a deployed database. This box sits in
+      Gate 2 with the code-shaped items rather than with Gate 5's operational ones, so unlike
+      the backup-key item at the end of this gate - which is left UNTICKED precisely because
+      its truth is a deployment decision - the tick here could be read as covering both
+      halves. It covers the code half. Run the query against production before relying on it.
 - [x] `CHECK (balance_idr >= 0)` present and exercised.
 - [x] Money is `INTEGER` IDR end to end; no float appears in any billing path. (Was `BIGINT` under Postgres; `STRICT` SQLite tables reject `BIGINT`, so the type is now `INTEGER` — see `decisions.md` §Money.)
 
