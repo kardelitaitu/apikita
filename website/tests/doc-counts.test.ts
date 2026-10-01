@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 193;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 628;
+const SERVER_TESTS = 629;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -319,6 +319,12 @@ test('no doc still claims a superseded count', () => {
         // ledger holds money and whose wallets row is missing - the case the schema
         // permits and the gate catches. The new test pins the helper directly.
         '627 tests', '627 passed', '627 / 0 / 0',
+        // Retired the round after, when the SAME weakness was found in four more copies of
+        // the same rule - `drift_rows` in admin.rs, keys.rs, proxy.rs and webhooks.rs. The
+        // previous round fixed the copies it found; this one searched for the class
+        // (duplicated helpers whose doc cites a document) and found the rest. Three of the
+        // four are still unpinned by any test, which is recorded in those files.
+        '628 tests', '628 passed', '628 / 0 / 0',
       ],
     },
     {
