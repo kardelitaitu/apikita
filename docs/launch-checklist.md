@@ -67,12 +67,45 @@ recoverable.
       and observing, which is Gate 1's remaining work; there is nothing left in
       this repository that could make it true or false.
 - [ ] Edge relay deployed; nginx configured with `proxy_buffering off` on `/events`.
+      **The configuration half is DONE and guarded; only "deployed" is open.** The shipped
+      relay config (`.docker/nginx/relay.conf`) already sets `proxy_buffering off` on the
+      `/events` location — the setting SSE needs, since a buffering proxy holds frames until
+      its buffer fills and a customer sees a wallet that never updates — and
+      `tools/relay-check/check.sh` asserts it, so it cannot regress silently. What is left is
+      provisioning the VPS, which no repository change can make true.
 - [ ] Automatic certificate renewal on the relay **and** on the backend.
+      > **No repository half.** Nothing under `.docker/` or `tools/` configures `certbot`, an
+      > ACME client, or a renewal timer, so unlike its neighbours this gate is *entirely*
+      > operational — there is no partial credit to record. Stated explicitly because the two
+      > gates either side of it DO have a done half, and a reader should not have to check
+      > each one to find out which kind it is.
 - [ ] Backend serves a valid certificate for the public hostname (required for
       failover — see [`topology.md`](topology.md)).
+      > **No repository half**, for the same reason: certificates are issued to a hostname in
+      > a live environment. Nothing here can be verified ahead of a deploy.
 - [ ] Health checks configured: relay and backend independently.
+      **Both halves are written; neither is running.** The backend image carries a
+      `HEALTHCHECK` that probes its own health endpoint, and `docker-compose.yml` gives the
+      relay a `wget` probe against `/healthz`. The compose file is the LOCAL stack — see the
+      scheduler gate, which is the same gap one level up — and both probes need a deployed
+      environment to mean anything.
 - [ ] Failover path tested (relay down -> backend serves).
+      > **No repository half, and it is the one gate here that cannot be simulated
+      > meaningfully.** "Relay down" is a real network condition; a local test would exercise
+      > the failure of a process, not of a path. Note also that `tools/alert/probe.sh` watches
+      > for it — `relay_down` is one of the alerts it evaluates, and `alerts.tsv` marks it
+      > **covered** on the grounds that liveness is externally observable — so the DETECTION
+      > is built and the rehearsal is what remains.
 - [ ] Backups running, **offsite**, encrypted, and verified to produce a sane size.
+      **Four of the five words are implemented and guarded; "running" is open.**
+      `tools/backup/backup.sh` takes the copy, verifies it is a readable database
+      (`integrity_check`, exit 5 on an empty or corrupt copy rather than a warning),
+      **encrypts** it (openssl AES-256-CBC, PBKDF2, 200k iterations, exit 7 if the artifact
+      does not decrypt), runs the **offsite** hook (exit 8 on failure; an unset `OFFSITE_CMD`
+      is exit 1, so a missing offsite copy can never read as success), and prunes old
+      artifacts without ever removing the newest. `tools/backup-check/check.sh` pins those
+      behaviours, including that no plaintext dump is ever written. What remains is running it
+      on a schedule against a real volume and a real offsite target — both operator inputs.
 
 ## Gate 2 — Money correctness
 
