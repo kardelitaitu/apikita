@@ -835,12 +835,27 @@ pub struct PurgedUsage {
 ///   `server/src`. The only user-facing act is `POST /api/reviews/withdraw`, which sets
 ///   `withdrawn_at` and deliberately does not delete — the row has to keep occupying
 ///   the account's single slot, which is what "one review per account" means. So a
-///   review is kept **indefinitely**, and the column that would bound it
-///   (`reviews.account_id`) is `ON DELETE SET NULL`, so a review outlives the account
-///   that wrote it and stays in the public aggregate with nobody attached. The one path
-///   that clears a body is account closure, and `status = 'closed'` is set by NO code
-///   in this crate (the schema allows it; `grep -rn closed server/src` is empty), so in
-///   practice nothing clears one either.
+///   review is kept **indefinitely**.
+///
+///   **AND ITS AUTHOR CANNOT BE DELETED EITHER, which this paragraph used to get
+///   backwards.** It read "`reviews.account_id` is `ON DELETE SET NULL`, so a review
+///   outlives the account that wrote it and stays in the public aggregate with nobody
+///   attached". That cannot happen: `reviews` carries
+///   `CHECK (account_id IS NOT NULL OR telegram_id IS NOT NULL)`, and a website-written
+///   review has `telegram_id IS NULL`, so the FK action clearing `account_id` would leave
+///   (NULL, NULL) and the CHECK refuses the ENTIRE `DELETE FROM accounts`. MEASURED with
+///   `PRAGMA foreign_keys=ON` (the CLI defaults to OFF, which made a first attempt at this
+///   meaningless — no FK action fires, the DELETE appears to succeed, and the review still
+///   shows its `account_id` exactly as if it had been protected). Both a funded account
+///   and one with no wallet row are refused with "CHECK constraint failed".
+///   `tools/sqlite-probes/validate-migration-schema.py` pins the constraint now, because
+///   removing it would falsify this paragraph with no red build.
+///
+///   The one path that clears a body is account closure, and `status = 'closed'` is set by
+///   NO code in this crate (the schema allows it; `grep -rn closed server/src` is empty),
+///   so in practice nothing clears one either. And closure could not delete the account
+///   while a review exists, for the CHECK above — it would have to clear the body and keep
+///   the row, which is what "forever, unless the account is closed" means.
 ///   A retention row that says "until the user deletes them" reads as a bounded window
 ///   and is not one. `docs/data-retention.md` now says "forever, unless the account is
 ///   closed", and that correction is the reason to keep this paragraph rather than

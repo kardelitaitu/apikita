@@ -334,11 +334,27 @@ test('the expiry guard is reading the files it names', () => {
 // above: a policy sentence that is grammatically a commitment and factually a
 // placeholder.
 //
-// The consequence is not only editorial. `reviews.account_id` is
-// `ON DELETE SET NULL`, so a review OUTLIVES the account that wrote it and stays
-// in the public aggregate attached to nobody. `account_id IS NULL` is also the
-// partial-index predicate for Telegram-authored reviews, so a row whose author
-// left becomes indistinguishable from one written through the bot.
+// The consequence is documented rather than editorial, and the FIRST version of this
+// paragraph got it backwards. It read: "`reviews.account_id` is `ON DELETE SET NULL`, so a
+// review OUTLIVES the account that wrote it and stays in the public aggregate attached to
+// nobody. `account_id IS NULL` is also the partial-index predicate for Telegram-authored
+// reviews, so a row whose author left becomes indistinguishable from one written through
+// the bot."
+//
+// THAT MECHANISM CANNOT HAPPEN, and the schema says so in one line:
+// `CHECK (account_id IS NOT NULL OR telegram_id IS NOT NULL)` on `reviews`. A
+// website-written review has `telegram_id IS NULL`, so when the FK action cleared
+// `account_id` the row would be (NULL, NULL) - and the CHECK refuses that, which refuses
+// the ENTIRE `DELETE FROM accounts`. The author cannot be deleted while their review
+// exists. MEASURED with `PRAGMA foreign_keys=ON` (the sqlite3 CLI defaults to OFF, which
+// silently made a first attempt at this meaningless): both a funded account and one with
+// no wallet are refused with "CHECK constraint failed".
+//
+// The corrected statement is the one that matters for retention: a review is kept forever
+// AND its author cannot be deleted, so the row is never orphaned into the bot-authored
+// partition. `tools/sqlite-probes/validate-migration-schema.py` now pins the constraint
+// itself, because removing it would falsify this paragraph and the one in
+// `server/src/db.rs` with no red build.
 //
 // This test pins the ABSENCE, so implementing deletion deletes this test - which
 // is the design of the file it sits in. What it cannot check is the account

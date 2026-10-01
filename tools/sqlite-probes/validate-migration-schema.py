@@ -290,6 +290,62 @@ expect("ledger 'adjustment' accepted (the admin path)",
        "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) "
        "VALUES (?,?,?,?,?)", ("a1", 100, "adjustment", 100, TS), True)
 
+print("\n--- the reviews author/telegram invariant ---")
+# WHY THIS EXISTS. `reviews.account_id` is `ON DELETE SET NULL`, and BOTH
+# `website/tests/credit-expiry-claim.test.ts` and `server/src/db.rs` reason about the
+# consequence. The reasoning that matters is written down as a claim about an ORPHAN:
+#
+#   "`account_id IS NULL` is also the partial-index predicate for Telegram-authored
+#    reviews, so a row whose author left becomes indistinguishable from one written
+#    through the bot."
+#
+# THE CLAIM IS FALSE, and this probe is where that is enforced rather than argued. The
+# table carries `CHECK (account_id IS NOT NULL OR telegram_id IS NOT NULL)`. A review
+# written through the WEBSITE has `telegram_id IS NULL`, so when the FK action clears
+# `account_id` the row would be (NULL, NULL) - and the CHECK REFUSES the INSERT of that
+# intermediate state, which refuses the ENTIRE `DELETE FROM accounts`. The author cannot
+# be deleted while their review exists, so the review cannot outlive them and cannot be
+# reclassified as bot-authored.
+#
+# MEASURED, with `PRAGMA foreign_keys=ON` (the CLI defaults to OFF, which silently made
+# a first attempt at this probe meaningless - no FK action fires, the DELETE "succeeds",
+# and the review still shows its account_id exactly as if it had been protected):
+#     DELETE FROM accounts WHERE id='acc-nowallet';
+#     Runtime error: CHECK constraint failed:
+#       account_id IS NOT NULL OR telegram_id IS NOT NULL
+#
+# The constraint is load-bearing for the documented reasoning and was pinned by NOTHING,
+# so removing it would falsify two documents with no red build. These three probes are
+# that pin: the both-NULL state is impossible, a bot review is constructible, and a
+# website review is constructible. If a later migration relaxes the CHECK, the first one
+# fails and names why it matters.
+expect("a review with NO author at all is refused (the CHECK that keeps SET NULL honest)",
+       "INSERT INTO reviews (id, account_id, telegram_id, rating, is_customer, created_at, updated_at) "
+       "VALUES (?,?,?,?,?,?,?)",
+       ("r-none", None, None, 5, 1, TS, TS), False)
+expect("a website review (account, no telegram) is accepted",
+       "INSERT INTO reviews (id, account_id, telegram_id, rating, is_customer, created_at, updated_at) "
+       "VALUES (?,?,?,?,?,?,?)",
+       ("r-web", "a1", None, 5, 1, TS, TS), True)
+expect("a bot review (telegram, no account) is accepted",
+       "INSERT INTO reviews (id, account_id, telegram_id, rating, is_customer, created_at, updated_at) "
+       "VALUES (?,?,?,?,?,?,?)",
+       ("r-bot", None, "tg-1", 4, 0, TS, TS), True)
+
+# And the FK ACTION itself, which is the other half: the schema must still say SET NULL,
+# because a RESTRICT there would make account deletion impossible for a different reason
+# and change what the documents are describing.
+_reviews_ddl = con.execute(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='reviews'").fetchone()[0]
+results.append(("reviews.account_id is declared ON DELETE SET NULL",
+                "ON DELETE SET NULL" in _reviews_ddl.replace("\n", " "),
+                "the FK action the retention documents reason about"))
+results.append(("reviews_telegram_uniq is partial on account_id IS NULL",
+                "reviews_telegram_uniq" in con.execute(
+                    "SELECT COALESCE(group_concat(sql), '') FROM sqlite_master "
+                    "WHERE type='index' AND name='reviews_telegram_uniq'").fetchone()[0],
+                "the partial index that makes account_id IS NULL mean 'bot-authored'"))
+
 print("\n--- STRICT implies NOT NULL on PRIMARY KEY columns ---")
 expect("NULL refused in a composite PRIMARY KEY",
        "INSERT INTO key_ip_daily (api_key_id, day, distinct_ips, request_count) VALUES (?,?,?,?)",
