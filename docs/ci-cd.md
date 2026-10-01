@@ -460,6 +460,18 @@ earlier change in this same series edited the table. A sixth, in `health.rs`, ci
 `error-model.md:168` for the "never echo the driver's detail" rule, which is not at 168
 at all — 168 is the streaming-error section, and the rule lives twenty lines earlier.
 
+> **Both figures below are AS OF the commit that wrote them, and both have since fallen —
+> because this is the work that lowers them.** Re-measured at HEAD: `.md:N` citations in
+> `server/src` are **130**, not 172, and `error-model.md:N` is **17**, not ~70. Nothing
+> regressed; each converted citation leaves the population being counted.
+> > That makes these the one kind of measurement in this repository that is **expected to go
+> > stale**, and a bare present-tense number here is wrong in a way a reader cannot see. The
+> > count is stated with its revision for that reason. **To reproduce:** count `.md:N`
+> > occurrences across `server/src` at the revision named — summing per-file matches, since
+> > one line can carry two citations and a line-counting tool under-reports (measured:
+> > `git grep -c` gives **128** at BOTH revisions, so it cannot see the change at all).
+
+
 **ALL 172 RESOLVE TO A NAMED SECTION, and the obvious move was rejected anyway.**
 Finding the nearest preceding heading turns every one of them into a section name that
 cannot drift, and a script did exactly that: 167 rewritten, 5 correctly skipped where
