@@ -158,8 +158,26 @@ opinion.
       the backup-key item at the end of this gate - which is left UNTICKED precisely because
       its truth is a deployment decision - the tick here could be read as covering both
       halves. It covers the code half. Run the query against production before relying on it.
+- [x] Money is `INTEGER` IDR **in storage and at every function boundary**; no money quantity is
+      held as a float. (Was `BIGINT` under Postgres; `STRICT` SQLite tables reject `BIGINT`, so
+      the type is now `INTEGER` — see `decisions.md` §Money.)
+      **This used to read "no float appears in any billing path", which was FALSE as written.**
+      Floats are used deliberately in the PRICING arithmetic and the money module says so
+      itself: the doc-comment on `money::calculate_token_cost_idr` records that "the rates are
+      f64 per million tokens and the arithmetic is on the SCALED quantity, then a single
+      saturating cast to i64". Both money-returning functions (`calculate_token_cost_idr`,
+      `calculate_preflight_reservation_idr`) return `i64`, and `balance_idr` / `delta_idr` /
+      `amount_idr` / `cost_idr` are `INTEGER` in every migration that declares them - so the
+      storage claim was true and the sentence overstated it.
+      The overstatement is worth naming rather than quietly deleting, because the f64 step has a
+      MEASURED consequence that this line was hiding. The doc-comment on
+      `money::tests::the_charge_scales_exactly_with_the_units_billed` records that the f64
+      product can land a few billionths above an exact whole number, so the ceiling then bills a
+      whole extra rupiah - and states the honest answer to "can this ever overcharge?" as **BY
+      ONE RUPIE PER REQUEST** relative to exact proportionality, whenever the true total lands on
+      a whole number, not scaling with the amount. That is documented in the money module and is
+      not something a reader would infer from "no float appears in any billing path".
 - [x] `CHECK (balance_idr >= 0)` present and exercised.
-- [x] Money is `INTEGER` IDR end to end; no float appears in any billing path. (Was `BIGINT` under Postgres; `STRICT` SQLite tables reject `BIGINT`, so the type is now `INTEGER` — see `decisions.md` §Money.)
 
 ### Billing accuracy
 
