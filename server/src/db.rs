@@ -5438,6 +5438,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_sweep_and_a_settlement_interleave_without_breaking_the_ledger() {
+        // THE COMBINATION NOTHING ELSE COVERS. `expire_credit` and
+        // `debit_usage_transaction` both debit the same wallet and both append a
+        // `usage`-reasoned ledger row, and in production they run concurrently: the
+        // nightly `usage-purge` binary calls the sweep while the proxy serves
+        // settlements against the same SQLite file (usage-purge.rs:96,
+        // proxy.rs:1652). Measured: 13 tests touch expiry and 3 drive reserve/settle
+        // lifecycles, and only ONE test touches both -- and it is about a hold that
+        // matched no wallet, not about interleaving.
+        //
+        // Sequenced here rather than raced, deliberately: SQLite admits one writer, so
+        // the interleaving that matters is the STATE each operation leaves for the
+        // other, not true parallelism. A race would be nondeterministic and would not
+        // tell a reader which property broke.
+        //
+        // The property is the platform invariant: `wallets.balance_idr` equals
+        // `SUM(ledger.delta_idr)` after every step, whatever order they happen in.
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        // A deposit old enough to expire, holding 40,000.
+        let aged = fund_through_topup(&db.pool, account, 40_000).await;
+        let aged_id = age_the_deposit(&db.pool, &aged, None).await;
+
+        // A live reservation taken against that same wallet, as a request in flight
+        // would hold it. 25,000 of the 40,000 is out for the duration.
+        let held = reserve_balance_transaction(&db.pool, account, 25_000, Some("wi-1"))
+            .await
+            .expect("hold");
+        assert!(
+            matches!(held, ReservationResult::Held { .. }),
+            "the hold must be taken against the funded wallet, got {held:?}"
+        );
+
+        // THE SWEEP RUNS WHILE THE HOLD IS OUT. The wallet holds 15,000, so the aged
+        // deposit can give up only that much -- and the money currently reserved must
+        // not be reachable by the expiry debit.
+        let sweep = expire_credit(&db.pool, Utc::now()).await.expect("sweep");
+        assert_eq!(
+            sweep.expired_idr, 15_000,
+            "the expiry may take only what the wallet holds once the hold is out; \
+             taking the reserved portion would pay for an expiry with money that is \
+             already committed to a request in flight"
+        );
+
+        // The hold is then released and a settlement charged, on a wallet the sweep has
+        // already touched.
+        let released = release_reservation_transaction(&db.pool, account, 25_000, Some("wi-1"))
+            .await
+            .expect("release");
+        assert_eq!(released, Some(25_000), "the hold comes back in full");
+
+        let settled = debit_usage_transaction(
+            &db.pool,
+            account,
+            None,
+            "flash",
+            100,
+            10,
+            200,
+            5_000,
+            Some("wi-1"),
+            25_000,
+        )
+        .await
+        .expect("settlement");
+        let _ = settled;
+
+        // THE INVARIANT, after the sweep, the release and the settlement have all
+        // written to the same wallet.
+        assert_eq!(
+            test_support::balance(&db.pool, account).await,
+            test_support::ledger_sum(&db.pool, account).await,
+            "the wallet must still equal the ledger sum after a sweep interleaved with a \
+             reservation, a release and a settlement"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+
+        // And the aged deposit is retired exactly once, so the sweep cannot be run again
+        // to take a second bite now that the release has put money back.
+        assert!(
+            credit_retired_at(&db.pool, aged_id).await.is_some(),
+            "the aged deposit must be marked retired"
+        );
+        let before = test_support::balance(&db.pool, account).await;
+        let second = expire_credit(&db.pool, Utc::now())
+            .await
+            .expect("second sweep");
+        assert_eq!(
+            second.expired_idr, 0,
+            "a second sweep must take nothing: the deposit is retired, and the money the \
+             release put back belongs to no aged deposit"
+        );
+        assert_eq!(test_support::balance(&db.pool, account).await, before);
+        assert_eq!(ledger_drift_rows(&db.pool, account).await, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn the_sweep_survives_a_second_account_and_leaves_it_alone() {
         // Each deposit is retired in its own transaction, so one account's aged
         // credit cannot be affected by another's. This also pins that the
