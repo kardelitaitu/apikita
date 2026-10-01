@@ -361,20 +361,30 @@ not do is worse than no policy, because it is a demonstrable false statement.
       *runbook* is written; the code is not, and there is no disbursement rail.
 - [x] ~~Credit expiry: yes or no, and for how long.~~ **Settled: 2 years from
 deposit date, per deposit** (see §Expiry). The *implementation* below is still open.
-- [x] ~~Credit expiry **implementation**: a schema field for per-deposit expiry, a
+- [ ] ~~Credit expiry **implementation**: a schema field for per-deposit expiry, a
       sweep job, and refusal of a spend against expired credit.~~ **Built, except the
-      last clause — and the last clause is deliberate.** `topups.credit_expires_at` is
+      last clause — and the last clause is deliberate — AND NOT WIRED.** `topups.credit_expires_at` is
       stamped at settlement in the same statement that records it; `db::expire_credit`
-      retires aged deposits oldest-first and runs in the `usage-purge` binary. There is
+      retires aged deposits oldest-first. There is
       **no spend-time refusal**: expiry is honoured to the sweep's cadence, so credit
       that ages out after the last run stays spendable until the next one. That is a
       decision, not an omission — `try_debit` checking expiry too would be a SECOND
       definition of when credit dies, and two definitions is how a rule stops being
       trusted. See `decisions.md`, "Credit expiry: implementation".
-      > **This line said "the code is not written" and was stale.** The column, the
-      > sweep and the binary wiring all exist and are tested; only the spend-time
-      > refusal is absent, on purpose. Corrected rather than deleted so the next reader
-      > can see which half was real.
+      > **THIS LINE IS UNTICKED ON PURPOSE, AND IT USED TO BE TICKED.** It read "Built,
+      > except the last clause", which was about the CODE, and the code is indeed built
+      > and tested. But an item in a register headed "Open items" is asking whether the
+      > promise is discharged, not whether the code exists — and this one is not
+      > discharged. `db::expire_credit` has exactly one caller,
+      > `server/src/bin/usage-purge.rs`, and that binary is not shipped and does not run;
+      > `run_retention` has no counterpart for it. So no credit expires. A tick here said
+      > "settled" about the half that is not.
+      > **Two further sentences on this line were stale and are corrected, not deleted:**
+      > it said the sweep "runs in the `usage-purge` binary" (it is CALLED there; the
+      > binary does not run) and the note below said "the binary wiring all exist and are
+      > tested" (`usage-purge` is not wired at all). Both readings came from the same
+      > mistake — treating a call as a run — which is why the item is a checkbox rather
+      > than prose: the state has to be re-decided, not re-read.
 - [ ] Whether an entity (PT) exists to contract with, or a personal account — see
       [`business/05-risk.md`](business/05-risk.md) R1.
 - [ ] Complaint handling process, and who owns it.

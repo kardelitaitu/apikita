@@ -182,15 +182,45 @@ UPDATE accounts SET status = 'closed', updated_at = :now WHERE id = :account_id;
 that a non-zero wallet is never closed is already recorded in
 [`data-retention.md`](data-retention.md).
 
+**The ordering is the operator's responsibility, because NO GUARD CHECKS IT, and that is
+measured rather than assumed.** Step 6 renumbered above is deliberately ordered 1-2-3, and
+the numbers are load-bearing: nothing enforces that they are run in that order. Run step 3
+early, or run step 2 without step 1, and reconcile in Step 7 still returns zero rows —
+because it compares `wallets.balance_idr` against `SUM(ledger.delta_idr)` and those two can
+agree perfectly on an account that was never paid out. Verified against a scratch database:
+
+    accounts.status = 'closed', wallets.balance_idr = 50000, SUM(ledger) = 50000
+    -> reconcile drift rows = 0
+
+The wallet and the ledger agree with each other, so no drift is reported, and the reconcile
+query never reads `accounts.status` at all. **So "zero rows" proves the payout was
+ARITHMETICALLY CONSISTENT; it does not prove every closed account was emptied.** An operator
+who wants the second fact has to query for it:
+
+```sql
+SELECT a.id, w.balance_idr FROM accounts a
+  JOIN wallets w ON w.account_id = a.id
+ WHERE a.status = 'closed' AND w.balance_idr <> 0;
+```
+
+**Zero rows from THAT query** is the proof that no closed account still holds money, and it
+is the one to run beside reconcile. It is written here because the runbook previously called
+Step 7's zero rows "the only proof the payout was complete and correct", which overstates
+what that query can see.
+
 ## Step 7 — Verify
 
 ```
 tools/reconcile/reconcile.sh
 ```
 
-**Zero rows.** This is the only proof the payout was complete and correct, and it must
-be run against a scratch copy before any live payout — an untested recovery path is a
-belief, and this is the same standard the backup drill is held to.
+**Zero rows from reconcile, AND zero rows from the closed-but-funded query above.** Reconcile
+is the money invariant; the second query is the closure rule. They answer different questions
+and a runbook that checks only the first can sign off a wind-down with unpaid balances on
+closed accounts.
+
+Both must be run against a scratch copy before any live payout — an untested recovery path is
+a belief, and this is the same standard the backup drill is held to.
 
 ## Step 8 — Destroy the banking details
 

@@ -353,6 +353,74 @@ printf '%s\n' "$out3" | grep -qF "ELIGIBLE (automatic payout)         : 0 accoun
 printf '%s\n' "$out3" | grep -qF "(none)" \
     || fail "an empty eligible list must be shown as '(none)' rather than as a blank the operator has to interpret"
 
+# --- 8. The runbook's CLOSURE query, which reconcile cannot replace -------------
+# WHY THIS IS HERE. `docs/wind-down.md` Step 7 used to say reconcile's zero rows are "the
+# only proof the payout was complete and correct". Measured: reconcile compares
+# `wallets.balance_idr` against `SUM(ledger.delta_idr)` and never reads `accounts.status`,
+# so a CLOSED account that was never paid out passes it perfectly - the wallet and the
+# ledger agree with each other. Step 7 now carries a second query for that, and this
+# section runs BOTH against a fixture built to separate them. A runbook step that does not
+# do what the runbook says is the defect class this repository keeps finding; asserting the
+# documented SQL executes and discriminates is what stops it recurring silently.
+#
+# The fixture: one account closed while still funded (the failure), one closed correctly,
+# one active and funded (which must appear in neither list).
+# The fixture is built from MIGRATIONS, not copied from $DB: $DB is seeded for the report
+# and already carries accounts, so a copy would make "which rows did I add" unanswerable and
+# its own drift would be indistinguishable from mine.
+CLOSURE_DB="$WORK/closure.db"
+for f in "$MIGRATION_DIR"/*.sql; do
+    sqlite3 -bail "$CLOSURE_DB" < "$f" >/dev/null 2>&1 || fail "the closure fixture could not apply $(basename "$f")"
+done
+sqlite3 -bail "$CLOSURE_DB" "
+  INSERT INTO accounts (id, status, created_at, updated_at)
+    VALUES ('w82-bad','closed','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+  INSERT INTO wallets (account_id, balance_idr, updated_at)
+    VALUES ('w82-bad', 50000, '2026-01-01T00:00:00+00:00');
+  INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at)
+    VALUES ('w82-bad', 50000, 'topup', 50000, '2026-01-01T00:00:00+00:00');
+  INSERT INTO accounts (id, status, created_at, updated_at)
+    VALUES ('w82-good','closed','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+  INSERT INTO wallets (account_id, balance_idr, updated_at)
+    VALUES ('w82-good', 0, '2026-01-01T00:00:00+00:00');
+  INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at)
+    VALUES ('w82-good', 50000, 'topup', 50000, '2026-01-01T00:00:00+00:00');
+  INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at)
+    VALUES ('w82-good', -50000, 'refund', 0, '2026-01-01T00:00:00+00:00');
+" >/dev/null 2>&1 || fail "could not build the closure fixture"
+
+# Reconcile's query, verbatim in shape (FULL OUTER JOIN over wallets/ledger).
+RECON_SUM=$(sqlite3 -bail "$CLOSURE_DB" "
+  SELECT COUNT(*) FROM (
+    SELECT COALESCE(w.account_id, l.account_id) AS account_id
+    FROM wallets w FULL OUTER JOIN ledger l ON l.account_id = w.account_id
+    GROUP BY w.account_id, l.account_id, w.balance_idr
+    HAVING w.account_id IS NULL OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+  );" 2>&1)
+[ "$RECON_SUM" = "0" ] || fail "the closure fixture is not balanced - reconcile reports $RECON_SUM drift row(s), so this section cannot show what reconcile misses"
+
+# The runbook's closure query. It MUST name the badly-closed account.
+CLOSED_FUNDED=$(sqlite3 -bail "$CLOSURE_DB" "
+  SELECT a.id || ':' || w.balance_idr FROM accounts a
+    JOIN wallets w ON w.account_id = a.id
+   WHERE a.status = 'closed' AND w.balance_idr <> 0;" 2>&1)
+[ "$CLOSED_FUNDED" = "w82-bad:50000" ] \
+    || fail "docs/wind-down.md Step 7's closure query must name the account closed while still funded (expected 'w82-bad:50000', got '$CLOSED_FUNDED'). If it returns nothing, the runbook prescribes a check that cannot see the failure it exists for; if it returns more, it is flagging accounts that are fine."
+
+printf '%s\n' "$CLOSED_FUNDED" | grep -qF "w82-good" \
+    && fail "the closure query must NOT flag a correctly-closed account, and it flagged w82-good"
+
+# THE TWO ASSERTIONS ABOVE ARE COMPLEMENTARY AND NEITHER IS SUFFICIENT, which was measured
+# rather than reasoned about. Mutating the exact match to `[ -n "$CLOSED_FUNDED" ]` SURVIVES
+# on its own - and that is NOT a weakness: with the query still correct the output is still
+# exactly the expected string, so the check passes for the right reason and the mutation
+# cannot change any outcome. Re-run with the expected value loosened AND the query widened
+# to every closed account, it fails on the `w82-good` line above. So:
+#   exact match -> catches a query that UNDER-reports (returns nothing / the wrong account)
+#   w82-good    -> catches a query that OVER-reports (names accounts that are fine)
+# Deleting either one leaves a direction unguarded, which is why both are here rather than
+# the exact match alone looking sufficient.
+
 if [ "$FAILED" -ne 0 ]; then
     echo "wind-down-check: the wind-down report contract is BROKEN (see above)" >&2
     exit 1
@@ -361,5 +429,6 @@ fi
 echo "wind-down-check: OK - the report classifies rails by SETTLED midtrans, splits the"
 echo "wind-down-check:      threshold strictly (32000 sub, 32001 eligible), floors the"
 echo "wind-down-check:      stablecoin units, refuses a missing/garbage/zero rate and a bad"
-echo "wind-down-check:      DATABASE_URL, and leaves the database byte-identical"
+echo "wind-down-check:      DATABASE_URL, leaves the database byte-identical, and the runbook's"
+echo "wind-down-check:      closure query catches a paid-out account that reconcile passes"
 exit 0
