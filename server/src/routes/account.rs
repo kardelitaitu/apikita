@@ -1315,16 +1315,29 @@ mod tests {
 
     /// The reconciliation check from docs/observability.md, scoped to one
     /// account: wallets.balance_idr must equal SUM(ledger.delta_idr).
+    ///
+    /// FULL OUTER JOIN, matching `tools/reconcile/reconcile.sh` and the copy in
+    /// `db.rs`. This used to be a `LEFT JOIN` driven from `wallets`, which is a
+    /// DIFFERENT and weaker question: it can only see accounts that have a wallet row.
+    /// `ledger.account_id` references `accounts(id)`, NOT `wallets`, so a ledger row
+    /// with no wallet is permitted by the schema - and against exactly that case the
+    /// old query reported 0 drift. Measured: an account with a 5000 IDR ledger row and
+    /// no wallet row gives drift=1 under this query and drift=0 under the old one, so
+    /// every assertion in this module would have passed on an account the real Gate 2
+    /// reconcile fails. The shipped gate has always used the FULL OUTER JOIN (its own
+    /// header says so - "so it also catches a ledger account with NO wallets row");
+    /// this is the test helper being brought back into agreement with it.
     async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
-                SELECT w.account_id
+                SELECT COALESCE(w.account_id, l.account_id) AS account_id
                 FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
+                WHERE COALESCE(w.account_id, l.account_id) = ?
+                GROUP BY w.account_id, l.account_id, w.balance_idr
+                HAVING w.account_id IS NULL
+                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )
@@ -1332,6 +1345,56 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("reconciliation query")
+    }
+
+    /// A test OF THE HELPER ABOVE, which is the thing that let this module drift from the
+    /// shipped gate for several rounds. `ledger_drift_rows` is a transcription of
+    /// `tools/reconcile/reconcile.sh`, and a transcription that has quietly become weaker
+    /// turns every assertion built on it into a weaker check - while still being green.
+    ///
+    /// The case it must not lose is the one the schema permits and the old LEFT JOIN could
+    /// not see: a `ledger` row whose account has NO `wallets` row. `ledger.account_id`
+    /// references `accounts(id)`, not `wallets`, so nothing forbids it, and it is real
+    /// money with no cache holding it.
+    ///
+    /// Written as a direct assertion on the helper rather than through a handler, because
+    /// no handler can create this state - which is exactly why it went unnoticed.
+    #[tokio::test]
+    async fn the_reconciliation_helper_sees_ledger_money_with_no_wallet_row() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        // A ledger row with no wallets row. The account exists (the FK needs it); the
+        // wallet deliberately does not.
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) \
+             VALUES (?, 5000, 'adjustment', 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the orphan ledger row");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count wallets"),
+            0,
+            "the fixture must have NO wallet row, or this test is not testing the case"
+        );
+
+        assert_eq!(
+            ledger_drift_rows(&db.pool, account).await,
+            1,
+            "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate \
+             reports it (reconcile.sql is a FULL OUTER JOIN for this case). A helper that \
+             returns 0 here has silently become a weaker rule than the one that ships, and \
+             every assertion using it inherits the weakness."
+        );
+
+        db.close().await;
     }
 
     /// An account with a live session cookie, built the way the login path

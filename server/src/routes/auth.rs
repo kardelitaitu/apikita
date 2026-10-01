@@ -1482,16 +1482,26 @@ mod tests {
 
     /// docs/observability.md's reconciliation, scoped to one account:
     /// wallets.balance_idr must equal SUM(ledger.delta_idr).
+    ///
+    /// FULL OUTER JOIN, matching `tools/reconcile/reconcile.sh` and the copies in
+    /// `db.rs` and `routes/account.rs`. This used to be a `LEFT JOIN` driven from
+    /// `wallets`, which asks a DIFFERENT and weaker question: it sees only accounts that
+    /// have a wallet row, while `ledger.account_id` references `accounts(id)` - not
+    /// `wallets` - so a ledger row with no wallet is permitted by the schema and was
+    /// invisible to it. Measured: an account with a 5000 IDR ledger row and no wallet
+    /// row reports drift=1 here and reported drift=0 before, so an assertion using the
+    /// old form could pass on an account the shipped Gate 2 reconcile fails.
     async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM (
-                SELECT w.account_id
+                SELECT COALESCE(w.account_id, l.account_id) AS account_id
                 FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
+                WHERE COALESCE(w.account_id, l.account_id) = ?
+                GROUP BY w.account_id, l.account_id, w.balance_idr
+                HAVING w.account_id IS NULL
+                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
             ) AS drift
             "#,
         )

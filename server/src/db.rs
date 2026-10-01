@@ -1958,6 +1958,19 @@ mod tests {
     /// with no wallet row reporting a PASS, which is the exact figure the case below
     /// reproduces. A transcription is only safe if it is the same rule, so it now joins
     /// the same way and refuses in the same two directions.
+    ///
+    /// AND THE FIX DID NOT REACH ITS TWO SIBLINGS, which is worth recording here because
+    /// this is the copy that was corrected. `ledger_drift_rows` also exists in
+    /// `routes/auth.rs` and `routes/account.rs`; both kept the weaker LEFT-JOIN shape for
+    /// several rounds after this one was fixed, so those modules went on asserting the
+    /// rule this comment says is not the one that ships. Both are FULL OUTER JOINs now,
+    /// matching this copy and `tools/reconcile/reconcile.sh`.
+    ///
+    /// The lesson is that the rationale lived in ONE of three copies. A comment explaining
+    /// why a helper is shaped a particular way does nothing for the sibling nobody edited,
+    /// and a helper duplicated three ways is three chances to fix one. If this shape ever
+    /// changes again, change all three in the same commit - or better, lift it to one
+    /// shared helper, which is what the duplication has already cost once.
     async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
