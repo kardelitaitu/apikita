@@ -45,6 +45,28 @@
 #   (d) The explicit live-looking refusals are separate branches from the
 #       `LOW = LIVE_LOW` comparison, so neutering it leaves them working.
 #
+#   RE-MEASURED, and one sentence above is wrong in a way worth correcting rather than
+#   leaving. It says the SPOTCHECK hook "trips the restored-drift assertion first". It does
+#   not: the drill's spot-check block comes BEFORE the row-count block and exits from
+#   inside itself, so a desynchronised snapshot is reported as SPOT-CHECK FAILED and
+#   `ROW-COUNT MISMATCH` is never printed at all. Measured three ways on a stable baseline:
+#
+#     neuter `SRC_BAL != DST_BAL` (the spot-check) -> check SURVIVED, exit 0
+#     neuter `SRC_ROWS != DST_ROWS` (the row count) -> check SURVIVED, exit 0
+#     neuter BOTH                                   -> check FAILS
+#
+#   The first row is the correction: the spot-check IS driven, and neutering it is invisible
+#   because the desync injection also changes the row count, so the `A|B` case statement in
+#   the desync block is satisfied by the other message. The second row is the header's "(c)"
+#   being right - the row count is not reachable at all. So (c) holds, but the pair is not a
+#   pair: one is reachable and unpinned, the other is unreachable.
+#
+#   AN ATTEMPT TO "FIX" THIS WAS MADE AND REVERTED, recorded so it is not retried blindly:
+#   splitting the `A|B` match into two required matches looked obviously right and made the
+#   check FAIL on a clean tree, because with the spot-check binding the row-count message is
+#   never printed. Requiring both asserts an unreachable thing. The `A|B` form is correct as
+#   written; what is wrong is only the sentence describing which assertion fires.
+#
 #   These are covered by READING the drill, not by this check. If that is not good
 #   enough, the fix is to delete the redundant assertions rather than to add a test that
 #   appears to cover them.
