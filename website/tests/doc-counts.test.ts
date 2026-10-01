@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 193;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 623;
+const SERVER_TESTS = 626;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -297,6 +297,15 @@ test('no doc still claims a superseded count', () => {
         // test and survived - and a surviving mutant is evidence about the check only
         // after the mutation has been shown to be a real regression.
         '622 tests', '622 passed', '622 / 0 / 0',
+        // Retired on 2026-10-01, and this one is worth the note because it was the exact
+        // state the constant's own comment warns about: 623 was never bumped as three
+        // server tests landed (`cced211` added one for the sweep against an in-flight
+        // reservation, `b52bccb` and the expiry-ordering test added the others), so the
+        // constant, README.md, server/README.md and docs/ci-cd.md all agreed on a number
+        // that was three behind - and the suite stayed GREEN, because every assertion
+        // here compares a document to THIS constant and none compares it to the suite.
+        // Bumped to 626 alongside the new expiry-attribution test.
+        '623 tests', '623 passed', '623 / 0 / 0',
       ],
     },
     {
