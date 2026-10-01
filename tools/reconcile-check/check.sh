@@ -198,15 +198,51 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 # --- a stranded hold is its OWN code, not drift -----------------------------
+#
+# THE FIXTURE CARRIES ROWS THE PREDICATE MUST *EXCLUDE*, and it did not until now. The hold
+# predicate in reconcile.sh has three clauses - `ref LIKE 'reserve_%'`, `delta_idr < 0`, and
+# the `NOT EXISTS` pairing check - and a fixture containing ONLY a stranded hold exercises the
+# positive case alone. Measured, mutating each clause in turn against a stable baseline:
+#
+#     drop `ref LIKE 'reserve_%'`      -> SURVIVED, check exit 0
+#     drop the `NOT EXISTS` pairing    -> SURVIVED, check exit 0
+#
+# Both survive because the fixture holds nothing for them to exclude: no NEGATIVE row outside
+# the reserve_ family, and no reserve whose debit HAS a matching credit. The two rows below
+# supply exactly those, so each clause has something to discriminate and a mutation of either
+# now fails. `delta_idr < 0` is not pinned this way - measured, a positive reserve row does
+# not change this query's output, because the pairing clause already excludes it - and that
+# limitation is stated rather than papered over with a row that looks like coverage.
 sqlite3 "$DB" "
   INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at)
     VALUES ('acct-1', -1000, 'usage', 'reserve_check_stranded', 2000, '2020-01-01T00:00:00+00:00');
-  UPDATE wallets SET balance_idr = 2000 WHERE account_id = 'acct-1';
+  -- a NEGATIVE row whose ref is NOT reserve_%: the LIKE clause must exclude it
+  INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at)
+    VALUES ('acct-1', -300, 'usage', 'usage_check_plain', 1700, '2020-01-01T00:00:00+00:00');
+  -- a reserve debit WITH its release: the NOT EXISTS clause must exclude it
+  INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at)
+    VALUES ('acct-1', -700, 'usage', 'reserve_check_paired', 1000, '2020-01-01T00:00:00+00:00');
+  INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at)
+    VALUES ('acct-1', 1700, 'usage', 'reserve_check_paired', 2700, '2020-01-01T00:00:00+00:00');
+  UPDATE wallets SET balance_idr = 2700 WHERE account_id = 'acct-1';
 "
 out=$(run_gate); rc=$?
 if [ "$rc" -ne 5 ]; then
     fail "a stranded reservation hold must exit 5 (distinct from drift), got $rc"
 fi
+# AND THE LIST MUST NAME ONE HOLD, NOT THREE. Exit 5 says "something is stranded"; this says
+# WHICH, which is the half that pins the two exclusion clauses. Without it a predicate that
+# reported every reservation would still exit 5 and pass.
+case "$out" in
+    *reserve_check_stranded*) ;;
+    *) fail "the stranded-hold report must name the stranded reservation, so an operator knows which to release" ;;
+esac
+case "$out" in
+    *reserve_check_paired*) fail "a reservation WITH its matching release was reported as stranded - the NOT EXISTS pairing clause is not binding" ;;
+esac
+case "$out" in
+    *usage_check_plain*) fail "a NON-reservation ledger row was reported as a stranded hold - the ref LIKE 'reserve_%' clause is not binding" ;;
+esac
 
 # --- the code-shape refusals -----------------------------------------------
 out=$(env DATABASE_URL="postgres://nope" RECONCILE_DATABASE_URL="postgres://nope" \
