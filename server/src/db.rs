@@ -1971,6 +1971,26 @@ mod tests {
     /// and a helper duplicated three ways is three chances to fix one. If this shape ever
     /// changes again, change all three in the same commit - or better, lift it to one
     /// shared helper, which is what the duplication has already cost once.
+    ///
+    /// HOW MANY TESTS WOULD NOTICE THIS BREAKING, measured because the number is not obvious
+    /// and it is the thing a reader would assume wrongly. Neutering the helper so it ALWAYS
+    /// reports clean fails exactly TWO of the suite's tests:
+    ///
+    ///     reconciliation_reports_drift_instead_of_always_passing
+    ///     the_gate_reports_an_account_whose_wallet_row_is_missing
+    ///
+    /// Both are this helper's OWN detecting tests, and they are the two arms of the HAVING
+    /// clause - the general drift case and the no-wallet-row case - each independently
+    /// verified by mutating that arm alone. The other 35 call sites stay green, which is
+    /// CORRECT rather than a gap: a caller asserting "the ledger is clean" cannot also be
+    /// the test that the detector detects, because a detector that always says clean
+    /// satisfies that assertion perfectly. Detection is the detector's own test's job.
+    ///
+    /// The count is recorded because it says where the risk sits: the Rust side of this
+    /// invariant's DETECTION ability rests on two tests, and deleting either is a silent
+    /// loss for the other 35 callers. The SHIPPED rule is pinned separately and more
+    /// thoroughly - `tools/reconcile-check` mutation-tests the SQL, four mutants as of the
+    /// last re-run, plus the hold predicate's clauses.
     async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
         sqlx::query_scalar(
             r#"
