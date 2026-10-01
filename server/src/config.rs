@@ -1001,6 +1001,43 @@ impl AppConfig {
                     )
                     .into());
                 }
+                // AND IT MUST NOT BE NEGATIVE, which is NOT implied by the bound above.
+                //
+                // The loop above caps the cache rate at the input rate; nothing floored it.
+                // A negative rate is finite and passes that test, so a config with
+                // `cache_read_peak = -1e6` validated. It then propagated through
+                // `money::calculate_token_cost_idr`, where the cache term is SUBTRACTED:
+                // measured, input=1e3, cache=5e7, output=1e3 at r_cache=-1e6 against the
+                // shipped peak rates gives a cost of -57_499_987 IDR.
+                //
+                // Where that lands is the reason this is a money defect and not a
+                // curiosity: `db::debit_usage_transaction` passes `cost_idr` STRAIGHT to
+                // `try_debit`, whose guard is `balance_idr >= ?1` - a FLOOR, not a sign
+                // check. A negative amount satisfies it for any non-negative balance, and
+                // `balance_idr - (-X)` CREDITS the wallet. `clamp_debit` floors the cost on
+                // the OTHER path only; the settled branch does not call it. The ledger and
+                // the wallet move together, so reconciliation stays clean - it is money
+                // created from a configuration value.
+                //
+                // Negative is not a meaningful price under any reading. A zero cache rate
+                // already means "cache reads are not discounted" and is accepted, so the
+                // floor refuses only what cannot mean anything.
+                // NaN is refused here too, and the form says so directly rather than
+                // relying on a subtlety: `NaN <= 0.0` is FALSE, so the reflex `<= 0.0`
+                // would let a NaN through, and the negated `!(x >= 0.0)` that fixes that
+                // is what clippy's `neg_cmp_op_on_partial_ord` rightly calls hard to read.
+                // Naming both cases says what is meant.
+                if cache_rate.is_nan() || cache_rate < 0.0 {
+                    return Err(format!(
+                        "Model {} {class} cache_read rate {cache_rate} is negative or not a \
+                         number. A cache read is a discount off the input rate, so it is \
+                         bounded by it at the top; a negative one is not a deeper discount \
+                         but a CREDIT, and it reaches try_debit as a negative cost that \
+                         adds money to the wallet",
+                        model.name
+                    )
+                    .into());
+                }
             }
             // An override is what the reservation is sized from, so a 0 or
             // negative one would under-reserve silently. A MISSING override
@@ -1961,6 +1998,10 @@ mod tests {
 
             // Below and equal: accepted. Equality is the boundary the rule
             // deliberately allows, and the shipped config is far below it.
+            //
+            // ZERO IS IN THIS LIST ON PURPOSE. A zero cache-read rate means "cache reads
+            // are not discounted", which is a coherent setting; the negative floor added
+            // beside the upper bound must not swallow it.
             for ok in [1000.0, 500.0, 0.0] {
                 let mut config = AppConfig::load_from_file("../config/apikita.toml")
                     .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
@@ -1974,6 +2015,38 @@ mod tests {
                 config
                     .validate()
                     .unwrap_or_else(|e| panic!("a {class} cache rate of {ok} is legal: {e}"));
+            }
+
+            // ...and NEGATIVE is not, which the upper bound alone did not cover. A
+            // negative rate is finite and below the input rate, so it passed every rule
+            // here and reached `calculate_token_cost_idr`, where the cache term is
+            // subtracted - a cost of -57_499_987 IDR for the worked example in the
+            // validator's comment. `debit_usage_transaction` hands that straight to
+            // `try_debit`, whose guard is a floor rather than a sign check, so it CREDITS
+            // the wallet.
+            for negative in [-1.0, -1_000_000.0] {
+                let mut config = AppConfig::load_from_file("../config/apikita.toml")
+                    .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+                    .expect("config/apikita.toml must load");
+                let rates = &mut config.models[0].rates;
+                if class == "peak" {
+                    rates.cache_read_peak = negative;
+                } else {
+                    rates.cache_read_offpeak = negative;
+                }
+                let err = config
+                    .validate()
+                    .expect_err("a NEGATIVE cache-read rate must be refused")
+                    .to_string();
+                assert!(
+                    err.contains("is negative or not a number"),
+                    "the {class} message must say the rate is negative, got {err}"
+                );
+                assert!(
+                    err.contains("CREDIT"),
+                    "the message must say what it turns into, or the rule reads as \
+                     pedantry about a discount that is merely very good, got {err}"
+                );
             }
         }
 
