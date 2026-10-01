@@ -321,6 +321,32 @@ matters just as much: a mutation that BREAKS THE BUILD has shown the wiring is
 load-bearing, which is weaker evidence than an assertion failing - a compile error says
 this name matters, a failed assertion says this value does.
 
+**AND THE MUTATION HARNESS NEEDS ITS OWN CONTROL, because "the mutant survived" and "no
+test ran" look identical from outside.** Measured twice in one session while proving the
+route counts guarded. The first attempt filtered on a test name that did not exist, so
+`cargo test --lib <name>` reported `test result: ok. 0 passed; 0 failed; 0 ignored;
+625 filtered out` - and the harness read `ok` as PASS. Both pinned counts appeared to
+survive mutation, which would have been reported as "the count is not enforced"; the pins
+were fine and the runner was wrong. The second attempt hit the same class one level down:
+the file is CRLF, so an anchor written with a bare `\n` matched nothing, the mutation was
+never applied, and the unmutated tree passed - again indistinguishable from a survivor.
+
+So a mutation result is only evidence once three things hold, and each is cheap:
+
+  - **the mutation was APPLIED.** Assert the anchor matched before writing, and re-read
+    the file to confirm it changed. A `String.replace` with no match returns the input
+    unchanged and raises nothing.
+  - **a test actually RAN.** Parse the passed/failed counts and treat `0 passed; 0 failed`
+    as an ERROR, never as success. `cargo test` exits 0 when a filter matches nothing,
+    which is the trap: the same exit code means "all green" and "nothing executed".
+  - **the restore is byte-identical**, checked by hash rather than by having run a copy
+    command. A restore that silently failed leaves a mutation in the tree, and the next
+    round reads mutated source as if it were real.
+
+A harness missing the second control is the most dangerous of the three, because it fails
+in the direction that looks like a finding: every mutant survives, and the report says the
+guard is weak when the runner was broken.
+
 ### Where this rule stops, and why it stops there
 
 The log guard checks the SEVENTH restatement, and it works because `logged`, `logs` and
