@@ -328,6 +328,13 @@ The wallet ledger is the business.
       > past tense, as what was true of the file BEFORE, which is the only form a correction
       > can take without refuting itself. Same shape as every other note in this repository
       > that records a defect it also fixes.
+      > **And 52 is case-insensitive, which the number does not say.** Re-running it
+      > case-sensitively gives **48**, because 4 of the occurrences are capitalised `Server`.
+      > Both are correct counts of a different thing, and a figure that a reader can
+      > reproduce only by guessing the method is the same defect as one that is wrong. The
+      > past-tense claim is `scheduler` and `maintenance` **0**, `server` **52** counting
+      > case-insensitively (48 lower-case + 4 capitalised), and 0 is insensitive to the
+      > method, which is the part that carries the argument.
       > **Why it is easy to miss.** The jobs are written, tested and CI-smoked, and several
       > documents describe the scheduler as *what enforces retention* — so every retention
       > and expiry claim reads as satisfied. But a job that is built and smoked is still a
