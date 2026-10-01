@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 193;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 626;
+const SERVER_TESTS = 627;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -306,6 +306,12 @@ test('no doc still claims a superseded count', () => {
         // here compares a document to THIS constant and none compares it to the suite.
         // Bumped to 626 alongside the new expiry-attribution test.
         '623 tests', '623 passed', '623 / 0 / 0',
+        // Retired the round after, when `credit_expiry_instant` finally got a test. It had
+        // none at all, while its doc-comment carried two worked examples - and both were
+        // misleading (the clamp illustrated with a one-month span when the shipped setting
+        // is 24, and the calendar-month argument demonstrated on 15 March, a date where
+        // months and days AGREE). The behaviour was correct; nothing checked it.
+        '626 tests', '626 passed', '626 / 0 / 0',
       ],
     },
     {
