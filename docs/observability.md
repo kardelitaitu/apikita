@@ -61,6 +61,31 @@ did not agree to. Log token **counts**, never content.
 
 ## Metrics
 
+> **NONE OF THESE ARE EMITTED YET, and the tables below are a SPEC rather than a
+> description.** Every name here is a Prometheus-style counter, and this repository
+> contains no metrics exporter and no `/metrics` endpoint: `grep` for `_total{`,
+> `prometheus`, `opentelemetry` or a scrape port returns nothing, and the checklist at the
+> bottom of this file still carries "Metrics backend" UNCHECKED. Five of the names below
+> (`http_requests_total`, `proxy_requests_total`, `topups_settled_total`,
+> `topups_rejected_total`, `wallet_balance_sum_idr`) appear in this document and NOWHERE
+> else in the repository — measured, and the reason this note exists.
+>
+> **What an operator has instead is `GET /api/admin/metrics`** (operator-only), and it does
+> NOT serve these names. Its payload is `server_errors`, `responses`, `error_rate`,
+> `unhealthy_models` and `retention` — a different shape, read from the in-process counter
+> and one database query, not from a time-series store. So a reader who greps for
+> `topups_settled_total` finds this table and nothing that produces it.
+>
+> Until a backend exists, treat this section as the argument for one — including the
+> rejection-reason breakdown below, which is a genuinely good idea that no code computes.
+>
+> This is NOT the same statement as the one under **Alerts**, which says the alerts are
+> "implemented" and evaluated "without a metrics backend" by `check-alerts.sh` (SQL against
+> the database file) and `probe.sh` (HTTP against `/health` and the relay). Both are true at
+> once: the ALERTS are real because they read the database and the health endpoint directly,
+> and the METRICS in this section are not, because nothing exports a counter. The two
+> sections used to read as though the same machinery served both.
+
 Keep it small. Three categories:
 
 ### Money (the ones that matter)
