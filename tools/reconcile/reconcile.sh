@@ -123,8 +123,27 @@ trap 'rm -f "$ERR" "$HOLD_OUT" "$HOLD_ERR" "$HOLD_SQL"' EXIT HUP INT TERM
 # changes, change this one in the same commit - two definitions of "stranded" is
 # how a detector stops being trusted.
 #
-# Timestamps are RFC3339 text (docs/architecture.md: every timestamp is written
-# from Rust, never by SQL), so the age is strftime('%s', ...) on both sides.
+# Timestamps are RFC3339 text, so the age is an integer subtraction between times.
+#
+# `strftime('%s', 'now')` READS SQLite's clock here, and the project rule is
+# "every timestamp is WRITTEN from Rust, never by SQL" (docs/architecture.md) -- so
+# say plainly why this is not a violation, because the comment here used to cite that
+# rule as though it justified the call. The rule exists because SQLite's
+# `CURRENT_TIMESTAMP` and `datetime('now')` emit a SPACE-SEPARATED form that does not
+# compare correctly against the RFC3339 values the code binds, and the columns carry a
+# GLOB CHECK so the wrong form cannot be stored at all. Neither is in play: this
+# expression is never STORED, and `strftime('%s', ...)` yields integer seconds rather
+# than any date string, so no format can leak into a column.
+#
+# What it does mean is that this age is measured against the READER's clock rather
+# than the one that wrote the row. For a report-only diagnostic that is acceptable; a
+# WRITER must not do this. The shipped WRITERS do not: no migrated column declares
+# `DEFAULT CURRENT_TIMESTAMP` -- the only occurrences in `server/migrations/` are the
+# comments stating that rule -- and `validate-migration-schema.py` asserts it over
+# sqlite_master. Two SQL-side clocks remain in tools/, both outside that check and both
+# outside any customer data: this one, and the `installed_on ... DEFAULT
+# CURRENT_TIMESTAMP` column in the table `rollback/drill.sh` SYNTHESISES to stand in for
+# sqlx's own `_sqlx_migrations` -- a scratch database the drill creates and deletes.
 cat > "$HOLD_SQL" <<'HOLDSQL'
 SELECT l.account_id,
        (SELECT i.email FROM identities i
