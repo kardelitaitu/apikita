@@ -160,25 +160,36 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
-/// The documents an operator acts on. Every one of them is either run by hand under
-/// time pressure or is the reference an operator reads while doing so, which is what
-/// makes a line citation here expensive rather than untidy: the reader follows it,
-/// lands on the wrong line, and is looking at code that has nothing to do with what
-/// they were told.
+/// The documents whose line citations are checked.
 ///
-/// THE FOUR RUNBOOKS BELOW WERE MISSING, and that was measured rather than suspected.
-/// Planting `server/src/routes/admin.rs:44` in `wind-down.md` left this file's guard
-/// PASSING, which is the whole failure: the rule was enforced over seventeen documents
-/// and the four most operationally loaded ones were outside it. `wind-down.md` is the
-/// clearest case - it is "the operator procedure for closing the service and paying
-/// balances back", its SQL is meant to be run by hand, and a citation that re-points
-/// after an unrelated edit is worst exactly there.
+/// A DOCUMENT BELONGS HERE BY BEING CITATION-CHECKED, NOT BY BEING OPERATIONAL, and that
+/// distinction is the whole content of this comment because it was got wrong here once.
+/// An earlier round added four runbooks - `wind-down.md`, `backup-and-restore.md`,
+/// `abuse-runbook.md`, `architecture/identity.md` - on the argument that they are "the
+/// four most operationally loaded documents". The list above `TRIAGED` was built by
+/// planting a citation in `wind-down.md` and watching the guard pass, so the observation
+/// was real; the conclusion did not follow. Being read under pressure makes a citation
+/// EXPENSIVE TO GET WRONG, which is a reason to check one that exists, not a reason to
+/// require that citations exist.
 ///
-/// A doc earns its place here by being ACTED ON, not by being long or by mentioning
-/// code. `testing.md` runs commands but is read while developing rather than while
-/// closing the service, and the business plans are neither. The list is a judgement;
-/// what is checkable is that the judgement is written down where the next person will
-/// find it.
+/// Each of the four already carried a TRIAGED reason, and the four are still the answer:
+/// `backup-and-restore.md` "cites no source lines" (verified: zero citations in it),
+/// `architecture/identity.md` makes claims about a SET of call sites that "no single line
+/// citation can carry", and the other two are read after the fact rather than acted on by
+/// line citation. Adding them here made their reasons UNREACHABLE - the triage loop
+/// `continue`s as soon as `OPERATIONAL_DOCS` matches, so the entry is never consulted -
+/// which is worse than either list alone: a reader finds two decisions and no way to tell
+/// which one is live.
+///
+/// The same category error is named in the triage test itself, about a frontend spec
+/// excluded for a reason ("the behaviours are covered by the website suite") that argues
+/// about COVERAGE rather than about whether a citation can mislead. It is a different
+/// question, and being well-tested is not a reason.
+///
+/// So the rule for this list: a document belongs here when a stale citation in it would
+/// mislead, and the four above are excluded because they do not cite at all - a state the
+/// triage test's SECOND assertion enforces, by failing an excluded document that has a
+/// line citation left to go stale unless the line number IS its content.
 const OPERATIONAL_DOCS: &[&str] = &[
     "launch-checklist.md",
     "observability.md",
@@ -197,12 +208,6 @@ const OPERATIONAL_DOCS: &[&str] = &[
     "topology.md",
     "server/api-spec.md",
     "website/06-api-keys-and-limits.md",
-    // Runbooks an operator works from, added after a planted citation proved the rule
-    // did not reach them.
-    "wind-down.md",
-    "backup-and-restore.md",
-    "abuse-runbook.md",
-    "architecture/identity.md",
 ];
 
 /// Every line-number citation in the documents above, as `(document, line)`.
