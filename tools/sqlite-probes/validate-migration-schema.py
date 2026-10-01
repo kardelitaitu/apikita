@@ -233,6 +233,27 @@ results.append((not unchecked, f"all {len(ts_cols)} date/time columns have a GLO
                 "all guarded" if not unchecked else f"unguarded: {unchecked}"))
 
 # No time may be written by SQL: a DEFAULT CURRENT_TIMESTAMP would emit the wrong format.
+#
+# WHY THIS SINGLE LINE CARRIES A WHOLE CLASS OF DEFECT. `docs/architecture.md` states that
+# every timestamp is WRITTEN from Rust. The reason is format, not taste: SQLite's
+# `CURRENT_TIMESTAMP` and `datetime('now')` emit `YYYY-MM-DD HH:MM:SS`, while every
+# timestamp column carries a GLOB CHECK for the RFC3339 form the Rust code binds. A
+# `DEFAULT CURRENT_TIMESTAMP` would therefore be a column the schema cannot populate -
+# every INSERT omitting it fails the CHECK, and every INSERT supplying it makes the default
+# dead. The two are mutually exclusive and this assertion is what stops a migration from
+# choosing the wrong one.
+#
+# The check reads `ddl[t]` for EVERY table, so it is exhaustive over migrated schema rather
+# than over a list of the columns anyone remembered.
+#
+# VERIFIED NON-VACUOUS, and the two directions are what make it evidence rather than
+# decoration. On a COPY of the tree, adding `w73_probe TEXT DEFAULT CURRENT_TIMESTAMP` to a
+# table (in BOTH the migration and the plan, so the Appendix-A drift check stays clean and
+# this assertion is the only one that can catch it) makes exactly one check fail -
+# `[FAIL] no DEFAULT CURRENT_TIMESTAMP anywhere` - and takes the script's exit code from 0
+# to 1. A pristine copy exits 0. The exit code is the half that matters for CI, which runs
+# this script as a step and reads nothing else: a probe that printed [FAIL] and exited 0
+# would let a schema with a SQL-written default merge.
 defaults = [f"{t}" for t in tables if "CURRENT_TIMESTAMP" in ddl[t].upper()]
 results.append((not defaults, "no DEFAULT CURRENT_TIMESTAMP anywhere",
                 "none" if not defaults else f"present on: {defaults}"))
