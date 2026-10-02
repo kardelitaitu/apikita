@@ -219,6 +219,23 @@ pub fn credit_expiry_instant(settled_at: DateTime<Utc>, months: u32) -> Option<D
 /// expiry PER DEPOSIT: the instant is fixed at this settlement and never
 /// recomputed, so a later spend cannot move it. 0 means the customer's `[wallet]`
 /// setting disables expiry; the column stays NULL and nothing ever ages out.
+///
+/// ATOMICITY, measured rather than assumed, because `docs/launch-checklist.md` ticks
+/// "Crediting is atomic with the `topups` status update and the ledger row" and named no
+/// enforcer for it.
+///
+/// Half of that guarantee is the TYPE SYSTEM, which is stronger than any test:
+/// `Transaction::commit(self)` CONSUMES the transaction, so committing early (after the status
+/// update but before the ledger row) does not compile. Attempting it gives
+/// `error[E0382]: borrow of moved value: tx`, because every later `&mut *tx` is a
+/// borrow-after-move. The realistic early-commit bug is therefore not expressible here at all,
+/// and no test could add anything to that.
+///
+/// The other half IS test-pinned, and heavily: replacing the three writes' `&mut *tx` with
+/// `pool`, which is the "someone refactored the transaction away" bug and compiles fine, fails
+/// **74 tests**, including `concurrent_requests_cannot_overdraw_a_one_request_balance` and every
+/// settlement fixture. Both halves matter: the type system stops the mistake that is easy to
+/// type, and the suite catches the one that is not.
 pub async fn credit_topup_transaction(
     pool: &SqlitePool,
     order_id: &str,

@@ -118,6 +118,15 @@ opinion.
 - [x] Amount validated against the **stored** `topups` row, never the payload.
 - [x] Crediting is idempotent by `order_id`.
 - [x] Crediting is atomic with the `topups` status update and the ledger row.
+      **Half of this is the TYPE SYSTEM and half is the test suite**, measured because the item
+      named neither. `Transaction::commit(self)` CONSUMES the transaction, so the realistic
+      early-commit bug (commit after the status update, before the ledger row) does not compile
+      at all - `error[E0382]: borrow of moved value: tx`, since every later `&mut *tx` is a
+      borrow-after-move. That half cannot regress without failing the build.
+      The half a test can reach is pinned heavily: replacing the three writes' `&mut *tx` with
+      `pool` - the "someone refactored the transaction away" bug, which compiles fine - fails
+      **74 tests**, including `concurrent_requests_cannot_overdraw_a_one_request_balance`. The
+      detail lives on `db::credit_topup_transaction`.
 - [x] `refund` and `partial_refund` statuses **refused, not handled**: a signed
       refund notification returns 200 with `{"status":"refund_not_supported"}`,
       logs at `error!`, and writes nothing — the topup stays `settled`, no ledger
