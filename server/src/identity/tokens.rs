@@ -364,6 +364,69 @@ mod tests {
         );
     }
 
+    /// Single use ACROSS CONCURRENT CALLERS, which is the claim the doc-comment actually makes.
+    ///
+    /// `consume`'s doc says "THE MARK AND THE CHECK ARE ONE STATEMENT ... two simultaneous
+    /// redemptions cannot both succeed". The test above is SEQUENTIAL, so it pins the predicate but
+    /// not the atomicity: MEASURED, rewriting `consume` as an explicit SELECT-then-UPDATE - the
+    /// classic TOCTOU, and exactly what the doc says the one-statement form prevents - left the
+    /// whole suite green at 644. The sequential test still passed, because the first `consume`
+    /// commits before the second begins.
+    ///
+    /// WHY IT MATTERS: a redemption link is a session-grade credential. If two concurrent redemptions
+    /// both succeed, one link yields two sessions, and for `Purpose::Reset` two password resets. The
+    /// single UPDATE is the only thing standing between "used once" and that.
+    ///
+    /// The assertion counts SUCCESSES rather than errors, so it fails on the mutation (two Ok) and
+    /// cannot be satisfied by a fixture that merely returns the wrong error type.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_token_cannot_be_redeemed_twice_by_concurrent_callers() {
+        const CALLERS: usize = 8;
+        const ROUNDS: usize = 5;
+
+        // Five rounds, because whether the tasks interleave is scheduling. This mirrors the
+        // reasoning in abuse.rs's cap test: a single round can pass by luck, and the first version
+        // of that test did.
+        for round in 0..ROUNDS {
+            let db = TestDb::new().await;
+            let account = crate::test_support::account(&db.pool).await;
+            let now = Utc::now();
+
+            let issued = issue(&db.pool, account, Purpose::Reset, hour(), now)
+                .await
+                .expect("issue");
+
+            let raw = std::sync::Arc::new(issued.raw);
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(CALLERS));
+            let mut handles = Vec::new();
+            for _ in 0..CALLERS {
+                let pool = db.pool.clone();
+                let raw = std::sync::Arc::clone(&raw);
+                let gate = std::sync::Arc::clone(&gate);
+                handles.push(tokio::spawn(async move {
+                    // All the callers pile in together, so the SELECT and the UPDATE of different
+                    // callers genuinely overlap rather than queueing behind each other.
+                    gate.wait().await;
+                    consume(&pool, &raw, Purpose::Reset, now).await.is_ok()
+                }));
+            }
+
+            let mut successes = 0;
+            for handle in handles {
+                if handle.await.expect("the caller task must not panic") {
+                    successes += 1;
+                }
+            }
+
+            assert_eq!(
+                successes, 1,
+                "round {round}: {successes} of {CALLERS} concurrent redemptions of ONE link \
+                 succeeded. A token that redeems twice is two sessions, and for a reset link two \
+                 password resets. The mark and the check must stay one statement"
+            );
+        }
+    }
+
     /// Only the hash is stored. A read of the table must not hand over working
     /// links, which is the one promise this module makes about its own storage.
     #[tokio::test]
