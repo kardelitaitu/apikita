@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 196;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 639;
+const SERVER_TESTS = 641;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -336,6 +336,7 @@ test('no doc still claims a superseded count', () => {
         '636 tests', '636 passed', '636 / 0 / 0',
         '637 tests', '637 passed', '637 / 0 / 0',
         '638 tests', '638 passed', '638 / 0 / 0',
+        '639 tests', '639 passed', '639 / 0 / 0',
       ],
     },
     {

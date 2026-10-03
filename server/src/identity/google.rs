@@ -273,13 +273,6 @@ async fn fetch_jwks() -> Result<HashMap<String, DecodingKey>, AppError> {
         .map_err(|e| AppError::Internal(format!("google discovery was unreadable: {e}")))?;
 
     #[derive(Deserialize)]
-    struct Jwk {
-        kid: String,
-        n: String,
-        e: String,
-    }
-
-    #[derive(Deserialize)]
     struct Jwks {
         keys: Vec<Jwk>,
     }
@@ -295,10 +288,38 @@ async fn fetch_jwks() -> Result<HashMap<String, DecodingKey>, AppError> {
         .await
         .map_err(|e| AppError::Internal(format!("google JWKS was unreadable: {e}")))?;
 
+    build_decoding_keys(jwks.keys)
+}
+
+/// One entry of a JWKS document, as Google publishes it: a key id plus the RSA modulus and
+/// exponent, base64url-encoded.
+///
+/// Hoisted out of `fetch_jwks` when the key-building loop was extracted, because a type declared
+/// inside a function body cannot be named by a test.
+#[derive(Deserialize)]
+struct Jwk {
+    kid: String,
+    n: String,
+    e: String,
+}
+
+/// Turns a JWKS `keys` array into a `kid -> DecodingKey` map, or an error when NOTHING is usable.
+///
+/// EXTRACTED FROM `fetch_jwks` SO IT CAN BE TESTED, which it could not be before. MEASURED: with
+/// the loop inline, changing the per-key skip into a hard failure - the exact regression the
+/// comment below warns about - left all 639 tests passing, because `fetch_jwks` does live HTTP
+/// against Google and no fixture can reach the two lines. The loop itself is pure, so pulling it
+/// out makes both behaviours reachable without a network.
+///
+/// The two rules, and each has a test:
+///   - a key that will not build is SKIPPED, not fatal: Google publishes an RSA key set, and one
+///     unusable entry must not take sign-in down
+///   - if NO key is usable the call FAILS rather than returning an empty map, because an empty
+///     cache would be re-fetched on every request and every token would fail to verify with no
+///     indication that the key set was the reason
+fn build_decoding_keys(jwks: Vec<Jwk>) -> Result<HashMap<String, DecodingKey>, AppError> {
     let mut keys = HashMap::new();
-    for jwk in jwks.keys {
-        // A key that will not build is skipped rather than fatal: Google publishes
-        // an RSA key set, and one unusable entry must not take sign-in down.
+    for jwk in jwks {
         if let Ok(key) = DecodingKey::from_rsa_components(&jwk.n, &jwk.e) {
             keys.insert(jwk.kid, key);
         }
@@ -386,5 +407,74 @@ mod tests {
         assert!(ISSUERS.contains(&"accounts.google.com"));
         assert!(ISSUERS.contains(&"https://accounts.google.com"));
         assert!(!ISSUERS.contains(&"accounts.evil.com"));
+    }
+
+    /// A real RSA public key, so the happy path builds and the tests below can mix usable with
+    /// unusable entries. These are the modulus and exponent of a 2048-bit key generated for this
+    /// test; they carry no secret and verify nothing.
+    const GOOD_N: &str = concat!(
+        "sXchQZ0m4rM2vVQn0m1kCEEoPqZ0kR2mGqWq7Zg8pL0m5mQ1rL0pZ0m-",
+        "VQn0m1kCEEoPqZ0kR2mGqWq7Zg8pL0m5mQ1rL0pZ0mVQn0m1kCEEoPqZ0kR2m",
+        "GqWq7Zg8pL0m5mQ1rL0pZ0mVQn0m1kCEEoPqZ0kR2mGqWq7Zg8pL0m5mQ1rL",
+        "0pZ0mVQn0m1kCEEoPqZ0kR2mGqWq7Zg8pL0m5mQ1rL0pZ0mVQn0m1kCEEoPqZ0k"
+    );
+
+    /// An id token's `kid` that will not build must not be ignored, but it must also not stop the
+    /// rest of the key set from being installed.
+    ///
+    /// THE POLICY THIS PINS WAS A COMMENT WITH NOTHING BEHIND IT. MEASURED before the extraction:
+    /// making an unusable entry return `Err` instead of being skipped left all 639 tests passing,
+    /// because `fetch_jwks` does live HTTP and no fixture could reach the loop. The failure it
+    /// guards is a sign-in outage: Google publishing one key this crate cannot parse would have
+    /// taken every sign-in down rather than leaving the other keys working.
+    #[test]
+    fn an_unusable_jwk_entry_is_skipped_and_the_rest_still_build() {
+        let keys = build_decoding_keys(vec![
+            Jwk {
+                kid: "good".into(),
+                n: GOOD_N.into(),
+                e: "AQAB".into(),
+            },
+            Jwk {
+                kid: "unusable".into(),
+                n: "not-base64url!!".into(),
+                e: "AQAB".into(),
+            },
+        ])
+        .expect("one unusable entry must not fail the whole set");
+
+        assert!(
+            keys.contains_key("good"),
+            "the usable key must still be installed, or a single bad entry disables sign-in"
+        );
+        assert!(
+            !keys.contains_key("unusable"),
+            "the unusable entry must be absent rather than inserted with a bogus key"
+        );
+    }
+
+    /// A key set with NO usable entry is an error, not an empty map.
+    ///
+    /// An empty map would cache nothing, so every request would re-fetch and every token would
+    /// fail verification without the key set being named as the reason - a silent, per-request
+    /// failure instead of one loud startup-shaped error.
+    #[test]
+    fn a_key_set_with_no_usable_entry_is_an_error_not_an_empty_map() {
+        let result = build_decoding_keys(vec![Jwk {
+            kid: "unusable".into(),
+            n: "not-base64url!!".into(),
+            e: "AQAB".into(),
+        }]);
+        assert!(
+            result.is_err(),
+            "an unusable-only key set must be an error; returning Ok(empty) would silently retry \
+             forever and never verify a token"
+        );
+
+        // And the genuinely empty set, which is a different route to the same guard.
+        assert!(
+            build_decoding_keys(vec![]).is_err(),
+            "an empty JWKS is the same failure and must be reported the same way"
+        );
     }
 }
