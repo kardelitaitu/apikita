@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 193;
+const WEBSITE_TESTS = 195;
 
 /**
  * The server count, and the same kind of literal for the same reason.
