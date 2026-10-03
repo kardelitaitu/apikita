@@ -838,6 +838,89 @@ mod tests {
             test above is what will make this line need updating."
         );
     }
+
+    /// The link-code TTL in the CONTRACT is the TTL in the code.
+    ///
+    /// `routes/telegram.rs` states the 5-minute window in a constant whose own doc-comment says
+    /// why it is a constant and not a config knob: "The TTL is NOT configurable: it is a
+    /// security parameter stated in the contract, and a config knob would let a deployment widen
+    /// it by accident." Two documents state the same figure to readers - `docs/server/api-spec.md`
+    /// and `docs/architecture/identity.md`.
+    ///
+    /// MEASURED, which is why this exists: changing `LINK_CODE_TTL_MINUTES` from 5 to 15 left the
+    /// ENTIRE suite green at 641 passed, while both documents went on telling a reader 5 minutes.
+    /// The reverse drifts too - rewording `api-spec.md` to "15-minute TTL" also passed.
+    ///
+    /// WHY IT IS WORTH A GUARD rather than a comment. The TTL is the second line of defence on a
+    /// brute-forceable 6-digit code: the code space is 10^6 and the caps bound attempts, but a
+    /// LONGER window means more codes are live at once, so an attacker's odds per guess rise
+    /// without any counter changing. The constant's own comment says the contract is what fixes
+    /// it; nothing enforced that the contract and the constant agree.
+    ///
+    /// THE FIGURE IS READ FROM THE CONTRACT, NOT WRITTEN HERE, and the first version of this test
+    /// got that wrong: it asserted `ttl == 5`, so moving the decision deliberately - the thing a
+    /// security parameter exists to allow, under review - failed the guard that was supposed to
+    /// permit it. Same mistake as the register guard two tests up, in the same week. The number
+    /// comes from `api-spec.md`; this test only insists that the constant and both documents
+    /// agree with it.
+    #[test]
+    fn the_link_code_ttl_in_the_contract_is_the_ttl_in_the_code() {
+        let ttl = crate::routes::telegram::LINK_CODE_TTL_MINUTES;
+
+        // `api-spec.md` is the contract, and it states the figure in the sentence that also
+        // carries the "single-use" property, so the number cannot be picked up from an unrelated
+        // mention.
+        let spec = std::fs::read_to_string(doc_path("server/api-spec.md"))
+            .expect("docs/server/api-spec.md must be readable, or this passes over nothing");
+        let sentence = spec
+            .lines()
+            .find(|l| l.contains("single-use,") && l.contains("-minute TTL"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/server/api-spec.md no longer states the link-code TTL in a sentence \
+                     containing both `single-use,` and `-minute TTL`, so this check cannot read \
+                     the figure out of the contract. If the sentence was reworded, point this at \
+                     the new wording in the same commit."
+                )
+            });
+        // ANCHOR ON `single-use,`, NOT ON THE LINE START. The sentence reads "Issues a 6-digit
+        // code: single-use, 5-minute TTL, ...", so reading the first integer of the LINE returns
+        // the 6 from "6-digit" - a code length, not a lifetime. Measured: that is exactly what
+        // the first version of this parser did, and it reported the contract promising 6 minutes.
+        let after_property = &sentence[sentence.find("single-use,").unwrap_or(0)..];
+        let promised = first_integer(after_property).unwrap_or_else(|| {
+            panic!("could not read a number out of the contract sentence: {sentence}")
+        });
+
+        assert_eq!(
+            ttl, promised,
+            "routes/telegram.rs carries LINK_CODE_TTL_MINUTES = {ttl} and the contract promises \
+             {promised} minutes. The constant's own comment says the TTL is fixed by the contract \
+             rather than by a knob, so these two are one decision and must move together."
+        );
+
+        // The second document must agree as well, with the figure it actually writes.
+        let identity = std::fs::read_to_string(doc_path("architecture/identity.md"))
+            .expect("docs/architecture/identity.md must be readable");
+        let line = identity
+            .lines()
+            .find(|l| l.contains("short TTL ("))
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/architecture/identity.md no longer describes the link-code TTL as a \
+                     `short TTL (...)`, so this check cannot read the figure out of it."
+                )
+            });
+        let stated = first_integer(&line[line.find("short TTL (").unwrap_or(0)..])
+            .unwrap_or_else(|| panic!("could not read a number out of the identity doc: {line}"));
+        assert_eq!(
+            stated, ttl,
+            "docs/architecture/identity.md tells a reader the code lives {stated} minutes while \
+             LINK_CODE_TTL_MINUTES is {ttl}. Both describe the same window on a brute-forceable \
+             code, so a reader acting on the document is misled in the direction that matters."
+        );
+    }
+
     /// No secret value is ever interpolated into a log or format macro.
     ///
     /// A FOURTH claim checked, and the only one about SOURCE rather than about a
