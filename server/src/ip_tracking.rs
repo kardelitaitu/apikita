@@ -917,6 +917,75 @@ mod tests {
         );
     }
 
+    /// Concurrent callers asking for the SAME new day must all get the SAME salt.
+    ///
+    /// The write-lock RE-CHECK in `salt_for_day` exists for this and nothing held it: MEASURED,
+    /// deleting it left the whole suite green at 643. Every other test here is single-threaded, so
+    /// it takes the read-lock fast path or rotates once - the double-rotation needs two threads to
+    /// reach the write lock together.
+    ///
+    /// WHY IT MATTERS, and it is not a cosmetic race. `state.bytes` is REPLACED on rotation, so
+    /// without the re-check the second thread mints a SECOND salt for the same day and discards the
+    /// one the first thread already returned. A caller that hashed an IP with the first salt can no
+    /// longer match it against a later lookup for that same day, because the lookup hashes with the
+    /// second - the abuse counters silently stop counting the thing they were counting. The
+    /// invariant the comment states ("rotating twice would drop the salt those in-flight requests
+    /// are about to use") is exactly this, and it is observable from outside via `ip_hash`.
+    #[test]
+    fn concurrent_callers_on_a_new_day_all_get_the_same_salt() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        let day = NaiveDate::from_ymd_opt(2026, 9, 25).expect("date");
+        let next = NaiveDate::from_ymd_opt(2026, 9, 26).expect("date");
+        // Seeded with a DIFFERENT day, so every thread must take the rotation path rather than the
+        // read-lock fast path - which is the branch under test.
+        let salt = Arc::new(DailySalt::seeded(day, [1u8; 32]));
+
+        // A barrier so all the threads pile onto the write lock at once rather than trickling.
+        let gate = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let salt = Arc::clone(&salt);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    salt.salt_for_day(next)
+                })
+            })
+            .collect();
+
+        let salts: Vec<[u8; 32]> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
+
+        // Every thread must agree, because a caller cannot know which of its peers won the race.
+        let first = salts[0];
+        assert_ne!(
+            first, [1u8; 32],
+            "the fixture must have rotated off the seeded salt"
+        );
+        for (i, s) in salts.iter().enumerate() {
+            assert_eq!(
+                s, &first,
+                "thread {i} got a different salt for the SAME day. Removing the write-lock \
+                 re-check in salt_for_day rotates twice, so the second rotation discards the salt \
+                 the first caller is already hashing with - and an IP hash made with the discarded \
+                 salt stops matching a later lookup for that day"
+            );
+        }
+
+        // And the same fact through the public hashing path, which is how a caller would notice.
+        let visitor = ip("203.0.113.9");
+        let stored = ip_hash(&first, &visitor);
+        assert_eq!(
+            ip_hash(&salt.salt_for_day(next), &visitor),
+            stored,
+            "an IP hashed with the salt returned to one caller must still match a later lookup"
+        );
+    }
+
     #[test]
     fn a_fresh_salt_is_not_all_zeroes() {
         // A zero salt is a salt anyone can guess, which defeats the point.
