@@ -552,7 +552,18 @@ mod tests {
         // "seconds") means the row can carry any figure, and the unit word is what ties the
         // figure to the config key's denominator - a row reworded to weeks would fail here
         // rather than silently comparing weeks against months.
-        let rows: [(&str, &str, i64, &str); 2] = [
+        //
+        // THE EIGHT LIMIT ROWS WERE TESTED BEFORE BEING ADDED. Mutating each config value and
+        // running the full suite left all EIGHT green at 638 passed, with the mutation's
+        // before/after value printed to confirm it had landed - so each was genuinely
+        // unpinned, not merely suspicious. `min_first_deposit` and `min_topup` were tested the
+        // same way and are DELIBERATELY ABSENT: changing either fails two tests already, so a
+        // guard here would be a third copy of one rule.
+        //
+        // Their units are `per`, because these rows state a bare count and the key name
+        // carries the denominator (`_per_minute`, `_per_day`). Anchoring on a unit word that
+        // is not in the row would fail at the anchor rather than at the number.
+        let rows: [(&str, &str, i64, &str); 10] = [
             (
                 "Credit expiry",
                 "months",
@@ -564,6 +575,54 @@ mod tests {
                 "seconds",
                 config.limits.key_metadata_cache_seconds as i64,
                 "the key-metadata cache TTL",
+            ),
+            (
+                "Wallet mutation limit",
+                "per",
+                config.limits.wallet_mutations_per_minute as i64,
+                "the wallet mutation limit",
+            ),
+            (
+                "SSE replay buffer",
+                "events",
+                config.realtime.replay_buffer_events as i64,
+                "the SSE replay buffer",
+            ),
+            (
+                "SSE connections per account",
+                "**",
+                config.realtime.max_connections_per_account as i64,
+                "the per-account SSE connection cap",
+            ),
+            (
+                "Health-check interval",
+                "failures",
+                config.circuit_breaker.health_check_failures as i64,
+                "the health-check failure threshold",
+            ),
+            (
+                "Key pool attempts",
+                "**",
+                config.key_pool.max_key_attempts as i64,
+                "the key-pool attempt count",
+            ),
+            (
+                "Key creation",
+                "per",
+                config.limits.key_creation_per_day as i64,
+                "the daily key-creation cap",
+            ),
+            (
+                "Review submissions",
+                "per",
+                config.limits.review_per_hour as i64,
+                "the hourly review cap",
+            ),
+            (
+                "Low-balance DM",
+                "Below",
+                config.wallet.low_balance_threshold_idr as i64,
+                "the low-balance threshold",
             ),
         ];
 
@@ -630,24 +689,74 @@ mod tests {
     ///
     /// Used to read a figure out of a register row rather than restating it in the test. Kept
     /// deliberately narrow: no decimals, no signs - a decision row states a plain count.
+    ///
+    /// COMMAS AND UNDERSCORES ARE PART OF THE NUMBER. The register writes `**Below 10,000 IDR**`
+    /// and the config writes `10000`, so a reader that stopped at the comma returned 10 and
+    /// reported a 1000x disagreement that does not exist. The separator is only absorbed when a
+    /// digit follows it, so `**10, max 1/day**` still reads as 10.
     fn first_integer(s: &str) -> Option<i64> {
         let bytes = s.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
                 let start = i;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                while i < bytes.len() {
+                    // A separator is absorbed ONLY between digits, so `10,000` is one number
+                    // and `10, max` stops at 10.
+                    let is_digit = bytes[i].is_ascii_digit();
+                    let is_separator_between_digits = (bytes[i] == b',' || bytes[i] == b'_')
+                        && i + 1 < bytes.len()
+                        && bytes[i + 1].is_ascii_digit();
+                    if !is_digit && !is_separator_between_digits {
+                        break;
+                    }
                     i += 1;
                 }
-                if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                // A digit run welded to letters is usually a QUANTITY (`30s`, `10k`), which is
+                // exactly what a register row states. It is only an identifier when the token
+                // is long and snake_case (`20260925000000_initial`), which is what the length
+                // and underscore conditions below separate out.
+                let tail_start = i;
+                let mut j = i;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                let tail = &s[tail_start..j];
+                if tail.len() > 2 && tail.contains('_') {
                     // part of an identifier like `20260925000000_initial` - keep looking
                     continue;
                 }
-                return s[start..i].parse::<i64>().ok();
+                let token = s[start..i].replace([',', '_'], "");
+                return token.parse::<i64>().ok();
             }
             i += 1;
         }
         None
+    }
+
+    /// `first_integer` reads a figure the way the register writes it.
+    ///
+    /// Written because the comma bug above was found by a test failing on a 1000x "disagreement"
+    /// rather than by reading the code, and the next reader deserves the cases spelled out.
+    #[test]
+    fn the_first_integer_reader_handles_thousands_separators_and_stops_at_prose() {
+        for (input, expected) in [
+            ("**Below 10,000 IDR, max 1/day**", Some(10_000)),
+            ("**2 years (24 months) from each deposit**", Some(2)),
+            ("**60 seconds**", Some(60)),
+            ("**100 events**", Some(100)),
+            ("**5**", Some(5)),
+            ("**30s, 2 failures to fail over**", Some(30)),
+            ("no digits here", None),
+            // a separator that is NOT between digits must not be swallowed
+            ("**10, max 1/day**", Some(10)),
+        ] {
+            assert_eq!(
+                first_integer(input),
+                expected,
+                "first_integer disagreed about: {input}"
+            );
+        }
     }
 
     /// The bot README's claim about the FOLDER is true, checked against the tree.
