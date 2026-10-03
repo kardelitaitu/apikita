@@ -359,9 +359,10 @@ not do is worse than no policy, because it is a demonstrable false statement.
       *runbook* is written; the code is not, and there is no disbursement rail.
 - [x] ~~Credit expiry: yes or no, and for how long.~~ **Settled: 2 years from
 deposit date, per deposit** (see §Expiry). The *implementation* below is still open.
-- [ ] ~~Credit expiry **implementation**: a schema field for per-deposit expiry, a
+- [x] ~~Credit expiry **implementation**: a schema field for per-deposit expiry, a
       sweep job, and refusal of a spend against expired credit.~~ **Built, except the
-      last clause — and the last clause is deliberate — AND NOT WIRED.** `topups.credit_expires_at` is
+      last clause — and the last clause is deliberate — AND NOW WIRED.**
+      `topups.credit_expires_at` is
       stamped at settlement in the same statement that records it; `db::expire_credit`
       retires aged deposits oldest-first. There is
       **no spend-time refusal**: expiry is honoured to the sweep's cadence, so credit
@@ -369,20 +370,25 @@ deposit date, per deposit** (see §Expiry). The *implementation* below is still 
       decision, not an omission — `try_debit` checking expiry too would be a SECOND
       definition of when credit dies, and two definitions is how a rule stops being
       trusted. See `decisions.md`, "Credit expiry: implementation".
-      > **THIS LINE IS UNTICKED ON PURPOSE, AND IT USED TO BE TICKED.** It read "Built,
-      > except the last clause", which was about the CODE, and the code is indeed built
-      > and tested. But an item in a register headed "Open items" is asking whether the
-      > promise is discharged, not whether the code exists — and this one is not
-      > discharged. `db::expire_credit` has exactly one caller,
-      > `server/src/bin/usage-purge.rs`, and that binary is not shipped and does not run;
-      > `run_retention` has no counterpart for it. So no credit expires. A tick here said
-      > "settled" about the half that is not.
-      > **Two further sentences on this line were stale and are corrected, not deleted:**
-      > it said the sweep "runs in the `usage-purge` binary" (it is CALLED there; the
-      > binary does not run) and the note below said "the binary wiring all exist and are
-      > tested" (`usage-purge` is not wired at all). Both readings came from the same
-      > mistake — treating a call as a run — which is why the item is a checkbox rather
-      > than prose: the state has to be re-decided, not re-read.
+      > **THIS LINE WAS UNTICKED FOR THREE ROUNDS, AND THE REASON IT WAS UNTICKED IS THE
+      > POINT.** It once read "Built, except the last clause", which was about the CODE,
+      > and the code was built and tested. But an item in a register headed "Open items"
+      > asks whether the promise is DISCHARGED, not whether the code exists — and it was
+      > not: `db::expire_credit` had exactly one caller,
+      > `server/src/bin/usage-purge.rs`, and that binary shipped in no image and ran on no
+      > schedule, so `run_retention` had no counterpart for it and **no credit expired
+      > while this page published a term saying it would**. That is what the tick now
+      > records: `server/Dockerfile` builds `--bin usage-purge`, and
+      > `.docker/maintenance/entrypoint.sh` runs it nightly as the `credit-expiry` job,
+      > which **exits non-zero** rather than reporting a sweep it could not perform.
+      > `tools/backup-check/check.sh` holds both halves, so unwiring either one fails a
+      > gate rather than a document.
+      > **A correction note is not exempt from going stale, and this one did.** The note
+      > above read "So no credit expires" and "`usage-purge` is not wired at all" — both
+      > true when written and both invalidated by the commit that wired it, which updated
+      > `decisions.md` and missed this page. The document that publishes the TERM is the
+      > last place a stale sentence should be allowed to sit, which is why the tick and
+      > the note moved in the same edit rather than a round apart.
 - [ ] Whether an entity (PT) exists to contract with, or a personal account — see
       [`business/05-risk.md`](business/05-risk.md) R1.
 - [ ] Complaint handling process, and who owns it.

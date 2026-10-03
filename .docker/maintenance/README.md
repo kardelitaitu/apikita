@@ -76,8 +76,8 @@ for the service itself to commit it.
 
 | Job | Status | Why it cannot run here |
 | --- | --- | --- |
-| **`ip-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/ip-purge.rs` is a **Rust binary**. A server image **does** exist (`server/Dockerfile`), but it ships only `apikita-server` and `migrate`, so no image in *this* compose file contains it. The **retention window IS enforced** — `run_retention` applies the same `DELETE`s through sqlite3. It is the *binary* that does not run here. |
-| **`usage-purge`** | **BINARY NOT WIRED; MOST OF ITS WORK IS — ONE PART IS NOT** | `server/src/bin/usage-purge.rs`, same shape. It makes TWO calls, and they are not equivalent. `db::purge_expired_usage` reports four deletions — `usage_events` (90d), `usage_daily` (730d), expired/revoked `sessions` (30d), expired `identity_tokens` — and `run_retention` covers all four, so `docs/data-retention.md` is enforced here. **`db::expire_credit` is NOT covered: no credit expires.** It retires aged credit with an `UPDATE` of `topups.credit_retired_at` plus an `INSERT` of a negative ledger row, so it has no `DELETE` for the table comparison to find and `run_retention` was never given one. The wallet page and `docs/terms-of-service.md` both state a two-year expiry term that nothing applies. This row used to read "applies all three of its sweeps", which counted the deletions as three and did not mention the second call at all. |
+| **`ip-purge`** | **BINARY NOT WIRED; WORK IS** | `server/src/bin/ip-purge.rs` is a **Rust binary**. The server image (`server/Dockerfile`) ships **three** binaries — `apikita-server`, `migrate` and `usage-purge` — and this is **not** one of them, so no image in *this* compose file contains it. The **retention window IS enforced** — `run_retention` applies the same `DELETE`s through sqlite3. It is the *binary* that does not run here. |
+| **`usage-purge`** | **WIRED — the `credit-expiry` job** | `server/src/bin/usage-purge.rs` makes TWO calls. `db::purge_expired_usage` reports four deletions — `usage_events` (90d), `usage_daily` (730d), expired/revoked `sessions` (30d), expired `identity_tokens` — and `run_retention` covers all four, so `docs/data-retention.md` is enforced here without the binary. **`db::expire_credit` is the part that needed it: it retires aged credit with an `UPDATE` of `topups.credit_retired_at` plus an `INSERT` of a negative ledger row, so it has no `DELETE` for the table comparison to find and `run_retention` has no counterpart for it.** The binary is now **built into the server image** (`server/Dockerfile`, `--bin usage-purge`) and `run_credit_expiry` runs it nightly, **exiting non-zero** rather than reporting a sweep it could not perform. This row read "**NOT covered: no credit expires**" until that wiring landed, and the correction matters because the wallet page and `docs/terms-of-service.md` published a two-year expiry term nothing applied. |
 | **`hold-sweep`** | **WIRED — REPORT-ONLY** | `server/src/bin/hold-sweep.rs` still is not shipped, but `run_hold_sweep` applies its **detector** inline through `sqlite3`: the same predicate as the binary, the same 900s bound. It counts, names the accounts and refs, and exits non-zero. It **never moves money** — the binary's `--release` is the deliberate operator action. This matters most because a stranded hold is **invisible money**: the ledger still balances and reconciliation returns *nothing*. |
 | **`benchmark`** | **NOT WIRED** | `server/src/bin/benchmark.rs`. Not a maintenance promise; it is a measurement tool and has no business running on a timer. |
 | **`alerts`** | **WIRED - DATABASE CHECKS** | `run_alert_checks` runs `tools/alert/check-alerts.sh` nightly, so the three SQL-answerable alerts (`ledger_drift`, `balance_negative`, `stranded_hold`) are evaluated on a schedule rather than only existing. Its exit code is preserved (1=fired 2=config 3=no sqlite3 4=failed 5=undelivered 6=unknown): a check that did not run is not a check that passed. **A breach with no channel configured still exits non-zero**, because an alert nobody receives is worse than no alerting: it is believed. |
@@ -85,7 +85,9 @@ for the service itself to commit it.
 
 ### The interim answer for the Rust jobs: run them on the host
 
-The server image ships only `apikita-server` and `migrate`, so run these on the
+The server image ships `apikita-server`, `migrate` and `usage-purge` — the last of those
+for `credit-expiry` only, which runs it nightly in-container. What is **not** in any image
+is `ip-purge` and `hold-sweep`, so run those on the
 **host**, on the same nightly cadence:
 
 ```sh
@@ -101,16 +103,26 @@ DATABASE_URL='sqlite://data/server.db' \
   cargo run --manifest-path server/Cargo.toml --bin hold-sweep -- --release
 ```
 
-**All three are now covered in-container.** `ip-purge` and `usage-purge` encode SQL
-the entrypoint applies itself, so their *retention promises* are kept here even
-though the binaries do not run. `hold-sweep` is covered too, as its **report-only**
-half: `run_hold_sweep` detects, names and exits non-zero. What stays on the host is
-the **money-moving** half (`--release`), and that is deliberate — silently crediting
-a hold is the same invisible-money anti-pattern the sweep exists to catch.
+**`usage-purge` and `hold-sweep` are covered in-container; `ip-purge` is covered by SQL.**
+`usage-purge` is now a real nightly job (`credit-expiry`) because `db::expire_credit` is
+the one sweep whose work cannot be re-expressed as a `DELETE` — it retires aged credit
+with an `UPDATE` plus a negative ledger row, so the entrypoint runs the tested Rust
+function rather than a second copy of the money rule in shell. `ip-purge`'s retention
+window is kept by the SQL `run_retention` applies itself. `hold-sweep` is covered as its
+**report-only** half: `run_hold_sweep` detects, names and exits non-zero. What stays on
+the host is the **money-moving** half (`--release`), and that is deliberate — silently
+crediting a hold is the same invisible-money anti-pattern the sweep exists to catch.
 
-The honest future change is to ship the three binaries in the server image and add
-a service that runs them - then delete the `NOT WIRED` lines from the banner in
-the **same commit**, so the log never claims a wiring the compose file lacks.
+**The "honest future change" this section used to name has partly happened, and the
+section is corrected rather than deleted.** It read: *"ship the three binaries in the
+server image and add a service that runs them - then delete the `NOT WIRED` lines from
+the banner in the same commit."* `usage-purge` is now shipped and run, and the banner
+says so on every start (it prints `NOT WIRED credit-expiry` **only** when the runner is
+absent, which is the condition an operator needs to see rather than a fixed label).
+`ip-purge` is still not shipped, deliberately: its work is already done by
+`run_retention`, so shipping the binary would add an image, a job and a second copy of
+the same `DELETE`s for no behaviour. The remaining honest change, if it is ever made,
+is `hold-sweep`'s `--release` half — and that wants an operator decision, not a timer.
 
 ## The compose service that runs this script - PORTED
 

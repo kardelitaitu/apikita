@@ -524,11 +524,12 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       and both alert jobs run from **one container** — the `scheduler` service in
       `docker-compose.yml`, entrypoint `.docker/maintenance/entrypoint.sh`, calling
       `run_wired_jobs` → `run_retention`, `run_reconcile`, `run_hold_sweep`,
-      `run_alert_checks`, `run_alert_probes`. **That container is not part of the production
-      deployment procedure.** `docs/deployment.md` describes three steps — Cloudflare Pages,
-      the edge relay VPS, and Northflank — and never mentions it; the image section names
-      *"one image containing two binaries"* (`apikita-server`, `migrate`), and the
-      maintenance scheduler is a **different image**.
+      `run_credit_expiry`, `run_alert_checks`, `run_alert_probes`. **That container is not part
+      of the production deployment procedure.** `docs/deployment.md` describes three steps —
+      Cloudflare Pages, the edge relay VPS, and Northflank — and never mentions it; the image
+      section names *"one image containing three binaries"* (`apikita-server`, `migrate`,
+      `usage-purge`), and the maintenance scheduler is a **different image** that merely mounts
+      the third binary from the server one.
       > The `scheduler` service's own comment in `docker-compose.yml` says the jobs "were
       > written and then never run by anything — this is the service that ends that." That is
       > true of **local development**. It is not yet true of production, and nothing says so.

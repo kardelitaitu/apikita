@@ -38,8 +38,10 @@
 #
 #   ip-purge    THE BINARY IS NOT WIRED; ITS WORK IS. server/src/bin/ip-purge.rs
 #               reaches the database through sqlx. server/Dockerfile exists (W17)
-#               but ships only `apikita-server` and `migrate`, so no image in THIS
-#               container has the binary. The retention WINDOW is still enforced -
+#               and now ships `apikita-server`, `migrate` and `usage-purge` - but
+#               NOT this one, deliberately: its retention work is already done by
+#               `run_retention`, so shipping it would add an image and a job for no
+#               behaviour. The retention WINDOW is still enforced -
 #               `run_retention` applies the same two DELETEs through sqlite3 - so
 #               the promise is kept; it is the binary that does not run here.
 #

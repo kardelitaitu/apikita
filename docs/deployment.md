@@ -124,13 +124,21 @@ migration that undoes it. Down-migrations on live data are how you lose rows.
 
 ## The server image
 
-Step [3] ships **one image** containing **two binaries**, both built from
+Step [3] ships **one image** containing **three binaries**, all built from
 `server/Dockerfile`:
 
 | Binary | In the image as | Used by |
 | --- | --- | --- |
 | `apikita-server` | `/usr/local/bin/apikita-server` (the entrypoint) | Step [3] — the service itself |
 | `migrate` | `/usr/local/bin/apikita-migrate` | Step [2] — `sqlite migrate`, **never on server boot** |
+| `usage-purge` | `/usr/local/bin/apikita-usage-purge` | The **maintenance scheduler**, not this service — its `credit-expiry` job runs `db::expire_credit` nightly. It ships HERE because the server image is the only one with a Rust toolchain to build it, and `.docker/maintenance/` has no compiler |
+
+**The third binary is not used by this service at all**, and that is the part worth
+reading twice. It is in this image because this is where a Rust binary can be *built* —
+the maintenance container is Alpine with `sqlite3` and `curl` and has no toolchain — and
+the scheduler mounts it from here. So "the server image contains a money-moving binary"
+is true and does **not** mean the API runs a sweep: `entrypoint.sh` on this image starts
+`apikita-server` and nothing else.
 
 **Build it from the REPOSITORY ROOT**, not from `server/`:
 
@@ -162,7 +170,7 @@ docker run -d --name apikita-api -p 8080:8080 \
 | Property | Why | Verified by |
 | --- | --- | --- |
 | Runs as **uid 10001, non-root** | It holds a writable database and provider credentials in its environment | `docker run … --entrypoint id` |
-| **No toolchain or package manager** | A compiler in the runtime image is attack surface with no operational use | the runtime stage copies only the two binaries |
+| **No toolchain or package manager** | A compiler in the runtime image is attack surface with no operational use | the runtime stage copies only the binaries |
 | `/srv/apikita/server/data` exists and is **writable by the runtime user** | A fresh volume with a root-owned directory fails on first start with "unable to open database file" | the probe in the smoke step |
 | A **working `HEALTHCHECK`** | An always-red probe turns a healthy deploy into a restart loop | the smoke step requires the container to *report healthy* |
 | The container's shutdown is **graceful** | `tini` reaps and forwards signals to the whole process group | `ENTRYPOINT` exec form |
