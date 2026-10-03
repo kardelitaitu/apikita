@@ -496,7 +496,35 @@ run_reconcile() {
     # Errexit is deliberately NEVER enabled in this script (see the top): the exit
     # code is captured explicitly instead, so a drifting ledger is a reported
     # failure and not a dead scheduler.
-    DATABASE_URL="$RECONCILE_DATABASE_URL" sh "$RECONCILE_SH"
+    #
+    # THE FILE IS RESOLVED HERE, and this job did not use to do that. The DSN is
+    # handed over VERBATIM, which preserves the contract above and also inherits the
+    # caller's CWD: a relative `sqlite://data/server.db` is opened relative to
+    # whatever directory this process happens to be in. docker-compose.yml sets
+    # `working_dir: /srv/apikita/server` for exactly this reason and its comment
+    # names the consequence - "reconciliation looks for /data/server.db, reports
+    # exit 6 'no such database file', and the Gate 2 money check silently never
+    # runs against the real database."
+    #
+    # MEASURED, which is why this is now resolved rather than left to the compose
+    # file: run from any other directory, the job reports exit 6 and NOTHING IS
+    # VERIFIED. The other four jobs in this schedule resolve their own file
+    # (`run_retention`, `run_hold_sweep`, `run_credit_expiry` and `run_alert_checks`
+    # all call `db_file_from_url`), so reconcile was the odd one out - and it is the
+    # GATE 2 MONEY CHECK, the job it would be worst to have quietly depend on a
+    # directory set in a different file. Absolutising it here makes all five agree.
+    #
+    # The SCHEME is still reconcile.sh's to judge: an absolute path is passed only
+    # when `db_file_from_url` accepts the DSN. Otherwise the raw value goes over, so
+    # reconcile.sh reports its own exit 2 rather than this script inventing a
+    # refusal with a different meaning.
+    RECONCILE_DSN="$RECONCILE_DATABASE_URL"
+    if [ -n "${RECONCILE_DATABASE_URL:-}" ]; then
+        if RECONCILE_DB=$(db_file_from_url "$RECONCILE_DATABASE_URL"); then
+            RECONCILE_DSN="sqlite://$RECONCILE_DB"
+        fi
+    fi
+    DATABASE_URL="$RECONCILE_DSN" sh "$RECONCILE_SH"
     rc=$?
 
     if [ "$rc" -eq 0 ]; then

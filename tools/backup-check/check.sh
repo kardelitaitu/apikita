@@ -444,6 +444,36 @@ KNOWN
         fail ".docker/maintenance/entrypoint.sh does not CALL run_credit_expiry (only defines it, or does not mention it), so the credit-expiry sweep is built and never RUN. A binary that ships and is not scheduled enforces the published term no better than one that never shipped."
     fi
 
+    # EVERY DATABASE JOB RESOLVES ITS OWN FILE, because a DSN resolved against the CWD is a
+    # job that works only under the working directory somebody set in another file.
+    #
+    # MEASURED, twice. `run_credit_expiry` passed DATABASE_URL straight to the binary: with no
+    # working directory it reported FAILED and swept NOTHING, and with `--workdir` it worked -
+    # production sets that directory in docker-compose.yml, so the job was correct THERE and
+    # broken for the `once` verb, a manual `docker exec`, and CI. `run_reconcile` had the same
+    # shape and had it first: reconcile.sh resolves a relative path against its CWD, and
+    # docker-compose.yml's own comment names the consequence - "the Gate 2 money check silently
+    # never runs against the real database". That is the worst job to leave depending on a
+    # directory set elsewhere, and it was the one still doing it.
+    #
+    # So: every job that opens a DATABASE FILE must call `db_file_from_url`. `run_alert_probes`
+    # is correctly exempt - it talks HTTP and never opens the database.
+    #
+    # This is a source check, not a behavioural one: it asserts the SHAPE that makes the
+    # behaviour independent of CWD. The behavioural proof lives in the CI smoke, which runs
+    # reconcile from the image default directory.
+    for job in run_retention run_reconcile run_hold_sweep run_credit_expiry; do
+        JOB_AT=$(grep -n "^${job}()" "$REPO/.docker/maintenance/entrypoint.sh" | head -n 1 | cut -d: -f1)
+        if [ -z "$JOB_AT" ]; then
+            fail "the maintenance entrypoint no longer defines ${job}(). Either it was renamed - in which case update this list in the same commit - or a scheduler job has gone, and the sweeps it ran are now unenforced."
+            continue
+        fi
+        JOB_BODY=$(sed -n "${JOB_AT},\$p" "$REPO/.docker/maintenance/entrypoint.sh" | sed -n '/^}/q;p')
+        if ! printf '%s\n' "$JOB_BODY" | grep -q 'db_file_from_url'; then
+            fail "${job} in .docker/maintenance/entrypoint.sh does not resolve its database file with db_file_from_url, so a relative DATABASE_URL is resolved against the job's working directory. That directory is set in docker-compose.yml, which means the job is correct under compose and CANNOT RUN anywhere else - the once verb, a manual docker exec, and the CI smoke. For run_reconcile this is the Gate 2 money check silently never running."
+        fi
+    done
+
     # THE DOC'S JOB LIST, tied to the function it describes.
     #
     # MEASURED: `docs/deployment.md`'s open item lists what `run_wired_jobs` calls, and it

@@ -509,6 +509,55 @@ jobs:
             exit 1
           fi
 
+          # 2b: reconcile. THE ONLY WIRED JOB WITH NO SMOKE UNTIL NOW, and the worst one to
+          # leave out: it is the Gate 2 money-correctness check, the job whose whole purpose is
+          # to notice that the wallet cache and the authoritative ledger disagree.
+          #
+          # WHY IT NEEDED ONE. `run_reconcile` handed the DSN to reconcile.sh VERBATIM, and
+          # reconcile.sh resolves a relative `sqlite://` path against its CWD. The only reason
+          # it worked in production is `working_dir: /srv/apikita/server` in docker-compose.yml
+          # — a directory set in a DIFFERENT FILE. Run it anywhere else and it reports exit 6
+          # "no such database file", which this step would have seen immediately. MEASURED
+          # before the fix: exit 6 from `/` and exit 0 from `/srv/apikita/server`.
+          #
+          # TWO ASSERTIONS, because either alone is wrong. A balanced database must exit 0
+          # (the job RUNS), and a drifted one must exit NON-ZERO (the job still DETECTS). A
+          # check that cannot fail is worse than one that cannot run - it reports OK over a
+          # broken ledger, which is the failure this whole service exists to prevent.
+          out=$($RUN $MOUNT $REC $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP reconcile 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "job reconcile: OK" || {
+            echo "::error::reconcile did not report success on a balanced database - the Gate 2 money check is not running"
+            exit 1
+          }
+
+          # Inject REAL drift: the wallet cache is raised so it no longer equals the ledger
+          # total. `reconcile.sh` must name it and exit non-zero.
+          $RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "UPDATE wallets SET balance_idr = balance_idr + 500;"'
+
+          drift_rc=0
+          $RUN $MOUNT $REC $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP reconcile >/dev/null 2>&1 || drift_rc=$?
+          if [ "$drift_rc" -eq 0 ]; then
+            echo "::error::reconcile exited 0 on a database where the wallet cache disagrees with the ledger - the Gate 2 check is blind"
+            exit 1
+          fi
+          echo "reconcile detected the injected 500 IDR drift (exit $drift_rc)"
+
+          # Put the drift back: the alert and credit-expiry steps after this one assume a
+          # consistent database, and leaving it broken would make THEIR failures meaningless.
+          $RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "UPDATE wallets SET balance_idr = balance_idr - 500;"'
+          $RUN $MOUNT $REC $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP reconcile 2>&1 | grep -q "job reconcile: OK" || {
+            echo "::error::reconcile did not return to OK after the injected drift was removed - the later steps would be running against a database this one broke"
+            exit 1
+          }
+
           # 3: hold-sweep. THE gap this step exists for: a stranded reservation hold
           # is INVISIBLE MONEY - the ledger balances and reconcile.sh is structurally
           # blind to it - so the scheduler must actually detect one, not merely claim to.
