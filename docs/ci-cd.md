@@ -209,7 +209,7 @@ So CI runs **bundled SQLite**, and the database is a file — no `services:`, no
 ```
 
 **There is no longer an ignored database tier.** `cargo test` is the whole suite:
-measured on the merged tree, `cargo test --lib` reports **646 passed / 0 failed /
+measured on the merged tree, `cargo test --lib` reports **647 passed / 0 failed /
 0 ignored**, where the previous arrangement reported 200 passed / 75 ignored and
 needed a live Postgres to run the difference.
 

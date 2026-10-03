@@ -3465,4 +3465,255 @@ mod tests {
              `release_hold` in `bin/hold-sweep.rs` could never credit a hold. Sites: {raw:#?}"
         );
     }
+
+    /// A line citation in a RUST COMMENT points at code that exists.
+    ///
+    /// `line_citations` above covers an operator-facing set of documents. This module's own scope
+    /// note explains why citations matter there - "a line citation re-points at its neighbour the
+    /// moment a row is added" - and the SAME argument applies to a comment inside this crate, which
+    /// nothing was checking. MEASURED before this test existed: of 54 citations in Rust comments,
+    /// **11 pointed at a blank line or a bare brace**. `db.rs` cited line 266 for `clamp_debit`,
+    /// which lives at 658 and cited a blank line in between; `proxy.rs` cited 1094-1098 for an
+    /// invariant stated at 1100, inside the citation's own doc block. Every one of them READ as a
+    /// plausible reference, which is the failure mode this module's header names: a reader following
+    /// one lands somewhere else without necessarily noticing.
+    ///
+    /// THREE WAYS A CITATION CAN BE LEGITIMATE, and the guard accepts exactly these:
+    ///
+    ///   1. it resolves inside this repository, at a line that holds code rather than a blank line
+    ///      or a closing brace;
+    ///   2. it names a DEPENDENCY's own source - `sqlx-sqlite 0.8.6, src/options/mod.rs:198` is a
+    ///      citation of the vendored crate, not of this crate, and it is accurate (verified: that
+    ///      line is `create_if_missing: false,`). The crate name must appear in the same COMMENT
+    ///      BLOCK, because a comment wraps and the name is often on the previous line;
+    ///   3. it is quoted as an EXAMPLE rather than asserted - `doc_claims.rs`'s own scope note
+    ///      discusses a hypothetical `config.rs:89`. Those are listed in CITATION_EXAMPLES below.
+    ///
+    /// WHAT IT CANNOT SEE. A citation that resolves to a real line but to the WRONG CODE is
+    /// indistinguishable from a correct one here - the line is non-blank either way. This catches
+    /// the drift that actually happens (a number left behind as the file grows), not a number that
+    /// was wrong when written. Saying so is the point: the guard is a floor, not a proof.
+    #[test]
+    fn every_rust_comment_citation_points_at_code() {
+        /// Citations that are QUOTED EXAMPLES of staleness rather than claims about this tree.
+        /// `(file, cited target, cited line)` - each is prose about what a stale citation looks
+        /// like, so it is meant not to resolve.
+        const CITATION_EXAMPLES: &[(&str, &str, u32)] = &[("doc_claims.rs", "config.rs", 89)];
+
+        /// Crates whose own source a comment may cite. If a citation does not resolve in this
+        /// repository, the comment block must name one of these for it to be a dependency citation.
+        const DEPENDENCIES: &[&str] = &[
+            "sqlx-sqlite",
+            "sqlx-core",
+            "sqlx",
+            "tokio",
+            "axum",
+            "hyper",
+            "chrono",
+            "serde_json",
+            "serde",
+            "reqwest",
+            "argon2",
+            "jsonwebtoken",
+        ];
+
+        // Every citation in a comment, with its file and line.
+        struct Citation {
+            file: String,
+            line: usize,
+            target: String,
+            cited: u32,
+            block: String,
+        }
+        let mut citations: Vec<Citation> = Vec::new();
+
+        for path in source_files() {
+            let rel = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let text = text.replace("\r\n", "\n");
+            let lines: Vec<&str> = text.lines().collect();
+
+            for (i, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                let is_comment = trimmed.starts_with("//") || trimmed.starts_with('*');
+                if !is_comment {
+                    continue;
+                }
+                // Find `<something>.rs:<digits>` in the comment.
+                let mut rest = *line;
+                while let Some(at) = rest.find(".rs:") {
+                    let before = &rest[..at];
+                    // Walk back over the path characters.
+                    let start = before
+                        .rfind(|c: char| {
+                            !(c.is_ascii_alphanumeric()
+                                || c == '_'
+                                || c == '/'
+                                || c == '.'
+                                || c == '-')
+                        })
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+                    // A citation is written EITHER repo-relative (`server/src/x.rs`) or
+                    // src-relative (`src/x.rs`, `routes/x.rs`). The leading `server/` is stripped so
+                    // both spellings resolve through one candidate list - without it,
+                    // `server/src/identity/email.rs` was tried as a path relative to `src/` and
+                    // reported missing while the file was plainly there.
+                    let raw_target = format!("{}.rs", &before[start..]);
+                    let target = raw_target
+                        .strip_prefix("server/")
+                        .unwrap_or(&raw_target)
+                        .to_string();
+                    let after = &rest[at + 4..];
+                    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(cited) = digits.parse::<u32>() {
+                        // The citation's OWN COMMENT BLOCK, for the dependency test - and it must be
+                        // the block the citation is IN, not a fixed window around it.
+                        //
+                        // A FIXED WINDOW FAILS OPEN, measured: with a `±3` window, a planted
+                        // `nosuch.rs:12` sitting beside `pub http_client: reqwest::Client` was waved
+                        // through because the window contained `reqwest`. A struct being documented
+                        // names crates in its own fields, so a nearby line matches almost always.
+                        //
+                        // The block is the run of CONTIGUOUS comment lines containing the citation:
+                        // narrower than the leading doc block (which a long module header would make
+                        // uselessly wide) and correct where a window is not.
+                        let mut lo = i;
+                        while lo > 0
+                            && (lines[lo - 1].trim_start().starts_with("//")
+                                || lines[lo - 1].trim_start().starts_with('*'))
+                        {
+                            lo -= 1;
+                        }
+                        let mut hi = i;
+                        while hi + 1 < lines.len()
+                            && (lines[hi + 1].trim_start().starts_with("//")
+                                || lines[hi + 1].trim_start().starts_with('*'))
+                        {
+                            hi += 1;
+                        }
+                        let block = lines[lo..=hi].join("\n");
+                        citations.push(Citation {
+                            file: rel.clone(),
+                            line: i + 1,
+                            target,
+                            cited,
+                            block,
+                        });
+                    }
+                    rest = &rest[at + 4..];
+                }
+            }
+        }
+
+        // THE FLOOR. A regex that matched nothing would report no violations and pass forever.
+        assert!(
+            citations.len() >= 40,
+            "the citation scanner found {} citations in Rust comments; it found 54 when this test \
+             was written. A number this low means the parse broke - a comment style changed, or the \
+             `.rs:<digits>` shape did - and every assertion below is vacuous.",
+            citations.len()
+        );
+
+        // A path-qualified citation must resolve as a path; a bare filename may resolve by UNIQUE
+        // basename. Matching a bare basename against a qualified path is how `src/options/mod.rs`
+        // once appeared to resolve to `routes/mod.rs` - the candidate list is what makes the guard
+        // sound, so it is spelled out rather than approximated.
+        let mut by_basename: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+            std::collections::HashMap::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for p in source_files() {
+            if let Some(name) = p.file_name() {
+                by_basename
+                    .entry(name.to_string_lossy().into_owned())
+                    .or_default()
+                    .push(p.clone());
+            }
+        }
+
+        let mut broken: Vec<String> = Vec::new();
+        for c in &citations {
+            // (3) a quoted example.
+            if CITATION_EXAMPLES
+                .iter()
+                .any(|(f, t, n)| c.file == *f && c.target == *t && c.cited == *n)
+            {
+                continue;
+            }
+
+            let candidates: Vec<std::path::PathBuf> = if c.target.contains('/') {
+                ["src/", ""].iter().fold(Vec::new(), |mut acc, pre| {
+                    let p = root.join("src").join(format!("{pre}{}", c.target));
+                    let p2 = root.join(format!("{pre}{}", c.target));
+                    if p.is_file() {
+                        acc.push(p);
+                    }
+                    if p2.is_file() {
+                        acc.push(p2);
+                    }
+                    acc
+                })
+            } else {
+                by_basename
+                    .get(c.target.rsplit('/').next().unwrap_or(&c.target))
+                    .filter(|v| v.len() == 1)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+
+            if let Some(hit) = candidates.first() {
+                if let Ok(target_text) = std::fs::read_to_string(hit) {
+                    let target_text = target_text.replace("\r\n", "\n");
+                    let target_lines: Vec<&str> = target_text.lines().collect();
+                    let at = c.cited as usize;
+                    let line = target_lines
+                        .get(at.saturating_sub(1))
+                        .map(|l| l.trim())
+                        .unwrap_or("");
+                    let punctuation_only = line.chars().all(|ch| ");}],".contains(ch));
+                    if !line.is_empty() && !punctuation_only {
+                        continue;
+                    }
+                    broken.push(format!(
+                        "{}:{} cites {}:{} but that line is {}",
+                        c.file,
+                        c.line,
+                        c.target,
+                        c.cited,
+                        if line.is_empty() {
+                            "BLANK"
+                        } else {
+                            "punctuation only"
+                        }
+                    ));
+                    continue;
+                }
+            }
+
+            // (2) a dependency's own source.
+            if DEPENDENCIES.iter().any(|d| c.block.contains(d)) {
+                continue;
+            }
+
+            broken.push(format!(
+                "{}:{} cites {}:{} which does not exist in this repository, and the comment names \
+                 no dependency whose source it could be",
+                c.file, c.line, c.target, c.cited
+            ));
+        }
+
+        assert!(
+            broken.is_empty(),
+            "a line citation in a Rust comment points at nothing. A citation re-points at its \
+             neighbour the moment a line is added above it, and the result READS as a plausible \
+             reference - which is why these were only found by measuring. Name the SYMBOL instead \
+             of the line: `clamp_debit` survives the file growing, `db.rs:266` does not. \
+             Sites: {broken:#?}"
+        );
+    }
 }
