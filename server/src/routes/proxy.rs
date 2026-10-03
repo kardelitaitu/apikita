@@ -3600,6 +3600,251 @@ mod tests {
         outcome.expect("the money-path assertions panicked");
     }
 
+    /// Wait until the wallet balance STOPS MOVING, then return it.
+    ///
+    /// WHY THIS EXISTS. `ReservationGuard::drop` releases through `tokio::spawn`, because `Drop`
+    /// cannot await. So every `guard.defuse()` call site has a twin the tests never see: if the
+    /// defuse is missing, the guard's Drop fires a SECOND release on a detached task, and a test
+    /// that reads the balance right after the handler returns reads it BEFORE that task commits.
+    ///
+    /// MEASURED, and this is what prompted the helper: deleting `guard.defuse()` at each of the six
+    /// production call sites left all 77 `routes::proxy` tests green. Running
+    /// `a_failed_upstream_releases_the_whole_hold_and_never_strands_it` six times with the defuse at
+    /// site 1442 deleted caught it ZERO times - the assertion always won the race.
+    ///
+    /// Polling to a FIXED POINT rather than sleeping a fixed time is what makes the double credit
+    /// observable: a correct request lets the balance settle ONCE, while a double credit moves it a
+    /// second time after the handler has already returned. A fixed sleep would either be flaky (too
+    /// short) or slow (too long); a fixed point is neither.
+    ///
+    /// It returns the settled balance so the assertion can be about the number, not the timing.
+    async fn settled_balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        let mut last = wallet_balance(pool, account_id).await;
+        // Generous: 200 polls at 10ms is two seconds, well past any detached task on a test pool.
+        // `stable_for` requires the balance to agree across SEVERAL consecutive reads, so one slow
+        // task cannot be mistaken for a settled value.
+        let mut stable_for = 0;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let now = wallet_balance(pool, account_id).await;
+            if now == last {
+                stable_for += 1;
+                if stable_for >= 5 {
+                    return now;
+                }
+            } else {
+                last = now;
+                stable_for = 0;
+            }
+        }
+        last
+    }
+
+    /// A REQUEST THAT NEVER REACHED A PROVIDER COSTS NOTHING - asserted after the guard's detached
+    /// release has had its chance to land.
+    ///
+    /// This is `a_failed_upstream_releases_the_whole_hold_and_never_strands_it` with the race
+    /// removed, and it exists because that test cannot catch a missing `defuse` at site 1442: it
+    /// reads the wallet before the spawned release commits. With `settled_balance`, a missing defuse
+    /// credits the hold a second time and the settled balance is `opening_idr + held_idr`, which
+    /// this asserts against.
+    #[tokio::test]
+    async fn a_refused_request_settles_to_its_opening_balance_and_never_credits_twice() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let expected_hold = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        assert!(
+            expected_hold > 0,
+            "the worst case must be a real hold, otherwise the test asserts nothing: {expected_hold}"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            call_chat_completions(&state, &key, body)
+                .await
+                .expect_err("with no provider key in the environment the upstream is unreachable");
+
+            // The handler has returned. Now let any detached guard release commit, and read the
+            // balance once it has genuinely stopped moving.
+            let settled = settled_balance(&pool_for_assertions, account_id).await;
+            assert_eq!(
+                settled, opening_idr,
+                "a refused request must settle to its OPENING balance. The hold came back once \
+                 (expected_hold = {expected_hold}); a balance of {} means the guard's Drop released \
+                 it a SECOND time because `guard.defuse()` was not called on this path - money in \
+                 the wallet with no ledger row behind it",
+                opening_idr + expected_hold
+            );
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a) after the detached release settled: balance_idr must equal \
+                 SUM(ledger.delta_idr), so the double credit is not merely a wrong number but a \
+                 ledger the wallet cannot explain"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a refused request leaves ZERO stranded holds"
+            );
+
+            // The ledger agrees with the wallet. Scoped to THIS request's reservation ref, because
+            // the opening top-up is in the same ledger and would otherwise dominate the list.
+            let deltas = ledger_deltas(&pool_for_assertions, account_id).await;
+            let reservation_ref = deltas
+                .iter()
+                .find(|(delta, _)| *delta == -expected_hold)
+                .and_then(|(_, reference)| reference.clone())
+                .expect("the hold carries its reservation ref");
+            let request_rows: Vec<i64> = deltas
+                .iter()
+                .filter(|(_, reference)| reference.as_deref() == Some(reservation_ref.as_str()))
+                .map(|(delta, _)| *delta)
+                .collect();
+            assert_eq!(
+                request_rows,
+                vec![-expected_hold, expected_hold],
+                "the whole ledger move for a refused request is -hold then +hold, and NOTHING else: \
+                 a third row under this ref is the double release"
+            );
+        })
+        .await;
+    }
+
+    /// A WASHED STREAM (no usage reported) SETTLES TO ITS OPENING BALANCE, for the same reason.
+    ///
+    /// This drives `settle_after_stream` DIRECTLY, the way the settlement test does, rather than the
+    /// handler. That is deliberate and was corrected by measurement: driving the real handler cannot
+    /// reach the washed branch at all in this fixture, because with no provider key in the
+    /// environment the upstream is unreachable and the request exits at the FAILURE site instead.
+    /// MEASURED: with the handler-driven form, deleting the `defuse` at the washed call site left
+    /// the whole module green (79 passed / 0 failed); the assertion was testing the 503 path and
+    /// never the wash.
+    ///
+    /// Constructing the outcome and the guard here is what puts the washed branch under test, so the
+    /// call site's `defuse` is exercised rather than a different branch's.
+    #[tokio::test]
+    async fn a_washed_stream_settles_to_its_opening_balance_and_never_credits_twice() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let held_idr = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        assert!(
+            held_idr > 0,
+            "the fixture needs a real hold, got {held_idr}"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            assert!(matches!(
+                reserve_balance_transaction(
+                    &pool_for_assertions,
+                    account_id,
+                    held_idr,
+                    Some(&reservation_ref)
+                )
+                .await
+                .expect("place the hold"),
+                ReservationResult::Held { .. }
+            ));
+
+            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+            let guard = ReservationGuard::new(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                &reservation_ref,
+                "flash",
+            );
+            // NoUsage is the washed outcome: the stream ended without reporting anything.
+            assert!(
+                settle_tx.send(StreamEnd::NoUsage).is_ok(),
+                "the settlement task must still be listening"
+            );
+
+            settle_after_stream(
+                settle_rx,
+                pool_for_assertions.clone(),
+                state.config.clone(),
+                state.events.clone(),
+                account_id,
+                key_id,
+                "flash".to_string(),
+                held_idr,
+                guard,
+            )
+            .await;
+
+            // Let any detached guard release commit before reading. With the washed call site's
+            // `defuse` present the guard is claimed and the balance is already final; without it the
+            // Drop fires a second release and the settled balance overshoots by exactly held_idr.
+            let settled = settled_balance(&pool_for_assertions, account_id).await;
+            assert_eq!(
+                settled,
+                opening_idr,
+                "a stream that reported no usage is billed NOTHING, so the wallet settles at its \
+                 opening balance (held_idr = {held_idr}). A balance of {} is the guard releasing a \
+                 hold the washed path already gave back",
+                opening_idr + held_idr
+            );
+            assert_eq!(
+                usage_today(&pool_for_assertions, account_id).await,
+                None,
+                "no usage was reported, so no usage row may exist"
+            );
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): the wallet and the ledger must agree after the release settled"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a washed request leaves ZERO stranded holds"
+            );
+
+            // Scoped to this request's ref: the opening top-up lives in the same ledger.
+            let request_rows: Vec<i64> = ledger_deltas(&pool_for_assertions, account_id)
+                .await
+                .into_iter()
+                .filter(|(_, reference)| reference.as_deref() == Some(reservation_ref.as_str()))
+                .map(|(delta, _)| delta)
+                .collect();
+            assert_eq!(
+                request_rows,
+                vec![-held_idr, held_idr],
+                "the hold went out and came back under one ref, and NOTHING else: a third row is \
+                 the double release"
+            );
+        })
+        .await;
+    }
+
     /// THE FAILURE PATH, THROUGH THE REAL HANDLER. A request that never reaches a
     /// provider must cost nothing and must leave no stranded hold.
     ///

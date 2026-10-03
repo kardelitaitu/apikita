@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 196;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 649;
+const SERVER_TESTS = 651;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -350,6 +350,13 @@ test('no doc still claims a superseded count', () => {
         '646 tests', '646 passed', '646 / 0 / 0',
         '647 tests', '647 passed', '647 / 0 / 0',
         '644 tests', '644 passed', '644 / 0 / 0',
+        // Retired when the citation guard landed, then when the reservation guard's two call
+        // sites were pinned. 648 was never published on its own - it is recorded here so the
+        // guard covers the count the suite passed through rather than only the ones a doc
+        // happened to name, and so a document carrying it cannot reappear unnoticed.
+        '648 tests', '648 passed', '648 / 0 / 0',
+        '649 tests', '649 passed', '649 / 0 / 0',
+        '650 tests', '650 passed', '650 / 0 / 0',
       ],
     },
     {
