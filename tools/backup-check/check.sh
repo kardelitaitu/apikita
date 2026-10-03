@@ -443,6 +443,50 @@ KNOWN
     if ! grep -qE '^[[:space:]]*run_credit_expiry[^([:alnum:]_]' "$REPO/.docker/maintenance/entrypoint.sh"; then
         fail ".docker/maintenance/entrypoint.sh does not CALL run_credit_expiry (only defines it, or does not mention it), so the credit-expiry sweep is built and never RUN. A binary that ships and is not scheduled enforces the published term no better than one that never shipped."
     fi
+
+    # THE DOC'S JOB LIST, tied to the function it describes.
+    #
+    # MEASURED: `docs/deployment.md`'s open item lists what `run_wired_jobs` calls, and it
+    # said five names - `run_credit_expiry` was missing after the job was added. Nothing
+    # noticed, because the two checks above ask whether the entrypoint RUNS the job and
+    # whether the image builds the binary; neither asks whether the document that tells an
+    # operator what the scheduler does still describes it. A list a reader takes as complete
+    # is how a schedule's coverage drifts out of step with its description.
+    #
+    # THE LIST, NOT THE FILE - and the first version of this got that wrong. It grepped the
+    # whole document, so `run_credit_expiry` appearing in the note that EXPLAINS the
+    # omission satisfied the check, and the omission itself still passed. MEASURED: deleting
+    # the name from the list left the check at exit 0, because the prose below it still
+    # matched. A guard that a comment about the defect can satisfy is not guarding the list.
+    #
+    # So the comparison is confined to the SENTENCE that carries the list: the line naming
+    # `run_wired_jobs`, plus the two continuation lines the list wraps onto. Every `run_*`
+    # the function calls must appear there.
+    JOBS_AT=$(grep -n '^run_wired_jobs()' "$REPO/.docker/maintenance/entrypoint.sh" | head -n 1 | cut -d: -f1)
+    if [ -n "$JOBS_AT" ]; then
+        CALLED=$(sed -n "${JOBS_AT},\$p" "$REPO/.docker/maintenance/entrypoint.sh" \
+            | sed -n '/^}/q;p' \
+            | grep -oE '^[[:space:]]*run_[a-z_]+' | tr -d ' ' | sort -u)
+        if [ -z "$CALLED" ]; then
+            fail "run_wired_jobs in .docker/maintenance/entrypoint.sh calls nothing - this comparison is measuring an empty set, so it can neither pass nor fail meaningfully"
+        fi
+        DEP_DOC="$REPO/docs/deployment.md"
+        # The list lives in the open item that names `run_wired_jobs`; take that line and the
+        # next two, which is where the wrapped names are. Deliberately NOT the whole item, so
+        # the explanatory note below the list cannot supply a name the list dropped.
+        LIST_AT=$(grep -n 'run_wired_jobs' "$DEP_DOC" | head -n 1 | cut -d: -f1)
+        if [ -z "$LIST_AT" ]; then
+            fail "docs/deployment.md no longer mentions run_wired_jobs, so the paragraph that tells an operator what the maintenance scheduler does has gone. The scheduler is a deployment step and the doc has to say so."
+        fi
+        LIST=$(sed -n "${LIST_AT},$((LIST_AT + 2))p" "$DEP_DOC")
+        MISSING=""
+        for job in $CALLED; do
+            printf '%s\n' "$LIST" | grep -qF "$job" || MISSING="$MISSING $job"
+        done
+        if [ -n "$MISSING" ]; then
+            fail "docs/deployment.md's scheduler paragraph does not name these jobs, which run_wired_jobs DOES call:$MISSING. That paragraph is where an operator reads what the maintenance scheduler does, so a job missing from the list is a job nobody knows has to be deployed."
+        fi
+    fi
 fi
 
 

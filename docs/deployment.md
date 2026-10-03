@@ -322,9 +322,16 @@ The wallet ledger is the business.
 - [ ] **The maintenance scheduler is not deployed.** Every recurring job the system relies on
       runs from **one container**: the `scheduler` service (`.docker/maintenance/`,
       `maintenance-entrypoint.sh`), whose `run_wired_jobs` calls `run_retention`,
-      `run_reconcile`, `run_hold_sweep`, `run_alert_checks` and `run_alert_probes`. It is
+      `run_reconcile`, `run_hold_sweep`, `run_credit_expiry`, `run_alert_checks` and
+      `run_alert_probes`. It is
       **not** a step in the pipeline above, and **no other section of this document names
       it** — this item is the only place it appears.
+      > **The list above is the reason this item is worth re-reading rather than trusting.**
+      > It said five calls and omitted `run_credit_expiry`, which was added to
+      > `run_wired_jobs` when the credit-expiry sweep was finally wired to run. A job list
+      > that a reader takes as complete is exactly how the scheduler's coverage drifts out of
+      > step with the schedule, so the six names above are the ones `run_wired_jobs` actually
+      > calls.
       > **This item is also the correction of its own measurement, and the wording matters.**
       > Before this was written, the word `scheduler` and the word `maintenance` appeared in
       > this file **zero times** while `server` appeared 52 — which is what made the omission

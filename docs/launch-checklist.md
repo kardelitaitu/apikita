@@ -524,12 +524,24 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       and both alert jobs run from **one container** — the `scheduler` service in
       `docker-compose.yml`, entrypoint `.docker/maintenance/entrypoint.sh`, calling
       `run_wired_jobs` → `run_retention`, `run_reconcile`, `run_hold_sweep`,
-      `run_credit_expiry`, `run_alert_checks`, `run_alert_probes`. **That container is not part
-      of the production deployment procedure.** `docs/deployment.md` describes three steps —
-      Cloudflare Pages, the edge relay VPS, and Northflank — and never mentions it; the image
-      section names *"one image containing three binaries"* (`apikita-server`, `migrate`,
-      `usage-purge`), and the maintenance scheduler is a **different image** that merely mounts
-      the third binary from the server one.
+      `run_credit_expiry`, `run_alert_checks`, `run_alert_probes`. **That container is not a
+      step in the production deployment procedure**, and the specific gap is narrow enough to
+      name: `docs/deployment.md`'s pipeline (its `Recommended gate order` block) has seven
+      entries — build+test, migrate, deploy server, health check, deploy frontend, reload
+      relay config, smoke test — and **none of them deploys or restarts the scheduler**. The image section names *"one
+      image containing three binaries"* (`apikita-server`, `migrate`, `usage-purge`), and the
+      maintenance scheduler is a **different image** that mounts the third binary from the
+      server one.
+      > **This item used to say `docs/deployment.md` "never mentions it", and that was false
+      > by the time anyone read it.** The file now names the scheduler eight times: the image
+      > table (two) and this document's own open item and its notes (six). `docs/deployment.md`
+      > says so itself at its own open item, and records the reason in the past tense — a
+      > sentence asserting "the word `scheduler` appears nowhere in this file" IS the word
+      > appearing in it. The claim was corrected here for the same reason it was corrected
+      > there, and the CONCLUSION did not change: naming a missing step in an open item is not
+      > performing it. **The corrected form is checkable, which the old one was not**: count
+      > the pipeline block and see whether the scheduler is one of its steps, rather than
+      > grep the file for a word the item itself had to use.
       > The `scheduler` service's own comment in `docker-compose.yml` says the jobs "were
       > written and then never run by anything — this is the service that ends that." That is
       > true of **local development**. It is not yet true of production, and nothing says so.
