@@ -4048,10 +4048,19 @@ mod tests {
             )
             .await;
 
+            // SETTLED TO A FIXED POINT, not read once. This assertion used plain `wallet_balance`,
+            // and that was not enough: `settle_after_stream` defuses the guard on this arm, and if
+            // it ever stops doing so the guard's Drop fires a SECOND release on a DETACHED task -
+            // which commits after this line runs. MEASURED: deleting the Settled arm's
+            // `guard.defuse()` left the WHOLE `routes::proxy` module green at 79 passed, ten runs
+            // out of ten. The amount is right either way at the instant of the read; only the
+            // settled form can see the money arrive afterwards.
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                settled_balance(&pool_for_assertions, account_id).await,
                 opening_idr - cost_idr,
-                "the request must cost exactly the reported usage, not the hold"
+                "the request must cost exactly the reported usage, not the hold - and it must STAY \
+                 that way. A balance that keeps moving after the handler returned is the guard's \
+                 Drop releasing a hold the settlement already credited"
             );
 
             let (input, cache_read, output, cost) = usage_today(&pool_for_assertions, account_id)
@@ -4098,6 +4107,171 @@ mod tests {
                 drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
+    /// THE PARTIAL ARM, DRIVEN THROUGH `settle_after_stream`, so its `defuse` is actually exercised.
+    ///
+    /// The clamped-debit test proves the MONEY RULE - a debit that cannot be covered clamps and still
+    /// records the usage - but it calls `debit_usage_transaction` DIRECTLY, so it never enters the
+    /// `Partial` arm of `settle_after_stream`. MEASURED: deleting that arm's `guard.defuse()` left
+    /// the entire `routes::proxy` module green at 79 passed. The arm is where the hold is claimed
+    /// after a clamped debit, and without the claim the guard's Drop releases the hold a SECOND time
+    /// - on top of an undercharge, which would PAY the customer for usage they did not cover.
+    ///
+    /// **THE FIXTURE HAS TO MAKE THE COST EXCEED THE HOLD, and deriving that is the whole test.**
+    /// Draining the wallet is NOT enough, and the first two versions of this test were wrong because
+    /// they assumed it was. `debit_usage_transaction` credits the hold back BEFORE it debits
+    /// (`db.rs`, step 0 then step 1), so the balance at debit time is `wallet_after_hold + hold`
+    /// whatever the wallet held - draining it just makes that sum exactly `hold`. `Partial` needs
+    /// `try_debit(cost)` to fail, i.e. `cost > hold`, so the usage has to be large enough that the
+    /// charge outstrips the worst-case reservation. At `output_peak = 10707.12` IDR per million
+    /// tokens that is a few hundred thousand output tokens, which is what this fixture uses.
+    ///
+    /// The assertions then split the two things worth separating: the hold comes back exactly once
+    /// (a second release would be money invented), and the usage is recorded in full (an undercharge
+    /// is a shortfall, not a lost charge).
+    #[tokio::test]
+    async fn a_partial_settlement_through_the_caller_claims_the_hold_and_never_credits_twice() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let held_idr = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        let model_cfg = state
+            .config
+            .models
+            .iter()
+            .find(|m| m.name == "flash")
+            .expect("flash is configured");
+
+        // **THE CHARGE MUST EXCEED THE OPENING BALANCE, not the hold, and getting that wrong cost
+        // three attempts.** `debit_usage_transaction` credits the hold back BEFORE it debits, so by
+        // the time `try_debit(cost)` runs the wallet holds exactly what it held before the hold was
+        // placed - `opening - hold + hold`. Draining the wallet afterwards does not change that sum,
+        // and a cost above the HOLD is not enough either: measured twice, both times the full charge
+        // was collected and the ordinary `Settled` arm was taken. `Partial` needs `cost > opening`.
+        //
+        // The margin is deliberately large (4x the opening balance) so the test does not sit on the
+        // boundary of a rounding rule it does not mean to test.
+        let usage = Usage {
+            input_tokens: 0,
+            cache_read_tokens: 0,
+            output_tokens: 25_000_000,
+        };
+        let cost_idr = calculate_token_cost_idr(
+            model_cfg.price,
+            usage.input_tokens as u64,
+            model_cfg.rates.input_peak,
+            usage.cache_read_tokens as u64,
+            model_cfg.rates.cache_read_peak,
+            usage.output_tokens as u64,
+            model_cfg.rates.output_peak,
+        );
+        assert!(
+            cost_idr > opening_idr,
+            "the fixture must produce a charge the OPENING BALANCE cannot cover, or the clamped arm \
+             is unreachable: cost {cost_idr} vs opening {opening_idr} (hold {held_idr})"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            let held = reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+            assert!(
+                matches!(&held, ReservationResult::Held { .. }),
+                "the hold must land, got {held:?}"
+            );
+
+            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+            let guard = ReservationGuard::new(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                &reservation_ref,
+                "flash",
+            );
+            assert!(
+                settle_tx.send(StreamEnd::Settled(usage)).is_ok(),
+                "the settlement task must still be listening"
+            );
+
+            settle_after_stream(
+                settle_rx,
+                pool_for_assertions.clone(),
+                state.config.clone(),
+                state.events.clone(),
+                account_id,
+                key_id,
+                "flash".to_string(),
+                held_idr,
+                guard,
+            )
+            .await;
+
+            // The hold came back and the charge could not be covered, so the wallet is back where
+            // the hold left it - and it must STOP there. A balance that keeps climbing is the
+            // guard's Drop releasing the hold a second time, which pays the customer for usage they
+            // could not cover.
+            //
+            // The clamped debit takes whatever the wallet CAN cover, which here is the whole
+            // `opening - hold` residue: the charge is 4x the opening balance, so the shortfall is
+            // real and the part that was collected is `opening - hold`.
+            let settled = settled_balance(&pool_for_assertions, account_id).await;
+            assert_eq!(
+                settled, 0,
+                "the clamped debit takes every collectable rupiah - `opening - hold` - and leaves \
+                 the wallet at zero. A balance of {} is the guard's Drop releasing the hold a SECOND \
+                 time after the clamped debit already returned it, which pays the customer for usage \
+                 they could not cover. hold {held_idr}, cost {cost_idr}, opening {opening_idr}",
+                opening_idr - held_idr
+            );
+
+            // The usage is still recorded in full: an undercharge is a shortfall, not a lost charge.
+            let recorded = usage_today(&pool_for_assertions, account_id)
+                .await
+                .expect("a clamped settlement still records the usage");
+            assert_eq!(
+                (recorded.0, recorded.1, recorded.2),
+                (
+                    usage.input_tokens,
+                    usage.cache_read_tokens,
+                    usage.output_tokens
+                ),
+                "the clamped debit must still record the real counters, separately"
+            );
+
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a partial settlement pairs its hold, never strands it"
             );
         })
         .await;
@@ -4433,10 +4607,19 @@ mod tests {
                 },
                 "a wallet that cannot cover the cost is a recorded shortfall, not a dropped charge"
             );
+            // SETTLED TO A FIXED POINT. The Partial arm defuses the guard because the clamped debit
+            // already credited the hold inside its own transaction - so a missing defuse credits it
+            // a SECOND time, on top of an UNDERCHARGE where the customer already paid less than the
+            // usage cost. A direct `wallet_balance` read cannot see that: the second release arrives
+            // on a detached task after the line runs. MEASURED: deleting this arm's
+            // `guard.defuse()` left the whole module green at 79 passed; with the fixed point it
+            // fails.
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                settled_balance(&pool_for_assertions, account_id).await,
                 0,
-                "the clamped debit lands on 0 and never below it"
+                "the clamped debit lands on 0 and never below it - and it must STAY there. A balance \
+                 that climbs after the handler returned is the guard's Drop releasing a hold the \
+                 clamped debit already gave back, which would pay the customer for an undercharge"
             );
 
             let (input, cache_read, output, cost) = usage_today(&pool_for_assertions, account_id)
