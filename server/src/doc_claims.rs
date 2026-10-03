@@ -513,7 +513,9 @@ mod tests {
     /// The class the session guard above opened, extended to the rest of the table. A register
     /// row that states a figure which also lives in `config/apikita.toml` is published twice,
     /// and two copies of one number drift - this repository's most-repeated finding, in the
-    /// worst possible place, because the register is what a reader trusts.
+    /// worst possible place, because `docs/decisions.md` calls itself "the single source of
+    /// truth for settled decisions". When it disagrees with the config, a reader is told to
+    /// trust the register, which is what makes this worse than a cosmetic mismatch.
     ///
     /// MEASURED, which is why this exists rather than being assumed covered. Changing
     /// `credit_expiry_months` from 24 to 36, and `key_metadata_cache_seconds` from 60 to 300,
@@ -525,9 +527,12 @@ mod tests {
     /// The session row was guarded and these two were not, which is the shape this repository
     /// keeps producing: one instance fixed where a class existed.
     ///
-    /// The assertion names BOTH sides on failure, so a reader learns which one moved without
-    /// going to look. It checks the figure AND the config, in that order, so a reworded row
-    /// reports as a reworded row rather than as a policy change.
+    /// THE NUMBER IS PARSED OUT OF THE REGISTER, not written here. The first version of this
+    /// test hardcoded 24 and 60 beside the config reads, and that is the mistake
+    /// `every_model_carries_the_margin_the_decision_record_states` already warns about in its
+    /// own doc-comment: "a copy beside the constant is a second place to update, and it goes
+    /// stale the way the claim would without it." A literal here would mean the decision
+    /// could not be changed without editing the test that exists to let it be changed.
     #[test]
     fn every_other_number_the_register_states_is_the_number_the_config_carries() {
         let register = std::fs::read_to_string(doc_path("decisions.md"))
@@ -537,37 +542,112 @@ mod tests {
                 .or_else(|_| crate::config::AppConfig::load_from_file("config/apikita.toml"))
                 .expect("config/apikita.toml must load");
 
-        // (the words the register must still carry, the config value, the value the register
-        // implies, what to call it when reporting)
-        let rows: [(&str, i64, i64, &str); 2] = [
+        // (row label, the UNIT the config key is denominated in, config value, what to call it
+        // when reporting).
+        //
+        // THE ANCHOR IS THE UNIT, NOT THE NUMBER. An earlier version anchored on the literal
+        // "24 months", which is the same mistake as hardcoding the figure one line over: a
+        // legitimate move to 36 months could not find its own anchor, so the test that exists
+        // to ALLOW the decision to change refused to let it. Anchoring on the unit ("months",
+        // "seconds") means the row can carry any figure, and the unit word is what ties the
+        // figure to the config key's denominator - a row reworded to weeks would fail here
+        // rather than silently comparing weeks against months.
+        let rows: [(&str, &str, i64, &str); 2] = [
             (
-                "**2 years (24 months) from each deposit's own date**",
+                "Credit expiry",
+                "months",
                 config.wallet.credit_expiry_months as i64,
-                24,
                 "credit expiry",
             ),
             (
-                "**60 seconds**",
+                "Key metadata cache TTL",
+                "seconds",
                 config.limits.key_metadata_cache_seconds as i64,
-                60,
                 "the key-metadata cache TTL",
             ),
         ];
 
-        for (stated, from_config, from_register, about) in rows {
-            assert!(
-                register.contains(stated),
-                "{about}: docs/decisions.md no longer says `{stated}`, which is how it records \
-                 this figure. Either the row was reworded - in which case update this check in \
-                 the same commit - or the policy changed and the register was not brought with \
-                 it. The register is what a reader trusts, so a stale row is worse than none."
-            );
+        for (label, phrase, from_config, about) in rows {
+            let row = register
+                .lines()
+                .find(|l| l.starts_with("| ") && l.contains(label))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{about}: docs/decisions.md no longer has a `{label}` row. Either the \
+                         row was renamed - in which case update this check in the same commit - \
+                         or the decision was dropped, and a dropped row is a decision nobody \
+                         recorded."
+                    )
+                });
+            let at = row.find(phrase).unwrap_or_else(|| {
+                panic!(
+                    "{about}: the `{label}` row no longer contains `{phrase}`, so this check \
+                     cannot read the figure out of it. If the row states the same decision in \
+                     different words, point this at the new words in the same commit. Row was: \
+                     {row}"
+                )
+            });
+
+            // The integer may sit BEFORE the phrase ("**60 seconds**") or INSIDE it ("24
+            // months"), so try both and take whichever is present. `first_integer` already
+            // ignores digits welded to letters, which is what keeps a promise like
+            // "12h" from reading as 12 when the config counts minutes.
+            let stated = first_integer(&row[at..])
+                .or_else(|| {
+                    // The number sits before the phrase, possibly with markdown between: the
+                    // row reads `| **60 seconds** |`, so the characters immediately left of
+                    // `seconds` are `**`, not digits. Skip the non-digit run first, then take
+                    // the digit run.
+                    let head = &row[..at];
+                    let digits: String = head
+                        .chars()
+                        .rev()
+                        .skip_while(|c| !c.is_ascii_digit())
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    digits.parse::<i64>().ok()
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{about}: the `{label}` row's `{phrase}` has no integer beside it, but \
+                         this check exists to compare one against the config. Row was: {row}"
+                    )
+                });
+
             assert_eq!(
-                from_config, from_register,
-                "{about}: the register states {from_register} and config/apikita.toml carries \
-                 {from_config}. These are one decision published twice; change both or neither."
+                from_config, stated,
+                "{about}: the register states {stated} and config/apikita.toml carries \
+                 {from_config}. These are one decision published twice, and the register wins \
+                 with a reader - change both or neither."
             );
         }
+    }
+
+    /// The first integer in a string, ignoring digits that are part of a larger token.
+    ///
+    /// Used to read a figure out of a register row rather than restating it in the test. Kept
+    /// deliberately narrow: no decimals, no signs - a decision row states a plain count.
+    fn first_integer(s: &str) -> Option<i64> {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                    // part of an identifier like `20260925000000_initial` - keep looking
+                    continue;
+                }
+                return s[start..i].parse::<i64>().ok();
+            }
+            i += 1;
+        }
+        None
     }
 
     /// The bot README's claim about the FOLDER is true, checked against the tree.
