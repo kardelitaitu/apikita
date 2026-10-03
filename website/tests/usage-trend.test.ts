@@ -64,6 +64,35 @@ test('all-zero series yields zero heights, and trendHasData is false', () => {
   assert.equal(trendHasData(buildTrend([bucket('2026-03-01', { input_tokens: 1 })])), true);
 });
 
+// A MIXED series, which is the only shape that distinguishes `some` from `every`.
+//
+// THE TWO CALLS ABOVE CANNOT TELL THEM APART. `some(h > 0)` and `every(h > 0)` agree when all
+// heights are zero and when all are non-zero; they differ only when the series has BOTH. Both
+// fixtures above are on the agreeing side - `[0, 0]` and a single non-zero bucket - so MEASURED:
+// rewriting `trendHasData` as `bars.every((b) => b.height > 0)` left this whole suite passing.
+//
+// That is not a hypothetical edit. `trendHasData` decides whether the usage chart renders at all
+// (`UsageAnalytics.astro`: `trendWrap.toggleAttribute('hidden', !hasData)`), so under `every` a
+// customer whose window contains ANY zero-usage day would be shown "no data yet" instead of their
+// real chart - the common case, not the edge one.
+test('trendHasData is true for a mixed series, which is what some() means', () => {
+  const bars = buildTrend([
+    bucket('2026-03-01'),
+    bucket('2026-03-02', { input_tokens: 20 }),
+  ]);
+  assert.deepEqual(
+    bars.map((b) => b.height),
+    [0, 1],
+    'the fixture must MIX zero and non-zero, or it cannot distinguish some() from every()',
+  );
+  assert.equal(
+    trendHasData(bars),
+    true,
+    'one day with usage is enough to have data: a chart that hides itself because some other ' +
+      'day was quiet is the defect this pins',
+  );
+});
+
 test('a bucket with no day label is dropped', () => {
   const bars = buildTrend([bucket(''), bucket('2026-03-01', { input_tokens: 5 })]);
   assert.equal(bars.length, 1);

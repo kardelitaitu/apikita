@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 195;
+const WEBSITE_TESTS = 196;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 195;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 638;
+const SERVER_TESTS = 639;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -335,6 +335,7 @@ test('no doc still claims a superseded count', () => {
         '633 tests', '633 passed', '633 / 0 / 0',
         '636 tests', '636 passed', '636 / 0 / 0',
         '637 tests', '637 passed', '637 / 0 / 0',
+        '638 tests', '638 passed', '638 / 0 / 0',
       ],
     },
     {
