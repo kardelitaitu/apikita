@@ -518,6 +518,30 @@ fn link_mail(
     }
 }
 
+/// Build the message, then hand the SEND to a detached task.
+///
+/// **THE WAIT IS THE ORACLE.** Signup, `request_password_reset` and `resend_verification` all answer
+/// the same neutral reply whether or not the address has an account, and all three call this only on
+/// the branch where the account EXISTS - a new account, a known address, a known unverified identity.
+/// Awaiting the SMTP conversation here therefore charged a REGISTERED address a full relay round trip
+/// and charged an unregistered one nothing, and the reply bodies matched the whole time.
+///
+/// MEASURED against a listener that accepts and never sends a banner: the send side took ~1001ms
+/// against ~0.1ms for the path that skips it. The relay timeout has a 10s floor
+/// (`identity::email::MIN_TIMEOUT_SECONDS`), so the gap is bounded by the RELAY, not by this client -
+/// and it is three orders of magnitude larger than the Argon2 timing difference the hash-ordering
+/// comments in `signup` and `login` were written to close. Nothing in the code or the docs recorded
+/// this one.
+///
+/// Spawning is the fix that matches the shape the rest of this file already uses
+/// (`ReservationGuard::drop` releases through `tokio::spawn` for the same reason: the request path
+/// must not wait on something whose outcome the caller cannot use). The caller has nothing to do
+/// with the result - the reply is neutral either way - so waiting bought no behaviour, only a
+/// measurement channel.
+///
+/// WHAT IS NOT SPAWNED: building the message. `link_mail` is a pure function whose output a test
+/// asserts on directly, and the token is issued by the CALLER on the request path, so the link the
+/// customer eventually clicks is committed before this is called. Only the transport wait moves.
 async fn send_link_mail(
     state: &AppState,
     account_id: Uuid,
@@ -533,21 +557,29 @@ async fn send_link_mail(
         }
     };
 
-    let outcome = sender.send(link_mail(purpose, raw_token, email)).await;
-
-    // A failure to reach the relay is reported against the ACCOUNT, never against
-    // the address: this path is reached for an address that may not have an
-    // account, and the log is not the place for it - which is the other half of
-    // why an empty recipient survived so long.
-    if let Err(e) = outcome {
-        error!(
-            account_id = %account_id,
-            purpose = purpose.as_str(),
-            error = %e,
-            "a verification or reset link could not be sent"
-        );
-    }
+    // Built here so a malformed address is still caught on the request path where it can be logged
+    // with the request's own context, rather than surfacing as a mystery in a detached task.
+    let message = link_mail(purpose, raw_token, email);
     let _ = state;
+
+    // Fire-and-forget: the reply does not depend on the relay, and waiting is what made a
+    // registered address answer on a different clock from an unregistered one.
+    tokio::spawn(async move {
+        let outcome = sender.send(message).await;
+
+        // A failure to reach the relay is reported against the ACCOUNT, never against
+        // the address: this path is reached for an address that may not have an
+        // account, and the log is not the place for it - which is the other half of
+        // why an empty recipient survived so long.
+        if let Err(e) = outcome {
+            error!(
+                account_id = %account_id,
+                purpose = purpose.as_str(),
+                error = %e,
+                "a verification or reset link could not be sent"
+            );
+        }
+    });
 }
 
 /// `POST /auth/signup` - create an account from an address and a password.

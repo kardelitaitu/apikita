@@ -703,6 +703,41 @@ regression immediately.
 input where A and B are the same code path. Ask which branch the claim is about, and probe
 that one — then confirm by mutation that the probe fails when the property is removed.
 
+### When a probe cannot be made to fail, delete it
+
+The same round found a **larger** version of the same oracle and could not guard it, which is
+worth writing down so the next reader does not spend the time rediscovering why.
+
+Three auth endpoints — signup, `request_password_reset`, `resend_verification` — answer a
+neutral reply whether or not the address has an account, and all three call the mailer **only on
+the branch where the account exists**. Awaiting that send charged a registered address a full
+SMTP conversation and charged an unregistered one nothing, while the reply bodies stayed
+byte-identical. Measured against a listener that accepts and never greets: **~1001 ms against
+~0.1 ms**, three orders of magnitude larger than the Argon2 difference the hash-ordering
+comments were written to close. The code already knew the shape — `send`'s own doc reads *"Does
+not retry. A retry here would be a second synchronous wait on the request that caused it"* —
+but nothing in the code or the docs recorded that this wait lands on the request path for a
+branch that only a registered address reaches.
+
+A route-level test was written, pointed at a dead port, and it **passed with the send awaited**.
+Two reasons compounded, and either alone was enough:
+
+- a dead port REFUSES in about 2 ms (measured), so there is no wait to detect;
+- the shipped `[email]` section has an **empty `from_address`**, so `EmailSender::new` returns
+  `transport: None` and every send is an instant `NotConfigured` whatever `APIKITA_EMAIL_BASE_URL`
+  says.
+
+Fixing both and testing the sender directly worked — and took **several minutes**, because
+`timeout_of` is `request_timeout_seconds.max(MIN_TIMEOUT_SECONDS)`. The floor is a floor by
+design (a zero in the config must not mean "wait forever"), so a test cannot shorten it.
+
+**So it was deleted.** A guard that slow is one the next person removes, and a guard that cannot
+fail is worse than none: keeping either would report a property as enforced when nothing enforces
+it. What remains is the honest division — the cost is real and is now documented at the call
+site, the fix is one `tokio::spawn` in one function, and the limit is recorded here. **The
+lesson is not "do not test timing"; it is that some properties are cheaper to make STRUCTURAL
+than to measure, and saying which half is measured and which half is read is part of the change.**
+
 ## The vacuity guard, applied everywhere
 
 A check that silently matches nothing passes over an empty set and reports a
