@@ -220,5 +220,11 @@ silent failure.** Alert on size, not just exit code.
       into the same SQLite file as money (`accounts` + `identities`), so the
       procedure above *is* the identity restore procedure: `backup.sh` backs the file
       up and `drill.sh` restores and reconciles it. Nothing else needs a restore path.
-- [x] **Port `tools/backup` and `tools/drill` to the SQLite file.** Done — the tools
-      implement the `.backup` + `integrity_check` + reconcile procedure described above.
+- [x] **Port `tools/backup/backup.sh` and `tools/drill/drill.sh` to the SQLite file.** Done — the
+      tools implement the `.backup` + `integrity_check` + reconcile procedure described above.
+      **Both paths are spelled out, because there are TWO drills in this repository and their
+      names differ by one word.** `tools/drill/drill.sh` restores and reconciles (this page's
+      procedure); `tools/rollback/drill.sh` rehearses a bad migration and belongs to
+      [`rollback`](../tools/rollback/README.md). This line said `tools/drill`, and a reader who
+      followed it to the wrong file would have found a tool that refuses to do what the sentence
+      promises — which is exactly the confusion the neighbouring lines avoid by naming the script.
