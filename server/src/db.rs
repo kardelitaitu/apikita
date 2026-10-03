@@ -3500,8 +3500,8 @@ mod tests {
     // Exhaustive property sweeps over the two pure money rules.
     //
     // The example tests above pin exact figures. What they cannot do is cover
-    // the DOMAIN: `clamp_debit` IS the billing decision (db.rs:266) and
-    // `settlement_ledger_deltas` IS the ledger move (db.rs:288), so a wrong
+    // the DOMAIN: `clamp_debit` IS the billing decision and
+    // `settlement_ledger_deltas` IS the ledger move, so a wrong
     // answer anywhere in the i64 plane is money invented or money vanished.
     // These sweeps walk every interesting boundary plus a deterministic
     // pseudo-random sample of the whole range. No new dependency: a fixed-seed
@@ -5055,9 +5055,9 @@ mod tests {
 
     /// A settlement whose reported hold was reserved against a wallet that does
     /// not exist releases NOTHING and still records the usage: crediting a hold
-    /// the ledger never took would create money. This is the guard at
-    /// db.rs:314-324, and it also drives the re-clamp retry inside
-    /// settle_partial_usage (db.rs:995-999) the honest way - with no wallet row,
+    /// the ledger never took would create money. This is the no-wallet guard in
+    /// `credit_topup_transaction`, and it also drives the re-clamp retry inside
+    /// `settle_partial_usage` the honest way - with no wallet row,
     /// the clamped debit matches no row and the retry floors the debit at zero.
     #[tokio::test]
     async fn a_settlement_whose_hold_matched_no_wallet_releases_nothing() {

@@ -1097,12 +1097,12 @@ fn stream_flag_allowed(requested: Option<bool>) -> Result<(), AppError> {
 /// The input-token estimate behind the pre-flight hold: ONE definition, shared
 /// by the handler and the tests.
 ///
-/// The hold is a CEILING over every settlement of the request (proxy.rs:1094-1098,
-/// money.rs:400), and input tokens are NOT bytes. `len/4` holds only for ASCII: a
+/// The hold is a CEILING over every settlement of the request (this doc,
+/// `money.rs`), and input tokens are NOT bytes. `len/4` holds only for ASCII: a
 /// UTF-8-dense body is 3 bytes per CJK character and a byte-level BPE emits about
 /// ONE token per character, so the old estimate came out ~3x short on exactly the
 /// traffic this proxy sees. The shortfall is uncollectable: settlement clamps the
-/// debit to what was reserved (db.rs:266-271) and logs a Partial, so the excess is
+/// debit to what was reserved (the `clamp_debit` path in `db.rs`) and logs a Partial, so the excess is
 /// silently written off.
 ///
 /// So the two halves are counted differently:
@@ -2769,7 +2769,7 @@ mod tests {
 
     /// The hold is taken BEFORE the upstream is called and is the only thing
     /// standing between a request and the balance. The handler's own comment
-    /// (proxy.rs:1094-1098) and money.rs:400 state the invariant as "never
+    /// and `money.rs` state the invariant as "never
     /// under-reserve": the reservation is a CEILING over every settlement of the
     /// same request.
     ///
@@ -2778,7 +2778,7 @@ mod tests {
     /// for a typical BPE tokenizer) carries roughly 3x the tokens a `len/4`
     /// estimate assumes, so the hold comes out smaller than the true cost and the
     /// difference is never collected: settlement clamps the debit to what was
-    /// reserved (db.rs:266-271) and logs a Partial. Uncollected revenue.
+    /// reserved (the `clamp_debit` path in `db.rs`) and logs a Partial. Uncollected revenue.
     #[test]
     fn the_input_estimate_covers_a_utf8_dense_body() {
         let config = live_config();
@@ -2821,7 +2821,7 @@ mod tests {
             hold(&sparse)
         );
 
-        // (2) The invariant itself (proxy.rs:1094-1098, money.rs:400): the hold
+        // (2) The invariant itself (the input-token estimate's doc, `money.rs`): the hold
         // is a CEILING over the settlement of this request, so it must cover the
         // tokens the body really is - one token per CJK character plus ~4 ASCII
         // bytes per token for the envelope.

@@ -1916,7 +1916,8 @@ mod tests {
     }
 
     /// A `data:` line whose payload is not valid UTF-8 must be skipped, not make
-    /// the whole parse panic. This is the `continue` at client.rs:104 - a
+    /// the whole parse panic. This is the `from_utf8` guard in
+    /// `parse_usage_from_sse` - a
     /// midstream chunk with mangled bytes still leaves the trailing valid usage
     /// block findable.
     #[test]

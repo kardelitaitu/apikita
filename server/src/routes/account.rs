@@ -2928,8 +2928,8 @@ mod tests {
 
     /// A rejection whose body carries `status_message` (and no `error_messages`)
     /// must surface that detail, and a 2xx whose body is not JSON must be its
-    /// own error rather than a parse panic. Covers account.rs:803-806 and
-    /// account.rs:815-817 - the two arms the 401 test above never reaches.
+    /// own error rather than a parse panic. Covers both arms of the Snap response
+    /// handling - the two the 401 test above never reaches.
     #[tokio::test]
     async fn snap_client_surfaces_status_message_and_refuses_a_non_json_success() {
         let payload = build_snap_payload("topup_x", 50_000, None);
@@ -3041,7 +3041,8 @@ mod tests {
     }
 
     /// An account with no wallets row yet exports its wallet as JSON null rather
-    /// than failing: the export describes what EXISTS. Covers account.rs:511.
+    /// than failing: the export describes what EXISTS. Covers the wallet read in
+    /// the export handler, which uses `fetch_optional` rather than `fetch_one`.
     #[tokio::test]
     async fn the_export_of_an_account_with_no_wallet_is_null_not_an_error() {
         let db = TestDb::new().await;
@@ -3080,9 +3081,9 @@ mod tests {
 
     /// The success path when Snap answers a token but NO redirect_url: the row
     /// is still created and the 201 still carries the token. A subscriber is
-    /// installed so the `info!` field expressions (account.rs:936) are actually
-    /// evaluated - tracing skips them when no subscriber is active, which left
-    /// that line uncovered even though the success path itself ran.
+    /// installed so the `info!` field expressions beside the Snap client call are
+    /// actually evaluated - tracing skips them when no subscriber is active, which
+    /// left that line uncovered even though the success path itself ran.
     #[tokio::test]
     async fn live_create_topup_success_without_a_redirect_url_still_creates_the_row() {
         let _env = EnvLock::acquire();
