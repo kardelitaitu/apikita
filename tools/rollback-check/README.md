@@ -139,27 +139,31 @@ It builds throwaway databases under `.agents/` and removes them via `trap ... EX
 TERM`. Needs `sqlite3` and POSIX `sh`; no network, no service container, no `DATABASE_URL`,
 no Rust build.
 
-### Run ONE AT A TIME
+### Concurrent runs are safe, and here is the measurement
 
-**This check is not safe to run concurrently with itself**, and the failure it produces does
-not look like a collision. Measured, twice, on a clean copy of the tree:
+**This check can be run concurrently with itself, and it could not in the previous revision.**
+The scratch root now carries the process id (`$REPO_ROOT/.agents/rollback-check-work.$$`), so
+two runs get their own directory. Measured on a clean copy of the tree, before and after:
 
-| | result |
-| --- | --- |
-| two runs, serial | `0`, `0` |
-| two runs, started together | **`1`, `1`** |
-| serial again afterwards | `0` — it does not persist |
+| | before | after |
+| --- | --- | --- |
+| two runs, serial | `0`, `0` | `0`, `0` |
+| two runs, started together | **`1`, `1`** | **`0`, `0`** |
 
-Both concurrent runs fail, and they fail with *specific, alarming* diagnostics rather than an
-obvious resource error — for example *"the un-injected control run must PASS, got exit 4"* and
-*"the wrong-version run exited 7 but did not report a SCHEMA VERSION MISMATCH"*. A reader who
-sees that would reasonably conclude the drill is broken.
+**Why it was worth changing rather than warning about.** The old failure did not look like a
+collision. Both runs failed with *specific, alarming* diagnostics — *"the un-injected control
+run must PASS, got exit 4"*, *"the wrong-version run exited 7 but did not report a SCHEMA
+VERSION MISMATCH"* — which a reader would reasonably take as the **drill** being broken. A
+guard whose collision reads as a defect in the thing it guards is worse than a slow one.
 
-**Why.** `check.sh` builds its scratch under one fixed root per repository
-(`ROLLBACK_CHECK_WORK`, defaulting to `.agents/rollback-check-work`), with no per-process
-isolation, so two runs share a working tree and each sees the other's half-built databases.
-The override exists — `ROLLBACK_CHECK_WORK=/some/other/dir` gives a run its own space — which
-is the way to parallelise if you must.
+The `$$` costs nothing here because of the teardown guarantee above: the scratch survives
+neither a passing nor a failing run, so there is no failed-run directory a stable path was
+preserving. Every other check in `tools/` already did this
+(`${TMPDIR:-/tmp}/apikita-<name>-check-$$`); this one was the outlier. Measured across all
+nine, the other eight passed as a concurrent pair and this one did not.
+
+`ROLLBACK_CHECK_WORK=/some/other/dir` still overrides the whole path, for a run that wants its
+scratch somewhere specific.
 
 **Why this is written here rather than left to the note above.** The note at
 ["A note on measurement"](#a-note-on-measurement-because-it-cost-two-rounds) records what

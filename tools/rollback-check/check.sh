@@ -88,7 +88,19 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
 fi
 
 # Scratch lives under .agents/ and is removed on EVERY exit path, failure included.
-WORK="${ROLLBACK_CHECK_WORK:-$REPO_ROOT/.agents/rollback-check-work}"
+#
+# THE `$$` SUFFIX IS THE CONCURRENCY FIX, and it costs nothing because of the sentence
+# above: nothing here is meant to outlive the run, so there is no failed-run scratch for a
+# stable path to preserve. Without it, two runs of this check share one working tree and each
+# sees the other's half-built databases. Measured on a clean copy: serial `0`, `0`; the same
+# two runs started together `1`, `1` - and they fail with SPECIFIC diagnostics ("the
+# un-injected control run must PASS, got exit 4") that blame the drill rather than the
+# collision.
+#
+# Every OTHER check in tools/ already does this (`${TMPDIR:-/tmp}/apikita-<name>-check-$$`);
+# this one was the outlier. Measured across all nine: the other eight pass as a concurrent
+# pair, this one did not, and does now.
+WORK="${ROLLBACK_CHECK_WORK:-$REPO_ROOT/.agents/rollback-check-work.$$}"
 rm -rf "$WORK" 2>/dev/null || true
 # scratch/ and logs/ are created HERE, not by the drill, and that is the fix for a
 # check that could not pass on a clean tree. `$WORK` is removed on the line above and
