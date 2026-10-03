@@ -116,7 +116,20 @@ opinion.
 
 - [x] Signature verified on every request; mismatches rejected and logged.
 - [x] Amount validated against the **stored** `topups` row, never the payload.
+      The check is IN the settling statement, not before it: `credit_topup_transaction`
+      updates `WHERE order_id = ? AND status = 'pending' AND amount_idr = ?`, so the stored
+      amount is the guard rather than something read and compared. Held by
+      `only_a_fresh_settle_announces_a_balance` (`routes/webhooks.rs`), which asserts
+      `AmountMismatch` is produced. **Named because this item did not name it**: a reader
+      could see the tick and not know whether a wrong amount was rejected or merely logged.
 - [x] Crediting is idempotent by `order_id`.
+      Two mechanisms, both real and neither previously named here. The statement above is
+      the first: a replayed webhook finds `status = 'settled'`, matches no row, and takes the
+      `AlreadySettled` branch — no money moves. The second is that the branch is then
+      **tested**: `live_webhook_settlement_credits_exactly_once_and_a_replay_does_not` and
+      `credit_topup_settles_replays_and_refuses_bad_input` (`routes/webhooks.rs`, `db.rs`),
+      plus `a_settlement_replayed_after_a_refund_is_refused_and_credits_nothing` for the
+      refund interaction.
 - [x] Crediting is atomic with the `topups` status update and the ledger row.
       **Half of this is the TYPE SYSTEM and half is the test suite**, measured because the item
       named neither. `Transaction::commit(self)` CONSUMES the transaction, so the realistic
@@ -131,6 +144,13 @@ opinion.
       refund notification returns 200 with `{"status":"refund_not_supported"}`,
       logs at `error!`, and writes nothing — the topup stays `settled`, no ledger
       row is appended, the wallet cannot move.
+      Held by `a_refund_notification_is_never_classified_as_a_debit`,
+      `a_refund_refusal_is_logged_under_its_own_documented_event` and
+      `a_settlement_replayed_after_a_refund_is_refused_and_credits_nothing`
+      (`routes/webhooks.rs`). The classification itself lives in
+      `money::evaluate_payment_status`, which maps the two refund statuses to
+      `RefundRefused` and deliberately has **no catch-all** that would let an
+      unrecognised status through as a credit.
 - [x] **Alerting on that refusal** — previously the ONE outstanding code-shaped item
       in this group. `server/src/routes/webhooks.rs` now emits `event = "refund.refused"`,
       a DISTINCT name from `topup.rejected` because they mean opposite things (a
@@ -199,13 +219,30 @@ opinion.
       a whole number, not scaling with the amount. That is documented in the money module and is
       not something a reader would infer from "no float appears in any billing path".
 - [x] `CHECK (balance_idr >= 0)` present and exercised.
+      **The CHECK is a BACKSTOP, not the mechanism, and the item did not say so.** Forcing a
+      full debit onto a short wallet would drive the balance negative and the CHECK would
+      refuse it — which is why `clamp_debit` exists: it floors the debit at the balance so the
+      constraint is never reached on a normal path. `db::clamp_debit`'s doc-comment states this
+      directly ("the backstop rather than the thing that refuses the debit"), and
+      `clamp_debit_holds_every_money_invariant_over_the_whole_domain` exercises it across the
+      boundary grid (`i64::MIN`, `i64::MAX`, zero, near-zero, and 40,000 fixed-seed pairs), so
+      "exercised" is a claim with a named test rather than an assertion.
 
 ### Billing accuracy
 
 - [x] **Cache-read tokens are never counted as input tokens** — test with a payload
       containing cache hits.
+      `cache_read_tokens_are_never_priced_as_input_tokens` (`money.rs`) is the pricing half;
+      `live_get_usage_keeps_the_three_token_classes_separate` (`routes/account.rs`) is the
+      storage half, against a live request. Two halves, two tests, named because the item
+      named neither.
 - [x] Three token classes stored separately in `usage_daily`.
+      Same two tests as the item above — the storage half is exactly what this claims.
 - [x] Peak/off-peak basis applied consistently between reservation and settlement.
+      `the_off_peak_rate_path_is_exercised_and_is_exactly_half_of_peak` is the consistency
+      claim; `off_peak_is_never_dearer_than_peak_in_any_shipped_model` and
+      `a_model_without_peak_rates_is_refused_at_validate` (`config.rs`) guard the config side,
+      so a rate table that inverted the basis is refused at load rather than at settlement.
 
 > **These boxes were UNCHECKED while the work was already done and tested** — the
 > same drift this file has been corrected for before. Each was verified against the
