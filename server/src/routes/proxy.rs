@@ -3858,6 +3858,161 @@ mod tests {
         .await;
     }
 
+    /// A SETTLED GUARD MUST NOT RELEASE ITS HOLD, and `defuse` is the only thing stopping it.
+    ///
+    /// The settlement test above cannot see this, and the reason is structural rather than a gap in
+    /// that test: `ReservationGuard::drop` releases through `tokio::spawn`, because `Drop` cannot
+    /// await, so the second credit lands on a DETACHED task that the assertion typically runs ahead
+    /// of. MEASURED: deleting `guard.defuse()` from the `Settled` arm of `settle_after_stream` left
+    /// all 75 `routes::proxy` tests green across five consecutive runs.
+    ///
+    /// A DETACHED RELEASE IS TESTABLE IF THE TEST DRIVES IT ITSELF. This test takes a guard, defuses
+    /// it, drops it, and then YIELDS until the spawned task has had its chance - so the assertion is
+    /// about the guard's behaviour rather than about a race the scheduler decides.
+    ///
+    /// WHY IT MATTERS. `release_reservation_transaction` credits UNCONDITIONALLY: it never checks
+    /// whether the ref is already paired, and `try_credit` has no idempotency guard. So a guard that
+    /// releases after a committed settlement credits the hold a SECOND time - money appearing in the
+    /// wallet that no ledger row accounts for, which is the `drift_rows` invariant failing and the
+    /// shape this repository calls "invisible money". `defuse` is the entire barrier.
+    #[tokio::test]
+    async fn a_defused_guard_never_credits_the_hold_a_second_time() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let opening_idr = 50_000;
+        let held_idr = 10_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr - held_idr,
+                "the hold is out of the wallet"
+            );
+
+            // (1) DEFUSED: the settlement already credited the hold inside its own transaction.
+            {
+                let mut guard = ReservationGuard::new(
+                    &pool_for_assertions,
+                    account_id,
+                    held_idr,
+                    &reservation_ref,
+                    "flash",
+                );
+                guard.defuse();
+                // Dropped here. A defused guard must do nothing.
+            }
+
+            // Let any spawned task run, so the assertion is not racing the scheduler. Several
+            // yields and a short sleep cover a task queued behind other work.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr - held_idr,
+                "a DEFUSED guard must not credit the hold back: the settlement already released it \
+                 inside its own committed transaction, and `release_reservation_transaction` \
+                 credits unconditionally, so a second release invents money the ledger cannot \
+                 account for"
+            );
+
+            // The pairing count is the same fact through the detector the alert uses: one negative
+            // row and no positive one, because the settlement never ran here.
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                1,
+                "the hold is still unpaired: the defused guard wrote no release row"
+            );
+        })
+        .await;
+    }
+
+    /// The other half, so the pair brackets the flag: a guard that is NOT defused DOES release.
+    ///
+    /// Without this, making `Drop` a no-op entirely would pass the test above - and silently turn
+    /// every aborted request into a stranded hold, which is the failure the guard exists to prevent.
+    #[tokio::test]
+    async fn an_undefused_guard_releases_the_hold_so_an_aborted_request_strands_nothing() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let opening_idr = 50_000;
+        let held_idr = 10_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+
+            // NOT defused: this is the aborted-request case - the client reset, or a `?` on an
+            // earlier step. The guard's Drop must give the whole hold back.
+            {
+                let _guard = ReservationGuard::new(
+                    &pool_for_assertions,
+                    account_id,
+                    held_idr,
+                    &reservation_ref,
+                    "flash",
+                );
+            }
+
+            // Poll until the detached release commits, rather than assuming a fixed delay: the
+            // spawned task has to open a transaction and take the write lock.
+            let mut balance = wallet_balance(&pool_for_assertions, account_id).await;
+            for _ in 0..200 {
+                if balance == opening_idr {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                balance = wallet_balance(&pool_for_assertions, account_id).await;
+            }
+
+            assert_eq!(
+                balance, opening_idr,
+                "an UNDEFUSED guard must release the hold: this is the aborted-request path, and \
+                 failing to release leaves a stranded hold - the money out of the wallet until an \
+                 operator runs the sweep"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "the release must pair the hold, so the stranded-hold alert stays quiet"
+            );
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "the release must keep balance_idr equal to SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
     /// THE WASHED CASE. A stream that ended without a usage report is billed
     /// NOTHING and gives the whole hold back (docs/failover.md (Mid-stream failure and billing)). Token
     /// counts are never invented to fill the gap.
