@@ -1031,6 +1031,89 @@ mod tests {
         );
     }
 
+    /// `stream_chat` must CONSULT the breaker, and nothing verified that before.
+    ///
+    /// MEASURED: replacing `if !endpoint.breaker.allow_request() { continue; }` with `if false` left
+    /// the entire suite green at 641 passed. The breaker itself is tested hard in its own module -
+    /// HalfOpen admits one trial, concurrent callers are rejected, the cooldown doubles and caps - but
+    /// those exercise `allow_request()` in ISOLATION. The sibling test above trips a breaker and
+    /// asserts it is open; it never asks whether the request path reads it.
+    ///
+    /// THE CALL SITE DOES TWO JOBS, and the second is the one that bites. Beyond refusing an Open
+    /// breaker, `allow_request()` CLAIMS THE HALFOPEN TRIAL SLOT (`inner.trial_in_flight = true`).
+    /// Skipping the check therefore does not merely hammer a known-bad provider: on a RECOVERING
+    /// endpoint it sends every concurrent request where the design admits exactly one, which is how a
+    /// provider that just failed is knocked over again by the traffic it failed under.
+    ///
+    /// This asserts the refusal half against a REAL upstream, so the proof is that no request
+    /// arrives - not merely that an error type came back.
+    #[tokio::test]
+    async fn a_stream_chat_never_reaches_an_endpoint_whose_breaker_is_open() {
+        // An upstream that counts what it is asked for.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback upstream");
+        let addr = listener.local_addr().expect("local addr");
+
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            // Accept more than once: if the check is skipped the request DOES arrive.
+            for _ in 0..4 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"error":"should not be reached"}"#;
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let url = format!("http://{addr}/v1");
+        let client = client_pointed_at(&url);
+        trip_endpoint(&client, 0);
+        assert!(
+            !client.models[0].endpoints[0].breaker.allow_request(),
+            "the fixture must actually have tripped the breaker"
+        );
+        // allow_request() just consumed the HalfOpen trial slot if it had one; re-trip so the
+        // state under test is unambiguously Open rather than depending on that side effect.
+        trip_endpoint(&client, 0);
+
+        let err = client
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect_err("an open breaker must refuse the request");
+
+        assert!(
+            matches!(err, UpstreamError::NoHealthyUpstream(_)),
+            "an open breaker must report NoHealthyUpstream, got {err:?}"
+        );
+
+        // THE ASSERTION THAT MATTERS, and it is about the WIRE rather than the return value: with
+        // the check disabled the request is sent and the counter moves even though the error type
+        // looks identical.
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no request may reach a provider whose breaker is open - a skipped check still returns \
+             NoHealthyUpstream (the 500 is recorded as a failure), so the return value alone cannot \
+             tell the two apart"
+        );
+    }
+
     /// A WEIGHTED endpoint with NO KEYS cannot mask a real outage on the endpoint
     /// that can serve. The shipped config no longer HAS that shape - the flash
     /// model's secondary placeholder was moved to weight 0 - so this test now
