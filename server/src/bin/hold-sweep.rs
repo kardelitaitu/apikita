@@ -244,6 +244,15 @@ async fn release_hold(pool: &SqlitePool, hold: &StrandedHold) -> Result<i64, sql
     // Same shape as reserve_balance_transaction: lock the wallet row, credit it,
     // and read back the resulting balance in one transaction so balance_after is
     // the true post-credit balance rather than a snapshot taken outside the lock.
+    //
+    // `account_id` IS BOUND HYPHENATED, like the other 196 binds in this crate and unlike the
+    // two that used to be here. `accounts.id`/`wallets.account_id` are TEXT holding the
+    // hyphenated form (`db.rs` reads them back via `uuid::fmt::Hyphenated`), so a raw `Uuid`
+    // is a different string and matches no row: the UPDATE returned RowNotFound and `--release`
+    // could never credit a hold. The unit test below is what found it - this function had no
+    // coverage at all before, and the mutation that dropped `.abs()` survived too.
+    let account_id = hold.account_id.hyphenated();
+
     let mut tx = pool.begin().await?;
     let new_balance: i64 = sqlx::query_scalar(
         "UPDATE wallets SET balance_idr = balance_idr + ?, updated_at = ? \
@@ -251,7 +260,7 @@ async fn release_hold(pool: &SqlitePool, hold: &StrandedHold) -> Result<i64, sql
     )
     .bind(amount)
     .bind(&now)
-    .bind(hold.account_id)
+    .bind(account_id)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -259,7 +268,7 @@ async fn release_hold(pool: &SqlitePool, hold: &StrandedHold) -> Result<i64, sql
         "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) \
          VALUES (?, ?, 'adjustment', ?, ?, ?)",
     )
-    .bind(hold.account_id)
+    .bind(account_id)
     .bind(amount)
     .bind(&hold.reservation_ref)
     .bind(new_balance)
@@ -517,6 +526,253 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------------------
+    // release_hold: the only function in this binary that MOVES MONEY
+    // ---------------------------------------------------------------------------------------
+    //
+    // Everything else here is parsing, formatting and reporting, and those are tested. `release_hold`
+    // had NO coverage of any kind, which was measured rather than assumed: dropping the `.abs()` -
+    // which inverts the direction of the credit - and deleting the ledger insert BOTH left the whole
+    // binary green at 15 passed.
+    //
+    // It was unreachable by the fixture style used above, because it needs a real database and
+    // `test_support` is `#[cfg(test)]` and private to the lib. The harness below is the same shape
+    // usage-purge.rs uses for the same reason.
+
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::str::FromStr;
+
+    /// A migrated on-disk SQLite URL in the system temp directory.
+    async fn migrated_temp_db() -> (String, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("apikita-hold-sweep-test-{}.db", Uuid::new_v4()));
+        let url = format!("sqlite://{}", path.to_str().unwrap().replace('\\', "/"));
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open temp db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("apply migrations");
+        pool.close().await;
+        (url, path)
+    }
+
+    /// Builds an account funded with `funding_idr` and holding `held_idr`, returning (account, hold)
+    /// with the hold shaped exactly as `stranded_holds` would report it.
+    ///
+    /// THE RESERVATION GOES THROUGH THE REAL PRODUCTION PATH (`db::reserve_balance_transaction`)
+    /// rather than a hand-written ledger row. Two reasons, and the first is why the first version of
+    /// this fixture failed: the ledger's `reason` is constrained to ('topup','usage','adjustment',
+    /// 'refund'), so inventing `'reserve'` is rejected by the schema - a hold is identified by
+    /// `ref LIKE 'reserve_%' AND delta_idr < 0`, not by its reason. The second is that a fixture
+    /// which writes its own row can drift from what the proxy actually produces.
+    ///
+    /// The hold's `amount_idr` is NEGATIVE, because that is what the real reporting query produces:
+    /// `stranded_holds` aggregates `SUM(l.delta_idr)`, and a reservation is a negative ledger row.
+    /// A fixture using a positive amount would make `release_hold`'s `.abs()` a no-op, and the test
+    /// would then pass against a build that debits the customer instead of refunding them.
+    async fn account_holding(
+        pool: &SqlitePool,
+        funding_idr: i64,
+        held_idr: i64,
+    ) -> (Uuid, StrandedHold) {
+        let account = Uuid::new_v4();
+        let now = Utc::now();
+
+        sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)")
+            .bind(account.hyphenated())
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("create the account");
+        sqlx::query("INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?, ?, ?)")
+            .bind(account.hyphenated())
+            .bind(0_i64)
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("create the wallet");
+
+        // Fund it the way a deposit settles, so the wallet's history is realistic.
+        sqlx::query("UPDATE wallets SET balance_idr = ? WHERE account_id = ?")
+            .bind(funding_idr)
+            .bind(account.hyphenated())
+            .execute(pool)
+            .await
+            .expect("fund the wallet");
+
+        // The hold, through the real guarded debit under a real `reserve_%` ref.
+        let ref_ = format!("reserve_{}", Uuid::new_v4().simple());
+        db::reserve_balance_transaction(pool, account, held_idr, Some(&ref_))
+            .await
+            .expect("reserve against the wallet");
+        assert_eq!(
+            wallet_balance(pool, account).await,
+            funding_idr - held_idr,
+            "the reservation must actually have left the wallet"
+        );
+
+        let hold = StrandedHold {
+            account_id: account,
+            email: None,
+            reservation_ref: ref_,
+            amount_idr: -held_idr,
+            held_at: now,
+            age_seconds: 900,
+            row_count: 1,
+        };
+        (account, hold)
+    }
+
+    async fn wallet_balance(pool: &SqlitePool, account: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+            .bind(account.hyphenated())
+            .fetch_one(pool)
+            .await
+            .expect("read the balance")
+    }
+
+    /// Releasing a stranded hold CREDITS the wallet by the held amount, and writes a ledger row
+    /// that pairs under the same ref.
+    ///
+    /// The `.abs()` is the load-bearing part and it is why this test exists: the hold is stored
+    /// NEGATIVE (`SUM(delta_idr)` over the reservation), so `balance_idr + amount` DEBITS the
+    /// customer a second time instead of refunding them. MEASURED before this test: dropping
+    /// `.abs()` kept all 15 tests in this binary passing, so a run of `--release` would have taken
+    /// money from every account it was meant to compensate.
+    #[tokio::test]
+    async fn releasing_a_hold_credits_the_held_amount_back() {
+        let (url, path) = migrated_temp_db().await;
+        let pool = db::init_pool(&url).await.expect("open the migrated db");
+
+        // The wallet was funded with 50_000 and a 10_000 reservation is outstanding, so it sits at
+        // 40_000: the customer is 10_000 short of what they paid for.
+        let (account, hold) = account_holding(&pool, 50_000, 10_000).await;
+
+        let reported = release_hold(&pool, &hold).await.expect("release the hold");
+        assert_eq!(
+            reported, 50_000,
+            "the return value is the balance_after written to the ledger, and it must be the \
+             post-credit balance"
+        );
+        assert_eq!(
+            wallet_balance(&pool, account).await,
+            50_000,
+            "releasing a 10_000 hold must CREDIT 10_000, restoring the funded 50_000. Seeing \
+             30_000 here means the negative stored amount was added without .abs(), which DEBITS \
+             the customer a second time instead of refunding them"
+        );
+
+        // The trace: an append-only POSITIVE adjustment under the SAME ref, which is what pairs the
+        // row and stops it being stranded. The ledger is never mutated, so this is an addition.
+        let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+            "SELECT delta_idr, reason, ref, balance_after FROM ledger \
+             WHERE account_id = ? AND reason = 'adjustment'",
+        )
+        .bind(account.hyphenated())
+        .fetch_all(&pool)
+        .await
+        .expect("read the adjustment");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one adjustment row, or the pairing is ambiguous"
+        );
+        let (delta, reason, ref_, balance_after) = &rows[0];
+        assert_eq!(
+            *delta, 10_000,
+            "the adjustment must be POSITIVE: it credits back"
+        );
+        assert_eq!(reason, "adjustment");
+        assert_eq!(
+            ref_, &hold.reservation_ref,
+            "the ref is passed through verbatim: rewriting it would hide the trace an operator \
+             needs, and the pairing is what stops the row being stranded"
+        );
+        assert_eq!(
+            *balance_after, 50_000,
+            "balance_after must be the post-credit balance read INSIDE the transaction, not a \
+             snapshot taken outside the lock"
+        );
+
+        // And the reservation itself is untouched: the ledger is append-only.
+        //
+        // Identified by ref AND SIGN. Both rows now share the ref by design - that is what pairs
+        // them - so a query on the ref alone returns whichever row SQLite reaches first, which is
+        // how the first version of this assertion read the +10_000 adjustment instead of the
+        // -10_000 reservation.
+        let reserved: i64 = sqlx::query_scalar(
+            "SELECT delta_idr FROM ledger WHERE account_id = ? AND ref = ? AND delta_idr < 0",
+        )
+        .bind(account.hyphenated())
+        .bind(&hold.reservation_ref)
+        .fetch_one(&pool)
+        .await
+        .expect("read the reservation");
+        assert_eq!(
+            reserved, -10_000,
+            "the negative reservation row stays exactly as written; the fix is a second row, never \
+             an edit to the first"
+        );
+
+        // The pairing, stated as `stranded_holds` states it: the hold is no longer stranded
+        // because a POSITIVE row now exists under the same ref. This is the invariant the
+        // operator's `--release` run is supposed to leave behind.
+        let unpaired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ( \
+               SELECT l.ref FROM ledger l \
+               WHERE l.account_id = ? AND l.ref LIKE 'reserve_%' AND l.delta_idr < 0 \
+               GROUP BY l.ref \
+               HAVING NOT EXISTS (SELECT 1 FROM ledger m \
+                                  WHERE m.account_id = l.account_id AND m.ref = l.ref \
+                                    AND m.delta_idr > 0))",
+        )
+        .bind(account.hyphenated())
+        .fetch_one(&pool)
+        .await
+        .expect("count unpaired holds");
+        assert_eq!(
+            unpaired, 0,
+            "after the release the hold must no longer be STRANDED: a positive row under the same \
+             ref is what nets it to zero and takes it off the operator's report"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Releasing the SAME hold twice credits twice, which is why `release_hold` is opt-in.
+    ///
+    /// This is not a bug being pinned - it is the reason the binary refuses to move money without
+    /// `--release`, stated as a test so the exposure is visible rather than inferred. An operator
+    /// re-running the command after an incident would double-credit.
+    #[tokio::test]
+    async fn releasing_twice_credits_twice_which_is_why_release_is_opt_in() {
+        let (url, path) = migrated_temp_db().await;
+        let pool = db::init_pool(&url).await.expect("open the migrated db");
+        let (account, hold) = account_holding(&pool, 50_000, 10_000).await;
+
+        release_hold(&pool, &hold).await.expect("first release");
+        release_hold(&pool, &hold).await.expect("second release");
+
+        assert_eq!(
+            wallet_balance(&pool, account).await,
+            60_000,
+            "a second release credits again: the guard against that is the operator's flag, not \
+             this function, and a reader should be able to see that here"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn bound_exceeds_the_worst_case_request() {
