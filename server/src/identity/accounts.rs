@@ -408,10 +408,21 @@ pub async fn upsert_password_identity(
 
 /// Marks an address as PROVEN, stamping when.
 ///
-/// The only writers are the three in [`super`]'s rule 4. Idempotent in the sense
-/// that re-marking keeps the EARLIEST `verified_at`: an address proven once stays
-/// proven, and moving the stamp forward would invalidate links that were authorised
-/// by the earlier proof.
+/// ONE OF THE TWO WRITERS OF `1`, both fixed in [`super`]'s rule 4. Its only production caller is
+/// `verify_email`, which reaches it by redeeming a token delivered to that address; the other
+/// writer is the Google identity INSERT, which writes `1` only after `verify_id_token` has checked
+/// the token's own claim.
+///
+/// THIS SAID "the three in `super`'s rule 4", which named the password-reset path as a third. That
+/// was wrong in the same way `mod.rs` was wrong, and it is corrected here too: a reset proves the
+/// mailbox was reachable and deliberately does NOT verify the address, because the verified
+/// transition is its own claim. See `routes::auth::tests::
+/// live_confirm_password_reset_sets_the_password_and_kills_every_session`, which asserts the flag
+/// stays 0 across a reset.
+///
+/// Idempotent in the sense that re-marking keeps the EARLIEST `verified_at`: an address proven once
+/// stays proven, and moving the stamp forward would invalidate links that were authorised by the
+/// earlier proof.
 pub async fn mark_verified(
     pool: &SqlitePool,
     identity_id: Uuid,
