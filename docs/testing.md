@@ -201,6 +201,38 @@ and those differ by design, because `MOUNTED` carries one row per request and th
 two dual-method paths are one route each. That is the failure mode described in
 the next section, and it is why the comparison now deduplicates paths first.
 
+### A mutation can land on a COPY, and then "SURVIVED" is not a finding
+
+**`routes/mod.rs` holds THREE copies of the route list, and only one of them ships.**
+In source order: the `ROUTES` string literal (two tests parse it), `create_router`'s own `routes!(...)`
+invocation (the only one that builds the router), and `MOUNTED_BY_THE_MACRO = routes!(@paths ...)`.
+The two `routes!` invocations are **separate tokens** - the macro is expanded twice - so editing one
+does not move the other.
+
+That cost three wrong conclusions in one round, each of which looked like a real defect:
+
+- mutating the verb in the `@paths` copy (`get` -> `post` on `/api/reviews/mine`) survived the suite,
+  which read as *"the method is catchable by nothing"*;
+- mutating it in the `ROUTES` literal also survived, which read as *"and the literal is worse"*;
+- writing a `@methods` arm and a method comparison **failed to close either**, because both new
+  checks compared the array copies to `ROUTES` while the mutation was still landing elsewhere.
+
+The shipping copy, mutated directly, is caught **five times over**: changing or deleting
+`/api/reviews/mine`, and changing `/api/me`, each fail five distinct tests - including
+`every_mounted_route_dispatches_and_every_near_miss_is_refused`,
+`the_state_handed_to_the_router_is_the_state_its_handlers_run_on`, and the route's own integration
+tests. It was never unprotected. The 261-line "fix" written to close the imaginary gap was reverted,
+because a second copy of the route list is exactly the duplicate-that-drifts defect this file's
+opening section is about - adding one to guard a gap that does not exist makes the next drift likelier.
+
+**The rule this earns: before believing a survivor, print the bytes you changed.** A mutation
+harness that edits a file by string match is only a measurement if the string it replaced is the one
+the program uses. `grep -c` the anchor and assert it is 1, then re-read the region you intended to
+edit - the same discipline as `server/src/doc_claims.rs`'s mutation notes, applied to the harness
+rather than the guard. When an anchor appears more than once, an ambiguous-range refusal is the
+correct outcome, and scoping the edit to the enclosing function or macro invocation is what turns a
+false SURVIVED into a real result.
+
 ### Four false alarms, and what they had in common
 
 Every one of these rounds has produced a finding that turned out, on checking, not
