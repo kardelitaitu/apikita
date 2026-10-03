@@ -179,7 +179,13 @@ silent failure.** Alert on size, not just exit code.
       > **PORTED (was the sharpest open item in this document).** `tools/backup/backup.sh` and
       > `tools/drill/drill.sh` now implement the **SQLite** procedure: a `.backup` copy, header +
       > `integrity_check` on both the artifact and the **restored** file, and the reconcile gate.
-      > They refuse a `postgres://` `DATABASE_URL` by name (exit 2). Verified end-to-end against a
+      > **Both now** refuse a `DATABASE_URL` that is not a `sqlite://` URL, by name and at exit 2.
+      > That word was **"They"** and it was half wrong when written: `backup.sh` had the check and
+      > `drill.sh` did not, so a `postgres://` value reached the drill, was taken as a literal
+      > path, and surfaced much later as a restore failure (measured: exit 7) rather than as the
+      > misconfiguration it was. The drill validates it now, and — like its sibling — draws a
+      > separate message for `sqlite::memory:`, which parses as a scheme but names no file.
+      > Verified end-to-end against a
       > scratch database built from the migration: a balanced source restores and reconciles green; a
       > drifted source **fails** (exit 1); a truncated or zero-length artifact is caught by the header
       > check (exit 6); and a zero-length *source* is refused, because SQLite opens an empty file as a

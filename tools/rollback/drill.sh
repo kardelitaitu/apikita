@@ -161,12 +161,44 @@ problem() {
 }
 
 # --- the live-looking guard, BEFORE anything is read, created or deleted ------
+#
+# THE SCHEME IS VALIDATED HERE, and this was missing while `backup.sh` had it. Both tools read
+# `DATABASE_URL`, and the sibling refuses anything that is not a `sqlite://` URL by name at exit
+# 2. This one stripped the prefix with `${SOURCE_URL#sqlite://}` - which is a NO-OP on a URL that
+# does not start with it - so `postgres://host/db` was taken as a literal PATH. Measured: the run
+# proceeded, opened nothing, and failed much later at exit 7 with a message about a restore. A
+# misconfiguration should name itself, not surface as a downstream symptom three steps away.
+#
+# `sqlite::memory:` gets its own message because it parses as a scheme but names no file, the
+# same distinction `backup.sh` draws.
+#
+# The environment forms are all validated, not just $DATABASE_URL: ROLLBACK_SOURCE_URL and
+# --source reach the same variable, so checking only the ambient one would leave two doors open.
 SOURCE_BASENAME=""
 if [ -n "$SOURCE_URL" ]; then
-    _p=${SOURCE_URL#sqlite://}
-    _p=${_p#sqlite:}
-    _p=${_p%%\?*}
-    [ -n "$_p" ] && SOURCE_BASENAME=$(basename -- "$_p")
+    case "$SOURCE_URL" in
+        sqlite::memory:*)
+            printf '%s\n' "rollback: DATABASE_URL names an in-memory database: '$SOURCE_URL'" >&2
+            printf '%s\n' "rollback:   the drill snapshots a FILE; there is nothing to copy from memory" >&2
+            exit 2
+            ;;
+        sqlite://*)
+            _p=${SOURCE_URL#sqlite://}
+            _p=${_p%%\?*}
+            [ -n "$_p" ] || {
+                printf '%s\n' "rollback: DATABASE_URL is a bare sqlite:// with no path: '$SOURCE_URL'" >&2
+                exit 2
+            }
+            # RELATIVE, not absolute: this becomes SOURCE_BASENAME for the live-looking guard
+            # below, and an absolute path would compare against the bare name and never match.
+            SOURCE_BASENAME=$(basename -- "$_p")
+            ;;
+        *)
+            printf '%s\n' "rollback: DATABASE_URL is not a sqlite:// URL: '$SOURCE_URL'" >&2
+            printf '%s\n' "rollback:   expected e.g. sqlite://data/server.db (there is no database server any more)" >&2
+            exit 2
+            ;;
+    esac
 fi
 
 LOW=$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')
