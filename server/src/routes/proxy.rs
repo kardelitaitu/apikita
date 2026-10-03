@@ -4277,6 +4277,135 @@ mod tests {
         .await;
     }
 
+    /// A SETTLEMENT THAT FAILS GIVES THE HOLD BACK, and that release is the one thing standing
+    /// between a database fault and a customer losing money on a request that was never billed.
+    ///
+    /// This is the `Err` arm the comment calls "the exact bug this fix closes - the old code warned
+    /// and walked away". MEASURED before this test: deleting its `guard.defuse()` left the whole
+    /// `routes::proxy` module green at 80 passed. The arm is reached only when
+    /// `debit_usage_transaction` RETURNS A FAULT, and no fixture produced one:
+    ///
+    ///   - a short wallet is an OUTCOME, not an error - it takes the `Partial` arm;
+    ///   - a DELETED wallet is also not an error - `try_credit` returns `None`, the release records
+    ///     zero, and `try_debit` then finds no row, which is `Partial` again. Found by reading
+    ///     `debit_usage_transaction`'s step 0; it never reaches this arm.
+    ///
+    /// So the fixture has to break the WRITE rather than the wallet. Dropping `usage_events` makes
+    /// `record_usage` fail, which fails the whole settlement transaction, while leaving `wallets` and
+    /// `ledger` intact - and that distinction is what makes the test mean something:
+    /// `release_quietly` writes to `ledger`, not to the dropped table, so the release CAN still
+    /// succeed. A fixture that broke the ledger too would reach the arm and then prove nothing about
+    /// whether the arm helps.
+    #[tokio::test]
+    async fn a_failed_settlement_releases_the_hold_rather_than_stranding_it() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let held_idr = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        let usage = Usage {
+            input_tokens: 1_000,
+            cache_read_tokens: 400,
+            output_tokens: 2_000,
+        };
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            let held = reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+            assert!(
+                matches!(&held, ReservationResult::Held { .. }),
+                "the hold must land, got {held:?}"
+            );
+            assert_eq!(
+                wallet_balance(&pool_for_assertions, account_id).await,
+                opening_idr - held_idr,
+                "the hold is out of the wallet before the settlement"
+            );
+
+            // Break the WRITE the settlement performs, not the wallet it debits. `usage_events` is
+            // written by `record_usage` inside the settlement transaction; `wallets` and `ledger`
+            // stay intact, so the recovery release still has somewhere to land.
+            sqlx::query("DROP TABLE usage_events")
+                .execute(&pool_for_assertions)
+                .await
+                .expect("drop the table the settlement writes");
+
+            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+            let guard = ReservationGuard::new(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                &reservation_ref,
+                "flash",
+            );
+            assert!(
+                settle_tx.send(StreamEnd::Settled(usage)).is_ok(),
+                "the settlement task must still be listening"
+            );
+
+            settle_after_stream(
+                settle_rx,
+                pool_for_assertions.clone(),
+                state.config.clone(),
+                state.events.clone(),
+                account_id,
+                key_id,
+                "flash".to_string(),
+                held_idr,
+                guard,
+            )
+            .await;
+
+            // THE MONEY COMES BACK. The debit failed, so nothing was charged and the hold must be
+            // returned - and exactly once. A missing defuse on this arm means the explicit release
+            // above AND the guard's Drop both fire, crediting the hold twice.
+            let settled = settled_balance(&pool_for_assertions, account_id).await;
+            assert_eq!(
+                settled, opening_idr,
+                "a settlement that failed must give the WHOLE hold back and cost nothing. A balance \
+                 of {} is the guard's Drop releasing it a second time after `release_quietly` \
+                 already did - money invented against a request that was never billed. \
+                 hold {held_idr}, opening {opening_idr}",
+                opening_idr + held_idr
+            );
+
+            // And the release PAIRED the hold, so the stranded-hold detector stays quiet.
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a failed settlement must not leave the customer's money stranded - \
+                 this is the defect the arm exists to prevent"
+            );
+            assert_eq!(
+                drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
     /// A SETTLED GUARD MUST NOT RELEASE ITS HOLD, and `defuse` is the only thing stopping it.
     ///
     /// The settlement test above cannot see this, and the reason is structural rather than a gap in
@@ -6015,7 +6144,18 @@ mod tests {
         // The usage the upstream reported is NOT billed (its model's rates are
         // gone), but the customer's hold must come back either way.
         assert!(usage_today(&db.pool, account_id).await.is_none());
-        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
+        // SETTLED TO A FIXED POINT. A direct `wallet_balance` read was not enough here: this arm
+        // defuses the guard because `release_quietly` already gave the hold back, and without the
+        // defuse the Drop fires a SECOND release on a detached task that commits after this line.
+        // MEASURED: deleting the arm's `guard.defuse()` left the whole module green at 81 passed
+        // while this assertion read the pre-release balance.
+        assert_eq!(
+            settled_balance(&db.pool, account_id).await,
+            1_000_000,
+            "the hold must come back ONCE, and the wallet must STOP moving. A balance above the \
+             opening 1_000_000 is the guard's Drop releasing it a second time after \
+             `release_quietly` did - money invented for a request whose model no longer exists"
+        );
         assert_eq!(drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
