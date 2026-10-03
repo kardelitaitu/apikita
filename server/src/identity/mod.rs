@@ -22,12 +22,26 @@
 //!
 //! ## The rule that outranks convenience
 //!
-//! `email_verified` may only become 1 from three places, and the register
-//! (`docs/architecture/identity.md`) calls this rule 4:
+//! `email_verified` is written in a CLOSED SET of places. Two of them can write `1`, and the
+//! register (`docs/architecture/identity.md`) fixes both:
 //!
-//! 1. redeeming a verification token DELIVERED to that address,
-//! 2. a Google ID token that itself carries `email_verified = true`,
-//! 3. redeeming a password-reset token for that identity.
+//! 1. the Google identity is inserted with `1`, and only after `verify_id_token` has
+//!    checked the token's own `email_verified` claim;
+//! 2. `mark_verified` writes `1`, and its only production caller is `verify_email`, which
+//!    reaches it by redeeming a token DELIVERED to that address.
+//!
+//! Signup writes `0` (`create_password_account`) — nothing in that path proves the address.
+//!
+//! **THE RESET PATH DELIBERATELY WRITES NOTHING.** `set_password` updates `password_hash`
+//! and no verification column, and `upsert_password_identity` takes a `verified` flag whose
+//! only production caller passes `false`. A reset proves the mailbox was reachable at that
+//! moment, but the verified transition is its own claim; marking it here would let a reset
+//! launder an unverified address into a linkable one.
+//!
+//! THIS PARAGRAPH USED TO LIST THREE WRITERS AND THE THIRD WAS THE RESET, which was the
+//! opposite of the code and of `identity.md` — a reader following it would have added the
+//! write the security decision forbids. It is corrected above rather than deleted, because
+//! the wrong version names the exact mistake to avoid.
 //!
 //! Nothing else sets it — not an admin endpoint, not a migration, not a call from
 //! a route that has decided it would be convenient. The pre-hijacking defences

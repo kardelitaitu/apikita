@@ -3858,6 +3858,36 @@ mod tests {
             "and the specific token from before the reset must no longer resolve"
         );
 
+        // AND THE RESET DID NOT VERIFY THE ADDRESS. This is the assertion that was missing, and
+        // its absence was MEASURED rather than suspected: making `set_password` also write
+        // `email_verified = 1` - precisely the laundering `docs/architecture/identity.md`
+        // forbids - left the whole suite green at 646 passed.
+        //
+        // Why it matters rather than being bookkeeping. The pre-hijacking defences gate on whether
+        // the PASSWORD identity's address was proven and WHEN: `identities` is unique on
+        // `(provider, email)`, so an unverified password row and a Google row may coexist on one
+        // address, and the linking rule reads the flag to decide whether a sign-in may join them.
+        // A reset that set it would let an attacker who controls the mailbox FOR AN INSTANT - a
+        // shared inbox, a forwarded alias, a briefly-held address - convert that into a verified
+        // identity that a later Google sign-in links to. The collision index is what makes the
+        // state reachable; this flag is what makes it safe.
+        //
+        // `create_password_account` writes 0 and nothing in this path proves the address, so 0 is
+        // the only correct value here.
+        let verified: i64 = sqlx::query_scalar(
+            "SELECT email_verified FROM identities WHERE account_id = ? AND provider = 'password'",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_one(&pool)
+        .await
+        .expect("the password identity must exist");
+        assert_eq!(
+            verified, 0,
+            "a password reset must NOT mark the address verified: a reset proves the mailbox was \
+             reachable, and the verified transition is a separate claim. Setting it here would let \
+             a reset launder an unverified address into one a later Google sign-in links to"
+        );
+
         db.close().await;
     }
 
