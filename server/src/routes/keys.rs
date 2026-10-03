@@ -246,6 +246,21 @@ pub(crate) async fn key_tokens_used(
 /// 0 means "no limit" (docs/website/06-api-keys-and-limits.md). A negative limit
 /// has no meaning and would fail every request, so it is refused here rather than
 /// stored and silently obeyed.
+///
+/// **`spend_used_idr` DOES NOT DECIDE ANYTHING, and the signature invites the opposite reading.**
+/// It is the key's real trailing-window spend, and it appears exactly once in this function - as a
+/// field in the error body of the negative case. So a request to LOWER the limit below what the key
+/// has already spent is ACCEPTED, and this parameter cannot make it otherwise.
+///
+/// That is deliberate: see the note on the `spend_limit_idr` arm in `update_key` for why refusing a
+/// lowering would be the wrong rule. It is called out here because the parameter's presence reads as
+/// "the real spend is compared against the request", and a reader who assumes that would conclude a
+/// guard exists where none does. MEASURED: replacing the caller's lookup with the constant `0` leaves
+/// all 22 `routes::keys` tests green.
+///
+/// The value is still worth fetching. docs/website/06-api-keys-and-limits.md requires the UI to show
+/// current-window usage against each limit, and an operator who asks for an impossible ceiling is told
+/// the figure they are up against - provided by the caller, carried by the error.
 fn check_spend_limit(requested_idr: i64, spend_used_idr: i64) -> Result<(), AppError> {
     if requested_idr < 0 {
         return Err(AppError::KeyLimitExceeded {
@@ -523,9 +538,26 @@ pub async fn update_key(
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&state.pool, &headers).await?;
 
-    // Lowering a limit below what the key has already spent in the window leaves
-    // it immediately over limit. Validate against the real spend so the operator
-    // sees the number rather than a silently ineffective limit.
+    // LOWERING BELOW THE WINDOW'S SPEND IS ALLOWED, and that is a decision rather than an oversight -
+    // worth stating because the previous comment here claimed the opposite.
+    //
+    // It used to read: "Validate against the real spend so the operator sees the number rather than a
+    // silently ineffective limit." That is not what the code does. `check_spend_limit` refuses only a
+    // NEGATIVE request; `spend_used_idr` is read here and used for nothing but a field in that
+    // negative-case error body, so it cannot change whether the request is refused. MEASURED: replacing
+    // this lookup with the constant `0` leaves all 22 `routes::keys` tests green, which is the proof
+    // that the value has no effect on the outcome.
+    //
+    // The lookup is still worth its query: `docs/website/06-api-keys-and-limits.md` requires the UI to
+    // "show current-window usage against each limit", and an operator who asks for an impossible
+    // limit is told the figure they are up against rather than a bare "negative".
+    //
+    // AND LOWERING IS NOT REFUSED, because refusing it would be the wrong rule. The document says
+    // "Allow raising limits immediately; **lowering** should warn that it may cut off in-flight usage"
+    // - a warn, not a refusal - and a key sitting over a newly lowered limit is not a broken state:
+    // `proxy.rs` refuses the NEXT request and the customer can raise the limit again. Blocking the
+    // edit instead would leave an operator unable to close a runaway key, which is the case the
+    // control exists for.
     if let Some(requested) = payload.spend_limit_idr {
         let spend_used_idr =
             key_spend_used(&state.pool, account_id, id, crate::ip_tracking::today_utc()).await?;
@@ -2477,7 +2509,134 @@ mod tests {
         db.close().await;
     }
 
-    /// The cookie path that falls through every `session=` piece without a match
+    /// LOWERING A LIMIT BELOW THE WINDOW'S SPEND IS ACCEPTED, and this test exists because a comment
+    /// here used to claim the opposite.
+    ///
+    /// The previous comment on `update_key`'s `spend_limit_idr` arm read *"Validate against the real
+    /// spend so the operator sees the number rather than a silently ineffective limit"*, which reads
+    /// as "a lowering below spend is refused". It is not: `check_spend_limit` rejects only a NEGATIVE
+    /// request, and `spend_used_idr` appears solely as a field in that negative-case error body.
+    /// MEASURED: replacing the caller's lookup with the constant `0` left all 22 `routes::keys` tests
+    /// green, which is what showed the value has no effect on the outcome.
+    ///
+    /// The behaviour is the RIGHT one, so this pins it rather than changing it.
+    /// docs/website/06-api-keys-and-limits.md says a lowering *"should warn that it may cut off
+    /// in-flight usage"* - a warn, not a refusal - and refusing would leave an operator unable to
+    /// close a runaway key, which is the situation the control exists for. The key simply sits over
+    /// its limit and `proxy.rs` refuses the next request.
+    ///
+    /// The other half is pinned too: the 402 for a negative still carries the real spend, so the
+    /// lookup keeps the justification the comment now gives it.
+    #[tokio::test]
+    async fn lowering_a_spend_limit_below_the_windows_spend_is_accepted_not_refused() {
+        let _cache = CacheLock::acquire();
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (key_id, _, _) =
+            create_key_via_handler(&state, &headers, "runaway", vec!["flash".into()], 0).await;
+
+        // Real spend inside the window, so there is something to lower BELOW.
+        let spent_idr: i64 = 7_500;
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, day, api_key_id, input_tokens,
+                                      cache_read_tokens, output_tokens, cost_idr)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(
+            crate::ip_tracking::today_utc()
+                .format("%Y-%m-%d")
+                .to_string(),
+        )
+        .bind(key_id.hyphenated())
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(spent_idr)
+        .execute(&pool)
+        .await
+        .expect("seed real spend for the key");
+
+        let read_back = key_spend_used(&pool, account_id, key_id, crate::ip_tracking::today_utc())
+            .await
+            .expect("the window spend is readable");
+        assert_eq!(
+            read_back, spent_idr,
+            "the fixture must actually have spend in the window, or this test asserts nothing"
+        );
+
+        // LOWER below it: accepted.
+        let res = update_key(
+            State(state.clone()),
+            Path(key_id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: None,
+                models: None,
+                spend_limit_idr: Some(spent_idr - 1),
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "lowering a spend limit below the window's spend must be ACCEPTED: the operator is \
+             closing a runaway key, and the key sitting over its limit is a state `proxy.rs`\
+             handles by refusing the next request. A refusal here would leave the limit unlowerable, \
+             which is the opposite of what the control is for."
+        );
+
+        let stored: i64 = sqlx::query_scalar("SELECT spend_limit_idr FROM api_keys WHERE id = ?")
+            .bind(key_id.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("read the limit back");
+        assert_eq!(
+            stored,
+            spent_idr - 1,
+            "the lowered limit must be what is STORED: the request is accepted, not silently ignored"
+        );
+
+        // And the negative case still carries the real spend, which is the lookup's whole purpose.
+        let err = match update_key(
+            State(state.clone()),
+            Path(key_id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: None,
+                models: None,
+                spend_limit_idr: Some(-1),
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("a negative spend limit must be refused"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "key_limit_exceeded");
+        assert_eq!(
+            err.details().unwrap()["spend_used_idr"],
+            spent_idr,
+            "the refusal must report the REAL window spend: this is the one thing `spend_used_idr` \
+             does, and a refusal that reported 0 would tell the operator nothing"
+        );
+
+        assert_eq!(
+            drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        db.close().await;
+    }
     /// (wrong token, revoked, or expired) must resolve to `Unauthenticated`, never
     /// to a panic or a default account. Covers the final `Err` arm at keys.rs:253
     /// and the inner `if let Some(s)` fall-through at keys.rs:249.
