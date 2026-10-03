@@ -3289,4 +3289,180 @@ mod tests {
         hits.sort_by_key(|p| p.as_os_str().len());
         hits.into_iter().next()
     }
+
+    /// No `Uuid` is ever bound to a statement WITHOUT `.hyphenated()`.
+    ///
+    /// The columns are TEXT and the ids are read back through `uuid::fmt::Hyphenated`, so the
+    /// hyphenated spelling is the only one that round-trips. The failure this guards is silent by
+    /// construction: `Uuid` implements `Display`, so `sqlx` accepts a raw `Uuid` in `.bind()`, the
+    /// statement compiles and runs, and **the predicate matches no row**. There is no compile error,
+    /// and no runtime error either unless that particular call site uses `fetch_one`.
+    ///
+    /// IT HAPPENED. `bin/hold-sweep.rs`'s `release_hold` bound `hold.account_id` raw, so the opt-in
+    /// `--release` sweep could never credit a stranded hold - and it stood until round 9 gave that
+    /// function its first test, because the other fifteen tests in the binary all cover argument
+    /// parsing and report rendering.
+    ///
+    /// TWO PROPERTIES MAKE THIS EVIDENCE RATHER THAN DECORATION:
+    ///
+    ///   1. It asserts a FLOOR on how many binds it found. A scan that resolves no `Uuid` at all
+    ///      reports zero raw binds and passes forever - the vacuity this session keeps hitting.
+    ///   2. Types are resolved PER FUNCTION, not per file. A file-level name set reported
+    ///      `db.rs`'s `expire_one_deposit` as a violation, because an unrelated `let topup_id: Uuid`
+    ///      elsewhere in that 5900-line file shadowed a `topup_id: &str` PARAMETER that is what the
+    ///      `.bind()` actually names. A guard with false positives gets muted.
+    ///
+    /// WHAT IT CANNOT SEE, stated so nobody reads more into it: a `Uuid` reached through a struct
+    /// field or a generic parameter. It catches the shape that happened - a local or a parameter
+    /// bound directly - and the floor assertion below is what keeps that scope honest.
+    #[test]
+    fn no_uuid_is_bound_to_a_statement_without_its_hyphenated_form() {
+        let mut found = 0usize;
+        let mut raw: Vec<String> = Vec::new();
+
+        for path in source_files() {
+            let rel = path
+                .strip_prefix(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = strip_comments(&std::fs::read_to_string(&path).unwrap_or_default());
+            let lines: Vec<&str> = src.lines().collect();
+
+            // Function bodies, found by brace depth from each `fn`.
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                let is_fn = trimmed.starts_with("fn ")
+                    || trimmed.starts_with("pub fn ")
+                    || trimmed.starts_with("pub(crate) fn ")
+                    || trimmed.starts_with("async fn ")
+                    || trimmed.starts_with("pub async fn ")
+                    || trimmed.starts_with("pub(crate) async fn ");
+                if !is_fn {
+                    continue;
+                }
+                let mut depth = 0i32;
+                let mut seen = false;
+                let mut end = None;
+                for (k, l) in lines.iter().enumerate().skip(i) {
+                    for ch in l.chars() {
+                        if ch == '{' {
+                            depth += 1;
+                            seen = true;
+                        } else if ch == '}' {
+                            depth -= 1;
+                            if seen && depth == 0 {
+                                end = Some(k);
+                                break;
+                            }
+                        }
+                    }
+                    if end.is_some() {
+                        break;
+                    }
+                }
+                if let Some(e) = end {
+                    if e > i {
+                        spans.push((i, e));
+                    }
+                }
+            }
+
+            for (start, end) in spans {
+                let body = &lines[start..=end];
+                let mut uuid_names: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+
+                for line in body {
+                    let l = line.trim();
+                    // `let x: Uuid = ..` / `let x = Uuid::new_v4()` / `let x = ..into_uuid()`
+                    if let Some(rest) = l.strip_prefix("let ") {
+                        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+                        if let Some((name, after)) = rest.split_once(':') {
+                            if after.trim_start().starts_with("Uuid") {
+                                uuid_names.insert(name.trim());
+                            }
+                        }
+                        if let Some((name, after)) = rest.split_once('=') {
+                            let after = after.trim_start();
+                            if after.starts_with("Uuid::") || after.contains("into_uuid()") {
+                                uuid_names.insert(name.trim());
+                            }
+                        }
+                    }
+                }
+
+                // Parameters typed `Uuid` count; parameters typed `&str`/`String` never do, even
+                // when an unrelated local of the same name was Uuid. This is the de-shadowing that
+                // removed the false positive.
+                let sig = body.iter().take(8).copied().collect::<Vec<_>>().join(" ");
+                for (idx, _) in sig.match_indices(": Uuid") {
+                    let before = &sig[..idx];
+                    let name = before
+                        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("");
+                    if !name.is_empty() {
+                        uuid_names.insert(name);
+                    }
+                }
+                for needle in [": &str", ": String", ": &String"] {
+                    for (idx, _) in sig.match_indices(needle) {
+                        let before = &sig[..idx];
+                        let name = before
+                            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                            .next()
+                            .unwrap_or("");
+                        uuid_names.remove(name);
+                    }
+                }
+
+                if uuid_names.is_empty() {
+                    continue;
+                }
+
+                for (k, line) in body.iter().enumerate() {
+                    let Some(at) = line.find(".bind(") else {
+                        continue;
+                    };
+                    let after = &line[at + ".bind(".len()..];
+                    let Some(close) = after.rfind(')') else {
+                        continue;
+                    };
+                    let expr = after[..close].trim();
+                    let expr = expr.strip_prefix('&').unwrap_or(expr);
+                    let root: String = expr
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if root.is_empty() || !uuid_names.contains(root.as_str()) {
+                        continue;
+                    }
+                    found += 1;
+                    if !line.contains("hyphenated()") && !line.contains(".simple()") {
+                        raw.push(format!("{rel}:{}  {}", start + k + 1, line.trim()));
+                    }
+                }
+            }
+        }
+
+        // THE FLOOR. If this trips, the scanner stopped resolving `Uuid` names and every assertion
+        // below became vacuous - which is a failure of the guard, not a tidy repository.
+        assert!(
+            found >= 50,
+            "the scanner resolved only {found} Uuid-typed binds across the crate. It found 170 when \
+             this test was written, so a number this low means the resolution broke (a renamed \
+             `fn` prefix, a changed let-binding shape) and the raw-bind assertion below is no longer \
+             checking anything."
+        );
+
+        assert!(
+            raw.is_empty(),
+            "a Uuid is bound without `.hyphenated()`. The columns are TEXT holding the hyphenated \
+             form, so this binds a different string: the statement compiles, runs, and matches NO \
+             ROW - silently, unless the call site happens to use `fetch_one`. That is exactly how \
+             `release_hold` in `bin/hold-sweep.rs` could never credit a hold. Sites: {raw:#?}"
+        );
+    }
 }

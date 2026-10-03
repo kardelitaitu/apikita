@@ -1055,7 +1055,12 @@ mod tests {
             "SELECT operator_id, action, target_type, detail FROM admin_audit
               WHERE target_id = ? ORDER BY id",
         )
-        .bind(target_id.to_string())
+        // `.hyphenated()` rather than `.to_string()`, which would also work: `Uuid`'s `Display`
+        // emits the hyphenated form, so the two agree today. The explicit call is the crate's
+        // single spelling for a UUID going into a TEXT column, and
+        // `doc_claims::tests::no_uuid_is_bound_to_a_statement_without_its_hyphenated_form` holds
+        // every bind to it - a rule with one permitted alternative is a rule that rots.
+        .bind(target_id.hyphenated())
         .fetch_all(pool)
         .await
         .expect("read admin_audit");

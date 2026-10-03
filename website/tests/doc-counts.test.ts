@@ -58,13 +58,20 @@ const WEBSITE_TESTS = 196;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 645;
+const SERVER_TESTS = 646;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
   ['README.md', `server: **${SERVER_TESTS} tests**`],
   ['server/README.md', `**${SERVER_TESTS} passed / 0 failed / 0 ignored**`],
   ['docs/ci-cd.md', `**${SERVER_TESTS} passed / 0 failed /`],
+  // THE WORKFLOW COUNTS TOO, and it was the one file this list missed. It carried
+  // "623 passed (measured 2026-09-30)" through several bumps, because a CI file reads like
+  // configuration rather than like a document - but it is a document, it states the figure, and
+  // it is the file a contributor opens to find out how to run the suite. A number nobody checks
+  // is the defect this whole test exists for; leaving out the one place CI describes itself is
+  // how it kept a figure three bumps behind.
+  ['.github/workflows/ci.yml', `${SERVER_TESTS} passed / 0 failed / 0 ignored`],
 ];
 
 /** Every doc that states the website count, and the exact text it must carry. */
@@ -339,6 +346,7 @@ test('no doc still claims a superseded count', () => {
         '639 tests', '639 passed', '639 / 0 / 0',
         '641 tests', '641 passed', '641 / 0 / 0',
         '643 tests', '643 passed', '643 / 0 / 0',
+        '645 tests', '645 passed', '645 / 0 / 0',
         '644 tests', '644 passed', '644 / 0 / 0',
       ],
     },

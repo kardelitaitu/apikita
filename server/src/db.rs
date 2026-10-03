@@ -36,6 +36,26 @@ use tracing::error;
 use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
+/// EVERY UUID IS STORED AND BOUND HYPHENATED, and this is the import that names the format.
+///
+/// The columns are TEXT (`accounts.id`, `wallets.account_id`, `ledger.account_id`, ...) and the
+/// identity rows are read back with `uuid::fmt::Hyphenated`, so the hyphenated spelling is the only
+/// one that round-trips. `Uuid` implements `Display`, so `sqlx` will happily accept a RAW `Uuid` in
+/// a `.bind()`: the statement compiles, the query runs, and **it matches no row**. There is no
+/// compile error and no runtime error unless the call site happens to use `fetch_one`.
+///
+/// THAT IS NOT HYPOTHETICAL. `bin/hold-sweep.rs`'s `release_hold` bound `hold.account_id` raw, so
+/// `UPDATE wallets ... WHERE account_id = ?` returned `RowNotFound` and the opt-in `--release` sweep
+/// could never credit a single stranded hold. It stood for as long as the function had no test: it
+/// was the only money-moving function in that binary, and the other fifteen tests there all cover
+/// argument parsing and report rendering. The fix is a `.hyphenated()` and the regression test is
+/// `releasing_a_hold_credits_the_held_amount_back`.
+///
+/// Measured when this note was written: 100 `Uuid` binds resolve through `.hyphenated()`, 0 bind raw.
+/// The count is not the guarantee - the point is that a NEW raw bind is invisible, which is why this
+/// sits beside the import rather than in a document somewhere.
+const _UUID_TEXTS_ARE_HYPHENATED: () = ();
+
 /// Opens the application pool.
 ///
 /// The options are not decoration. Each is a measured trap from the plan's
