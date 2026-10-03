@@ -243,7 +243,17 @@ opinion.
       reader who went looking for a rejection would find the guarantee, then wonder whether
       the check enforcing it was tested. That is the question this note removes.*
 - [x] Logout revokes the session row; "sign out everywhere" revokes all of them.
-- [x] Suspension revokes sessions **and** keys atomically.
+- [x] Suspension revokes sessions **and** keys atomically. **Enforced** by
+      `routes::admin::suspend_account`, which opens one `begin_immediate` transaction and writes
+      the account status, the `sessions` revocation, the `api_keys` revocation (returning the
+      hashes the cache needs) and the `admin_audit` row on that single transaction, then commits
+      once. Measured: writing to the pool instead and dropping the transaction uncommitted -
+      which compiles - is **CAUGHT by 10 tests**, including
+      `a_failed_suspend_writes_no_audit_row` (a failed suspend must leave nothing behind) and
+      `suspend_revokes_every_live_session_and_every_live_key`. `BEGIN IMMEDIATE` rather than a
+      deferred BEGIN is deliberate and documented in the function: SQLite has no row locks and
+      rejects `FOR UPDATE`, so the write lock taken up front is what serialises two concurrent
+      suspends of one account.
 - [x] Admin endpoints require the operator flag; an operator cannot act on
       themselves.
 - [x] Every admin action writes an `admin_audit` row in the same transaction.
