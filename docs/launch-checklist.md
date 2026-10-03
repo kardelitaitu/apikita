@@ -462,14 +462,15 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       > **What remains operator-dependent:** the fee half (minimums, rate limit) is in the
       > page header and is above the form; the disclosure paragraph is now directly above
       > it. Both are in the composed page, so this half is verifiable and verified.
-- [ ] **Credit expiry actually runs.**
+- [x] **Credit expiry actually runs — IN CODE. Resolved 2026-10-03 by the second of the
+      two options below.**
       The wallet page tells every customer "Credit expires 2 years after each deposit", and
-      `docs/terms-of-service.md` states the term. **The mechanism exists and nothing invokes
-      it.** `db::expire_credit` has exactly one caller, `server/src/bin/usage-purge.rs`, and
-      that binary is **not shipped in the server image** —
-      `.docker/maintenance/entrypoint.sh` says so itself (`NOT WIRED usage-purge ... does
+      `docs/terms-of-service.md` states the term. **The mechanism exists and nothing invoked
+      it.** `db::expire_credit` had exactly one caller, `server/src/bin/usage-purge.rs`, and
+      that binary was **not built by `server/Dockerfile` and shipped in no image** —
+      `.docker/maintenance/entrypoint.sh` said so itself (`NOT WIRED usage-purge ... does
       NOT run here`). The entrypoint reimplements the retention sweeps inline in
-      `run_retention`; the credit-expiry sweep is not among them. Measured: `credit_expires_at`
+      `run_retention`; the credit-expiry sweep was not among them. Measured: `credit_expires_at`
       appears nowhere under `.docker/`, so the shipped sweep path never touches it.
       > **Why this gate did not exist until now, which is the part worth keeping.** The
       > promise is displayed on a page, tested in the suite, and documented — and **no gate
@@ -488,8 +489,36 @@ done. Kept as a note so the next reader knows the claim was checked, not paraphr
       > the file and the function named.
       > **Two acceptable resolutions, and the choice is the operator's:** reimplement the
       > sweep inline in `run_retention` beside the others, or wire `usage-purge` into the
-      > image and schedule it. Until one is done, the honest options are to do it, or to
-      > stop promising the term on the page.
+      > image and schedule it. **THE SECOND WAS CHOSEN, and the reason is the ledger.** The
+      > sweep is not a DELETE: it is a guarded debit (`UPDATE wallets ... WHERE balance_idr
+      > >= ?`), a ledger `INSERT` carrying `balance_after`, and a retirement mark, in one
+      > immediate transaction per deposit. Re-expressing that in shell SQL would be a second
+      > implementation of the invariant the whole money model rests on, and this repository
+      > has removed exactly that duplication before. So `server/Dockerfile` now builds and
+      > copies `usage-purge`, and `.docker/maintenance/entrypoint.sh` runs it nightly as the
+      > `credit-expiry` job — which reports `FAILED` and exits non-zero when the runner is
+      > missing, because a scheduler that quietly stops enforcing a published term is the
+      > failure this gate was added to end.
+      >
+      > **VERIFIED END TO END, not asserted.** Against a migrated database with a settled
+      > deposit whose `credit_expires_at` is in the past: the job reports
+      > `deposits_expired=1 credit_expired_idr=50000`, the wallet goes 50000 → 0,
+      > `credit_retired_at` is stamped, one ledger row is written
+      > (`delta=-50000 ref=expiry:<topup> after=0`), and a SECOND run is a no-op (still one
+      > row, balance still 0). With a balanced source the Gate 2 invariant holds across the
+      > sweep: `wallets=50000 ledger=50000` → `wallets=0 ledger=0`. With the binary absent
+      > the job exits 1 and says NO CREDIT EXPIRES.
+      >
+      > **`tools/backup-check/check.sh` was widened to hold this**, and it is the guard that
+      > should have caught the original defect: it compares the Rust sweeps against the
+      > shell's, but only by `DELETE FROM` table names, and neither side has one for this
+      > sweep. It now asserts that `server/Dockerfile` builds `--bin usage-purge` AND that
+      > the entrypoint CALLS `run_credit_expiry`. Both halves are falsifiable: dropping the
+      > `--bin` flag fails, and deleting the call fails.
+      >
+      > **What remains is deployment, not code:** the scheduler container must actually run
+      > in production. That is the next gate, and until it does, this half is "shipped and
+      > scheduled" rather than "observed to run".
 - [ ] **The maintenance scheduler is deployed in production.**
       Every retention promise in `data-retention.md`, the nightly reconcile, the hold sweep
       and both alert jobs run from **one container** — the `scheduler` service in

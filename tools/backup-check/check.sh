@@ -389,21 +389,59 @@ else
     # Sweeps the entrypoint genuinely reimplements inline. `purge_expired_usage` is the
     # age-based DELETE sweep and is covered by the table comparison above.
     INLINE_COVERED='purge_expired_usage'
-    # Sweeps that are NOT inline and are therefore not enforced in production. Each
-    # needs a reason, and the reason is what a reader needs to act on.
+    # Sweeps covered by running the shipped binary, asserted below. This is the list that
+    # `db::expire_credit` MOVED ONTO - it used to be KNOWN_UNENFORCED, which was accurate
+    # while `usage-purge` shipped in no image and is now false.
+    BINARY_COVERED='expire_credit'
+    # Sweeps that are NOT inline AND NOT run by any shipped binary. Each needs a reason,
+    # and the reason is what a reader needs to act on.
+    #
+    # THIS LIST IS EMPTY, AND THAT IS THE OUTCOME IT EXISTED FOR. `db::expire_credit` was
+    # its only entry: the sweep is an UPDATE plus an INSERT, so the DELETE-based comparison
+    # above could not see it, and `usage-purge` was built by nothing - so the wallet page
+    # and the terms of service promised a two-year expiry that nothing applied. The fix was
+    # NOT a second implementation in the entrypoint (that would duplicate a guarded debit
+    # and a ledger row, i.e. the ledger invariant); it was to BUILD AND SHIP THE BINARY.
+    #
+    # An entry here means a published promise is unenforced, so adding one is a serious
+    # choice rather than a way to silence this check.
     KNOWN_UNENFORCED=$(cat <<'KNOWN'
-db::expire_credit - the credit-expiry sweep. NOT reimplemented inline: it is an UPDATE of topups.credit_retired_at plus an INSERT of a negative ledger row, so the DELETE-based comparison above cannot see it. Effect: no credit expires in production. Recorded in docs/terms-of-service.md ("Built, and NOT RUNNING") and in docs/decisions.md. Wiring it is a launch blocker.
 KNOWN
 )
     UNEXPLAINED=""
     for fn in $UNWIRED_CALLS; do
         case " ${INLINE_COVERED} " in *" ${fn#db::} "*) continue ;; esac
+        case " ${BINARY_COVERED} " in *" ${fn#db::} "*) continue ;; esac
         if ! printf '%s\n' "$KNOWN_UNENFORCED" | grep -qF "$fn "; then
             UNEXPLAINED="$UNEXPLAINED $fn"
         fi
     done
     if [ -n "$UNEXPLAINED" ]; then
-        fail "server/src/bin/usage-purge.rs calls these db functions and NOTHING accounts for them:$UNEXPLAINED. That binary is NOT shipped, so it does not run: either reimplement the work inline in run_retention, or add it to KNOWN_UNENFORCED here AND say so in docs/terms-of-service.md. The credit-expiry sweep went unenforced for exactly this reason, and the DELETE-based comparison above could not see it."
+        fail "server/src/bin/usage-purge.rs calls these db functions and NOTHING accounts for them:$UNEXPLAINED. Either the entrypoint reimplements the work inline (add it to INLINE_COVERED here, and to run_retention), or a shipped binary runs it (add it to BINARY_COVERED and add the job), or it is genuinely unenforced (add it to KNOWN_UNENFORCED with the reason a reader needs, AND say so in docs/terms-of-service.md). The credit-expiry sweep went unenforced for exactly this reason, and the DELETE-based comparison above could not see it."
+    fi
+
+    # THE COVERAGE ITSELF, not just the accounting. The loop above passes when every call is
+    # either inline or explained; that is the wrong question now that the answer for
+    # `expire_credit` is "the binary runs it". Ask directly: is the binary BUILT by the
+    # image, and is it RUN by the schedule? Two greps, because a binary that is built and
+    # never run leaves the promise exactly as broken as one that is neither.
+    if ! grep -q -- '--bin usage-purge' "$REPO/server/Dockerfile"; then
+        fail "server/Dockerfile does not build --bin usage-purge, so db::expire_credit ships in no image and NO CREDIT EXPIRES while docs/terms-of-service.md promises a two-year term. This is the defect this check was widened to catch."
+    fi
+    # THE CALL, NOT THE DEFINITION - and two attempts at this both failed, so the reason is
+    # worth recording.
+    #   attempt 1: `grep -q 'run_credit_expiry'` matched the `run_credit_expiry() {` line.
+    #   attempt 2: `grep -qE '^[[:space:]]*run_credit_expiry([[:space:]]|\|\||$)'` ALSO
+    #              matched it, because in ERE `()` is an EMPTY GROUP - the pattern reduces
+    #              to "the bare name" and the `(` that follows is never examined.
+    # MEASURED each time: deleting the call from `run_wired_jobs` left this check at exit 0.
+    # A guard satisfied by a definition is satisfied by dead code, which is the same defect
+    # as the unwired binary it exists to catch.
+    #
+    # So match a CALL SHAPE explicitly: the name, NOT followed by `(`, then whitespace (which
+    # is what both real call sites have - `run_credit_expiry || rc=1` and the bare verb form).
+    if ! grep -qE '^[[:space:]]*run_credit_expiry[^([:alnum:]_]' "$REPO/.docker/maintenance/entrypoint.sh"; then
+        fail ".docker/maintenance/entrypoint.sh does not CALL run_credit_expiry (only defines it, or does not mention it), so the credit-expiry sweep is built and never RUN. A binary that ships and is not scheduled enforces the published term no better than one that never shipped."
     fi
 fi
 

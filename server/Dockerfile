@@ -69,7 +69,7 @@ COPY server/migrations ./migrations
 
 # Touch so cargo cannot consider the stale dummy artefact fresh.
 #
-# TWO binaries, not one. `apikita-server` is the service; `migrate` is the schema
+# THREE binaries, not two. `apikita-server` is the service; `migrate` is the schema
 # tool, and it ships in the same image because deployment step [2] ("run
 # migrations") otherwise has NO artifact to run — the pipeline would have a step
 # with no executable, which is the same defect as the missing Dockerfile itself.
@@ -77,8 +77,26 @@ COPY server/migrations ./migrations
 # `bin/migrate.rs` and NEVER on server boot, so this cannot be folded into the
 # server's startup: the operator must be able to migrate the schema BEFORE the
 # new binary starts, and against a database the old binary is still writing.
+#
+# `usage-purge` is here for ONE of its two sweeps: `db::expire_credit`, the
+# credit-expiry sweep. The wallet page and docs/terms-of-service.md both promise
+# "credit expires 2 years after each deposit", and until this line that promise
+# had no runner — the binary existed, the sweep inside it was tested by seventeen
+# tests, and nothing shipped it. The maintenance scheduler could not reimplement
+# it safely: the sweep is a GUARDED DEBIT plus a ledger row carrying
+# `balance_after`, i.e. the Gate 2 ledger invariant, and writing that a second
+# time in shell SQL is the duplication this repository has removed before.
+# Shipping the tested function is the safer half of the two resolutions
+# docs/launch-checklist.md allows.
+#
+# Its OTHER sweep (`purge_expired_usage`) duplicates four DELETEs that
+# `.docker/maintenance/entrypoint.sh run_retention` already performs inline. That
+# is deliberate and harmless — the statements are idempotent, and the alternative
+# is a second copy of them — but the scheduler reports both, so an operator sees
+# two counts rather than one.
 RUN touch src/main.rs src/lib.rs \
-    && cargo build --release --locked --bin apikita-server --bin migrate
+    && cargo build --release --locked \
+        --bin apikita-server --bin migrate --bin usage-purge
 
 # -----------------------------------------------------------------------------
 # Stage 2: runtime
@@ -139,6 +157,12 @@ WORKDIR /srv/apikita/server
 
 COPY --from=builder /build/target/release/apikita-server /usr/local/bin/apikita-server
 COPY --from=builder /build/target/release/migrate /usr/local/bin/apikita-migrate
+# The credit-expiry sweep. It lives in this image rather than in the maintenance
+# scheduler's because the sweep is money-moving Rust that is already tested, and
+# the scheduler image is Alpine with no toolchain — it would have to run a static
+# copy of this same binary. One image that can run it is enough; what matters is
+# that SOME shipped artifact does, which until now none did.
+COPY --from=builder /build/target/release/usage-purge /usr/local/bin/apikita-usage-purge
 
 # The config is baked in because it is source, not a secret: it is versioned in
 # the repository and a deployment that mounts a different one is a deployment

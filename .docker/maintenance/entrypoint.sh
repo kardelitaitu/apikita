@@ -43,32 +43,58 @@
 #               `run_retention` applies the same two DELETEs through sqlite3 - so
 #               the promise is kept; it is the binary that does not run here.
 #
-#   usage-purge THE BINARY IS NOT WIRED; ITS WORK IS. Same shape as ip-purge:
-#               server/src/bin/usage-purge.rs, not shipped in the server image.
-#               `run_retention` applies all FIVE of its deletes -
-#               usage_events (90d), usage_daily (730d), expired/revoked
-#               sessions (30d), expired identity links, and terminal Telegram
-#               link codes - through sqlite3, so docs/data-retention.md is
-#               enforced here.
+#   usage-purge HALF ITS WORK IS HERE, HALF IS A JOB - AND THE MISSING HALF WAS
+#               THE ONE THAT MOVES MONEY. server/src/bin/usage-purge.rs makes TWO
+#               calls that are not equivalent:
 #
-#               THE FOURTH IS THE ONE THAT WAS MISSING FOR LONGEST. Expired
-#               verification and password-reset links had a purge function with a
-#               unit test and NO caller anywhere - no binary, no scheduler entry,
-#               not even the inline SQL here - so they accumulated forever. The
-#               Rust side has now been folded into `purge_expired_usage` and the
-#               delete below is what actually runs in production. Its cutoff has no
-#               interval (`expires_at <= datetime('now')`) because a link is stale
-#               when it expires, not N days later.
+#               `db::purge_expired_usage` reports five deletes - usage_events
+#               (90d), usage_daily (730d), expired/revoked sessions (30d),
+#               expired identity links, and terminal Telegram link codes - and
+#               `run_retention` applies ALL FIVE through sqlite3, so
+#               docs/data-retention.md is enforced here. Running the binary as
+#               well would repeat them; the statements are idempotent, so it is
+#               waste rather than harm, and `run_credit_expiry` below reports
+#               both counts so an operator sees them agree.
 #
-#               THE FIFTH WAS FOUND BY READING AN EXCUSE. `db.rs` listed `link_codes`
-#               among the tables the sweep "deliberately does NOT touch", on the
-#               grounds that its rule is "a different shape". By the time anyone
-#               checked, the fourth entry above had already brought an
-#               expires-then-delete table into the same sweep - so the exception
-#               described a design the sweep had outgrown, and it was holding a
-#               published 24-hour window that no code implemented. A STALE REFUSAL
-#               is harder to find than a missing call: it reads as a decision
-#               someone made after thinking about it.
+#               `db::expire_credit` is the one that is NOT inline, and this
+#               comment used to say so while leaving it that way: "NO CREDIT
+#               EXPIRES, while the wallet page and docs/terms-of-service.md state
+#               the term." Both promise "credit expires 2 years after each
+#               deposit". That is now run, from the shipped binary, by
+#               `run_credit_expiry`.
+#
+#               WHY IT IS NOT INLINE LIKE THE OTHERS, which is the part worth
+#               keeping. The retention sweeps are DELETEs, and a DELETE is
+#               something this file can safely re-express: it is idempotent, it
+#               touches one table, and getting the cutoff wrong is visible. The
+#               credit sweep is not that shape. It is a GUARDED DEBIT
+#               (`UPDATE wallets ... WHERE account_id = ? AND balance_idr >= ?`),
+#               a ledger INSERT carrying `balance_after`, and a retirement mark -
+#               all in one immediate transaction, per deposit, oldest first. That
+#               is the Gate 2 ledger invariant. A second copy of it in shell SQL
+#               would be two implementations of the one thing the whole money
+#               model rests on, and this repository has removed that exact
+#               duplication before. So the tested Rust function runs, and the
+#               shell does not restate it.
+#
+#               THE FOURTH DELETE IS THE ONE THAT WAS MISSING FOR LONGEST.
+#               Expired verification and password-reset links had a purge function
+#               with a unit test and NO caller anywhere - no binary, no scheduler
+#               entry, not even the inline SQL here - so they accumulated forever.
+#               The Rust side has now been folded into `purge_expired_usage` and
+#               the delete below is what actually runs in production. Its cutoff
+#               has no interval (`expires_at <= datetime('now')`) because a link is
+#               stale when it expires, not N days later.
+#
+#               THE FIFTH WAS FOUND BY READING AN EXCUSE. `db.rs` listed
+#               `link_codes` among the tables the sweep "deliberately does NOT
+#               touch", on the grounds that its rule is "a different shape". By
+#               the time anyone checked, the fourth entry above had already
+#               brought an expires-then-delete table into the same sweep - so the
+#               exception described a design the sweep had outgrown, and it was
+#               holding a published 24-hour window that no code implemented. A
+#               STALE REFUSAL is harder to find than a missing call: it reads as a
+#               decision someone made after thinking about it.
 #
 #   hold-sweep  RUNS HERE, FOR REAL - report-only, and that is the point. A
 #               stranded reservation hold is INVISIBLE MONEY: the ledger still
@@ -131,6 +157,16 @@ export RECONCILE_DATABASE_URL
 # Overridable so this job can be exercised without a container: the default is the
 # path the compose service mounts, which is what production uses.
 RECONCILE_SH="${RECONCILE_SH:-/usr/local/share/reconcile/reconcile.sh}"
+
+# The credit-expiry sweep's runner. It is the ONE job here that is not inline SQL,
+# for the reason argued in the header: the sweep is a guarded debit plus a ledger
+# row, so it runs the shipped, tested Rust function rather than a second copy of
+# the money invariant.
+#
+# Overridable so the job can be exercised without a container, the same way
+# RECONCILE_SH is. The default is where server/Dockerfile puts it, which is what
+# production uses.
+USAGE_PURGE_BIN="${USAGE_PURGE_BIN:-/usr/local/bin/apikita-usage-purge}"
 
 TMP="${TMPDIR:-/tmp}"
 SQL_ERR="$TMP/maintenance-sql.$.err"
@@ -197,7 +233,11 @@ banner() {
     log "WIRED     retention  - age-based sweep, SQL inline in this entrypoint: key_ip_seen > 7d, key_ip_daily > 90d (docs/ip-tracking.md); usage_events > 90d, usage_daily > 730d, expired/revoked sessions > 30d, link_redemption_attempts > 7d, auth_attempts > 7d, link_code_issues > 7d, expired identity_tokens, terminal link_codes > 1d (docs/data-retention.md)"
     log "WIRED     reconcile  - tools/reconcile/reconcile.sh, exit code preserved (1=drift 2=no DATABASE_URL 3=no sqlite3 4=sqlite3 failed 5=stranded hold 6=no such database file)"
     log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary NOT shipped in the server image; it does NOT run here. Its retention window IS enforced inline (see retention above)."
-    log "NOT WIRED usage-purge - server/src/bin/usage-purge.rs, same: not shipped, does NOT run here. It makes TWO calls and they are NOT equivalent: db::purge_expired_usage reports four deletions (usage_events, usage_daily, sessions, identity_tokens) and ALL FOUR are enforced inline (see retention above); db::expire_credit retires aged credit and is NOT enforced here at all. That second one is an UPDATE plus an INSERT, not a DELETE, so run_retention never had it and the DELETE-based comparison in tools/backup-check could not see it either. EFFECT: NO CREDIT EXPIRES, while the wallet page and docs/terms-of-service.md state the term. This line used to read 'Its five sweeps ARE enforced inline', which was wrong twice - the binary reports four, not five, and one of the two things it does is not inline."
+    if [ -x "$USAGE_PURGE_BIN" ]; then
+        log "WIRED     credit-expiry - $USAGE_PURGE_BIN (server/Dockerfile), db::expire_credit. THE PROMISE IS NOW KEPT: the wallet page and docs/terms-of-service.md both state 'credit expires 2 years after each deposit', and until this job existed NOTHING applied it - the sweep had seventeen tests and no runner. It is the one job here that is not inline SQL: the sweep is a guarded debit plus a ledger row carrying balance_after, i.e. the Gate 2 invariant, so it runs the tested Rust function rather than a second copy of that arithmetic in shell. Its other sweep, purge_expired_usage, repeats five DELETEs run_retention already does; they are idempotent, so that is reported rather than avoided."
+    else
+        log "NOT WIRED credit-expiry - $USAGE_PURGE_BIN is absent, so NO CREDIT EXPIRES while the wallet page and docs/terms-of-service.md promise that it does. This is the failure this job was added to end, so it is reported as a defect and the job exits non-zero."
+    fi
     log "WIRED     hold-sweep - REPORT-ONLY, SQL inline in this entrypoint, using the SAME predicate as server/src/bin/hold-sweep.rs (which warns that a different predicate would make the binary and the library disagree about what 'stranded' means). Bound ${HOLD_SWEEP_BOUND_SECONDS}s. It counts, names and exits non-zero; it NEVER moves money, because silently crediting a hold is the same invisible-money anti-pattern the sweep exists to catch. --release stays a deliberate host action."
     if [ -x "$ALERT_CHECK" ]; then
         if [ -n "${WEBHOOK_URL:-}" ] || [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || [ -n "${ALERT_SINK_FILE:-}" ] || [ -n "${ALERT_SINK_STDOUT:-}" ]; then
@@ -209,7 +249,7 @@ banner() {
     else
         log "NOT WIRED alerts     - $ALERT_CHECK is not present, so tools/alert is not mounted into this container. The checks exist and nothing runs them; see docker-compose.yml."
     fi
-    log "NOT WIRED two report-only gaps, not silent ones. Run them on the host on the same cadence: DATABASE_URL=... cargo run --manifest-path server/Cargo.toml --bin ip-purge (or --bin usage-purge)"
+    log "NOT WIRED one report-only gap, not a silent one. Run it on the host on the same cadence: DATABASE_URL=... cargo run --manifest-path server/Cargo.toml --bin ip-purge"
     log "DATABASE_URL=${DATABASE_URL:-<unset>}"
     log "RECONCILE_DATABASE_URL=${RECONCILE_DATABASE_URL:-<unset>}"
     if [ -n "${DATABASE_URL:-}" ]; then
@@ -545,6 +585,57 @@ run_hold_sweep() {
 
 
 # -----------------------------------------------------------------------------
+# Credit expiry
+# -----------------------------------------------------------------------------
+# The one sweep this file does NOT re-express in SQL, and the argument is in the
+# header: it is a guarded debit plus a ledger row, not a DELETE, so the shipped
+# Rust function runs instead of a second copy of the money invariant.
+#
+# WHY THIS JOB EXISTS AT ALL. `db::expire_credit` had exactly one caller,
+# `bin/usage-purge.rs`, and that binary was built by nothing and shipped in no
+# image. So the sweep was exercised by seventeen tests and by no production
+# process, while the wallet page and docs/terms-of-service.md both promised
+# "credit expires 2 years after each deposit". A term that extinguishes value has
+# to be disclosed AND enforced; only the disclosure was gated.
+#
+# THE BINARY IS NAMED ABSOLUTELY AND ITS ABSENCE IS A FAILURE, not a skip. A
+# scheduler that quietly stops enforcing a published term is the failure mode this
+# job exists to end, so a missing runner must be loud - the same rule the
+# retention job follows when sqlite3 is absent.
+#
+# `--release` IS NOT A FLAG HERE, deliberately: in `bin/hold-sweep.rs` it means
+# "apply", but usage-purge sweeps unconditionally, so this job always moves money
+# when deposits are past their instant. That is intended, and it is why the sweep
+# is idempotent per deposit (`credit_retired_at` marks each one finished).
+run_credit_expiry() {
+    log "job credit-expiry: start (a published term that nothing applied)"
+    if [ -z "${DATABASE_URL:-}" ]; then
+        log "job credit-expiry: FAILED - DATABASE_URL is not set (refusing to report a sweep that did not run)"
+        return 1
+    fi
+    if [ ! -x "$USAGE_PURGE_BIN" ]; then
+        log "job credit-expiry: FAILED - $USAGE_PURGE_BIN is missing or not executable."
+        log "job credit-expiry:   It ships in the SERVER image (server/Dockerfile). If this container"
+        log "job credit-expiry:   cannot reach it, NO CREDIT EXPIRES while the wallet page and the"
+        log "job credit-expiry:   terms of service promise that it does. Nothing was swept."
+        return 1
+    fi
+
+    # The binary takes DATABASE_URL from the environment and applies its own
+    # scheme check, so the file is not re-derived here: one parser, not two.
+    OUT=$("$USAGE_PURGE_BIN" 2>&1) || {
+        log "job credit-expiry: FAILED - $USAGE_PURGE_BIN exited non-zero (nothing may have been swept)"
+        printf '%s\n' "$OUT" | while IFS= read -r l; do log "job credit-expiry:   $l"; done
+        return 1
+    }
+    printf '%s\n' "$OUT" | while IFS= read -r l; do log "job credit-expiry:   $l"; done
+
+    log "job credit-expiry: OK - the sweep ran (deposits past their instant are retired; see the counts above)"
+    return 0
+}
+
+
+# -----------------------------------------------------------------------------
 # Alert checks
 # -----------------------------------------------------------------------------
 # Runs the DATABASE-BACKED alert checks (tools/alert/check-alerts.sh) after the
@@ -778,6 +869,7 @@ run_wired_jobs() {
     run_retention || rc=1
     run_reconcile || rc=1
     run_hold_sweep || rc=1
+    run_credit_expiry || rc=1
     run_alert_checks || rc=1
     run_alert_probes || rc=1
     return "$rc"
@@ -875,6 +967,10 @@ case "${1:-schedule}" in
         run_hold_sweep
         exit $?
         ;;
+    credit-expiry)
+        run_credit_expiry
+        exit $?
+        ;;
     alerts)
         run_alert_checks
         exit $?
@@ -884,7 +980,7 @@ case "${1:-schedule}" in
         exit $?
         ;;
     *)
-        echo "usage: maintenance-entrypoint.sh [schedule|once|retention|reconcile|hold-sweep|alerts|alert-probes]" >&2
+        echo "usage: maintenance-entrypoint.sh [schedule|once|retention|reconcile|hold-sweep|credit-expiry|alerts|alert-probes]" >&2
         exit 2
         ;;
 esac

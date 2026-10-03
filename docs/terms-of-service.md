@@ -119,7 +119,7 @@ credit, which is not what was decided.
 > period but the interaction with the non-refundable clause is **not settled**. This
 > remains part of the Gate 0 legal review.
 
-**Built, and NOT RUNNING.** The system expires credit, per deposit, as of
+**Built, and RUNNING.** The system expires credit, per deposit, as of
 `topups.credit_expires_at`, which is stamped at settlement *in the same statement*
 that records the settlement — so a deposit's date and its expiry instant cannot be
 made to disagree by a crash. `db::expire_credit` retires each aged deposit (oldest
@@ -129,30 +129,28 @@ first, capped by that deposit's own amount and by what the wallet holds) as a ne
 `credit_expiry_months = 0` disables the window and writes NULL, which the sweep reads as
 "nothing to retire" rather than as long overdue.
 
-**But the sweep has exactly one caller, and it does not run.** `db::expire_credit` is
-called from `server/src/bin/usage-purge.rs` and from nowhere else — every other
-reference is a `#[cfg(test)]` test. That binary is NOT shipped in the server image, and
-`.docker/maintenance/entrypoint.sh` says so itself: `NOT WIRED usage-purge - ... not
-shipped, does NOT run here.` The entrypoint reimplements the retention sweeps inline;
-the credit-expiry sweep is not among them, because it is an `UPDATE` plus an `INSERT`
-rather than a `DELETE`, and the guard that compares the two
-(`tools/backup-check/check.sh`) compares `DELETE FROM` table names. Measured: that
-binary contains no `DELETE FROM` at all, so the sweep was never in the comparison — the
-guard's own comment lists two blind spots and this is a third.
+**The caller is now shipped and scheduled.** `db::expire_credit` is called from
+`server/src/bin/usage-purge.rs`; that binary is built and copied into the server image
+(`server/Dockerfile`), and `.docker/maintenance/entrypoint.sh` runs it nightly as the
+`credit-expiry` job, which refuses loudly and exits non-zero if the binary is missing.
+It is the only maintenance job that is **not** inline SQL, deliberately: the sweep is a
+guarded debit plus a ledger row carrying `balance_after` — the ledger invariant — and
+re-expressing that in shell would be a second copy of the one thing the money model
+rests on. Its other sweep (`purge_expired_usage`) repeats five DELETEs the retention job
+already performs inline; they are idempotent, so that is waste rather than harm.
 
-**So no credit has expired, and none will until the sweep is wired.** The window is
-stamped, the mechanism is tested, and nothing invokes it on a schedule. This paragraph
-previously read "It runs from the `usage-purge` binary", which is true of the CALL and
-misleading about the RUN — the same distinction this repository draws elsewhere between
-a mounted tool and a tool that runs. Wiring it is a launch blocker before any expiry
-term is enforced against a customer.
+**This paragraph previously read "Built, and NOT RUNNING", and the correction is the
+point.** Until this job existed the sweep had seventeen tests, a stamped window and no
+runner in production, so the term was disclosed and not enforced — a distinction this
+repository draws elsewhere between a tool that exists and a tool that runs. Anything
+that read the old wording is now out of date in the direction that mattered.
 
 Three things this section does **not** claim:
 
 - **Nothing refuses a spend against aged credit between sweeps.** Expiry is applied by
-  a periodic sweep (`usage-purge`), not at the point of use: a deposit that aged out
-  after the last run is still spendable until the next one. The window is honoured
-  to within the sweep's cadence, not to the instant.
+  a periodic sweep (the `credit-expiry` job), not at the point of use: a deposit that
+  aged out after the last run is still spendable until the next one. The window is
+  honoured to within the sweep's cadence, not to the instant.
 - **No notification is sent before credit expires.** The sweep retires it silently.
   That is the part a customer is most likely to experience as a surprise.
 - **Expired credit is not refunded.** Which is what the open legal risk above is
