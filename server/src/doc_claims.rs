@@ -507,6 +507,69 @@ mod tests {
             "the register promises a 7-day idle session lifetime, and that is also the only combination that makes the idle bound bind at all: at or above absolute_days the idle rule is inert by construction"
         );
     }
+
+    /// Every OTHER number the register states is the number the config carries.
+    ///
+    /// The class the session guard above opened, extended to the rest of the table. A register
+    /// row that states a figure which also lives in `config/apikita.toml` is published twice,
+    /// and two copies of one number drift - this repository's most-repeated finding, in the
+    /// worst possible place, because the register is what a reader trusts.
+    ///
+    /// MEASURED, which is why this exists rather than being assumed covered. Changing
+    /// `credit_expiry_months` from 24 to 36, and `key_metadata_cache_seconds` from 60 to 300,
+    /// each left the ENTIRE suite green at 637 passed, while the register went on stating 24
+    /// months and 60 seconds. Both mutations were confirmed to have LANDED - the config line
+    /// printed before and after - before the verdict was read, because a mutation that does
+    /// not apply passes for the wrong reason.
+    ///
+    /// The session row was guarded and these two were not, which is the shape this repository
+    /// keeps producing: one instance fixed where a class existed.
+    ///
+    /// The assertion names BOTH sides on failure, so a reader learns which one moved without
+    /// going to look. It checks the figure AND the config, in that order, so a reworded row
+    /// reports as a reworded row rather than as a policy change.
+    #[test]
+    fn every_other_number_the_register_states_is_the_number_the_config_carries() {
+        let register = std::fs::read_to_string(doc_path("decisions.md"))
+            .expect("docs/decisions.md must be readable, or this passes over nothing");
+        let config =
+            crate::config::AppConfig::load_from_file(concat!("../", "config/apikita.toml"))
+                .or_else(|_| crate::config::AppConfig::load_from_file("config/apikita.toml"))
+                .expect("config/apikita.toml must load");
+
+        // (the words the register must still carry, the config value, the value the register
+        // implies, what to call it when reporting)
+        let rows: [(&str, i64, i64, &str); 2] = [
+            (
+                "**2 years (24 months) from each deposit's own date**",
+                config.wallet.credit_expiry_months as i64,
+                24,
+                "credit expiry",
+            ),
+            (
+                "**60 seconds**",
+                config.limits.key_metadata_cache_seconds as i64,
+                60,
+                "the key-metadata cache TTL",
+            ),
+        ];
+
+        for (stated, from_config, from_register, about) in rows {
+            assert!(
+                register.contains(stated),
+                "{about}: docs/decisions.md no longer says `{stated}`, which is how it records \
+                 this figure. Either the row was reworded - in which case update this check in \
+                 the same commit - or the policy changed and the register was not brought with \
+                 it. The register is what a reader trusts, so a stale row is worse than none."
+            );
+            assert_eq!(
+                from_config, from_register,
+                "{about}: the register states {from_register} and config/apikita.toml carries \
+                 {from_config}. These are one decision published twice; change both or neither."
+            );
+        }
+    }
+
     /// The bot README's claim about the FOLDER is true, checked against the tree.
     ///
     /// A third kind of promise, and the other two are the wrong shape for this one.
