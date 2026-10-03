@@ -497,6 +497,38 @@ this section argues for - a second, independent reading of the thing being descr
 **So a scan is only evidence after it has been shown to fail on a known-bad input.** Every
 finding in this file that survived scrutiny was confirmed a second way - by mutating the code
 and running the suite, or by reproducing the extraction and printing what it actually read.
+
+**The `#[cfg(test)]` trap, with numbers, because it silently inverted a whole round's results.**
+The paragraph above says `#[cfg(test)]` regions are "interleaved with production code". The sharp
+version of that is not interleaving - it is that **`#[cfg(test)]` appears on ITEMS as well as on
+the test MODULE**, and the obvious rule "test code starts at the first `#[cfg(test)]`" is wrong
+in 10 files.
+
+MEASURED: 26 test-only items across 10 files sit above their file's `mod tests`. Taking the first
+`#[cfg(test)]` as the boundary misclassifies, in these files: `db.rs` 1804 lines (the marker is on a
+single `pub const SHIPPED_CREDIT_EXPIRY_MONTHS`, and the real `mod tests` is at line 1980), `proxy.rs`
+1764 (`line 49`), `auth.rs` 1259 (`line 47`), `webhooks.rs` 387 (`line 12`), `reviews.rs` 374
+(`line 57`), `identity/google.rs` 7 (`line 338`, one `pub fn clear_cache`). About 5,600 lines of
+PRODUCTION code were being counted as test code.
+
+This is not a cosmetic miscount. A scan that believes production code is test code reports that the
+money module contains **no production SQL** - `db.rs` came back `prod=0 test=15` - which is not an
+error the reader can see. The corrected count is `prod=7 test=8`, and those seven statements are the
+reserve, settle and ledger paths.
+
+**The correct rule, and the one to reuse:** the test module begins at a `#[cfg(test)]` that is
+immediately followed - skipping further attributes and blank lines - by `mod <name> {`. A
+`#[cfg(test)]` on anything else is a test-only item, and the lines after it are production until the
+real module starts. Written as a helper rather than re-derived per scan, because this session
+re-derived it wrong once already.
+
+**A second, smaller lesson from the same round.** Four private money helpers in `db.rs`
+(`try_debit`, `try_credit`, `insert_ledger_row`, `expire_one_deposit`) have no *direct* test caller,
+which looks alarming and is not a finding: they are reached through public functions that are
+tested. Mutating them settled it - removing `try_debit`'s `balance_idr >= ?1` floor fails 5 tests
+including `concurrent_requests_cannot_overdraw_a_one_request_balance`, and doubling `try_credit`'s
+operand fails 16. "No caller in test code" is a reason to CHECK coverage, never evidence of its
+absence; only the mutation decides.
 The mutation harness has been reliable across all of it for one reason: it compiles and runs
 the real thing. Text that only resembles the thing is not a measurement of it.
 
