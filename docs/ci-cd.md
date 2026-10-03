@@ -70,6 +70,19 @@ These nine are CI stages rather than local scripts because each guards a failure
 produces **no error**: the thing looks like it works and does not. A local script only
 helps someone who already suspects a problem.
 
+**AND THE WIRING IS CHECKED IN BOTH DIRECTIONS, because a gate CI never runs is the same
+failure with the polarity reversed.** Measured rather than assumed: every `tools/*-check/check.sh`
+on disk appears in `.github/workflows/ci.yml` (9 of 9), and every `check.sh` the workflow names
+exists (9 of 9) - so there is neither an orphan gate nor a dangling stage. `ci-docs-check` closes
+the third side by comparing the workflow's **28 step names** against this document's tables, in
+both directions: it reports a step this document never names, and a name this document claims that
+the workflow does not run. Removing a single stage name from a table here makes it exit 1, which
+is how that comparison was confirmed to be non-vacuous rather than merely present.
+
+That triple matters because the failure a gate protects against and the failure of the gate
+ITSELF are both silent. A `-check` directory nothing invokes reads exactly like one that passes,
+and this table would still describe it in the present tense.
+
 | Stage | Guards against | Silently wrong because |
 | --- | --- | --- |
 | Check the edge relay streams SSE | A buffering relay | The UI answers 200 and stops updating |
