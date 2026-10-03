@@ -384,6 +384,32 @@ A harness missing the second control is the most dangerous of the three, because
 in the direction that looks like a finding: every mutant survives, and the report says the
 guard is weak when the runner was broken.
 
+**TWO MORE WAYS AN ANCHOR CAN POINT AT THE WRONG PLACE, both measured while re-checking the
+rounds that had produced survivors.** The controls above catch "nothing ran" and "nothing was
+applied"; these catch "something was applied, to the wrong text":
+
+- **A DOC-COMMENT THAT QUOTES THE MUTATED LINE.** `client.rs` carries a fixture comment reading
+  *"MEASURED: replacing `if !endpoint.breaker.allow_request() { continue; }` with `if false` left the
+  entire suite green at 641 passed"*. That sentence contains the anchor **verbatim**, so counting
+  occurrences in the raw file gave **2** for a line the code has once - which reads as "the mutation
+  may have landed on a copy", the exact suspicion it was there to rule out. Comment-stripping
+  (`strip_comments`, which `doc_claims.rs` already uses for the same reason) brings it to 1. The
+  ambiguity was an artefact of documentation ABOUT the code, not of the code.
+
+- **TWO BLOCKS THAT DIFFER ONLY BY INDENTATION.** `ip_tracking.rs`'s `salt_for_day` holds the same
+  three lines twice: the read-lock fast return at 12 spaces and the write-lock re-check at 8. A
+  string anchor written from the inner block matches only that one, so a re-test aimed at the
+  re-check silently mutated the fast return instead - and reported NOT CAUGHT, against a guard that
+  is in fact caught. **When two blocks are near-identical, mutate by LINE INDEX and assert the block
+  you are deleting is the one you expect**, rather than by string search.
+
+The second one has a sequel worth stating, because it nearly became a finding. The fast return is a
+**lock-contention optimisation**: with it removed, a same-day call takes the write lock, hits the
+re-check, and returns the same bytes. The same-day and rotation tests still pass, correctly, and
+`M_read` is NOT CAUGHT. **A pure optimisation is not supposed to be pinned by a behavioural test** -
+writing one would pin a performance detail and call it correctness. "Not caught" is the right answer
+there, and the discipline is to read what the code does before deciding which of the two it is.
+
 ### Where this rule stops, and why it stops there
 
 The log guard checks the SEVENTH restatement, and it works because `logged`, `logs` and
