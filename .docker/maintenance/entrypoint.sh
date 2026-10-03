@@ -236,7 +236,7 @@ banner() {
     log "WIRED     reconcile  - tools/reconcile/reconcile.sh, exit code preserved (1=drift 2=no DATABASE_URL 3=no sqlite3 4=sqlite3 failed 5=stranded hold 6=no such database file)"
     log "NOT WIRED ip-purge   - server/src/bin/ip-purge.rs is a Rust binary NOT shipped in the server image; it does NOT run here. Its retention window IS enforced inline (see retention above)."
     if [ -x "$USAGE_PURGE_BIN" ]; then
-        log "WIRED     credit-expiry - $USAGE_PURGE_BIN (server/Dockerfile), db::expire_credit. THE PROMISE IS NOW KEPT: the wallet page and docs/terms-of-service.md both state 'credit expires 2 years after each deposit', and until this job existed NOTHING applied it - the sweep had seventeen tests and no runner. It is the one job here that is not inline SQL: the sweep is a guarded debit plus a ledger row carrying balance_after, i.e. the Gate 2 invariant, so it runs the tested Rust function rather than a second copy of that arithmetic in shell. Its other sweep, purge_expired_usage, repeats five DELETEs run_retention already does; they are idempotent, so that is reported rather than avoided."
+        log "WIRED     credit-expiry - $USAGE_PURGE_BIN (built into THIS image, see .docker/maintenance/Dockerfile), db::expire_credit. THE PROMISE IS NOW KEPT: the wallet page and docs/terms-of-service.md both state 'credit expires 2 years after each deposit', and until this job existed NOTHING applied it - the sweep had seventeen tests and no runner. It is the one job here that is not inline SQL: the sweep is a guarded debit plus a ledger row carrying balance_after, i.e. the Gate 2 invariant, so it runs the tested Rust function rather than a second copy of that arithmetic in shell. Its other sweep, purge_expired_usage, repeats five DELETEs run_retention already does; they are idempotent, so that is reported rather than avoided."
     else
         log "NOT WIRED credit-expiry - $USAGE_PURGE_BIN is absent, so NO CREDIT EXPIRES while the wallet page and docs/terms-of-service.md promise that it does. This is the failure this job was added to end, so it is reported as a defect and the job exits non-zero."
     fi
@@ -617,14 +617,41 @@ run_credit_expiry() {
     fi
     if [ ! -x "$USAGE_PURGE_BIN" ]; then
         log "job credit-expiry: FAILED - $USAGE_PURGE_BIN is missing or not executable."
-        log "job credit-expiry:   It ships in the SERVER image (server/Dockerfile). If this container"
-        log "job credit-expiry:   cannot reach it, NO CREDIT EXPIRES while the wallet page and the"
+        log "job credit-expiry:   It is built into THIS image - see .docker/maintenance/Dockerfile. If it"
+        log "job credit-expiry:   cannot be reached, NO CREDIT EXPIRES while the wallet page and the"
         log "job credit-expiry:   terms of service promise that it does. Nothing was swept."
         return 1
     fi
 
-    # The binary takes DATABASE_URL from the environment and applies its own
-    # scheme check, so the file is not re-derived here: one parser, not two.
+    # THE DSN IS RESOLVED HERE, and this differs from what the job first did. It used to pass
+    # DATABASE_URL straight through, on the argument that the binary already parses it and two
+    # parsers is one too many. That argument holds for the SCHEME and fails for the PATH: a
+    # relative `sqlite://data/server.db` is resolved by the binary against ITS OWN CWD, and this
+    # container's CWD is not part of the job - it is whatever the runtime gives it.
+    #
+    # MEASURED: with no working directory the job reports `FAILED - exited non-zero` and NOTHING
+    # IS SWEPT (`50000/50000/0` before and after); with `--workdir /srv/apikita/server` it reports
+    # `deposits_expired=1` and the wallet and ledger both reach 0. Production happens to set that
+    # directory (docker-compose.yml `working_dir`), so the job works THERE and fails everywhere
+    # else - the `once` verb, a manual `docker exec`, and the CI smoke, which is how this was
+    # found. A job whose correctness depends on a directory set in a different file is one
+    # refactor away from silently enforcing nothing, and `run_retention` beside it has always
+    # resolved the DSN itself (`db_file_from_url`), so this also makes the two agree.
+    #
+    # The ABSOLUTE form is passed down, so the binary's own scheme check still runs - one parser
+    # for the scheme, which is the part the original comment was protecting.
+    if ! SWEEP_DB=$(db_file_from_url "$DATABASE_URL"); then
+        log "job credit-expiry: FAILED - DATABASE_URL is not a sqlite:// URL, or names an in-memory database: $DATABASE_URL"
+        log "job credit-expiry:   expected e.g. sqlite://data/server.db. Nothing was swept."
+        return 1
+    fi
+    if [ ! -f "$SWEEP_DB" ]; then
+        log "job credit-expiry: FAILED - no such database file: $SWEEP_DB (nothing was swept)"
+        return 1
+    fi
+    export DATABASE_URL="sqlite://$SWEEP_DB"
+    log "job credit-expiry:   database file $SWEEP_DB"
+
     OUT=$("$USAGE_PURGE_BIN" 2>&1) || {
         log "job credit-expiry: FAILED - $USAGE_PURGE_BIN exited non-zero (nothing may have been swept)"
         printf '%s\n' "$OUT" | while IFS= read -r l; do log "job credit-expiry:   $l"; done

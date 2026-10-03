@@ -555,6 +555,59 @@ jobs:
             echo "::error::the startup banner does not report hold-sweep as WIRED"
             exit 1
           }
+
+          # 4: credit-expiry. THE JOB THAT MOVES MONEY, and it was added to this schedule
+          # without a line here.
+          #
+          # WHY IT NEEDS A CONTAINER TEST SPECIFICALLY. The job runs `db::expire_credit` from a
+          # binary rather than inline SQL, and the binary has to be REACHABLE FROM INSIDE THIS
+          # IMAGE. It was built into the SERVER image, which is a different image - so the job
+          # existed, the Dockerfile built the runner, and the scheduler could not see it. The
+          # banner would have said NOT WIRED every night in production while every host-side
+          # check passed, because on the host the path resolves. That is the same
+          # container-integration seam the alert-jobs step below exists for.
+          #
+          # The fixture settles a deposit whose credit_expires_at is in the PAST, balancing the
+          # wallet with its own funding ledger row so the Gate 2 comparison means something.
+          # Three things are required: the job reports OK, the MONEY ACTUALLY MOVED (balance
+          # down, credit_retired_at set), and the ledger invariant still holds - a sweep that
+          # debits without a ledger row would balance nothing.
+          $RUN -v $PWD/.docker/maintenance/ci/credit-expiry-smoke-seed.sql:/seed.sql:ro \
+            -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db < /seed.sql'
+
+          out=$($RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP credit-expiry 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "job credit-expiry: OK" || {
+            echo "::error::the credit-expiry job did not report success - the sweep behind a published term did not run"
+            exit 1
+          }
+          echo "$out" | grep -q "WIRED     credit-expiry" || {
+            echo "::error::the startup banner does not report credit-expiry as WIRED, so the runner is not reachable from this image"
+            exit 1
+          }
+          echo "$out" | grep -q "deposits_expired=1" || {
+            echo "::error::credit-expiry ran but expired nothing; the seeded deposit was past its instant, so a zero here means the sweep is not seeing it"
+            exit 1
+          }
+
+          # The three facts as three COLUMNS, joined by `-separator`. Written this way rather
+          # than with SQL string literals because the `-c` wrapper already spends both quote
+          # characters: `"/"` inside is an IDENTIFIER to SQLite, not a string, and the query
+          # fails with `no such column: "/"`. MEASURED while writing this - the first version
+          # did exactly that, and a failing query reads as "the sweep did not work".
+          after=$($RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 -separator / /srv/apikita/server/data/server.db \
+                "SELECT (SELECT balance_idr FROM wallets), (SELECT COALESCE(SUM(delta_idr),0) FROM ledger), (SELECT CASE WHEN credit_retired_at IS NULL THEN 0 ELSE 1 END FROM topups);"')
+          echo "credit-expiry result (balance/ledger/retired-0-or-1): $after"
+          if [ "$after" != "0/0/1" ]; then
+            echo "::error::credit-expiry did not retire the credit as the terms promise: expected 0/0/1 (balance/ledger/retired), got $after. A debit without its ledger row would break the Gate 2 invariant, and an untouched balance would mean the term is still not applied."
+            exit 1
+          fi
+
           # 4: the ALERT jobs. Added in W48/W49 and exercised by nothing until now.
           #
           # WHY THIS IS THE RIGHT PLACE AND NOT A NEW STEP. The host-side
