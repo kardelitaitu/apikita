@@ -525,10 +525,34 @@ re-derived it wrong once already.
 **A second, smaller lesson from the same round.** Four private money helpers in `db.rs`
 (`try_debit`, `try_credit`, `insert_ledger_row`, `expire_one_deposit`) have no *direct* test caller,
 which looks alarming and is not a finding: they are reached through public functions that are
-tested. Mutating them settled it - removing `try_debit`'s `balance_idr >= ?1` floor fails 5 tests
+tested. Mutating them settled it - removing `try_debit`'s `balance_idr >= ?1` floor fails 5 tests,
 including `concurrent_requests_cannot_overdraw_a_one_request_balance`, and doubling `try_credit`'s
 operand fails 16. "No caller in test code" is a reason to CHECK coverage, never evidence of its
 absence; only the mutation decides.
+
+**A whole-repo scan also reads a STALE PARALLEL COPY of this repository, because one lives in-tree
+at `.agents/rg/`.** It is a full duplicate - `server/`, `website/`, `tools/`, `docs/`, `.github/` -
+and it is gitignored by `**/.agents/`, so it is invisible to `git status`, to CI, and to every
+gate. It is nonetheless on disk, and anything that WALKS the tree sees two of everything.
+
+MEASURED: of its 292 files, 271 are byte-identical to the real ones and **20 differ** - it carries a
+pre-`16b35b2` `server/src/bin/hold-sweep.rs`, i.e. the version whose `release_hold` bound
+`hold.account_id` raw and could never credit a hold. A scan that counts occurrences double-counts
+(`INSERT INTO ledger`: 12 real, 12 in the copy, 24 walked naively), and a scan that looks a file up
+by NAME can silently read the stale one - which is how it first surfaced, as duplicate findings for
+`tools/backup-check/check.sh` and `server/src/doc_claims.rs`.
+
+**No gate is misled by it, which was checked rather than hoped.** All nine `tools/*-check/check.sh`
+were read for a whole-repo walk (`find "$REPO"`, `grep -r` over `$REPO`, `git grep`) and none has
+one; all nine were then run against the current tree and all nine exit 0. The single mention of
+`.agents` is in `rollback-check`, which uses `.agents/rollback-check-work.$$` as its own scratch
+directory - a real dependency on the directory, not on the stale copy inside it.
+
+**So the rule for a scan is: never walk the repository root.** Walk the directories that hold the
+code - `server/src`, `website/src`, `tools`, `docs` - and, where a whole-tree sweep is genuinely
+wanted, exclude `.agents/` explicitly. `git ls-files` is a better starting point than `fs.walk`,
+because it cannot see what git ignores.
+
 The mutation harness has been reliable across all of it for one reason: it compiles and runs
 the real thing. Text that only resembles the thing is not a measurement of it.
 
