@@ -28,6 +28,27 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use crate::config::AuthConfig;
 use crate::error::AppError;
 
+/// How many times `hash_password` has been invoked, in tests only.
+///
+/// A COUNTED HASH IS HOW AN ANTI-ENUMERATION PROPERTY IS PINNED WITHOUT A STOPWATCH. Two endpoints
+/// promise that a request for an unknown account does the SAME WORK as one for a known account with
+/// a wrong password - `signup` hashes before it checks existence, and `login` hashes a throwaway on
+/// the missing-account path. Both are claims about COST, so a test that compares response bodies
+/// cannot see a regression in either.
+///
+/// A wall-clock assertion would be flaky, and a flaky guard gets muted; "did the hasher run at all
+/// on this path" is deterministic and is the fact that actually distinguishes the two paths. The
+/// counter is compiled out of production, so it cannot become a data race on a hot path.
+#[cfg(test)]
+pub(crate) static HASH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read the test-only hash counter. See [`HASH_CALLS`].
+#[cfg(test)]
+pub(crate) fn hash_calls() -> usize {
+    HASH_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The hasher named by the config, built on every call.
 ///
 /// NOT CACHED, deliberately. `Argon2` is a thin value holding the parameters,
@@ -58,6 +79,9 @@ fn hasher(auth: &AuthConfig) -> Result<Argon2<'static>, AppError> {
 /// stays verifiable after an operator raises them. That is what makes the cost
 /// knob tunable without a migration.
 pub async fn hash_password(auth: AuthConfig, password: String) -> Result<String, AppError> {
+    #[cfg(test)]
+    HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // The hash is CPU-bound and deliberately slow, so it runs on a blocking
     // thread. `spawn_blocking` rather than `block_in_place` because the runtime
     // is multi-threaded and this is the idiomatic form; the join error can only

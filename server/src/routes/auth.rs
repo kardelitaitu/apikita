@@ -3580,6 +3580,162 @@ mod tests {
              what protects the account, not the reply plus an overwrite"
         );
 
+        // THE COST, which the reply equality above cannot see. The comment on the hash call in
+        // `signup` says hashing happens BEFORE the existence check "so both branches pay the same
+        // cost", and an early return would make "already registered" measurably faster than
+        // "created" - an oracle in the timing domain even though the bodies match.
+        //
+        // THE PROBE MUST USE AN ALREADY-REGISTERED ADDRESS, and getting that wrong is easy: an
+        // UNKNOWN address takes the create-branch and hashes under BOTH orderings, so probing one
+        // cannot tell them apart. MEASURED: with the hash moved inside `existing.is_none()`, a probe
+        // on an unknown address still saw one call and the assertion passed - it was testing that
+        // hashing HAPPENS, not that it happens FIRST. `known` already has a password identity from
+        // the first signup in this test, so it is the branch the ordering actually protects.
+        let before = identity::password::hash_calls();
+        let _ = call(signup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            signup_json(known, "a-real-enough-password"),
+        ))
+        .await;
+        let calls = identity::password::hash_calls().saturating_sub(before);
+        assert!(
+            calls >= 1,
+            "a signup for an address that ALREADY has a password identity made {calls} calls to \
+             `hash_password`. The hasher must run BEFORE the existence check so both branches pay \
+             the same cost; an early return makes 'already registered' measurably faster than \
+             'created', which is a membership oracle in the timing domain even though the bodies \
+             match. See the comment on the hash call in `signup`."
+        );
+
+        db.close().await;
+    }
+
+    /// One error body with its `request_id` blanked, for comparing two replies that are allowed to
+    /// differ only in that one field.
+    fn without_request_id(body: &str) -> String {
+        body.split("\"request_id\":\"")
+            .enumerate()
+            .map(|(i, part)| {
+                if i == 0 {
+                    part.to_string()
+                } else {
+                    // Drop everything up to the closing quote of the id.
+                    match part.find('"') {
+                        Some(at) => format!("<id>{}", &part[at..]),
+                        None => part.to_string(),
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\"request_id\":\"")
+    }
+
+    /// LOGIN ANSWERS AN UNKNOWN ADDRESS AND A WRONG PASSWORD IDENTICALLY - and pays the same work.
+    ///
+    /// The repository tests the neutral answer for signup, for password reset and for resend
+    /// verification. LOGIN WAS THE ONE THAT HAD NO SUCH TEST, and it is the endpoint where an oracle
+    /// is most directly useful: a 401 that arrives faster for an unregistered address than for a
+    /// registered one with a wrong password tells an attacker which addresses have accounts, without
+    /// ever guessing a password.
+    ///
+    /// The code already takes measures against that - a throwaway hash on the missing-account path,
+    /// one `Unauthenticated` for both credential failures, and the same 401 for a suspended account.
+    /// MEASURED before this test existed: deleting the throwaway hash left all 38 `routes::auth`
+    /// tests green, so the RESPONSE was pinned and the COST was not.
+    ///
+    /// A HASH IS COUNTED, NOT TIMED. Two endpoints promise that an unknown account does the same
+    /// WORK as a known one - `signup` hashes before it checks existence, and `login` hashes a
+    /// throwaway - and both are claims about cost that a body comparison cannot see. A wall-clock
+    /// assertion would be flaky, and a flaky guard gets muted; "did the hasher run on this path" is
+    /// deterministic and is the fact that distinguishes them. See `identity::password::hash_calls`.
+    #[tokio::test]
+    async fn live_login_answers_an_unknown_address_exactly_like_a_wrong_password() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = state_for(&pool);
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+
+        let config = auth_config_for_tests().expect("the shipped [auth] section parses");
+        let known = "has-a-password@example.com";
+        crate::identity::accounts::create_password_account(
+            &pool,
+            known,
+            &identity::password::hash_password(config, "the-real-password".to_string())
+                .await
+                .expect("hashing must work"),
+            Utc::now(),
+        )
+        .await
+        .expect("creating the fixture account must work");
+
+        // (1) THE REPLY. The two failures a membership oracle would separate.
+        let unknown = call(login(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest {
+                email: "no-such-address@example.com".into(),
+                password: "any-password-at-all".into(),
+            })),
+        ))
+        .await;
+        let wrong = call(login(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest {
+                email: known.into(),
+                password: "not-the-real-password".into(),
+            })),
+        ))
+        .await;
+
+        assert_eq!(
+            unknown.status,
+            StatusCode::UNAUTHORIZED,
+            "an unknown address is a credential failure, not a distinct code"
+        );
+        assert_eq!(
+            unknown.status, wrong.status,
+            "an unknown address and a wrong password must answer the same STATUS, or the \
+             difference says which addresses are registered"
+        );
+        // The `request_id` is deliberately FRESH per error (see `every_error_event_carries_a_fresh_
+        // documented_request_id`), so it is the one field two replies may differ in. Blanking it is
+        // what makes the comparison a statement about the ORACLE rather than about a correlation id.
+        assert_eq!(
+            without_request_id(&unknown.body_text()),
+            without_request_id(&wrong.body_text()),
+            "and the BODIES must match apart from the fresh request id: the same status with \
+             different copy still tells an attacker which addresses are registered"
+        );
+
+        // (2) THE WORK, which the reply equality cannot see. Run one login for an address with no
+        // identity and count the hasher invocations it caused.
+        let before = identity::password::hash_calls();
+        let _ = call(login(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest {
+                email: "another-unknown@example.com".into(),
+                password: "any-password-at-all".into(),
+            })),
+        ))
+        .await;
+        let calls = identity::password::hash_calls().saturating_sub(before);
+
+        assert!(
+            calls >= 1,
+            "a login for an address with no identity made {calls} calls to `hash_password`, so \
+             the missing-account path returns early and does NOT pay for a hash. That makes 'no \
+             such address' measurably faster than 'wrong password', which is a membership oracle \
+             in the timing domain even though the bodies above match. See the throwaway hash in \
+             the `login` body."
+        );
+
         db.close().await;
     }
 

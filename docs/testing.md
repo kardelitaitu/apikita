@@ -675,6 +675,34 @@ implementation settles it. *"The proxy never reads a cookie"* is settled by the 
 signature: it takes `HeaderMap`, so a cookie is not in scope rather than being refused. No
 search is involved, and no reader has to trust that a search was thorough.
 
+## A timing claim needs a counted probe, and the probe needs the right branch
+
+Two endpoints promise that a request for an unknown account does the same WORK as one for a
+known account with a wrong password: `signup` hashes before it checks existence, and `login`
+hashes a throwaway on the missing-account path. Both comments justify the ordering as an
+anti-enumeration measure — *"an early return here would make 'already registered' measurably
+faster than 'created'"* — and neither was enforced. Deleting the throwaway hash in `login`
+left all 38 `routes::auth` tests green, and moving `signup`'s hash inside the existence branch
+did too.
+
+**A stopwatch is the wrong instrument.** This repository's rule is that a flaky guard gets
+muted, and a wall-clock assertion about a hash is flaky by construction. The deterministic
+form of "the same work happens" is a COUNT: `identity::password` carries a `#[cfg(test)]`
+counter, and the assertion is that the missing-account path invokes the hasher *at all*. That
+is the fact that distinguishes the two paths, and it does not depend on how loaded the machine
+is.
+
+**THEN THE PROBE ITSELF HAS TO BE CHECKED, and this is where the first attempt was wrong.**
+The signup assertion was written against an UNKNOWN address, and it passed under the mutation
+— because an unknown address takes the create-branch and hashes under *both* orderings. It was
+testing that hashing happens, not that it happens FIRST. Moving the probe to an
+already-registered address, which is the branch the ordering protects, made it catch the
+regression immediately.
+
+**The general shape:** a property of the form "A and B cost the same" cannot be probed on an
+input where A and B are the same code path. Ask which branch the claim is about, and probe
+that one — then confirm by mutation that the probe fails when the property is removed.
+
 ## The vacuity guard, applied everywhere
 
 A check that silently matches nothing passes over an empty set and reports a
