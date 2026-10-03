@@ -542,8 +542,27 @@ fn link_mail(
 /// WHAT IS NOT SPAWNED: building the message. `link_mail` is a pure function whose output a test
 /// asserts on directly, and the token is issued by the CALLER on the request path, so the link the
 /// customer eventually clicks is committed before this is called. Only the transport wait moves.
+///
+/// **WHAT THE DETACH MAKES WORSE, stated because it is a real cost and this comment is the only
+/// place it is written down.** An awaited send was tracked by the request: if the process went away
+/// mid-send, so did the thing that was waiting on it. A detached task is not tracked by anything.
+/// `main.rs` calls `axum::serve` with no shutdown signal and the process runs under `tini`, so a
+/// SIGTERM drops the runtime rather than draining it - there is no graceful drain in this service
+/// and no task tracker to add one to (`JoinSet` appears nowhere outside two test stubs). A send
+/// caught in the window between the response and the relay therefore vanishes with no row, no log
+/// and no retry: the customer is told to check their inbox and nothing is coming.
+///
+/// The window is small and the recovery is cheap and already built - the link expired with the
+/// process, so `resend_verification` and `request_password_reset` are exactly the paths for it, and
+/// both are this same function. That is why the trade is worth making: the alternative is a request
+/// path that leaks whether an address is registered. But "small" is not "closed", and a shutdown
+/// during a burst of signups is the shape where it would be felt. Writing it here rather than
+/// leaving it implied is the point - the next reader gets to weigh it with the number attached.
+///
+/// The `state` parameter was REMOVED here. It was already unused before this change (the previous
+/// body carried `let _ = state;` to silence the warning) and the shorter body made that obvious.
+/// `email_config` is a free function, so nothing in this path needed the app state at all.
 async fn send_link_mail(
-    state: &AppState,
     account_id: Uuid,
     purpose: identity::tokens::Purpose,
     raw_token: &str,
@@ -560,10 +579,10 @@ async fn send_link_mail(
     // Built here so a malformed address is still caught on the request path where it can be logged
     // with the request's own context, rather than surfacing as a mystery in a detached task.
     let message = link_mail(purpose, raw_token, email);
-    let _ = state;
 
     // Fire-and-forget: the reply does not depend on the relay, and waiting is what made a
-    // registered address answer on a different clock from an unregistered one.
+    // registered address answer on a different clock from an unregistered one. See the doc above
+    // for what the detach costs on shutdown.
     tokio::spawn(async move {
         let outcome = sender.send(message).await;
 
@@ -661,7 +680,6 @@ pub async fn signup(
         // The address here is the one the caller typed, which is the one the
         // account was created with after normalization.
         send_link_mail(
-            &state,
             issued,
             identity::tokens::Purpose::Verification,
             &token.raw,
@@ -968,7 +986,6 @@ pub async fn request_password_reset(
         // The reset link carries the address so the confirmation page can submit
         // without making the user retype it; see `mail_link`.
         send_link_mail(
-            &state,
             account_id,
             identity::tokens::Purpose::Reset,
             &token.raw,
@@ -1095,7 +1112,6 @@ pub async fn resend_verification(
             .await?;
 
             send_link_mail(
-                &state,
                 identity.account_id,
                 identity::tokens::Purpose::Verification,
                 &token.raw,
