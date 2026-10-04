@@ -70,8 +70,25 @@ const SRC = 'src';
  * file under website/src. The leading-character guard keeps this from matching
  * inside a longer token: `https://host/page.md:12` is not a citation, and neither
  * is `foo.bar.rs:1` where `bar.rs` is not a file in this repository.
+ *
+ * THE EXTENSION LIST WAS A CLOSED SET AND THAT WAS A HOLE, MEASURED. With `css` absent, a planted
+ * `website/src/styles/global.css:99999` - a line number far past the end of that file - was
+ * INVISIBLE: the suite stayed at 4 pass / 0 fail, while the same citation written against `.md` was
+ * caught. The list is larger than any citation currently in the tree, so nothing was missed at the
+ * time; the failure would have arrived with the first `.css` citation anyone wrote, silently.
+ *
+ * It is now the extensions this repository actually contains. A citation to a file type NOT in this
+ * list is invisible rather than wrong, which is the failure mode worth naming: the guard cannot
+ * report a citation it does not recognise, so an unrecognised extension is silence, not an error.
+ * The meta-test below pins the list against the repository so a new file type cannot quietly
+ * re-open the hole.
  */
-const CITATION = /(?<![\w/.-])([A-Za-z0-9_][A-Za-z0-9_/.@-]*\.(?:md|rs|ts|toml|sql|py|sh|astro|yml|json)):(\d+)(?:-(\d+))?(?![\w-])/g;
+const CITATION = /(?<![\w/.-])([A-Za-z0-9_][A-Za-z0-9_/.@-]*\.(?:md|rs|ts|tsx|astro|toml|sql|py|sh|yml|yaml|json|css|html|js|mjs)):(\d+)(?:-(\d+))?(?![\w-])/g;
+
+/** The extensions the CITATION regex can see, in the order it writes them. */
+const CITATION_EXTENSIONS: readonly string[] = [
+  'md', 'rs', 'ts', 'tsx', 'astro', 'toml', 'sql', 'py', 'sh', 'yml', 'yaml', 'json', 'css', 'html', 'js', 'mjs',
+];
 
 interface Citation {
   /** File under website/src that writes the citation. */
@@ -287,3 +304,80 @@ test('the privacy page states the date its source document last changed', () => 
     `the privacy page says it was last updated "${stated[1]}", but docs/data-retention.md last changed "${actual}". The page states its own rule at website/src/pages/privacy.astro:11-12 - the date is the git date of the document it restates - so the page is the thing that is out of date. Change the page, not this test, unless the page has stopped being a restatement of that document.`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// The reader itself
+// ---------------------------------------------------------------------------
+//
+// Everything above depends on the CITATION regex, and NOTHING pinned it. That is the gap that mattered
+// here: three rounds of this project have found guards reading part of what they claim to check (a
+// range's start and not its end; a timeout's unit and not its amount; a key's presence and not its
+// section), and in each case the value-level tests kept passing while the reader was wrong.
+//
+// A guard cannot report a citation it does not RECOGNISE. So an extension missing from the list is
+// not a false negative the suite can see - it is silence. These tests make the silence visible.
+
+test('the citation regex still reads every shape it must recognise', () => {
+  const reads = (s: string): string | null => {
+    const m = s.match(new RegExp(CITATION.source, ''));
+    return m ? m[1] : null;
+  };
+
+  // SINGLE LINE, RANGE, and a range the earlier form discarded.
+  assert.equal(reads('see account.rs:190'), 'account.rs', 'a plain citation is no longer read');
+  assert.equal(reads('see account.rs:190-204'), 'account.rs', 'a range citation is no longer read');
+  assert.equal(reads('see docs/x.md:12'), 'docs/x.md', 'a slash-separated path is no longer read');
+
+  // THE EXTENSION LIST, assembled from the constant rather than hand-written, so this test and the
+  // regex cannot drift apart: adding to one without the other fails right here.
+  for (const ext of CITATION_EXTENSIONS) {
+    assert.equal(
+      reads(`see some/file.${ext}:12`),
+      `some/file.${ext}`,
+      `the regex no longer recognises .${ext}, so every citation to a .${ext} file is invisible`,
+    );
+  }
+  // And `.css` specifically, because that is the one that was missing and measurably silent.
+  assert.equal(reads('see global.css:153'), 'global.css', 'a .css citation is invisible again');
+
+  // THE NEGATIVE DIRECTION, which is the other half: things that must NOT be read as citations. A
+  // regex that matched everything would pass every assertion above and be useless.
+  assert.equal(reads('https://host/page.md:12'), null, 'a URL is being read as a citation');
+
+  // AND THE CASE THAT LOOKS LIKE A NEGATIVE AND IS NOT. A sentence-ending period after a citation is
+  // the COMMON shape in prose - "see account.rs:190. It does the parse." - so `.` must not end the
+  // match. The first draft of this test asserted `file.md:12.5` reads as nothing; it reads as
+  // `file.md:12`, and that is correct: the regex cannot know that `12.5` was not a sentence ending,
+  // and refusing it would break the far more common case. Recorded because it is the assertion a
+  // future author is most likely to "fix" in the wrong direction.
+  assert.equal(
+    reads('see account.rs:190. It does the parse.'),
+    'account.rs',
+    'a citation followed by a sentence-ending period is no longer read, which would make most prose citations invisible',
+  );
+  assert.equal(
+    reads('see docs/x.md:12.'),
+    'docs/x.md',
+    'a citation at the end of a sentence is no longer read',
+  );
+});
+
+test('the citation regex has not silently narrowed since this guard was written', () => {
+  const source = CITATION.source;
+  // The extension alternation is the part that went wrong before, so it is asserted by CONTENT and
+  // not merely by "a regex exists".
+  const alternation = source.match(/\\\.\(\?:([a-z|]+)\)\)/);
+  assert.ok(alternation, 'the CITATION regex no longer has an extension alternation at all');
+  const present = alternation[1].split('|');
+  for (const ext of CITATION_EXTENSIONS) {
+    assert.ok(
+      present.includes(ext),
+      `CITATION_EXTENSIONS lists .${ext} but the regex does not match it, so this guard and its own test disagree`,
+    );
+  }
+  assert.ok(
+    present.includes('css'),
+    'the .css extension is gone again, and a citation to a stylesheet would be silent rather than reported',
+  );
+});
+
