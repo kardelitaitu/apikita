@@ -3159,9 +3159,46 @@ mod tests {
             "an unknown order must not append a ledger row"
         );
         assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
-    }
 
-    /// ONE logical top-up must be selectable by ONE ledger ref.
+        // 5. A SETTLED order presented with a MISMATCHED amount is a REPLAY, not a
+        //    mismatch - and that is the precedence `credit_topup_transaction`
+        //    documents at its refusal block: "Status is tested before the amount ...
+        //    a `settled` row with a mismatched amount is a replay, not a mismatch."
+        //
+        // WHY THIS CASE NEEDS ITS OWN TEST. Case 2 above replays with the MATCHING
+        // amount, so the status arm and the amount arm agree and the order they are
+        // tested in cannot be observed. MEASURED: swapping the two `if` arms in the
+        // refusal block left the ENTIRE suite green at 655 passed. The precedence was
+        // documented and unpinned.
+        //
+        // IT MATTERS because the two refuse for different reasons and a caller acts on
+        // which one it got. `AlreadySettled` is the benign double-delivery every
+        // payment provider retries into; `AmountMismatch` says the stored record and
+        // the webhook disagree, which is a discrepancy somebody has to investigate. A
+        // provider re-delivering a webhook must not be reported as a discrepancy, and
+        // an investigation opened on a normal retry is the cost of getting this wrong.
+        assert_eq!(
+            credit_topup_transaction(&pool, &order_id, AMOUNT - 1, SHIPPED_CREDIT_EXPIRY_MONTHS)
+                .await
+                .expect("a replay is a recorded outcome, not an error"),
+            TopupCreditResult::AlreadySettled,
+            "a settled row with a mismatched amount is a REPLAY: the status is judged \
+             before the amount, so a provider retrying a delivery is not reported as a \
+             discrepancy. Swap the two arms in the refusal block and this assertion is \
+             the one that fails."
+        );
+        assert_eq!(
+            wallet_balance(&pool, account_id).await,
+            AMOUNT,
+            "the replay must still not move the wallet"
+        );
+        assert_eq!(
+            ledger_rows(&pool, account_id, "topup").await.len(),
+            1,
+            "the replay must still not append a second ledger row"
+        );
+        assert_eq!(ledger_drift_rows(&pool, account_id).await, 0);
+    }
     ///
     /// docs/website/02-data-model.md:79 defines the column as "topup id, usage
     /// batch id, etc." - the top-up's OWN id. The credit path must write that id,
