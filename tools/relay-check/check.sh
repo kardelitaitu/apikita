@@ -68,14 +68,35 @@ for LOC in "/events" "/v1/"; do
     assert_directive "$LOC" '^[[:space:]]*proxy_buffering[[:space:]]+off;' "proxy_buffering off"
     assert_directive "$LOC" '^[[:space:]]*gzip[[:space:]]+off;' "gzip off"
     assert_directive "$LOC" '^[[:space:]]*chunked_transfer_encoding[[:space:]]+off;' "chunked_transfer_encoding off"
-    # The timeout must EXCEED the server-block default of 60s. `1h` is what ships;
-    # rather than accept only that spelling, reject the known-bad defaults.
+    # The timeout must EXCEED the server-block default of 60s.
+    #
+    # THIS CHECK USED TO MATCH ON SPELLING RATHER THAN VALUE, and the hole was measurable. It
+    # rejected the literal strings `60s|30s|10s|5s` and accepted `[0-9]+[mh]`, so it never converted a
+    # unit: MEASURED, `1m` - which IS 60 seconds, the very default it must outlast - PASSED, and
+    # `0m` - a timeout of zero - passed too, while `90s`, real headroom, was REJECTED for not being in
+    # minutes or hours. A guard that reads the unit and not the amount is the same shape as a
+    # citation guard that reads a range's start and not its end.
+    #
+    # So the value is converted to SECONDS and compared. `s`, `m` and `h` are all accepted spellings;
+    # what matters is that the number is greater than the 60s default.
     block=$(location_block "$LOC")
     if [ -n "$block" ]; then
-        if printf '%s\n' "$block" | grep -qE '^[[:space:]]*proxy_read_timeout[[:space:]]+(60s|30s|10s|5s);'; then
-            fail "location $LOC sets proxy_read_timeout to a short default; a live stream must outlast the 60s server-block default"
-        elif ! printf '%s\n' "$block" | grep -qE '^[[:space:]]*proxy_read_timeout[[:space:]]+[0-9]+[mh];'; then
-            fail "location $LOC has no proxy_read_timeout in minutes or hours"
+        timeout_secs=$(printf '%s\n' "$block" \
+            | sed -n 's/^[[:space:]]*proxy_read_timeout[[:space:]]\+\([0-9]\+\)\([smh]\?\);.*/\1 \2/p' \
+            | head -n 1)
+        if [ -z "$timeout_secs" ]; then
+            fail "location $LOC has no proxy_read_timeout, so a live stream is cut at the 60s server-block default"
+            continue
+        fi
+        amount=${timeout_secs%% *}
+        unit=${timeout_secs##* }
+        case "$unit" in
+            h) seconds=$((amount * 3600)) ;;
+            m) seconds=$((amount * 60)) ;;
+            *) seconds=$amount ;;
+        esac
+        if [ "$seconds" -le 60 ]; then
+            fail "location $LOC sets proxy_read_timeout to ${amount}${unit:-s} = ${seconds}s, which does not EXCEED the 60s server-block default; a live stream is cut mid-answer"
         fi
     fi
 done
