@@ -3632,11 +3632,24 @@ mod tests {
         }
 
         // THE FLOOR. A regex that matched nothing would report no violations and pass forever.
+        //
+        // WHY THE FIGURE IS A RANGE AND NOT A NUMBER, measured rather than assumed. This read "it
+        // found 54 when this test was written". A later round deleted two citations that pointed at
+        // the wrong code (`client.rs:406` and `:462`, cited from `config.rs` for a filter that is at
+        // `477`) and the live count fell to 53; writing THIS comment put it back to 54, because the
+        // sentence naming those two bad citations is itself a citation. Both moves are honest - a
+        // repaired citation and a description of the repair are the same kind of edit - which is
+        // exactly why a second number here would be stale again next time.
+        //
+        // The floor is what matters: 40, against a live count near 50. A floor AT the live count
+        // would fail every time a comment is reworded; a floor far below it is a tripwire rather than
+        // a tripwire-shaped decoration. The reader does not need 54 or 53 - they need "the same order
+        // as 50, and a collapse means the parse broke".
         assert!(
             citations.len() >= 40,
-            "the citation scanner found {} citations in Rust comments; it found 54 when this test \
-             was written. A number this low means the parse broke - a comment style changed, or the \
-             `.rs:<digits>` shape did - and every assertion below is vacuous.",
+            "the citation scanner found {} citations in Rust comments; it found 53-54 when this test \
+             was last revised. A number this low means the parse broke - a comment style changed, or \
+             the `.rs:<digits>` shape did - and every assertion below is vacuous.",
             citations.len()
         );
 
