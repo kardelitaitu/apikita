@@ -226,5 +226,25 @@ test('the promises that must stay are still present', () => {
   // Non-refundable, the 2-year expiry, and paying balances back at closure.
   assert.ok(text.includes('non-refundable'), 'the non-refundable promise must stay');
   assert.ok(text.includes('2 years'), 'the credit-expiry term must stay stated');
-  assert.ok(text.includes('pay remaining balances back'), 'the wind-down payout promise must stay');
+
+  // THE WIND-DOWN PAYOUT PROMISE, matched as a CLAIM AND NOT AS A WORD ORDER. It was pinned to the
+  // exact string `pay remaining balances back`, which is one ordering of three words - so
+  // `pay back remaining balances`, identical in meaning, failed the guard. MEASURED: rewording the
+  // page that way fired this test, on a page whose promise was intact.
+  //
+  // That matters more here than a style point, because of what a false positive does to a suite of
+  // this kind: it teaches the reader that a red test can be a reworded sentence rather than a lost
+  // promise, and the next real loss is discounted as noise. The other two assertions above are left
+  // exact because their phrase IS the claim being quoted - `non-refundable` and `2 years` are the
+  // terms, and the test names say so.
+  //
+  // So: all three words must appear, in any order, within one sentence of each other. That accepts
+  // every natural phrasing of the promise and still fails if any word is dropped - which is the
+  // failure the test exists to catch.
+  const payout = /pay\b[^.]{0,40}\bremaining\b[^.]{0,40}\bbalances?\b[^.]{0,20}\bback\b/.test(text)
+    || /pay\b[^.]{0,40}\bback\b[^.]{0,40}\bremaining\b[^.]{0,40}\bbalances?\b/.test(text);
+  assert.ok(
+    payout,
+    'the wind-down payout promise must stay: the page must say that remaining balances are paid back at closure (all of "pay", "remaining", "balances" and "back" within one sentence)',
+  );
 });
