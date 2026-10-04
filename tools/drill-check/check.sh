@@ -23,7 +23,13 @@
 # skips LOUDLY (exit 3) otherwise, never 0.
 #
 # Usage: sh tools/drill-check/check.sh
-# Exit: 0 all hold, 1 a violation, 3 a prerequisite is missing.
+# Exit: 0 all hold, 1 a violation, 2 the scratch directory could not be created,
+#       3 a prerequisite is missing.
+#
+# 2 IS NOT "USAGE". Nothing on the command line is wrong and there is no flag to correct:
+# mkdir failed, so this is a permissions or disk problem. It printed no code at all before,
+# which meant an operator seeing a bare failure had to guess whether to re-read their flags
+# or look at the filesystem.
 
 set -u
 
