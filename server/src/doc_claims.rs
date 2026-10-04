@@ -3523,6 +3523,8 @@ mod tests {
             line: usize,
             target: String,
             cited: u32,
+            /// The END of a range citation (`<file>:<start>-<end>`), when one was written.
+            cited_end: Option<u32>,
             block: String,
         }
         let mut citations: Vec<Citation> = Vec::new();
@@ -3571,6 +3573,23 @@ mod tests {
                         .to_string();
                     let after = &rest[at + 4..];
                     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    // A citation may be a RANGE (`<file>:<start>-<end>`). The end is read here because
+                    // the check below must apply to BOTH ends: MEASURED, a planted range whose start
+                    // was real code and whose end was far past the file passed, because only the
+                    // start was ever looked at. A span reaching past the end of its target is as
+                    // wrong as a start that points at a blank line, and the guard now says so.
+                    // (The examples above name no real file, so they cannot be read as citations of
+                    // this tree - which is what the guard would otherwise and rightly flag.)
+                    let after_digits = &after[digits.len()..];
+                    let cited_end: Option<u32> = after_digits
+                        .strip_prefix('-')
+                        .map(|rest| {
+                            rest.chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .collect::<String>()
+                        })
+                        .and_then(|d| d.parse::<u32>().ok())
+                        .filter(|end| *end > 0);
                     if let Ok(cited) = digits.parse::<u32>() {
                         // The citation's OWN COMMENT BLOCK, for the dependency test - and it must be
                         // the block the citation is IN, not a fixed window around it.
@@ -3603,6 +3622,7 @@ mod tests {
                             line: i + 1,
                             target,
                             cited,
+                            cited_end,
                             block,
                         });
                     }
@@ -3670,6 +3690,36 @@ mod tests {
                 if let Ok(target_text) = std::fs::read_to_string(hit) {
                     let target_text = target_text.replace("\r\n", "\n");
                     let target_lines: Vec<&str> = target_text.lines().collect();
+
+                    // A RANGE'S END IS CHECKED TOO. It was not, and the hole was measurable: a
+                    // planted range whose start was real code and whose end was far past the file
+                    // passed, because only the start was examined. A span reaching past the end of
+                    // its target is as wrong as a start on a blank line, and it is the shape a
+                    // hurried edit produces - a range copied from one construct and stretched to
+                    // cover another.
+                    if let Some(end) = c.cited_end {
+                        if end < c.cited {
+                            broken.push(format!(
+                                "{}:{} cites {}:{}-{} with the END before the START",
+                                c.file, c.line, c.target, c.cited, end
+                            ));
+                            continue;
+                        }
+                        if end as usize > target_lines.len() {
+                            broken.push(format!(
+                                "{}:{} cites {}:{}-{} but {} has only {} lines",
+                                c.file,
+                                c.line,
+                                c.target,
+                                c.cited,
+                                end,
+                                c.target,
+                                target_lines.len()
+                            ));
+                            continue;
+                        }
+                    }
+
                     let at = c.cited as usize;
                     let line = target_lines
                         .get(at.saturating_sub(1))
