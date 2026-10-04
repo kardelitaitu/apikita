@@ -5828,8 +5828,9 @@ mod tests {
         // `debit_usage_transaction` both debit the same wallet and both append a
         // `usage`-reasoned ledger row, and in production they run concurrently: the
         // nightly `usage-purge` binary calls the sweep while the proxy serves
-        // settlements against the same SQLite file (usage-purge.rs:96,
-        // proxy.rs:1652). Measured: 13 tests touch expiry and 3 drive reserve/settle
+        // settlements against the same SQLite file (`usage-purge.rs`'s `expire_credit`
+        // call, `proxy.rs`'s `debit_usage_transaction` call). Measured: 13 tests touch
+        // expiry and 3 drive reserve/settle
         // lifecycles, and only ONE test touches both -- and it is about a hold that
         // matched no wallet, not about interleaving.
         //

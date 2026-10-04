@@ -1216,6 +1216,7 @@ pub async fn chat_completions(
 
     // The upstream client is process-wide state: the pool, the key pools and
     // the breakers only do their job when every request shares them.
+    //
     let upstream = UPSTREAM.get_or_init(|| UpstreamClient::new(state.config.clone()));
 
     // Read only what the checks below need; the body itself goes upstream as-is.
@@ -6158,5 +6159,74 @@ mod tests {
         );
         assert_eq!(drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
+    }
+
+    /// THE HANDLER MUST NOT WAIT FOR SETTLEMENT, asserted on the SOURCE because it cannot be driven.
+    ///
+    /// `chat_completions` serves the client and hands billing to `tokio::spawn(settle_after_stream(...))`.
+    /// MEASURED: replacing that task with one that drops the guard without settling left every other
+    /// test in this module green - a served request would be billed NOTHING, because the hold returns
+    /// through the guard's Drop and no charge is written. Nothing in the suite noticed.
+    ///
+    /// **WHY THIS IS A TEXT ASSERTION RATHER THAN A TEST THAT DRIVES THE HANDLER.** The handler takes
+    /// its upstream from `static UPSTREAM: OnceLock<UpstreamClient>` (line 240), built once per
+    /// PROCESS from whichever config got there first. A test cannot inject a streaming upstream into
+    /// it, so no test can reach a successful handler stream at all - which is why every existing
+    /// `chat_completions` test expects an ERROR, and why the four streaming-stub tests call
+    /// `stream_at`/`settle_after_stream` themselves. THIS FILE ALREADY SAYS SO at line 5520.
+    ///
+    /// A first attempt at this test drove the real handler through the loopback stub and failed with
+    /// `ModelNotAllowed("mock-stream-model")`, because the OnceLock had already been initialised with
+    /// another test's config. That is the limit, stated rather than worked around.
+    ///
+    /// So the property is pinned where it is visible: the settlement is SPAWNED, not awaited, and the
+    /// spawn is the last thing before the response is built. A future edit that turns it into
+    /// `.await` would block the client on billing - and would fail here.
+    #[test]
+    fn the_handler_spawns_settlement_rather_than_awaiting_it() {
+        // `include_str!` reads this same file, so the assertion cannot drift from the code it is
+        // about - the technique `doc_claims` uses for citations it cannot resolve structurally.
+        let source = include_str!("proxy.rs");
+
+        // THE MATCH MUST BE ON CODE, NOT ON THE WHOLE FILE, and the first version of this test got
+        // that wrong in exactly the way `tools/backup-check` describes about itself: a whole-file
+        // `contains()` also matched this test's OWN assertion string, so RENAMING the real spawn
+        // left it passing. MEASURED. Comments and string literals are stripped first, so no message
+        // in this file can satisfy the search.
+        let mut code = String::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        for line in source.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for ch in line.chars() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                if ch == '"' {
+                    in_string = true;
+                    continue;
+                }
+                code.push(ch);
+            }
+            code.push('\n');
+        }
+
+        assert!(
+            code.contains("tokio::spawn(settle_after_stream("),
+            "`chat_completions` no longer spawns `settle_after_stream`. If it awaits it instead, the \
+             client is blocked on a billing write it does not need - and if it drops the future, a \
+             served request is never charged at all. Both are silent: no other test in this module \
+             reaches a successful handler stream, because the upstream client is a process-wide \
+             `OnceLock` that no test can inject into."
+        );
     }
 }

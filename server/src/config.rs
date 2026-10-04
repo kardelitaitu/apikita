@@ -589,10 +589,16 @@ impl ModelConfig {
         // Two rate sets are in play and both are deliberate. This hold is taken
         // BEFORE routing, so it prices each endpoint at its own rates and keeps the
         // dearest - that is why per-endpoint rates exist at all. SETTLEMENT, by
-        // contrast, always charges the MODEL's rates: every call site
-        // (routes/proxy.rs:1522, :2637, :3331) passes model_cfg.rates.* and never
-        // the endpoint's, because once the answer is streamed the customer pays the
-        // product price, not the reseller's.
+        // contrast, always charges the MODEL's rates: every call site of
+        // `calculate_token_cost_idr` in `routes/proxy.rs` passes `model_cfg.rates.*`
+        // and never the endpoint's, because once the answer is streamed the customer
+        // pays the product price, not the reseller's.
+        //
+        // The sites were cited BY LINE here (three numbers) until a round that added a
+        // test shifted all three onto a blank line, a test's closing brace and an
+        // unrelated assertion - and the citation guard caught it. Naming the FUNCTION
+        // is what survives an edit; `calculate_token_cost_idr` has one production
+        // caller and two in tests, and the claim is about all of them.
         //
         // Taking the max over ENDPOINTS alone therefore did not guarantee the one
         // thing the hold has to do: cover the charge. The model's rates were only
@@ -1391,8 +1397,8 @@ mod tests {
     ///     at its OWN rates (worst_case_reservation_idr, below) and keeps the
     ///     dearest. That is the documented reason per-endpoint rates exist at all:
     ///     a failover to a dearer reseller must not overdraw the balance.
-    ///   * SETTLEMENT always charges the MODEL's rates. Every call site -
-    ///     routes/proxy.rs:1522, :2637, :3331 - passes model_cfg.rates.* and never
+    ///   * SETTLEMENT always charges the MODEL's rates. Every call site of
+    ///     `calculate_token_cost_idr` passes model_cfg.rates.* and never
     ///     the endpoint's, because by settlement time the choice is made and the
     ///     customer pays the product price, not the reseller's.
     ///
