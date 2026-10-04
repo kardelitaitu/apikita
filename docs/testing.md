@@ -580,6 +580,37 @@ immediately followed - skipping further attributes and blank lines - by `mod <na
 real module starts. Written as a helper rather than re-derived per scan, because this session
 re-derived it wrong once already.
 
+**Which newline patterns survive CRLF, stated as a rule because three rounds were bitten by it.**
+Most of this repository's text files are CRLF - counted over `docs/`, the repository root and
+`website/`: **130** of the `.md`, `.toml`, `.yml`, `.json` and `.sh` files. A scan written against an
+LF file is wrong about them in one of two directions. The distinguishing factor is not whether the
+pattern contains `\n` - almost all of them do - but **whether the newline is the LAST character before
+the delimiter or the FIRST of a pair**:
+
+| pattern | on CRLF | why |
+| --- | --- | --- |
+| `\nX` (`indexOf('\n}')`, `indexOf('\n## ')`) | **matches** | `\nX` is a substring of `\r\nX`; the `\r` sits harmlessly before it |
+| `\n\n` | **never matches** | CRLF separates the two newlines with `\r`, so the pair does not occur |
+| `/^\n/m` | matches | `m` makes `^` match after the `\n`, which is present |
+
+MEASURED on the real files rather than reasoned about: `docs/error-model.md` is CRLF and
+`indexOf('\n## ')` returns 217; `website/src/lib/errors.ts` is CRLF and `indexOf('\n}')` returns 856.
+Both guards are correct as written. The `\n\n` form is the dangerous one, and it fails the way the
+worst scanners fail - **open**, not closed.
+
+The instance worth keeping: a guard read a paragraph with
+`text.slice(text.lastIndexOf('\n\n', at), text.indexOf('\n\n', at))`. On a CRLF document both searches
+return `-1`, the fallbacks `?? 0` and `?? text.length` selected the WHOLE FILE, and every citation in
+it was then blessed by any occurrence of the word the guard was looking for anywhere in the document.
+A decoy reading "the old probe was retired in March", in its own paragraph, ~55 characters away, was
+waved through at 5 passed. Normalising **inside the helper** fixed it; normalising at each call site
+would have left the next caller free to reintroduce it, and the helper now asserts that what it
+returned is not the entire document.
+
+The check to run before trusting any scanner over these files: replace `\n\n` with `\r?\n\r?\n`, or
+normalise once at the read. `website/tests/no-shadowing-config.test.ts` already writes `/\r?\n/` for
+its frontmatter fence - that is the form to copy.
+
 **A second, smaller lesson from the same round.** Four private money helpers in `db.rs`
 (`try_debit`, `try_credit`, `insert_ledger_row`, `expire_one_deposit`) have no *direct* test caller,
 which looks alarming and is not a finding: they are reached through public functions that are
