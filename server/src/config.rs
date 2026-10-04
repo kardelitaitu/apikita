@@ -1052,14 +1052,37 @@ impl AppConfig {
                 // An override is what the reservation is sized from, so a NaN here
                 // under-reserves by the same route a zero does, and for the same
                 // reason: the "<= 0" test below is false for it.
-                // Weight is the ROUTED flag, read as "weight > 0.0" in three places
-                // (client.rs:406, :462 and the endpoint-key documentation check), so it
+                // Weight is the ROUTED flag, read as "weight > 0.0" in FOUR places, and it
                 // suffers the same IEEE 754 blind spot from the other end: NaN > 0.0 is
                 // false, so a NaN weight does not fail a check, it silently DISABLES
                 // the endpoint. Nothing is ever routed to it, and because
                 // all_endpoints_unhealthy only counts endpoints that passed the same
                 // filter, it cannot report the model as down either. The endpoint
                 // vanishes with no error and no alert.
+                //
+                // THE SITES ARE NAMED RATHER THAN COUNTED WITH LINE NUMBERS. This said
+                // "three places (client.rs:406, :462 and the endpoint-key documentation
+                // check)", and all three parts had gone wrong: there are FOUR sites, 406 is
+                // a doc-comment and 462 is a function signature rather than a filter, and
+                // the "documentation check" is a real filter, not documentation. A reader
+                // following the old citation would have looked for the fix in two places
+                // that cannot contain it. Verified by reading each enclosing function, and
+                // the split is worth knowing:
+                //   `stream_chat`              client.rs - the endpoint choice that ROUTES,
+                //                              `weight > 0.0 && key_count() > 0`
+                //   `all_endpoints_unhealthy`  client.rs - the health filter, `weight > 0.0`.
+                //                              This is the function named directly below, so
+                //                              a NaN weight is invisible to the alert too.
+                //   `every_routable_endpoint_key_is_documented_in_the_env_example`
+                //                              config.rs - asserts every routable endpoint's
+                //                              key is documented
+                //   `the_config_header_does_not_overstate_how_many_endpoints_are_routable`
+                //                              config.rs - asserts the config header does
+                //                              not overstate how many endpoints route
+                // The last two are TESTS, which is why the count kept drifting: two of the
+                // four sites move whenever a fixture changes. A count in a comment is a
+                // claim that decays; a name is a claim a reader can resolve. Same lesson the
+                // shell exit-code tables learned.
                 //
                 // A non-positive weight is legitimate and means "do not route to
                 // this", so only finiteness is refused here, not positivity.
@@ -2754,8 +2777,17 @@ mod tests {
     ///
     /// The endpoint weight is what separates the two cases, so the exemption is keyed on
     /// it rather than on a list of names: a name list would rot the moment someone added
-    /// a placeholder, and weight is the SAME condition the router filters on
-    /// (upstream/client.rs:462).
+    /// a placeholder, and weight is the SAME condition the router filters on, in
+    /// `stream_chat`'s endpoint choice.
+    ///
+    /// CITED BY FUNCTION AND NOT BY LINE. This read `(upstream/client.rs:462)`, which is
+    /// `stream_chat`'s SIGNATURE - `) -> Result<UpstreamStream, UpstreamError> {` - and not
+    /// the filter the sentence is about. It is the kind of stale citation the line guard in
+    /// `doc_claims.rs` CANNOT catch, and says so about itself: a citation that resolves to a
+    /// real line but to the wrong code is indistinguishable from a correct one, because the
+    /// line is non-blank either way. The reader who followed it would have found the function
+    /// and had to search inside it, which is exactly the work the citation was meant to save
+    /// - and one edit away from concluding the claim was wrong.
     #[test]
     fn every_routable_endpoint_key_is_documented_in_the_env_example() {
         let config = AppConfig::load_from_file("../config/apikita.toml")
