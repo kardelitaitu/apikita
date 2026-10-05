@@ -11,9 +11,17 @@ own: `cd website && npm test`).
 **Those two are the commands CI runs, and the second one builds first for a reason.** `npm test` is
 `npm run build && node --test ...`, not the test run alone: one of the website suites reads the
 RENDERED pages under `website/dist`, so running the tests without a build makes that suite report a
-SKIP instead of the assertion it exists to make. `package.json` also carries a `test:unit` that skips
-the build - it reports 204 passed and 1 skipped where `npm test` reports 205 passed - and it is
-deliberately NOT what this document tells you to run. Measured, not assumed.
+SKIP instead of the assertion it exists to make (`tests/built-output.test.ts`). `package.json` also
+carries a `test:unit` that skips the build, and it is deliberately NOT what this document tells you to
+run.
+
+WHY THAT MATTERS IS THE SKIP, NOT A COUNT, which is how this paragraph used to make the point and why
+it went stale. It read "it reports 204 passed and 1 skipped where `npm test` reports 205 passed", and
+MEASURED on 2026-10-01 both commands report **216 passed / 0 skipped** - the numbers had drifted and
+the comparison had quietly stopped demonstrating anything, because a `dist` left over from an earlier
+build makes `test:unit` skip nothing at all. `test:unit` is the wrong command to run on a clean
+checkout, where `website/dist` does not exist and the rendered-output suite skips; its COUNT is not
+the reason. Stated as the mechanism rather than as a pair of figures that will drift again.
 
 This used to say `cargo test --workspace`, which names a workspace that does not exist here: there is
 no root `Cargo.toml` and no `[workspace]` table, and `cargo metadata` reports one implicit member, so
