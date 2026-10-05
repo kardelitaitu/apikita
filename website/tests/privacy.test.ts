@@ -12,16 +12,71 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 import { stored, notStored, retention, requests } from '../src/lib/privacy.ts';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/** Every table the migrations CREATE, read from the migrations themselves. */
+function schemaTables(): string[] {
+  const dir = join(root, 'server', 'migrations');
+  const names = new Set<string>();
+  for (const file of readdirSync(dir)) {
+    if (!file.endsWith('.sql')) continue;
+    const sql = readFileSync(join(dir, file), 'utf8');
+    for (const m of sql.matchAll(/CREATE TABLE(?:\s+IF NOT EXISTS)?\s+([a-z_]+)/gi)) {
+      names.add(m[1].toLowerCase());
+    }
+  }
+  // A REBUILD STAGING TABLE is not a category of data: it is a transient copy the migration itself
+  // creates and drops. Excluded by name rather than by a hand-kept allowlist so a real table cannot
+  // hide behind the exclusion.
+  for (const n of [...names]) {
+    if (/_rebuild_staging$/.test(n)) names.delete(n);
+  }
+  return [...names].sort();
+}
 
 function mentions(rows: readonly { what: string }[], needle: string): boolean {
   return rows.some((r) => r.what.toLowerCase().includes(needle.toLowerCase()));
 }
 
-test('every category the schema holds is disclosed as stored', () => {
-  // The classes docs/data-retention.md "What is stored" names. If the schema
-  // gains a category, this list is where the disclosure must catch up.
+/**
+ * EVERY table the schema creates must be disclosed, checked against the SCHEMA rather than a list.
+ *
+ * THIS TEST USED TO CHECK ELEVEN HAND-PICKED CATEGORIES while its own header claimed it checked "the
+ * categories the schema actually holds". MEASURED: deleting the whole `auth_attempts` disclosure row
+ * left this file green at 7 passed / 0 failed, because `auth_attempts` was not one of the eleven.
+ * The disclosure itself was complete - all 21 tables were covered - so the defect was the CHECK, not
+ * the subject, which is the harder of the two to notice.
+ *
+ * The coverage is now derived from `server/migrations/*.sql`, so a NEW table fails here until it is
+ * disclosed. That is the property the header always described.
+ */
+test('every table the migrations create is disclosed as stored', () => {
+  const tables = schemaTables();
+  assert.ok(
+    tables.length > 15,
+    `only ${tables.length} tables were read from server/migrations, so this check is looking at the ` +
+      'wrong place and would pass vacuously',
+  );
+
+  const undisclosed = tables.filter((t) => !stored.some((r) => (r.covers ?? []).includes(t)));
+  assert.deepEqual(
+    undisclosed,
+    [],
+    'these tables exist in the schema and NO stored-disclosure row claims them. docs/data-retention.md ' +
+      'requires the /privacy page to change in the same commit as the data model, so a new table ' +
+      `must be disclosed here: ${undisclosed.join(', ')}`,
+  );
+});
+
+test('the disclosure names the human categories, not only table names', () => {
+  // Coverage by table name is necessary and not sufficient: a row can claim a table and still fail to
+  // say what the data IS. These are the phrases docs/data-retention.md names.
   for (const category of [
     'email',
     'password hash',
@@ -34,6 +89,7 @@ test('every category the schema holds is disclosed as stored', () => {
     'api keys',
     'review',
     'session',
+    'sign-in attempt',
   ]) {
     assert.ok(mentions(stored, category), `the disclosure does not name a stored category: ${category}`);
   }
