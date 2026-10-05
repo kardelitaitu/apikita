@@ -1188,10 +1188,19 @@ mod tests {
             }
         }
 
-        // A FLOOR WITH SLACK, never AT the measured value. server/src holds exactly 30
-        // .rs files, so a floor OF 30 is a tripwire: it passes today, fails the moment one
-        // file is deleted, and cannot tell a whole-crate walk from a narrowed one that
-        // happens to reach 30. The count is content; the scope is what this floor guards.
+        // A FLOOR WITH SLACK, never AT the measured value: an exact floor is a tripwire that passes
+        // today, fails the moment one file is deleted, and cannot tell a whole-repo walk from a
+        // narrowed one that happens to reach the same number. The count is content; the scope is
+        // what this floor guards.
+        //
+        // WHAT `walked` COUNTS, stated because this comment used to name a different measurement.
+        // It is incremented on `name.ends_with(".md")` in the walk above - MARKDOWN FILES UNDER THE
+        // REPO ROOT - and never on `.rs` files. The comment used to justify the number with
+        // "server/src holds exactly 30 .rs files", which was true when written and is now 38, and
+        // which measured a different tree in a different unit: nothing here ever counts Rust files.
+        // A figure that is right about something else is worse than a stale one, because it reads as
+        // a measurement of this floor. The `.md` count is 78 at the time of writing, so the floor of
+        // 18 carries slack of 60 - which is the property being bought, not the figure.
         assert!(
             walked >= 18,
             "only {walked} source files were read, so this is not walking the crate"
