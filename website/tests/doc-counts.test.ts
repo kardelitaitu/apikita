@@ -39,8 +39,27 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * recursion the note above is about. So it is a hand-kept number wearing the clothes of a
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
+ *
+ * WHY THIS ONE STILL CANNOT BE MEASURED, while the server count below now is. The server count comes
+ * from `cargo test --lib -- --list`, which ENUMERATES without executing. The website suite has no
+ * equivalent, and a STATIC COUNT OF THE SOURCE IS NOT ONE: MEASURED, a scan for `test(` calls across
+ * these twenty-nine files finds 187 where the runner reports 204.
+ *
+ * Seventeen tests exist only at RUNTIME, and `website/tests/error-model.test.ts` is the reason to
+ * stop looking for a scanner that would find them:
+ *
+ *     for (const c of CASES) {
+ *       test(`${c.name}: ${c.view.message}`, async () => { ... });
+ *     }
+ *
+ * One call site, one test per case in a list that grows whenever a status code is pinned. No
+ * line-based count can produce 204 from that, and a count derived from the list length would be a
+ * second hand-kept number rather than a measurement - the same defect wearing different clothes.
+ *
+ * So this figure is updated WITH the run that changes it. That is a smaller guarantee than the server
+ * count now carries, and it is stated rather than implied.
  */
-const WEBSITE_TESTS = 203;
+const WEBSITE_TESTS = 204;
 
 /**
  * The server count, and the same kind of literal for the same reason.
