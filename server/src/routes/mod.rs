@@ -1783,6 +1783,120 @@ mod tests {
         );
     }
 
+    /// THE OTHER MARKER, and the half nothing read: a route marked ⚠ must NOT be mounted.
+    ///
+    /// WHAT WAS MISSING, measured. The test above reads the PARAGRAPH and the ROW LABEL - the literal
+    /// `| **Bot** ⚠ |`. It never reads a per-route marker. Two edits proved it:
+    ///
+    ///   - flipping `GET /api/bot/account` from ⚠ to ✅ INSIDE the Bot row left the suite green,
+    ///     because the row label that test asserts is still there, and the paragraph still names the
+    ///     path. Nothing compared either to the router.
+    ///   - adding ✅ to `POST /api/admin/topups/:id/refund` - a route the table itself strikes
+    ///     through as **not planned** - also left it green, because no row other than Bot's is read
+    ///     at all.
+    ///
+    /// THE TABLE'S VOCABULARY, read off the file rather than assumed: a route with NO marker is
+    /// SERVED, and ⚠ means designed-not-built. Measured - `✅` appears in exactly one row, the Bot
+    /// row, and everywhere else service is the default. A first draft of this test asserted the
+    /// opposite convention (that ✅ marks the served majority) and its own positive control caught
+    /// the mistake at 1 matched marker out of 57 parsed.
+    ///
+    /// SO THE RULE IS THE ⚠ DIRECTION, which is also the one that misleads: a route marked ⚠ and
+    /// actually MOUNTED tells an integrator not to build against an endpoint that works, which is a
+    /// smaller harm than the reverse - but the reverse, a route with NO marker that is not mounted,
+    /// is the 404-in-production case, and that is what `SPEC_ONLY` and
+    /// `the_spec_names_every_route_it_does_not_serve` cover for the three known paths. What no check
+    /// covered is that the ⚠ SET ITSELF is honest against the router, and that is this test.
+    #[test]
+    fn every_route_the_spec_marks_designed_is_not_mounted() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("server")
+                .join("api-spec.md"),
+        )
+        .expect("docs/server/api-spec.md must be readable, or this checks nothing");
+
+        const PLACEHOLDER: &str = "00000000-0000-0000-0000-000000000000";
+        // `GET /api/keys/:id` as the spec writes it.
+        let mounted: Vec<String> = MOUNTED
+            .iter()
+            .map(|(method, path, _)| format!("{method} {}", path.replace(PLACEHOLDER, ":id")))
+            .collect();
+
+        // Every `METHOD /path` inside backticks in a table row, with whatever marker trails it.
+        let mut parsed = 0usize;
+        let mut designed_seen = 0usize;
+        let mut served_seen = 0usize;
+        for line in spec.lines() {
+            if !line.starts_with('|') {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(open) = rest.find('`') {
+                let Some(close) = rest[open + 1..].find('`') else {
+                    break;
+                };
+                let inside = rest[open + 1..open + 1 + close].to_string();
+                let tail = rest[open + 1 + close + 1..].to_string();
+                rest = &rest[open + 1 + close + 1..];
+                let after = tail.trim_start();
+
+                // `GET /api/me`, or `GET/POST /api/keys` for a dual-method row.
+                let mut methods: Vec<&str> = Vec::new();
+                let mut path = "";
+                for (i, tok) in inside.split(' ').enumerate() {
+                    if i == 0 {
+                        methods = tok.split('/').collect();
+                    } else if tok.starts_with('/') {
+                        path = tok;
+                    }
+                }
+                if path.is_empty() {
+                    continue;
+                }
+
+                let designed = after.starts_with('⚠');
+                if designed {
+                    designed_seen += 1;
+                } else if after.starts_with('✅') {
+                    served_seen += 1;
+                }
+
+                for method in methods {
+                    parsed += 1;
+                    let want = format!("{method} {path}");
+                    if designed {
+                        assert!(
+                            !mounted.contains(&want),
+                            "docs/server/api-spec.md marks `{method} {path}` as ⚠ DESIGNED, and \
+                             create_router MOUNTS it. The table tells an integrator not to build \
+                             against a route that works - or, reading it the other way, the ⚠ set \
+                             and the router have drifted apart and one of them is wrong. Move the \
+                             marker to ✅, or remove the route. (normalised: {want})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // THE POSITIVE CONTROLS, both of them. The loop reports "no mismatches" for a correct table
+        // AND for a parser that read nothing, so both the marker set and the route parse are pinned.
+        assert!(
+            designed_seen >= 3,
+            "only {designed_seen} route(s) in the spec table carry a ⚠ marker. The MARKED ROUTES \
+             paragraph names three, so this parser has stopped reading them and the comparison \
+             above proved nothing."
+        );
+        assert!(
+            parsed >= 30,
+            "only {parsed} `METHOD /path` token(s) were parsed out of the spec table, far fewer \
+             than it lists, so the comparison above examined almost nothing. ({served_seen} carried \
+             an explicit ✅.)"
+        );
+    }
+
     /// And the OTHER direction: every route the server MOUNTS is in the spec.
     ///
     /// The companion to the test above, and the half nobody checks. That one asks
