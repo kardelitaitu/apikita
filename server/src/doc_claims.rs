@@ -3493,6 +3493,121 @@ mod tests {
     /// indistinguishable from a correct one here - the line is non-blank either way. This catches
     /// the drift that actually happens (a number left behind as the file grows), not a number that
     /// was wrong when written. Saying so is the point: the guard is a floor, not a proof.
+    ///
+    /// AND THE LAUNCH GATES THEMSELVES, which nothing read. `docs/launch-checklist.md` is the
+    /// document that decides whether this ships, and every check on it above reads its CITATIONS -
+    /// the line numbers and the bound figures. None read its TICK BOXES. MEASURED: deleting every
+    /// unticked item, leaving a checklist of nothing but `[x]`, left `doc_claims` at 29 passed and
+    /// nothing anywhere failed. The blockers a launch waits on could be removed, one careful edit at
+    /// a time, and the suite would report the document as healthy.
+    ///
+    /// That is the expensive direction to be wrong in, and it is the same shape as the citation
+    /// guards: the file was read, just not the part that carries the meaning.
+    ///
+    /// WHAT THIS ASSERTS, and what it deliberately does not. It pins the SET OF FACTS each open item
+    /// is about - by a distinctive KEYWORD its text must contain - rather than a count. A count would
+    /// fail the moment an item is legitimately closed, which teaches the next person to raise the
+    /// number until the suite is green; a fact fails only when THAT blocker stops being tracked.
+    /// Closing an item means deleting its entry in OPEN_ITEM_FACTS in the same commit, which is a
+    /// small deliberate act rather than a number nobody reads.
+    ///
+    /// THE KEYS ARE WORDS, NOT WORD ORDERS, and the difference is not cosmetic. The first draft used
+    /// multi-word PHRASES - "Abuse-report contact published", "Health checks configured" - and
+    /// MEASURED: rewording one item to "An abuse-report contact is published and monitored by a
+    /// human" failed the guard, because the substring no longer appeared. That is the defect this
+    /// repository keeps finding in other guards, written into a new one: a check that matches a
+    /// sentence's shape rather than its content, so a legitimate rewrite looks like a deletion and
+    /// the next person edits the guard instead of reading it. Twelve of the first draft's seventeen
+    /// keys were word orders. Every key below survives rewording, and the uppercase items match
+    /// case-insensitively so "Backups" and "backups" are the same fact.
+    #[test]
+    fn every_launch_blocker_the_checklist_tracks_is_still_an_open_item() {
+        /// Each entry is `(a distinctive KEYWORD the item's text contains, why it is a launch gate)`.
+        /// The keyword is matched case-insensitively against the unticked items' text. Choose a word
+        /// that names the BLOCKER and appears in no other open item.
+        ///
+        /// WHEN ONE OF THESE IS GENUINELY DONE, delete its entry. The test is not a to-do list and
+        /// does not care how many there are - it cares that a gate already named as blocking did not
+        /// stop being tracked without anyone deciding it should.
+        ///
+        /// The list reads the LEGAL items first because they are the ones that cannot be fixed by
+        /// writing code, which makes them the ones most likely to be quietly dropped.
+        const OPEN_ITEM_FACTS: &[(&str, &str)] = &[
+            ("contracting entity", "decides the entity the Terms are between - contract, tax and dispute posture all follow from it"),
+            ("Legal review", "Gate 0. Everything published in the ToS is unreviewed until this lands"),
+            ("Publish the Terms", "the ToS is written but not served, so no customer has agreed to anything"),
+            ("privacy policy", "the app collects personal data and publishes no policy covering it"),
+            ("persistent volume", "the SQLite file is on the container filesystem, so a redeploy loses every account"),
+            ("Edge relay", "the relay is written and unexercised; `/events` buffering is the silent-failure mode it exists to prevent"),
+            ("certificate renewal", "renewal is manual, so the site is one expiry away from being unreachable"),
+            ("public hostname", "cookies are `Secure` and `SameSite`, so sign-in does not work over an invalid cert"),
+            ("Health checks", "nothing restarts or reports a wedged relay or backend"),
+            ("Failover", "the failover is documented and has never been tried, which is a hypothesis rather than a path"),
+            ("offsite", "there are no offsite backups of the production database"),
+            ("encryption keys", "a key stored beside its backup is not a separate control"),
+            ("Alerts", "a rejected webhook or a drifting ledger is invisible until a customer reports it"),
+            ("restore drill", "an unexercised backup is a belief; the drill is what turns it into a recovery time"),
+            ("restore time", "the RTO is a guess until one is measured"),
+            ("abuse-report", "there is no published route for a report to arrive by"),
+            ("maintenance scheduler", "the retention and expiry sweeps have no scheduler behind them in production"),
+        ];
+
+        let checklist = std::fs::read_to_string(doc_path("launch-checklist.md"))
+            .expect("docs/launch-checklist.md must be readable, or this checks nothing");
+
+        // The unticked items, joined so an item that wraps is still one item. Lowercased once, here,
+        // so every comparison below is case-insensitive by construction rather than by each key
+        // happening to be spelled the way the document is.
+        let open: String = checklist
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("- [ ]") || t.starts_with("* [ ]")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+
+        // THE POSITIVE CONTROL, first: a checklist whose unticked set is EMPTY would satisfy every
+        // assertion below by finding nothing, and an empty open list is exactly what the mutation
+        // that motivated this test produces.
+        let open_count = checklist
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("- [ ]") || t.starts_with("* [ ]")
+            })
+            .count();
+        assert!(
+            open_count >= 10,
+            "docs/launch-checklist.md has only {open_count} unticked item(s). Launch is not blocked \
+             by fewer than ten separate deployment and legal steps, so either the document lost its \
+             open items or this parser stopped reading them - and the checks below would then report \
+             success for a checklist with no gates left on it."
+        );
+
+        let mut found = 0usize;
+        for (key, why) in OPEN_ITEM_FACTS {
+            assert!(
+                open.contains(&key.to_lowercase()),
+                "docs/launch-checklist.md no longer carries an unticked item mentioning {key:?} \
+                 ({why}). Either the item was deleted, or it was TICKED - and if the gate is \
+                 genuinely closed, delete this entry in the same commit so the decision is visible. \
+                 A launch gate that stops being tracked is the one change this document cannot \
+                 absorb quietly."
+            );
+            found += 1;
+        }
+
+        // AND THE FLOOR IS THE LIST ITSELF: if the array were emptied, the loop above would pass
+        // without opening the file.
+        assert!(
+            found >= 17,
+            "only {found} launch-gate key(s) were checked, so this test has been weakened to the \
+             point of not covering the checklist."
+        );
+    }
+
     #[test]
     fn every_rust_comment_citation_points_at_code() {
         /// Citations that are QUOTED EXAMPLES of staleness rather than claims about this tree.
