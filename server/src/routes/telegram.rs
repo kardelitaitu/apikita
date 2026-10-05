@@ -19,9 +19,21 @@
     // cap once counted link_codes, a table this very handler DELETEs from, so it
     // could not fire at all; a cap that cannot fire is indistinguishable from a cap
     // that is not being hit, and the suite was green throughout. It now counts
-    // link_code_issues, which nothing deletes from, so the count is bounded by
-    // admissions rather than by surviving rows. A module whose job is enforcing
-    // limits should not be the one place where a limit is quietly inert.
+    // link_code_issues, so the count is bounded by admissions rather than by
+    // surviving rows. A module whose job is enforcing limits should not be the one
+    // place where a limit is quietly inert.
+    //
+    // THIS SAID "which nothing deletes from", AND THAT WAS WRONG. `ip_tracking::purge_expired` has
+    // swept `link_code_issues` on `LINK_CODE_ISSUE_RETENTION_DAYS` (7) since the table landed; the
+    // sibling comment further down said the same thing. What is true, and is the property the cap
+    // actually relies on, is that the table is not deleted from BY THIS HANDLER and not deleted from
+    // on a timescale shorter than the window the cap is stated over - the counter cannot be reset by
+    // the traffic it is counting. That is what makes the cap reachable; "nothing deletes from it"
+    // would have been a table that grows forever, which is a different (and false) claim.
+    //
+    // The distinction cost a round to find: the sweep's own boundary was pinned by NOTHING until
+    // `the_timestamp_sweeps_delete_their_cutoff_instant_and_keep_the_one_inside` existed, because
+    // this comment and its sibling reasoned as though the sweep did not exist.
     deny(clippy::arithmetic_side_effects)
 )]
 
@@ -383,9 +395,13 @@ pub async fn issue_link_code(
     // rather than LIVE ROWS needs a record that survives the delete, and it is easy
     // to conclude from there that no such record exists. One does, two lines below.
     //
-    // The counting is `link_code_issues`, a table nothing deletes from, so the
+    // The counting is `link_code_issues`, which THIS HANDLER never deletes from, so the
     // number the cap compares against grows with every admission instead of being
-    // reset by the DELETE. The cap therefore FIRES, and holds under concurrency,
+    // reset by the DELETE. (It IS swept by `ip_tracking::purge_expired` at 7 days - the
+    // earlier wording here said "a table nothing deletes from", which was false. What the
+    // cap needs is narrower and is what holds: no deletion happens on a timescale
+    // shorter than the hour the cap is stated over, so traffic cannot reset its own
+    // counter.) The cap therefore FIRES, and holds under concurrency,
     // because the COUNT and the INSERT and the issuance record commit in ONE
     // transaction: a concurrent caller either sees the earlier row or waits on the
     // lock. MEASURED by

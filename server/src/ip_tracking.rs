@@ -1432,6 +1432,99 @@ mod tests {
         db.close().await;
     }
 
+    /// The TWO TIMESTAMP-column sweeps, at their own boundaries.
+    ///
+    /// WHY THESE NEED THEIR OWN TEST while the date-column sweeps above are covered. The test above
+    /// seeds `key_ip_seen` and `key_ip_daily`; `link_code_issues` is not named in it at all and
+    /// `link_redemption_attempts` only appears as a table name. MEASURED, in the module they live in:
+    ///
+    ///   `link_code_issues`'s comparison flipped to `<`               30 passed / 0 failed SURVIVED
+    ///   `link_code_issues`'s sweep made a complete NO-OP, `AND 0`   30 passed / 0 failed SURVIVED
+    ///
+    /// The second is the one that matters: a retention policy that silently stops sweeping retains
+    /// every IP-hash row forever, and nothing in the suite noticed. The table IS measured by a health
+    /// report test in db.rs, but that seeds a row 200 DAYS old - it proves the report fires, not that
+    /// the sweep deletes at 7. Two properties, and only one of them was pinned.
+    ///
+    /// The unit differs from the date sweeps and that is the reason both are seeded as INSTANTS:
+    /// `attempted_at` and `created_at` are timestamps in TEXT columns, so the bound has to be
+    /// midnight-UTC-of-the-cutoff-day. A bare `NaiveDate` would be the shorter string, sort FIRST, and
+    /// match nothing - a silent retention failure in the direction that KEEPS data.
+    #[tokio::test]
+    async fn the_timestamp_sweeps_delete_their_cutoff_instant_and_keep_the_one_inside() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let today = today_utc();
+
+        // Midnight UTC of each cutoff DAY - the instant each sweep binds.
+        let attempts_cutoff = (today - chrono::Duration::days(SEEN_RETENTION_DAYS))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc();
+        let issues_cutoff = (today - chrono::Duration::days(LINK_CODE_ISSUE_RETENTION_DAYS))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc();
+        // One second INSIDE each window: must survive. A whole day inside would be caught by a
+        // comparison that is off by a day; one second is the tightest provable neighbour.
+        let attempts_kept = attempts_cutoff + chrono::Duration::seconds(1);
+        let issues_kept = issues_cutoff + chrono::Duration::seconds(1);
+
+        for (at, address) in [
+            (attempts_cutoff, "198.51.100.21"),
+            (attempts_kept, "198.51.100.22"),
+        ] {
+            sqlx::query(
+                "INSERT INTO link_redemption_attempts (ip_hash, attempted_at) VALUES (?, ?)",
+            )
+            .bind(ip_hash(&[3u8; 32], &ip(address)))
+            .bind(at.to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("seed a link redemption attempt");
+        }
+        for at in [issues_cutoff, issues_kept] {
+            sqlx::query("INSERT INTO link_code_issues (account_id, created_at) VALUES (?, ?)")
+                .bind(account_id.hyphenated())
+                .bind(at.to_rfc3339())
+                .execute(&db.pool)
+                .await
+                .expect("seed a link code issue");
+        }
+
+        let purged = purge_expired(&db.pool, today).await.expect("purge");
+        assert_eq!(
+            purged.link_attempts, 1,
+            "exactly the attempt ON its cutoff instant is deleted. 0 means the sweep stopped \
+             matching - the NaiveDate-against-a-timestamp shape - and 2 means the comparison is \
+             `<=` to the wrong cutoff"
+        );
+        assert_eq!(
+            purged.link_issues, 1,
+            "exactly the ISSUE on its cutoff instant is deleted. A 0 here is the retention policy \
+             silently not running, which was MEASURED as a surviving mutation before this test"
+        );
+
+        let kept_attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM link_redemption_attempts WHERE attempted_at >= ?",
+        )
+        .bind(attempts_kept.to_rfc3339())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read surviving attempts");
+        assert_eq!(kept_attempts, 1, "the attempt one second inside survives");
+
+        let kept_issues: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM link_code_issues WHERE created_at >= ?")
+                .bind(issues_kept.to_rfc3339())
+                .fetch_one(&db.pool)
+                .await
+                .expect("read surviving issues");
+        assert_eq!(kept_issues, 1, "the issue one second inside survives");
+
+        db.close().await;
+    }
+
     // -----------------------------------------------------------------------
     // The link_redemption_attempts sweep.
     //
