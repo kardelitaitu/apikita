@@ -1570,6 +1570,102 @@ mod tests {
         }
     }
 
+    /// THE ARGON2 PARAMETERS ARE REFUSED AT LOAD, AND NOTHING PINNED THAT.
+    ///
+    /// `validate` refuses three values that would produce a hasher failing on EVERY sign-in
+    /// rather than refusing one - "a lockout with no symptom but 'nobody can log in'". The
+    /// comment above each check explains why the floor is what it is; what was missing is that
+    /// DELETING any of the three left the whole suite green.
+    ///
+    /// MEASURED, in a worktree at HEAD with each guard replaced by `if false {`, whole suite:
+    /// 656 passed / 0 failed in all three cases, and in the case of the password floor below.
+    /// Four guards, four survivors - the guards were documentation with a side effect.
+    ///
+    /// The values tested are the ones that MATTER, not the boundary: 0 KiB and 1 KiB both
+    /// describe the same failure (Argon2 divides memory by its block size, so a sub-block
+    /// allocation cannot work), and the assertion is on the refusal, which is the behaviour a
+    /// production login endpoint depends on.
+    #[test]
+    fn the_argon2_parameters_are_refused_at_load() {
+        // 8 KiB is Argon2's own floor, so anything below it cannot produce a working hash.
+        for bad in [0, 1, 7] {
+            let mut config = load_shipped_config();
+            config.auth.argon2_memory_kib = bad;
+            let err = config
+                .validate()
+                .expect_err("argon2_memory_kib below the Argon2 floor must be refused")
+                .to_string();
+            assert!(
+                err.contains("argon2_memory_kib"),
+                "the refusal must name the field, got {err} for {bad}"
+            );
+        }
+
+        // A single pass is not a work factor.
+        let mut config = load_shipped_config();
+        config.auth.argon2_iterations = 0;
+        let err = config
+            .validate()
+            .expect_err("zero Argon2 iterations must be refused")
+            .to_string();
+        assert!(err.contains("argon2_iterations"), "got {err}");
+
+        // Argon2 divides by the lane count.
+        let mut config = load_shipped_config();
+        config.auth.argon2_parallelism = 0;
+        let err = config
+            .validate()
+            .expect_err("zero Argon2 lanes must be refused")
+            .to_string();
+        assert!(err.contains("argon2_parallelism"), "got {err}");
+
+        // And the shipped values must survive their own validation, or the checks above could be
+        // passing for the wrong reason - a config that is refused for something else entirely.
+        load_shipped_config()
+            .validate()
+            .expect("the shipped config must pass its own validation");
+    }
+
+    /// THE PUBLISHED PASSWORD MINIMUM IS A CONTRACT WITH THE SIGNUP PAGE.
+    ///
+    /// `website/src/lib/auth-flow.ts` tells the user the minimum, and a server floor BELOW it
+    /// means the page describes a rule that is not enforced. Only the downward divergence is
+    /// refused - a stricter server is safe - so this pins the asymmetry rather than a number.
+    ///
+    /// MEASURED: replacing `if self.auth.password_min_length < 8 {` with `if false {` left the
+    /// whole suite at 656 passed, so the published promise had no test behind it.
+    #[test]
+    fn the_published_password_minimum_is_enforced_server_side() {
+        let mut config = load_shipped_config();
+        config.auth.password_min_length = 7;
+        let err = config
+            .validate()
+            .expect_err("a server floor below the published 8 must be refused")
+            .to_string();
+        assert!(
+            err.contains("password_min_length"),
+            "the refusal must name the field, got {err}"
+        );
+
+        // The safe direction: stricter than published is allowed, and must NOT be refused.
+        let mut config = load_shipped_config();
+        config.auth.password_min_length = 12;
+        config
+            .validate()
+            .expect("a floor stricter than the published one is safe and must be accepted");
+    }
+
+    /// `config/apikita.toml`, from whichever of the two working directories the test runs in.
+    ///
+    /// `cargo test` runs with the crate root as the CWD, but some harnesses run one level up, and
+    /// three existing tests in this module carry both spellings. Named once here rather than
+    /// copied a fourth and fifth time.
+    fn load_shipped_config() -> AppConfig {
+        AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load")
+    }
+
     /// A NaN or infinite price is NOT caught by the "<= 0" guard, and it is not a
     /// cosmetic one: NaN <= 0.0 is FALSE in IEEE 754 - the value compares greater
     /// than nothing, including itself, so every "<= 0" test in validate() waves it
