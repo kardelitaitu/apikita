@@ -1412,8 +1412,21 @@ pub async fn purge_expired_usage(
         .rows_affected();
 
     // `day` is a DATE in `YYYY-MM-DD` form (a TEXT column), so the bound is a
-    // date, not an instant. Binding an instant here would make the longer string
-    // sort AFTER the stored dates and the DELETE would match nothing.
+    // date, not an instant.
+    //
+    // THIS COMMENT USED TO CLAIM MORE THAN IS TRUE, and the correction is worth
+    // keeping because the claim reads authoritative. It said binding an instant
+    // "would make the longer string sort AFTER the stored dates and the DELETE
+    // would match nothing". That is the hazard of a `>=` comparison, not this one:
+    // an instant IS the date plus a suffix, so `day <= instant` and `day <= date`
+    // agree on every value - the cutoff day is a prefix of the instant and sorts
+    // first either way. MEASURED: substituting `midnight(...)` here left the whole
+    // suite green at 669 passed / 0 failed, and it is an EQUIVALENT mutation rather
+    // than an uncaught one.
+    //
+    // The DATE binding is still the right one - it states the unit the column
+    // holds, and a future change to `>=` would make the instant genuinely wrong.
+    // The comment now says which of those two it is guarding.
     let usage_daily = sqlx::query("DELETE FROM usage_daily WHERE day <= ?")
         .bind(today - chrono::Duration::days(USAGE_DAILY_RETENTION_DAYS))
         .execute(pool)
@@ -5066,11 +5079,25 @@ mod tests {
         .await;
         // (c) Still live (expires in the future, not revoked) -> kept.
         seed_session(&db.pool, account_id, future, None).await;
+        // (d) EXACTLY ON the cutoff -> DELETED, and this row is the reason the boundary is pinned.
+        //
+        // Every fixture above sits a whole DAY away from `cutoff`, so `<=` and `<` behave identically
+        // on all of them. MEASURED: flipping this statement's comparison to `<` left the whole suite
+        // green at 669 passed / 0 failed, because nothing was seeded ON the boundary. The sibling
+        // test for `usage_daily` seeds `at_cutoff` exactly and DOES catch its flip - the discipline
+        // was applied to one retention statement and not the other.
+        //
+        // Which way it must go: the row is deleted. `purge_expired_usage` states the rule as "once it
+        // stopped being USABLE at least 30 days ago", and midnight-on-the-cutoff is exactly 30 days
+        // ago, so it is included.
+        seed_session(&db.pool, account_id, cutoff, None).await;
 
         let purged = purge_expired_usage(&db.pool, today).await.unwrap();
         assert_eq!(
-            purged.sessions, 2,
-            "the expired row and the early-revoked row both go; the live one stays"
+            purged.sessions, 3,
+            "the expired row, the early-revoked row AND the row exactly on the cutoff go; the live \
+             one stays. If this is 2, the comparison is `<` rather than `<=` and a session sitting on \
+             the boundary is retained a day past the 30 the docs promise"
         );
 
         let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
