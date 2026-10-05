@@ -122,6 +122,23 @@ stays there. See [`docs/server/api-spec.md`](server/api-spec.md).
 | Connection/IP | client IP | **30 req/s sustained, 60 burst** | Stop floods and brute force |
 | Request/API key | `Authorization` header or key prefix | **100 req/s** | Stop a runaway client |
 | Concurrent connections | client IP | **50** | Slow-loris and connection exhaustion |
+| Midtrans callbacks | client IP | **200 req/s, 1000 burst** | Bound a flood without refusing a payment callback |
+
+**Every API location names the IP tier AS WELL AS the key tier, and that is load-bearing.**
+A location that names only a key-keyed zone is **unlimited for a caller who sends no
+`Authorization` header** — two nginx rules combine: `limit_req` is *replace*-not-merge, so naming
+a zone **discards** the inherited one; and an **empty zone key disables the limit entirely**.
+Keying on `$http_authorization` therefore means an unauthenticated request is not counted at all.
+Measured before the fix, with both zones at 1 req/s and burst 2: `/auth/login`, `/v1/` and
+`/webhooks/` returned **200 for all eight** rapid requests, while the same path **with** a header
+503'd after three. `/auth/login` unlimited is credential-stuffing surface, which is why the IP
+tier is not optional in any API location.
+
+**The webhook is the one place where the RATE is deliberately different.** Midtrans sends no
+`Authorization` header and may fan out from few addresses, and a 503 here is a **missed credit** —
+the backend is never asked and the money is not recorded. So `/webhooks/` uses its own per-IP zone
+at 200 req/s rather than the 30 req/s sized for a browser: high enough that a legitimate provider
+retry storm is never refused, still bounded so a single host cannot flood the endpoint.
 
 ### Why these numbers
 
