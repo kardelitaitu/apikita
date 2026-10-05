@@ -101,6 +101,118 @@ for LOC in "/events" "/v1/"; do
     fi
 done
 
+# ---------------------------------------------------------------------------
+# The RATE-LIMIT structure. Until this existed, the file's flood protection had no guard at all.
+# ---------------------------------------------------------------------------
+#
+# WHY IT IS HERE RATHER THAN LEFT TO THE CONFIG'S OWN COMMENT. `relay.conf` carries a long note
+# explaining a bug that shipped and was fixed by hand, and that note is currently the ONLY thing
+# preventing its return. A rule nothing checks is a rule that decays, and this defect is one line of
+# plausible-looking YAML away: adding a location, or tidying the pairs below into a single directive,
+# reintroduces it silently.
+#
+# THE BUG, measured in a real nginx and recorded in relay.conf:22-45. Every API location named
+# `zone=perkey`, which is keyed on `$http_authorization`. Two independent facts compound:
+#
+#   1. `limit_req` is REPLACE-not-merge. A location naming a zone DISCARDS the `perip` directive it
+#      would otherwise inherit from the server block, so the per-IP limit stops applying there.
+#   2. nginx SKIPS a `limit_req` whose zone key evaluates to the EMPTY STRING. An unauthenticated
+#      caller sends no `Authorization` header, so `perkey` never counted them.
+#
+# The two together meant the tier a FLOOD would use did not exist: /v1/ and /auth/login answered
+# 8/8 requests of an unauthenticated burst while an authenticated caller was limited after 3. The
+# fix is that every API location names BOTH zones - a per-IP zone for everyone and a per-key zone
+# for callers who identify themselves.
+#
+# WHAT THIS CHECKS, stated as the falsifiable rule rather than as the fixed shape: any location
+# carrying a directive whose zone is keyed on a header an anonymous caller does not send must ALSO
+# carry a directive keyed on something they DO have (`$binary_remote_addr`).
+#
+# THE LOCATIONS ARE DISCOVERED, NOT LISTED. The first draft of this check hardcoded the five doors it
+# knew about, and MEASURED: adding a SIXTH location carrying only `zone=perkey` passed it, because the
+# loop never looked at that location. That is the same defect one level up, and this repository has
+# the lesson written down already - `website/tests/citation-lines.test.ts` says of its own citation
+# list that "a hand-kept list of nineteen citations would be the same defect this file is about, one
+# level up: the twentieth citation would simply not be in it." So the check walks every `location`
+# block in the file.
+#
+# The key-derived zone names ARE named explicitly, and that is the one thing discovery cannot supply:
+# a zone is header-keyed because of how its `limit_req_zone` line is written, and reading that line is
+# the check's job rather than its subject. The zone list is derived from the file's own declarations
+# below, so a renamed or added zone is picked up rather than silently ignored.
+
+# Every zone DEFINED over a request header. Read out of the file's own `limit_req_zone` lines rather
+# than hardcoded: the key is the second whitespace-separated token of the directive.
+header_zones=$(sed -n 's/^[[:space:]]*limit_req_zone[[:space:]]\+\(\$[A-Za-z_]*\)[[:space:]]\+zone=\([A-Za-z0-9_]*\).*/\1 \2/p' "$CONF" \
+    | awk '$1 != "$binary_remote_addr" { printf "%s ", $2 }')
+# And every zone defined over the peer address, which every caller has whether or not it identifies.
+address_zones=$(sed -n 's/^[[:space:]]*limit_req_zone[[:space:]]\+\(\$[A-Za-z_]*\)[[:space:]]\+zone=\([A-Za-z0-9_]*\).*/\1 \2/p' "$CONF" \
+    | awk '$1 == "$binary_remote_addr" { printf "%s ", $2 }')
+
+if [ -z "$header_zones" ]; then
+    fail "no limit_req_zone in $CONF is keyed on a request header, so the two-zone check below would examine nothing"
+fi
+if [ -z "$address_zones" ]; then
+    fail "no limit_req_zone in $CONF is keyed on \$binary_remote_addr, so there is no per-IP tier for an unauthenticated caller to be bounded by"
+fi
+
+# Every location block in the file, by its name. The awk prints the `location` token of each opening
+# line, so the loop below sees locations added later without anyone updating a list.
+every_location() {
+    awk '
+        match($0, /^[[:space:]]*location[[:space:]]+[^[:space:]]+/) {
+            line = $0
+            sub(/^[[:space:]]*location[[:space:]]+/, "", line)
+            sub(/[[:space:]]*\{.*$/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            print line
+        }
+    ' "$CONF"
+}
+
+for LOC in $(every_location); do
+    block=$(location_block "$LOC")
+    [ -n "$block" ] || continue
+
+    # Does this location name a header-keyed zone?
+    names_header_zone=""
+    for z in $header_zones; do
+        if printf '%s\n' "$block" | grep -qE "^[[:space:]]*limit_req[[:space:]]+zone=$z([[:space:]]|;)"; then
+            names_header_zone="$z"
+        fi
+    done
+    [ -n "$names_header_zone" ] || continue
+
+    # It does. Then it MUST also name an address-keyed zone, or an unauthenticated caller is
+    # unlimited - the exact defect.
+    has_address_zone=""
+    for z in $address_zones; do
+        if printf '%s\n' "$block" | grep -qE "^[[:space:]]*limit_req[[:space:]]+zone=$z([[:space:]]|;)"; then
+            has_address_zone="$z"
+        fi
+    done
+    if [ -z "$has_address_zone" ]; then
+        fail "location $LOC names zone=$names_header_zone but no per-IP zone. $names_header_zone is keyed on a request header, which an unauthenticated caller does not send, and nginx SKIPS a limit_req whose key is empty. With no address-keyed zone beside it, an anonymous flood of $LOC is UNLIMITED"
+    fi
+done
+
+# THE POSITIVE CONTROL. A check that reports nothing because it read nothing looks identical to a
+# check that passed. If no location in the whole file names a header-keyed zone, the loop above proved
+# nothing - it may have been looking at a file that does not exist, or the zone may have been renamed.
+if ! grep -qE "^[[:space:]]*limit_req[[:space:]]+zone=($(printf '%s' "$header_zones" | tr ' ' '|'))([[:space:]]|;)" "$CONF"; then
+    fail "no location in $CONF names a header-keyed zone, so the two-zone check above examined nothing. Either the zone was renamed or the directives were removed - in both cases this check is now vacuous"
+fi
+
+# AND THE COUNT IS PINNED, because the rule above is conditional: it fires only where a header-keyed
+# zone appears. Deleting every `zone=perkey` directive would satisfy it trivially while removing the
+# per-key limit entirely. The floor is a TRIPWIRE rather than the current figure - five at the time of
+# writing, in /events, /v1/, /auth/, /api/ and /webhooks/ - so adding a location does not fail this
+# while removing one does.
+header_directives=$(grep -cE "^[[:space:]]*limit_req[[:space:]]+zone=($(printf '%s' "$header_zones" | tr ' ' '|'))([[:space:]]|;)" "$CONF")
+if [ "$header_directives" -lt 5 ]; then
+    fail "only $header_directives limit_req directive(s) name a header-keyed zone; there were 5 in /events, /v1/, /auth/, /api/ and /webhooks/. A check that asserts 'where a per-key limit exists, an address-keyed one exists beside it' proves nothing once the per-key limits are gone"
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "relay-check: the relay contract is BROKEN. A buffering relay looks connected" >&2
     echo "relay-check: while the dashboard silently stops updating (docs/edge-relay.md:110)." >&2
