@@ -1304,6 +1304,30 @@ mod tests {
             .await
             .expect("pre-revoke one key");
 
+        // AND THE SESSION-SIDE HALF OF THE SAME IDEA, which the key half above has had since it was
+        // written and the session half never did.
+        //
+        // The comment above says of the pre-revoked KEY that it "must NOT be counted or re-stamped".
+        // `suspend_account` revokes sessions with `UPDATE sessions SET revoked_at = ? WHERE
+        // account_id = ? AND revoked_at IS NULL` - the same predicate - and MEASURED: deleting that
+        // guard left the whole suite at 665 passed / 0 failed. Nothing observed it.
+        //
+        // WHY RE-STAMPING MATTERS. `revoked_at` is what the retention sweep reads -
+        // `db.rs`: `DELETE FROM sessions WHERE COALESCE(revoked_at, expires_at) <= ?` - so stamping
+        // an already-revoked row with `now` pushes its collection instant forward by the full
+        // window. A row due to be deleted is retained another 30 days, and each suspend re-stamps
+        // it again.
+        //
+        // Pinned to a FIXED PAST INSTANT so the assertion compares a value, not an ordering.
+        let dead_session_stamped = Utc::now() - chrono::Duration::days(3);
+        let dead_session_token = issue_session(&pool, victim).await;
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?")
+            .bind(dead_session_stamped)
+            .bind(hash_token(&dead_session_token))
+            .execute(&pool)
+            .await
+            .expect("pre-revoke one session");
+
         assert_eq!(
             live_sessions(&pool, victim).await,
             2,
@@ -1343,6 +1367,32 @@ mod tests {
             live_keys(&pool, victim).await,
             0,
             "EVERY live key must be revoked by the suspend"
+        );
+
+        // AND THE PRE-REVOKED SESSION WAS NOT RE-STAMPED - the session-side half of the comment
+        // above about the pre-revoked KEY.
+        //
+        // `revoked_at` is what the retention sweep reads (`db.rs`: `DELETE FROM sessions WHERE
+        // COALESCE(revoked_at, expires_at) <= ?`), so stamping an already-revoked row with `now`
+        // pushes its collection instant forward by the full window: a row due to be deleted is
+        // retained another 30 days, and every suspend re-stamps it again.
+        //
+        // The key-side equivalent has been asserted here since this test was written. MEASURED, for
+        // the session side: deleting `AND revoked_at IS NULL` from suspend's UPDATE left the whole
+        // suite at 665 passed / 0 failed.
+        let dead_session_after: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
+                .bind(hash_token(&dead_session_token))
+                .fetch_one(&pool)
+                .await
+                .expect("read the pre-revoked session's revocation time");
+        assert_eq!(
+            dead_session_after,
+            Some(dead_session_stamped),
+            "suspend must NOT re-stamp an already-revoked session. If this moved, the UPDATE ran \
+             without its `revoked_at IS NULL` guard, and the retention sweep - which reads \
+             COALESCE(revoked_at, expires_at) - keeps the row for the full window from this moment \
+             instead of deleting it on schedule."
         );
 
         // Not one unrevoked session row is left, expired ones included.

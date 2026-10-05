@@ -3324,6 +3324,65 @@ mod tests {
             changed.body_text()
         );
 
+        // AND THE CHANGE DID NOT REWRITE AN ALREADY-REVOKED ROW'S TIMESTAMP.
+        //
+        // `change_password` revokes with `UPDATE sessions SET revoked_at = ? WHERE account_id = ?
+        // AND revoked_at IS NULL`, and MEASURED, before this assertion existed: deleting that guard
+        // left the whole suite at 665 passed / 0 failed. Nothing observed the predicate.
+        //
+        // WHY IT IS NOT BOOKKEEPING. `revoked_at` is what the retention sweep reads -
+        // `db.rs`: `DELETE FROM sessions WHERE COALESCE(revoked_at, expires_at) <= ?` - so
+        // re-stamping an already-revoked row pushes its collection instant forward by the full
+        // window. A row due to be deleted is retained another 30 days, and every password change
+        // re-stamps it again.
+        //
+        // The fixture is the arrangement where the statement actually reads an already-revoked row:
+        // a SIBLING revoked directly at a fixed instant, with this handler then running over the
+        // account. A second `change_password` would NOT do - by then the caller's own session is
+        // revoked, `resolve_account_from_cookie` refuses, and the UPDATE never executes at all,
+        // which is how an earlier attempt at this assertion passed against the mutant.
+        let sibling_token =
+            add_live_session(&pool, account.account_id, Utc::now() + Duration::days(1)).await;
+        let sibling_stamped = Utc::now() - Duration::days(3);
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?")
+            .bind(sibling_stamped)
+            .bind(hash_token(&sibling_token))
+            .execute(&pool)
+            .await
+            .expect("revoke the sibling at a fixed instant");
+
+        // A THIRD change, from a session that is still live, so the handler runs its UPDATE.
+        let caller_token =
+            add_live_session(&pool, account.account_id, Utc::now() + Duration::days(1)).await;
+        let third = call(change_password(
+            State(state.clone()),
+            peer(),
+            cookie_header(&caller_token),
+            change_request("new-password-456", "third-password-789"),
+        ))
+        .await;
+        assert_eq!(
+            third.status,
+            StatusCode::NO_CONTENT,
+            "the second change must succeed: {}",
+            third.body_text()
+        );
+
+        let sibling_after: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
+                .bind(hash_token(&sibling_token))
+                .fetch_one(&pool)
+                .await
+                .expect("read the sibling's revocation time");
+        assert_eq!(
+            sibling_after,
+            Some(sibling_stamped),
+            "the change's account-wide revoke must not REWRITE the revocation time of an \
+             already-revoked session. If this moved, the UPDATE ran without its `revoked_at IS NULL` \
+             guard, and the retention sweep - which reads COALESCE(revoked_at, expires_at) - keeps \
+             the row for the full window from this moment instead of deleting it on schedule."
+        );
+
         // The link is dead: redeeming it now fails. This is the assertion that fails
         // against a handler that only revoked the sessions.
         let redeemed = crate::identity::tokens::consume(
@@ -4265,6 +4324,61 @@ mod tests {
                 .await
                 .is_err(),
             "and the specific token from before the reset must no longer resolve"
+        );
+
+        // AND IT DID NOT REWRITE AN ALREADY-REVOKED ROW'S TIMESTAMP.
+        //
+        // This handler's revoke is `UPDATE sessions SET revoked_at = ? WHERE account_id = ?
+        // AND revoked_at IS NULL`, and MEASURED: deleting that guard left the whole suite at
+        // 665 passed / 0 failed. Nothing observed the predicate.
+        //
+        // WHY IT IS NOT BOOKKEEPING. `revoked_at` is what the retention sweep reads -
+        // `db.rs`: `DELETE FROM sessions WHERE COALESCE(revoked_at, expires_at) <= ?` - so
+        // re-stamping an already-revoked row pushes its collection instant forward by the full
+        // window. A row due to be deleted is retained another 30 days, and every reset re-stamps it
+        // again. The column would stop meaning "when this session was revoked".
+        //
+        // The fixture is the only arrangement where the statement reads an already-revoked row: a
+        // SIBLING revoked directly at a fixed instant, before this handler runs over the account.
+        let sibling_token =
+            add_live_session(&pool, account_id, Utc::now() + Duration::days(1)).await;
+        let sibling_stamped = Utc::now() - Duration::days(5);
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?")
+            .bind(sibling_stamped)
+            .bind(hash_token(&sibling_token))
+            .execute(&pool)
+            .await
+            .expect("revoke the sibling at a fixed instant");
+
+        let second = identity::tokens::issue(
+            &pool,
+            account_id,
+            identity::tokens::Purpose::Reset,
+            Duration::minutes(30),
+            Utc::now(),
+        )
+        .await
+        .expect("issuing a second reset token must work");
+        let response = call(confirm_password_reset(
+            State(state.clone()),
+            reset_json(&second.raw, email, "the-third-password"),
+        ))
+        .await;
+        assert_eq!(response.status, StatusCode::NO_CONTENT);
+
+        let sibling_after: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
+                .bind(hash_token(&sibling_token))
+                .fetch_one(&pool)
+                .await
+                .expect("read the sibling's revocation time");
+        assert_eq!(
+            sibling_after,
+            Some(sibling_stamped),
+            "the reset's account-wide revoke must not REWRITE the revocation time of an \
+             already-revoked session. If this moved, the UPDATE ran without its `revoked_at IS NULL` \
+             guard, and the retention sweep - which reads COALESCE(revoked_at, expires_at) - keeps \
+             the row for the full window from this moment instead of deleting it on schedule."
         );
 
         // AND THE RESET DID NOT VERIFY THE ADDRESS. This is the assertion that was missing, and
