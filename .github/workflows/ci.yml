@@ -752,6 +752,81 @@ jobs:
             exit 1
           }
 
+          # 5: `once`, THE COMBINED RUN, which nothing drove.
+          #
+          # Every step above drives ONE verb. `once` is different: it calls `run_wired_jobs`, which
+          # runs six jobs in sequence and returns non-zero if ANY of them failed. The README states
+          # the contract at .docker/maintenance/README.md:214 - "`once` and the individual verbs exit
+          # non-zero if any wired job failed, so this service can gate CI the same way
+          # tools/reconcile/reconcile.sh does" - and MEASURED, no automation ran it: the only
+          # references were a hand-recorded results table (README rows d/e/n/o) and a STATIC grep in
+          # tools/alert-check/check.sh that reads `run_wired_jobs`'s TEXT to confirm it schedules
+          # run_alert_checks. Neither executes the composition.
+          #
+          # WHAT THAT LEAVES UNTESTED is the part only the composition has:
+          #   - `run_retention || rc=1` accumulates rather than aborting, so a failure in an EARLY
+          #     job must still let the LATER ones run. An `|| exit 1` here would silently skip the
+          #     money check whenever retention failed - the failure mode where the sweep that
+          #     matters most is the one that stops being reported.
+          #   - the AGGREGATE exit code. Six jobs, one status: a `return 0` anywhere loses every
+          #     other job's verdict, and this service gates on that status.
+          #
+          # Both are asserted below with REAL drift, not a mocked failure.
+          echo "== once: the combined run, on a consistent database =="
+          once_ok=0
+          out=$($RUN $MOUNT $REC $ALERT $ENV $ALERT_ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP once 2>&1) || once_ok=$?
+          echo "$out"
+          if [ "$once_ok" -ne 0 ]; then
+            echo "::error::'once' exited $once_ok on a database every individual verb passed on. The combined run must succeed where its parts do."
+            exit 1
+          fi
+          # ALL SIX must appear. A `once` that ran three jobs and returned 0 would satisfy the
+          # exit-code check above, so the jobs are counted by name.
+          for job in retention reconcile hold-sweep credit-expiry alerts alert-probes; do
+            echo "$out" | grep -q "job $job: " || {
+              echo "::error::'once' never reached 'job $job' - run_wired_jobs runs six jobs and this run reported fewer, so a later job is unreachable behind an earlier one"
+              exit 1
+            }
+          done
+
+          # Now inject drift and require TWO things of the same run: a NON-ZERO exit, and the
+          # LATER jobs still reporting. The second is the accumulation property - an early `exit`
+          # would leave `alerts` and `alert-probes` unrun, which the loop above cannot see because
+          # this run is expected to fail.
+          $RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "UPDATE wallets SET balance_idr = balance_idr + 500;"'
+
+          once_rc=0
+          out=$($RUN $MOUNT $REC $ALERT $ENV $ALERT_ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP once 2>&1) || once_rc=$?
+          echo "$out"
+          if [ "$once_rc" -eq 0 ]; then
+            echo "::error::'once' exited 0 with injected ledger drift. The README promises it exits non-zero if ANY wired job failed, and reconcile is one of those jobs - a combined run that reports success over a failed money check is worse than no combined run at all."
+            exit 1
+          fi
+          # THE ACCUMULATION PROPERTY. reconcile failed, and the three jobs AFTER it must still have
+          # run. `run_reconcile || rc=1` continues; `run_reconcile || exit 1` does not, and the
+          # difference is invisible to the exit code alone.
+          for job in hold-sweep credit-expiry alert-probes; do
+            echo "$out" | grep -q "job $job: " || {
+              echo "::error::'once' stopped at reconcile (job $job never reported). A failing job must not abort the run - the jobs after it include the alert path, and a scheduler that goes silent precisely when something is wrong is the failure this service exists to prevent."
+              exit 1
+            }
+          done
+          # The failure must be NAMED, not merely counted: the aggregate exit says something broke,
+          # and only the job's own line says what.
+          echo "$out" | grep -q "job reconcile: FAILED" || {
+            echo "::error::'once' exited non-zero without naming the failing job - an operator has a status and no cause"
+            exit 1
+          }
+
+          # Put the drift back, so the cleanup below and anything after it see a consistent volume.
+          $RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "UPDATE wallets SET balance_idr = balance_idr - 500;"'
+
           # Cleanup is BEST-EFFORT and must NEVER fail the step. The volume is
           # scratch, and the daemon can still hold it for a moment after the
           # `--rm` containers exit, so the removal is allowed to fail.
