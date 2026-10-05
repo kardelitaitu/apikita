@@ -52,6 +52,7 @@ anyway, so the check below can demand an exact match:
 | --- | --- |
 | Apply migrations to an empty database | Migrations apply cleanly, in order, to a database that is empty *literally* (deleted first) |
 | Validate the schema against the plan | The shipped schema still matches the plan's Appendix A, **and** 32 invariant probes pass against it |
+| Probe the SQLite dialect assumptions the port rests on | `sqlite-port-probe.py` and `sqlite-timestamp-probe.py` exit 0. The plan says to run these "first, before writing any Rust"; CI ran only the third of the three, and this one had been failing on its own version banner since Python 3.14 removed `sqlite3.version` |
 
 #### The deployable artifacts actually work
 

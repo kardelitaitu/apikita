@@ -92,7 +92,7 @@ jobs:
           rm -f ci-schema-check.db ci-schema-check.db-wal ci-schema-check.db-shm
           cargo run --bin migrate
 
-# Schema DRIFT, not just applicability. The step above proves the migrations APPLY;
+      # Schema DRIFT, not just applicability. The step above proves the migrations APPLY;
       # this proves the shipped schema still matches the plan's Appendix A - "the plan is a
       # lie about the database, which is worse than no plan" - and then runs 32 INVARIANT
       # probes against the shipped migration: every table STRICT, no REAL/FLOAT column, the
@@ -106,6 +106,32 @@ jobs:
       # half.
       - name: Validate the schema against the plan
         run: python3 tools/sqlite-probes/validate-migration-schema.py
+
+      # THE OTHER TWO PROBES, which nothing ran - and one of them was BROKEN the whole time.
+      #
+      # docs/plans/sqlite-migration.md says to "run the probes first, before writing any Rust.
+      # They take seconds and they confirm the dialect assumptions the whole port rests on", and
+      # lists all three. CI invoked only `validate-migration-schema.py`. MEASURED on Python 3.14.5:
+      #
+      #   sqlite-port-probe.py   exit 1  AttributeError: module 'sqlite3' has no attribute 'version'
+      #   sqlite-timestamp-probe.py   exit 0
+      #
+      # `sqlite3.version` was REMOVED in Python 3.14, and the line sat in the script's own version
+      # banner - before the first probe ran - so the whole file died on its heading. Every
+      # assertion the plan cites from it was unverified by anything.
+      #
+      # AND IT WAS HIDING A SECOND FAILURE, which is the same shape as the comment above about the
+      # drift check: once the banner was fixed, `VACUUM INTO (the backup primitive)` reported
+      # `[ERROR] cannot VACUUM from within a transaction`. That was the probe forgetting to
+      # `commit()` - Python's sqlite3 opens an implied transaction before a DML statement - so the
+      # script had been saying the BACKUP PRIMITIVE does not work when it meant its own harness did
+      # not. Fixed in the probe; both now run 24 and N probes with exit 0.
+      #
+      # A red first line was again hiding a whole second half. Run all three.
+      - name: Probe the SQLite dialect assumptions the port rests on
+        run: |
+          python3 tools/sqlite-probes/sqlite-port-probe.py
+          python3 tools/sqlite-probes/sqlite-timestamp-probe.py
 
       # There is no second, `#[ignore]`d database tier any more. The database is a
       # file, so `server/src/test_support.rs` gives every database test its own

@@ -27,7 +27,16 @@ def fresh():
 
 
 print(f"sqlite3 library version : {sqlite3.sqlite_version}")
-print(f"python sqlite3 module   : {sqlite3.version}")
+# `sqlite3.version` WAS REMOVED IN PYTHON 3.14, and this line ran before a single probe did, so the
+# script died on its own banner - `AttributeError: module 'sqlite3' has no attribute 'version'`,
+# exit 1. MEASURED on Python 3.14.5. docs/plans/sqlite-migration.md says to "run the probes first,
+# before writing any Rust", and this is the FIRST of the three, so that instruction led straight
+# into a crash rather than a measurement.
+#
+# `sys.version` has no deprecation and says the thing the line was for: WHICH interpreter is running
+# the module. The sqlite library version above is the one the port's behaviour depends on, and it
+# stays from `sqlite3.sqlite_version`, which is not affected.
+print(f"python                  : {sys.version.split()[0]}")
 print()
 
 # ---------------------------------------------------------------------------
@@ -341,6 +350,24 @@ def t_vacuum_into():
     con = fresh()
     con.execute("CREATE TABLE t (k TEXT)")
     con.execute("INSERT INTO t VALUES ('a')")
+    # THE COMMIT IS THE POINT OF THIS PROBE, NOT A DETAIL OF IT.
+    #
+    # Python's sqlite3 opens an IMPLICIT transaction before a DML statement (isolation_level=''),
+    # so the INSERT above left the connection "within a transaction" and SQLite refused:
+    #
+    #   OperationalError: cannot VACUUM from within a transaction
+    #
+    # That was reported as `[ERROR] VACUUM INTO (the backup primitive)` for as long as nobody ran
+    # this script, so the probe appeared to say the BACKUP PRIMITIVE does not work, when what it
+    # actually said was that the probe forgot to commit. MEASURED, three ways:
+    #   (a) uncommitted INSERT            -> ERROR: cannot VACUUM from within a transaction
+    #   (b) after con.commit()            -> ok, 8192 bytes
+    #   (c) sqlite3.connect(...).isolation_level == '' (the implicit-transaction default)
+    #
+    # Worth keeping as a comment because it is a REAL hazard for the Rust code too: the backup path
+    # must not hold an open write transaction when it runs the vacuum. The probe now commits and so
+    # measures the primitive rather than its own harness.
+    con.commit()
     import tempfile, os
     p = os.path.join(tempfile.mkdtemp(), "backup.db")
     con.execute(f"VACUUM INTO '{p}'")
