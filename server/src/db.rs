@@ -1849,13 +1849,37 @@ async fn settle_partial_usage(
 ) -> Result<UsageSettlement, AppError> {
     let (debited_idr, _) = clamp_debit(cost_idr, available_idr);
 
-    // The clamped debit fits by construction, but it can still miss: a concurrent
-    // settlement can take the balance between the caller's guarded UPDATE and the
-    // read that sized this clamp, and a row failing the guard is not locked. Re-clamp
-    // once against the balance as it is now. A second miss leaves the debit at zero,
-    // which is the safe floor: a zero ledger delta cannot break
-    // balance_idr = SUM(ledger.delta_idr) whatever the other transaction did, and the
-    // usage is recorded either way - discarding it is the defect being fixed.
+    // THE RETRY BELOW IS UNREACHABLE, and it is kept as a cheap invariant rather than deleted.
+    //
+    // What it was written for: "a concurrent settlement can take the balance between the caller's
+    // guarded UPDATE and the read that sized this clamp, and a row failing the guard is not locked."
+    // That interleave cannot happen here, and the reason is the LOCK rather than the statement order.
+    // `debit_usage_transaction` opens this transaction with `begin_immediate`, so SQLite's write lock
+    // is held for the whole of it: `available_idr` is read under that lock at the caller, and no other
+    // connection can write between that read and the `try_debit` here. MEASURED, on a two-connection
+    // probe against this crate's own pool settings: a second `BEGIN IMMEDIATE` BLOCKS until the first
+    // commits - it does not interleave, and it does not proceed on a stale snapshot.
+    //
+    // So `clamp_debit(cost, available)` always yields a debit the wallet can cover, the first
+    // `try_debit` always matches, and this `None` arm is dead. What makes it dead is the clamp's own
+    // guarantee: `assert_clamp_debit_invariants` asserts the debit is EXACTLY `true_cost.min(held)`,
+    // where `held` is `available_idr.max(0)` - so `debited_idr <= available_idr` is not an extra
+    // property that could be forgotten, it is the equality the property test pins over the boundary
+    // grid. The clamp and the guard therefore use the same figure, read in the same locked
+    // transaction.
+    //
+    // WHY IT IS KEPT. Deleting it would be correct and would also remove the only thing that holds
+    // the floor if the lock ever weakens - `begin_immediate`'s own doc says it exists so that "a later
+    // edit that adds a read to the top of one of these functions cannot reintroduce the trap", which
+    // is an admission that the property is maintained by discipline rather than by the type system. If
+    // a future change switched this path to a deferred `BEGIN`, the interleave becomes possible again
+    // and this arm becomes the thing standing between that and a lost debit. It costs one branch on a
+    // path that has already failed its fast path.
+    //
+    // What was WRONG was the comment, not the code: it described a race this transaction's lock
+    // prevents, so a reader could not tell "reachable and handled" from "unreachable and kept". The
+    // second `None` arm floors at zero, which is safe for `balance_idr = SUM(ledger.delta_idr)`
+    // whatever happened - that part of the original reasoning holds and is why the floor is 0.
     let (debited_idr, new_balance) = match try_debit(&mut tx, account_id, debited_idr).await? {
         Some(new_balance) => (debited_idr, new_balance),
         None => {
