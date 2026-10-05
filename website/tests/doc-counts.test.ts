@@ -39,7 +39,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * measurement, and that matters more than being wrong, because the comment tells the next
  * person there is nothing to update.
  */
-const WEBSITE_TESTS = 196;
+const WEBSITE_TESTS = 203;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -58,7 +58,7 @@ const WEBSITE_TESTS = 196;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 656;
+const SERVER_TESTS = 658;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -362,6 +362,7 @@ test('no doc still claims a superseded count', () => {
         '653 tests', '653 passed', '653 / 0 / 0',
         '654 tests', '654 passed', '654 / 0 / 0',
         '655 tests', '655 passed', '655 / 0 / 0',
+        '656 tests', '656 passed', '656 / 0 / 0',
       ],
     },
     {
@@ -448,6 +449,10 @@ test('no doc still claims a superseded count', () => {
         // all emptied, and a new guard (all four assertions mutation-proved) now fails if any
         // of the three grows a field back.
         'website: **189 tests**', 'passes **189 tests**', '**189 tests**',
+        // Retired when the website suite reached 203. The count had been stale since before
+        // this bump: 196 was the figure the docs carried and the suite had already grown past it,
+        // which is exactly the drift this constant exists to make visible.
+        'website: **196 tests**', 'passes **196 tests**', '**196 tests**',
       ],
     },
   ];
