@@ -3980,4 +3980,127 @@ mod tests {
             );
         }
     }
+
+    /// A comment must not claim data goes to **Postgres**. There is none.
+    ///
+    /// WHY THIS EXISTS. `hash_token`'s doc comment said the plaintext "never reaches Postgres", and
+    /// `routes/mod.rs` had a second such line in a test. Both were present-tense claims about where
+    /// a credential goes, and the port to SQLite is complete: `db.rs` is `SqlitePool` throughout and
+    /// `main.rs` states outright that this deployment has no Postgres. A reader who believed the
+    /// comment would reason about a network boundary that does not exist, and about the wrong
+    /// transaction semantics and types behind it.
+    ///
+    /// The first one also cited `docs/website/02-data-model.md` as current authority - while
+    /// `the_superseded_documents_say_so` in this same file already records that document as
+    /// "SUPERSEDED - it documents the PostgreSQL schema the port replaced". The guard knew the
+    /// citation was dead and the comment did not, which is the shape this file keeps meeting.
+    ///
+    /// WHAT IS ALLOWED, because most mentions here are GOOD and this check must not fight them: a
+    /// PAST-TENSE note about the code that came before - "the Postgres original did this in one
+    /// statement", "Ported from the Postgres original" - explains why a dialect choice was made and
+    /// is cited to `docs/plans/sqlite-migration.md`. Those are history. The rule is about a claim in
+    /// the present tense that the SYSTEM still stores somewhere that does not exist.
+    ///
+    /// SO THE CHECK IS NARROW, and it is narrow on purpose: it fires on a comment line that names
+    /// Postgres AND uses a present-tense storage verb, and that does NOT carry one of the
+    /// history markers. A broader check would flag the migration notes and be deleted by whoever
+    /// touched the file next - the failure mode `strip_comments`' own doc comment describes.
+    #[test]
+    fn no_comment_claims_data_is_stored_in_a_database_this_crate_does_not_use() {
+        // Present-tense storage verbs. A line must carry one of these AND name Postgres.
+        const CLAIMS: &[&str] = &[
+            "never reaches Postgres",
+            "reaches Postgres",
+            "stored in Postgres",
+            "stored to Postgres",
+            "goes to Postgres",
+            "reaches PostgreSQL",
+            "stored in PostgreSQL",
+        ];
+        // History markers. A line carrying one is a note about the old code, not a claim.
+        const HISTORY: &[&str] = &[
+            "original",
+            "Ported",
+            "ported",
+            "used to",
+            "migration",
+            "no longer",
+            "would have",
+            "relied on",
+            "the plan",
+            "Postgres-shaped",
+            "Postgres-only",
+            "had Postgres",
+            "Postgres defaults",
+            "Postgres schema",
+            "Postgres keeps",
+            "Postgres stores",
+            "Postgres stores",
+            "requires live Postgres",
+            "no Postgres is running",
+            "a REAL Postgres",
+            "Live Postgres",
+            "if the constant",
+        ];
+
+        let mut offenders = Vec::new();
+        for path in source_files() {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            for (n, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // comments only
+                if !(trimmed.starts_with("//")
+                    || trimmed.starts_with("///")
+                    || trimmed.starts_with("//!"))
+                {
+                    continue;
+                }
+                let claims_postgres = CLAIMS.iter().any(|c| line.contains(c));
+                if !claims_postgres {
+                    continue;
+                }
+                if HISTORY.iter().any(|h| line.contains(h)) {
+                    continue;
+                }
+                // A QUOTED claim is a comment ABOUT the claim, not the claim. `hash_token`'s fixed
+                // comment has to be able to quote the phrase it is correcting and explain why it was
+                // wrong - a guard that forbids quoting makes the correction impossible to record,
+                // which is how a guard gets deleted by the next person to touch the file.
+                //
+                // THE EXCLUSION IS "A QUOTE MARK ON EACH SIDE", not "the claim IS a quoted string".
+                // MEASURED: the narrower form let a correction through that quoted a LONGER sentence
+                // containing the claim, which is exactly how a correction reads. Matching before-and-
+                // after is what makes that pass without also letting the bare claim through.
+                //
+                // THIS PARAGRAPH DOES NOT REPEAT THE PHRASE, deliberately: it did, and the guard fired
+                // on its own comment. Reworded rather than special-cased, because a guard whose
+                // exclusion depends on how a comment escapes its own quotes is a guard that will be
+                // wrong again the next time somebody writes about it.
+                let claims = CLAIMS
+                    .iter()
+                    .find(|c| line.contains(**c))
+                    .copied()
+                    .unwrap_or("");
+                if let Some(at) = line.find(claims) {
+                    let before = &line[..at];
+                    let after = &line[at + claims.len()..];
+                    let open = ['"', '`', '\u{201c}'];
+                    let close = ['"', '`', '\u{201d}'];
+                    if before.contains(open) && after.contains(close) {
+                        continue;
+                    }
+                }
+                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "a comment claims data is stored in Postgres, and this crate has no Postgres - the port \
+             to SQLite is complete and `main.rs` says so. A reader who believes this line reasons \
+             about a network boundary that does not exist. If the line is a NOTE ABOUT THE OLD CODE, \
+             say so in the past tense (\"the Postgres original ...\") and it will pass. Sites: \
+             {offenders:#?}"
+        );
+    }
 }

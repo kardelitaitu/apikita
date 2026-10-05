@@ -43,8 +43,25 @@ use proxy::AppState;
 pub const SESSION_COOKIE: &str = "session";
 
 /// SHA-256 of a credential, hex. Only the hash is ever stored or compared
-/// (docs/website/02-data-model.md, sessions), so the plaintext never reaches
-/// Postgres.
+/// (docs/server/api-spec.md, sessions), so the plaintext never reaches the DATABASE.
+///
+/// THIS SAID "never reaches Postgres" AND CITED A SUPERSEDED DOCUMENT, which is worth recording
+/// because both halves were wrong in the same direction - a reader sent to the wrong engine and the
+/// wrong page.
+///
+///   * There is no Postgres. The port is complete: `db.rs` is `SqlitePool` throughout and
+///     `main.rs` says outright that this deployment has no Postgres. `doc_claims.rs` already marks
+///     the schema document this comment used to cite as "SUPERSEDED - it documents the PostgreSQL
+///     schema the port replaced", so the guard knew the citation was dead and this line did not.
+///   * Naming the engine in a claim about a CREDENTIAL matters more than it looks. "Never reaches
+///     Postgres" invites the reader to reason about a network boundary; the truth is a file, and the
+///     relevant fact for a credential is narrower and stronger - it is not in the DATABASE at all,
+///     whichever engine. The hash is, and a hash is what a lookup can use.
+///
+/// The historical notes elsewhere in this crate that begin "the Postgres original" are DELIBERATE
+/// and are NOT this: they explain why a dialect choice was made, and `docs/plans/sqlite-migration.md`
+/// is their cited home. The distinction is tense and subject - a past-tense note about the old code
+/// is history; a present-tense claim about where data goes is a claim about THIS system.
 pub fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -909,7 +926,8 @@ mod tests {
 
     #[test]
     fn session_token_hash_is_sha256_hex_and_never_the_token() {
-        // Only the hash reaches Postgres; the cookie value never does.
+        // Only the hash reaches the DATABASE; the cookie value never does. (This comment said
+        // "Postgres" - there is no Postgres, the port to SQLite is complete. See `hash_token`.)
         assert_eq!(
             hash_token("apk_sess_abc"),
             "c943c9214781fe698239bd2827dda2ed0fd7c0c746cd3ab44785da20083a1a9e"
