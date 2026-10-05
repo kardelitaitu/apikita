@@ -24,6 +24,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -58,7 +59,7 @@ const WEBSITE_TESTS = 203;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 658;
+const SERVER_TESTS = 659;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -105,6 +106,65 @@ test('every doc states the measured server test count', () => {
       `${file} must state "${needle}" (the suite reports ${SERVER_TESTS})`,
     );
   }
+});
+
+/**
+ * THE LINK THE CHAIN WAS MISSING: `SERVER_TESTS` itself, against the suite.
+ *
+ * Every other test in this file compares a DOCUMENT to the constant. None compared the constant to
+ * reality, so a stale figure propagated consistently - which is the design working for the docs and
+ * failing for the number. MEASURED twice in four rounds: the constant read 656 while the suite had
+ * 658, then 658 while it had 659. Both times every doc agreed with the constant and the suite was
+ * green, which is exactly the state the comment above calls "the one state this guard cannot detect".
+ *
+ * WHY A LITERAL WAS EVER RIGHT, AND WHY IT IS NOT ANY MORE. The header says the count is passed in
+ * because running `cargo test` from a node test would recurse. That is true of running. It is NOT
+ * true of LISTING: `cargo test --lib -- --list` enumerates the tests and executes none of them, so
+ * nothing recurses and the website suite is not re-entered. MEASURED: 624 ms against 53 s for a real
+ * run, and a node test that shells out to it returns the right figure with no recursion.
+ *
+ * So the number is now checked by a measurement rather than by recall - which is the standard this
+ * file set for every document and had never applied to itself.
+ *
+ * WHAT IT DOES WHEN CARGO IS ABSENT. It SKIPS rather than passes. A contributor without a Rust
+ * toolchain, or a `cargo` that fails to start, must not be told the count is correct: that is the
+ * same fail-open this repository writes guards against. The skip is loud and says what it did not
+ * check.
+ */
+test('SERVER_TESTS is the count the library suite actually has', (t) => {
+  let listed = '';
+  try {
+    listed = execFileSync('cargo', ['test', '--lib', '--', '--list'], {
+      cwd: join(root, 'server'),
+      encoding: 'utf8',
+      timeout: 600_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    t.skip(`cargo test --lib -- --list could not run here (${(err as Error).message.split('\n')[0]}), so the count was NOT verified`);
+    return;
+  }
+
+  const summary = listed.match(/(\d+) tests?, \d+ benchmarks?/);
+  assert.ok(
+    summary,
+    `cargo test --lib -- --list printed no "N tests, M benchmarks" summary, so the count was not read. First 300 chars: ${listed.slice(0, 300)}`,
+  );
+
+  const listed_count = Number(summary[1]);
+  // A LISTING CANNOT BE ZERO. A floor, because a build that failed, or a target that was renamed,
+  // would print "0 tests" and this assertion would otherwise read that as agreement with a constant
+  // that had also gone to zero.
+  assert.ok(
+    listed_count > 600,
+    `the library suite listed only ${listed_count} tests, which is far below this repository's size - the listing did not read the real suite`,
+  );
+
+  assert.equal(
+    SERVER_TESTS,
+    listed_count,
+    `SERVER_TESTS is ${SERVER_TESTS} and the library suite has ${listed_count} tests. The four documents below this constant now agree with a figure that is wrong, because every check in this file compares a document to the CONSTANT and none compared the constant to the SUITE. Bump SERVER_TESTS and the four SERVER_CLAIMS sites together`,
+  );
 });
 
 test('every doc states the measured website test count', () => {
@@ -363,6 +423,10 @@ test('no doc still claims a superseded count', () => {
         '654 tests', '654 passed', '654 / 0 / 0',
         '655 tests', '655 passed', '655 / 0 / 0',
         '656 tests', '656 passed', '656 / 0 / 0',
+        // 657 was passed through between the two constants and never published on its own;
+        // recorded for the same reason 648 was, so a document carrying it cannot reappear.
+        '657 tests', '657 passed', '657 / 0 / 0',
+        '658 tests', '658 passed', '658 / 0 / 0',
       ],
     },
     {
