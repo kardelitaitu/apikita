@@ -1309,9 +1309,10 @@ mod tests {
         }
 
         assert!(
-            // Slack, for the reason the two source walks above now carry: 30 is the
-            // file count, so a floor equal to it cannot distinguish a whole-crate walk
-            // from a narrowed one.
+            // Slack, for the reason the other source walks carry: a floor equal to the file
+            // count cannot distinguish a whole-crate walk from a narrowed one. This walk DOES
+            // count `.rs` files under `server/src`, so the figure moves with the crate - it is
+            // 38 at the time of writing, and a floor AT it would be a tripwire.
             files >= 18,
             "only {files} Rust files were read, so nothing can look read"
         );
@@ -1881,8 +1882,11 @@ mod tests {
         }
         sources.sort();
         assert!(
-            // Slack for the same reason as the other source walk: 30 is the file count,
-            // and a floor equal to it is a tripwire rather than a guard.
+            // Slack for the same reason as the other source walks: a floor equal to the file
+            // count is a tripwire rather than a guard. This walk counts `.rs` files under
+            // `server/src`, so the figure is 38 at the time of writing - the number was 30
+            // when this comment was written, which is why the sentence names the PROPERTY
+            // (slack below the count) rather than the count itself.
             walked >= 18,
             "only {walked} Rust files were walked, so this test is not looking at the whole crate"
         );
