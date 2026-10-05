@@ -653,6 +653,98 @@ mod tests {
             .expect("attempts two hours old must be outside the one-hour window");
     }
 
+    /// A row EXACTLY at the window start still counts, and this is the only test that sits on it.
+    ///
+    /// WHY IT IS NEEDED. Both arms of `record_and_check` count `created_at >= window_start`, so the
+    /// boundary row is INSIDE the closed window. The test above seeds its rows TWO HOURS back against
+    /// an HOURLY window - clearly outside, never on the line. MEASURED: flipping EITHER arm's
+    /// comparison to `>` left the whole suite green at 673 passed / 0 failed.
+    ///
+    /// That matters more here than in a retention sweep. These are the credential-guessing caps: an
+    /// exclusive boundary lets an attacker make one more attempt per window than the policy states,
+    /// on every window, forever - and the suite is blind to it.
+    ///
+    /// This is the FIFTH fixture found with the same habit (see `abuse.rs`'s
+    /// `a_row_exactly_at_the_window_start_still_counts_against_the_cap`, and the three retention
+    /// rounds before it), which is why it is now written down in each place rather than treated as an
+    /// isolated miss: a fixture is written to be CLEARLY on one side of a boundary, and the cheap way
+    /// to be clear is to be far from it.
+    ///
+    /// BOTH ARMS ARE SEEDED. `Subject::Ip` and `Subject::Account` are separate SQL strings, so a test
+    /// that exercised one would leave the other's flip uncaught - which is exactly the state this
+    /// round found them in.
+    #[tokio::test]
+    async fn an_attempt_exactly_at_the_window_start_still_counts() {
+        let db = TestDb::new().await;
+        let now = Utc::now();
+        let window = window();
+        let key = ip_key(ip("203.0.113.17"), &[7u8; 32]);
+        let account = crate::test_support::account(&db.pool).await;
+
+        // `window` rows, all stamped EXACTLY at `now - window`, so a cap of `window`-count is full and
+        // the next attempt must be refused. If the comparison is `>`, these fall outside, `used` reads
+        // 0, and the attempt is allowed while the budget is in fact spent.
+        let at_the_start = now - window;
+        let budget = window.num_hours();
+        assert!(
+            budget > 0,
+            "the fixture assumes a window of at least an hour"
+        );
+        for _ in 0..budget {
+            record(&db.pool, Kind::Login, Subject::Ip(&key), at_the_start)
+                .await
+                .expect("seed an IP attempt on the window start");
+            record(
+                &db.pool,
+                Kind::Login,
+                Subject::Account(account),
+                at_the_start,
+            )
+            .await
+            .expect("seed an account attempt on the window start");
+        }
+
+        // A cap of ONE with `budget` rows on the boundary: both arms must refuse.
+        let ip_err = record_and_check(&db.pool, Kind::Login, Subject::Ip(&key), 1, now).await;
+        assert!(
+            ip_err.is_err(),
+            "{budget} attempts stamped exactly at `now - window` are INSIDE the closed window \
+             [now - window, now], so the IP-keyed budget is spent and the next attempt must be \
+             refused. Being allowed here means the IP arm's comparison excludes the boundary, so the \
+             cap is one wider than the policy on every window"
+        );
+
+        let account_err =
+            record_and_check(&db.pool, Kind::Login, Subject::Account(account), 1, now).await;
+        assert!(
+            account_err.is_err(),
+            "the ACCOUNT arm has its own SQL and its own boundary. A test that covers only the IP arm \
+             leaves this one uncaught, which is the state a mutation survey found them in"
+        );
+
+        // And a microsecond the other side of the line is OUTSIDE it, so both budgets free. This is
+        // what makes the refusals above a BOUNDARY assertion rather than a counting one.
+        sqlx::query("UPDATE auth_attempts SET created_at = ? WHERE kind = ?")
+            .bind(at_the_start - Duration::microseconds(1))
+            .bind(Kind::Login.as_str())
+            .execute(&db.pool)
+            .await
+            .expect("move every attempt a microsecond out of the window");
+
+        assert!(
+            record_and_check(&db.pool, Kind::Login, Subject::Ip(&key), 1, now)
+                .await
+                .is_ok(),
+            "a microsecond outside the window does not count, so the IP budget frees"
+        );
+        assert!(
+            record_and_check(&db.pool, Kind::Login, Subject::Account(account), 1, now)
+                .await
+                .is_ok(),
+            "and the account budget frees with it"
+        );
+    }
+
     /// THE DAILY-SALT CONSEQUENCE, which until now lived only in this module's prose: the IP-keyed
     /// caps are an hourly window over a key that CHANGES AT THE UTC DAY BOUNDARY, so a caller who
     /// spends their whole budget at the end of one day and again at the start of the next gets TWO
