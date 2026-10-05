@@ -3259,10 +3259,17 @@ mod tests {
 
     /// THE DETECTING TEST for `drift_rows` above, which had none.
     ///
-    /// All 14 of this file's call sites assert `drift_rows(...) == 0` as a fixture sanity
+    /// EVERY OTHER call site in this file asserts `drift_rows(...) == 0` as a fixture sanity
     /// check ("fixture must not drift"). A helper that ALWAYS returns 0 satisfies that
     /// perfectly, so none of them can catch the helper weakening - MEASURED: replacing the
     /// `HAVING` clause with `HAVING 0` leaves every test in the suite passing.
+    ///
+    /// THE COUNT IS DELIBERATELY NOT STATED. This comment was COPIED from `keys.rs`, which said
+    /// "All 14 of this file's call sites" - already wrong there when written, and wrong twice over
+    /// here: this file held 15 zero-expecting sites then and holds 20 now, plus the one detector
+    /// below. A shared sentence carrying one file's number into another file is the
+    /// duplicate-that-drifts shape. The relationship is what matters and it is stable: every other
+    /// site is a fixture check, and this is the only one asserting the OTHER direction.
     ///
     /// This asserts the other direction, on the case the schema permits and the old `LEFT JOIN`
     /// form could not see: a `ledger` row whose account has NO `wallets` row.

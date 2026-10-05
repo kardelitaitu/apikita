@@ -1055,10 +1055,17 @@ mod tests {
 
     /// THE DETECTING TEST for `drift_rows` above, which had none.
     ///
-    /// All 14 of this file's call sites assert `drift_rows(...) == 0` as a fixture sanity
+    /// EVERY OTHER call site in this file asserts `drift_rows(...) == 0` as a fixture sanity
     /// check ("fixture must not drift"). A helper that ALWAYS returns 0 satisfies that
     /// perfectly, so none of them can catch the helper weakening - MEASURED: replacing the
     /// `HAVING` clause with `HAVING 0` leaves every test in the suite passing.
+    ///
+    /// THE COUNT IS DELIBERATELY NOT STATED, and it used to be: this said "All 14 of this file's
+    /// call sites", a figure that was ALREADY WRONG when written - the file held 15 zero-expecting
+    /// sites at that commit - and holds 16 now, plus the one detector below. A count of call sites is
+    /// a number that every added test invalidates, so it tells the next reader something false about
+    /// a rule that has not changed. What matters is the relationship, which is stable: every other
+    /// site is a fixture check, and this is the only one that asserts the OTHER direction.
     ///
     /// This asserts the other direction, on the case the schema permits and the old `LEFT JOIN`
     /// form could not see: a `ledger` row whose account has NO `wallets` row.
