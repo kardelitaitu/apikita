@@ -64,6 +64,19 @@ matching on its text is a bug waiting to happen.
 | 429 | `rate_limited` | Too fast | Back off; respect `Retry-After` |
 | 500 | `internal_error` | Our bug | Retry once, then report |
 | 503 | `no_upstream_available` | Every upstream is unhealthy | Retry after `Retry-After` |
+| 503 | `unavailable` | A service THIS server depends on cannot be reached — currently the session store, when the database cannot be queried | Retry after `Retry-After`; do **not** treat as a bad session |
+
+**`unavailable` is separate from `no_upstream_available` on purpose, and separate from 401 above all.**
+Both answer 503, and the difference is what failed: `no_upstream_available` means the model providers
+are unhealthy and browsing the dashboard still works; `unavailable` means the store behind
+authentication cannot be read, so the request could be neither authorised nor refused. It must not be
+a 401 — a 401 tells a signed-in customer their session is bad, and the web client acts on a 401 by
+redirecting to `/login`, so a database blip would log the whole site out. 503 says "try again", which
+is what is true. See `routes/mod.rs::unusable_session_store`.
+
+This row was MISSING until now, and that was the defect rather than a gap in paperwork: the server
+emitted `unavailable` while this table — the client contract, "the `code` is the contract" — did not
+define it at all.
 
 ## 401 vs 403 — the distinction that matters
 

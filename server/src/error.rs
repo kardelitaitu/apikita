@@ -346,6 +346,10 @@ mod tests {
         (429, "rate_limited"),
         (500, "internal_error"),
         (503, "no_upstream_available"),
+        // ADDED with the variant's row in docs/error-model.md. The server has emitted this code since
+        // `AppError::Unavailable` was introduced; the contract did not list it, so a client switching
+        // on `code` had no definition for a 503 that is NOT `no_upstream_available`.
+        (503, "unavailable"),
     ];
 
     /// The published table is the whole API, and ONE code lives outside `AppError`:
@@ -519,6 +523,12 @@ mod tests {
     /// Every AppError variant, one of each. The response-level tests run over
     /// this whole set, so a newly added variant is covered the day it lands
     /// rather than the day someone remembers to extend a hand-picked list.
+    ///
+    /// THAT SENTENCE WAS ASPIRATIONAL until `every_variant_is_listed_here` was added below. MEASURED:
+    /// the enum had 16 variants and this list had 15 - `Unavailable` was missing - so the claim above
+    /// was describing a mechanism that did not exist. Adding a variant still needed someone to
+    /// remember, which is exactly what the comment said was unnecessary. `Unavailable` was added by
+    /// hand here as well; the difference is that the guard now fails if it happens again.
     fn every_variant() -> Vec<AppError> {
         vec![
             AppError::InvalidRequest("body is not an object".into()),
@@ -541,9 +551,114 @@ mod tests {
             AppError::NoUpstreamAvailable {
                 retry_after_secs: 30,
             },
+            AppError::Unavailable("the session store is unreachable".into()),
             AppError::Database(sqlx::Error::RowNotFound),
             AppError::Internal("upstream request failed".into()),
         ]
+    }
+
+    /// The two lists above must name EVERY variant the enum declares.
+    ///
+    /// WHY THIS IS A TEST AND NOT A COMMENT. `every_variant()` said "a newly added variant is covered
+    /// the day it lands rather than the day someone remembers to extend a hand-picked list" - and it
+    /// WAS a hand-picked list. The enum had 16 variants, `every_variant()` had 15 and
+    /// `documented_cases` had 14, and MEASURED, `Unavailable`'s status (503) and code
+    /// ("unavailable") could BOTH be changed to wrong values with the whole suite green at
+    /// 667 passed / 0 failed.
+    ///
+    /// That is not cosmetic here. `Unavailable` is what `routes/mod.rs` answers when the SESSION
+    /// STORE cannot be queried, and the 503 is load-bearing: a 401 during a database blip tells every
+    /// signed-in customer their session is bad, and the web client redirects to /login on a 401, so an
+    /// outage would log the whole site out.
+    ///
+    /// WHAT IT READS. The variant names are parsed from THIS FILE's enum declaration, so it needs no
+    /// new dependency and no reflection. A variant named in the enum and absent from either list is a
+    /// failure, with the name in the message.
+    #[test]
+    fn every_variant_is_listed_here() {
+        const SOURCE: &str = include_str!("error.rs");
+
+        // The enum body: from `pub enum AppError` to the closing brace at column 0.
+        let start = SOURCE
+            .find("pub enum AppError")
+            .expect("AppError's declaration must still be in this file");
+        let body = &SOURCE[start..];
+        let end = body
+            .find("\n}")
+            .expect("the enum must still be closed by a brace at column 0");
+        let declared: Vec<&str> = body[..end]
+            .lines()
+            .filter_map(|l| {
+                // a variant is indented four spaces and starts with an uppercase letter
+                let t = l.strip_prefix("    ")?;
+                if t.starts_with(' ') || t.starts_with('/') || t.starts_with('#') {
+                    return None;
+                }
+                let name: String = t.chars().take_while(|c| c.is_alphanumeric()).collect();
+                let mut chars = name.chars();
+                match chars.next() {
+                    Some(c) if c.is_ascii_uppercase() => Some(name),
+                    _ => None,
+                }
+            })
+            .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
+            .collect();
+
+        assert!(
+            declared.len() >= 10,
+            "only {} variants were parsed from the enum, so this check is looking at the wrong thing \
+             and would pass vacuously: {declared:?}",
+            declared.len()
+        );
+
+        // Every declared variant must produce a DISTINCT code among the ones every_variant() covers.
+        // Compared through `code()` rather than by counting entries, so a variant added to the list
+        // but mapped to an existing code is caught too - two variants sharing a terminal code is
+        // legal (`Database` and `Internal` both answer `internal_error`) and is exactly why this
+        // cannot be a plain length comparison.
+        let listed_codes: Vec<&str> = every_variant().iter().map(|e| e.code()).collect();
+        let missing_from_every: Vec<&str> = declared
+            .iter()
+            .filter(|name| {
+                let code = variant_code(name);
+                code.is_empty() || !listed_codes.contains(&code)
+            })
+            .copied()
+            .collect();
+
+        assert!(
+            missing_from_every.is_empty(),
+            "these variants are declared in `AppError` and produce no entry with a distinct code in \
+             `every_variant()`, so no response-level test covers them: {missing_from_every:?}. Add \
+             one, and add the matching row to `documented_cases` with its status - that list is what \
+             pins the contract docs/error-model.md publishes."
+        );
+    }
+
+    /// The `code()` string a variant is expected to produce, by name.
+    ///
+    /// Spelled out rather than derived: this is a second statement of the mapping, and the point of
+    /// the check above is to notice when THAT statement and the enum disagree. Deriving it from
+    /// `code()` would make the assertion a tautology.
+    fn variant_code(variant: &str) -> &'static str {
+        match variant {
+            "InvalidRequest" => "invalid_request",
+            "Unauthenticated" => "unauthenticated",
+            "KeyRevoked" => "key_revoked",
+            "KeyExpired" => "key_expired",
+            "InsufficientBalance" => "insufficient_balance",
+            "KeyLimitExceeded" => "key_limit_exceeded",
+            "ModelNotAllowed" => "model_not_allowed",
+            "WrongCredentialType" => "wrong_credential_type",
+            "NotFound" => "not_found",
+            "Conflict" => "conflict",
+            "ValidationFailed" => "validation_failed",
+            "RateLimited" => "rate_limited",
+            "NoUpstreamAvailable" => "no_upstream_available",
+            "Unavailable" => "unavailable",
+            "Database" | "Internal" => "internal_error",
+            _ => "",
+        }
     }
 
     /// One variant per documented row, paired with the row it must match.
@@ -596,6 +711,21 @@ mod tests {
                 },
                 503,
                 "no_upstream_available",
+            ),
+            // ADDED, and it was missing for as long as the variant has existed. `Unavailable` is
+            // constructed at `routes/mod.rs:108` when the SESSION STORE cannot be queried, and the
+            // reasoning there is load-bearing: a 401 during a database blip tells every signed-in
+            // customer their session is bad, and the web client redirects to /login on a 401, so the
+            // whole site would be logged out by an outage. 503 says "try again", which is true.
+            //
+            // MEASURED before this row existed: changing Unavailable's status to 500 AND its code to
+            // "internal_error" left the whole suite green at 667 passed / 0 failed, because neither
+            // list named the variant and the test's own name - "every variant" - did not notice one
+            // was missing.
+            (
+                AppError::Unavailable("the session store is unreachable".into()),
+                503,
+                "unavailable",
             ),
             (
                 AppError::Database(sqlx::Error::RowNotFound),

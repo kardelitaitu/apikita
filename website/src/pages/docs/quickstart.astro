@@ -88,6 +88,7 @@ const errorCodes = [
   { status: '429', code: 'rate_limited', meaning: "The key's requests-per-minute limit was exceeded.", action: 'Back off; honour Retry-After.' },
   { status: '500', code: 'internal_error', meaning: 'Our bug.', action: 'Retry once, then report the request_id.' },
   { status: '503', code: 'no_upstream_available', meaning: 'Every upstream is unhealthy.', action: 'Back off; honour Retry-After.' },
+  { status: '503', code: 'unavailable', meaning: 'A service this server depends on cannot be reached — currently the session store, when the database cannot be queried.', action: 'Back off; honour Retry-After. This is NOT a bad session, so do not sign the user out on it.' },
 ];
 ---
 

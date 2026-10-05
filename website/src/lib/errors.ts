@@ -153,6 +153,16 @@ export function describeError(err: unknown): ErrorView {
       // A 503 is a 5xx, so request_id applies (docs/website/03-functional-spec.md
       // rule 1). Browsing still works; only inference is degraded.
       return { ...base, message: 'Inference is degraded right now. Your dashboard still works.', requestId: err.requestId, retryable: true };
+    case 'unavailable':
+      // THE OTHER 503, and it is NOT about inference. The server answers this when the SESSION STORE
+      // cannot be read, so the request could be neither authorised nor refused (routes/mod.rs::
+      // unusable_session_store). It must not read like the inference case: nothing is degraded, the
+      // whole surface is unreachable for a moment.
+      //
+      // AND IT MUST BE `retryable: true` WITH THE SESSION KEPT. A 401 would have signed the user out,
+      // and the remedy that copy suggests - sign in again - is wrong here, because the session is
+      // fine and the store is not. The message says so, so a user does not act on a false diagnosis.
+      return { ...base, message: 'We cannot reach our database right now. Your session is fine — try again in a moment.', requestId: err.requestId, retryable: true };
     case 'internal_error':
       return { ...base, message: 'Something went wrong on our side.', requestId: err.requestId, retryable: true };
     default:
