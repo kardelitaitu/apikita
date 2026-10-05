@@ -66,11 +66,21 @@ If the plan and the schema disagree, the run fails. A plan that lies about the
 database is worse than no plan, and this is the only mechanism that stops the two
 drifting apart after the port lands.
 
-**2. Invariants**, asserted against the *shipped* migration — 32 checks:
+**2. Invariants**, asserted against the *shipped* migration — the script prints its own count, and the
+run reports **38 checks** with 0 failed. Read the number off a run rather than from here; two of the
+three figures on this list had gone stale, which is the reason the prose below names the *shape* of
+each assertion instead of the count it produced on the day this was written:
 
-- the schema has exactly 17 tables, and every one is `STRICT`;
+- the schema has **at least 17** tables, and every one is `STRICT`. NOT "exactly 17", which is what
+  this line used to say: the script pins a FLOOR on purpose, because the exact count was 17 in the
+  first migration alone and extending the probe to apply every migration made an exact assertion fail
+  on a correct schema. The run reports **21 tables** today, and a migration that adds a table should
+  not have to edit a check whose job is to catch a migration skipping the CONVENTIONS rather than to
+  ratify a number;
 - no `REAL`/`FLOAT`/`NUMERIC`/`DECIMAL` column exists anywhere;
-- all 30 date and time columns carry a `GLOB` format check;
+- **every** date and time column carries a `GLOB` format check — the run reports **39** such columns.
+  This said "all 30" and the figure moves with the schema, which makes it the same trap as the table
+  count: a reader who checks it finds a number that was true once;
 - no table has a `DEFAULT CURRENT_TIMESTAMP` — a default that fires writes the wrong
   format (plan §4.6);
 - `REAL` and `TEXT` are refused in `INTEGER` money and flag columns;
