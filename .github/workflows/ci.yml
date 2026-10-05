@@ -78,6 +78,50 @@ jobs:
         working-directory: server
         run: cargo test
 
+      # THE STATED TEST COUNT, CHECKED WHERE IT IS CHEAP RATHER THAN WHERE IT IS TRUE.
+      #
+      # docs/ci-cd.md, README.md, server/README.md and the "Unit tests" step above all state the
+      # library suite's size, and website/tests/doc-counts.test.ts is what keeps those four documents
+      # agreeing with `SERVER_TESTS`. That constant has now gone stale five times - 656 vs 658, 658 vs
+      # 659, 664 vs 665, and twice at 665 vs 667 - every time because a commit added a test and did not
+      # bump the figure, and every time the four documents went on agreeing with a wrong number.
+      #
+      # The check existed, but it ran at the LAST step of this workflow, 908 lines below this one:
+      # `Website contract tests` needs `npm install` and a website build, and sits behind the server
+      # image build and two container smoke steps. So a contributor learned about a stale count minutes
+      # later, in a step whose name gives no clue that a Rust test count is what failed.
+      #
+      # `cargo test --lib -- --list` ENUMERATES the tests and EXECUTES none of them. MEASURED: 533 ms
+      # against ~130 s for the real run, and it needs no build beyond what this step's predecessor just
+      # produced. The constant is read by grep, because running the TypeScript test file here would
+      # need the Node dependencies this early step deliberately does not install.
+      #
+      # This is a FAST SIGNAL, NOT A SECOND SOURCE OF TRUTH: doc-counts.test.ts still compares the
+      # constant to the suite and to all four documents, and remains the guard. This step only moves
+      # the discovery of a stale figure 908 lines earlier, to the step whose name already says tests.
+      - name: The stated test count matches the suite
+        working-directory: server
+        run: |
+          set -euo pipefail
+
+          actual=$(cargo test --lib -- --list 2>/dev/null | sed -n 's/^\([0-9][0-9]*\) tests\?, [0-9][0-9]* benchmarks\?$/\1/p' | head -1)
+          if [ -z "$actual" ]; then
+            echo "::error::cargo test --list printed no 'N tests, M benchmarks' summary, so the stated count was not checked"
+            exit 1
+          fi
+
+          stated=$(sed -n 's/^const SERVER_TESTS = \([0-9][0-9]*\);$/\1/p' ../website/tests/doc-counts.test.ts | head -1)
+          if [ -z "$stated" ]; then
+            echo "::error::could not read SERVER_TESTS from website/tests/doc-counts.test.ts - the constant moved or was renamed, and this step cannot verify a figure it cannot find"
+            exit 1
+          fi
+
+          if [ "$stated" != "$actual" ]; then
+            echo "::error::SERVER_TESTS is $stated and the library suite has $actual tests. Bump SERVER_TESTS and the four SERVER_CLAIMS sites (README.md, server/README.md, docs/ci-cd.md, and the Unit tests count in this file) together."
+            exit 1
+          fi
+          echo "SERVER_TESTS ($stated) matches the $actual library tests"
+
       # Schema check: every migration must apply, in order, to an empty database.
       # `bin/migrate` is the mechanism the register names (`sqlx migrate`,
       # forward-only, never on application boot): it creates the file, applies the
@@ -141,7 +185,7 @@ jobs:
       # Nothing is skipped or `#[ignore]`d: the former live-PocketBase exchange
       # test was replaced by a loopback stub, and the identity port has since
       # deleted that route and its stub entirely, so the suite reports
-      # 665 passed / 0 failed / 0 ignored. Identity is
+      # 667 passed / 0 failed / 0 ignored. Identity is
       # served natively by the crate - there is no PocketBase to reach at runtime.
       #
       # THE FIGURE IS PINNED, not remembered. This comment carried a count dated

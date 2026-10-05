@@ -44,6 +44,7 @@ anyway, so the check below can demand an exact match:
 | **Dependency audit** | Known CVEs in the lockfile |
 | Build | `cargo build` |
 | Unit tests | Pure logic |
+| The stated test count matches the suite | `SERVER_TESTS` still matches `cargo test --lib -- --list` |
 | **Integration tests** | A real database (bundled SQLite), real schema, fake upstream |
 
 #### Correctness of the DATABASE
@@ -210,7 +211,7 @@ So CI runs **bundled SQLite**, and the database is a file — no `services:`, no
 ```
 
 **There is no longer an ignored database tier.** `cargo test` is the whole suite:
-measured on the merged tree, `cargo test --lib` reports **665 passed / 0 failed /
+measured on the merged tree, `cargo test --lib` reports **667 passed / 0 failed /
 0 ignored**, where the previous arrangement reported 200 passed / 75 ignored and
 needed a live Postgres to run the difference.
 
