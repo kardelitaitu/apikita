@@ -81,8 +81,26 @@ const RETIRED_FIGURES =
   /(?:~?\s?(?:IDR|Rp)\s?~?\s?(?:1[.,]?100|4[.,]?400)\b)|(?:\b(?:1[.,]?100|4[.,]?400)\s?(?:IDR|Rp)\b)/;
 
 test('the superseded whitepaper figures appear only where they are being corrected', () => {
+  const docs = liveDocs();
+
+  // THE FLOOR THE TWO `offenders == []` ASSERTIONS BELOW NEED, and the reason they cannot supply
+  // their own. MEASURED: making `liveDocs()` return an empty array leaves this file at 5 pass /
+  // 0 fail - both assertions still run, find nothing to iterate, and report a clean document set.
+  // The walk finding nothing and the documents being clean are the SAME OBSERVATION to an assertion
+  // whose input is the walk's output, so the floor has to come from outside that loop.
+  //
+  // The other walkers in this repository already carry one and this file did not: `doc-counts` and
+  // its neighbours assert `>= 20` / `>= 15` / `> 1000` with the message "so this guard is vacuous".
+  // The number here is a floor rather than a count - the repository has far more than 10 live docs,
+  // and it is deliberately not pinned to the real total, because that figure is what `doc-counts`
+  // owns and a second copy of it would drift.
+  assert.ok(
+    docs.length >= 10,
+    `liveDocs() found only ${docs.length} live document(s). The two tests below assert that NO live doc quotes the retired figures, which is vacuously true over an empty list - so a walk that stopped recursing would report a clean repository while checking nothing. Check the walk's skip list and the docs/ layout before adjusting this floor.`,
+  );
+
   const offenders: string[] = [];
-  for (const file of liveDocs()) {
+  for (const file of docs) {
     const rel = relative(root, file).replace(/\\/g, '/');
     if (ALLOWED.includes(rel)) continue;
     const text = readFileSync(file, 'utf8');
@@ -187,8 +205,20 @@ function paragraphAround(text: string, at: number): string {
 test('no live doc points at the whitepaper as the design of record', () => {
   // The failure mode this prevents: a doc re-introduces "see the whitepaper" for
   // behaviour, which sends a reader to a document known to be wrong.
+  const docs = liveDocs();
+
+  // The same floor as the retired-figures test above, and for the same measured reason: this
+  // assertion is `offenders == []`, so an empty `liveDocs()` satisfies it while inspecting nothing.
+  // Both call sites are floored deliberately rather than sharing a hoisted constant, because each
+  // one's INPUT is the walk's output - a single floor evaluated once would still leave whichever
+  // loop came second unguarded if the list were emptied between them.
+  assert.ok(
+    docs.length >= 10,
+    `liveDocs() found only ${docs.length} live document(s), so "no live doc points at the whitepaper" is vacuously true. This assertion has no other input: check the walk before adjusting the floor.`,
+  );
+
   const offenders: string[] = [];
-  for (const file of liveDocs()) {
+  for (const file of docs) {
     const rel = relative(root, file).replace(/\\/g, '/');
     if (rel === 'docs/whitepaper.md' || rel === 'docs/failover.md' || rel === 'docs/plan-audit.md') continue;
     const text = readFileSync(file, 'utf8');
