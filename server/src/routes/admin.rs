@@ -1209,6 +1209,77 @@ mod tests {
         (status, json_body(res).await)
     }
 
+    /// `forbidden` obeys docs/error-model.md's rules, and it has no variant to enforce them.
+    ///
+    /// WHY THIS IS SEPARATE FROM error.rs's CHECKS. `forbidden` is the ONE error code built outside
+    /// `AppError` - `forbidden_response` assembles its own envelope, because the operator surface
+    /// needs a message that says WHICH denial, and no `AppError` variant carries one. Every guard in
+    /// error.rs iterates `every_variant()`, so none of them can see this response at all.
+    ///
+    /// MEASURED: replacing the generated `request_id` with an empty string left the whole suite GREEN
+    /// at 668 passed / 0 failed - while `every_error_carries_a_request_id_in_the_documented_format`
+    /// passes for all fourteen real variants, because rule 3's enforcement is scoped to them.
+    /// docs/error-model.md, rule 3 is flat: "**Always include `request_id`.** It is the support
+    /// conversation's starting point."
+    #[tokio::test]
+    async fn a_forbidden_response_follows_the_documented_error_rules() {
+        let res = forbidden_response("operator access is required");
+        let status = res.status();
+        let body = json_body(res).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "docs/error-model.md publishes 403 for `forbidden`. A 401 here would be acted on by the \
+             web client as a dead session and redirect to /login."
+        );
+        let error = &body["error"];
+        assert_eq!(
+            error["code"], "forbidden",
+            "the code is the contract (docs/error-model.md, rule 4)"
+        );
+        assert_eq!(
+            error["message"], "operator access is required",
+            "the operator surface's whole reason for building this envelope by hand is that its \
+             message says WHICH denial"
+        );
+
+        // RULE 3, and the assertion the mutation above walked past.
+        let id = error["request_id"]
+            .as_str()
+            .expect("docs/error-model.md, rule 3 - always include `request_id`");
+        assert!(
+            id.starts_with("req_"),
+            "request_id must follow the documented req_... form, got {id}"
+        );
+        let hex = &id["req_".len()..];
+        assert_eq!(
+            hex.len(),
+            32,
+            "request_id suffix should be a bare uuid, got {id}"
+        );
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "request_id suffix must be hex, got {id}"
+        );
+
+        // The documented shape, field for field. `details` is OMITTED when there is none -
+        // `ApiErrorBody` carries `#[serde(skip_serializing_if = "Option::is_none")]`, so absence is
+        // the documented encoding and not a gap. Asserted this way round because my first version
+        // required the key to be PRESENT and failed on a correct response.
+        assert!(
+            error["details"].is_null(),
+            "a forbidden has no field-level detail, so `details` is either absent or null - never a \
+             populated object: {body}"
+        );
+        assert_eq!(
+            error.as_object().map(|o| o.len()),
+            Some(3),
+            "the envelope is code, message, request_id and nothing else when details is absent. An \
+             extra key is a field a client may come to depend on: {body}"
+        );
+    }
+
     /// A request through the whole router, so the real extractors and the real
     /// dispatch order run.
     async fn call(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
