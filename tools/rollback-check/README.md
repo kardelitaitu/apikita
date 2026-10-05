@@ -46,7 +46,10 @@ The drill now separates them: a non-numeric reading exits 4 with
 ## What this check does NOT cover -- read this before trusting it
 
 Measured with a verified mutation battery (8 mutations, each confirmed to have landed).
-**Two of the drill's assertions are mutation-covered; four are not.**
+**Two of the drill's assertions are mutation-covered; FIVE are not** - seven in the table below.
+(The sentence read "four", which the table has never agreed with: it lists seven rows, and the fifth
+uncovered one is the `LOW == LIVE_LOW` refusal branch, which `drill.sh` really does implement. A
+count that disagrees with the table printed under it is the kind of figure a reader stops checking.)
 
 | Drill assertion | Covered? |
 | --- | --- |
@@ -58,7 +61,7 @@ Measured with a verified mutation battery (8 mutations, each confirmed to have l
 | row-count comparison | no -- and unreachable in the desync scenario |
 | `LOW == LIVE_LOW` refusal branch | no |
 
-**Why the four are structural rather than missing tests:**
+**Why the five are structural rather than missing tests:**
 
 - **integrity** -- the drill checks a file `.restore` just wrote from a snapshot it
   produced itself. Nothing in its interface can make integrity fail, so the assertion is
