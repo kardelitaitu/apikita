@@ -250,13 +250,17 @@ topup_per_hour = 5
 # should be enforcing it and it will not.
 #
 # **AND WITH THESE TWO VALUES IT WOULD NOT BIND ANYWAY, which changes how urgent that is.**
-# 5 per hour is 5 per minute, which is under 10, so no client can reach this cap on ANY
-# route while topup_per_hour is the smaller number. Wiring this key without raising that
-# one would add a second query per request and change no outcome - so the trigger to wire
-# it is a NEW ROUTE, and the arithmetic below says when the arithmetic changes too.
+# `topup_per_hour` is 5 per hour, which is one request every 12 minutes - so the busiest a client
+# can be on that route while still being admitted is an order of magnitude below the 10 per MINUTE
+# this key would allow, and no client can reach this cap on ANY route while `topup_per_hour` is the
+# smaller number. (It read "5 per hour is 5 per minute", which is not a true statement about the
+# rate; the comparison it was carrying is 5/hour < 10/minute, which holds by a factor of 120.) Wiring
+# this key without raising that one would add a second query per request and change no outcome - so
+# the trigger to wire it is a NEW ROUTE, and the arithmetic below says when the arithmetic changes too.
 #
-#     5/hour  <  10/minute        this key can never bind
+#     5/hour  <  10/minute        this key can never bind    (5/hour = 0.083/min)
 #     600/hour >  10/minute       this key WOULD bind, and nothing would enforce it
+#                                 (600/hour = 10/min, exactly - so the trigger is > 600)
 #
 # So there are two ways this becomes real, and they need different responses: a second
 # caller-controlled wallet mutation (wire this key), or `topup_per_hour` raised above 600
