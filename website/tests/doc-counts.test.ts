@@ -59,7 +59,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * So this figure is updated WITH the run that changes it. That is a smaller guarantee than the server
  * count now carries, and it is stated rather than implied.
  */
-const WEBSITE_TESTS = 204;
+const WEBSITE_TESTS = 205;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -538,6 +538,7 @@ test('no doc still claims a superseded count', () => {
         // this bump: 196 was the figure the docs carried and the suite had already grown past it,
         // which is exactly the drift this constant exists to make visible.
         'website: **196 tests**', 'passes **196 tests**', '**196 tests**',
+        'website: **204 tests**', 'passes **204 tests**', '**204 tests**',
       ],
     },
   ];
