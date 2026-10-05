@@ -116,6 +116,23 @@ pub async fn hash_password(auth: AuthConfig, password: String) -> Result<String,
 /// The comparison is constant-time inside the crate, which is why this does not
 /// re-implement one: `PasswordVerifier::verify_password` is the only thing here
 /// that sees both the secret and the guess.
+///
+/// WHERE THAT GUARANTEE ACTUALLY LIVES, traced rather than assumed, because the obvious reading of
+/// the crate source is that it does NOT hold. In the `password-hash` crate's blanket
+/// `PasswordVerifier` impl, the comparison is written as a plain `==` between the expected and the
+/// computed `Output`. On the page that reads as an early-exit byte comparison, and it would be one if
+/// `Output` were a plain byte array. It is not: the same crate implements `PartialEq for Output` by
+/// delegating to `subtle`'s `ConstantTimeEq` (`self.ct_eq(other).into()`), and the crate's own note
+/// above the `==` says exactly that - "See notes on `Output` about the use of a constant-time
+/// comparison". So the operator is a plain `==` and the implementation behind it is constant-time,
+/// which is the opposite of what the line looks like. The citations here name the crate rather than a
+/// line, because these are dependency sources that this repository's citation guard cannot follow.
+///
+/// What that guarantee does NOT cover, stated for the same reason it is stated on
+/// `require_bot_token`: `Output`'s `ct_eq` compares `self.as_ref()` against `other.as_ref()`, so it
+/// inherits `subtle`'s length short-circuit. Here that is unreachable - both operands are the
+/// fixed-width output of the same KDF under the same parameters - but a reader should not have to
+/// re-derive that from a crate two levels down.
 pub async fn verify_password(
     auth: AuthConfig,
     stored: String,
