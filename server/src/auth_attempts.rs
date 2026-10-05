@@ -653,6 +653,100 @@ mod tests {
             .expect("attempts two hours old must be outside the one-hour window");
     }
 
+    /// THE DAILY-SALT CONSEQUENCE, which until now lived only in this module's prose: the IP-keyed
+    /// caps are an hourly window over a key that CHANGES AT THE UTC DAY BOUNDARY, so a caller who
+    /// spends their whole budget at the end of one day and again at the start of the next gets TWO
+    /// budgets in about ten seconds.
+    ///
+    /// The module doc calls this "the failure mode that hides" and states the ceiling as "ONE EXTRA
+    /// BUDGET PER DAY per IP-keyed cap — not an unbounded limiter". The arithmetic behind that
+    /// sentence was measured before this test existed, by simulating the real rule (rows are keyed on
+    /// the salted hash, a refused attempt writes nothing, the window is one hour, the salt rotates
+    /// daily): over ten simulated days an unbounded attacker never exceeded the designed 24-hour rate,
+    /// and the ONLY excess was one extra budget at the boundary. That is the claim asserted here.
+    ///
+    /// The salt itself is NOT reachable from this module - `Subject::Ip` carries the already-computed
+    /// hash, and `routes/auth.rs` is what hashes under `salt_for_day(today_utc())`. So two days are
+    /// modelled as two keys, which is exactly what the boundary produces. `ip_tracking.rs` separately
+    /// tests that the rotation really mints a different salt (`the_salt_is_stable_within_a_day_and_replaced_across_days`),
+    /// which is the half that makes this key change in production.
+    ///
+    /// WHAT THIS TEST DOES *NOT* PIN, measured rather than assumed: every row it writes is stamped
+    /// `now`, so it has no row outside any plausible window and is blind to the window's LENGTH.
+    /// Widening `window()` from 1 hour to 25 does not fail this test - it is caught by
+    /// `attempts_older_than_the_window_do_not_count`, which is the test written for that property.
+    /// Dropping the `kind` condition from the query also does not fail this one; that is
+    /// `the_kinds_do_not_share_a_budget`'s job. Both were checked by mutation, and both are equivalent
+    /// mutants HERE rather than gaps. The property this test owns is the KEY separation - that a fresh
+    /// key grants a fresh budget and that the budget is still finite.
+    #[tokio::test]
+    async fn a_salt_rotation_grants_one_extra_budget_and_not_an_unbounded_limiter() {
+        let db = TestDb::new().await;
+        let now = Utc::now();
+        /// The cap the caller passes in; `record_and_check` takes a `u32`.
+        const CAP: u32 = 3;
+        /// The same figure for the row-count assertion, which `COUNT(*)` returns as `i64`.
+        const CAP_ROWS: i64 = CAP as i64;
+
+        // Day one's key, and the key the rotation produces a moment later.
+        let day_one = ip_key(ip("203.0.113.17"), &[11u8; 32]);
+        let day_two = ip_key(ip("203.0.113.17"), &[12u8; 32]);
+
+        // Spend day one's ENTIRE budget in the minute before the boundary. `>=` is the refusal bound
+        // (module docs: "The bound is INCLUSIVE — `used < limit` allows"), so the CAP-th attempt is
+        // the last one allowed.
+        for attempt in 0..CAP {
+            record_and_check(&db.pool, Kind::Login, Subject::Ip(&day_one), CAP, now)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("attempt {attempt} of {CAP} is within day one's budget: {e:?}")
+                });
+        }
+        assert!(
+            record_and_check(&db.pool, Kind::Login, Subject::Ip(&day_one), CAP, now)
+                .await
+                .is_err(),
+            "day one's budget must be EXHAUSTED, or the second budget below proves nothing"
+        );
+
+        // The boundary passes: the same caller, the same address, a new key.
+        // The extra budget is real - this is the documented cost of the privacy choice.
+        for attempt in 0..CAP {
+            record_and_check(&db.pool, Kind::Login, Subject::Ip(&day_two), CAP, now)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("attempt {attempt} of {CAP} is day two's fresh budget: {e:?}")
+                });
+        }
+
+        // AND IT IS NOT UNBOUNDED: day two's budget is itself exhaustible, so the excess is one
+        // budget per rotation rather than a limiter that stops limiting. If a future change made
+        // these caps count on something unstable, or lengthened the window past the salt's life,
+        // this assertion is what would stop holding.
+        assert!(
+            record_and_check(&db.pool, Kind::Login, Subject::Ip(&day_two), CAP, now)
+                .await
+                .is_err(),
+            "the second day's budget must ALSO be exhaustible, or the rotation gives an unbounded \
+             limiter rather than the documented one-extra-budget-per-day"
+        );
+
+        // The two budgets are separate rows, not one shared count: the first day's attempts are
+        // invisible under the second day's key, which is the unlinkability the privacy page promises.
+        let day_two_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM auth_attempts WHERE ip_hash = ? AND kind = ?")
+                .bind(day_two)
+                .bind(Kind::Login.as_str())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count day two");
+        assert_eq!(
+            day_two_rows, CAP_ROWS,
+            "the second day's rows must be its own budget's worth - the first day's attempts are \
+             under a different hash and are what makes yesterday unlinkable"
+        );
+    }
+
     /// A real IP and a real account are hashed and stored as such — the raw
     /// address never lands in the table. Gate 4 of docs/launch-checklist.md and
     /// the privacy page both promise this, and it is the kind of promise that is
