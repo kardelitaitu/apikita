@@ -642,9 +642,33 @@ fn bot_token() -> Result<String, AppError> {
 
 /// Checks the `Authorization: Bearer <token>` header against the bot secret.
 ///
-/// Compared in CONSTANT TIME via `subtle`, the same primitive the Midtrans
-/// signature uses: a byte-by-byte early-exit comparison leaks the secret's prefix
-/// through timing, and this secret authorises a wallet binding.
+/// Compared with `subtle`, the same primitive the Midtrans signature uses: a byte-by-byte
+/// early-exit comparison leaks the secret's prefix through timing, and this secret authorises a
+/// wallet binding.
+///
+/// WHAT THAT GUARANTEE ACTUALLY IS, because the primitive is weaker than "constant time" and the
+/// difference is reachable HERE. `subtle`'s `ConstantTimeEq for [T]` short-circuits on the LENGTHS of
+/// its arguments before comparing any byte - its own source says so: "Short-circuit on the *lengths*
+/// of the slices, not their contents" (subtle 2.6.1, lib.rs). So this comparison leaks the EXPECTED
+/// token's length through its running time, and does not leak its prefix.
+///
+/// Why that is acceptable here, stated rather than assumed: a Telegram bot token has a public shape,
+/// so its length is not a secret, and length is not the credential. What matters is that no PREFIX is
+/// leaked, which `subtle` does guarantee.
+///
+/// Why the Midtrans comparison in `money.rs` is not the same case despite sharing the primitive:
+/// its left operand is `hex::encode(Sha512::...)` - a 128-character hex digest - and its right
+/// operand is the notification's `signature_key`, which Midtrans also sends as a hex digest. Both
+/// sides are therefore the same fixed width, so the short-circuit is reachable only for a malformed
+/// notification, never for a well-formed one. This function compares an environment-supplied secret
+/// against whatever the caller sends, so the lengths differ on every wrong guess - which is why the
+/// distinction is written down here rather than there.
+///
+/// This comment is the ONLY specification of the comparison's behaviour: a timing property cannot be
+/// asserted in a unit test, and no test in this module attempts to. A reader who took "constant time"
+/// at face value would believe the length was protected, and would then be wrong about which property
+/// the next change has to preserve - hashing both sides to a fixed width is what would make the length
+/// safe, and that is a change nobody would make while the looser wording stands.
 fn require_bot_token(headers: &HeaderMap) -> Result<(), AppError> {
     let expected = bot_token()?;
 
