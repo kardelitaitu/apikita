@@ -501,6 +501,90 @@ test('every numeric retention period the privacy page publishes is the one that 
     );
   }
 
+  // --- THE LINK-CODE GRACE, which is ONE DAY stated in HOURS -------------------
+  // This row was compared by NOTHING until it was measured. It is not in `pairs` above because its
+  // period is prose - "Until used or expired + 24h" - and `daysIn` reads a number followed by
+  // days/months/years, so it would have hit the `assert.fail` arm. It is not in `unnumbered` below
+  // either, because that list asserts the ABSENCE of a digit and this row has one. So it fell between
+  // the two halves of this test, and MEASURED it fell silently: changing the page to "+ 48h" left the
+  // whole website suite at 221 pass / 0 fail.
+  //
+  // What that would have meant: the page promising two days while `LINK_CODE_RETENTION_GRACE_DAYS`
+  // expires the row after one - a promise kept by the document and broken by the code, which is the
+  // shape the header above names as the reason this test exists.
+  //
+  // THE '+' IS LOAD-BEARING IN THE PATTERN. The window is "expired, PLUS one day"; a matcher that
+  // accepted any `24h` anywhere on the row would also accept a rewrite that dropped the grace and
+  // said "until expired, 24h" - a different claim that happens to contain the same number.
+  {
+    const keep = published('Telegram link codes');
+    const statedHours = keep.match(/\+\s*(\d+)\s*h\b/);
+    assert.ok(
+      statedHours !== null,
+      `website/src/lib/privacy.ts publishes "${keep}" for the link-code row, which no longer states a "+ Nh" grace, so the period cannot be read. If the row was reworded, update this matcher - but keep the "+", because that is what makes the claim "one day AFTER the code stops working" rather than a bare hour count.`,
+    );
+    // The grace is DECLARED in routes/telegram.rs and re-exported through db.rs. Read it from the
+    // module that owns the number, since that is the one the purge uses.
+    const graceDays = rustNumber(
+      'routes/telegram.rs',
+      /const LINK_CODE_RETENTION_GRACE_DAYS:\s*i64\s*=\s*(\d+)/,
+      'the link_codes retention grace',
+    );
+    assert.equal(
+      Number(statedHours[1]),
+      graceDays * 24,
+      `website/src/lib/privacy.ts publishes "${keep}" for the link-code row, which reads as ${Number(statedHours[1])} hours after the code stops being usable, but server/src/routes/telegram.rs declares a grace of ${graceDays} day(s) = ${graceDays * 24} hours. The page promises a window the sweep does not implement.`,
+    );
+  }
+
+  // --- THE LOGS ROW, which no sweep can own and which nothing compared ---------
+  // "30-90 days" describes a LOG ROTATION policy, and MEASURED there is no rotation mechanism in this
+  // repository to compare it to: no logrotate config, no `maxage`, no `rotate` for logs anywhere -
+  // and `docs/observability.md` still lists "Log retention period" as an UNTICKED checklist item. So
+  // the number is published before it is implemented, which is a launch-checklist matter rather than
+  // something this test can enforce.
+  //
+  // What it CAN enforce is that the two documents stating it agree. `docs/data-retention.md` and
+  // `website/src/lib/privacy.ts` both publish this window, and a privacy notice that disagrees with
+  // the retention policy it is supposed to summarize is the failure this file exists for - the row
+  // read "30-90 days" in both places by inspection, and MEASURED nothing compared them: changing the
+  // page to "5-10 days" left the suite at 221 pass / 0 fail.
+  //
+  // The comparison is between DOCUMENTS rather than against a constant, because the constant is the
+  // thing that does not exist yet. When log rotation lands, the pair to add is a real one.
+  {
+    const keep = published('Logs');
+    const stated = keep.match(/^(\d+)\s*-\s*(\d+)\s*days$/);
+    assert.ok(
+      stated !== null,
+      `website/src/lib/privacy.ts publishes "${keep}" for the Logs row, which is no longer a "N-N days" range. That row is the only place this window is stated as a range, and the shape is what makes it readable as a window rather than a point.`,
+    );
+    const [low, high] = [Number(stated[1]), Number(stated[2])];
+    assert.ok(
+      low < high,
+      `website/src/lib/privacy.ts publishes "${keep}" for the Logs row, whose range is not ascending. A backwards range reads as a window and means nothing.`,
+    );
+
+    // The policy document must state the same range. Read it as TEXT, the way every other
+    // doc-comparison in this suite does, because a markdown table row cannot be imported.
+    const policy = readFileSync(join(here, '..', '..', 'docs', 'data-retention.md'), 'utf8');
+    const row = policy.split('\n').find((l) => /^\|\s*\*\*Logs\*\*/.test(l.trim()));
+    assert.ok(
+      row !== undefined,
+      'docs/data-retention.md no longer has a **Logs** row, so the privacy page states a window the retention policy does not. Either the row was renamed or the policy dropped it; both need to be deliberate.',
+    );
+    const policyRange = row.match(/(\d+)\s*-\s*(\d+)\s*days/);
+    assert.ok(
+      policyRange !== null,
+      `docs/data-retention.md's Logs row no longer states an "N-N days" range, so it cannot be compared to the page: ${row.trim().slice(0, 120)}`,
+    );
+    assert.equal(
+      `${Number(policyRange[1])}-${Number(policyRange[2])}`,
+      `${low}-${high}`,
+      `website/src/lib/privacy.ts publishes "${keep}" for the Logs row while docs/data-retention.md's Logs row says "${policyRange[0]}". A privacy notice that disagrees with the retention policy it summarizes is a disclosure defect, not a typo.`,
+    );
+  }
+
   // --- the identity links, whose window is a CONFIG TTL, not a sweep --------
   // These are the two figures the file header has been promising to check since
   // the `minlength="8"` round, and they are the reason this test exists at all.
