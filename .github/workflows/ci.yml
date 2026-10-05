@@ -1026,9 +1026,50 @@ jobs:
         working-directory: website
         run: npm run build
 
+      # THE SKIPS ARE COUNTED, because a skip is a green tick over an assertion that did not run.
+      #
+      # MEASURED, in this exact step: with `website/dist` present the run reports
+      # `# pass 211 / # skipped 0`, and with it ABSENT the run reports `# pass 210 / # skipped 1` -
+      # and BOTH exit 0. `node --test` does not fail on a skip, so "the rendered pages were verified"
+      # and "nothing was verified" produce the same exit code and the same green tick.
+      #
+      # Round 66 fixed the ORDER (`Build website` before this step) so that `dist/` exists, and
+      # tools/ci-docs-check/check.sh now pins that pair in both files. But that guard only holds the
+      # order; it cannot see whether the skip happened anyway - because of a build that produced no
+      # `dist/`, an `outDir` change in astro.config.mjs, or a new skip added to another test file.
+      # Before this step, nothing in this workflow read the skipped count at all: `git grep -F
+      # 'skipped 0'` matched no tool, no workflow line, and no test.
+      #
+      # So this asserts the FLOOR: zero skips, zero failures. It is deliberately not a count of
+      # PASSES - that figure lives in website/tests/doc-counts.test.ts, which sums to 211 - because a
+      # second copy of a count here would be the hand-kept figure this repository has had to re-bump
+      # five times. "Nothing was skipped" is stable under adding tests; "N passed" is not.
       - name: Website contract tests
         working-directory: website
-        run: node --test 'tests/**/*.test.ts'
+        run: |
+          set -euo pipefail
+          node --test 'tests/**/*.test.ts' 2>&1 | tee /tmp/website-tests.log
+
+          skipped=$(sed -n 's/^# skipped \([0-9][0-9]*\)$/\1/p' /tmp/website-tests.log | tail -1)
+          failed=$(sed -n 's/^# fail \([0-9][0-9]*\)$/\1/p' /tmp/website-tests.log | tail -1)
+
+          # A summary that could not be read is not a pass - the same fail-closed rule the count check
+          # above follows. `node --test` always prints these lines, so an empty read means the output
+          # shape changed and this guard no longer measures anything.
+          if [ -z "$skipped" ] || [ -z "$failed" ]; then
+            echo "::error::could not read the '# skipped' / '# fail' summary from the test output, so the skip count was NOT verified. The output shape changed; fix this guard rather than deleting it."
+            exit 1
+          fi
+
+          if [ "$failed" != "0" ]; then
+            echo "::error::$failed website contract tests failed"
+            exit 1
+          fi
+          if [ "$skipped" != "0" ]; then
+            echo "::error::$skipped website contract test(s) SKIPPED. A skip reports as a pass and verifies nothing - built-output.test.ts skips without website/dist, and doc-counts.test.ts skips without cargo. Run the same command locally to see which, and fix the cause instead of accepting the tick."
+            exit 1
+          fi
+          echo "website contract tests: 0 failed, 0 skipped"
 
       # A floor, not a full scanner: enough to catch the two mistakes that reach
       # history most often. docs/ci-cd.md leaves the tool open.

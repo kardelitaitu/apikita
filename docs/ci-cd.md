@@ -64,7 +64,7 @@ anyway, so the check below can demand an exact match:
 | Smoke the maintenance scheduler image | The nightly jobs run for real in the image that ships - retention, hold-sweep, **and the two alert jobs**, each given the SAME mounts `docker-compose.yml` gives them. The alert jobs are asserted to reach a **verdict** rather than crash on a missing mount, to **name the absent channel** instead of implying the stack is monitored, and to **skip `api_down` explicitly** when no API URL is set - because `probe.sh` would otherwise default to `127.0.0.1`, which inside a container is its own loopback, and poll it for two minutes on every scheduled run |
 | Typecheck (website) | `tsc --noEmit` |
 | Build website | Every page builds. **It runs BEFORE the contract tests below, and that order is load-bearing**: one of those tests reads the rendered pages under `website/dist`, so with the build after them it reported a skip on every run and verified nothing. `ci-docs-check` pins this pair's order for that reason |
-| Website contract tests | The frontend's own suites, including the rendered-output checks that need `dist/` to exist |
+| Website contract tests | The frontend's own suites, including the rendered-output checks that need `dist/` to exist. **The step FAILS on a skip, not just on a failure**: measured, a run without `website/dist` reports `# pass 210 / # skipped 1` and still exits 0, so the exit code alone cannot tell "the rendered pages were verified" from "nothing was verified". The step reads the summary and requires `fail 0, skipped 0`, and refuses a summary it cannot read rather than passing over it |
 
 #### The contracts that fail SILENTLY
 
