@@ -2359,6 +2359,105 @@ mod tests {
         outcome.expect("the logout_all dead-session assertions panicked");
     }
 
+    /// The "revoked_at IS NULL" clause in logout_all's SELECT - the half its neighbour above does
+    /// NOT cover.
+    ///
+    /// `live_logout_all_ignores_a_session_that_is_not_live` tests the `expires_at > ?` clause with an
+    /// EXPIRED cookie. An expired row fails `session_is_live_at` on `expires_at` whatever the SQL
+    /// says, so that test passes with either clause removed and does not reach this one.
+    ///
+    /// MEASURED: deleting `revoked_at IS NULL` from logout_all's SELECT - and only from that copy,
+    /// leaving the two resolver copies intact - left the whole suite at 664 passed / 0 failed.
+    ///
+    /// WHY IT MATTERS. `session_is_live_at` takes NO revocation parameter, so it cannot catch a
+    /// revoked row. The only thing standing between a REVOKED-but-unexpired cookie and the global
+    /// revoke below is this SQL clause. Without it, a token the server no longer honours anywhere
+    /// else can still sign every other device on the account out - the same denial of service the
+    /// doc-comment on `logout_all` describes for the idle half, arriving through the half that is
+    /// present in its SQL.
+    ///
+    /// The fixture is the case the clause exists for and no test had: revoked, not yet expired.
+    #[tokio::test]
+    async fn live_logout_all_ignores_a_revoked_but_unexpired_session() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = live_account(&pool).await;
+
+        // Revoked, but future-dated: `session_is_live_at` will call this live.
+        let revoked_token =
+            add_live_session(&pool, account.account_id, Utc::now() + Duration::days(30)).await;
+        // A second live session that must SURVIVE. If logout_all fires, this is revoked too.
+        let survivor_token = account.token.clone();
+
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?")
+            .bind(Utc::now())
+            .bind(hash_token(&revoked_token))
+            .execute(&pool)
+            .await
+            .expect("revoke the first session");
+
+        let outcome = tokio::spawn(logout_all_ignores_revoked_sessions(
+            pool.clone(),
+            account.account_id,
+            revoked_token,
+            survivor_token,
+        ));
+        let outcome = outcome.await;
+
+        db.close().await;
+        outcome.expect("the logout_all revoked-session assertions panicked");
+    }
+
+    async fn logout_all_ignores_revoked_sessions(
+        pool: SqlitePool,
+        account_id: Uuid,
+        revoked_token: String,
+        survivor_token: String,
+    ) {
+        assert_eq!(
+            live_sessions(&pool, account_id).await,
+            1,
+            "the fixture must leave exactly one live session, so a global revoke is visible"
+        );
+
+        // A revoked session must not resolve; it is no longer a credential anywhere.
+        assert!(
+            resolve_account_from_cookie(&pool, &cookie_header(&revoked_token))
+                .await
+                .is_err(),
+            "the fixture's revoked session must not resolve"
+        );
+
+        let response = call(logout_all(
+            State(pool.clone()),
+            cookie_header(&revoked_token),
+        ))
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::NO_CONTENT,
+            "a revoked cookie is not an error, it is just not a credential: {}",
+            response.body_text()
+        );
+
+        assert_eq!(
+            live_sessions(&pool, account_id).await,
+            1,
+            "a REVOKED-but-unexpired cookie must not sign the account's other sessions out. If this \
+             is 0, logout_all's SELECT returned a revoked row - its `revoked_at IS NULL` clause is \
+             gone or bypassed, and `session_is_live_at` cannot catch it because it takes no \
+             revocation parameter."
+        );
+
+        // ...and the surviving session still works, so nothing was silently killed.
+        assert_eq!(
+            resolve_account_from_cookie(&pool, &cookie_header(&survivor_token))
+                .await
+                .expect("the surviving session must still resolve"),
+            account_id
+        );
+    }
+
     async fn logout_all_ignores_dead_sessions(
         pool: SqlitePool,
         account_id: Uuid,
