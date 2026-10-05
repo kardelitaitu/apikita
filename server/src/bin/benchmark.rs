@@ -285,7 +285,13 @@ async fn bench_concurrent_streaming_streams(concurrency: usize) {
         "    Estimated Socket RAM: {:>10.2} MB (well within 256MB limit)",
         (concurrency * 35) as f64 / 1024.0
     );
+    // THE COUNT IS THE ONE THAT RAN, not a literal. This line read `500 concurrent active streams`
+    // for every scenario, so the 1,000-stream run printed its own result under the 500-stream
+    // heading - a benchmark that mislabels its output, on the run whose whole point is to show
+    // headroom. MEASURED: `bench_concurrent_streaming_streams(1_000)` printed `handles 500
+    // concurrent active streams`.
     println!(
-        "    Status              : [PASS] 0.2 vCPU easily handles 500 concurrent active streams\n"
+        "    Status              : [PASS] 0.2 vCPU easily handles {} concurrent active streams\n",
+        concurrency
     );
 }

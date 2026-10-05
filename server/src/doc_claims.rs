@@ -3779,4 +3779,90 @@ mod tests {
              Sites: {broken:#?}"
         );
     }
+
+    /// `docs/benchmark.md` must not send a reader to a command that does something else.
+    ///
+    /// WHY THIS EXISTS. The section documented
+    /// `cargo run --release --bin benchmark -- --concurrency 250 --duration 60s --scenarios
+    /// streaming,ledger`, and promised a summary table of RPS, p50/p90/p95/p99 and RSS/CPU.
+    /// MEASURED: that command RUNS TO COMPLETION - cargo passes the arguments and the binary
+    /// ignores them - and prints the same four fixed scenarios it always prints. So the doc
+    /// described a load test that does not exist, in the way that is hardest to notice: a command
+    /// that succeeds, so nobody investigates.
+    ///
+    /// WHAT IS PINNED, and it is the narrow part that a reader would actually act on:
+    ///   * the invocation has no flags, because the binary parses no arguments;
+    ///   * the promised output - an RPS column and a percentile column - is named as NOT produced.
+    ///
+    /// WHAT IS NOT PINNED: that the scenarios still are the four this doc lists, or that their
+    /// thresholds are the ones stated. Those need a parser for a println-driven binary, and a
+    /// guard that re-states its subject in prose is the decoration `docs/testing.md` warns about.
+    /// The struck claims below are the ones that were wrong; this test is what stops the flags
+    /// coming back.
+    #[test]
+    fn the_benchmark_doc_describes_a_command_the_binary_actually_has() {
+        let doc = std::fs::read_to_string(doc_path("benchmark.md"))
+            .expect("docs/benchmark.md must be readable, or this passes over nothing");
+
+        // THE BINARY PARSES NO ARGUMENTS. Assert that directly rather than trusting the prose: if
+        // someone adds a parser, the invocation in the doc becomes legitimate and this test should
+        // be the thing that says so.
+        let bin = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("bin")
+                .join("benchmark.rs"),
+        )
+        .expect("server/src/bin/benchmark.rs must be readable, or this passes over nothing");
+        let parses_args = bin.contains("env::args")
+            || bin.contains("args().collect")
+            || bin.contains("clap::")
+            || bin.contains("Parser::parse");
+        assert!(
+            !parses_args,
+            "benchmark.rs now parses arguments, so the documented invocation may be real again. \
+             Update docs/benchmark.md and this test together - do not just delete the assert."
+        );
+
+        // The invocation the doc shows must carry no flags, since the binary accepts none.
+        let invocation = doc
+            .lines()
+            .find(|l| l.contains("--bin benchmark"))
+            .unwrap_or_else(|| panic!("docs/benchmark.md no longer shows how to run the binary"));
+        assert!(
+            !invocation.contains(" -- "),
+            "docs/benchmark.md shows `{invocation}` with arguments, and benchmark.rs parses none. \
+             MEASURED: cargo passes them through and the binary ignores them, so the documented \
+             command SUCCEEDS while running the fixed scenarios instead of the requested ones. \
+             A reader who wants those flags wants a load test, which is a different tool."
+        );
+
+        // The struck claims must stay struck. An unstruck promise of a percentile table would
+        // re-create the defect, because that output does not exist.
+        //
+        // SCOPED TO THE BINARY'S OWN SECTION, and the first version of this check was not: it
+        // scanned the whole file and fired on `$p99 \le 2\text{ ms}$` in the TARGETS table at the
+        // top, which is a real measured objective and nothing to do with this binary's output. A
+        // guard that fails on a different section teaches people to ignore it - the same mistake
+        // `the_published_retention_periods_...` records about bolding a table cell.
+        let section = doc
+            .split("## 4. Benchmark Tooling & Execution")
+            .nth(1)
+            .expect("docs/benchmark.md must still have its tooling section");
+        for promised in ["Throughput (RPS)", "percentiles"] {
+            let live = section.lines().any(|l| {
+                let t = l.trim_start();
+                l.contains(promised)
+                    && !t.starts_with('>')
+                    && !t.starts_with("~~")
+                    && !t.contains("~~")
+            });
+            assert!(
+                !live,
+                "docs/benchmark.md's tooling section promises `{promised}` as benchmark output, \
+                 and the binary produces no RPS table and no latency histogram. Real percentiles \
+                 come from a load test against a running server, which is not what this binary is."
+            );
+        }
+    }
 }

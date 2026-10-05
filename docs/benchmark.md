@@ -89,18 +89,47 @@ We must answer five concrete questions through empirical testing:
 We provide a dedicated benchmarking harness binary in `server/src/bin/benchmark.rs`:
 
 ```bash
-# Run the benchmark harness against local server
-cargo run --release --bin benchmark -- --concurrency 250 --duration 60s --scenarios streaming,ledger
+cargo run --release --bin benchmark
 ```
 
-The benchmark runner outputs:
-- Summary table: Throughput (RPS), Latency percentiles ($p50, p90, p95, p99$), Error rate.
-- Resource telemetry: Peak RSS RAM, CPU user/system time.
-- ~~Automated Ledger Invariant Check~~ — **not implemented.** This line claimed the
-  benchmark runs `verify_wallet_reconciliation` across all modified accounts at
-  completion. It does not: `bin/benchmark.rs` never calls that function, and the only
-  callers of it are its own tests in `db.rs`. The money invariant is checked by
-  `tools/reconcile/reconcile.sh` against the real database, which is where it belongs —
-  a benchmark process holds a synthetic wallet that the reconcile query would not
-  recognise. The claim is struck rather than deleted so the next reader knows it was
-  checked, not missed.
+**It takes no arguments**, and that is not an oversight to fix by adding a parser — it is a
+different kind of tool from what this section used to describe. It is an **in-process capacity
+suite**: one OS thread (`current_thread`, standing in for a 0.2 vCPU container) running four
+synthetic scenarios — key-auth maths, Midtrans SHA-512 verification, 100-key pool routing under a
+10% 429 rate, and concurrent SSE stream simulation at 500 and 1,000 streams. It never starts a
+server and never opens the database.
+
+> ~~`cargo run --release --bin benchmark -- --concurrency 250 --duration 60s --scenarios
+> streaming,ledger`~~ — **the flags do nothing.** MEASURED: that exact command runs to completion,
+> because `cargo` passes the arguments and the binary ignores them. The output is the fixed four
+> scenarios, not the requested `streaming,ledger`. A documented invocation that silently succeeds
+> while doing something else is worse than one that fails, which is why the line is struck rather
+> than corrected.
+
+> ~~The benchmark runner outputs: Summary table: Throughput (RPS), Latency percentiles (p50, p90,
+> p95, p99), Error rate. Resource telemetry: Peak RSS RAM, CPU user/system time.~~ — **not
+> produced.** The binary has no HTTP client, no latency histogram and no RSS/CPU sampling. What it
+> actually prints per scenario is a line of `Throughput` in scenario-native units (`ops/sec`,
+> `sigs/sec`, `req/sec`, `tokens/sec`), an average latency where the scenario has one, and a
+> `[PASS]`/`[WARN]` verdict against a **hardcoded** target. Neither the units nor the thresholds
+> are configurable.
+>
+> **It follows that these numbers are not a load test and must not be quoted as one.** An
+> in-process loop over a hash function measures the hash function; it says nothing about latency
+> under real request concurrency, connection handling, or the SQLite write path. Real figures come
+> from the drill and the reconcile tools against a running stack.
+
+> ~~Automated Ledger Invariant Check~~ — **not implemented.** This line claimed the
+> benchmark runs `verify_wallet_reconciliation` across all modified accounts at
+> completion. It does not: `bin/benchmark.rs` never calls that function, and the only
+> callers of it are its own tests in `db.rs`. The money invariant is checked by
+> `tools/reconcile/reconcile.sh` against the real database, which is where it belongs —
+> a benchmark process holds a synthetic wallet that the reconcile query would not
+> recognise. The claim is struck rather than deleted so the next reader knows it was
+> checked, not missed.
+
+**A second defect, in the binary itself and fixed with this note.** Scenario 4 printed
+`[PASS] 0.2 vCPU easily handles 500 concurrent active streams` from a **literal 500**, so the
+1,000-stream run reported its result under the 500-stream heading. The message now interpolates the
+count that ran. The lesson is the same one this section keeps recording: a number written twice
+drifts, and the copy nobody re-reads is the one a reader trusts.
