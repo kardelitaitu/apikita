@@ -46,11 +46,6 @@ export function canResume(status: AccountStatus): boolean {
   return status === 'suspended';
 }
 
-/** The verb to put on the button for the action a given status allows. */
-export function actionLabel(action: 'suspend' | 'resume'): string {
-  return action === 'suspend' ? 'Suspend account' : 'Resume account';
-}
-
 /**
  * The exact, honest consequence text for an action, shown in the confirmation.
  *
@@ -376,10 +371,17 @@ export function formatErrorRate(rate: number | null): string {
   return (rate * 100).toFixed(2) + '%';
 }
 
-/**
- * The severity word for the current rate, matching the badge vocabulary the rest
- * of the console uses.
- */
-export function errorRateSeverity(metrics: OperatorMetrics): 'ok' | 'warn' {
-  return errorRateBreached(metrics) ? 'warn' : 'ok';
-}
+// `errorRateSeverity(metrics)` used to sit here, documented as "the severity word for the current
+// rate, matching the badge vocabulary the rest of the console uses", and it was NEVER CALLED.
+//
+// MEASURED three ways before removing it: an exhaustive grep across the repository (its only
+// occurrence was its own definition), `tsc --noEmit` (which does not flag unused EXPORTS, only
+// unused locals), and the built output, where the bundler had already tree-shaken the name away.
+//
+// Why it was dead weight rather than a missing wiring: it was a one-line wrapper over
+// `errorRateBreached`, which the island calls DIRECTLY and a test pins. The thing it computed was
+// already being computed. Nothing was lost by its absence, and a second source of the same word -
+// one that is never rendered - is a place where two answers can drift apart.
+//
+// `the_src_lib_export_check` in tests/doc-counts.test.ts is what found it. That check exists because
+// deleting the wrapper left the suite green: there was no behaviour to test, only a name to remove.

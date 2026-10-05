@@ -23,6 +23,47 @@ const lead = 'This is where the link in your verification email lands. We confir
       aria-live="polite"
       class="rounded-lg border border-edge-strong bg-surface-sunken p-3 text-sm text-ink"
     ></div>
+
+    <!--
+      THE RESEND AFFORDANCE, which did not exist until now.
+
+      `POST /auth/verification/resend` is in the API spec (docs/server/api-spec.md:227) with its own
+      rate limit (`verification_resend_per_hour`), the server route is implemented, and
+      `lib/auth-api.ts` had a `resendVerification` client for it - which NOTHING CALLED. MEASURED, by
+      an exhaustive grep, by `tsc --noEmit` (which does not flag unused exports) and by the built
+      output, where the bundler had tree-shaken the name away.
+
+      So a user whose verification link had expired - the common case, since the token is the only
+      thing in the email - landed on this page, was told the link was unusable, and was offered
+      "Go to sign in" as the only next step. Signing in does not verify the address, so the dead end
+      was real: the way out existed on the server and had no button.
+
+      Shown only after a failure, because a successful verification needs no resend.
+    -->
+    <div id="verify-resend" hidden class="space-y-2">
+      <p class="text-sm text-ink-muted">
+        If the link has expired, we can email a new one. This only works for an address that is
+        already registered and still unverified.
+      </p>
+      <form id="verify-resend-form" class="space-y-2">
+        <label for="verify-resend-email" class="block text-sm font-medium">Your email address</label>
+        <input
+          id="verify-resend-email"
+          name="email"
+          type="email"
+          autocomplete="email"
+          required
+          class="w-full rounded-md border border-edge-strong bg-surface px-3 py-2 text-sm"
+        />
+        <button
+          id="verify-resend-button"
+          type="submit"
+          class="rounded-md border border-edge-strong bg-surface-raised px-4 py-2 text-sm font-medium"
+        >Email me a new link</button>
+      </form>
+      <div id="verify-resend-status" role="status" aria-live="polite" class="text-sm"></div>
+    </div>
+
     <p class="text-sm">
       <a href="/login" class="font-medium underline">Go to sign in</a>
     </p>
@@ -30,12 +71,16 @@ const lead = 'This is where the link in your verification email lands. We confir
 </AuthLayout>
 
 <script>
-  import { verifyEmail } from '../lib/auth-api';
+  import { verifyEmail, resendVerification } from '../lib/auth-api';
   import { isUnreachable, readAuthToken, UNREACHABLE_MESSAGE, VERIFICATION_FAILED_MESSAGE, withoutAuthToken } from '../lib/auth-flow';
 
   const pending = document.getElementById('verify-pending') as HTMLDivElement;
   const outcome = document.getElementById('verify-outcome') as HTMLDivElement;
   const message = document.getElementById('verify-message') as HTMLDivElement;
+  const resend = document.getElementById('verify-resend') as HTMLDivElement;
+  const resendForm = document.getElementById('verify-resend-form') as HTMLFormElement;
+  const resendButton = document.getElementById('verify-resend-button') as HTMLButtonElement;
+  const resendStatus = document.getElementById('verify-resend-status') as HTMLDivElement;
 
   const token = readAuthToken(window.location.search);
 
@@ -54,8 +99,39 @@ const lead = 'This is where the link in your verification email lands. We confir
     outcome.hidden = false;
   }
 
+  /** The failure path, which is also the only place the resend form is offered. */
+  function fail(text: string): void {
+    finish(text);
+    resend.hidden = false;
+  }
+
+  resendForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const email = (document.getElementById('verify-resend-email') as HTMLInputElement).value.trim();
+    if (email === '') return;
+    resendButton.disabled = true;
+    resendStatus.textContent = 'Asking for a new link…';
+    void resendVerification(email)
+      .then((reply) => {
+        // The server answers with the same neutral message whether or not the address is registered,
+        // which is deliberate (docs/server/api-spec.md): the reply must not become an oracle for
+        // "does this address have an account". So the copy reports what was done, not what exists.
+        resendStatus.textContent = reply.message;
+        resendForm.hidden = true;
+      })
+      .catch((err: unknown) => {
+        // A 429 carries its own wait, and the copy for that is the rate-limited message; anything
+        // else is the generic unreachable/refused wording. The button is re-enabled for both, or a
+        // transient failure would leave the user with no way to try again.
+        resendStatus.textContent = isUnreachable(err)
+          ? UNREACHABLE_MESSAGE
+          : 'We could not send that link just now. Try again in a moment.';
+        resendButton.disabled = false;
+      });
+  });
+
   if (token === null) {
-    finish(VERIFICATION_FAILED_MESSAGE);
+    fail(VERIFICATION_FAILED_MESSAGE);
   } else {
     void verifyEmail(token)
       .then(() => finish('Your email address is verified. Sign in to reach the dashboard.'))
@@ -63,6 +139,6 @@ const lead = 'This is where the link in your verification email lands. We confir
       // wrong. The API marks a token consumed in the same statement that checks it,
       // so "already verified" arrives here as an unusable token and lands on the
       // same line, with the same next step.
-      .catch((err: unknown) => finish(isUnreachable(err) ? UNREACHABLE_MESSAGE : VERIFICATION_FAILED_MESSAGE));
+      .catch((err: unknown) => fail(isUnreachable(err) ? UNREACHABLE_MESSAGE : VERIFICATION_FAILED_MESSAGE));
   }
 </script>

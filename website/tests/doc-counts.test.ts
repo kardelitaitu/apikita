@@ -43,13 +43,109 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const read = (p: string) => readFileSync(join(root, p), 'utf8');
+
+/**
+ * An exported function in `src/lib/` that NOTHING calls is dead weight with a doc comment claiming a
+ * job it does not have.
+ *
+ * WHY THIS EXISTS. `admin.ts` exported `actionLabel(action)`, documented as "the verb to put on the
+ * button for the action a given status allows". It was never called: the admin island hardcodes
+ * "Suspend account" and "Resume account" in its own markup, MEASURED by three independent methods -
+ * an exhaustive grep (its only occurrence was its own definition), `tsc --noEmit` (which does not
+ * flag unused EXPORTS, only unused locals), and the built output, where the bundler had tree-shaken
+ * the name away entirely.
+ *
+ * A mutation of that function SURVIVED the whole suite, and the right reading was not "add a test":
+ * there is no behaviour to test, because nothing runs it. The copy an operator reads comes from the
+ * island's markup, and a second source of that copy - one that is never rendered - is a place where
+ * the two can silently disagree.
+ *
+ * WHAT IT DOES NOT DO. It counts CALLS, not references, so a name appearing in a doc comment or a
+ * string does not save it, and a function called only from a TEST counts as called. That last part is
+ * deliberate: a helper the suite exercises is not dead, and this check must not argue with the tests
+ * about it.
+ *
+ * COMMENTS ARE STRIPPED BEFORE COUNTING, and that is not tidiness - the first version of this check
+ * MISSED ITS OWN SUBJECT because of them. `actionLabel`'s two occurrences were its definition and a
+ * MENTION IN THIS PARAGRAPH; the count saw one non-definition hit and called it live, while
+ * `errorRateSeverity` and `resendVerification` were flagged correctly. A doc comment that discusses a
+ * function must not be able to keep it alive, or the check is defeated by whoever documents it.
+ */
+test('every exported function in src/lib is called somewhere', () => {
+  /** Line comments, block comments and doc comments removed, so only CODE is counted. */
+  const stripComments = (text: string): string =>
+    text
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+      .replace(/([^:])\/\/.*$/gm, '$1');
+
+  const libDir = join(root, 'website', 'src', 'lib');
+  const sources: Array<[string, string]> = [];
+  const collect = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) collect(full);
+      else if (/\.(ts|astro)$/.test(entry.name)) {
+        sources.push([full, stripComments(readFileSync(full, 'utf8'))]);
+      }
+    }
+  };
+  collect(join(root, 'website', 'src'));
+  sources.push(
+    ...[join(root, 'website', 'tests')].flatMap((d) =>
+      readdirSync(d)
+        .filter((f) => f.endsWith('.ts'))
+        .map((f): [string, string] => [join(d, f), stripComments(readFileSync(join(d, f), 'utf8'))]),
+    ),
+  );
+
+  const exported: Array<[string, string]> = [];
+  for (const [file, text] of sources) {
+    if (!file.includes(`${'lib'}`)) continue;
+    for (const m of text.matchAll(/^export (?:async )?function ([A-Za-z0-9_]+)/gm)) {
+      exported.push([file, m[1]]);
+    }
+  }
+
+  const uncalled: string[] = [];
+  for (const [file, name] of exported) {
+    // Count every mention across src AND tests, then subtract the DEFINITION itself. One mention per
+    // definition line, so a name with no other occurrence is uncalled. Counting this way rather than
+    // "is it imported" is deliberate: an import of a module that never names the function would
+    // otherwise mark the whole module live.
+    let mentions = 0;
+    for (const [, text] of sources) {
+      mentions += [...text.matchAll(new RegExp(`\\b${name}\\b`, 'g'))].length;
+    }
+    const definitions = sources.reduce(
+      (n, [, text]) =>
+        n + [...text.matchAll(new RegExp(`export (?:async )?function ${name}\\b`, 'g'))].length,
+      0,
+    );
+    if (mentions - definitions === 0) {
+      uncalled.push(`${file.replace(root, '').replace(/\\/g, '/')}: ${name}()`);
+    }
+  }
+
+  assert.deepEqual(
+    uncalled,
+    [],
+    'these src/lib exports are never called anywhere. An exported function with no caller still ' +
+      'carries a doc comment describing behaviour, so a reader trusts copy that nothing renders. ' +
+      'TWO DIFFERENT THINGS LAND HERE and the remedy differs: (a) DEAD WEIGHT - a redundant wrapper ' +
+      'whose work is already done elsewhere, which should be deleted; (b) MISSING WIRING - a ' +
+      'function whose SERVER ROUTE exists but which no page calls, which is a product gap to land, ' +
+      'not code to remove. Check which one you have before deleting. Sites: ' +
+      `${uncalled.join(', ')}`,
+  );
+});
 
 /**
  * The website suite's count. A LITERAL, despite what this comment used to say.
@@ -79,7 +175,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * So this figure is updated WITH the run that changes it. That is a smaller guarantee than the server
  * count now carries, and it is stated rather than implied.
  */
-const WEBSITE_TESTS = 219;
+const WEBSITE_TESTS = 220;
 
 /**
  * The server count, and the same kind of literal for the same reason.
