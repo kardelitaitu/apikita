@@ -320,6 +320,52 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// THE DIRECTORY-CREATION BRANCH, which nothing drove.
+    ///
+    /// `run` creates the database's parent directory when it is absent (see the comment on that
+    /// branch: "SQLite creates the database file but never its parent directory, and a missing
+    /// directory surfaces only as 'unable to open database file'"). Every other test here uses
+    /// `temp_db_url`, which writes into `std::env::temp_dir()` - a directory that ALWAYS exists - so
+    /// `parent.exists()` was true in all of them and the branch never executed.
+    ///
+    /// MEASURED: deleting the branch entirely, and separately turning its body into a comment, both
+    /// left this binary's suite at 8 passed / 0 failed. That is the one code path between a fresh
+    /// checkout and a working database, and it had no guard at all.
+    ///
+    /// WHY IT MATTERS BEYOND THE FRESH CHECKOUT. `docker compose up` on a clone with no
+    /// `server/data` bind-mounts a source Docker creates SILENTLY, as a root-owned directory (exit 0,
+    /// no warning - measured). The compose comment calls that harmless, and it is for the SCHEDULER,
+    /// which only reads. The host API is the process that must then create the file inside a
+    /// directory it may not own, and this branch is what makes the ordinary case work.
+    #[tokio::test]
+    async fn run_creates_the_database_directory_when_it_is_absent() {
+        // A parent that is guaranteed NOT to exist: a fresh uuid under the temp dir, never created.
+        let parent = std::env::temp_dir().join(format!("apikita-migrate-dir-{}", Uuid::new_v4()));
+        assert!(
+            !parent.exists(),
+            "the probe's parent directory must not exist, or this test proves nothing"
+        );
+        let db_path = parent.join("server.db");
+        let url = format!("sqlite://{}", db_path.to_str().unwrap().replace('\\', "/"));
+
+        run(&url)
+            .await
+            .expect("migrate must create a missing parent directory rather than failing to open");
+
+        assert!(
+            parent.is_dir(),
+            "run() returned Ok but the parent directory was not created, so the next connection \
+             would fail with 'unable to open database file'"
+        );
+        assert!(
+            db_path.exists(),
+            "run() returned Ok but created no database file inside the directory it made"
+        );
+
+        // Clean up the tree the test created, not just the file.
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     #[tokio::test]
     async fn run_rejects_an_unparseable_database_url() {
         // sqlx is lenient with a bare path (it treats "foo.db" as a relative
