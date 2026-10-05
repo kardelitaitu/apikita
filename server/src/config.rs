@@ -1012,9 +1012,22 @@ impl AppConfig {
                 // The loop above caps the cache rate at the input rate; nothing floored it.
                 // A negative rate is finite and passes that test, so a config with
                 // `cache_read_peak = -1e6` validated. It then propagated through
-                // `money::calculate_token_cost_idr`, where the cache term is SUBTRACTED:
-                // measured, input=1e3, cache=5e7, output=1e3 at r_cache=-1e6 against the
-                // shipped peak rates gives a cost of -57_499_987 IDR.
+                // `money::calculate_token_cost_idr`, whose cache term is `tokens * rate` - so a
+                // NEGATIVE RATE makes that term a negative number, which the sum at the end of
+                // the function carries straight into the total. (The mechanism matters and this
+                // comment used to name the wrong one: nothing subtracts the cache term. The rate
+                // is what is negative, and that is why the fix belongs in the validator rather
+                // than in the formula - a formula that special-cased the sign would have to
+                // decide what a negative rate MEANS, and the answer is that it means nothing.)
+                //
+                // Computed rather than quoted: input=1e3, cache=5e7, output=1e3 at r_cache=-1e6
+                // against the shipped flash peak rates (r_in=2676.78, r_out=10707.12, M=1.50)
+                // gives wholesale -49_999_986.6161, so the charge is ceil(-74_999_979.92) =
+                // -74_999_979 IDR. (This read -57_499_987, which no assignment of the stated
+                // inputs produces - the cache term alone is -5e7, already past what that figure
+                // needs, and reaching it would take r_cache near -511_111. The figure is an
+                // illustration rather than a measurement, so it is re-derived here to stay
+                // checkable; no test asserted it either way.)
                 //
                 // Where that lands is the reason this is a money defect and not a
                 // curiosity: `db::debit_usage_transaction` passes `cost_idr` STRAIGHT to
@@ -2144,11 +2157,14 @@ mod tests {
 
             // ...and NEGATIVE is not, which the upper bound alone did not cover. A
             // negative rate is finite and below the input rate, so it passed every rule
-            // here and reached `calculate_token_cost_idr`, where the cache term is
-            // subtracted - a cost of -57_499_987 IDR for the worked example in the
-            // validator's comment. `debit_usage_transaction` hands that straight to
-            // `try_debit`, whose guard is a floor rather than a sign check, so it CREDITS
-            // the wallet.
+            // here and reached `calculate_token_cost_idr`, where the cache term becomes a
+            // negative number and drags the total below zero - a cost of -74_999_979 IDR for
+            // the worked example in the validator's comment. `debit_usage_transaction` hands
+            // that straight to `try_debit`, whose guard is a floor rather than a sign check,
+            // so it CREDITS the wallet. (This cited -57_499_987, the figure the validator
+            // comment also used; neither is what the stated inputs produce, and both now
+            // carry the re-derived value. Nothing asserted either number, which is why the
+            // pair could disagree with the formula for as long as it did.)
             for negative in [-1.0, -1_000_000.0] {
                 let mut config = AppConfig::load_from_file("../config/apikita.toml")
                     .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
