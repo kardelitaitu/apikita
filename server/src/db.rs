@@ -732,6 +732,25 @@ pub async fn debit_usage_transaction(
     //    wallet can never have spent more than its own balance, so the release
     //    always matches when a hold was actually taken, and a zero reservation
     //    (nothing held) skips the statement entirely.
+    //
+    //    THE `reserved_idr > 0` GUARD IS A SKIPPED STATEMENT, NOT A DECISION, and that is worth
+    //    stating because mutation testing cannot see it. MEASURED: forcing this condition always-true
+    //    leaves the whole library suite at 664 passed / 0 failed. It is not an untested guard - it is
+    //    an EQUIVALENT one, and the reason is checkable rather than a matter of reading:
+    //
+    //      - The production path cannot reach the else arm at all. `proxy.rs:1395` takes
+    //        `reserved_idr` from `ReservationResult::Held`, and `reserve_balance_transaction`
+    //        returns `Zero` for any `reserved_idr <= 0` (db.rs:1741) - so a `Held` value is strictly
+    //        positive. The only production caller of this function is `proxy.rs:1653`.
+    //      - Where a test DOES pass 0, both branches agree on every observable: `try_credit` with 0
+    //        issues `balance_idr = balance_idr + 0`, returning the unchanged balance, so
+    //        `released_idr` is 0 either way and no ledger row is written. `settlement_ledger_deltas`
+    //        is pinned to return `(0, 0)` for that input by `a_zero_reservation_writes_no_release_row`
+    //        (db.rs:2609), independently of this branch.
+    //
+    //    So the guard saves one no-op UPDATE on a path that already costs a transaction. Kept because
+    //    it documents the intent, with this note so the next mutation sweep does not open the same
+    //    investigation and reach a weaker conclusion than the two facts above.
     let released_idr = if reserved_idr > 0 {
         match try_credit(&mut tx, account_id, reserved_idr).await? {
             Some(_) => reserved_idr,
