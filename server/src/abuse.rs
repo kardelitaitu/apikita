@@ -424,6 +424,79 @@ mod tests {
             be rewritten as an assertion that the cap holds"
         );
     }
+    /// A row EXACTLY at the window start still counts, and this is the only test that sits on it.
+    ///
+    /// WHY IT IS NEEDED. The cap's query is `created_at >= window_start`, so the boundary row is
+    /// INSIDE the window. The test above ages its rows out by TWO HOURS against an HOURLY window, and
+    /// every other fixture seeds rows at `now` - all of them far from the line. MEASURED: flipping
+    /// the comparison to `>` left the whole suite green at 672 passed / 0 failed.
+    ///
+    /// That is the FOURTH sweep or cap in a row with the same habit - db.rs's session retention,
+    /// ip_tracking.rs's link_code_issues, identity/tokens.rs and link_codes all had boundary tests
+    /// whose fixtures sat a whole unit away from the line. Written down here because the pattern is
+    /// now established rather than suspected: fixtures are written to be CLEARLY on one side, and the
+    /// cheap way to be clear is to be far.
+    ///
+    /// WHICH WAY IT MUST GO, and it is worth stating because the two rules differ by design. For a
+    /// trailing WINDOW, a row at `window_start` is inside the window - the window is the closed
+    /// interval `[now - window, now]`, so `>=` counts it. That is the opposite reading from the
+    /// retention sweeps, where a row AT the cutoff is deleted because it has REACHED its life. Both
+    /// are `<=`-style inclusive; the difference is which side of the line the row belongs to, and
+    /// this test pins the cap's side so a future tidy-up cannot quietly make the window N-1 wide.
+    #[tokio::test]
+    async fn a_row_exactly_at_the_window_start_still_counts_against_the_cap() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
+        let limit = configured_limits().topup_per_hour;
+        assert!(limit > 0, "the fixture assumes a configured hourly cap");
+
+        // `now` with sub-second precision, so `now - window` lands on an exact instant rather than a
+        // rounded one. The seeded row's `created_at` IS that instant, so the comparison is decided on
+        // the boundary and not by clock drift between the seed and the check below.
+        let now = Utc::now();
+        let window = topup_window();
+        for _ in 0..limit {
+            insert_topup(&db.pool, account_id).await;
+        }
+        sqlx::query("UPDATE topups SET created_at = ? WHERE account_id = ?")
+            .bind(now - window)
+            .bind(account_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("move every row exactly onto the window start");
+
+        // `limit` rows, all ON the boundary, and the cap must be FULL. If the comparison is `>`, the
+        // boundary rows fall out, `used` reads 0, and this call is allowed while the account is
+        // over its cap.
+        assert!(
+            enforce_creation_cap(&db.pool, "topups", window, limit, account_id, now)
+                .await
+                .is_err(),
+            "a row at `now - window` is INSIDE the closed window [now - window, now], so {limit} of \
+             them put the account exactly at its cap and the next creation must be refused. Being \
+             allowed here means the comparison excludes the boundary and the window is silently one \
+             instant narrower than the policy states"
+        );
+
+        // And one microsecond the other side of the line is OUTSIDE it, so the cap frees again. This
+        // is the assertion that makes the one above a boundary test rather than a counting test.
+        sqlx::query("UPDATE topups SET created_at = ? WHERE account_id = ?")
+            .bind(now - window - Duration::microseconds(1))
+            .bind(account_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("move every row one microsecond out of the window");
+
+        assert!(
+            enforce_creation_cap(&db.pool, "topups", window, limit, account_id, now)
+                .await
+                .is_ok(),
+            "the same {limit} rows a microsecond OUTSIDE the window do not count, so the cap frees"
+        );
+
+        db.close().await;
+    }
+
     #[tokio::test]
     async fn the_topup_cap_lets_the_limit_through_and_refuses_the_next() {
         let db = TestDb::new().await;
