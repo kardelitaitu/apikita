@@ -951,12 +951,37 @@ mod tests {
     fn no_secret_is_interpolated_into_a_log_or_format_macro() {
         // Names that carry a secret. A caller holding one of these holds something
         // that must not leave the process.
+        //
+        // THIS LIST WAS HALF THE CRATE'S CREDENTIALS, and the guard cannot be wider than what it
+        // names. MEASURED: injecting `tracing::info!("the bot token is {bot_token}")` PASSED this
+        // check, while the same injection with `server_key` FAILED it - so the mechanism works and
+        // the coverage did not. Everything below `bot_token` is new.
+        //
+        // WHY IT WAS SHORT IN A WAY THAT LOOKS FINE: the five original names are the ones that appear
+        // in LOGGING CONTEXT in the code that exists, so the list was written from the call sites
+        // rather than from the credential inventory. A guard built that way catches today's leaks and
+        // misses the next one - and the next one is what it is for.
+        //
+        // The additions come from the crate's credential HOLDERS: a value a caller must treat as a
+        // secret whether or not it is logged today. `salt` is deliberately NOT here: `ip_tracking.rs`
+        // has `panic!("poison the salt lock")`, which names the LOCK and never the salt's value, and a
+        // guard that fires on correct code gets deleted.
         const SECRETS: &[&str] = &[
             "server_key",
             "api_key",
             "token_hash",
             "full_key",
             "presented_key",
+            // A Telegram bot token authorises a wallet binding.
+            "bot_token",
+            // A raw single-use credential, before it is hashed or consumed.
+            "raw_token",
+            // The Midtrans signature the webhook verifies money against.
+            "signature_key",
+            // A password in the clear, on both the change and the reset paths.
+            "password",
+            "current_password",
+            "new_password",
         ];
         const MACROS: &[&str] = &[
             "error!",
