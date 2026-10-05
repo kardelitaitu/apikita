@@ -61,6 +61,22 @@ async fn resolve_account_from_cookie(
     let idle_days = sessions.idle_days as i64;
     let absolute_days = sessions.absolute_days as i64;
 
+    // THREE CLAUSES, TWO INDEPENDENT CHECKS, and the redundancy is deliberate rather than untested.
+    //
+    // The `expires_at > ?` predicate here is checked AGAIN in this same function, by
+    // `session_is_live_at` at the call below. MEASURED: deleting the SQL clause alone leaves the
+    // library suite at 664 passed / 0 failed, while deleting the Rust check is caught by 2 tests - and
+    // forcing it to fire always is caught by 100. A mutation sweep will therefore find the SQL copy
+    // "untested" and the Rust copy guarded, which is the correct reading: the rule lives in Rust, and
+    // the query predicate keeps the common case from doing the work.
+    //
+    // The `revoked_at IS NULL` clause is NOT duplicated in Rust - `session_is_live_at` takes no
+    // revocation parameter - and deleting it IS caught (2 tests). So the two clauses have different
+    // standing, which is why they are called out separately rather than as "the WHERE clause".
+    //
+    // THIS EXACT QUERY APPEARS TWICE, here and in `logout_all` below. Both are followed by the same
+    // `session_is_live_at` call, so the same reading applies to both; the duplication is why the
+    // clause analysis above is written once, here, rather than beside each copy.
     let session = sqlx::query(
         "SELECT account_id, last_seen_at, expires_at FROM sessions \
          WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
