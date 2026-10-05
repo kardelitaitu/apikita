@@ -886,13 +886,30 @@ jobs:
         working-directory: website
         run: npx --yes -p typescript@5.6 tsc --noEmit -p tsconfig.json
 
-      - name: Website contract tests
-        working-directory: website
-        run: node --test 'tests/**/*.test.ts'
-
+      # THE BUILD COMES FIRST, and the order is load-bearing rather than tidiness.
+      #
+      # The contract tests read SOURCE - signup.astro, the .ts libs - and that is most of what they are
+      # for. But one of them, `tests/built-output.test.ts`, reads the RENDERED pages under
+      # `website/dist`, because a claim can hold in source and fail in output: `landing-claims.test.ts`
+      # pins the cross-border disclosure ABOVE the signup submit control by reading bytes of
+      # signup.astro, and a layout change can render that block below the button while the source
+      # assertion stays green.
+      #
+      # MEASURED: with the tests before the build, `dist/` does not exist yet, so that test reported
+      # ONE SKIP on every CI run and verified nothing. A guard that skips forever is the failure mode
+      # this repository writes checks against - it looks like a green tick in the summary. Running the
+      # build first turns the skip into a real assertion: 204 passed + 1 skipped becomes 205 passed.
+      #
+      # The cost is one build - about four seconds - and the build does not read the tests, so nothing
+      # else about the job moves. The build is also allowed to fail here for the same reason it did
+      # before: a site that does not compile is not deployable.
       - name: Build website
         working-directory: website
         run: npm run build
+
+      - name: Website contract tests
+        working-directory: website
+        run: node --test 'tests/**/*.test.ts'
 
       # A floor, not a full scanner: enough to catch the two mistakes that reach
       # history most often. docs/ci-cd.md leaves the tool open.
