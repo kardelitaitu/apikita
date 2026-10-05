@@ -54,6 +54,15 @@ pub struct RealtimeEvent {
 }
 
 impl RealtimeEvent {
+    /// The account this event is addressed to. `#[cfg(test)]` for the same reason
+    /// `subscribe_for_test` exists: a test outside this module must be able to assert the ADDRESS of
+    /// an event, which is the property `publish_balance`'s DEFECT-1 scoping depends on and which
+    /// nothing in the crate could observe.
+    #[cfg(test)]
+    pub(crate) fn account_id(&self) -> Uuid {
+        self.account_id
+    }
+
     /// A wallet balance, as an absolute value — never a change.
     ///
     /// `owner` is the account this balance belongs to: the live stream filters
@@ -194,6 +203,24 @@ impl RealtimeHub {
 
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RealtimeEvent> {
         self.tx.subscribe()
+    }
+
+    /// A receiver for tests OUTSIDE this module, so a publisher's CHOICE OF ACCOUNT can be observed
+    /// rather than inferred.
+    ///
+    /// WHY IT IS NEEDED. `publish_balance` is scoped to `account_id` (DEFECT 1), and the webhook
+    /// resolves that id with `topup_account_id` - a query in `webhooks.rs` that this module cannot
+    /// see. MEASURED: making that query ignore its `order_id` and return any topup row left the whole
+    /// suite green at 674 passed / 0 failed, and making it return NOTHING did too. Both are
+    /// cross-account leaks or silent drops on the live-balance path, and neither was observable
+    /// because `subscribe` is private to this module and no other module's test could look at what
+    /// was actually published.
+    ///
+    /// `#[cfg(test)]` rather than `pub(crate)`: this exists so a test can assert WHICH account an
+    /// event was addressed to, and shipping it would widen the hub's surface for no caller.
+    #[cfg(test)]
+    pub(crate) fn subscribe_for_test(&self) -> tokio::sync::broadcast::Receiver<RealtimeEvent> {
+        self.subscribe()
     }
 
     /// Decide what a reconnecting client gets, given its Last-Event-ID.

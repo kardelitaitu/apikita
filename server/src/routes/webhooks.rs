@@ -717,6 +717,80 @@ mod tests {
     /// abuse.rs suites use. The SQLite schema has no DEFAULT for id, created_at
     /// or updated_at, so the Postgres RETURNING id shape would fail at runtime
     /// with a NOT NULL constraint error rather than here.
+    /// The live-balance event is addressed to the account that PAID, and to no other.
+    ///
+    /// WHY THIS EXISTS. A settlement publishes `publish_balance(&state.events, account_id, ..)` where
+    /// `account_id` comes from `topup_account_id` - a separate query. MEASURED: making that query
+    /// ignore its `order_id` and return ANY topup row left the whole suite green at 674 passed /
+    /// 0 failed, and making it return NOTHING did too. Nothing observed which account the event was
+    /// addressed to, because `RealtimeHub::subscribe` is private to events.rs and no test outside it
+    /// could look.
+    ///
+    /// WHY THE WRONG ACCOUNT IS A LEAK RATHER THAN A COSMETIC BUG. `publish_balance` is scoped to that
+    /// id so only its dashboard receives it - the module doc calls this the DEFECT 1 filter. Handing
+    /// it another account's id puts CUSTOMER A'S NEW BALANCE on CUSTOMER B'S live stream. The
+    /// second-worst outcome, returning None, silently drops the event and leaves the paying customer's
+    /// dashboard stale until its next snapshot.
+    ///
+    /// THE NEGATIVE CONTROL IS THE POINT, and `events.rs`'s
+    /// `a_subscriber_receives_only_its_own_accounts_events` records why: an isolation assertion is
+    /// VACUOUS if the event never arrives at all, because "nothing leaked" and "nothing was sent" look
+    /// identical. So this drains the receiver and requires BOTH that an event arrived AND that it
+    /// names the payer.
+    #[tokio::test]
+    async fn a_settlement_publishes_the_balance_to_the_paying_account_only() {
+        run_live(|pool, account_id, state| async move {
+            // A SECOND account that also has a TOPUP ROW, so a lookup that ignores its `order_id`
+            // has something wrong to return. This is load-bearing and was MEASURED: with the
+            // bystander holding only a wallet, `SELECT account_id FROM topups LIMIT 1` still returned
+            // the payer - because `topups` had one row - and the mutation survived the test. The
+            // bystander's row is created FIRST, so it is the one an unordered lookup finds.
+            let bystander = test_support::account_with_wallet(&pool).await;
+            let _bystander_order = pending_topup(&pool, bystander, 50_000).await;
+
+            // 50000 IDR matches the `gross_amount` signed below, so the settlement is not refused for
+            // an amount mismatch - which would leave no event to observe and make this test's
+            // assertions vacuous rather than failing.
+            let order_id = pending_topup(&pool, account_id, 50_000).await;
+
+            // Subscribe BEFORE the webhook, so the event cannot be missed.
+            let mut rx = state.events.subscribe_for_test();
+
+            let payload = notification(&order_id, "200", "50000.00", "settlement", LIVE_TEST_SERVER_KEY);
+            let (status, body) = post(&state, payload).await;
+            assert_eq!(status, StatusCode::OK, "the settlement must be accepted: {body}");
+
+            let delivered: Vec<_> = std::iter::repeat(())
+                .map_while(|_| rx.try_recv().ok())
+                .collect();
+            let balance: Vec<_> = delivered
+                .iter()
+                .filter(|e| e.name() == "balance")
+                .collect();
+
+            assert_eq!(
+                balance.len(),
+                1,
+                "a fresh settlement publishes exactly ONE balance event. Zero means the lookup \
+                 returned None and the paying customer's dashboard was left stale; more than one \
+                 means the webhook published twice"
+            );
+            assert_eq!(
+                balance[0].account_id(),
+                account_id,
+                "the balance event must be addressed to the account that PAID. Another id here puts \
+                 one customer's balance on another customer's live stream"
+            );
+            assert_ne!(
+                balance[0].account_id(),
+                bystander,
+                "the event was addressed to the bystander account, which is the cross-account leak \
+                 this test exists to catch"
+            );
+        })
+        .await;
+    }
+
     async fn fixture_account(pool: &SqlitePool) -> Uuid {
         test_support::account_with_wallet(pool).await
     }
