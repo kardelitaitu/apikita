@@ -20,6 +20,26 @@
 // states it - they must all agree with each other and with SERVER_TESTS below.
 // Bumping SERVER_TESTS is part of landing a server test; the point is that one
 // edit cannot update four documents and miss the fifth.
+//
+// WHAT THIS FIGURE DOES *NOT* COUNT, measured rather than assumed, because all four
+// claim sites name `cargo test --lib` and a reader could easily take 667 for the
+// whole suite. It is not: `cargo test` builds SEVEN test targets and the library is
+// only the first. The five `src/bin` targets hold 31 further tests - `hold-sweep`
+// 17, `migrate` 9, `usage-purge` 3, `ip-purge` 2, `benchmark` 0 - so the bare
+// command reports 698 across its eight `test result:` lines while this constant
+// stays 667. The scoping is deliberate: every claim is phrased "`cargo test --lib`",
+// so 667 is the right number FOR WHAT IS CLAIMED.
+//
+// The asymmetry that leaves: `cargo test --lib -- --list` cannot see the bin
+// targets, so DELETING one of those 31 tests lowers nothing any guard reads.
+// MEASURED: commenting out an `ip-purge` test leaves this check passing at
+// "667 vs 667". A bin-test FAILURE is still caught - CI runs the bare `cargo test`
+// and it exits non-zero - so the uncovered direction is only a silent deletion, and
+// the practical exposure is limited because those binaries are exercised
+// independently: CI's maintenance smoke step drives `hold-sweep` against a seeded
+// stranded hold and requires it to NAME the ref, and `migrate` appears in 17 tool
+// scripts. This paragraph exists so a reader knows the boundary of the number
+// instead of inferring coverage the constant does not provide.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
