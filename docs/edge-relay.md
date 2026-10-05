@@ -120,7 +120,7 @@ stays there. See [`docs/server/api-spec.md`](server/api-spec.md).
 | Tier | Key | Limit | Purpose |
 | --- | --- | --- | --- |
 | Connection/IP | client IP | **30 req/s sustained, 60 burst** | Stop floods and brute force |
-| Request/API key | `Authorization` header or key prefix | **100 req/s** | Stop a runaway client |
+| Request/API key | `Authorization` header or key prefix | **100 req/s, 200 burst** | Stop a runaway client |
 | Concurrent connections | client IP | **50** | Slow-loris and connection exhaustion |
 | Midtrans callbacks | client IP | **200 req/s, 1000 burst** | Bound a flood without refusing a payment callback |
 

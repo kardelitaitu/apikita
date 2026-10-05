@@ -213,6 +213,101 @@ if [ "$header_directives" -lt 5 ]; then
     fail "only $header_directives limit_req directive(s) name a header-keyed zone; there were 5 in /events, /v1/, /auth/, /api/ and /webhooks/. A check that asserts 'where a per-key limit exists, an address-keyed one exists beside it' proves nothing once the per-key limits are gone"
 fi
 
+# ---------------------------------------------------------------------------
+# The TIER TABLE in docs/edge-relay.md, against the zones the config declares.
+# ---------------------------------------------------------------------------
+#
+# WHY. The doc's tier table is what a reader consults to know the relay's limits, and it is the table
+# the last commit EDITED - adding the webhook row. Nothing compared it to the config, and MEASURED:
+# changing the doc's `60 burst` to `99`, or the config's `rate=30r/s` to `rate=3r/s`, failed NO gate.
+# A tier table that disagrees with the file it describes is worse than no table, because it is the
+# thing a reader trusts - `docs/testing.md` makes the same argument about a guard that overstates its
+# own scope.
+#
+# WHAT IT COMPARES, narrowly: for each zone the config declares, the doc must state that zone's rate
+# and burst. The comparison is on the NUMBERS, not the prose - a reader may reword the row freely, but
+# a row whose number no longer matches the config fails here.
+#
+# The zone-to-row mapping is by the zone's own rate, which is what makes each row identifiable: the
+# doc writes `30 req/s`, `100 req/s` and `200 req/s` and the config declares exactly those rates.
+DOC_CONF="$(dirname -- "$CONF")/../../docs/edge-relay.md"
+if [ -f "$DOC_CONF" ]; then
+    # THE POSITIVE CONTROL COMES FIRST, and it is the lesson from this block's own first draft.
+    #
+    # `grep -qE` exits 2 on a MALFORMED pattern, and `! grep -qE` reads any non-zero exit - including
+    # 2 - as "no match". A pattern with a syntax error therefore made this block report a violation
+    # or, in the burst case, silently skip: the first draft used `(\*\*)?`, which is invalid POSIX
+    # ERE, and MEASURED the block exited 0 while comparing nothing at all. So the pattern is proven
+    # valid before it is trusted, and a comparison that cannot run is an ERROR rather than a pass.
+    if ! printf '%s\n' 'probe' | grep -qE '[[:space:]]*probe' 2>/dev/null; then
+        fail "grep -E is not usable, so every comparison in this block would fail open"
+    fi
+
+    # `burst=` lives on the limit_req DIRECTIVE, not on the limit_req_zone DECLARATION. The first
+    # draft read it from the declaration line, where it never appears, so every zone was skipped by
+    # the `[ -n "$burst" ] || continue` guard below and the comparison ran zero times. MEASURED: the
+    # whole block exited 0 on a doc with every burst figure removed.
+    #
+    # WHAT THIS CANNOT SEE, stated because a reader who believes otherwise will not look for it. The
+    # comparison asserts each config figure APPEARS somewhere in the doc. It does not assert the TABLE
+    # ROW is the only place, and it could not: this doc states `30 req/s` three times by design - the
+    # tier row, the sentence contrasting the webhook's 200 req/s with it, and the rationale bullet. A
+    # row corrupted to `3 req/s` while the prose still says `30 req/s` therefore passes. MEASURED.
+    #
+    # That is the boundary `server/src/doc_claims.rs` describes about its own citation guard: it
+    # catches the drift that actually happens, not a number that was wrong when written. Deleting a
+    # figure, or letting the config and the doc disagree about which number exists at all, is caught;
+    # editing one mention of a number that is repeated is not.
+    #
+    # So each zone's burst is taken from the directive that names it. A zone used with two different
+    # bursts would be reported by the count below rather than silently taking the first.
+    zone_burst() { # zone_burst <zone> -> the burst value, or empty
+        sed -n "s/^[[:space:]]*limit_req[[:space:]]\+zone=$1[[:space:]]\+burst=\([0-9]\+\).*/\1/p" "$CONF" | sort -u | head -n 1
+    }
+    zone_rate() { # zone_rate <zone> -> the declared rate, or empty
+        sed -n "s/.*zone=$1:[0-9a-z]*[[:space:]]\+rate=\([0-9]\+\)r\/s.*/\1/p" "$CONF" | head -n 1
+    }
+
+    compared=0
+    for z in $header_zones $address_zones; do
+        rate=$(zone_rate "$z")
+        if [ -n "$rate" ]; then
+            compared=$((compared + 1))
+            if ! grep -qE "(^|[^0-9])${rate}[[:space:]]*req/s" "$DOC_CONF"; then
+                fail "the config declares zone=$z at rate=${rate}r/s, and $DOC_CONF states no '${rate} req/s' tier. The doc's tier table is the thing a reader consults, so a rate that is in one and not the other is a limit the reader will get wrong"
+            fi
+        fi
+
+        # AND THE BURST, paired with the word `burst`. That pairing is what makes `<n> burst` a burst
+        # figure rather than an incidental number: the tier table's cells are bold, and the first
+        # draft's alternative `\*\*[^*]*<n>[^*]*\*\*` matched ANY bold run containing the number, so
+        # `**30 req/s sustained, 60 burst**` satisfied it for 60 whatever the row said. MEASURED:
+        # rewriting every burst figure in the doc to the words "many bursts" left that version at
+        # exit 0.
+        burst=$(zone_burst "$z")
+        if [ -n "$burst" ]; then
+            compared=$((compared + 1))
+            if ! grep -qE "(^|[^0-9])${burst}[[:space:]]*\*{0,2}[[:space:]]*burst" "$DOC_CONF"; then
+                fail "the config uses zone=$z with burst=$burst, and $DOC_CONF states no '${burst} burst' figure. A doc that names the rate but not the burst describes a limit half the size of the real one"
+            fi
+        fi
+    done
+
+    # THE OTHER HALF OF THE POSITIVE CONTROL: the loop above must have compared something. If the zone
+    # lists came back empty - a renamed key variable, a reformatted declaration - it would run zero
+    # times and report nothing while printing the same OK as a real pass.
+    if [ "$compared" -lt 6 ]; then
+        fail "the tier-table comparison ran $compared time(s); there are three zones with a rate and a burst, so it should compare at least six figures. It is comparing almost nothing"
+    fi
+
+    # And the doc must still contain the table. A doc that lost its rate figures would make every
+    # `grep` above fail - which is correct - but a doc that lost the TABLE while keeping three rates
+    # in prose would pass vacuously, so the heading is required too.
+    if ! grep -qE '^\|[[:space:]]*Tier' "$DOC_CONF"; then
+        fail "$DOC_CONF has no '| Tier' table header, so the tier table this block compares against is gone"
+    fi
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "relay-check: the relay contract is BROKEN. A buffering relay looks connected" >&2
     echo "relay-check: while the dashboard silently stops updating (docs/edge-relay.md:110)." >&2
