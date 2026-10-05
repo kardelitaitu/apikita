@@ -78,8 +78,12 @@ to be, not because production will be.
 
 ```
 # 1. the relay. There is no database container any more — the database is a file
-#    (step 2), so this brings up nginx alone.
-docker compose up -d
+#    (step 2). NAME THE SERVICE: `docker compose up -d` with no service starts
+#    EVERY service in the file, which since the maintenance scheduler was added
+#    means `scheduler` as well. That is a nightly container a front-end session
+#    does not want, and it prints a wall of WIRED/NOT WIRED banners before
+#    settling into an 80000-second sleep.
+docker compose up -d nginx
 
 # 2. database — a file, created and migrated by the migrate binary
 DATABASE_URL=sqlite://data/server.db cargo run --bin migrate

@@ -110,6 +110,49 @@ if printf '%s\n' "$RENDERED" | awk '/apikita-scheduler/{f=1} f&&/healthcheck:/{p
     fail "the scheduler has a healthcheck; it serves nothing and listens on nothing, so the probe would be theatre that reports unhealthy forever"
 fi
 
+# 6. EVERY `docker compose up` IN THE DOCS NAMES A SERVICE, OR THE DOC SAYS IT MEANS ALL.
+#
+# WHY. `docker compose up -d` with NO service starts EVERY service in the file. That was a
+# one-service file when `docs/local-development.md` told a front-end session to run it and said the
+# step "brings up nginx alone". The maintenance `scheduler` service was added later, so the line
+# silently started a nightly container too, and the sentence explaining it became false.
+#
+# FOUND BY RUNNING IT, not by reading: `docker compose up -d` on the shipped file brings up
+# `nginx` AND `scheduler`, and the doc's promise is the reason a reader would not look. I caused
+# exactly this while verifying it - the bare command took down a running container - so the guard is
+# for the person who follows the doc without thinking about it, which is the point of a doc.
+#
+# THE RULE: a bare `docker compose up` is allowed ONLY where the surrounding text says it starts
+# everything. Otherwise the service must be named. This is checked against the SERVICE LIST the
+# file actually declares, so adding a service cannot make a naming line wrong - only a bare line
+# wrong, which is the direction that matters.
+if [ -f "$REPO/docs/local-development.md" ]; then
+    SERVICES=$(printf '%s\n' "$RENDERED" | sed -n 's/^  \([a-z][a-z0-9_-]*\):$/\1/p')
+    svc_count=$(printf '%s\n' "$SERVICES" | grep -c . || true)
+    # Every line that invokes `docker compose up`.
+    grep -nE 'docker compose up' "$REPO/docs/local-development.md" > /tmp/composeup.$$ 2>/dev/null || true
+    while IFS= read -r hit; do
+        [ -z "$hit" ] && continue
+        lineno=${hit%%:*}
+        text=${hit#*:}
+        # A service is named if a token follows `up` that is not a flag and is a declared service.
+        named=""
+        for s in $SERVICES; do
+            case "$text" in
+                *"up -d $s"*|*"up $s"*) named="$s" ;;
+            esac
+        done
+        if [ -z "$named" ]; then
+            # Bare form: allowed only if the nearby text says it covers all services.
+            if ! sed -n "$((lineno > 3 ? lineno - 3 : 1)),$((lineno + 3))p" "$REPO/docs/local-development.md" \
+                 | grep -qiE 'every service|all services|all of them'; then
+                fail "docs/local-development.md:$lineno runs \`docker compose up\` with no service, and the file declares $svc_count services ($(printf '%s' "$SERVICES" | tr '\n' ' ')). Compose starts ALL of them - so this line does more than the sentence above it says. Name the service, or state that it means every one."
+            fi
+        fi
+    done < /tmp/composeup.$$
+    rm -f /tmp/composeup.$$
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "compose-check: the compose contract is BROKEN (see above)" >&2
     exit 1
