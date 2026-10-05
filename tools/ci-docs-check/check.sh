@@ -185,6 +185,54 @@ for linked in $(grep -oE '\]\([a-z0-9-]+/README\.md\)' "$INDEX" | sed 's/^](//; 
     }
 done
 
+# --- THE ONE ORDERING THAT IS LOAD-BEARING -----------------------------------
+#
+# Every check above is about MEMBERSHIP: is this step named, does this named check exist, is this tool
+# indexed. None of them reads ORDER, and order was the defect one round ago.
+#
+# MEASURED, and it is why this block exists. The workflow ran `Website contract tests` BEFORE
+# `Build website`. One of those tests reads the RENDERED pages under `website/dist`, so with the build
+# after them `dist/` did not exist yet and the test reported a SKIP on every CI run - a green tick
+# over an assertion that never executed. Membership was satisfied the whole time: both steps were in
+# the workflow and both were named in this document, in the same wrong order.
+#
+# So this pins the PAIR, in both files, against a specific reason. It is deliberately not a general
+# ordering check: most CI step order is a preference, and asserting it would be the hand-kept-list
+# defect this file has already been rewritten twice to remove. This one earns its place because a
+# test's result depends on it.
+build_at=$(grep -n '^      - name: Build website$' "$WORKFLOW" | head -n 1 | cut -d: -f1)
+tests_at=$(grep -n '^      - name: Website contract tests$' "$WORKFLOW" | head -n 1 | cut -d: -f1)
+
+# Both must exist, or the comparison below is vacuously true.
+if [ -z "$build_at" ] || [ -z "$tests_at" ]; then
+    echo "ci-docs-check: FAIL - cannot find both '- name: Build website' (at '${build_at:-none}') and" >&2
+    echo "ci-docs-check:   '- name: Website contract tests' (at '${tests_at:-none}') in $WORKFLOW, so" >&2
+    echo "ci-docs-check:   the ordering assertion below would pass over a missing step rather than a" >&2
+    echo "ci-docs-check:   wrong order." >&2
+    exit 1
+fi
+
+if [ "$build_at" -ge "$tests_at" ]; then
+    echo "ci-docs-check: FAIL - the workflow runs 'Website contract tests' (line $tests_at) BEFORE" >&2
+    echo "ci-docs-check:   'Build website' (line $build_at). One of those tests reads the rendered" >&2
+    echo "ci-docs-check:   pages under website/dist, so with the build after them it SKIPS on every" >&2
+    echo "ci-docs-check:   run and verifies nothing - the failure mode looks like a green tick." >&2
+    echo "ci-docs-check:   Move the build above the tests, and keep the table in docs/ci-cd.md in" >&2
+    echo "ci-docs-check:   the same order." >&2
+    exit 1
+fi
+
+# AND THE DOCUMENT, in the same order, because a reader follows the table rather than the YAML.
+doc_build=$(grep -n '^| Build website ' "$DOC" | head -n 1 | cut -d: -f1)
+doc_tests=$(grep -n '^| Website contract tests ' "$DOC" | head -n 1 | cut -d: -f1)
+if [ -n "$doc_build" ] && [ -n "$doc_tests" ] && [ "$doc_build" -ge "$doc_tests" ]; then
+    echo "ci-docs-check: FAIL - docs/ci-cd.md lists 'Website contract tests' (line $doc_tests) before" >&2
+    echo "ci-docs-check:   'Build website' (line $doc_build), which is the order that made the" >&2
+    echo "ci-docs-check:   rendered-output test skip. A reader reproduces the document's order." >&2
+    exit 1
+fi
+
 echo "ci-docs-check: OK - all $COUNT workflow steps are named in docs/ci-cd.md, every check it advertises exists,"
-echo "ci-docs-check:      and all $REAL_COUNT tool directories are indexed in tools/README.md"
+echo "ci-docs-check:      the build precedes the website contract tests in both files, and all $REAL_COUNT tool"
+echo "ci-docs-check:      directories are indexed in tools/README.md"
 exit 0
