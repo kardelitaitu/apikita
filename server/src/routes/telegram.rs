@@ -1612,4 +1612,96 @@ mod tests {
         // A leading/trailing newline is a classic bypass of a length-only check.
         assert!(!is_well_formed("123456\n"));
     }
+
+    /// `purge_terminal`'s boundary: a code whose governing instant IS the cutoff is deleted.
+    ///
+    /// WHY THIS EXISTS. `purge_terminal` had NO test of its own boundary - it is called from db.rs's
+    /// sweep, and nothing seeded a row near the cutoff it computes. MEASURED: flipping its comparison
+    /// to `<` left the whole suite green at 670 passed / 0 failed. Making the sweep a complete no-op
+    /// WAS caught, so the sweep ran; only its exact cut was unpinned.
+    ///
+    /// THE SAME SHAPE AS TWO SIBLING SWEEPS. `db.rs`'s session retention and `ip_tracking.rs`'s
+    /// link_code_issues both had boundary tests whose fixtures sat a whole unit away from the cutoff.
+    /// Three sweeps, one habit: a fixture written to be clearly on one side of a boundary and never
+    /// ON it.
+    ///
+    /// THE GOVERNING INSTANT IS AN EXPRESSION, not a column - `COALESCE(used_at, expires_at)`, because
+    /// a redeemed code stops being usable at `used_at` and an unredeemed one at `expires_at`. Both
+    /// arms are seeded at the cutoff so the test cannot pass by exercising only one of them, and a
+    /// REDEEMED code has `expires_at` far in the FUTURE: a statement that read `expires_at` alone
+    /// would keep it and this assertion would fail while the sweep looked wired.
+    #[tokio::test]
+    async fn purge_terminal_deletes_the_code_whose_governing_instant_is_the_cutoff() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let now = Utc::now();
+        let cutoff = now - Duration::days(LINK_CODE_RETENTION_GRACE_DAYS);
+        let future = now + Duration::days(30);
+
+        async fn seed_at(
+            pool: &SqlitePool,
+            account_id: Uuid,
+            code: &str,
+            expires_at: chrono::DateTime<Utc>,
+            used_at: Option<chrono::DateTime<Utc>>,
+        ) {
+            sqlx::query(
+                "INSERT INTO link_codes (code, account_id, expires_at, used_at, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(code)
+            .bind(account_id.hyphenated())
+            .bind(expires_at)
+            .bind(used_at)
+            .bind(used_at.unwrap_or(expires_at))
+            .execute(pool)
+            .await
+            .expect("seed a link code at a chosen instant");
+        }
+
+        // (a) unredeemed, expiring EXACTLY at the cutoff -> deleted, on `expires_at`.
+        seed_at(&db.pool, account_id, "cutoff-unredeemed", cutoff, None).await;
+        // (b) REDEEMED exactly at the cutoff with an `expires_at` far in the FUTURE -> deleted, on
+        //     `used_at`. This is the arm that proves the COALESCE is read.
+        seed_at(
+            &db.pool,
+            account_id,
+            "cutoff-redeemed",
+            future,
+            Some(cutoff),
+        )
+        .await;
+        // (c) one microsecond the near side of the cutoff -> kept.
+        seed_at(
+            &db.pool,
+            account_id,
+            "just-inside",
+            cutoff + Duration::microseconds(1),
+            None,
+        )
+        .await;
+
+        let purged = purge_terminal(&db.pool, now).await.expect("purge");
+        assert_eq!(
+            purged, 2,
+            "the unredeemed code expiring AT the cutoff and the redeemed code whose used_at IS the \
+             cutoff are both deleted, and the code a microsecond inside survives. 1 means the \
+             comparison is `<`; 0 means the COALESCE is not being read and the redeemed arm was \
+             kept on its future expires_at"
+        );
+
+        let surviving: Vec<String> =
+            sqlx::query_scalar("SELECT code FROM link_codes WHERE account_id = ? ORDER BY code")
+                .bind(account_id.hyphenated())
+                .fetch_all(&db.pool)
+                .await
+                .expect("read surviving codes");
+        assert_eq!(
+            surviving,
+            vec!["just-inside".to_string()],
+            "only the code one microsecond inside the window survives"
+        );
+
+        db.close().await;
+    }
 }

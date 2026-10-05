@@ -637,4 +637,69 @@ mod tests {
             "the live row must survive the purge"
         );
     }
+
+    /// The boundary itself: a token whose `expires_at` IS `now` must be deleted.
+    ///
+    /// WHY THIS IS SEPARATE FROM THE TEST ABOVE, which has been here since the sweep was written.
+    /// That test issues its stale token TWO HOURS past expiry and its live one an hour ahead - both a
+    /// whole duration away from the instant `purge_expired` compares against. `<=` and `<` are
+    /// indistinguishable on both, so MEASURED, flipping this statement's comparison to `<` left the
+    /// whole suite green at 670 passed / 0 failed.
+    ///
+    /// The same shape was found in two sibling sweeps (db.rs's session retention, ip_tracking.rs's
+    /// link_code_issues), so it is a habit rather than three accidents: a fixture is written to be
+    /// clearly on one side of a boundary and never ON it.
+    ///
+    /// WHICH WAY IT MUST GO. `purge_expired` deletes "rows that are past their life", and a token
+    /// whose expiry IS `now` has reached it - the same reading `consume` uses, where
+    /// `expires_at > ?` is the criterion for STILL BEING USABLE. A token at exactly `now` is not
+    /// usable, so it is swept. The two statements are therefore consistent at the boundary, which is
+    /// the property this pins; a `<` here would retain it one instant past its life.
+    #[tokio::test]
+    async fn a_token_expiring_exactly_now_is_purged() {
+        let db = TestDb::new().await;
+        let account = crate::test_support::account(&db.pool).await;
+        let now = Utc::now();
+
+        // `issue` takes a `ttl` measured from `issued_at`, so a token issued `ttl` ago expires AT
+        // `now`. Both the issue instant and the TTL are bound, so the expiry is exact rather than
+        // approximately now.
+        let ttl = Duration::hours(1);
+        let at_the_instant = issue(&db.pool, account, Purpose::Reset, ttl, now - ttl)
+            .await
+            .expect("issue a token that expires exactly now");
+
+        // A microsecond the far side of it, so the assertion cannot be satisfied by clock skew.
+        let still_live = issue(
+            &db.pool,
+            account,
+            Purpose::Verification,
+            ttl,
+            now - ttl + Duration::microseconds(1),
+        )
+        .await
+        .expect("issue a token that expires just after now");
+
+        let purged = purge_expired(&db.pool, now).await.expect("purge");
+        assert_eq!(
+            purged, 1,
+            "exactly the token whose expiry IS now is deleted. 0 means the comparison is `<` rather \
+             than `<=`, so a token is retained past the life the privacy page promises it has"
+        );
+
+        assert!(
+            matches!(
+                consume(&db.pool, &at_the_instant.raw, Purpose::Reset, now).await,
+                Err(AppError::Unauthenticated)
+            ),
+            "the token that expired exactly now is gone"
+        );
+        assert!(
+            consume(&db.pool, &still_live.raw, Purpose::Verification, now)
+                .await
+                .is_ok(),
+            "the token expiring a microsecond later must survive, so the assertion above is not \
+             passing because the whole table was emptied"
+        );
+    }
 }
