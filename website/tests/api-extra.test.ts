@@ -148,3 +148,100 @@ test('redirectToLogin preserves the destination when called directly', async () 
     );
   });
 });
+
+// THE REQUEST SIDE. Every test above checks what apiFetch does with a RESPONSE; none checked what it
+// SENDS, and MEASURED, two properties could be deleted with the whole website suite green at
+// 216 passed / 0 failed:
+//
+//   credentials: 'include'              -> the browser drops the session cookie
+//   the body-conditional Content-Type   -> a POST without it is a 415
+//
+// Neither failure is loud. Dropping the cookie signs the user out on the NEXT request rather than
+// failing this one, and a missing content type is refused by the server, not by anything here. The
+// same shape the file header describes - an assertion that holds for a reason other than its subject.
+
+/**
+ * Captures the `init` apiFetch passes to `fetch`, and answers with `response`.
+ *
+ * The captured value is handed out through a GETTER rather than as an argument: `fetch` runs
+ * asynchronously, so a value passed into `fn` would still be the initial `undefined` when the
+ * assertions ran - which is exactly how the first version of these tests failed.
+ */
+async function withCapturedRequest(
+  response: () => Response,
+  fn: (seen: () => RequestInit | undefined) => Promise<void>,
+): Promise<void> {
+  const original = globalThis.fetch;
+  let seen: RequestInit | undefined;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    seen = init;
+    return response();
+  }) as typeof fetch;
+  try {
+    await fn(() => seen);
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test('apiFetch sends the session cookie', async () => {
+  await withCapturedRequest(
+    () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    async (seen) => {
+      await apiFetch('/x');
+      assert.ok(seen(), 'fetch was never called, so this test proves nothing');
+      assert.equal(
+        seen()!.credentials,
+        'include',
+        "apiFetch must send `credentials: 'include'`. Narrowing it drops the HttpOnly session " +
+          'cookie, and the symptom is a user signed out on the NEXT request - not a failure here.',
+      );
+    },
+  );
+});
+
+test('apiFetch sends Content-Type only when it has a body', async () => {
+  const headersOf = (seen: RequestInit | undefined): Record<string, string> =>
+    (seen?.headers ?? {}) as Record<string, string>;
+
+  await withCapturedRequest(
+    () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    async (seen) => {
+      await apiFetch('/x');
+      assert.equal(
+        headersOf(seen())['Content-Type'],
+        undefined,
+        'a GET with no body must not carry a Content-Type. The header describes content that is ' +
+          'not there, and it is what makes a request look like it has one.',
+      );
+    },
+  );
+
+  await withCapturedRequest(
+    () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    async (seen) => {
+      await apiFetch('/x', { method: 'POST', body: JSON.stringify({ a: 1 }) });
+      assert.equal(
+        headersOf(seen())['Content-Type'],
+        'application/json',
+        'a POST WITH a body must carry Content-Type: the server parses these as JSON, and a ' +
+          'missing header is a 415 rather than a field error, so nothing here would fail.',
+      );
+    },
+  );
+});
+
+test('a caller header wins over the default Accept', async () => {
+  await withCapturedRequest(
+    () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    async (seen) => {
+      await apiFetch('/x', { headers: { Accept: 'text/event-stream' } });
+      assert.equal(
+        ((seen()?.headers ?? {}) as Record<string, string>).Accept,
+        'text/event-stream',
+        'a caller-supplied header must win. Spreading the defaults after the caller would silently ' +
+          'clobber the Accept the SSE island depends on.',
+      );
+    },
+  );
+});

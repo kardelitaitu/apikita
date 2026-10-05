@@ -79,7 +79,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * So this figure is updated WITH the run that changes it. That is a smaller guarantee than the server
  * count now carries, and it is stated rather than implied.
  */
-const WEBSITE_TESTS = 216;
+const WEBSITE_TESTS = 219;
 
 /**
  * The server count, and the same kind of literal for the same reason.
