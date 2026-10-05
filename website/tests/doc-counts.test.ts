@@ -59,7 +59,7 @@ const read = (p: string) => readFileSync(join(root, p), 'utf8');
  * So this figure is updated WITH the run that changes it. That is a smaller guarantee than the server
  * count now carries, and it is stated rather than implied.
  */
-const WEBSITE_TESTS = 205;
+const WEBSITE_TESTS = 210;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -78,7 +78,7 @@ const WEBSITE_TESTS = 205;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 664;
+const SERVER_TESTS = 665;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -453,6 +453,7 @@ test('no doc still claims a superseded count', () => {
         // document carrying a count the suite passed through must not be able to reappear.
         '662 tests', '662 passed', '662 / 0 / 0',
         '663 tests', '663 passed', '663 / 0 / 0',
+        '664 tests', '664 passed', '664 / 0 / 0',
         '661 tests', '661 passed', '661 / 0 / 0',
       ],
     },
@@ -545,6 +546,10 @@ test('no doc still claims a superseded count', () => {
         // which is exactly the drift this constant exists to make visible.
         'website: **196 tests**', 'passes **196 tests**', '**196 tests**',
         'website: **204 tests**', 'passes **204 tests**', '**204 tests**',
+        'website: **206 tests**', 'passes **206 tests**', '**206 tests**',
+        'website: **207 tests**', 'passes **207 tests**', '**207 tests**',
+        'website: **208 tests**', 'passes **208 tests**', '**208 tests**',
+        'website: **209 tests**', 'passes **209 tests**', '**209 tests**',
       ],
     },
   ];
