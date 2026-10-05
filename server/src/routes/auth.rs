@@ -74,9 +74,29 @@ async fn resolve_account_from_cookie(
     // revocation parameter - and deleting it IS caught (2 tests). So the two clauses have different
     // standing, which is why they are called out separately rather than as "the WHERE clause".
     //
-    // THIS EXACT QUERY APPEARS TWICE, here and in `logout_all` below. Both are followed by the same
-    // `session_is_live_at` call, so the same reading applies to both; the duplication is why the
-    // clause analysis above is written once, here, rather than beside each copy.
+    // THIS QUERY APPEARS THREE TIMES - here, in `logout_all` below, and in
+    // `crate::routes::resolve_account_from_cookie` - and the three DO NOT have the same standing.
+    // All three are followed by a `session_is_live_at` call, so the `expires_at` half of the reading
+    // above applies to all three. The `revoked_at IS NULL` half does NOT, and the difference is
+    // measured rather than assumed:
+    //
+    //   this copy (the test-side resolver)  deleting `revoked_at IS NULL` -> CAUGHT (2 tests)
+    //   crate::routes::resolve_account_...  deleting it                   -> CAUGHT (6 tests)
+    //   logout_all (auth.rs)                deleting it                   -> 664 passed / 0 failed
+    //
+    // So `logout_all`'s copy is the one nothing guards, and the clause analysis above - written once
+    // "because the duplication means the same reading applies to both" - was the reason nobody
+    // looked. MEASURED, then corrected rather than left as an assumption:
+    //
+    //   A REVOKED cookie whose timestamps are still in the FUTURE passes every Rust-side check,
+    //   because `session_is_live_at` takes no revocation parameter. With this clause gone from
+    //   `logout_all`, such a cookie reaches the global revoke and signs every other device on the
+    //   account out. That is the same denial-of-service the doc-comment on `logout_all` describes
+    //   for the idle half, arriving through the half that IS in its SQL.
+    //
+    // The neighbouring tests cover an EXPIRED cookie (`logout_all_ignores_dead_sessions`), which
+    // fails on `expires_at` regardless of this clause - which is why they pass either way. What is
+    // missing is the case this clause exists for: revoked, not yet expired.
     let session = sqlx::query(
         "SELECT account_id, last_seen_at, expires_at FROM sessions \
          WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
