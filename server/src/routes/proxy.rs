@@ -5713,8 +5713,8 @@ mod tests {
             .await
             .expect("the mock upstream is healthy");
 
-        // The Debug contract (client.rs:218-223): names the endpoint and whether
-        // a lease is held - never the body.
+        // The Debug contract (`impl fmt::Debug for UpstreamStream`, client.rs): names the endpoint
+        // and whether a lease is held - never the body.
         let debugged = format!("{upstream_stream:?}");
         assert!(debugged.contains("mock"), "names the endpoint: {debugged}");
         assert!(
@@ -5969,8 +5969,8 @@ mod tests {
 
     /// A transport cut MID-answer is announced in band (never retried, never a
     /// provider name), reports no usage, and washes. Covers the error branch of
-    /// poll_next (819-832), `finish(false)` and UpstreamStream::finish_status
-    /// (client.rs:253-255).
+    /// poll_next (819-832), `finish(false)` and `UpstreamStream::finish_status`
+    /// (client.rs).
     #[tokio::test]
     async fn a_stream_that_dies_mid_answer_announces_the_failure_in_band_and_washes() {
         let _env = crate::routes::test_env::EnvLock::acquire();

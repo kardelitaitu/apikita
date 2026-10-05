@@ -123,6 +123,19 @@ pub fn parse_usage_from_sse(tail: &[u8]) -> Option<Usage> {
             continue;
         };
         let text = text.trim();
+        // THIS GUARD IS AN OPTIMISATION, NOT A DECISION, and mutation testing cannot see the
+        // difference. MEASURED: deleting `|| text == "[DONE]"` leaves `upstream::client` at 35 passed
+        // / 0 failed. The reason it cannot change an outcome is one line below - `"[DONE]"` is not
+        // valid JSON, so `serde_json::from_str` rejects it and the `continue` on the parse failure
+        // skips it anyway. The two paths are indistinguishable because both end in "this line
+        // contributes no usage", which is all this loop extracts.
+        //
+        // The parse-failure arm IS exercised: turning its `continue` into a panic is caught by 1 test,
+        // so the loop is known to run over a body containing the terminator. That is what makes the
+        // equivalence above a proof rather than an inference.
+        //
+        // Kept because it saves a JSON parse per stream and names the terminator explicitly. A future
+        // sweep will flag it; the two facts above are why it is not a gap.
         if text.is_empty() || text == "[DONE]" {
             continue;
         }
