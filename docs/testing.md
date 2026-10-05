@@ -453,6 +453,25 @@ re-check, and returns the same bytes. The same-day and rotation tests still pass
 writing one would pin a performance detail and call it correctness. "Not caught" is the right answer
 there, and the discipline is to read what the code does before deciding which of the two it is.
 
+**A THIRD WAY, and the one the controls above cannot see: A FILTER THAT MATCHES THE WRONG TESTS.**
+The second control catches `0 passed; 0 failed`, which means the filter matched nothing. This is the
+case where it matched *something* - so the counts are real, `ok` is real, tests genuinely ran, and
+none of them was the guard. MEASURED, on `reserve_balance_transaction`'s `reserved_idr <= 0` early
+return: filtering the mutation re-test on `reserve` ran **three** tests and reported all three
+mutants NOT CAUGHT. `cargo test --lib reserve` had matched them as substrings of other words -
+`the_query_encoder_leaves_UNRESERVE_d_bytes_alone`, `token_sums_PRESERVE_s_large_i64_values`,
+`the_cap_truncates_..._and_so_PRESERVE_s_...` - while the test that pins the guard,
+`a_zero_reservation_holds_nothing_and_writes_nothing`, was filtered out. Re-run on `reservation`
+(10 tests) or `zero_reservation` (2), all three mutants are CAUGHT.
+
+The count is what makes this invisible: `3 passed` is neither zero nor a failure, so both existing
+controls pass and the run reads as a clean survivor. The rule is to filter on the **module path or
+the exact test name** (`db::tests::a_zero_reservation_...`) rather than a stem guessed from the
+function under test, and to print the test NAMES that ran, not just the counts - a stem that has
+quietly started matching unrelated words is then visible in the output rather than inferred from it.
+The pathology is the same one this file keeps recording in the code under test: a check that reads
+plausible while measuring something else.
+
 ### Where this rule stops, and why it stops there
 
 The log guard checks the SEVENTH restatement, and it works because `logged`, `logs` and
