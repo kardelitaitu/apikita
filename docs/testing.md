@@ -611,6 +611,48 @@ The check to run before trusting any scanner over these files: replace `\n\n` wi
 normalise once at the read. `website/tests/no-shadowing-config.test.ts` already writes `/\r?\n/` for
 its frontmatter fence - that is the form to copy.
 
+**A scanner that passes a regex THROUGH argv reports defects that are not there.** Three separate
+"findings" in this session were this, and the second one is the instructive one because it looked
+like a real defect in a real gate.
+
+The pattern in `tools/backup-check/check.sh`, in the block that compares the unwired binary's sweeps
+against the entrypoint's inline ones, is `db::[a-z_]+\(\)?|db::[a-z_]+\(&`. A scanner that
+extracted it from the source and handed it to `grep` as a **separate argv element** reported it
+INVALID - `grep` exited 2, "Unmatched ( or \(". The same pattern, written to a file and read with
+`grep -qE -f pattern.txt`, exits 1 on empty input and matches five calls in `usage-purge.rs`. It is a
+plain POSIX ERE and it works.
+
+Two things were happening, and neither is about the pattern:
+
+- **A shell in the middle re-quotes.** The path from the scanner to `grep` crossed a PowerShell
+  invocation, and an argument containing backslashes did not arrive byte-exact, so `grep` received
+  something with an unmatched group. The same check run through `sh -c` gave the opposite answer,
+  which is the tell: a verdict that changes with the caller's shell is a verdict about the caller.
+- **Retyping a regex in a nested language loses backslashes.** The source has `\(`; inside a JS
+  single-quoted string that is written `\\(`, and inside a `node -e` inline script it needs another
+  layer again. MEASURED: an inline probe of the same pattern reported exit 2 while the file-based
+  probe of it reported exit 1 - the only difference was how many layers the backslash had crossed.
+  **Read the pattern out of the file rather than retyping it**, which is what the method below does.
+
+**The method that works, and the one to reuse:** write the pattern to a file and let the shell read
+it, so nothing between the extractor and the tool touches the bytes -
+
+```sh
+# `$pattern` must come from the file under test, not from a retyped literal.
+printf '%s' "$pattern" > pat.txt
+grep -qE -f pat.txt /dev/null    # exit 1 = valid, 2 = invalid
+```
+
+MEASURED on both sides, so the method is known to discriminate rather than merely to agree:
+`backup-check:390`'s pattern exits **1** (valid), and `a(b` exits **2** (invalid). A probe that only
+ever sees valid patterns cannot tell a working method from one that returns "valid" unconditionally.
+
+**And the general rule this belongs to.** Every finding in this file that survived scrutiny was
+confirmed a second way. This one did not: the same pattern, read from a file instead of passed through
+argv, gave the opposite verdict. A scanner that AGREES WITH ITSELF proves nothing - the useful question
+is not only "did my scan fail on a known-bad input" but "does my scan give the same answer through a
+different path". When two tools disagree about the same bytes, the bytes are not the problem.
+
 **A second, smaller lesson from the same round.** Four private money helpers in `db.rs`
 (`try_debit`, `try_credit`, `insert_ledger_row`, `expire_one_deposit`) have no *direct* test caller,
 which looks alarming and is not a finding: they are reached through public functions that are
