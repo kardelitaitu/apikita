@@ -213,3 +213,62 @@ test('a never-used key reads Never rather than a date', () => {
   assert.match(lastUsedText({ last_used_at: new Date().toISOString() }), /\d/);
   assert.equal(lastUsedText({ last_used_at: 'not-a-date' }), '—', 'an unreadable timestamp must not print "Invalid Date" to a customer');
 });
+
+/**
+ * THE TOP-UP ISLAND'S OWN COPY OF THE DEPOSIT MINIMUMS, which is the THIRD copy of them.
+ *
+ * `lib/models.ts` exports both figures and `prices.test.ts` compares THOSE to `config/apikita.toml`,
+ * with a comment that states the stakes: "a figure that lives in one place is still a COPY - one
+ * place is not one source... a customer who deposits 10,000 having read 10,001 is rejected by a server
+ * the page contradicts, and the page is what they read."
+ *
+ * TopUpForm.astro declares its OWN `FIRST_DEPOSIT_MIN_IDR` / `RETOPUP_MIN_IDR` and uses them for both
+ * the printed minimum and the form's own check. MEASURED: changing the island's first-deposit figure
+ * to 55,000 while the config, the lib and the server all said 50,000 left the suite at 210 passed /
+ * 0 failed, and `FIRST_DEPOSIT_MIN_IDR` is named by no test in this repository.
+ *
+ * The consequence is the one the prices comment describes, aimed at the surface a customer actually
+ * types into: the form refuses a 50,000 deposit as below its own stated floor while the server
+ * accepts it.
+ */
+test('the top-up island quotes the same deposit minimums as the config', () => {
+  const island = readFileSync(join(root, 'src', 'islands', 'wallet', 'TopUpForm.astro'), 'utf8');
+
+  // The authority is the CONFIG, read the way prices.test.ts reads it, rather than the lib - so this
+  // compares the island straight to the source of truth instead of chaining through a second copy.
+  const toml = readFileSync(join(root, '..', 'config', 'apikita.toml'), 'utf8');
+  const walletSection = toml.match(/^\[wallet\]([\s\S]*?)(?=^\[|\Z)/m);
+  assert.ok(walletSection, 'config/apikita.toml must still have a [wallet] section, or this test has no authority');
+  const readKey = (key: string): number => {
+    const m = walletSection[1].match(new RegExp(`^\\s*${key}\\s*=\\s*([0-9]+)`, 'm'));
+    assert.ok(m, `the config no longer declares wallet.${key}`);
+    return Number(m[1]);
+  };
+
+  const PAIRS: Array<[string, string]> = [
+    ['FIRST_DEPOSIT_MIN_IDR', 'min_first_deposit'],
+    ['RETOPUP_MIN_IDR', 'min_topup'],
+  ];
+
+  for (const [constName, configKey] of PAIRS) {
+    const m = island.match(new RegExp(`const ${constName}\\s*=\\s*([0-9_]+)`));
+    assert.ok(
+      m,
+      `TopUpForm.astro must still declare ${constName}. If the island now imports it from the lib, delete this case rather than the test - the point is that no surface quotes a minimum the config does not have.`,
+    );
+    const islandValue = Number(m[1].replace(/_/g, ''));
+    const configValue = readKey(configKey);
+    assert.equal(
+      islandValue,
+      configValue,
+      `TopUpForm.astro says ${constName} = ${islandValue} and config/apikita.toml says ${configKey} = ${configValue}. ` +
+        'The island uses this for the printed minimum AND the form check, so a divergence makes the page refuse a deposit the server accepts.',
+    );
+  }
+
+  // The relationship the config's own comment calls deliberate, asserted here too because the island
+  // prints both figures - a first deposit below the later minimum would quote an unreachable pair.
+  const first = Number(island.match(/const FIRST_DEPOSIT_MIN_IDR\s*=\s*([0-9_]+)/)![1].replace(/_/g, ''));
+  const re = Number(island.match(/const RETOPUP_MIN_IDR\s*=\s*([0-9_]+)/)![1].replace(/_/g, ''));
+  assert.ok(first > re, 'the island must not state a first-deposit minimum at or below the later minimum');
+});
