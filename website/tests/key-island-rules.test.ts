@@ -32,28 +32,41 @@ test('the key island lists exactly the models the lib publishes', () => {
   const libMatch = libSrc.match(/export const models = (\[[^\]]*\])/);
   assert.ok(libMatch, 'lib/models.ts must still export `models`, or this comparison has no authority');
 
-  const islandMatch = islandSrc.match(/const MODELS_ALL = (\[[^\]]*\])/);
-  assert.ok(
-    islandMatch,
-    'KeyManagement.astro must still declare MODELS_ALL. If it was renamed, update this test - but do not delete it: the island compares `k.models.length >= MODELS_ALL.length`, so the length is load-bearing.',
-  );
-
   const parse = (s: string): string[] => s.replace(/[\[\]'"]/g, '').split(',').map((x: string) => x.trim()).filter(Boolean);
   const lib = parse(libMatch[1]);
-  const island = parse(islandMatch[1]);
 
-  // Worded so a reader learns WHICH direction is dangerous.
-  assert.deepEqual(
-    island.slice().sort(),
-    lib.slice().sort(),
-    `the island's MODELS_ALL is ${JSON.stringify(island)} and lib/models.ts publishes ${JSON.stringify(lib)}. ` +
-      'modelsText returns "All models" when k.models.length >= MODELS_ALL.length, so a SHORTER island copy ' +
-      'makes a key restricted to a subset read as unrestricted. Import the lib list instead of keeping a ' +
-      'second copy, or fix this array - but the two must not drift.',
-  );
+  // BOTH COPIES, and the second was found only by sweeping for the VALUE rather than the name.
+  //
+  // The island declares the model list TWICE: `MODELS` in the client script (used to render the
+  // create-key checkboxes) and `MODELS_ALL` beside the formatters (whose LENGTH decides whether a key
+  // reads "All models"). MEASURED: a name-based sweep for duplicates across website/src finds none -
+  // the two copies use different names for the same value - and before this test, `MODELS` was
+  // mentioned by no test in the suite while `MODELS_ALL` was covered.
+  //
+  // A drift in either is customer-visible in a different way: MODELS renders as the checkbox list a
+  // customer ticks, so a missing entry silently omits a buyable model, and an extra one offers a
+  // model the proxy does not route. MODELS_ALL only affects the length comparison.
+  for (const name of ['MODELS', 'MODELS_ALL']) {
+    const m = islandSrc.match(new RegExp(`const ${name}\\s*=\\s*(\\[[^\\]]*\\])`));
+    assert.ok(
+      m,
+      `KeyManagement.astro must still declare ${name}. If it was renamed, update this test - but do not delete it: ${name === 'MODELS_ALL' ? 'the island compares `k.models.length >= MODELS_ALL.length`, so the length is load-bearing' : 'the list renders directly as the create-key checkboxes'}.`,
+    );
 
-  // The positive control: both sides are non-empty, or the deepEqual above passes over empty arrays.
-  assert.ok(lib.length > 0 && island.length > 0, 'both lists must be non-empty or the comparison is vacuous');
+    const island = parse(m[1]);
+    // The positive control: an empty array would satisfy the comparison below vacuously.
+    assert.ok(island.length > 0, `${name} must be non-empty, or the comparison below is vacuous`);
+
+    assert.deepEqual(
+      island.slice().sort(),
+      lib.slice().sort(),
+      `the island's ${name} is ${JSON.stringify(island)} and lib/models.ts publishes ${JSON.stringify(lib)}. ` +
+        (name === 'MODELS_ALL'
+          ? 'modelsText returns "All models" when k.models.length >= MODELS_ALL.length, so a SHORTER island copy makes a key restricted to a subset read as unrestricted. '
+          : 'MODELS renders as the create-key checkbox list, so a missing entry omits a buyable model and an extra one offers a model the proxy does not route. ') +
+        'Import the lib list instead of keeping a copy, or fix this array - but the two must not drift.',
+    );
+  }
 });
 
 /**
