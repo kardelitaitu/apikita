@@ -5,8 +5,21 @@ to learn - **what it cannot check**. That last section is not a disclaimer. Thre
 ideas for an automatic guard in this repository were built and measured to death,
 and the measurements are here so nobody builds them again.
 
-Run everything with `cd server && cargo test --workspace` (the website has its
+Run everything with `cd server && cargo test` (the website has its
 own: `cd website && npm test`).
+
+**Those two are the commands CI runs, and the second one builds first for a reason.** `npm test` is
+`npm run build && node --test ...`, not the test run alone: one of the website suites reads the
+RENDERED pages under `website/dist`, so running the tests without a build makes that suite report a
+SKIP instead of the assertion it exists to make. `package.json` also carries a `test:unit` that skips
+the build - it reports 204 passed and 1 skipped where `npm test` reports 205 passed - and it is
+deliberately NOT what this document tells you to run. Measured, not assumed.
+
+This used to say `cargo test --workspace`, which names a workspace that does not exist here: there is
+no root `Cargo.toml` and no `[workspace]` table, and `cargo metadata` reports one implicit member, so
+the flag selected exactly what the plain command does. It was the only `--workspace` in the repository
+and it was on the first line a reader copies, which is the wrong place for a flag that suggests a
+layout the tree does not have.
 
 ## The rule that produces most of the real defects
 
