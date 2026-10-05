@@ -2297,6 +2297,187 @@ mod tests {
             .expect("the shipped config must still load and validate");
     }
 
+    /// THE PASSWORD LENGTH PAIR, which no test drove.
+    ///
+    /// `validate` refuses `password_max_length < password_min_length` because "no password could
+    /// satisfy both, so every signup would fail" - a lockout with no symptom but an empty signup
+    /// form. MEASURED: neutralising that arm left this module at 29 passed / 0 failed, and no test
+    /// anywhere in the crate sets either field, so removing it was silent.
+    ///
+    /// The floor below is separate and IS tested (`the_published_password_minimum_is_enforced_server_side`);
+    /// this is the CROSS-FIELD relation between the two, which is the half that can only fail when both
+    /// are configured.
+    #[test]
+    fn a_password_maximum_below_the_minimum_is_refused() {
+        let mut config = shipped_config();
+
+        // The pair as shipped is satisfiable, so any failure here is the mutation's, not the config's.
+        let min = config.auth.password_min_length;
+        config.auth.password_max_length = min;
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("max == min is satisfiable (only one length): {e}"));
+
+        config.auth.password_max_length = min.saturating_sub(1);
+        let err = config
+            .validate()
+            .expect_err("a maximum below the minimum admits no password at all")
+            .to_string();
+        assert!(
+            err.contains("password_max_length") && err.contains("password_min_length"),
+            "the message must name BOTH settings, since the operator has to know which to raise: {err}"
+        );
+    }
+
+    /// THE TWO CLOCK-OVERFLOW ARMS, which turn out to have DIFFERENT reachability - and saying which
+    /// is which is more useful than testing them symmetrically.
+    ///
+    /// MEASURED, against the real chrono, rather than reasoned about:
+    ///
+    ///   - `credit_expiry_months` IS REACHABLE. `Months::new(u32::MAX)` is ~357 million years, which
+    ///     `checked_add_months` refuses, so `validate` returns the error. Its comment names the
+    ///     consequence precisely - "a panic inside the Midtrans webhook: the one endpoint where a
+    ///     crash means we cannot tell whether we were paid" - which is why this one is worth a test.
+    ///
+    ///   - The `verification_ttl_minutes` / `reset_ttl_minutes` arm is NOT REACHABLE from any `u32`.
+    ///     `now + u32::MAX minutes` lands at year **+10192** (measured, not computed by hand), and
+    ///     chrono's representable range is far wider, so `checked_add_signed` never returns `None`.
+    ///     The arm is a correct defensive check whose stated failure cannot occur through this field.
+    ///
+    /// That second fact is why this test asserts the OPPOSITE for the TTL arm: it pins that a large
+    /// value is ACCEPTED, which documents the reachability rather than pretending to exercise a
+    /// refusal. A test that asserted a refusal there would fail, and the tempting fix - widening the
+    /// field or the arithmetic to make it fire - would change behaviour to satisfy a test. Asserting
+    /// the truth is the point.
+    ///
+    /// Both arms were untested before this: neutralising either left this module at 29 passed / 0
+    /// failed, and no test in the crate sets any of the three fields.
+    #[test]
+    fn a_span_the_clock_cannot_represent_is_refused_rather_than_panicking_later() {
+        // REACHABLE: a calendar-month span past the representable range is refused at load, which is
+        // what keeps the Midtrans webhook from panicking mid-payment.
+        let mut config = shipped_config();
+        config.wallet.credit_expiry_months = u32::MAX;
+        let err = config
+            .validate()
+            .expect_err("an expiry span the clock cannot represent must be refused at load")
+            .to_string();
+        assert!(
+            err.contains("credit_expiry_months"),
+            "the message must name the setting, or an operator cannot fix it: {err}"
+        );
+        assert!(
+            err.contains("PANIC"),
+            "the refusal must say WHY it exists - settling a deposit would panic: {err}"
+        );
+
+        for real in [1u32, 12, 24] {
+            let mut config = shipped_config();
+            config.wallet.credit_expiry_months = real;
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("credit_expiry_months = {real} is a real span: {e}"));
+        }
+
+        // NOT REACHABLE, asserted rather than assumed: `u32::MAX` minutes is roughly eight thousand
+        // years, which the clock represents, so the TTL arm accepts it. If a future change makes this
+        // refuse, the arm became reachable and THIS is where that is noticed.
+        for field in ["verification_ttl_minutes", "reset_ttl_minutes"] {
+            let mut config = shipped_config();
+            set_token_ttl_minutes(&mut config, field, u32::MAX);
+            config.validate().unwrap_or_else(|e| {
+                panic!(
+                    "{field} = u32::MAX now REFUSES ({e}). That is not a regression - it means the \
+                     overflow arm became reachable, so it is no longer a defensive check that cannot \
+                     fire, and this test should assert the refusal instead of documenting acceptance."
+                )
+            });
+
+            for real in [15u32, 60, 1440] {
+                set_token_ttl_minutes(&mut config, field, real);
+                config
+                    .validate()
+                    .unwrap_or_else(|e| panic!("{field} = {real} is a real lifetime: {e}"));
+            }
+        }
+    }
+
+    /// THE HALF-CONFIGURED RELAY. `smtp_host = ""` means "no mail" and is SUPPORTED - signup creates
+    /// an inert account and the operator sees one WARN. A host WITH a port of 0, or with no
+    /// from-address, is a deployment that believes it sends mail and does not: every message is
+    /// refused by the relay and the first person to find out is a customer who never received a
+    /// verification link.
+    ///
+    /// MEASURED: neutralising either arm left 29 passed / 0 failed, and `smtp_port` is set in NO test
+    /// in the crate - the field was never exercised even incidentally. That is why both directions
+    /// are asserted here: the empty host must STILL be accepted, or the fix for this test would break
+    /// the documented no-mail deployment.
+    #[test]
+    fn a_half_configured_relay_is_refused_but_an_unconfigured_one_is_not() {
+        // The supported state: no host, no mail, no refusal.
+        let mut config = shipped_config();
+        config.email.smtp_host = String::new();
+        config.email.smtp_port = 0;
+        config.email.from_address = String::new();
+        config.validate().unwrap_or_else(|e| {
+            panic!("an unconfigured relay is a supported state, not a validation failure: {e}")
+        });
+
+        // A host with a port of 0: nothing to connect to.
+        let mut config = shipped_config();
+        config.email.smtp_host = "smtp.example.test".into();
+        config.email.smtp_port = 0;
+        config.email.from_address = "noreply@example.test".into();
+        let err = config
+            .validate()
+            .expect_err("a named relay with no port is a deployment that cannot send mail")
+            .to_string();
+        assert!(
+            err.contains("smtp_port"),
+            "the message must name the setting to fix: {err}"
+        );
+
+        // A host with a port but no from-address: every message rejected.
+        let mut config = shipped_config();
+        config.email.smtp_host = "smtp.example.test".into();
+        config.email.smtp_port = 587;
+        config.email.from_address = String::new();
+        let err = config
+            .validate()
+            .expect_err("a named relay with no from-address cannot send a message")
+            .to_string();
+        assert!(
+            err.contains("from_address"),
+            "the message must name the setting to fix: {err}"
+        );
+
+        // And the fully configured relay is accepted, so the two refusals above are not just
+        // "any non-empty host is refused".
+        let mut config = shipped_config();
+        config.email.smtp_host = "smtp.example.test".into();
+        config.email.smtp_port = 587;
+        config.email.from_address = "noreply@example.test".into();
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("a fully configured relay must validate: {e}"));
+    }
+
+    /// The shipped config, which every test above starts from - so a mutation there cannot be
+    /// mistaken for a bug in the test.
+    fn shipped_config() -> AppConfig {
+        AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load")
+    }
+
+    fn set_token_ttl_minutes(config: &mut AppConfig, field: &str, minutes: u32) {
+        match field {
+            "verification_ttl_minutes" => config.auth.verification_ttl_minutes = minutes,
+            "reset_ttl_minutes" => config.auth.reset_ttl_minutes = minutes,
+            other => panic!("unknown token TTL field {other}"),
+        }
+    }
+
     fn set_session_days(config: &mut AppConfig, field: &str, days: u32) {
         match field {
             "absolute_days" => config.sessions.absolute_days = days,

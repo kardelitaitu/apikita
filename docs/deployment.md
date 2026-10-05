@@ -169,11 +169,25 @@ docker run -d --name apikita-api -p 8080:8080 \
 
 | Property | Why | Verified by |
 | --- | --- | --- |
-| Runs as **uid 10001, non-root** | It holds a writable database and provider credentials in its environment | `docker run … --entrypoint id` |
-| **No toolchain or package manager** | A compiler in the runtime image is attack surface with no operational use | the runtime stage copies only the binaries |
-| `/srv/apikita/server/data` exists and is **writable by the runtime user** | A fresh volume with a root-owned directory fails on first start with "unable to open database file" | the probe in the smoke step |
-| A **working `HEALTHCHECK`** | An always-red probe turns a healthy deploy into a restart loop | the smoke step requires the container to *report healthy* |
-| The container's shutdown is **graceful** | `tini` reaps and forwards signals to the whole process group | `ENTRYPOINT` exec form |
+| Runs as **uid 10001, non-root** | It holds a writable database and provider credentials in its environment | `tools/backup-check` reads the runtime stage: a `USER` line must be present, must not be root, and must name an account that stage actually creates |
+| **No toolchain or package manager** | A compiler in the runtime image is attack surface with no operational use | the smoke step greps for `apt`, `apt-get` and `dpkg`, which regressed once already |
+| `/srv/apikita/server/data` exists and is **writable by the runtime user** | A fresh volume with a root-owned directory fails on first start with "unable to open database file" | the probe in the smoke step: it migrates and starts on a fresh volume |
+| A **working `HEALTHCHECK`** | An always-red probe turns a healthy deploy into a restart loop | the smoke step requires the container to *report healthy*, then re-reads the documented body |
+| The container's shutdown is **graceful** | `tini` reaps and forwards signals to the whole process group | `ENTRYPOINT` exec form — **read from the Dockerfile, not asserted by a check** |
+
+> **This table used to overstate three of its rows, and the cells were the reason nobody looked.**
+> The non-root row named `docker run … --entrypoint id`; the package-manager row named a property of
+> the build rather than a check; the shutdown row named the `ENTRYPOINT` form. **No workflow step and
+> no tool check ran any of them.** MEASURED: deleting `USER apikita` from `server/Dockerfile` — so
+> the container runs as **root**, holding the money database and the provider credentials — left
+> `backup-check`, `compose-check` and `ci-docs-check` all at exit 0, and the smoke step would not
+> have caught it either: it polls the health status, checks the health body, and greps for
+> `apt`/`dpkg`, all of which a root container satisfies.
+>
+> The non-root row is now genuinely checked. The package-manager row names the grep that runs. The
+> shutdown row says plainly that it is **read, not asserted** — `tini` is in the `ENTRYPOINT` line
+> and a check could pin it, but a cell claiming a verification that does not exist is worse than a
+> cell admitting there is none, because the first is why nobody checks.
 
 **One entrypoint, two verbs.** The image's `ENTRYPOINT` is `tini -- apikita-server`;
 running the migration means overriding it with `--entrypoint`. There is no

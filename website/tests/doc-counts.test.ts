@@ -78,7 +78,7 @@ const WEBSITE_TESTS = 205;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 661;
+const SERVER_TESTS = 664;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
@@ -448,6 +448,12 @@ test('no doc still claims a superseded count', () => {
         '658 tests', '658 passed', '658 / 0 / 0',
         '659 tests', '659 passed', '659 / 0 / 0',
         '660 tests', '660 passed', '660 / 0 / 0',
+        // 662 and 663 were passed through in one commit, which added three tests at once, and
+        // neither was published on its own. Recorded for the same reason 648 and 657 were: a
+        // document carrying a count the suite passed through must not be able to reappear.
+        '662 tests', '662 passed', '662 / 0 / 0',
+        '663 tests', '663 passed', '663 / 0 / 0',
+        '661 tests', '661 passed', '661 / 0 / 0',
       ],
     },
     {

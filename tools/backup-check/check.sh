@@ -572,6 +572,64 @@ else
     }
 fi
 
+# ---------------------------------------------------------------------------
+# THE RUNTIME USER, which docs/deployment.md marks as VERIFIED and nothing verified.
+# ---------------------------------------------------------------------------
+# The image-guarantee table in docs/deployment.md claims five properties and gives a "Verified by"
+# column for each. Three of those cells name something no workflow step and no tool check runs:
+#
+#   | Runs as uid 10001, non-root | ... | `docker run ... --entrypoint id` |
+#   | No toolchain or package manager | ... | the runtime stage copies only the binaries |
+#   | shutdown is graceful | ... | `ENTRYPOINT` exec form |
+#
+# MEASURED: deleting `USER apikita` from server/Dockerfile - which makes the container run as ROOT -
+# left backup-check, compose-check and ci-docs-check ALL at exit 0, and CI's smoke step would not
+# catch it either: that step polls the health status, checks the health body, and greps for apt/dpkg,
+# and a root container satisfies every one of them. Nothing in this repository inspects the uid.
+#
+# That is worse than an unverified property. The table tells a reader the property IS machine-checked,
+# which is exactly the reason they would not check it themselves - and this container holds the money
+# database and the provider credentials, which is the reason the row exists.
+#
+# WHAT THIS ASSERTS, narrowly and honestly: the Dockerfile declares a non-root USER, and the runtime
+# stage's USER is not `root`. It does NOT assert uid 10001 specifically, because a project may
+# renumber without the guarantee changing, and it does NOT build the image - a uid assertion that
+# needs Docker belongs in the smoke step that already runs it.
+if [ -f "$REPO/server/Dockerfile" ]; then
+    RUNTIME_STAGE=$(awk '/^FROM .* AS runtime/{f=1} f' "$REPO/server/Dockerfile")
+    if [ -z "$RUNTIME_STAGE" ]; then
+        fail "server/Dockerfile has no 'FROM ... AS runtime' stage, so the USER check below inspected nothing. Fix the stage name or this check, not the assertion."
+    else
+        LAST_USER=$(printf '%s\n' "$RUNTIME_STAGE" | grep -E '^USER ' | tail -1 | awk '{print $2}')
+        if [ -z "$LAST_USER" ]; then
+            fail "server/Dockerfile's runtime stage sets no USER, so the container runs as ROOT. docs/deployment.md's guarantee table says this is 'Verified by docker run ... --entrypoint id', and MEASURED: removing the USER line leaves every check at exit 0. This image holds the money database and the provider credentials."
+        elif [ "$LAST_USER" = "root" ] || [ "$LAST_USER" = "0" ]; then
+            fail "server/Dockerfile's runtime stage ends with 'USER $LAST_USER', which is root. The guarantee table says non-root and calls it verified; nothing else in this repository inspects the uid."
+        fi
+        # The user must also be CREATED in that stage, or the image fails to start with
+        # "unable to find user" - which the health poll would report as an unhealthy container
+        # rather than as a missing account.
+        #
+        # THE NAMES ARE COMPARED, not merely their presence. MEASURED: the first version of this
+        # check only asked whether a `useradd`/`adduser` appeared ANYWHERE in the stage, and
+        # `USER ghost` - a name nothing creates - passed it at exit 0. The container would fail at
+        # start with "unable to find user: ghost", so the check has to match the two NAME TOKEN
+        # FOR NAME TOKEN rather than confirm that each kind of line exists.
+        #
+        # Matched anywhere in the stage rather than at a line start: the creation here is a
+        # line-continued RUN - `RUN groupadd ... \` then `    && useradd ...` - so an anchored
+        # pattern missed it and an earlier version of this check failed on a correct Dockerfile.
+        CREATED_NAMES=$(printf '%s\n' "$RUNTIME_STAGE" \
+            | grep -oE '(useradd|adduser)[^&|;]*(--system|--uid[ =][0-9]+)?[^&|;]*' \
+            | grep -oE '[A-Za-z_][A-Za-z0-9_-]*' | grep -vxE 'useradd|adduser|system|uid|gid|home|shell|create|group' | tr '\n' ' ')
+        if [ -z "$CREATED_NAMES" ]; then
+            fail "server/Dockerfile's runtime stage sets 'USER $LAST_USER' but no useradd/adduser call was found in the stage. The image would fail at start with 'unable to find user', which surfaces as an unhealthy container rather than as a missing account."
+        elif ! printf '%s\n' " $CREATED_NAMES " | grep -q " $LAST_USER "; then
+            fail "server/Dockerfile's runtime stage sets 'USER $LAST_USER', and the account(s) the stage creates are: $CREATED_NAMES. The name the container runs as is not one of them, so the image would fail at start with 'unable to find user: $LAST_USER' - which surfaces as an unhealthy container rather than as a missing account. MEASURED: an earlier version of this check only asked whether a useradd call existed, and 'USER ghost' passed it."
+        fi
+    fi
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "backup-check: the backup contract is BROKEN (see above)" >&2
     exit 1
