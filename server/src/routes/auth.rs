@@ -2085,6 +2085,76 @@ mod tests {
             "a second logout must not rewrite the original revocation time"
         );
 
+        // THE ACCOUNT-WIDE FORM OF THE SAME GUARD, and this is the one nothing checked.
+        //
+        // `logout` above uses `WHERE token_hash = ? AND revoked_at IS NULL`, and the assertion just
+        // made pins its timestamp. The BULK form - `UPDATE sessions SET revoked_at = ?
+        // WHERE account_id = ? AND revoked_at IS NULL`, copied at eleven sites across auth.rs and
+        // admin.rs - had no such assertion, and MEASURED: deleting `AND revoked_at IS NULL` from any
+        // of the four account-wide sites left the whole suite at 665 passed / 0 failed.
+        //
+        // WHY IT IS NOT COSMETIC. `revoked_at` is what the retention sweep reads
+        // (`db.rs`: `DELETE FROM sessions WHERE COALESCE(revoked_at, expires_at) <= ?`), so
+        // re-stamping an ALREADY-revoked row pushes its collection instant forward by the full
+        // window - a row that was due to be deleted is retained another 30 days. And every suspend,
+        // password reset and logout-all re-stamps it again, so the row's `revoked_at` stops meaning
+        // "when this session was revoked" and starts meaning "when a bulk revoke last touched it".
+        //
+        // THE FIXTURE NEEDS THE CALLER LIVE AND A SIBLING ALREADY REVOKED, which is narrower than it
+        // first looks. An earlier version of this test simply ran `logout_all` twice: the second run
+        // finds no LIVE caller, so `caller` is `None` and the UPDATE never executes at all - the
+        // mutation is unobservable and the test passed with the guard removed. The UPDATE only reads
+        // an already-revoked row when the caller IS live and some OTHER row of the same account is
+        // not. That is the arrangement below.
+        let account = live_account(&pool).await;
+        let sibling =
+            add_live_session(&pool, account.account_id, Utc::now() + Duration::days(30)).await;
+        let caller =
+            add_live_session(&pool, account.account_id, Utc::now() + Duration::days(30)).await;
+
+        // Revoke the sibling DIRECTLY, so its `revoked_at` is a fixed instant we can compare.
+        let sibling_stamped = Utc::now() - Duration::days(10);
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?")
+            .bind(sibling_stamped)
+            .bind(hash_token(&sibling))
+            .execute(&pool)
+            .await
+            .expect("revoke the sibling");
+
+        // The caller is live, so logout_all's SELECT resolves it and the bulk UPDATE runs over the
+        // account - including the sibling, which is ALREADY revoked.
+        let response = call(logout_all(State(pool.clone()), cookie_header(&caller))).await;
+        assert_eq!(response.status, StatusCode::NO_CONTENT);
+
+        let sibling_after: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
+                .bind(hash_token(&sibling))
+                .fetch_one(&pool)
+                .await
+                .expect("read the sibling's revocation time");
+        assert_eq!(
+            sibling_after,
+            Some(sibling_stamped),
+            "the account-wide revoke must not REWRITE the revocation time of an already-revoked \
+             session. If this moved, the bulk UPDATE ran without its `revoked_at IS NULL` guard: the \
+             row's revoked_at is no longer when it was revoked, and the retention sweep - which \
+             reads COALESCE(revoked_at, expires_at) - retains the row for the full window from this \
+             moment instead of deleting it on schedule."
+        );
+
+        // And the guard is not so tight that it skips the rows it is FOR: the sibling was revoked,
+        // and the caller - live until this call - must now be too.
+        let caller_after: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
+                .bind(hash_token(&caller))
+                .fetch_one(&pool)
+                .await
+                .expect("read the caller's revocation time");
+        assert!(
+            caller_after.is_some(),
+            "logout-all must still revoke the live session that called it"
+        );
+
         // The victim account is otherwise intact.
         let sessions_left: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE account_id = ?")
