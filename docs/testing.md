@@ -380,6 +380,28 @@ So a mutation result is only evidence once three things hold, and each is cheap:
     command. A restore that silently failed leaves a mutation in the tree, and the next
     round reads mutated source as if it were real.
 
+**A FOURTH: with `cargo test` and no `--lib`, there is more than one result line, and the first one
+can be a pass while the run failed.** MEASURED, because it is the same trap as the `0 passed` case
+one level up and it is worse - the counts are real, the `ok` is real, and the suite still failed.
+
+One `cargo test` in this repository prints **eight** `test result:` lines across seven binaries: the
+library, `main`, and five bins. A deliberate failure planted in `hold-sweep`'s tests produced
+
+```
+exit 101                                   <- cargo sees it, CI fails, correct
+test result: ok. 658 passed; 0 failed; ...  <- the FIRST line: the library, which passed
+```
+
+So a harness that reads the first result line reports "658 passed / 0 failed" for a run that failed.
+The three lines reporting `0 passed; 0 failed` are the bins with no tests at all, and they are the
+same shape as the filter-matches-nothing case above: a number that reads as health.
+
+The corollary is what CI already does: **`cargo test` is permitted to be judged by its EXIT CODE and
+by nothing else.** That is immune to all of this - rustc exits non-zero if any target's suite fails -
+and it is why `ci.yml` runs `cargo test` without parsing the output. A tool that parses instead must
+sum the failures across every result line, and must treat "no result line at all" as an error rather
+than as zero failures.
+
 A harness missing the second control is the most dangerous of the three, because it fails
 in the direction that looks like a finding: every mutant survives, and the report says the
 guard is weak when the runner was broken.
