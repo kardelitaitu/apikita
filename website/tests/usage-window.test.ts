@@ -64,6 +64,25 @@ test('the usage window is two real YYYY-MM-DD bounds, not the -30d shorthand the
 
   // An unusable clock is refused loudly rather than sent as "Invalid Date".
   assert.throws(() => usageWindowQuery(new Date(Number.NaN)), RangeError);
+
+  // AND THE REFUSAL MUST BE THE ONE THIS FUNCTION WROTE, not any RangeError that happens along.
+  //
+  // MEASURED: deleting the `Number.isNaN(to.getTime())` guard left the whole website suite GREEN at
+  // 211 passed / 0 failed. An invalid date still throws - `toIsoDay` calls `toISOString()`, which
+  // raises `RangeError: Invalid time value` - so the assertion above is satisfied by a DIFFERENT
+  // line's error and cannot see the guard go.
+  //
+  // The guard's whole contribution is therefore the MESSAGE: it names the function and the cause,
+  // where the fallback names neither. A diagnostic whose value is its message is not tested by
+  // asserting its error type, so the message is asserted here.
+  assert.throws(
+    () => usageWindowQuery(new Date(Number.NaN)),
+    (err: unknown) =>
+      err instanceof RangeError && /usageWindowQuery needs a valid Date/.test(err.message),
+    'an invalid Date must be refused by usageWindowQuery\'s OWN check, with its own message. If \
+     this fails while the type assertion above passes, the NaN guard is gone and the reported \
+     error comes from toIsoDay instead - which names neither the function nor the cause.'
+  );
 });
 
 test('a bucket is labelled from the server\'s "day" field, and "date" is still tolerated', () => {
