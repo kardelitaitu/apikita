@@ -3125,6 +3125,23 @@ mod tests {
 
         // The general rule: every `DROP TABLE` in the migrations must be accounted for above.
         // A new one that silently retires an earlier definition is exactly the trap this exists for.
+        //
+        // THE FIRST VERSION OF THIS PARSE HAD THREE GAPS, found by probing it with migration files
+        // rather than by reading it. Each was measured against the real guard:
+        //
+        //   `DROP TABLE IF EXISTS accounts;`   REJECTED IT, reporting the table as `IF`. A worse
+        //                                      failure than a miss: a correct migration, written
+        //                                      defensively, is refused with a message naming the
+        //                                      wrong table, and the fix looks like editing the map.
+        //   `drop table accounts;`             SKIPPED. SQLite is case-insensitive here, so a real
+        //                                      retirement in lower case was invisible - the exact
+        //                                      defect the rule exists to catch.
+        //   `DROP TABLE\n  accounts;`          SKIPPED. Line-based `strip_prefix` cannot see a
+        //                                      statement split across lines.
+        //
+        // So the parse is over the WHOLE FILE, case-insensitively, with `IF EXISTS` consumed as part
+        // of the prefix and the name taken as the first identifier after it. That covers all three
+        // shapes and is what the probes now pin.
         let mut entries: Vec<_> = std::fs::read_dir(&migrations)
             .expect("server/migrations must be readable")
             .flatten()
@@ -3139,21 +3156,38 @@ mod tests {
                 .unwrap_or_default()
                 .to_string();
             let text = std::fs::read_to_string(&path).unwrap_or_default();
-            for line in text.lines() {
-                let Some(rest) = line.trim().strip_prefix("DROP TABLE ") else {
-                    continue;
-                };
-                let dropped = rest
-                    .split(|c: char| c == ';' || c.is_whitespace())
-                    .next()
-                    .unwrap_or_default();
+            let upper = text.to_uppercase();
+
+            let mut from = 0usize;
+            while let Some(at) = upper[from..].find("DROP TABLE") {
+                let start = from + at + "DROP TABLE".len();
+                from = start;
+
+                // Walk past whitespace, then past an optional `IF EXISTS`, then whitespace again,
+                // tracking an offset into the ORIGINAL text so the table's casing is preserved.
+                let after = &text[start.min(text.len())..];
+                let mut off = after.len() - after.trim_start().len();
+                let tail_upper = after[off..].to_uppercase();
+                if let Some(rest) = tail_upper.strip_prefix("IF EXISTS") {
+                    let consumed = tail_upper.len() - rest.len();
+                    off += consumed;
+                    let tail = &after[off..];
+                    off += tail.len() - tail.trim_start().len();
+                }
+                let dropped: String = after[off..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+
                 // A rebuild staging table is dropped or renamed as part of its own dance, not as the
                 // retirement of an earlier definition.
-                if dropped.starts_with('_') || dropped.is_empty() {
+                if dropped.is_empty() || dropped.starts_with('_') {
                     continue;
                 }
                 assert!(
-                    REBUILT.iter().any(|(w, _, t)| *w == name && *t == dropped),
+                    REBUILT
+                        .iter()
+                        .any(|(w, _, t)| *w == name && t.eq_ignore_ascii_case(&dropped)),
                     "{name} DROPs `{dropped}`, which retires an earlier CREATE TABLE of the same \
                      name - so ONE of the two definitions is dead and an edit to it changes nothing. \
                      Add it to REBUILT so the relationship is asserted rather than assumed."
@@ -3161,6 +3195,85 @@ mod tests {
             }
         }
     }
+
+    /// The parser inside the rebuild guard, pinned against the three shapes that defeated its first
+    /// version. A parser is code, and this one is reached only by dropping a table - so without these
+    /// it would be exercised once per schema change rather than per run.
+    ///
+    /// The first version used `line.trim().strip_prefix("DROP TABLE ")`, which MEASURED against the
+    /// real guard gave three wrong answers: `DROP TABLE IF EXISTS accounts;` was REJECTED with the
+    /// table reported as `IF` (a correct migration refused, with a message naming the wrong table),
+    /// and both `drop table accounts;` and a statement split across two lines were SKIPPED - a real
+    /// retirement made invisible, which is the exact defect the rule exists to catch.
+    ///
+    /// The function below mirrors the parser rather than calling it, because the parser lives inside a
+    /// test that reads the migrations directory. Mirroring is the weaker form and is chosen knowingly:
+    /// it pins the SHAPES, and the real migration in the directory is what proves the guard still
+    /// accepts the file it is about.
+    fn drop_table_names(sql: &str) -> Vec<String> {
+        let upper = sql.to_uppercase();
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(at) = upper[from..].find("DROP TABLE") {
+            let start = from + at + "DROP TABLE".len();
+            from = start;
+            let after = &sql[start.min(sql.len())..];
+            let mut off = after.len() - after.trim_start().len();
+            let tail_upper = after[off..].to_uppercase();
+            if let Some(rest) = tail_upper.strip_prefix("IF EXISTS") {
+                off += tail_upper.len() - rest.len();
+                let tail = &after[off..];
+                off += tail.len() - tail.trim_start().len();
+            }
+            let name: String = after[off..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_drop_parser_reads_the_table_and_not_the_clause_beside_it() {
+        // A correct, defensively-written migration. The first version returned `IF` here.
+        assert_eq!(
+            drop_table_names("DROP TABLE IF EXISTS accounts;"),
+            vec!["accounts".to_string()],
+            "`IF EXISTS` is part of the statement, not the table's name. Reading it as the name \
+             rejects a correct migration and blames the wrong table, which sends the reader to edit \
+             the map instead of the parser"
+        );
+
+        // SQLite is case-insensitive, so the guard must be. The first version skipped this entirely.
+        assert_eq!(
+            drop_table_names("drop table accounts;"),
+            vec!["accounts".to_string()],
+            "a lower-case DROP retires a definition exactly like an upper-case one; skipping it \
+             makes a real retirement invisible"
+        );
+
+        // A statement split across lines. Line-based `strip_prefix` cannot see it.
+        assert_eq!(
+            drop_table_names("DROP TABLE\n  accounts;"),
+            vec!["accounts".to_string()],
+            "a statement is not a line"
+        );
+
+        // Mixed casing on both parts, and two statements in one file.
+        assert_eq!(
+            drop_table_names("Drop Table If Exists a_b; select 1; DROP TABLE c;"),
+            vec!["a_b".to_string(), "c".to_string()],
+            "every statement in a file must be found, not the first"
+        );
+
+        // Vacuity guard: an empty input yields nothing, so the assertions above are not passing
+        // because the parser returns a constant.
+        assert!(drop_table_names("CREATE TABLE t (id TEXT);").is_empty());
+    }
+
     #[test]
     fn every_document_under_docs_is_either_citation_checked_or_triaged_with_a_reason() {
         const TRIAGED: &[(&str, &str)] = &[
