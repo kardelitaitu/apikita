@@ -1537,6 +1537,75 @@ mod tests {
                 .unwrap();
         assert_eq!(rows, 1, "a rebind must replace, not accumulate");
 
+        // AND THE OTHER HALF OF THE `SET`, which this test was not reading.
+        //
+        // The upsert updates TWO columns - `account_id` and `linked_at` - and only the account was
+        // asserted. `linked_at` was written and read by nothing: three references in the whole tree,
+        // all of them INSERT/UPDATE text. MEASURED: deleting `linked_at = excluded.linked_at` from
+        // the `SET` left the whole 682-test suite green, while deleting the `account_id` half was
+        // caught by the assertion above. A `SET` clause with one covered assignment and one not is
+        // the shape where the uncovered half is the one nobody notices.
+        //
+        // WHY THE TIMESTAMP MATTERS RATHER THAN BEING ORNAMENT. It records when this chat last
+        // proved control of an account, and the semantics above are explicitly "a chat belongs to
+        // whoever MOST RECENTLY proved control". A rebind that moved the account but kept the old
+        // timestamp would leave the row naming the current account while recording when the previous
+        // one proved control.
+        //
+        // THE ASSERTION CANNOT COMPARE THE TWO REDEMPTIONS' STAMPS, and that was measured: both are
+        // `Utc::now()` calls milliseconds apart, and a `relinked_at >= first_linked_at` comparison
+        // STILL PASSED with the assignment deleted, because the two values came out equal. So the
+        // test plants a timestamp it knows is old on the existing row and requires the rebind to
+        // replace it. A `SET` that carried the old value forward would leave that planted string.
+        const PLANTED: &str = "2000-01-01T00:00:00+00:00";
+        let planted_owned = PLANTED.to_string();
+        let planted = sqlx::query("UPDATE telegram_links SET linked_at = ? WHERE telegram_id = ?")
+            .bind(PLANTED)
+            .bind("5550010")
+            .execute(&db.pool)
+            .await
+            .expect("plant an old timestamp");
+        assert_eq!(
+            planted.rows_affected(),
+            1,
+            "the chat must be bound before this point, or the plant proves nothing"
+        );
+
+        // A FRESH code for the same account: the two above were consumed by the loop, and a spent
+        // code is refused before it reaches the upsert.
+        seed_code(&db.pool, first_account, "333333", 5, false).await;
+
+        let response = redeem_link_code(
+            State(state.clone()),
+            peer(),
+            bot_headers(BOT_TOKEN),
+            Json(RedeemLinkCodeRequest {
+                code: "333333".into(),
+                telegram_id: "5550010".into(),
+            }),
+        )
+        .await
+        .expect("a redemption after planting a timestamp must still succeed");
+        assert!(body_text(response).await.contains("linked"));
+
+        let after: String =
+            sqlx::query_scalar("SELECT linked_at FROM telegram_links WHERE telegram_id = ?")
+                .bind("5550010")
+                .fetch_one(&db.pool)
+                .await
+                .expect("read the rebind's timestamp");
+        assert_ne!(
+            after, PLANTED,
+            "the rebind left the PREVIOUS `linked_at` ({PLANTED}) in place. The upsert's SET must \
+             carry `linked_at = excluded.linked_at`, or the row names the account that most recently \
+             proved control while recording when the one before it did. MEASURED: dropping that \
+             assignment left the whole 682-test suite green."
+        );
+        assert!(
+            after >= planted_owned,
+            "the rebind wrote a `linked_at` ({after}) EARLIER than the one it replaced ({PLANTED})"
+        );
+
         db.close().await;
     }
 
