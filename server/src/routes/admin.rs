@@ -677,6 +677,27 @@ pub async fn suspend_account(
         .into());
     }
 
+    // TWO ASSIGNMENTS, AND TWO DIFFERENT GUARDS - worth distinguishing, because only one of them
+    // survives deleting the test suite.
+    //
+    // `docs/testing.md`'s sweep table says of this statement and `resume_account`'s: "MEASURED:
+    // dropping either assignment breaks the query's bind count". That is true - deleting
+    // `updated_at = ?` leaves one placeholder against two `.bind()` calls, and 6 admin tests fail.
+    //
+    // But the bind count is the WEAKER guard, and it is a property of the TESTS. MEASURED separately:
+    // keeping both placeholders and both binds while aiming `updated_at` at the account id instead of
+    // an instant fails 10 admin tests - and it fails at the SCHEMA, as a 500 out of the handler, not
+    // at an assertion. `accounts.updated_at` carries
+    // `CHECK (updated_at GLOB '????-??-??T??:??:??*+00:00')`
+    // (migrations/20260925000000_initial_schema.sql:30), so a value that is not an RFC3339 instant is
+    // refused by SQLite itself and the whole UPDATE - including `status = 'suspended'` - never lands.
+    //
+    // WHY THE DISTINCTION MATTERS: the bind-count mistake is a coding error a test catches; the format
+    // mistake is a DATA error the schema catches, in production, for a caller whose tests never ran.
+    // It is why `Utc::now()` is bound rather than anything string-shaped that merely looks like a
+    // timestamp - `2026-01-01 12:00:00`, and `2026-01-01T12:00:00` without an offset, are both
+    // rejected by that GLOB, and the failure surfaces as an opaque 500 rather than as a suspension
+    // that never happened.
     sqlx::query("UPDATE accounts SET status = 'suspended', updated_at = ? WHERE id = ?")
         .bind(Utc::now())
         .bind(id.hyphenated())
