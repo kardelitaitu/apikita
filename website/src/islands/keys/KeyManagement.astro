@@ -199,6 +199,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   import { apiFetch, ApiError } from '../../lib/api';
   import { describeError, inlineNotice, renderFieldError } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
+  import { getLiveStore } from '../../lib/live';
   import {
     buildCreateKeyRequest,
     buildUpdateKeyRequest,
@@ -271,7 +272,13 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     return isNaN(d.getTime()) ? '—' : d.toLocaleString();
   }
 
+  // The list as last rendered, so the live subscription can patch it without a refetch. Kept in one
+  // place because `render` replaces the DOM wholesale - a patched row that is not in this array would
+  // be lost on the next render.
+  let renderedKeys: ApiKey[] = [];
+
   function render(keys: ApiKey[]): void {
+    renderedKeys = keys;
     ($('key-list-loading') as HTMLElement).hidden = true;
     const hasAny = keys.length > 0;
     emptyEl.toggleAttribute('hidden', hasAny);
@@ -353,6 +360,37 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       showError(inlineNotice(view));
       render([]);
     }
+  }
+
+  // CROSS-TAB REVOCATION, which was the whole point of the `key` event and had no consumer.
+  //
+  // `live.ts` listens for `key` and records revoked ids in `revokedKeyIds`. That field was read by
+  // ZERO files outside live.ts — MEASURED against every sibling field, which are read by 2 to 15 —
+  // so this page kept rendering a Revoke button for a key another tab had already revoked, and
+  // clicking it answered 404. The comment on the field says "for cross-tab consistency"; this is the
+  // subscriber that makes that sentence true.
+  //
+  // IT PATCHES THE LIST RATHER THAN REFETCHING. The event carries `key_id` and `revoked_at`, which is
+  // exactly what `statusLabel` and the button gate read, so there is nothing a round trip would add —
+  // and a refetch on every event would race a concurrent create.
+  //
+  // AND IT DOES NOT FETCH ON LOAD. `loadKeys` is the only path that populates the list; the
+  // subscription only ever marks a key that is already rendered, so an event for a key this page has
+  // never seen is ignored rather than inserting a half-known row.
+  function applyRevocations(): void {
+    const revoked = new Set(getLiveStore().getState().revokedKeyIds);
+    if (revoked.size === 0) return;
+    let changed = false;
+    for (const key of renderedKeys) {
+      if (key.revoked_at === null && revoked.has(key.id)) {
+        // The stream's `revoked_at` is not carried into the row: the list's own fetch is the source
+        // of the timestamp, and inventing one here would put a client-side clock into a field the
+        // server owns. The row only needs to stop being "live".
+        key.revoked_at = 'revoked';
+        changed = true;
+      }
+    }
+    if (changed) render(renderedKeys);
   }
 
   // The plaintext key is held nowhere but the #key-secret node. Dismissing the
@@ -609,4 +647,9 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   });
 
   void loadKeys();
+
+  // The cross-tab subscription. Started here rather than at module scope so the DOM the listener
+  // writes to is in place, and because the store de-duplicates subscribers - a second call to
+  // `getLiveStore()` returns the same one `DashboardLayout` already started.
+  getLiveStore().subscribe(applyRevocations);
 </script>
