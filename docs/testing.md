@@ -532,6 +532,36 @@ and two more in `doc_claims.rs` and `config.rs` guarded by `expect` and by a com
 assertion. The check that works is to ask which of the three applies, and to grep the whole file for
 a control that names the same source function - not to look for a counter in the scan's own body.
 
+### The method that DID find a gap, and the one measurement that did not
+
+Round 114 found `ledger.balance_after` unasserted on the settlement path by asking a narrower
+question than "which scans are unguarded": **which columns does a customer-facing route return, and
+which of those has a semantic assertion?** That framing worked, so it is worth writing down with the
+number that makes it usable.
+
+A route returns a column in the shape `"<column>": r.try_get::<T, _>("<column>")?`. Grepping for it
+over `server/src/routes` gives **25 distinct columns**. For each, count the test files that mention
+it:
+
+| columns | test files mentioning it |
+| --- | --- |
+| `settled_at` | 2 |
+| `last_used_at` | 3 |
+| `token_limit`, `rate_limit_rpm`, `spend_limit_idr` | 5-6 |
+| every other of the 25 | 8 or more |
+
+**All 25 are mentioned by at least two test files, and the two sparsest were read in full before
+concluding anything.** `settled_at` is asserted in `account.rs` where a settled top-up carries it and
+a pending one does not; `last_used_at` in `proxy.rs` ("resolving a key must record last_used_at") plus
+three website tests for its rendering; `rail` in `tools/wind-down-check`, whose two fixtures exist
+precisely to prove the payout method differs by rail.
+
+**The count is a triage order, not a verdict.** A column mentioned by nine test files may still have
+no assertion about it - `balance_after` had nine - and a column mentioned by two may be pinned
+exactly. What the count buys is an order to read them in, so a sweep over twenty-five columns spends
+its time on the two that are cheapest to be wrong about. Reporting a low count as a finding without
+reading the two is the same mistake as round 113's, one level along.
+
 ### Where this rule stops, and why it stops there
 
 The log guard checks the SEVENTH restatement, and it works because `logged`, `logs` and
