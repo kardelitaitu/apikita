@@ -3207,6 +3207,82 @@ mod tests {
         id
     }
 
+    /// `record_request_source` files the source under TODAY, and nothing observed that.
+    ///
+    /// WHY THIS EXISTS. `record_key_ip` is well tested - with an explicit `day` the caller supplies.
+    /// The WRAPPER that DERIVES that day, `record_request_source`, had no test at all: its only
+    /// occurrence in the crate is its definition and the one call inside `chat_completions`, and the
+    /// handler tests do not read the `key_ip_seen` / `key_ip_daily` rows afterwards.
+    ///
+    /// MEASURED: replacing `let day = today_utc()` with a hardcoded `2020-01-01` left the whole suite
+    /// green at 679 passed / 0 failed. Every request source in production would then be filed under
+    /// one arbitrary day - the retention sweep deletes it immediately (its window is 7 days), so the
+    /// distinct-IP signal the abuse guard reads would be permanently empty, which is the silent
+    /// direction: a counter that never rises looks exactly like a key nobody abuses.
+    ///
+    /// The SAME day must reach both the hash and the row. `record_request_source` derives them
+    /// together, before its spawn, for the reason its own comment gives: after the spawn the UTC day
+    /// could roll over and the row would then be filed under a different day than the salt that
+    /// produced the hash - which makes the hash unusable for correlation, silently.
+    #[tokio::test]
+    async fn record_request_source_files_the_row_under_today() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        // A peer address the trusted-proxy rules pass through unchanged, so the hash is over a known
+        // value rather than over a forwarded header this test would also have to pin.
+        let peer = SocketAddr::from(([203, 0, 113, 77], 4321));
+        let headers = HeaderMap::new();
+
+        record_request_source(&state, key_id, peer, &headers);
+
+        // The write is SPAWNED, so wait for it rather than assuming it has landed. Polling is the
+        // honest way to observe a detached task.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for _ in 0..100 {
+            rows = sqlx::query_as("SELECT day, ip_hash FROM key_ip_seen WHERE api_key_id = ?")
+                .bind(key_id.hyphenated())
+                .fetch_all(&pool)
+                .await
+                .expect("read key_ip_seen");
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "one served request must write exactly one seen-address row"
+        );
+        let today = crate::ip_tracking::today_utc().to_string();
+        assert_eq!(
+            rows[0].0, today,
+            "the row must be filed under TODAY. A row for any other day is outside the 7-day window \
+             the retention sweep keeps, so it is deleted before the distinct-IP signal can ever be \
+             read - a counter that silently never rises"
+        );
+
+        // And the hash is the one THIS day's salt produces, so the two were derived together.
+        let expected = ip_hash(
+            &state.ip_salt.salt_for_day(crate::ip_tracking::today_utc()),
+            &resolve_client_ip(peer.ip(), &headers, &state.trusted_proxies),
+        );
+        assert_eq!(
+            rows[0].1, expected,
+            "the stored hash must be the one computed under TODAY's salt. If it differs, the day \
+             used for the hash and the day written to the row came from different reads - the race \
+             the function's own comment says it avoids by deriving both before the spawn"
+        );
+
+        db.close().await;
+    }
+
     /// INVARIANT (a), scoped to THIS fixture's account: wallets.balance_idr must
     /// equal SUM(ledger.delta_idr). It must return 0 rows.
     ///
