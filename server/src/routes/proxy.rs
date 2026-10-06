@@ -4224,6 +4224,9 @@ mod tests {
                 "the settlement task must still be listening"
             );
 
+            // Subscribed BEFORE the settlement runs, so an event published during it cannot be missed.
+            let mut rx = state.events.subscribe_for_test();
+
             settle_after_stream(
                 settle_rx,
                 pool_for_assertions.clone(),
@@ -4281,6 +4284,47 @@ mod tests {
                 0,
                 "INVARIANT (b): a partial settlement pairs its hold, never strands it"
             );
+
+            // AND THE EVENTS IT PUBLISHED ARE ADDRESSED TO THIS ACCOUNT.
+            //
+            // This arm publishes `publish_balance` AND `publish_usage`, and MEASURED, both could be
+            // sent to a DIFFERENT account - `publish_balance(&events, Uuid::new_v4(), ..)` - with the
+            // whole suite green at 675 passed / 0 failed. The same gap was found and closed on the
+            // webhook's settlement path last round; this is the STREAMING path, which carries the
+            // traffic, and it was still open.
+            //
+            // `publish_balance` is scoped by account so only that dashboard receives it - events.rs
+            // calls this the DEFECT 1 filter. A wrong id puts one customer's balance and daily usage
+            // on another customer's live stream.
+            //
+            // The subscription is taken from the SAME `state.events` the call above publishes into,
+            // and the harness is only viable because `subscribe_for_test` exists - the hub's own
+            // `subscribe` is private to events.rs.
+            let delivered: Vec<_> = std::iter::repeat(())
+                .map_while(|_| rx.try_recv().ok())
+                .collect();
+            let names: Vec<&str> = delivered.iter().map(|e| e.name()).collect();
+            assert_eq!(
+                delivered.len(),
+                2,
+                "the Partial arm publishes exactly a balance and a usage event, in that order, got \
+                 {names:?}. Zero means the subscriptions missed them; the negative control below is \
+                 what keeps this assertion from being satisfied by silence"
+            );
+            assert_eq!(
+                names,
+                vec!["balance", "usage"],
+                "the clamped settlement publishes the balance FIRST and the usage totals second: {names:?}"
+            );
+            for event in &delivered {
+                assert_eq!(
+                    event.account_id(),
+                    account_id,
+                    "every event here must be addressed to the account that was billed. Another id \
+                     puts this customer's balance and usage on another customer's live stream, which \
+                     is the leak the DEFECT 1 filter exists to stop"
+                );
+            }
         })
         .await;
     }
