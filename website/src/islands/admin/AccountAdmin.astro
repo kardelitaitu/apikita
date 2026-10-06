@@ -532,6 +532,24 @@ import Skeleton from '../../components/Skeleton.astro';
         return 'border-danger-edge bg-danger-surface text-danger-ink';
       case 'closed':
         return 'border-edge-strong bg-surface-sunken text-ink-muted';
+      // THE UNKNOWN ARM, which this function was missing and its sibling has.
+      //
+      // `statusBadge` above ends in `default:`; this one enumerated the three union members and
+      // stopped. That was SAFE only while `AccountStatus` stayed exactly three values - and
+      // MEASURED, the compiler does not hold that line: adding a fourth member to the union leaves
+      // `tsc --noEmit` at exit 0, so this function would fall off its end and return `undefined`.
+      //
+      // The symptom is visible rather than silent, which is the only good thing about it: the value
+      // is interpolated into a className at the call site, and `${undefined}` in a template literal
+      // is the string "undefined". A rendered account row would then carry the class list
+      // "rounded border px-2 py-0.5 text-xs font-medium undefined" with no border or background
+      // from its status at all - a status badge that has stopped saying anything.
+      //
+      // The fallback matches `statusBadge`'s `default:` arm deliberately. The two functions return
+      // the same three strings for the same three states, so a status the badge renders as muted
+      // must not be the one case the row styling has no answer for.
+      default:
+        return 'border-edge-strong bg-surface-sunken text-ink-muted';
     }
   }
 

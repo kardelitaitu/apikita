@@ -40,7 +40,7 @@ It does **not** proxy LLM requests. That is [`server/`](../../server/README.md).
 
 **The website is built and builds green.** Measured 2026-09-30:
 `cd website && npm run build` emits **18 static pages** and `npm test` passes
-**228 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 228`, `# pass 228`).
+**229 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 229`, `# pass 229`).
 Count them rather than recalling them — both numbers move whenever a page or a
 contract test lands.
 Every route in the spec's table
