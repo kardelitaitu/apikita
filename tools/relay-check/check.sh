@@ -296,8 +296,22 @@ if [ -f "$DOC_CONF" ]; then
     # THE OTHER HALF OF THE POSITIVE CONTROL: the loop above must have compared something. If the zone
     # lists came back empty - a renamed key variable, a reformatted declaration - it would run zero
     # times and report nothing while printing the same OK as a real pass.
-    if [ "$compared" -lt 6 ]; then
-        fail "the tier-table comparison ran $compared time(s); there are three zones with a rate and a burst, so it should compare at least six figures. It is comparing almost nothing"
+    #
+    # A FLOOR WITH SLACK, not one AT the measured value. This read `-lt 6` and justified itself with
+    # "there are three zones with a rate and a burst" - arithmetically true, and a TRIPWIRE, which is
+    # the failure `doc_claims.rs` names about its own floors: an exact floor "passes today, fails the
+    # moment one file is deleted, and cannot tell a whole-crate walk from a narrowed one that happens
+    # to reach the same number". MEASURED: removing the ONE `burst=` this config gives `perwh` - a
+    # legitimate edit that takes the comparison to 5 - made this gate FAIL on an otherwise-correct
+    # tree, printing the sentence above it as if the config contradicted itself. The message then
+    # asserts "there are three zones", which is false in exactly the case that trips it.
+    #
+    # The floor's JOB is to catch a loop that ran almost nothing, and that failure looks like 0 or 1,
+    # not 5. So the bound is set below what the config could plausibly declare: two zones would give
+    # four comparisons, one gives two, and a parser that broke gives zero - all still caught - while a
+    # config that drops a zone no longer fails a check about the DOC.
+    if [ "$compared" -lt 4 ]; then
+        fail "the tier-table comparison ran $compared time(s), which is too few to be a comparison of the whole table. A working parse of this config compares a rate and a burst per declared zone; zero or one comparison means the loop found no zones at all, which is how this block fails - and it fails while printing the same OK as a real pass"
     fi
 
     # And the doc must still contain the table. A doc that lost its rate figures would make every
