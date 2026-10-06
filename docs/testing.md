@@ -1057,13 +1057,12 @@ clause with one covered assignment and one uncovered is a shape worth sweeping, 
 
 | site | columns | what makes each safe |
 | --- | --- | --- |
-| `hold-sweep.rs` | `balance_idr`, `updated_at` | the balance is asserted by the hold-sweep suite; a dropped assignment breaks the bind count |
-| `config.rs:970` | `hold`, `charge` | the two settlement deltas, pinned by the clamp property tests |
-| `accounts.rs:452` | `email_verified`, `verified_at`, `updated_at` | `marking_verified_keeps_the_earliest_stamp` pins the `COALESCE` semantic |
-| `accounts.rs:574` | `password_hash`, `updated_at` | the hash is asserted by the password-change tests |
-| `ip_tracking.rs:368` | `request_count`, `distinct_ips` | asserted as PAIRS across a `h1, h1, h2` sequence |
-| `admin.rs:680`, `admin.rs:798` | `status`, `updated_at` | MEASURED: dropping either assignment breaks the query's bind count |
-| `telegram.rs:560` | `account_id`, `linked_at` | the round-118 fix, above |
+| `hold-sweep.rs`'s `release_hold` | `balance_idr`, `updated_at` | the balance is asserted by the hold-sweep suite; a dropped assignment breaks the bind count |
+| `accounts.rs`'s `mark_verified` | `email_verified`, `verified_at`, `updated_at` | `marking_verified_keeps_the_earliest_stamp` pins the `COALESCE` semantic |
+| `accounts.rs`'s `set_password` | `password_hash`, `updated_at` | the hash is asserted by the password-change tests |
+| `ip_tracking.rs`'s `record_key_ip` | `request_count`, `distinct_ips` | asserted as PAIRS across a `h1, h1, h2` sequence |
+| `admin.rs`'s `suspend_account` and `resume_account` | `status`, `updated_at` | MEASURED: dropping either assignment breaks the query's bind count |
+| `telegram.rs`'s `redeem_link_code` | `account_id`, `linked_at` | the round-118 fix, above |
 
 **BIND COUNT IS A GUARD, and it is worth naming as one.** Four of these are safe for a reason that
 has nothing to do with a semantic assertion: every column in a parameterised `SET` takes a `.bind()`,
