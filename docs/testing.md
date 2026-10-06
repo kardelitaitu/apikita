@@ -522,6 +522,41 @@ quietly started matching unrelated words is then visible in the output rather th
 The pathology is the same one this file keeps recording in the code under test: a check that reads
 plausible while measuring something else.
 
+### The guard that satisfies itself
+
+Everything above is about a mutation run that measured the wrong thing. This is the same disease one
+step further in: **a guard whose own source satisfies its assertion**, so it passes whatever the code
+does. The harness traps make a REAL guard look absent; this makes an ABSENT guard look real - which is
+the direction that survives review, because the test passes and the code reads fine.
+
+Four versions of one guard failed this way, each on a different part of its own text. The sequence is
+the useful part, because every fix looked final:
+
+1. it searched the file for `verify_id_token(` **to find the calls it was checking** - and matched the
+   same string inside its own `assert!` messages;
+2. narrowed to `= verify_id_token(`, which matched its own doc comment explaining that pattern;
+3. listed `encode(` as a needle meaning "a test can mint a token" - and the needle list lives inside
+   the module being searched, so it found `encode(` in the list;
+4. asserted `text.contains(marker)`, where `let marker = "EVERYTHING BELOW..."` sat three lines below -
+   so deleting the note it was watching left it green.
+
+**The tell: a guard that reads the file it lives in and looks for a string it also writes.** Steps 1
+to 3 are all that shape, and the reason there are four is that each fix removed one occurrence while
+leaving the mechanism. Step 4 is the purest form: the check's own literal was the only thing answering
+the check.
+
+The fixes that hold, in order of how well:
+
+- **Assert something the guard cannot contain.** The final version asserts that no token-minting call
+  exists in the test module and that its fixtures are still literals - properties of OTHER code, not a
+  pattern this guard also spells out.
+- **Split a literal so its source cannot answer it.** `concat!("UNREACHED BY THE ", "TEST SUITE")`
+  appears nowhere in the file as one string, so `text.contains(...)` can only be satisfied by the note
+  itself. A `concat!` is the cheapest honest fix for this shape.
+- **Scope to a region the guard is not in**, and then assert the scope is non-empty. Where a check must
+  parse, take the test module or the function body explicitly rather than the whole file - a parse that
+  found its own region is the same bug one level up.
+
 ### The same trap one level up: scoping a coverage scan to the module that DEFINES a rule
 
 The filter trap above is about a test RUN that matches the wrong tests. Its sibling is a SCAN that
