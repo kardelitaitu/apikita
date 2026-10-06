@@ -745,8 +745,16 @@ pub async fn debit_usage_transaction(
     //      - Where a test DOES pass 0, both branches agree on every observable: `try_credit` with 0
     //        issues `balance_idr = balance_idr + 0`, returning the unchanged balance, so
     //        `released_idr` is 0 either way and no ledger row is written. `settlement_ledger_deltas`
-    //        is pinned to return `(0, 0)` for that input by `a_zero_reservation_writes_no_release_row`
-    //        (db.rs:2609), independently of this branch.
+    //        is pinned to return `(0, 0)` for that input by `a_zero_reservation_writes_no_release_row`,
+    //        independently of this branch.
+    //
+    //        THE CITATION IS BY NAME, not by line. It read `(db.rs:2609)` and pointed at an
+    //        `assert!` inside a DIFFERENT test - `credit_expiry_instant` - for as long as the two
+    //        tests have been lines apart. The guard that checks these citations accepted it, because
+    //        the wrong line was non-blank and looked like a plausible declaration; it only failed
+    //        when an unrelated edit made that line blank. A line number cannot be checked for being
+    //        the RIGHT line, only a plausible one, so this names the test instead - which is what
+    //        `docs/testing.md` asks for and what `tools/alert-check` enforces for `alerts.tsv`.
     //
     //    So the guard saves one no-op UPDATE on a path that already costs a transaction. Kept because
     //    it documents the intent, with this note so the next mutation sweep does not open the same
@@ -2241,6 +2249,60 @@ mod tests {
         assert_eq!(
             ledger_delta, -opening_balance,
             "the ledger must record exactly what was debited, not the full cost"
+        );
+
+        // 3b. AND THE COLUMN THE CUSTOMER READS, which nothing asserted on this path.
+        //
+        // `ledger.balance_after` is served to the customer by `routes/account.rs`, which selects it
+        // and returns it in the wallet ledger JSON - it is the "balance after this entry" figure a
+        // person uses to trace their money. It is written at nine sites, and MEASURED, the SETTLEMENT
+        // was the one with no assertion on it: offsetting either row's `balance_after` by a constant
+        // left the whole 682-test suite green (both directions tried). The only semantic assertion on
+        // the column anywhere was `hold-sweep.rs`'s, for a SINGLE-row credit.
+        //
+        // A wrong `balance_after` does not break `balance_idr = SUM(ledger.delta_idr)` - that
+        // invariant is over `delta_idr` only, and `reconcile.sh` sums exactly that - so nothing else
+        // in the suite can catch it. The column has to be checked directly.
+        //
+        // The two rows are the fixture's opening TOP-UP and then this settlement's charge. There is
+        // no release row: `released_idr` is 0 for this request, so nothing was handed back. The pair
+        // proves the column advances by each row's own delta, which is the property a customer reads
+        // and which `balance_idr = SUM(delta_idr)` cannot see.
+        let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+            "SELECT delta_idr, reason, balance_after FROM ledger WHERE account_id = ? ORDER BY id",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_all(&pool)
+        .await
+        .expect("read the ledger rows this settlement wrote");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "the fixture's opening top-up and this settlement's charge are the only ledger rows this \
+             account should have; {rows:?}"
+        );
+
+        let mut running = 0i64;
+        for (delta, reason, balance_after) in &rows {
+            // The running figure is computed HERE from the deltas and never read from the column, so
+            // this is a closed form rather than a restatement of the writer.
+            running += delta;
+            assert_eq!(
+                *balance_after, running,
+                "the ledger row for {reason:?} moves {delta} and claims a balance of \
+                 {balance_after}, but the deltas up to and including it sum to {running}. \
+                 `balance_after` is what the customer reads to trace their money \
+                 (routes/account.rs selects and returns it), and NOTHING covers it: the invariant \
+                 `reconcile.sh` checks is over `delta_idr` alone and never reads this column. \
+                 MEASURED: offsetting either settlement row's figure by a constant left the whole \
+                 682-test suite green."
+            );
+        }
+        assert_eq!(
+            rows[1].2, 0,
+            "the wallet is spent down to exactly zero by this settlement, so the charge row's \
+             `balance_after` must be 0 - the balance the customer sees after the request"
         );
 
         let (input, cache_read, output, usage_cost): (i64, i64, i64, i64) = sqlx::query_as(
