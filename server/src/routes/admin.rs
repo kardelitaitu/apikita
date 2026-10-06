@@ -189,6 +189,20 @@ pub(crate) async fn require_operator(
         // A live session whose account row is gone cannot be authorised: the FK
         // makes this unreachable, and if it ever is reached the safe answer is
         // the same 401 a dead session gets.
+        //
+        // MEASURED, not assumed: changing this arm to `Ok(actor)` - authorising a session whose
+        // account row is gone - survives the ENTIRE suite at 681 passed / 0 failed. That is the
+        // correct outcome rather than a missing test, and the reason is worth stating so nobody
+        // "fixes" it by adding a fixture that cannot exist:
+        //
+        //   `sessions.account_id` is `TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE`
+        //   (migrations/20260925000000_initial_schema.sql:90), and `db::init_pool` sets
+        //   `foreign_keys(true)` on every connection - sqlx's SQLite default, but set explicitly
+        //   because with it off every CASCADE in the schema is silently inert. So the row this
+        //   query reads cannot outlive its account, and `None` is unreachable by construction.
+        //
+        // A test for it would have to disable foreign keys to seed the state, which would make the
+        // guard look load-bearing while proving only that the fixture had broken the schema.
         None => Err(AdminError::App(AppError::Unauthenticated)),
     }
 }
