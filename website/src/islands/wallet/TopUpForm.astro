@@ -169,7 +169,7 @@ const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbo
   import { apiFetch } from '../../lib/api';
   import { describeError, fieldInput, renderNotice } from '../../lib/errors';
   import type { Noticeable } from '../../lib/errors';
-  import { formatIdr } from '../../lib/format';
+  import { formatIdr, formatTopupTime } from '../../lib/format';
   import { getLiveStore } from '../../lib/live';
   import { midtransEnvMismatch } from '../../lib/midtrans-env.ts';
 
@@ -342,7 +342,22 @@ const MIDTRANS_HOST_ENV = MIDTRANS_ENV === 'production' ? 'production' : 'sandbo
       row.className = 'border-b border-edge';
 
       const cells = [
-        new Date(topup.created_at).toLocaleString(),
+        // THE ONE CELL WITH A PARSE TO FAIL, and it goes through `lib/format.ts` for that reason.
+        //
+        // `created_at` arrives as `chrono::DateTime<Utc>` from `server/src/routes/account.rs:336`
+        // which always serialises to RFC3339 - so THIS server cannot send a value that fails to
+        // parse, and this guard is defensive rather than a fix for a live bug. It is here because
+        // the alternative is not a smaller version of the same thing: `new Date(x).toLocaleString()`
+        // on an unparseable value returns the literal string "Invalid Date", which would be printed
+        // into a deposit row as if it were a timestamp.
+        //
+        // `formatTopupTime` is the rule `lib/recent-usage.ts` already cites the top-up history for
+        // stating - "an unparseable value returns the raw string, never 'Invalid Date'". That
+        // citation was true of the rule and not of this row, which used the unguarded expression.
+        //
+        // MEASURED: replacing this cell with the literal `'Invalid Date'`, and deleting the cell
+        // outright, BOTH left the website suite at 226 pass / 0 fail.
+        formatTopupTime(topup.created_at),
         topup.order_id,
         formatIdr(topup.amount_idr),
         topup.status,
