@@ -242,6 +242,28 @@ export function createLiveStore(): LiveStore {
       stopped = false;
       void (async () => {
         // First paint, and the cheapest way to find out the session is dead.
+        //
+        // THE THREE TERMS, and what each one decides. `loadMe` returns null for a 401 and for any
+        // other failure, but sets `state.error` only for the others - so:
+        //
+        //   * 401        -> me null, error null -> RETURN. apiFetch has already redirected to
+        //                   /login; opening an EventSource against a session being torn down is a
+        //                   stream nobody will read.
+        //   * 500 or a network fault -> error set -> fall through to connect(). The session is not
+        //                   what failed, so the store must keep trying, or a transient error leaves
+        //                   the dashboard permanently non-live.
+        //
+        // `state.balanceIdr === null` IS DEFENSIVE AND CURRENTLY UNREACHABLE, checked rather than
+        // assumed. Its writers are `applyMe` and the balance frame, both of which run AFTER this
+        // line - and `store.start()` has exactly ONE production call site
+        // (`layouts/DashboardLayout.astro`), on a store created fresh per page load. So the term is
+        // always true today, and MEASURED: deleting it changes no test.
+        //
+        // It is kept because it encodes the condition the early return actually needs - "nothing is
+        // displayed yet and the session is gone" - where `me === null && error === null` alone says
+        // "this load failed silently". A second `start()` after a successful one would make the two
+        // differ, and that is the edit the term is there for. Removed, the guard would still be
+        // correct today and would stop being correct the moment anything restarts the store.
         const me = await loadMe();
         if (me === null && state.balanceIdr === null && state.error === null) return;
         if (me) applyMe(me);

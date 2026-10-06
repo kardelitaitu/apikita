@@ -330,3 +330,80 @@ test('loadMe records an ApiError failure with its request id', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('a dead session opens no stream, and a failing-but-alive one does', async () => {
+  // THE EARLY RETURN IN `start()`, which nothing covered.
+  //
+  // `start()` loads `/api/me` first and returns before `connect()` when the session is gone:
+  //
+  //     const me = await loadMe();
+  //     if (me === null && state.balanceIdr === null && state.error === null) return;
+  //     if (me) applyMe(me);
+  //     connect();
+  //
+  // MEASURED: deleting that line, dropping its `balanceIdr` term, and dropping its `error` term all
+  // left the whole website suite at 230 pass / 0 fail. The guard is the difference between a page on
+  // a dead session and a page that opens an EventSource against it.
+  //
+  // WHY THE `error` TERM IS LOAD-BEARING, and it is the half that looks redundant. `loadMe` returns
+  // `null` for a 401 AND for a 500, but only the 500 sets `state.error`. So `error === null` is what
+  // distinguishes "the session is gone, apiFetch has already redirected to /login" from "the server
+  // is unwell but the session is fine". Without it the second case would also skip `connect()`, and
+  // a customer hitting a transient 500 on /api/me would get a page that never goes live.
+  //
+  // The two cases are asserted together on purpose: a test for the 401 alone would pass against a
+  // guard that skipped `connect()` on ANY failure, which is the mutation that matters.
+  const originalFetch = globalThis.fetch;
+
+  // (1) A 401: the session is gone.
+  FakeEventSource.instances = [];
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'no' } }), {
+      status: 401,
+      headers: { 'content-type': 'application/json' },
+    });
+  try {
+    const store = createLiveStore();
+    store.start();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(
+      FakeEventSource.instances.length,
+      0,
+      'a 401 must not open an event stream: `/api/me` returning 401 means the session is gone and ' +
+        'apiFetch has already redirected to /login, so the stream would be opened against a session ' +
+        'that is being torn down. This is the guard at the top of `start()`.',
+    );
+    assert.equal(store.getState().status, 'connecting');
+    assert.equal(store.getState().error, null, 'a 401 is a redirect, not an error to display');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // (2) A 500: the session is fine, the server is not.
+  FakeEventSource.instances = [];
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { code: 'server_error', message: 'boom' } }), {
+      status: 500,
+      headers: { 'content-type': 'application/json' },
+    });
+  try {
+    const store = createLiveStore();
+    store.start();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(
+      FakeEventSource.instances.length,
+      1,
+      'a 500 from /api/me must still open the stream. The session is not what failed, so the store ' +
+        'has to keep trying - otherwise a transient server error leaves the dashboard permanently ' +
+        'non-live. The guard distinguishes this from the 401 by `state.error`, which `loadMe` sets ' +
+        'only for a non-401 failure.',
+    );
+    assert.equal(store.getState().error, 'boom', 'and the failure is still surfaced');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
