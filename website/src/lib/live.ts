@@ -36,6 +36,17 @@ export interface LiveState {
   usage: UsageToday | null;
   /** Key ids the stream has reported revoked, for cross-tab consistency. */
   revokedKeyIds: string[];
+  /**
+   * Key ids the stream has reported CREATED OR EDITED, newest last.
+   *
+   * The counterpart to `revokedKeyIds`, and it exists because the two need different remedies. A
+   * revocation is applied by PATCHING the row already on screen - the event's `revoked_at` is all the
+   * list needs to stop offering Revoke. A create or an edit is not patchable from the event: the
+   * payload carries only `key_id` and `revoked_at`, while the row shows a label, models, limits, spend
+   * and a prefix, and a CREATED key is not on screen at all. So this field is a SIGNAL to refetch, not
+   * a value to apply, and it is the reason a listener must not treat it like `revokedKeyIds`.
+   */
+  changedKeyIds: string[];
   /** Set when the last request failed for a reason other than 401. */
   error: string | null;
   requestId: string | null;
@@ -67,6 +78,7 @@ export function createLiveStore(): LiveStore {
     balanceIdr: null,
     usage: null,
     revokedKeyIds: [],
+    changedKeyIds: [],
     error: null,
     requestId: null,
   };
@@ -169,8 +181,20 @@ export function createLiveStore(): LiveStore {
         key_id: string;
         revoked_at: string | null;
       };
-      if (data.revoked_at && !state.revokedKeyIds.includes(data.key_id)) {
-        set({ revokedKeyIds: [...state.revokedKeyIds, data.key_id] });
+      if (data.revoked_at) {
+        // A revocation PATCHES: the id is all the list needs to stop offering Revoke.
+        if (!state.revokedKeyIds.includes(data.key_id)) {
+          set({ revokedKeyIds: [...state.revokedKeyIds, data.key_id] });
+        }
+        return;
+      }
+      // A CREATE OR EDIT is a SIGNAL, not a value - see `changedKeyIds`. Recorded separately so a
+      // listener can tell "this row is now revoked" (patch it) from "this row's fields are stale, or
+      // it does not exist on this page yet" (refetch). The two were one field's absence before this:
+      // `revoked_at` truthy was the only case handled, so a key created in another tab never appeared
+      // and an edit never landed.
+      if (!state.changedKeyIds.includes(data.key_id)) {
+        set({ changedKeyIds: [...state.changedKeyIds, data.key_id] });
       }
     });
 

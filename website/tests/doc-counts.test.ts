@@ -175,7 +175,7 @@ test('every exported function in src/lib is called somewhere', () => {
  * So this figure is updated WITH the run that changes it. That is a smaller guarantee than the server
  * count now carries, and it is stated rather than implied.
  */
-const WEBSITE_TESTS = 224;
+const WEBSITE_TESTS = 225;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -194,7 +194,7 @@ const WEBSITE_TESTS = 224;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 676;
+const SERVER_TESTS = 677;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [

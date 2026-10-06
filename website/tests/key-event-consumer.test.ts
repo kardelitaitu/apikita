@@ -58,10 +58,23 @@ test('the `key` event has a consumer, not only a producer', () => {
       'consistent, and this page is where that tab is.',
   );
   assert.ok(
-    /getLiveStore\(\)\s*\.\s*subscribe\(/.test(island),
+    /\b\w+\.subscribe\(\s*applyRevocations\s*\)/.test(island) ||
+      /getLiveStore\(\)\s*\.\s*subscribe\(/.test(island),
     `${KEYS_ISLAND} imports the live store but never SUBSCRIBES to it. Importing without subscribing ` +
       'reads like the wiring is done and leaves the page exactly as blind as before - which is the ' +
-      'state this test was written for: `revokedKeyIds` had a producer, a doc-comment, and no reader.',
+      'state this test was written for: `revokedKeyIds` had a producer, a doc-comment, and no reader. ' +
+      'The subscription may be written either as a chained call or against a hoisted store; both are ' +
+      'matched, because pinning the SHAPE of the call rather than its existence would fail on a ' +
+      'refactor that kept the behaviour - which is what happened when the store was hoisted so two ' +
+      'listeners could share it.',
+  );
+  assert.ok(
+    /\b\w+\.subscribe\(\s*applyKeyChanges\s*\)/.test(island),
+    `${KEYS_ISLAND} must ALSO subscribe for create/edit. docs/realtime.md:73 promises the \`key\` ` +
+      'event on "created, edited, or revoked" and the two are not interchangeable: a revocation is ' +
+      'patched into the rows on screen, while a create or edit carries no field values and has to ' +
+      'trigger a REFETCH. A page that subscribes only to revocations handles a third of the promise ' +
+      'and still looks wired.',
   );
 });
 
@@ -76,6 +89,20 @@ test('the cross-tab revocation field is read outside the module that writes it',
       'has at least one consumer, so a field with none is not "unused yet" - it is a documented ' +
       'promise ("for cross-tab consistency") whose last link is missing. The server emits the event, ' +
       'the client stores it, and no page acts on it.',
+  );
+});
+
+test('the create/edit signal is read outside live.ts too', () => {
+  // The same rule for `changedKeyIds`, which was added because the first field could only ever
+  // express a revocation. A signal with no reader is the identical defect one field over.
+  const readers = websiteSources().filter(
+    ([path, text]) =>
+      path !== `/${LIVE.split('/').slice(1).join('/')}` && text.includes('changedKeyIds'),
+  );
+  assert.ok(
+    readers.length > 0,
+    '`changedKeyIds` is written by live.ts and read by NOTHING, so the create/edit half of ' +
+      'docs/realtime.md:73 is stored and discarded exactly as `revokedKeyIds` once was.',
   );
 });
 

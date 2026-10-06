@@ -122,7 +122,15 @@ test('the store keeps the last value and reacts to every stream event', async ()
       'key',
       JSON.stringify({ key_id: 'k1', revoked_at: '2020-01-01T00:00:00Z' }),
     );
-    // revoke frame with no revoked_at must not change the list.
+    // A frame with NO revoked_at is a CREATE or an EDIT, and it is recorded in its OWN field. This
+    // assertion used to read "revoke frame with no revoked_at must not change the list", which was
+    // true of the code and false of the contract: docs/realtime.md:73 promises the event on
+    // "created, edited, or revoked", and dropping the first two left every other tab stale. The two
+    // fields are separate because the remedies are separate - a revocation is PATCHED into the rows
+    // on screen, while a create or edit carries no field values and has to trigger a REFETCH.
+    es.dispatch('key', JSON.stringify({ key_id: 'k2', revoked_at: null }));
+    // A repeat of the same edit must not grow the list: the store is a set, and a burst of events for
+    // one key would otherwise make a debounced refetch fire on every tick.
     es.dispatch('key', JSON.stringify({ key_id: 'k2', revoked_at: null }));
 
     // Error frame with parseable data marks the store stale and records id.
@@ -154,6 +162,14 @@ test('the store keeps the last value and reacts to every stream event', async ()
     assert.equal(finalState.balanceIdr, 777);
     assert.equal(finalState.usage?.cost_idr, 20);
     assert.deepEqual(finalState.revokedKeyIds, ['k1']);
+    assert.deepEqual(
+      finalState.changedKeyIds,
+      ['k2'],
+      'a `key` frame with no `revoked_at` is a CREATE or EDIT and must be recorded as a change. Zero ' +
+        'entries here means the store still handles only the revoked case, so a key created in another ' +
+        'tab never appears and an edit never lands - two thirds of what docs/realtime.md:73 promises. ' +
+        'The duplicate dispatch above must NOT have added a second entry.',
+    );
 
     assert.ok(states.length > 0, 'subscribers were notified');
     unsub();

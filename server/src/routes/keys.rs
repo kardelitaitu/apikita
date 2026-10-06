@@ -518,6 +518,18 @@ pub async fn create_key(
     // transaction's opening.
     tx.commit().await?;
 
+    // AND THE LIVE STREAM IS TOLD, after the commit and only after it.
+    //
+    // `docs/realtime.md:73` promises the `key` event is "Emitted when a key is created, edited, or
+    // revoked — so a second browser tab stays consistent". The revoke half was wired last round and
+    // the other two were not, so a second tab never learned about a key created elsewhere: the list is
+    // fetched ONCE when the island starts, and nothing else refetches it.
+    //
+    // `None` for `revoked_at` is the documented encoding of a LIVE key, which is what a key is the
+    // moment it is created. The event is published AFTER `tx.commit()`, so a subscriber can never be
+    // told about a key that then rolls back.
+    publish_key_update(&state.events, account_id, id, None);
+
     Ok((
         StatusCode::CREATED,
         Json(CreateKeyResponse {
@@ -616,6 +628,16 @@ pub async fn update_key(
         return Err(AppError::NotFound("Key not found or revoked".into()));
     };
     invalidate_key_cache(&state.config, &key_hash);
+
+    // AND THE LIVE STREAM IS TOLD, on the same condition as the cache eviction and for the same
+    // reason: the statement above matches only a key that exists AND is not revoked, so reaching here
+    // means an edit landed. Publishing on the `None` path would announce a change that the UPDATE
+    // refused - and it would announce it for a key the caller does not own, since the same statement
+    // is scoped by `account_id`.
+    //
+    // `None` for `revoked_at` because an edited key is still live; the event reports "this key
+    // changed", and the revoked/live distinction is what the field encodes.
+    publish_key_update(&state.events, account_id, id, None);
 
     Ok(StatusCode::OK)
 }
@@ -1639,6 +1661,113 @@ mod tests {
             "an idempotent re-revoke matches no row and changes nothing, so it must publish NOTHING. \
              Got {:?}",
             dup.iter().map(|e| e.name()).collect::<Vec<_>>()
+        );
+
+        db.close().await;
+    }
+
+    /// Creating and editing a key announce it too, and they are the two thirds of the promise that
+    /// were still missing after the revocation half was wired.
+    ///
+    /// `docs/realtime.md:73` says the `key` event is emitted when a key is "created, edited, or
+    /// revoked". Only the third worked, so a second browser tab never learned about a key created
+    /// elsewhere - the list is fetched ONCE when the island starts and nothing else refetches it -
+    /// and an edit made in one tab never reached the other.
+    ///
+    /// `revoked_at: null` is the documented encoding of a LIVE key, which is what a newly created or
+    /// freshly edited key is. The two are asserted separately because they are separate handlers with
+    /// separate SQL: a test that drove only `create_key` would leave `update_key`'s publish uncaught,
+    /// and vice versa.
+    #[tokio::test]
+    async fn creating_and_editing_a_key_announce_it_on_the_live_stream() {
+        let _cache = CacheLock::acquire();
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        // CREATE, subscribed before the call so the event cannot be missed.
+        let mut rx = state.events.subscribe_for_test();
+        let (id, _, _) =
+            create_key_via_handler(&state, &headers, "announced-create", vec![], 0).await;
+        let created: Vec<_> = std::iter::repeat(())
+            .map_while(|_| rx.try_recv().ok())
+            .collect();
+        let created_keys: Vec<_> = created.iter().filter(|e| e.name() == "key").collect();
+        assert_eq!(
+            created_keys.len(),
+            1,
+            "creating a key must publish exactly one `key` event, got [{}]",
+            created
+                .iter()
+                .map(|e| e.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            created_keys[0].account_id(),
+            account_id,
+            "scoped to the owner"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&created_keys[0].data_for_test()).expect("the event carries JSON");
+        assert_eq!(
+            payload["key_id"],
+            json!(id.hyphenated().to_string()),
+            "the event names the key just created: {payload}"
+        );
+        assert!(
+            payload["revoked_at"].is_null(),
+            "a CREATED key is LIVE, so `revoked_at` must be null - the documented encoding. A \
+             timestamp here would tell every other tab the new key is already dead: {payload}"
+        );
+
+        // EDIT, on its own handler and its own SQL.
+        let mut rx2 = state.events.subscribe_for_test();
+        let edited = update_key(
+            State(state.clone()),
+            Path(id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: Some("announced-edit".to_string()),
+                models: None,
+                spend_limit_idr: None,
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("update_key must succeed")
+        .into_response();
+        assert_eq!(edited.status(), StatusCode::OK);
+
+        let after: Vec<_> = std::iter::repeat(())
+            .map_while(|_| rx2.try_recv().ok())
+            .collect();
+        let edited_keys: Vec<_> = after.iter().filter(|e| e.name() == "key").collect();
+        assert_eq!(
+            edited_keys.len(),
+            1,
+            "editing a key must publish exactly one `key` event, got [{}]. Zero means a tab that \
+             changed a label or a limit stayed invisible to every other tab",
+            after
+                .iter()
+                .map(|e| e.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            edited_keys[0].account_id(),
+            account_id,
+            "scoped to the owner"
+        );
+        let edit_payload: serde_json::Value =
+            serde_json::from_str(&edited_keys[0].data_for_test()).expect("the event carries JSON");
+        assert!(
+            edit_payload["revoked_at"].is_null(),
+            "an EDITED key is still live, so `revoked_at` must be null: {edit_payload}"
         );
 
         db.close().await;

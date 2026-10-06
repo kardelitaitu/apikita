@@ -393,6 +393,27 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     if (changed) render(renderedKeys);
   }
 
+  // CREATE AND EDIT, which cannot be patched and therefore have to REFETCH.
+  //
+  // A create is the case that makes this necessary rather than nice: the new key is not on screen at
+  // all, and the event carries only `key_id` and `revoked_at` while the row needs a label, models,
+  // limits and a prefix. An edit is the same problem in reverse - the row exists but every field in it
+  // may have moved. So `changedKeyIds` is a signal, and this is the only thing that can turn it into
+  // correct markup.
+  //
+  // DEBOUNCED, because a burst is normal: creating a key fires one event, and the create result and
+  // the refetch are both list-shaped. Without the timer, N events in a tick would issue N requests and
+  // the last response to land would win rather than the last one REQUESTED.
+  let refetchTimer: number | null = null;
+  function applyKeyChanges(): void {
+    if (getLiveStore().getState().changedKeyIds.length === 0) return;
+    if (refetchTimer !== null) return;
+    refetchTimer = window.setTimeout(() => {
+      refetchTimer = null;
+      void loadKeys();
+    }, 150);
+  }
+
   // The plaintext key is held nowhere but the #key-secret node. Dismissing the
   // secret step must RELEASE it, not merely hide it: a 52-char credential must not
   // linger in a hidden DOM node for the lifetime of the page.
@@ -651,5 +672,10 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   // The cross-tab subscription. Started here rather than at module scope so the DOM the listener
   // writes to is in place, and because the store de-duplicates subscribers - a second call to
   // `getLiveStore()` returns the same one `DashboardLayout` already started.
-  getLiveStore().subscribe(applyRevocations);
+  //
+  // TWO listeners for one event, because the two outcomes need different remedies: a revocation is
+  // PATCHED into the rows already on screen, a create or edit REFETCHES. See `changedKeyIds`.
+  const store = getLiveStore();
+  store.subscribe(applyRevocations);
+  store.subscribe(applyKeyChanges);
 </script>
