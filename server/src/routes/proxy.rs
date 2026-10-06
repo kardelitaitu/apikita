@@ -3987,10 +3987,15 @@ mod tests {
             .find(|m| m.name == "flash")
             .expect("flash is configured");
 
+        // THESE COUNTS ARE LARGE ON PURPOSE, and the floor assertion below is what keeps them honest.
+        // At `1000 / 400 / 2000` the whole charge is 37 IDR and the classes are indistinguishable
+        // after `ceil()`; at this scale the charge is ~3,617 IDR and a swap moves it by ~4.8 IDR, so
+        // the assertion below can actually fail. The hold still covers it comfortably - the assertion
+        // just after this checks that, and the wallet is funded well above.
         let usage = Usage {
-            input_tokens: 1_000,
-            cache_read_tokens: 400,
-            output_tokens: 2_000,
+            input_tokens: 100_000,
+            cache_read_tokens: 40_000,
+            output_tokens: 200_000,
         };
         let cost_idr = calculate_token_cost_idr(
             model_cfg.price,
@@ -4004,6 +4009,66 @@ mod tests {
         assert!(
             held_idr > cost_idr,
             "the worst-case hold must cover the real cost, or the fixture proves nothing ({held_idr} vs {cost_idr})"
+        );
+
+        // THE INDEPENDENT CHARGE, computed HERE so it does not borrow the config the fixture moves.
+        //
+        // The `cost_idr` above cannot falsify a mistake in the settlement's own call: it is produced by
+        // the SAME function with the SAME `usage`, so a wrong count or a swapped rate cancels out on
+        // both sides. MEASURED: putting `usage.input_tokens` where `usage.cache_read_tokens` belongs at
+        // the production call site left the whole suite green at 679 passed / 0 failed.
+        //
+        // So the arithmetic is written out from the token counts and the three rates, rather than
+        // called. It is the same formula stated a second time on purpose - a second statement is what
+        // makes the first falsifiable.
+        let (price, r_in, r_cache, r_out) = (
+            model_cfg.price,
+            model_cfg.rates.input_peak,
+            model_cfg.rates.cache_read_peak,
+            model_cfg.rates.output_peak,
+        );
+        let expected_wholesale = (usage.input_tokens as f64 / 1_000_000.0) * r_in
+            + (usage.cache_read_tokens as f64 / 1_000_000.0) * r_cache
+            + (usage.output_tokens as f64 / 1_000_000.0) * r_out;
+        let expected_cost = (expected_wholesale * price).ceil() as i64;
+
+        // The fixture only proves anything if the classes have DISTINCT counts: were input and
+        // cache-read equal, a call site that confused them would charge the same either way and no
+        // assertion could tell.
+        assert_ne!(
+            usage.input_tokens, usage.cache_read_tokens,
+            "the fixture must use DIFFERENT counts for the input and cache-read classes, or a call \
+             site that swaps them is indistinguishable"
+        );
+
+        // AND THE COUNTS MUST BE LARGE ENOUGH THAT A SWAP SURVIVES THE CEILING.
+        //
+        // THIS IS THE DEFECT THE ASSERTION ABOVE COULD NOT SEE, and it took a second measurement to
+        // find. At `input=1000, cache_read=400, output=2000` the whole charge is **37 IDR**, and the
+        // difference a cache/input swap makes is 1.6 IDR - which `ceil()` absorbs. MEASURED on the
+        // real rates: correct 37, swapped 37. So the swap was invisible not because nothing checked
+        // it but because this fixture is too SMALL for the two answers to differ in whole rupiah.
+        //
+        // The threshold is arithmetic, not a guess. The mutation this guards replaces the
+        // CACHE-READ COUNT with the INPUT count, so the charge moves by
+        // `(input - cache_read) * r_cache / 1e6 * price` - the extra tokens priced at the CACHE rate,
+        // not at the difference between the two rates. MEASURED for the counts below:
+        // (1000-400)/1e6 * 53.54 * 1.5 = 0.048 IDR, which `ceil()` absorbs, while the two rounded
+        // totals are both 37. A first version of this formula used `(r_in - r_cache)` and was wrong
+        // about which rate the substituted tokens are charged at; it passed a fixture this check
+        // exists to reject.
+        let swap_idr = (usage.input_tokens.abs_diff(usage.cache_read_tokens) as f64 / 1_000_000.0)
+            * r_cache
+            * price;
+        assert!(
+            swap_idr >= 1.0,
+            "the fixture's input and cache-read counts differ too little for a call site that SWAPS \
+             them to change the rounded charge: the swap moves {swap_idr:.6} IDR, which `ceil()` \
+             absorbs, so every assertion about the charge passes either way. Raise the counts until \
+             this is at least 1 IDR. Counts in use: input={}, cache_read={}, r_cache={r_cache}, \
+             price={price}",
+            usage.input_tokens,
+            usage.cache_read_tokens
         );
 
         let pool_for_assertions = pool.clone();
@@ -4084,6 +4149,43 @@ mod tests {
                 "the three token classes are ALWAYS separate - never summed"
             );
             assert_eq!(cost, cost_idr, "usage_daily carries what the request cost");
+
+            // AND THE CHARGE IS THE ONE AN INDEPENDENT COMPUTATION GIVES.
+            //
+            // The assertion above is a TAUTOLOGY: `cost_idr` was produced by calling
+            // `calculate_token_cost_idr` with `usage`, and the settlement calls the SAME function with
+            // the SAME `usage`, so any mistake inside that call cancels out. MEASURED: replacing the
+            // cache-read COUNT with the input count at the production call site
+            // (`usage.input_tokens` where `usage.cache_read_tokens` belongs) left the whole suite
+            // green at 679 passed / 0 failed - because the fixture changed on both sides at once.
+            //
+            // The rate is pinned and the count is not, which is a subtle asymmetry: swapping
+            // `cache_read_peak` for `output_peak` DOES fail (the test's copy reads the same config
+            // field, so the two disagree with the independently derived fence below), while swapping
+            // the count does not.
+            //
+            // So this recomputes the charge from the TOKEN COUNTS AND RATES SPELLED OUT, with the
+            // arithmetic written here rather than called. It is the same formula, stated a second
+            // time on purpose: a second statement is what makes the first one falsifiable.
+            //
+            // `expected_cost` is computed OUTSIDE this closure, from the same three counts and rates,
+            // and captured as an `i64` - so this assertion cannot borrow the config the fixture moved.
+            assert_eq!(
+                cost, expected_cost,
+                "the settled charge must equal the three token classes priced at their OWN rates and \
+                 rounded up. A count charged at another class's rate, or one class dropped, moves this \
+                 number - and it moves it HERE even when it moves the test's own `cost_idr` copy by the \
+                 same amount, which is what made the assertion above blind to it"
+            );
+
+            // The fixture only proves anything if the three counts are DISTINCT: if input and
+            // cache-read were equal, a call site that confused them would charge the same either way
+            // and no assertion here could tell.
+            assert_ne!(
+                usage.input_tokens, usage.cache_read_tokens,
+                "the fixture must use DIFFERENT counts for the input and cache-read classes, or a \
+                 call site that swaps them is indistinguishable"
+            );
 
             // Scoped to THIS request's reservation ref: the opening top-up is in
             // the same ledger, so the account-wide sum would be dominated by it.
