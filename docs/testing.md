@@ -222,6 +222,46 @@ and those differ by design, because `MOUNTED` carries one row per request and th
 two dual-method paths are one route each. That is the failure mode described in
 the next section, and it is why the comparison now deduplicates paths first.
 
+### A guard's parser is a component, and it needs its own inputs
+
+The section above is about a parse that reports the wrong thing. This is the narrower version: **the
+parser inside a guard can be wrong about valid input**, and reading it does not reveal that, because
+the bug is in *which text it matches* rather than in the logic around it.
+
+MEASURED on the rebuild guard, which walks the migrations and asserts that every `DROP TABLE` is
+declared in a map. Its parser was `line.trim().strip_prefix("DROP TABLE ")` plus a whitespace split.
+Probing it with SQL rather than reading it gave three wrong answers:
+
+```
+DROP TABLE IF EXISTS accounts;   REJECTED, reporting the table as `IF`
+drop table accounts;             skipped - invisible
+DROP TABLE\n  accounts;          skipped - invisible
+```
+
+The first is the interesting one, and it is worse than the other two. A MISS is a gap: the check does
+not fire when it should, which is a defect of coverage. A MISPARSED ACCEPT is different - a correct
+migration, written defensively with `IF EXISTS`, is **refused**, and the message names the wrong table.
+The reader follows the message to the map, which is the one edit that cannot help. The second and third
+are the defect the rule exists to catch, made invisible by SQLite's case-insensitivity and by the fact
+that a statement is not a line.
+
+Three things this earns:
+
+- **Probe a parser with the inputs it will see, not with the ones you wrote it from.** `IF EXISTS`,
+  lower case and a line break are all ordinary SQL. The parser was reviewed when it was written and read
+  correctly; it was only wrong about input that did not exist yet in the repository.
+- **The fix needs a test of the parser itself**, because a parser reached only by a schema change runs
+  once per schema change. Mirroring the parse into a helper rather than calling it is the weaker form -
+  it pins the shapes, and the real file in the directory is what proves the guard still accepts what it
+  is about - but it is the difference between a parser exercised per run and one exercised per quarter.
+  Verify the mirror is not a tautology by feeding it the OLD implementation: the round that fixed this
+  checked exactly that, and the old parser fails it with the wrong name in the diff.
+- **And keep a behaviour-preserving control.** The same round probed a rewrite of the guard's own
+  subject - renaming a captured variable - and confirmed it still passes. A parser that only matches
+  one spelling turns a legitimate refactor into a failure, which teaches the next person to edit the
+  guard instead of reading it. That probe is the reason `\b\w+\.subscribe\(` is written with `\w+`
+  rather than with the variable's actual name.
+
 ### A mutation can land on a COPY, and then "SURVIVED" is not a finding
 
 **`routes/mod.rs` holds THREE copies of the route list, and only one of them ships.**
