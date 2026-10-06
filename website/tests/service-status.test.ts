@@ -15,21 +15,50 @@ import assert from 'node:assert/strict';
 
 import {
   healthPath,
+  SERVICE_STATUSES,
   statusDetail,
   statusFromResponse,
   statusLabel,
   type ServiceStatus,
 } from '../src/lib/service-status.ts';
 
-const ALL: ServiceStatus[] = ['checking', 'operational', 'degraded', 'unreachable'];
+/**
+ * Every state the indicator can be in.
+ *
+ * READ FROM THE MODULE, not typed out here, and the difference was MEASURED rather than assumed.
+ * This was `const ALL: ServiceStatus[] = ['checking', 'operational', 'degraded', 'unreachable']` - a
+ * hand-kept copy of the union. The annotation LOOKS like a tie to the type and is not one: a
+ * `ServiceStatus[]` may hold a SUBSET, so deleting `'unreachable'` from this list left the test
+ * below passing AND `tsc --noEmit` at exit 0. The suite's own claim - "every state has a label and a
+ * detail" - would then have quietly stopped covering a state, while `statusLabel` and
+ * `statusDetail` kept a branch for it that nothing exercised.
+ *
+ * `service-status.ts` exports the list for this reason. The direction that IS caught by the
+ * compiler is the other one: widening the union makes the two default-less switches fall off their
+ * end, and `tsc` reports the missing return.
+ */
+const ALL = SERVICE_STATUSES;
 
 test('every state has a label and a detail, and they are distinct', () => {
+  // The floor that makes the loop below meaningful. Reading `ALL` from the module ties it to the
+  // union; this ties it to NOTHING having gone wrong with the export - an empty or short list would
+  // satisfy every assertion in the body by finding no states to check.
+  assert.ok(
+    ALL.length >= 4,
+    `SERVICE_STATUSES holds only ${ALL.length} state(s). The label/detail check below runs over ` +
+      'whatever it is handed, so a list that lost a member would narrow this test rather than fail ' +
+      'it - which is exactly what happened when the list was written out here by hand.',
+  );
+
   const labels = ALL.map(statusLabel);
   const details = ALL.map(statusDetail);
   for (const label of labels) assert.ok(label.length > 0);
   for (const detail of details) assert.ok(detail.length > 0);
   // No two states read the same — a badge that cannot be told apart is useless.
   assert.equal(new Set(labels).size, ALL.length, labels.join(' | '));
+  // And the same for the details, which the "distinct" claim above never covered: two states with
+  // different labels and one shared explanation would read as the same badge underneath.
+  assert.equal(new Set(details).size, ALL.length, details.join(' | '));
 });
 
 test('a 200 healthy is operational', () => {

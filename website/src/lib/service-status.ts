@@ -33,6 +33,22 @@ export interface HealthBody {
  */
 export type ServiceStatus = 'checking' | 'operational' | 'degraded' | 'unreachable';
 
+/**
+ * Every member of {@link ServiceStatus}, as a value.
+ *
+ * IT EXISTS SO A TEST DOES NOT HAVE TO COPY THE UNION. `service-status.test.ts` asserts that every
+ * state has a distinct label and detail, and it used to hold its own literal array to iterate. That
+ * copy looked tied to the type - it was annotated `ServiceStatus[]` - but the annotation permits a
+ * SUBSET, so MEASURED, deleting a member from the test's copy left the suite green AND `tsc
+ * --noEmit` at exit 0. The check would have narrowed silently rather than failed.
+ *
+ * This list gets the compiler's help in one direction: `statusLabel` and `statusDetail` return on
+ * every path with no `default:` arm, so ADDING a member to the union makes them fall off their end
+ * and `tsc` reports it. Removing one from here is not caught by anything - which is why the test
+ * carries a floor on this array's length as well.
+ */
+export const SERVICE_STATUSES: ServiceStatus[] = ['checking', 'operational', 'degraded', 'unreachable'];
+
 /** The label for one state — the words on the badge. */
 export function statusLabel(status: ServiceStatus): string {
   switch (status) {
