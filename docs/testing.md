@@ -272,6 +272,28 @@ reads text it did not write, four edits, each a one-line change to the subject a
 | the thing removed, but a NEIGHBOUR left in place | FAIL | the guard matched the neighbour - the vocabulary, not the statement |
 | the value changed while the SHAPE is kept | FAIL | the guard checks a shape and never the value |
 
+**ROW ONE MEANS THE SPELLINGS THE INPUT CAN TAKE, NOT A TYPO.** That distinction cost a round, and it is
+worth stating because the row as first written is satisfiable by a probe that proves nothing. The
+`DROP TABLE` parser had THREE wrong answers, and a single behaviour-preserving probe finds at most one
+of them:
+
+```
+probe chosen                the buggy parser's answer   what the prober concludes
+DROP TABLE x;               correct                     parser fine - MISSES the bug
+DROP TABLE IF EXISTS x;     the name reads as `IF`      parser broken - finds it
+drop table x;               skipped                     parser fine - MISSES the bug
+DROP TABLE\n  x;            skipped                     parser fine - MISSES the bug
+```
+
+One probe, one-in-four. So row one is not "reword it" but **"write the same statement the way a
+different author would"**, which for SQL means: the optional clause, the other case, and the split line.
+The rule generalises to the syntax classes of whatever is being read - a Rust string in a raw literal,
+a config key under a different section, an array spread over lines.
+
+A reformat that keeps the thing on one line, in one case, with no optional clause, is a probe of the
+AUTHOR's style rather than of the parser. That is why the round it was written in found the bug and the
+row did not predict it.
+
 The second row is the ordinary one. The third and fourth are where the real defects live, because both
 pass a reading: `credit-expiry-claim` records two of them in its own comments - a check that matched
 `settled_at = ?, credit_expires_at = ?` as a SUBSTRING and so survived `/*x*/` inserted between them,
@@ -289,6 +311,15 @@ read the statement instead of the line - the same correction the two paragraphs 
 So the table is worth running before believing an unfamiliar guard, and worth running after WRITING
 one: all three of the defects found in this repository's own parsers were introduced by the person who
 then had to find them.
+
+A LATER ROUND EXTENDED THE SAME ROWS to `key-island-rules`' array parser: an array reformatted one
+entry per line PASSED (the pattern spans newlines, so a reformat is tolerated) and an entry REMOVED
+while the lib still publishes it FAILED. Its pattern is `\[[^\]]*\]`, which stops at the first `]` - so
+an entry containing `]` would truncate the match. That bound is RECORDED rather than fixed, because it
+is unreachable: every `name` in the config is `[a-z0-9-]`, and a probe for a defect no input can
+produce is the same mistake as a fixture for one. Finding the bound and then checking whether the input
+can reach it is the cheap half of this section, and it is the half that stops a theoretical limit being
+reported as a bug.
 
 ### A mutation can land on a COPY, and then "SURVIVED" is not a finding
 
