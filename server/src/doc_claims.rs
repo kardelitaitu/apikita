@@ -1587,22 +1587,120 @@ mod tests {
 
         // The retention table, as the page writes it: what / keep / why.
         let mut durations: Vec<String> = Vec::new();
-        for line in page.lines() {
+        // The keeps that state no unit at all - the page's word-periods.
+        let mut words: Vec<String> = Vec::new();
+        // THE ROWS THE PARSER COULD NOT READ, tracked separately so a shape change is loud.
+        //
+        // WHY, and it is the same defect this file's price-card guard was fixed for in the round
+        // before this comment was written. Every failure below is a `continue`, and a row that stops
+        // matching the parser simply stops being compared - the vacuity floor cannot see it, because
+        // the floor sits at 4 against 8 rows. MEASURED: changing ONE duration row's `, why:` key to
+        // `, whyText:` took the parse from 8 rows to 7 and left this test GREEN. That row's period
+        // then went unchecked, so the page could have changed it to a wrong number in the same edit
+        // and nothing would have said so.
+        //
+        // SCOPE, because `privacy.ts` holds THREE `{ what: ... }` tables and only one of them is the
+        // retention table. `stored` carries `where:` and `notStored` carries a bare `why:`; neither
+        // has a `keep:` and neither is a period a customer is promised. A first version of this
+        // assertion ran over the whole file and failed on a CORRECT tree with nine "unreadable" rows
+        // that were simply not retention rows - so the scan starts at `export const retention` and
+        // stops at the closing bracket.
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut rows_seen = 0usize;
+        let retention_table: Vec<&str> = {
+            let mut out = Vec::new();
+            let mut inside = false;
+            for line in page.lines() {
+                if line.trim_start().starts_with("export const retention") {
+                    inside = true;
+                    continue;
+                }
+                if inside && line.trim() == "];" {
+                    break;
+                }
+                if inside {
+                    out.push(line);
+                }
+            }
+            out
+        };
+        for line in &retention_table {
             let Some(rest) = line.trim().strip_prefix("{ what:") else {
                 continue;
             };
+            rows_seen += 1;
             let Some((_, after_what)) = rest.split_once(", keep: '") else {
+                unreadable.push(format!("no `, keep: '` in {rest:.40}"));
                 continue;
             };
             let Some((keep, _)) = after_what.split_once("', why:") else {
+                unreadable.push(format!("no `', why:` in {rest:.40}"));
                 continue;
             };
             // A duration and nothing else. `30-90 days` is one, because a customer
             // reading a range is still being told a period.
             if keep.contains("day") || keep.contains("month") || keep.contains("hour") {
                 durations.push(keep.to_string());
+            } else {
+                words.push(keep.to_string());
             }
         }
+
+        // EVERY ROW IN THE RETENTION TABLE WAS UNDERSTOOD. A row listed here is one whose period - if
+        // it has one - is no longer being compared against the policy document.
+        assert!(
+            unreadable.is_empty(),
+            "{} row(s) in the `retention` table of website/src/lib/privacy.ts carry a shape this \
+             parser cannot read, so their periods are not being checked at all: {unreadable:?}. The \
+             rows are written `{{ what: '...', keep: '...', why: '...' }}`; a row that no longer \
+             matches has left the check silently, and the floor below cannot see it.",
+            unreadable.len()
+        );
+
+        // AND THE TABLE IS STILL THE SIZE THE FLOOR ASSUMES. Fifteen rows, eight of them durations,
+        // so a table that lost a row entirely is visible even when every remaining row parses.
+        assert!(
+            rows_seen >= 15,
+            "the `retention` table of website/src/lib/privacy.ts yielded only {rows_seen} row(s). \
+             Fifteen rows were there when this floor was written; a lower count means a row was \
+             DELETED, which every assertion below would accept because it only ever checks the rows \
+             it can see."
+        );
+        // AND EVERY KEEP THAT STATES NO UNIT IS ONE OF THE PAGE'S WORD-PERIODS.
+        //
+        // THIS REPLACED A COUNT, and the count was the wrong instrument - MEASURED rather than
+        // reasoned. The first version asserted `non_duration >= 5` against 7 word-periods, so
+        // changing one row's `7 days` to `a week` left a floor with two of slack passing: the row
+        // still parsed, still counted, and simply stopped being compared. Raising the floor to 7
+        // would catch that one mutation and become a tripwire the other way - it would fail when a
+        // row is ADDED that states a real duration, which is a change nobody should have to fight.
+        //
+        // A count cannot tell "a duration became prose" from "a row was added". The SHAPE can: a
+        // keep either states a unit this test knows, or it is one of the words the page uses when
+        // there is no number to give. Anything else is a period the comparison above silently
+        // skipped, and it is named here.
+        const WORD_PERIODS: &[&str] = &[
+            "Forever",
+            "Kept indefinitely; not deleted on request",
+            "Same as the review",
+            "Until used, or the link expires (24h for verification, 30m for a reset)",
+            "Until used or expired + 24h",
+            "Keep record, drop personal data",
+        ];
+        let unrecognised: Vec<&String> = words
+            .iter()
+            .filter(|w| !WORD_PERIODS.contains(&w.as_str()))
+            .collect();
+        assert!(
+            unrecognised.is_empty(),
+            "{} `keep:` value(s) in the retention table state no unit this test recognises and are \
+             not one of the page's word-periods: {unrecognised:?}. Every other row's period is \
+             compared against docs/data-retention.md; this one is compared against nothing, which is \
+             how a duration rewritten as prose (a `7 days` becoming `a week`) leaves the check while \
+             the run stays green. If the page gained a legitimate word-period, add it to \
+             WORD_PERIODS in this test.",
+            unrecognised.len()
+        );
 
         // The vacuity guard: a parser that matched no row would agree with anything,
         // and this file is written in a style a small edit can change.
