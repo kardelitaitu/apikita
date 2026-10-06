@@ -557,6 +557,36 @@ The fixes that hold, in order of how well:
   parse, take the test module or the function body explicitly rather than the whole file - a parse that
   found its own region is the same bug one level up.
 
+**AND THE OBVIOUS SCREEN FOR THIS SHAPE DOES NOT WORK.** After finding it by hand, sweeping for it
+looks mechanical: find every assertion whose needle also appears in the file it searches. MEASURED
+across `server/src`, that screen returns **53 candidates in `config.rs` alone**, and the ones inspected
+were all false positives - the pair below is one, and it is a CORRECT guard rather than a vacuous one:
+
+```
+in config.rs's `validate`, a production message:
+    return Err("At least one model must be configured in models".into());
+in its test module, the assertion that reads it:
+    assert!(err.contains("At least one model"), "got {err}");
+```
+
+The needle genuinely appears twice - once in the production message, once in the assertion that reads
+it - and that is a CORRECT guard, not a self-satisfying one. Counting occurrences cannot tell the two
+apart, because a real guard and a vacuous one have the same shape: a literal on both sides of a
+`contains`.
+
+What distinguishes them is **which text the search actually reads**, and that is not visible in a
+literal count:
+
+- the vacuous guard reads the FILE THAT HOLDS ITS OWN SOURCE - so the needle it finds may be its own
+  occurrence;
+- the correct guard reads a RUNTIME VALUE (an error string, a response body, a rendered frame) - and a
+  literal in the assertion is the expected shape of that value.
+
+So the screen has to know the receiver's provenance, not just that a `contains` exists. A cheap
+approximation that does hold: flag only when the searched text came from `read_to_string` on the guard's
+own path. That still needs reading, and this file would rather say so than offer a scanner that reports
+53 non-defects in one file.
+
 ### The same trap one level up: scoping a coverage scan to the module that DEFINES a rule
 
 The filter trap above is about a test RUN that matches the wrong tests. Its sibling is a SCAN that
