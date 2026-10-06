@@ -504,6 +504,34 @@ The cheap version of the check, and the one used here, is to run the mutation ag
 `cargo test --lib` rather than a filtered subset before writing anything. A filtered run answers
 "does the module that defines this believe in it", which is not the question.
 
+### And the third: a scan that asserts an empty collection needs proof it looked
+
+A scan whose success condition is `assert!(offenders.is_empty())` is satisfied perfectly by a scan
+that examines nothing, so it needs evidence of reachability somewhere. What counts as evidence is
+wider than it first appears, and a sweep that looks for it in only one place returns false alarms -
+three of them in one round, all in `money.rs`, all reported as unguarded.
+
+The three placements, in the order this repository prefers them:
+
+1. **A dedicated control test beside the scan.** `money.rs` names it plainly:
+   `the_scan_actually_read_the_tree` asserts the walk found more than ten `.rs` files AND that
+   `money.rs` is among them. `the_parser_found_the_prices` does the same for the config parser, with
+   `found.len() >= 30`. Each source of data gets its own control, and the scans that consume that
+   source inherit the proof. This is the strongest form because the control can be read on its own.
+2. **An `expect` rather than an `unwrap_or_default`.** `doc_claims.rs`'s telegram-folder guard calls
+   `.expect("telegram/ must be readable")`, so an unreadable directory fails loudly rather than
+   yielding an empty listing that satisfies `others.is_empty()`. The distinction between
+   `unwrap_or_default` and `expect` IS the reachability guard in that shape, and it does not look
+   like a counter.
+3. **A counter and a floor inside the scan itself.** What round 112 added to the Postgres-claim
+   guard, and the fallback when neither of the above is present.
+
+**So the heuristic "this scan has no counter and no floor" is not a finding.** It produced three
+false positives in `money.rs` alone, each of which had a dedicated control test a hundred lines away,
+and two more in `doc_claims.rs` and `config.rs` guarded by `expect` and by a companion length
+assertion. The check that works is to ask which of the three applies, and to grep the whole file for
+a control that names the same source function - not to look for a counter in the scan's own body.
+
 ### Where this rule stops, and why it stops there
 
 The log guard checks the SEVENTH restatement, and it works because `logged`, `logs` and
