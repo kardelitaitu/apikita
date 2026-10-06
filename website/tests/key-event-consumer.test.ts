@@ -124,3 +124,77 @@ test('the field the consumer reads is the one the client writes', () => {
     'live.ts must still declare and write `revokedKeyIds`, which is the field the island reads',
   );
 });
+
+test('a key revoked in another tab renders as revoked, not as an invalid date', () => {
+  // THE SENTINEL IS A PLACEHOLDER, and it is deliberately not a timestamp.
+  //
+  // `applyRevocations` patches the row on screen by writing the STRING `'revoked'` into
+  // `revoked_at`, because the stream does not carry the server's timestamp and inventing one would
+  // put a client-side clock into a server-owned field. So `revoked_at` holds a value that is not a
+  // date on purpose, and the only thing that turns it back into the right label is the `isNaN`
+  // branch in `statusLabel`.
+  //
+  // MEASURED, and this is why the test exists: deleting that branch - so the label becomes
+  // `'Revoked · ' + d.toLocaleDateString()` unconditionally - left the whole website suite at
+  // 225 pass / 0 fail. The customer-visible result of that edit is a revoked key reading
+  // **"Revoked · Invalid Date"**, and NOTHING in the suite could see it. Changing the sentinel
+  // itself to `'1999-01-01'` - which would render a confidently WRONG date instead of an obviously
+  // broken one - also passed.
+  //
+  // The assertion is therefore on the PAIR: the island must write a non-date sentinel AND guard the
+  // read. Either half alone is satisfied by a broken tree.
+  const island = read(KEYS_ISLAND);
+
+  assert.ok(
+    /key\.revoked_at\s*=\s*'revoked'/.test(island),
+    'the keys island must mark a cross-tab revocation with the non-date sentinel `\'revoked\'`. ' +
+      'The stream carries no `revoked_at` for the row to adopt, and a client-side timestamp would ' +
+      'put a browser clock into a field the server owns.',
+  );
+
+  // THE ASSERTION IS SCOPED TWICE, and both scopes are load-bearing.
+  //
+  // A bare search for `isNaN(d.getTime())` over the whole file is satisfied by THREE other
+  // functions; scoping to `statusLabel` still leaves TWO inside it - the revocation branch written
+  // for this sentinel, and the EXPIRY branch below it, which compares a real timestamp. MEASURED:
+  // deleting the guard from the revocation branch alone - the exact edit that makes a revoked key
+  // read "Revoked · Invalid Date" - passed BOTH the file-wide search and the `statusLabel` slice,
+  // because a sibling `isNaN` was still in view each time. So the assertion below reads the
+  // revocation branch's own return statement, which is the only place that can carry this claim.
+  const statusLabel = island.slice(
+    island.indexOf('function statusLabel('),
+    island.indexOf('function spendText('),
+  );
+  assert.ok(
+    statusLabel.includes('function statusLabel(') && statusLabel.includes('revoked_at'),
+    'the keys island must still define `statusLabel` and branch on `revoked_at`; this test reads ' +
+      'that function\'s body, so a rename or a move would silently make the check below vacuous.',
+  );
+
+  const revokedBranch = statusLabel.match(/if \(k\.revoked_at\)\s*\{[\s\S]*?\n\s*\}/);
+  assert.ok(
+    revokedBranch !== null,
+    '`statusLabel` must still carry a brace-delimited `if (k.revoked_at)` branch. This test reads ' +
+      'that branch specifically, because the function contains a second, unrelated `isNaN` for the ' +
+      'expiry case that would satisfy a looser search.',
+  );
+  assert.ok(
+    /isNaN\(\s*d\.getTime\(\)\s*\)/.test(revokedBranch[0]),
+    'the `k.revoked_at` branch of `statusLabel` must keep its `isNaN(d.getTime())` guard. ' +
+      '`revoked_at` can hold the non-date sentinel `\'revoked\'`, and ' +
+      "`new Date('revoked').toLocaleDateString()` is the string \"Invalid Date\". Without this " +
+      'branch a key revoked in another tab displays "Revoked · Invalid Date" to the customer. ' +
+      'MEASURED: removing it left this suite green twice - once against a file-wide search, and ' +
+      'once against a search scoped only to the enclosing function.',
+  );
+
+  // And prove the sentinel really is unparseable, so the guard above is not defending against a
+  // condition that cannot occur. If `'revoked'` ever became a parseable date string, the `isNaN`
+  // branch would stop firing and the row would show a wrong date - which is the M2 mutation.
+  assert.ok(
+    Number.isNaN(new Date('revoked').getTime()),
+    "the sentinel `'revoked'` must not parse as a date. It is chosen because it cannot be mistaken " +
+      'for one; a sentinel that parses would render a confident wrong date and the `isNaN` branch ' +
+      'would never fire.',
+  );
+});
