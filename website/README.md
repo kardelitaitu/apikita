@@ -50,7 +50,7 @@ without a refresh, falling back to polling if the stream drops.
 ## Status
 
 **Built and building.** Measured 2026-09-30: `npm run build` emits **18 pages** and
-`npm test` passes **229 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 229`,. Count them rather than recalling them — both numbers move every time a
+`npm test` passes **230 tests** (`node --test "tests/**/*.test.ts"` reports `# tests 230`,. Count them rather than recalling them — both numbers move every time a
 page or a contract test lands. What exists today:
 
 - **Public pages** — `/` (landing + pricing), `/login`, `/signup`, `/verify`,

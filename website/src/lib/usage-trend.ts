@@ -52,6 +52,27 @@ export function barHeight(value: number, max: number): number {
  */
 export type TrendMetric = 'input_tokens' | 'output_tokens' | 'cost_idr';
 
+/**
+ * Every member of {@link TrendMetric}, as a value.
+ *
+ * THE SAME REASON `SERVICE_STATUSES` EXISTS in `service-status.ts`, and found the same way. The test
+ * checking "every metric has a label" held its own literal array, annotated `as TrendMetric[]`. That
+ * annotation LOOKS like a tie to the type and is not one - a `TrendMetric[]` may hold a SUBSET.
+ * MEASURED: dropping `'cost_idr'` from the test's list left the suite green AND `tsc --noEmit` at
+ * exit 0, so the check would have narrowed to two metrics while `metricLabel` kept a third branch
+ * that nothing exercised.
+ *
+ * The compiler helps in the other direction only: removing a case from `metricLabel` makes it fall
+ * off its end and `tsc` reports it (MEASURED: exit 2).
+ *
+ * THIS IS ALSO THE LIST `UsageAnalytics.astro` SPELLS OUT IN MARKUP. Its three `data-metric` buttons
+ * are the only source of the values reaching `metricLabel`, through an unchecked `as TrendMetric`
+ * cast in the click handler. A fourth metric would need a fourth button, and that cast would not
+ * notice the omission - the island's `?? 'input_tokens'` default only fires on a MISSING attribute,
+ * not on one holding an unknown value.
+ */
+export const TREND_METRICS: TrendMetric[] = ['input_tokens', 'output_tokens', 'cost_idr'];
+
 /** The metric's human label, for the axis title and the toggle. */
 export function metricLabel(metric: TrendMetric): string {
   switch (metric) {
