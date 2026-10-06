@@ -176,6 +176,36 @@ pub async fn verify_id_token(
     let decoded = decode::<GoogleClaims>(id_token, &key, &validation)
         .map_err(|_| AppError::Unauthenticated)?;
 
+    // ---------------------------------------------------------------------------------------------
+    // EVERYTHING BELOW THIS LINE IS UNREACHED BY THE TEST SUITE, AND THAT IS STRUCTURAL.
+    //
+    // MEASURED: each of the three checks that follow survives being disabled.
+    //
+    //   `claims.email_verified != Some(true)`  ->  `== Some(false)`   SURVIVED at 683 passed / 0 failed
+    //   the empty-email filter                 ->  a permissive read  SURVIVED
+    //   the re-read `ISSUERS` check            ->  `if false`         SURVIVED
+    //
+    // WHY, and it is not an oversight. `decode` above needs a token signed by a key from Google's live
+    // JWKS endpoint, and there is no seam to inject a key or a claim set. The only two tests that call
+    // this function - `a_malformed_token_is_unauthenticated` and `an_unconfigured_client_id_is_an_internal_error` -
+    // both pass a string that is not a JWT at all, so they return at `decode` and never arrive here.
+    // `routes/auth.rs` records the same limit from the caller's side ("HONEST LIMIT: the happy path of
+    // this handler CANNOT be driven from a test").
+    //
+    // WHY THE NOTE IS HERE RATHER THAN ONLY THERE. `routes/auth.rs` says the happy path is untested;
+    // it does not say that the four checks the module's own doc calls "exactly four things that make
+    // it evidence" are each independently unenforced by any test. A reader editing one of them is
+    // looking at THIS code, and a SURVIVED mutation from a coverage run has to be interpretable here
+    // or it gets re-investigated as a defect.
+    //
+    // WHAT THAT MEANS FOR AN EDITOR: these lines have no safety net. A change here is verified by
+    // reading it, not by a failing test - and the schema is NOT a substitute. `identities` carries
+    // `CHECK (provider <> 'google' OR email_verified = 1)` as a BACKSTOP, so weakening the first check
+    // turns a 401 into a 500 rather than into an unverified identity. The other two have no backstop
+    // at all: an empty email or a foreign issuer would simply be accepted, which is why they are the
+    // more dangerous pair to touch.
+    // ---------------------------------------------------------------------------------------------
+
     let claims = decoded.claims;
 
     // Checked AFTER the signature, so this is a fact about a token Google really
@@ -367,6 +397,124 @@ mod tests {
             matches!(err, AppError::Unauthenticated),
             "a caller's bad token is 401, not 500, got {err:?}"
         );
+    }
+
+    /// The note above the post-decode checks is TRUE, and this is what keeps it true.
+    ///
+    /// `verify_id_token` has four load-bearing checks that no test reaches, because `decode` needs a
+    /// token signed by Google's live JWKS key and there is no seam to inject one. MEASURED: disabling
+    /// the `email_verified`, empty-email and `ISSUERS` checks each survives the whole suite.
+    ///
+    /// A note claiming "this is structurally untestable" is worth exactly as much as its assumption,
+    /// and the assumption is that NO TEST REACHES THE REGION. That is checkable from the source, so it
+    /// is checked here rather than trusted - and if the assumption stops holding, this fails and the
+    /// note above has to be rewritten instead of quietly becoming false.
+    #[test]
+    fn the_post_decode_checks_are_unreachable_from_this_modules_tests() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("identity")
+            .join("google.rs");
+        let text = std::fs::read_to_string(&path).expect("google.rs must be readable");
+
+        // Vacuity guards first: the assertions below mean nothing if the region or the tests moved.
+        //
+        // THE MARKER IS ASSEMBLED AT RUNTIME, and that is not decoration. A literal here would be
+        // found in THIS FILE, so `text.contains(marker)` would be satisfied by the check's own source
+        // - which is what MEASURED: deleting the note's sentence left this test passing, because the
+        // `let marker = "..."` three lines below still contained it. Splitting the string means the
+        // source of this test cannot answer its own question.
+        let marker = concat!("UNREACHED BY THE ", "TEST SUITE");
+        assert!(
+            text.contains(marker),
+            "the note marking the untested region is gone, so this guard is now checking nothing. \
+             If the region became testable, delete this test rather than the note."
+        );
+        for check in [
+            "claims.email_verified != Some(true)",
+            "!ISSUERS.contains(&claims.iss.as_str())",
+        ] {
+            assert!(
+                text.contains(check),
+                "the check `{check}` is no longer in google.rs, so the note above the region \
+                 describes code that moved or was deleted"
+            );
+        }
+
+        // THE ASSUMPTION, stated so it can be falsified: no test in this module can get past `decode`,
+        // because every token it passes is a LITERAL that is not a JWT.
+        //
+        // Three earlier versions of this check tried to parse the `verify_id_token(...)` ARGUMENT LIST
+        // and reject anything that was not a string literal. Each one failed on correct code, and for
+        // the same reason: the pattern also appears in this guard's own prose and string literals, so
+        // the parser kept matching its own documentation - reporting `"` and `= verify_id_token(` as
+        // bad test arguments. Parsing text that contains the parser is the trap.
+        //
+        // So the check does not parse arguments at all. It asserts the two things that would have to
+        // change for the note to become false, and both are simple substring facts about the module:
+        //
+        //   1. no test constructs a token - nothing in the test module encodes or signs a JWT;
+        //   2. the tokens it does pass are literals, so `decode` cannot succeed on them.
+        //
+        // (2) is checked by demanding the literal markers still be there, which is also a vacuity
+        // guard: if someone replaces them with a constructed token, this fails and the note above the
+        // post-decode checks has to be rewritten rather than quietly becoming false.
+        let test_mod = text
+            .split_once("#[cfg(test)]\nmod tests {")
+            .or_else(|| text.split_once("#[cfg(test)]\r\nmod tests {"))
+            .map(|(_, rest)| rest)
+            .expect("google.rs must still have a #[cfg(test)] mod tests block");
+
+        // (1) Nothing in the tests builds a token. Any of these would be the seam the note denies.
+        //
+        // THE NEEDLES MUST NOT APPEAR IN THIS LIST ITSELF, which is the fourth time this guard has
+        // tripped over its own text. `encode(` was listed as a needle and the list is inside the
+        // module being searched, so the check failed on the word `encode(` in the array. The needles
+        // below are therefore spelled so that they do not occur literally here: the assertion searches
+        // for the needle plus a marker concatenated at runtime, which cannot match the source of this
+        // list because the source spells the two parts separately.
+        for (a, b) in [
+            ("encode", "(JwtClaims"),
+            ("EncodingKey", "::from_"),
+            ("from_jwk", "(json"),
+            ("insecure_disable", "_signature_validation"),
+        ] {
+            let needle = format!("{a}{b}");
+            assert!(
+                !test_mod.contains(&needle),
+                "the test module now contains `{needle}`, which looks like a way to MINT a token. If a \
+                 test can produce one that passes `decode`, the post-decode checks ARE testable and \
+                 the note above them - and this guard - must be replaced by real coverage rather than \
+                 left claiming the region is unreachable."
+            );
+        }
+
+        // (2) The tokens the tests DO pass are literals. These are the current fixtures; they are
+        // asserted present so that replacing one with a constructed token cannot happen silently.
+        for literal in ["\"not-a-jwt\"", "\"whatever\""] {
+            assert!(
+                test_mod.contains(literal),
+                "the fixture {literal} is gone from the test module. If it was replaced by a \
+                 CONSTRUCTED token, `decode` may now succeed and the post-decode region is no longer \
+                 unreachable - rewrite the note above it."
+            );
+        }
+
+        // And the premise itself: the function takes no seam. A trait object, a generic key source or
+        // a claim set parameter would invalidate the whole argument.
+        let signature = text
+            .split("pub async fn verify_id_token(")
+            .nth(1)
+            .and_then(|s| s.split(") ->").next())
+            .expect("verify_id_token's signature must be parseable");
+        for seam in ["impl ", "dyn ", "&[Claim", "keys:"] {
+            assert!(
+                !signature.contains(seam),
+                "verify_id_token's signature now contains `{seam}`, which looks like an injection \
+                 seam. If it is one, the post-decode checks are testable and the note above them is \
+                 no longer honest: {signature}"
+            );
+        }
     }
 
     /// An unconfigured client id is a SERVER misconfiguration and must say so —

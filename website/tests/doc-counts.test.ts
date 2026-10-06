@@ -194,7 +194,7 @@ const WEBSITE_TESTS = 231;
  * independently in five places. Bumping these is five documents and two constants, which is
  * why it has not been done opportunistically and why it should be done deliberately.
  */
-const SERVER_TESTS = 683;
+const SERVER_TESTS = 684;
 
 /** Every doc that states the server count, and the exact text it must carry. */
 const SERVER_CLAIMS: Array<[string, string]> = [
