@@ -472,6 +472,38 @@ quietly started matching unrelated words is then visible in the output rather th
 The pathology is the same one this file keeps recording in the code under test: a check that reads
 plausible while measuring something else.
 
+### The same trap one level up: scoping a coverage scan to the module that DEFINES a rule
+
+The filter trap above is about a test RUN that matches the wrong tests. Its sibling is a SCAN that
+reads the wrong FILE, and it produced two false alarms in one round - both reported as uncovered
+rules that were in fact guarded twice over.
+
+The scan was looking for tests exercising `money::evaluate_payment_status`, so it read the
+`#[cfg(test)]` module of `money.rs` and asked whether each status in that classifier's four sets
+appears in a test. Two did not: `authorize`, and the `Unrecognised` fallback. The second looked
+serious, because `money.rs` states the rule in bold - everything outside the four sets "is
+`Unrecognised` and must be surfaced, never assumed to be in progress" - and a mutation changing the
+catch-all to `PaymentAction::Pending` left `cargo test --lib money::` at **32 passed, 0 failed**.
+
+The whole-suite run says otherwise: **678 passed, 2 failed**, from
+`routes::webhooks::tests::an_unrecognised_status_is_never_classified_as_pending` and
+`live_webhook_an_unrecognised_status_writes_nothing`. `authorize` is pinned by
+`legitimate_in_progress_statuses_still_classify_as_pending` in the same file. Every value in all
+four sets appears somewhere in the crate; the scan simply never looked outside `money.rs`.
+
+**The rules are asserted where they are CONSUMED, not where they are defined**, and that is the right
+place for them to live - the behaviour a customer sees is the webhook returning 200 or 500, not the
+classifier's return value. So the rule is:
+
+> A scan for the coverage of a rule must read the WHOLE test tree, and any "no test covers this"
+> conclusion has to be re-checked against the full suite before it is believed. Scoping a scan to the
+> module that defines the thing is the natural first move and is wrong for exactly the rules that
+> matter most: the ones a second module is responsible for honouring.
+
+The cheap version of the check, and the one used here, is to run the mutation against
+`cargo test --lib` rather than a filtered subset before writing anything. A filtered run answers
+"does the module that defines this believe in it", which is not the question.
+
 ### Where this rule stops, and why it stops there
 
 The log guard checks the SEVENTH restatement, and it works because `logged`, `logs` and
