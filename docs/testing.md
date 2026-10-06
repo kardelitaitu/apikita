@@ -1038,3 +1038,47 @@ If the rule is stated in a document, the guard should read the document. If it
 is stated in a comment, the guard should read the thing the comment is about.
 A claim that lives only in prose is a claim that will be true until the day
 someone edits the prose.
+
+### The multi-assignment write: one half asserted is not the clause asserted
+
+Round 118 found an upsert whose `SET` carried two assignments and whose test read back only one:
+
+```
+INSERT INTO telegram_links (telegram_id, account_id, linked_at) VALUES (?, ?, ?)
+ON CONFLICT (telegram_id) DO UPDATE
+    SET account_id = excluded.account_id, linked_at = excluded.linked_at
+```
+
+`relinking_the_same_chat_rebinds_it` asserted `account_id` and the row count. Deleting the
+`linked_at` half left the whole 682-test suite green; deleting the `account_id` half was caught. A
+clause with one covered assignment and one uncovered is a shape worth sweeping, so it was:
+
+**Every `UPDATE ... SET` with two or more assignments in production code, and what covers each.**
+
+| site | columns | what makes each safe |
+| --- | --- | --- |
+| `hold-sweep.rs` | `balance_idr`, `updated_at` | the balance is asserted by the hold-sweep suite; a dropped assignment breaks the bind count |
+| `config.rs:970` | `hold`, `charge` | the two settlement deltas, pinned by the clamp property tests |
+| `accounts.rs:452` | `email_verified`, `verified_at`, `updated_at` | `marking_verified_keeps_the_earliest_stamp` pins the `COALESCE` semantic |
+| `accounts.rs:574` | `password_hash`, `updated_at` | the hash is asserted by the password-change tests |
+| `ip_tracking.rs:368` | `request_count`, `distinct_ips` | asserted as PAIRS across a `h1, h1, h2` sequence |
+| `admin.rs:680`, `admin.rs:798` | `status`, `updated_at` | MEASURED: dropping either assignment breaks the query's bind count |
+| `telegram.rs:560` | `account_id`, `linked_at` | the round-118 fix, above |
+
+**BIND COUNT IS A GUARD, and it is worth naming as one.** Four of these are safe for a reason that
+has nothing to do with a semantic assertion: every column in a parameterised `SET` takes a `.bind()`,
+so deleting an assignment while leaving the bind leaves sqlx with a parameter it cannot place and the
+query fails. `admin.rs` looked uncovered by the obvious measure - `updated_at` is written there and
+read by nothing - and is in fact caught immediately, six tests deep, because the failure is a bind
+mismatch rather than a wrong value.
+
+That is the third placement in the pattern this file keeps recording: a guard that does not look like
+one. A literal `SET`, whose values are inlined rather than bound, gets no such protection - and
+`telegram.rs`'s is exactly that shape, which is why one half of it could disappear unnoticed.
+
+**The measurement that did NOT work**, kept because it is the trap: the first fix compared the two
+redemptions' `linked_at` values with `>=`. It still passed with the assignment deleted, because both
+are `Utc::now()` calls milliseconds apart and the two values came out equal. A test that compares two
+timestamps taken microseconds apart cannot distinguish "moved" from "carried over". Planting a
+timestamp known to be old on the row and requiring the value to CHANGE is what discriminates.
+
