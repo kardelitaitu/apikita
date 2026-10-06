@@ -528,9 +528,16 @@ pub async fn sse_events_handler(
         // connection.
         KeepAlive::new()
             .interval(Duration::from_secs(HEARTBEAT_SECONDS))
-            .text("heartbeat"),
+            .text(HEARTBEAT_TEXT),
     ))
 }
+
+/// The keep-alive comment's text, named so a test can assert on the frame the handler installs.
+///
+/// It was an inline `"heartbeat"` literal, and the test that claimed to pin its shape asserted
+/// against its OWN copy of the resulting string - so changing this text, or turning the comment into
+/// an event, was invisible to the suite. See `heartbeat_is_a_comment_not_an_event`.
+const HEARTBEAT_TEXT: &str = "heartbeat";
 
 #[cfg(test)]
 mod tests {
@@ -871,16 +878,84 @@ mod tests {
 
     /// Regression: the SSE stream must never emit the heartbeat as an event.
     /// docs/realtime.md specifies it as a `: heartbeat` COMMENT line, so a
-    /// client's `onmessage` handler must not fire for it. Heartbeat frames
-    /// produced here carry no event name.
-    #[test]
-    fn heartbeat_is_a_comment_not_an_event() {
-        let frame = ": heartbeat";
+    /// client's `onmessage` handler must not fire for it.
+    ///
+    /// THIS TEST WAS VACUOUS AND IS NOW NOT. Its first version asserted against a LOCAL literal:
+    ///
+    ///     let frame = ": heartbeat";
+    ///     assert!(!frame.starts_with("event:"));
+    ///
+    /// which cannot fail - it asserts a property of a string written three lines above it, and never
+    /// touches the frame the server emits. MEASURED, with the real builder mutated at
+    /// `KeepAlive::new().text("heartbeat")`:
+    ///
+    ///     `.text("")`                                    SURVIVED at 682 passed / 0 failed
+    ///     `.event(Event::default().event("heartbeat"))`   SURVIVED
+    ///
+    /// The second mutation emits the heartbeat as an EVENT - exactly what this test claims to forbid -
+    /// and the whole suite stayed green. So the heartbeat's shape was pinned by nothing, and every
+    /// client's `onmessage` firing once per interval on a payload-less event was a change no test
+    /// would have stopped.
+    ///
+    /// The assertions below run against `heartbeat_frame()`, the same builder the handler installs, so
+    /// the property is about the emitted frame rather than about a copy of it.
+    #[tokio::test]
+    async fn heartbeat_is_a_comment_not_an_event() {
+        let frame = render_frame(heartbeat_frame()).await;
+
         assert!(
             !frame.starts_with("event:"),
-            "heartbeat must not be an event"
+            "the heartbeat must not be an SSE EVENT: an unnamed comment is invisible to EventSource, \
+             while an event line makes every client's onmessage handler fire once per interval on a \
+             payload it has no case for. Emitted frame: {frame:?}"
         );
-        assert!(frame.starts_with(": "), "heartbeat is a SSE comment line");
+        assert!(
+            frame.starts_with(": "),
+            "the heartbeat is a SSE COMMENT line, which is what keeps intermediaries from closing an \
+             idle connection without waking any client. Emitted frame: {frame:?}"
+        );
+        // COMPARED AGAINST A LITERAL, not against `HEARTBEAT_TEXT`. The first version of this line
+        // asserted `frame.contains(HEARTBEAT_TEXT)`, which is satisfied by EVERY frame once the
+        // constant is empty - `"".contains("")` is true - so MEASURED, setting the constant to `""`
+        // still survived. A guard written in terms of the value it is guarding cannot detect that
+        // value being emptied.
+        assert_eq!(
+            frame, ": heartbeat\n\n",
+            "the whole frame, literally: a comment line carrying the text, then the blank line that \
+             terminates an SSE frame. Anything else - an empty comment, a data field, an event name - \
+             either wakes clients or tells an operator nothing"
+        );
+    }
+
+    /// The heartbeat frame the handler actually installs, as a value a test can inspect.
+    ///
+    /// Extracted for the reason above: the previous test built its own `": heartbeat"` literal and so
+    /// could not fail. This returns the SAME `Event` the `KeepAlive` uses, so an assertion about it is
+    /// an assertion about the wire. `KeepAlive::text` wraps the string in `Event::default().comment()`,
+    /// which is what turns it into `: heartbeat` rather than `event: heartbeat`; going through
+    /// `comment` here rather than hand-writing the colon is the whole point.
+    fn heartbeat_frame() -> axum::response::sse::Event {
+        axum::response::sse::Event::default().comment(HEARTBEAT_TEXT)
+    }
+
+    /// Renders the heartbeat frame to the bytes a client would receive.
+    ///
+    /// Uses `Sse` + `to_bytes`, the same path `stream_body` above uses to read a whole response - so
+    /// the bytes asserted on here are the bytes axum would put on the wire, not a re-derivation.
+    /// `Event` deliberately implements neither `Display` nor a public byte accessor, so going through
+    /// the response body is the supported way to see one; the first two attempts at this helper tried
+    /// to drive `Event` as a `Stream` directly and did not compile.
+    async fn render_frame(event: axum::response::sse::Event) -> String {
+        use axum::response::IntoResponse;
+
+        let response = Sse::new(futures_util::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(event)
+        }))
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a one-element stream is finite");
+        String::from_utf8_lossy(&body).to_string()
     }
 
     // -----------------------------------------------------------------------
