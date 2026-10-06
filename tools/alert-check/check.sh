@@ -283,6 +283,52 @@ else
     if [ "$STOPPED" -gt 0 ]; then
         fail "$STOPPED alerts.tsv citation(s) still use a LINE NUMBER (docs/observability.md:N). A line citation re-points at its neighbour the moment a row is added, which already happened to 9 of 11 of them - cite the row by name instead"
     fi
+
+    # -----------------------------------------------------------------------
+    # AND THE COVERAGE COUNT THE PROSE STATES, which nothing compared.
+    # -----------------------------------------------------------------------
+    # `docs/launch-checklist.md` and `todo.md` both publish "10 of its 11 alerts
+    # are `covered`", and the checklist's own text records that this sentence was
+    # WRONG once before ("This line said '9 of 10' until it was measured") and
+    # gives the reason it went stale: "nothing tied the sentence to the file".
+    # That reason is still true of the replacement figure - MEASURED: changing
+    # both files to "11 of its 11" leaves this gate at exit 0, so the number the
+    # checklist offers as evidence of alert coverage is checked by nothing.
+    #
+    # Both figures are derivable from the file this block already parses, so the
+    # comparison is exact rather than a floor. Every document must agree with
+    # alerts.tsv: a sentence citing this file as its evidence while disagreeing
+    # with it is the failure this whole section exists to catch.
+    COVERED=$(grep -v '^#' "$TSV" | grep -v '^id' | cut -f6 | grep -c '^covered$')
+    for DOC in "$REPO/docs/launch-checklist.md" "$REPO/todo.md"; do
+        if [ ! -f "$DOC" ]; then
+            fail "cannot read $DOC, so the published alert-coverage count was not compared"
+            continue
+        fi
+        REL="${DOC#"$REPO"/}"
+        # `tr` first, so a sentence broken across two lines is still one string - and the CR is
+        # STRIPPED, because this repository is CRLF (130 text files) and `tr '\n' ' '` leaves the
+        # `\r` behind. MEASURED: without the second `tr`, the checklist's sentence arrives as
+        # "10 of its 11^M alerts are `covered`", so the space between "11" and "alerts" is actually
+        # a carriage return and the pattern below matches nothing. todo.md has the same sentence on
+        # ONE line, so it matched anyway - which is exactly how one of two documents gets compared
+        # while the other silently is not.
+        #
+        # THE PATTERN STOPS AT THE PHRASE, not at the end of the sentence. The checklist writes
+        # ``are `covered`**`` (a bold marker closes right after the term) and todo.md writes
+        # ``are `covered```, so anchoring on the closing backtick would miss one of them.
+        STATED=$(tr '\n' ' ' < "$DOC" | tr -d '\r' | grep -o '[0-9][0-9]* of its [0-9][0-9]* alerts are `covered' | head -1)
+        if [ -z "$STATED" ]; then
+            fail "$REL no longer states an 'N of its M alerts are covered' figure. Either the sentence moved or it was deleted - and this block exists because that sentence carries the only evidence the checklist offers for alert coverage."
+            continue
+        fi
+        S_COVERED=$(printf '%s' "$STATED" | sed 's/^\([0-9][0-9]*\) of its.*/\1/')
+        S_TOTAL=$(printf '%s' "$STATED" | sed 's/^[0-9][0-9]* of its \([0-9][0-9]*\) alerts.*/\1/')
+        if [ "$S_COVERED" != "$COVERED" ] || [ "$S_TOTAL" != "$D_COUNT" ]; then
+            fail "$REL publishes '$STATED' but tools/alert/alerts.tsv holds $COVERED covered of $D_COUNT definitions. The checklist cites that file as the evidence the alerts are checked; a count that disagrees with it is a coverage claim nothing supports."
+        fi
+        echo "alert-check:   $REL states $STATED, which matches alerts.tsv"
+    done
 fi
 
 
