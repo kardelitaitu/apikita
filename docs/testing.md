@@ -262,6 +262,34 @@ Three things this earns:
   guard instead of reading it. That probe is the reason `\b\w+\.subscribe\(` is written with `\w+`
   rather than with the variable's actual name.
 
+**THE PROCEDURE, since it was run by hand three times in one round and is short.** For any guard that
+reads text it did not write, four edits, each a one-line change to the subject and a re-run:
+
+| edit | expected | what a wrong answer means |
+| --- | --- | --- |
+| a rewrite that keeps the BEHAVIOUR but changes the SPELLING | PASS | the guard pins a spelling, not a rule, and the next refactor will be blamed on it |
+| the thing the guard is FOR, removed | FAIL | the guard does not catch its own subject |
+| the thing removed, but a NEIGHBOUR left in place | FAIL | the guard matched the neighbour - the vocabulary, not the statement |
+| the value changed while the SHAPE is kept | FAIL | the guard checks a shape and never the value |
+
+The second row is the ordinary one. The third and fourth are where the real defects live, because both
+pass a reading: `credit-expiry-claim` records two of them in its own comments - a check that matched
+`settled_at = ?, credit_expires_at = ?` as a SUBSTRING and so survived `/*x*/` inserted between them,
+and a check that looked for `credit_retired_at IS NULL` anywhere in the crate and so was satisfied by
+the sweep's SELECT, which tests that predicate for a different reason. Both were replaced by reading
+the STATEMENT rather than the phrase.
+
+MEASURED this round, all four rows, on three guards that read source text:
+`credit-expiry-claim`'s settlement and mark parsers (4 for 4 - raw-string literals and renamed locals
+tolerated, removal and self-assignment caught), and `stated-limits`' `configNumber` (a duplicate key
+earlier in the file with a different value is caught, which is the first-match behaviour working). The
+one guard that FAILED its first row was the previous round's `DROP TABLE` parser, and the fix was to
+read the statement instead of the line - the same correction the two paragraphs above describe twice.
+
+So the table is worth running before believing an unfamiliar guard, and worth running after WRITING
+one: all three of the defects found in this repository's own parsers were introduced by the person who
+then had to find them.
+
 ### A mutation can land on a COPY, and then "SURVIVED" is not a finding
 
 **`routes/mod.rs` holds THREE copies of the route list, and only one of them ships.**
