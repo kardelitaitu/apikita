@@ -31,9 +31,9 @@ use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::routes::events::publish_key_update;
 use crate::routes::hash_token;
 use crate::routes::proxy::{invalidate_key_cache, AppState};
-
 #[derive(Debug, Serialize)]
 pub struct ApiKeyDto {
     pub id: Uuid,
@@ -635,6 +635,10 @@ pub async fn revoke_key(
     // plaintext key exists nowhere in the database (it was shown once, at
     // creation). The hash is also all `invalidate_key_cache` will ever take, so
     // the plaintext never has to be reconstructed to evict an entry.
+    // The instant is bound to a NAME rather than written inline, because the realtime event below has
+    // to carry the SAME value the row now holds. A second `Utc::now()` would put a slightly later
+    // timestamp on the wire than in the database, and the two are compared by the client.
+    let revoked_at = Utc::now();
     let revoked_hash: Option<String> = sqlx::query_scalar(
         r#"
         UPDATE api_keys SET revoked_at = ?
@@ -642,7 +646,7 @@ pub async fn revoke_key(
         RETURNING key_hash
         "#,
     )
-    .bind(Utc::now())
+    .bind(revoked_at)
     .bind(id.hyphenated())
     .bind(account_id.hyphenated())
     .fetch_optional(&state.pool)
@@ -660,6 +664,21 @@ pub async fn revoke_key(
     // documented cost of the cache and is not closed by this call.
     if let Some(key_hash) = revoked_hash {
         invalidate_key_cache(&state.config, &key_hash);
+
+        // AND THE LIVE STREAM IS TOLD, which it had never been.
+        //
+        // `docs/realtime.md:73` promises the `key` event is "Emitted when a key is created, edited, or
+        // revoked — so a second browser tab stays consistent", `RealtimeEvent::key` and
+        // `publish_key_update` both existed for it, `website/src/lib/live.ts:167` LISTENS for it and
+        // records the id in `revokedKeyIds` so the key greys out — and NOTHING CALLED THE PUBLISHER.
+        // MEASURED: its only caller in the whole repository was a test in events.rs, so every link of
+        // that chain was present except the first one, and a second tab showed a revoked key as live
+        // until it was reloaded.
+        //
+        // Published INSIDE the `Some` arm, on the same condition as the cache eviction and for the
+        // same reason: a second revoke matches no row, so there is no state change to announce. Sending
+        // on the `None` path would report a revocation that did not happen.
+        publish_key_update(&state.events, account_id, id, Some(revoked_at));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -1516,6 +1535,112 @@ mod tests {
             0,
             "fixture must not drift"
         );
+        db.close().await;
+    }
+
+    /// Revoking a key ANNOUNCES it on the live stream, which nothing had ever done.
+    ///
+    /// WHY THIS TEST IS THE FIX, not a formality. `docs/realtime.md:73` promises the `key` event is
+    /// "Emitted when a key is created, edited, or revoked — so a second browser tab stays consistent",
+    /// `RealtimeEvent::key` and `publish_key_update` both existed for it, and
+    /// `website/src/lib/live.ts:167` LISTENS for it and records the id in `revokedKeyIds` so the key
+    /// greys out. MEASURED: `publish_key_update`'s ONLY caller in the repository was a test in
+    /// events.rs. Every link of that chain was present except the first, so a second tab showed a
+    /// revoked key as live until it was reloaded - a documented behaviour with no producer.
+    ///
+    /// The event must carry the SAME instant the row holds, which is why the handler binds
+    /// `revoked_at` to a name rather than writing `Utc::now()` inline: a second call would put a
+    /// slightly later timestamp on the wire than in the database, and the client keeps what it is sent.
+    ///
+    /// AND IT MUST NOT FIRE ON A SECOND REVOKE. The handler is idempotent - a repeat matches no row
+    /// and answers 204 - so there is no state change to announce. Publishing there would report a
+    /// revocation that did not happen, with a fresh timestamp.
+    #[tokio::test]
+    async fn revoking_a_key_announces_it_on_the_live_stream() {
+        let _cache = CacheLock::acquire();
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (id, _, _) = create_key_via_handler(&state, &headers, "announced", vec![], 0).await;
+
+        // Subscribed BEFORE the revoke, so an event published during it cannot be missed.
+        let mut rx = state.events.subscribe_for_test();
+
+        let res = revoke_key(State(state.clone()), Path(id), headers.clone())
+            .await
+            .expect("revoke must succeed")
+            .into_response();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let delivered: Vec<_> = std::iter::repeat(())
+            .map_while(|_| rx.try_recv().ok())
+            .collect();
+        let keys: Vec<_> = delivered.iter().filter(|e| e.name() == "key").collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "a revocation must publish exactly one `key` event, got [{}]. Zero is the state this test \
+             was written for - the documented event had no producer - and more than one would put a \
+             duplicate on every subscriber's stream",
+            delivered.iter().map(|e| e.name()).collect::<Vec<_>>().join(", ")
+        );
+        assert_eq!(
+            keys[0].account_id(),
+            account_id,
+            "the event must be scoped to the key's owner (DEFECT 1): another id puts this account's \
+             revocation on another customer's stream"
+        );
+
+        // The timestamp on the wire is the one in the row.
+        let stored: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = ?")
+                .bind(id.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("read revoked_at");
+        let payload: serde_json::Value =
+            serde_json::from_str(&keys[0].data_for_test()).expect("the key event carries JSON");
+        assert_eq!(
+            payload["key_id"],
+            json!(id.hyphenated().to_string()),
+            "the event names the key it is about: {payload}"
+        );
+        // Compared as INSTANTS, not as strings: the same moment serializes `Z` on the wire and
+        // `+00:00` out of SQLite, so a string comparison would fail on a correct event. My first
+        // version did exactly that.
+        let announced: DateTime<Utc> = payload["revoked_at"]
+            .as_str()
+            .expect("the event carries a revoked_at")
+            .parse()
+            .expect("revoked_at is an RFC3339 instant");
+        assert_eq!(
+            announced,
+            stored.expect("the row is revoked"),
+            "the announced instant must be the STORED one. A second `Utc::now()` in the publish would \
+             put a later timestamp on the wire than in the database, and the client keeps what it is \
+             sent"
+        );
+
+        // A SECOND revoke changes nothing, so it announces nothing.
+        let mut rx2 = state.events.subscribe_for_test();
+        let again = revoke_key(State(state.clone()), Path(id), headers.clone())
+            .await
+            .expect("a second revoke is not an error")
+            .into_response();
+        assert_eq!(again.status(), StatusCode::NO_CONTENT);
+        let dup: Vec<_> = std::iter::repeat(())
+            .map_while(|_| rx2.try_recv().ok())
+            .collect();
+        assert!(
+            dup.is_empty(),
+            "an idempotent re-revoke matches no row and changes nothing, so it must publish NOTHING. \
+             Got {:?}",
+            dup.iter().map(|e| e.name()).collect::<Vec<_>>()
+        );
+
         db.close().await;
     }
 

@@ -63,6 +63,13 @@ impl RealtimeEvent {
         self.account_id
     }
 
+    /// The event's `data` payload, for a test that must assert what a subscriber RECEIVES and not only
+    /// that something arrived. `cfg(test)` for the same reason as the two accessors above.
+    #[cfg(test)]
+    pub(crate) fn data_for_test(&self) -> String {
+        self.data.clone()
+    }
+
     /// A wallet balance, as an absolute value — never a change.
     ///
     /// `owner` is the account this balance belongs to: the live stream filters
