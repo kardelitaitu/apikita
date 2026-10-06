@@ -2712,6 +2712,22 @@ mod tests {
         ];
 
         let mut checked = 0usize;
+        // EVERY RATE LINE THE CONFIG STATES, counted separately from what the check manages to read.
+        //
+        // WHY THE TWO COUNTS, and it is a MEASURED gap rather than a tidy-up. The loop below used to
+        // `continue` on an unparseable CNY figure or value WITHOUT recording that it had skipped the
+        // line, so a rate whose comment lost its `¥` figure simply stopped being checked - the exact
+        // drift this guard exists to catch. The vacuity floor was the only thing that could notice,
+        // and it sits at 30 against 36 lines, so MEASURED: stripping the CNY figure from SIX rate
+        // lines left all 31 doc_claims guards GREEN, and the seventh turned the run red. Six prices
+        // could have lost their source unnoticed.
+        //
+        // The floor cannot be raised to close this - it would then be a tripwire at the count, which
+        // the sibling floors in this file argue against. Counting the SKIPS is what makes each one
+        // visible: `existing` is read from the config, `checked` from the guard's own success, and
+        // the difference is asserted to be zero.
+        let mut existing = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
         for line in config.lines() {
             let trimmed = line.trim();
             // The COMMENT IS SPLIT OFF FIRST, or the value carries it and will not parse.
@@ -2724,12 +2740,14 @@ mod tests {
             if !RATE_KEYS.contains(&key.trim()) {
                 continue;
             }
+            existing += 1;
 
             let cny: String = comment
                 .chars()
                 .filter(|c| c.is_ascii_digit() || *c == '.')
                 .collect();
             let (Ok(cny), Ok(stated)) = (cny.parse::<f64>(), value.trim().parse::<f64>()) else {
+                skipped.push(format!("{} = {}", key.trim(), value.trim()));
                 continue;
             };
             checked += 1;
@@ -2745,11 +2763,33 @@ mod tests {
             );
         }
 
+        // EVERY RATE LINE WAS READ, which the floor below cannot say on its own. A line whose CNY
+        // figure or value will not parse is reported here rather than passed over in silence.
+        assert!(
+            skipped.is_empty(),
+            "{} rate line(s) carry a value or a CNY comment this check cannot read, so they are \
+             NOT being compared against the price card: {skipped:?}. A rate that quietly leaves \
+             this check is the drift it exists to catch - either the line lost its `¥` figure, or \
+             its comment no longer states one. MEASURED: six such lines could drop out unnoticed \
+             before this assertion existed, because the floor below sits at 30 against 36 lines.",
+            skipped.len()
+        );
+
         // The vacuity guard, and it is not decorative: it caught two of the four versions
         // above, both of which would otherwise have been green runs.
         assert!(
             checked >= 30,
             "only {checked} rate(s) with a CNY source were found, so this is not checking the price card"
+        );
+
+        // AND THE TWO COUNTS AGREE, so the assertion above cannot be satisfied by a config that
+        // stopped stating rates at all: with `existing` at zero, the `skipped` list would be empty
+        // too and the run would be green.
+        assert_eq!(
+            checked, existing,
+            "{checked} rate(s) were compared but {existing} exist in the config. The difference is \
+             what the assertion above should have caught; if it did not, this count is the one to \
+             trust."
         );
     }
     /// Every table the schema creates is either DISCLOSED on the privacy page or

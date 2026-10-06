@@ -508,8 +508,16 @@ mod tests {
 
         // Three attempts inside the window, at 50, 40 and 10 minutes before `now`. The window frees
         // when the 50-minute one ages out, i.e. 10 minutes from now.
-        let oldest = now - Duration::minutes(50);
-        for offset in [50, 40, 10] {
+        //
+        // THE OLDEST OFFSET IS NAMED ONCE rather than written in two places. This was
+        // `let oldest = now - Duration::minutes(50);` followed by a loop over a literal
+        // `[50, 40, 10]` - so the binding was never read, and `cargo clippy --all-targets -D
+        // warnings` failed the whole crate on `unused variable: oldest` (MEASURED: exit 101). The
+        // 50 lived in two places and only one of them was used, which is the shape that goes wrong
+        // quietly - changing the loop to start at 45 would have left the other mention, and any
+        // reader following it, still saying 50.
+        const OLDEST_MINUTES: i64 = 50;
+        for offset in [OLDEST_MINUTES, 40, 10] {
             record(
                 &db.pool,
                 Kind::Login,
@@ -530,11 +538,25 @@ mod tests {
         assert_eq!(
             retry_after_secs,
             600,
-            "the wait must be the time until the OLDEST attempt leaves the window - 50 minutes ago \
-             plus {window:?} is 10 minutes, or 600 seconds. A much larger number means the answer came \
-             from the NEWEST row (MAX instead of MIN), which tells the client to wait longer than it \
-             must AND moves forward with every further attempt, so it never comes down. 1 means the \
-             oldest row was not read at all and the value fell to the floor"
+            "the wait must be the time until the OLDEST attempt leaves the window - {OLDEST_MINUTES} \
+             minutes ago plus {window:?} is 10 minutes, or 600 seconds. A much larger number means the \
+             answer came from the NEWEST row (MAX instead of MIN), which tells the client to wait \
+             longer than it must AND moves forward with every further attempt, so it never comes \
+             down. 1 means the oldest row was not read at all and the value fell to the floor"
+        );
+
+        // AND THE ARITHMETIC THE MESSAGE STATES IS THE ARITHMETIC THAT HOLDS. The 600 above is a
+        // literal, so it cannot follow `OLDEST_MINUTES` if the offset moves; this recomputes it from
+        // the same three values the seed and the window use, which is the count that tells a reader
+        // whether the literal is still the right one.
+        let window_minutes = window.num_minutes();
+        assert_eq!(
+            600,
+            (window_minutes - OLDEST_MINUTES) * 60,
+            "the assertion above expects 600 seconds, but {window_minutes} minutes of window minus \
+             the oldest {OLDEST_MINUTES} leaves {} seconds. A literal that no longer matches its own \
+             explanation is read as confirmation of the wrong thing",
+            (window_minutes - OLDEST_MINUTES) * 60
         );
     }
 
