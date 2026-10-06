@@ -254,6 +254,56 @@ rather than the guard. When an anchor appears more than once, an ambiguous-range
 correct outcome, and scoping the edit to the enclosing function or macro invocation is what turns a
 false SURVIVED into a real result.
 
+### The other kind of survivor: a correct mutation of unreachable code
+
+The section above is about a mutation that landed somewhere else. This one is about a mutation that
+landed **exactly where intended** and still survived - and whether that is a defect depends on a
+question the mutation harness cannot answer.
+
+`mutation testing` reports SURVIVED. That verdict has **two** meanings, and they call for opposite
+responses:
+
+- **A reachable mutant survived** - the code can do the wrong thing on some input the system can
+  actually produce, and no test sees it. That is a gap: write the fixture.
+- **An unreachable mutant survived** - the changed line cannot be reached, or the change is
+  behaviourally identical on every reachable input. That is a **correct negative**, and writing a
+  fixture for it is worse than leaving it: the fixture has to break something else to set the state
+  up, so it ends up asserting the broken thing.
+
+Both appear as the same three characters in the log. Separating them is a **reachability argument**,
+and it has to be made against the schema and the call graph rather than against intuition.
+
+**A worked pair from two consecutive rounds, same verdict, opposite meanings.**
+
+`all_endpoints_unhealthy` filters on `weight > 0.0 && pool.key_count() > 0`. Dropping the weight half
+SURVIVED. That is a **gap**: the separating input is a weight-0 endpoint whose breaker is *open*, and
+the two existing weight-0 tests both leave the breaker closed - with a closed breaker the two filters
+agree, so the assertion cannot tell them apart. Every fixture endpoint also has a key
+(`endpoint()` always sets `api_key_envs`), so `key_count() > 0` never excludes anything either. The
+state is **reachable** - `config/apikita.toml` shipped a weight-0 placeholder for exactly this reason -
+so the fixture was written and the mutant now dies.
+
+One round later, `verified_at.is_some_and(|v| v < now)` changed to `<= now` SURVIVED. That is a
+**correct negative**. The boundary needs the stamp to equal the sign-in's `now` to the nanosecond, and
+three separate facts make that unproducible: `mark_verified` is the only production writer and it
+keeps the EARLIEST stamp (`COALESCE(verified_at, ?)`), the `now` compared is captured in a *later*
+request, and `upsert_password_identity(verified = true)` has no production caller at all - its live
+caller passes `false`. A fixture would have to disable foreign keys or fabricate the stamp.
+
+**The rule this earns: a survivor is a question, and the question is "what input would tell these
+apart?"** If no input the system can produce would, the survivor is the right answer and the finding
+is the *argument*, recorded at the line so the next reader does not re-derive it. If an input would,
+the fixture is missing - and the fastest way to find that input is to ask what the two branches do
+differently, which is exactly what the weight-0 case is.
+
+**A cheap way to notice you are holding an equivalence rather than a gap: the mutation changes
+nothing you can name.** Both `verified == now` and round 127's `presented = ""` are like this - each
+needs a state the schema forbids (`sessions.account_id` is `ON DELETE CASCADE` with
+`foreign_keys(true)` on every connection; `bot_token()` refuses an empty secret before the comparison
+runs). In both cases another guard already refuses the input, so the mutation removes a *redundant*
+refusal rather than a load-bearing one. When two guards sit on one property, removing either is
+inert - and the surviving test is measuring the pair, not the line you changed.
+
 ### Four false alarms, and what they had in common
 
 Every one of these rounds has produced a finding that turned out, on checking, not
