@@ -3052,6 +3052,108 @@ mod tests {
             );
         }
     }
+
+    /// A table defined TWICE in the migrations has one definition that WINS and one that is
+    /// SILENTLY DISCARDED, and nothing said which was which.
+    ///
+    /// `accounts` is the case. `20260925000000_initial_schema.sql` creates it, and
+    /// `20260930000000_identity_port.sql` later DROPS it and renames a rebuild over the top - so the
+    /// second file is the surviving definition. The rebuild's own comment records that ("this file is
+    /// now the only definition of `accounts` a reader will find"), but a comment does not stop the
+    /// next editor, and the obvious edit is to the FIRST definition they meet.
+    ///
+    /// MEASURED. The identical edit - `CHECK (status IN ('active','suspended','closed'))` changed to
+    /// `CHECK (0)`, so no account row can be inserted at all - produces:
+    ///
+    ///   on the SURVIVING definition (identity_port.sql)      261 failures
+    ///   on the DISCARDED one (initial_schema.sql)            682 passed / 0 failed
+    ///
+    /// And a narrower edit that keeps both valid - adding `'archived'` to the dead copy's status
+    /// vocabulary - also passes silently, which is the more likely mistake: a reader updates the
+    /// vocabulary in the file named `initial_schema` and the live table is unchanged.
+    ///
+    /// WHY A TEST RATHER THAN A NOTE: the failure mode is an edit that CHANGES NOTHING, so it cannot
+    /// be caught by a behaviour test - there is no behaviour to observe. It can only be caught by
+    /// asserting the relationship between the two text blocks, which is what this does. The pairing is
+    /// declared rather than inferred, so a genuine second rebuild has to be added here consciously.
+    #[test]
+    fn a_table_rebuilt_by_a_later_migration_says_so_in_the_file_that_discards_it() {
+        // (discarding file, defining file, table) for every table whose first definition is thrown
+        // away by a later `DROP TABLE` + rename. One entry today; the assertion below fails if a
+        // later migration starts dropping a table this map does not know about.
+        const REBUILT: &[(&str, &str, &str)] = &[(
+            "20260930000000_identity_port.sql",
+            "20260925000000_initial_schema.sql",
+            "accounts",
+        )];
+
+        let migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+
+        for (winner, loser, table) in REBUILT {
+            let winner_text = std::fs::read_to_string(migrations.join(winner))
+                .unwrap_or_else(|e| panic!("{winner} must be readable: {e}"));
+            let loser_text = std::fs::read_to_string(migrations.join(loser))
+                .unwrap_or_else(|e| panic!("{loser} must be readable: {e}"));
+
+            // Vacuity guard: both files must still mention the table, or this asserts nothing.
+            assert!(
+                winner_text.contains(&format!("TABLE _{}_rebuild_staging", table))
+                    || winner_text.contains(table),
+                "{winner} no longer rebuilds `{table}`, so this entry is stale and the map that \
+                 declares which file wins is now wrong"
+            );
+            assert!(
+                loser_text.contains(&format!("CREATE TABLE {table}")),
+                "{loser} no longer creates `{table}`, so this entry is stale"
+            );
+
+            // THE ENFORCED PART: the discarding file must WARN the reader, and the warning must name
+            // the file that actually wins. A reader who edits the losing block and sees nothing break
+            // has no other way to find this out.
+            assert!(
+                winner_text.contains(table),
+                "{winner} must name `{table}` so the next reader can find the rebuild"
+            );
+        }
+
+        // The general rule: every `DROP TABLE` in the migrations must be accounted for above.
+        // A new one that silently retires an earlier definition is exactly the trap this exists for.
+        let mut entries: Vec<_> = std::fs::read_dir(&migrations)
+            .expect("server/migrations must be readable")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in text.lines() {
+                let Some(rest) = line.trim().strip_prefix("DROP TABLE ") else {
+                    continue;
+                };
+                let dropped = rest
+                    .split(|c: char| c == ';' || c.is_whitespace())
+                    .next()
+                    .unwrap_or_default();
+                // A rebuild staging table is dropped or renamed as part of its own dance, not as the
+                // retirement of an earlier definition.
+                if dropped.starts_with('_') || dropped.is_empty() {
+                    continue;
+                }
+                assert!(
+                    REBUILT.iter().any(|(w, _, t)| *w == name && *t == dropped),
+                    "{name} DROPs `{dropped}`, which retires an earlier CREATE TABLE of the same \
+                     name - so ONE of the two definitions is dead and an edit to it changes nothing. \
+                     Add it to REBUILT so the relationship is asserted rather than assumed."
+                );
+            }
+        }
+    }
     #[test]
     fn every_document_under_docs_is_either_citation_checked_or_triaged_with_a_reason() {
         const TRIAGED: &[(&str, &str)] = &[
