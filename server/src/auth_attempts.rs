@@ -478,6 +478,66 @@ mod tests {
         );
     }
 
+    /// The Retry-After counts down from the OLDEST attempt, and nothing asserted its value.
+    ///
+    /// WHY THIS EXISTS. Every test above asserts THAT a refusal happens; none reads the
+    /// `retry_after_secs` it carries. MEASURED, at 680 passed / 0 failed:
+    ///
+    ///   `MIN(created_at)` changed to `MAX(created_at)`   SURVIVED
+    ///   `oldest` changed to `NULL`                       SURVIVED
+    ///
+    /// THE FIRST IS NOT COSMETIC. The window frees when the OLDEST attempt in it ages out, so MIN is
+    /// what makes the wait count DOWN. With MAX the answer is derived from the NEWEST attempt, which
+    /// is LATER - so the client is told to wait longer than it must, retries into the same refusal,
+    /// and, because every further attempt moves the newest row forward, the Retry-After never comes
+    /// down at all. That is exactly the failure the test above names in prose ("the Retry-After never
+    /// comes down") and nothing was measuring it.
+    ///
+    /// THE SECOND collapses the wait to `retry_after_secs`'s floor of 1. A client told "retry in 1
+    /// second" retries into the same refusal, which reads as a broken limiter.
+    ///
+    /// The expected value is derived here from the seeded instants rather than copied from the
+    /// implementation: three attempts at known offsets, so MIN and MAX differ by a wide, checkable
+    /// margin and the assertion could not pass for either.
+    #[tokio::test]
+    async fn the_retry_after_counts_down_from_the_oldest_attempt() {
+        let db = TestDb::new().await;
+        let now = Utc::now();
+        let key = ip_key(ip("203.0.113.40"), &[7u8; 32]);
+        let window = window();
+
+        // Three attempts inside the window, at 50, 40 and 10 minutes before `now`. The window frees
+        // when the 50-minute one ages out, i.e. 10 minutes from now.
+        let oldest = now - Duration::minutes(50);
+        for offset in [50, 40, 10] {
+            record(
+                &db.pool,
+                Kind::Login,
+                Subject::Ip(&key),
+                now - Duration::minutes(offset),
+            )
+            .await
+            .expect("seed an attempt");
+        }
+
+        // A cap of 1 with three rows on the books: refused, and the wait is what MIN gives.
+        let refused = record_and_check(&db.pool, Kind::Login, Subject::Ip(&key), 1, now).await;
+        let retry_after_secs = match refused {
+            Err(AppError::RateLimited { retry_after_secs }) => retry_after_secs,
+            other => panic!("a key over its cap must be refused, got {other:?}"),
+        };
+
+        assert_eq!(
+            retry_after_secs,
+            600,
+            "the wait must be the time until the OLDEST attempt leaves the window - 50 minutes ago \
+             plus {window:?} is 10 minutes, or 600 seconds. A much larger number means the answer came \
+             from the NEWEST row (MAX instead of MIN), which tells the client to wait longer than it \
+             must AND moves forward with every further attempt, so it never comes down. 1 means the \
+             oldest row was not read at all and the value fell to the floor"
+        );
+    }
+
     /// An IP-keyed and an account-keyed attempt are different counters even for
     /// the same kind. This is what makes the two sign-in caps independent.
     #[tokio::test]
