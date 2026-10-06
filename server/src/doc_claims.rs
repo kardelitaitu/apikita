@@ -4224,9 +4224,67 @@ mod tests {
             "if the constant",
         ];
 
+        // THE POSITIVE CONTROL FOR THE LISTS THEMSELVES, which the two counters below cannot be.
+        //
+        // `files` and `comment_lines` prove the scan reached the crate's comments, but NEITHER
+        // depends on `CLAIMS` - MEASURED: replacing the CLAIMS list with a string that cannot occur
+        // left this test green even with both counters in place. The lists are the other half, and
+        // their failure is silent in the opposite direction: a CLAIMS entry with a typo, or an empty
+        // string, changes which lines are offenders without changing any count.
+        for claim in CLAIMS {
+            assert!(
+                !claim.is_empty(),
+                "CLAIMS must not carry an empty entry - `line.contains(\"\")` is true for EVERY \
+                 line, so every comment would become an offender and the real ones would be lost in \
+                 the flood."
+            );
+            assert!(
+                claim.ends_with("Postgres") || claim.ends_with("PostgreSQL"),
+                "the CLAIMS entry {claim:?} does not END with the database name, so it can never \
+                 match the claim it was written to describe. Every entry here is a storage verb \
+                 followed directly by `Postgres` or `PostgreSQL`, and the difference matters: a typo \
+                 such as `Postgress` still CONTAINS `Postgres`, so a `contains` test accepts it and \
+                 the guard runs, finds no offender, and reports success. MEASURED: mutating an entry \
+                 to `stored in Postgress` passed a `contains`-based version of this assertion."
+            );
+            assert!(
+                claim.len() > "PostgreSQL".len(),
+                "the CLAIMS entry {claim:?} carries no storage verb in front of the database name. \
+                 That would flag every comment mentioning Postgres - including the historical notes \
+                 the HISTORY list exists to allow - and a guard that fires on correct code is deleted \
+                 by whoever touches the file next."
+            );
+        }
+        for marker in HISTORY {
+            assert!(
+                !marker.is_empty(),
+                "HISTORY must not carry an empty marker - `line.contains(\"\")` is true for every \
+                 line, so one empty entry would exempt the entire crate from this check."
+            );
+        }
+
         let mut offenders = Vec::new();
+        // THE VACUITY GUARD THIS TEST WAS MISSING, and it is not a formality - every sibling scan in
+        // this file has one and this was the outlier.
+        //
+        // The assertion at the end is `offenders.is_empty()`, which a scan that examines NOTHING
+        // satisfies perfectly. MEASURED: replacing the CLAIMS list with a single string that cannot
+        // occur in any line left this test GREEN (1 passed, 0 failed, and it COMPILED - the first
+        // version of that mutation dropped a semicolon and failed to build, which is not a caught
+        // mutation and proved nothing at all).
+        //
+        // The two counts close the SCOPE half of that hole: `files` proves `source_files()` returned
+        // something, `comment_lines` proves the loop reached comment text. They do NOT close the
+        // CLAIMS half - neither reads that list - which is why the loop just above exists.
+        let mut files = 0usize;
+        let mut comment_lines = 0usize;
         for path in source_files() {
             let text = std::fs::read_to_string(&path).unwrap_or_default();
+            // `unwrap_or_default` means an UNREADABLE file yields an empty string and contributes
+            // nothing - the same silent-skip shape. Counting only readable files makes that visible.
+            if !text.is_empty() {
+                files += 1;
+            }
             for (n, line) in text.lines().enumerate() {
                 let trimmed = line.trim_start();
                 // comments only
@@ -4236,6 +4294,7 @@ mod tests {
                 {
                     continue;
                 }
+                comment_lines += 1;
                 let claims_postgres = CLAIMS.iter().any(|c| line.contains(c));
                 if !claims_postgres {
                     continue;
@@ -4274,6 +4333,25 @@ mod tests {
                 offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
             }
         }
+
+        // THE SCAN READ THE CRATE, before the assertion that it found nothing. `files` and
+        // `comment_lines` are independent of the CLAIMS list, so a list that stopped matching is
+        // caught here even though the offender check below would report success.
+        assert!(
+            files >= 25,
+            "only {files} readable source file(s) were walked, so the Postgres-claim scan covered \
+             almost nothing and its `offenders.is_empty()` result means nothing. A file that cannot \
+             be read contributes no lines at all - that is the silent-skip shape rather than a \
+             failure - so the count is over files whose text actually arrived."
+        );
+        assert!(
+            comment_lines >= 1000,
+            "only {comment_lines} comment line(s) were seen across {files} file(s). This crate's \
+             comments run to 17,408 lines across 38 files at the time of writing, so a count this \
+             low means the comment filter stopped matching - and a scan whose CLAIMS never meet a \
+             comment passes while checking nothing. MEASURED: replacing CLAIMS with a string that \
+             cannot occur left this test green before these counts existed."
+        );
 
         assert!(
             offenders.is_empty(),
