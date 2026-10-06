@@ -203,6 +203,13 @@ const OPERATIONAL_DOCS: &[&str] = &[
     "admin-surface.md",
     "edge-relay.md",
     "deployment.md",
+    // The operator's runbook, and it belongs here for the reason this list gives rather than by
+    // resemblance: an operator FOLLOWS this file. Its steps cite `deployment.md`'s rules by name, and
+    // its rollback table tells a reader which action to take under pressure - so a citation that
+    // drifted would send somebody to the wrong section while they are already in an incident. That is
+    // the mislead this list exists to catch, and it costs more in a document that is executed than in
+    // one that is read.
+    "deploy-runbook.md",
     "local-development.md",
     "data-retention.md",
     "topology.md",
