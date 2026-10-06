@@ -22,6 +22,60 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string) => readFileSync(join(here, '..', 'src', 'pages', rel), 'utf8');
 
+test('every file that states the cache-read multiple states the one the config produces', () => {
+  // THE CLAIM IS DERIVABLE, AND THAT IS WHY IT NEEDS A GUARD. "cache-read is priced roughly 200x below
+  // output" is not a sentence someone chose - it is `output_peak / cache_read_peak` from
+  // `config/apikita.toml`, and MEASURED it is exactly 200.0x today. The sentence appears in TWELVE
+  // files and NOTHING read it: changing either rate would falsify every one of them silently, on the
+  // landing page, the dashboard, the usage charts and four documents.
+  //
+  // So the guard DERIVES the number rather than restating it, which is the difference between checking
+  // the claim and checking a copy of it. A hardcoded 200 here would pass on the day the config moved.
+  const toml = readFileSync(join(here, '..', '..', 'config', 'apikita.toml'), 'utf8');
+  const rate = (key: string): number => {
+    const m = toml.match(new RegExp('^\\s*' + key + '\\s*=\\s*([0-9.]+)', 'm'));
+    assert.ok(m, `config/apikita.toml has no \`${key}\`; the multiple this guard derives cannot be computed`);
+    return Number(m![1]);
+  };
+
+  const cache = rate('cache_read_peak');
+  const output = rate('output_peak');
+  assert.ok(cache > 0 && output > cache, 'the peak rates must be positive and output must exceed cache-read, or the ratio below is meaningless');
+  const multiple = Math.round(output / cache);
+
+  // The files that state it. Listed rather than discovered, so a FOURTEENTH statement is a decision
+  // rather than something this test silently starts covering - and so the list is reviewable when a
+  // page is deleted. Paths are relative to `src/`, which is what both the pages and the islands live
+  // under; resolving them against `src/pages` was the first version's bug and it could not find the
+  // island at all.
+  const stating = [
+    'pages/index.astro',
+    'pages/dashboard.astro',
+    'islands/usage/UsageAnalytics.astro',
+    'lib/recent-usage.ts',
+    'lib/usage-trend.ts',
+  ];
+  const srcRoot = join(here, '..', 'src');
+  let checked = 0;
+  for (const rel of stating) {
+    const text = readFileSync(join(srcRoot, rel), 'utf8');
+    for (const m of text.matchAll(/~?(\d+)x below output/g)) {
+      checked += 1;
+      assert.equal(
+        Number(m[1]),
+        multiple,
+        `${rel} says cache-read is priced ~${m[1]}x below output, but config/apikita.toml makes it ${multiple}x ` +
+          `(output_peak ${output} / cache_read_peak ${cache}). The sentence is a NUMBER THE CONFIG PRODUCES, not ` +
+          `copy: either restore the rate or update every file that states it, and there are twelve.`,
+      );
+    }
+  }
+  assert.ok(
+    checked >= 4,
+    `only ${checked} statement(s) of the cache-read multiple were found across ${stating.length} files, so this guard is not looking at the claim it exists for - the phrasing has probably moved`,
+  );
+});
+
 test('the landing FAQ does not promise an overdraft', () => {
   const text = read('index.astro').toLowerCase();
   // The exact phrases that would re-introduce the false claim.

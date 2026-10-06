@@ -175,7 +175,7 @@ test('every exported function in src/lib is called somewhere', () => {
  * So this figure is updated WITH the run that changes it. That is a smaller guarantee than the server
  * count now carries, and it is stated rather than implied.
  */
-const WEBSITE_TESTS = 231;
+const WEBSITE_TESTS = 232;
 
 /**
  * The server count, and the same kind of literal for the same reason.
