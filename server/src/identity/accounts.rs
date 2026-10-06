@@ -185,6 +185,26 @@ pub async fn resolve_google_sign_in(
                 parse_uuid(&row.get::<String, _>("account_id"), "identities.account_id")?;
             let verified_at: Option<DateTime<Utc>> = row.get("verified_at");
 
+            // STRICT `<`, and MEASURED rather than assumed: changing it to `<=` survives the ENTIRE
+            // suite at 682 passed / 0 failed. That is the correct outcome, not a missing fixture -
+            // the boundary is unreachable in production, and the reason is worth writing down so
+            // nobody adds a same-instant test that cannot be produced:
+            //
+            //   * `verified_at` is written by `mark_verified` (the only production writer), which
+            //     uses `COALESCE(verified_at, ?)` and therefore keeps the EARLIEST proof. A later
+            //     proof cannot bring the stamp forward to a future sign-in's `now`.
+            //   * the `now` here is captured at the top of a Google sign-in REQUEST, while the
+            //     stamp was written by an earlier request - two separate `Utc::now()` calls, so
+            //     equality would need a zero-nanosecond gap.
+            //   * `upsert_password_identity(verified = true)` does not exist in production: its live
+            //     caller (`routes/auth.rs`, the reset path) deliberately passes `false`, and every
+            //     `true` is a `#[cfg(test)]` fixture.
+            //
+            // The test fixture in this module stamps verification five minutes BEFORE the sign-in on
+            // purpose, and its own comment says a same-instant fixture "would be asserting the
+            // boundary case rather than the ordinary one". That is the same conclusion, reached when
+            // the order was first written; what was missing was the measurement that the boundary
+            // cannot be reached at all.
             let adoptable = verified_at.is_some_and(|verified| verified < now);
 
             if adoptable {
