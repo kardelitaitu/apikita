@@ -5498,6 +5498,164 @@ mod tests {
         db.close().await;
     }
 
+    /// The token ceiling counts ALL THREE classes, and the CACHE-READ one is the case nothing drove.
+    ///
+    /// WHY THIS IS SEPARATE. The test above seeds `input_tokens` and `output_tokens` only - its INSERT
+    /// does not name `cache_read_tokens` - so the ceiling it exercises is decided by the two obvious
+    /// classes. MEASURED: dropping `cache_read_tokens` from `key_tokens_used`'s SUM left the whole
+    /// suite green at 677 passed / 0 failed.
+    ///
+    /// `keys.rs` states the rule and argues it: "All three token classes are summed because
+    /// `token_limit` counts tokens, not money: cache-read tokens are ~50x cheaper than output tokens
+    /// but they are still tokens consumed". A key could therefore sit at its ceiling having consumed
+    /// nothing but cache reads, and the ceiling would not bite - spend would be negligible while the
+    /// token count was over. The two limits are deliberately different questions and this pins the
+    /// token one to the class that is cheapest and most easily overlooked.
+    #[tokio::test]
+    async fn the_token_ceiling_counts_cache_read_tokens_too() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+        sqlx::query("UPDATE api_keys SET token_limit = 1 WHERE key_hash = ?")
+            .bind(crate::routes::hash_token(&key))
+            .execute(&pool)
+            .await
+            .expect("cap the key at one token");
+
+        let today: String = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // CACHE-READ ONLY: the other two columns are 0, so a SUM that skips this column reads 0 and
+        // the ceiling cannot bite.
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens, cache_read_tokens, output_tokens)
+             VALUES (?, ?, ?, 0, 5, 0)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(key_id.hyphenated())
+        .bind(&today)
+        .execute(&pool)
+        .await
+        .expect("record cache-read-only usage");
+
+        let err = call_chat_completions(
+            &test_state(pool.clone()),
+            &key,
+            r#"{"model":"flash","stream":true}"#,
+        )
+        .await
+        .expect_err(
+            "a key whose only recorded usage is CACHE READS is still over its token ceiling, and \
+             must be refused before any money moves. Being served here means the SUM skips \
+             cache_read_tokens, so the cheapest class is the one that can run a key past its limit",
+        );
+        assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(err.code(), "key_limit_exceeded");
+        assert_eq!(
+            err.details()
+                .and_then(|d| d["reason"].as_str().map(str::to_string)),
+            Some("token_limit_reached".to_string())
+        );
+        db.close().await;
+    }
+
+    /// ONE KEY'S USAGE MUST NOT COUNT AGAINST ANOTHER, and nothing asserted that.
+    ///
+    /// Both enforcement reads - `key_spend_used` and `key_tokens_used` - filter
+    /// `account_id = ? AND api_key_id = ?`. MEASURED: making BOTH predicates ignore `api_key_id`
+    /// (`OR 1 = 1`) left the whole suite green at 677 passed / 0 failed.
+    ///
+    /// The account half is well covered - `a_key_of_one_account_is_invisible_and_unrevokable_to_another`
+    /// pins cross-ACCOUNT tenancy - but the per-KEY half had no fixture with two keys on one account
+    /// and usage on only one of them. The spend test that comes closest creates a second key with a
+    /// DIFFERENT limit, so both keys still behave as before when the scope widens; a shared-limit
+    /// fixture is what makes the difference visible.
+    ///
+    /// WHY IT MATTERS: a key's limit is a per-key ceiling an operator sets per key. If a read is not
+    /// scoped, one busy key exhausts every OTHER key on the account - every sibling starts answering
+    /// `key_limit_exceeded` for traffic it never generated, which reads to the customer as a broken
+    /// account rather than as a limit being reached.
+    #[tokio::test]
+    async fn one_keys_usage_does_not_count_against_another_key() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 500_000).await;
+
+        let busy_key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let quiet_key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let busy_id = create_api_key(&pool, account_id, &busy_key, &["flash"]).await;
+        let quiet_id = create_api_key(&pool, account_id, &quiet_key, &["flash"]).await;
+
+        // The SAME ceiling on both, so a widened scope cannot be distinguished by the limit value.
+        let ceiling = 1_000;
+        sqlx::query("UPDATE api_keys SET spend_limit_idr = ? WHERE account_id = ?")
+            .bind(ceiling)
+            .bind(account_id.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("give both keys the same ceiling");
+
+        // Usage on the BUSY key only, comfortably over the ceiling. The quiet key has NONE.
+        let today: String = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens, output_tokens, cost_idr)
+             VALUES (?, ?, ?, 10, 10, ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(busy_id.hyphenated())
+        .bind(&today)
+        .bind(ceiling * 5)
+        .execute(&pool)
+        .await
+        .expect("record usage against the busy key only");
+
+        // The reads themselves, for the reason the mutation is about: this is where the scope lives.
+        let today_utc = crate::ip_tracking::today_utc();
+        assert_eq!(
+            crate::routes::keys::key_spend_used(&pool, account_id, busy_id, today_utc)
+                .await
+                .expect("read the busy key's spend"),
+            ceiling * 5,
+            "the busy key's own spend is what was recorded against it"
+        );
+        assert_eq!(
+            crate::routes::keys::key_spend_used(&pool, account_id, quiet_id, today_utc)
+                .await
+                .expect("read the quiet key's spend"),
+            0,
+            "the QUIET key's window spend must be ZERO: nothing was ever recorded against it. A \
+             non-zero answer means the read is not scoped by api_key_id, so one key's usage is \
+             charged against its siblings and every other key on the account refuses traffic it \
+             never generated"
+        );
+        assert_eq!(
+            crate::routes::keys::key_tokens_used(&pool, account_id, quiet_id, today_utc)
+                .await
+                .expect("read the quiet key's tokens"),
+            0,
+            "and the TOKEN read must be scoped the same way - it is a second statement, so a fix to \
+             one leaves the other"
+        );
+
+        // And the enforcement path agrees: the quiet key is not refused for a spend limit it never hit.
+        let state = test_state(pool.clone());
+        if let Err(e) =
+            call_chat_completions(&state, &quiet_key, r#"{"model":"flash","stream":true}"#).await
+        {
+            assert_ne!(
+                e.details()
+                    .and_then(|d| d["reason"].as_str().map(str::to_string)),
+                Some("spend_limit_idr_reached".to_string()),
+                "the QUIET key was refused for a spend limit it never reached, because the read \
+                 counted the busy key's usage: {e:?}"
+            );
+        }
+
+        db.close().await;
+    }
+
     /// THE COLUMN THE KEY LIST PUBLISHES MUST ACTUALLY GET WRITTEN.
     ///
     /// `api_keys.last_used_at` is defined by the schema, documented in the data
