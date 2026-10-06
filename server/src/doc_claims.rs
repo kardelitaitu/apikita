@@ -1030,9 +1030,14 @@ mod tests {
         // A scan over a set it cannot report the size of asserts an absence over whatever
         // it happened to be handed: `source_files` covers the whole of `src` today, and
         // nothing here would notice a future skip that halved it. The floor is 25 against
-        // 30 files, with slack on purpose - a floor AT the count is a tripwire that fires
-        // when a file is deleted and says nothing about a scan that stopped early, which is
-        // the failure this floor exists to catch.
+        // the crate's own count - 38 at the time of writing, so the slack is 13 - and the
+        // slack is the point: a floor AT the count is a tripwire that fires when a file is
+        // deleted and says nothing about a scan that stopped early, which is the failure this
+        // floor exists to catch. (This said "against 30 files", a count that was right when
+        // written and is one of FOUR copies of the same stale figure in this file - the others
+        // are the four `>= 18` floors, each of which carried the same sentence. Naming the
+        // figure is what let it drift, so the number here is the one the property needs and the
+        // sentence says which property that is.)
         let scanned = source_files().len();
         assert!(
             scanned >= 25,
