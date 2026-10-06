@@ -1250,6 +1250,48 @@ mod tests {
             "the only ROUTED endpoint is open, so the model cannot be served - the unrouted placeholder must not hide it"
         );
     }
+
+    /// EVERY weight-0 endpoint open is NOT an outage, and no fixture reached this.
+    ///
+    /// WHY THIS IS SEPARATE from the two weight-0 tests above. Both of those have a CLOSED breaker on
+    /// the weight-0 endpoint, and a closed breaker makes the two filters give the SAME answer:
+    ///
+    ///   `a_weightless_only_pool_is_not_all_providers_unhealthy`  ghost(0.0), breaker closed
+    ///     with `weight > 0.0`   : skipped  -> routed=0 -> false
+    ///     without it            : counted, closed -> returns false
+    ///     both false, so the assertion cannot tell the filters apart.
+    ///
+    /// MEASURED: dropping only `weight > 0.0` from the filter - so a weight-0 endpoint is counted as
+    /// a provider that could serve - left the whole suite green at 681 passed / 0 failed. The sibling
+    /// mutation (dropping `key_count() > 0`) IS caught, because that one has a fixture that separates
+    /// it; the weight half of the SAME predicate had none.
+    ///
+    /// WHY IT MATTERS: this is the `all_providers_unhealthy` alert. With the weight filter gone, every
+    /// unrouted placeholder in the config - and `config/apikita.toml` documents one that shipped at
+    /// weight 0 for exactly this reason - becomes a provider that can mask the outage, or an OPEN one
+    /// becomes a provider that can invent one. The predicate's own doc says an alert that is
+    /// structurally unable to fire "reads as one that is working", and this is the filter that keeps
+    /// unrouted endpoints out of both directions.
+    ///
+    /// The breaker is TRIPPED here, which is the whole point: a weight-0 endpoint whose breaker is
+    /// open is the only shape that distinguishes the two filters, and nothing built it before.
+    #[test]
+    fn a_weight_zero_endpoint_that_is_open_does_not_report_an_outage() {
+        let _lock = EnvLock::acquire();
+        let _key = EnvGuard::set("APK_TEST_GHOST_KEY_1", "test-key");
+        let client = client(vec![model("flash", vec![endpoint("ghost", 0.0)])]);
+        trip_endpoint(&client, 0);
+
+        assert!(
+            !client.all_endpoints_unhealthy("flash"),
+            "a weight-0 endpoint is NEVER ROUTED (the failover loop filters on `weight > 0.0`), so \
+             it cannot be a provider that is down - not even with its breaker open. Reporting an \
+             outage here means an unrouted placeholder in the config can fire the all-providers-down \
+             alert on its own, and an alert that fires when nothing is wrong trains the operator to \
+             ignore it"
+        );
+    }
+
     #[test]
     fn no_open_breaker_reports_none_not_a_guessed_number() {
         // The whole point of the Option: "nothing is open" is a real, distinct
