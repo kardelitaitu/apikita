@@ -4456,8 +4456,136 @@ mod tests {
         }
     }
 
-    /// A comment must not claim data goes to **Postgres**. There is none.
+    /// The two benchmark THRESHOLDS are stated in the document AND as constants, and nothing coupled
+    /// them.
     ///
+    /// WHY THIS IS A SECOND GUARD rather than part of the pool-size one above. That guard couples
+    /// `docs/benchmark.md` to a **config** value (`db::POOL_MAX_CONNECTIONS`). These two are stated in
+    /// the same document and defined in the **benchmark binary** (`PUBLISHED_PASS_PCT`,
+    /// `MIN_STREAMS_TARGET`), which no test target reaches: `cargo test --lib` never compiles
+    /// `src/bin/`, and MEASURED, no gate under `tools/` reads either constant. `doc-figures` is the
+    /// sweep for this class and reads the config and `server/src` — not the bins.
+    ///
+    /// MEASURED BEFORE THIS EXISTED, with `cargo test` across ALL targets and unfiltered: moving
+    /// `PUBLISHED_PASS_PCT` from 99.9 to 95.0, and separately `MIN_STREAMS_TARGET` from 250 to 100,
+    /// each left the suite at 0 failed and every tool gate at exit 0. The document still said
+    /// "$\ge 99.9\%$" and "$\ge 250$". So the pass criterion a benchmark prints — the number an
+    /// operator reads as the bar — could be lowered in code while the published bar stayed where it
+    /// was, and the disagreement would surface only as a benchmark that PASSES where the document says
+    /// it should not.
+    ///
+    /// WHY THE CONSTANTS ARE WORTH COUPLING AT ALL. Both are documented as "the published" figure,
+    /// quoted from the document's metrics matrix — the constants are a RESTATEMENT, not an independent
+    /// decision. `MIN_SIGS_PER_SEC` is deliberately NOT checked here: its own doc says it is derived
+    /// rather than quoted, "named so that a reader can see the verdict compares against SOMETHING
+    /// stated", because the matrix has no row for signature throughput. A guard that demanded a
+    /// document figure for it would be inventing a claim the document does not make — which is the
+    /// over-reach the four-way probe table exists to catch.
+    #[test]
+    fn the_benchmark_thresholds_are_the_thresholds_the_document_publishes() {
+        let doc = std::fs::read_to_string(doc_path("benchmark.md"))
+            .expect("docs/benchmark.md must be readable, or this passes over nothing");
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("bin")
+                .join("benchmark.rs"),
+        )
+        .expect("the benchmark binary must be readable, or this passes over nothing");
+
+        // The constant's value, read from the declaration rather than restated here.
+        let constant = |name: &str| -> f64 {
+            let at = src
+                .find(&format!("const {name}:"))
+                .unwrap_or_else(|| panic!("benchmark.rs no longer declares {name}"));
+            let rest = &src[at..];
+            let value = rest
+                .split('=')
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} has no assignment"))
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches("_f64")
+                .replace('_', "");
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}'s value is not a number: {value:?}"))
+        };
+
+        // A figure the document states as a lower bound: the digits immediately after `\ge `.
+        //
+        // SEARCHING AFTER THE LABEL DOES NOT WORK, and that was the first version's bug. The streams
+        // floor is written `| **Max Concurrent Streams** | $\ge 250$ | ...` — the label and the number
+        // are in DIFFERENT TABLE CELLS, so looking for digits after the label finds the next column's
+        // `< 100` instead, and the guard failed with "no floor found" on correct input. Both claims do
+        // put the figure directly after `\ge `, so that is what is read.
+        let published = |needle: &str| -> Vec<f64> {
+            let mut out = Vec::new();
+            for line in doc.lines() {
+                let t = line.trim_start();
+                // A struck-through or quoted figure is a correction, not a live claim.
+                if t.starts_with('>') || t.contains("~~") {
+                    continue;
+                }
+                if !line.contains(needle) {
+                    continue;
+                }
+                let mut rest = line;
+                while let Some(idx) = rest.find("\\ge ") {
+                    let after = &rest[idx + "\\ge ".len()..];
+                    let digits: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.')
+                        .collect();
+                    if let Ok(v) = digits.parse::<f64>() {
+                        out.push(v);
+                    }
+                    rest = after;
+                }
+            }
+            out
+        };
+
+        // The success-rate floor, stated as `$\ge 99.9\%$`.
+        let rate_claims: Vec<f64> = published("success rate")
+            .into_iter()
+            .filter(|v| *v > 1.0)
+            .collect();
+        assert!(
+            !rate_claims.is_empty(),
+            "no success-rate floor was found on a line naming the success rate in docs/benchmark.md, so \
+             this guard is not reading the claim it was written for"
+        );
+        assert!(
+            rate_claims.iter().any(|v| (*v - constant("PUBLISHED_PASS_PCT")).abs() < 0.001),
+            "docs/benchmark.md publishes {rate_claims:?} and PUBLISHED_PASS_PCT is {}. The constant is \
+             a RESTATEMENT of the document's figure, so a reader comparing a benchmark's printed PASS \
+             against the published bar is comparing two numbers that no longer agree.",
+            constant("PUBLISHED_PASS_PCT")
+        );
+
+        // The concurrent-streams floor, stated in the metrics matrix row.
+        let streams: Vec<f64> = published("Max Concurrent Streams")
+            .into_iter()
+            .filter(|v| *v >= 1.0)
+            .collect();
+        assert!(
+            !streams.is_empty(),
+            "no 'Max Concurrent Streams' floor was found in docs/benchmark.md, so this guard is not \
+             reading the claim it was written for"
+        );
+        assert!(
+            streams.iter().any(|v| (*v - constant("MIN_STREAMS_TARGET")).abs() < 0.001),
+            "docs/benchmark.md publishes a streams floor of {streams:?} and MIN_STREAMS_TARGET is {}. \
+             These are one bar stated twice; the document is what an operator reads and the constant \
+             is what the benchmark compares against.",
+            constant("MIN_STREAMS_TARGET")
+        );
+    }
+
+    /// A comment must not claim data goes to **Postgres**. There is none.
     /// WHY THIS EXISTS. `hash_token`'s doc comment said the plaintext "never reaches Postgres", and
     /// `routes/mod.rs` had a second such line in a test. Both were present-tense claims about where
     /// a credential goes, and the port to SQLite is complete: `db.rs` is `SqlitePool` throughout and
