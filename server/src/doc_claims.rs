@@ -4656,4 +4656,195 @@ mod tests {
              {offenders:#?}"
         );
     }
+
+    /// `strip_comments` decides what every OTHER check in this file is allowed to see, and NOTHING
+    /// tested it.
+    ///
+    /// WHY A COMPONENT THAT IS ONLY EVER USED IS STILL WORTH TESTING. The guards here read the
+    /// stripped text, so a stripper that removes too much makes them pass on code they never saw, and
+    /// one that removes too little makes them fire on prose. Both failures are SILENT from the
+    /// caller's side: nobody reads `strip_comments` output, they read its consequences. This is the
+    /// same reason the round that added the `DROP TABLE` parser gave that parser its own test.
+    ///
+    /// THE CASE THAT PROMPTED IT, MEASURED, and it broke a DIFFERENT repository's test first: a doc
+    /// comment carrying the glob `tools` + star + `/check.sh` contains a block-comment OPENER, which this function reads as a
+    /// block-comment OPEN. The file ends the scan still "inside" a comment, so everything after that
+    /// point disappears. In `website/tests/credit-expiry-claim.test.ts` - whose stripper concatenates
+    /// every file in walk order - that swallowed a whole module and the guard reported a missing
+    /// `UPDATE`, about a file nothing had touched. Here the damage is confined to ONE file, because
+    /// both call sites strip per file rather than concatenating, so it is smaller and no less silent.
+    ///
+    /// WHAT THIS ASSERTS. The three shapes that matter - a line comment, a block comment, and a
+    /// block-comment marker inside a line comment - plus the property that makes a finding readable:
+    /// the extraction is BLANKED, so line numbers survive. It does NOT model string literals, and the
+    /// last case is the honest record of that: the function cannot tell an opener in code from one in a
+    /// string, and the guard below pins the behaviour rather than pretending it is correct.
+    #[test]
+    fn strip_comments_blanks_the_three_shapes_and_keeps_every_line() {
+        // A line comment goes; the code before it stays; the line COUNT is unchanged.
+        let out = strip_comments("let a = 1; // gone\nlet b = 2;\n");
+        assert!(
+            out.contains("let a = 1;"),
+            "code before a line comment must survive"
+        );
+        assert!(!out.contains("gone"), "a line comment must be removed");
+        assert!(
+            out.contains("let b = 2;"),
+            "code after a line comment must survive"
+        );
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "blanking must preserve the line count, or a finding names a line the reader cannot open"
+        );
+
+        // THE INPUTS ARE BUILT FROM PARTS, and that is not style. A test that feeds a marker to the
+        // stripper must CONTAIN the marker, and an opener in a string literal is exactly what defeats
+        // the stripper - so writing this test the obvious way re-arms the bug for every OTHER guard
+        // that strips this file. MEASURED: the first version did, and
+        // `website/tests/credit-expiry-claim.test.ts` - whose stripper concatenates all of
+        // `server/src` - reported that `reviews.rs` has no withdrawal UPDATE, because this file's
+        // own fixture had opened a block comment that swallowed the rest of the walk.
+        //
+        // `concat!` and a `&str` slice put the two characters next to each other AT RUNTIME while
+        // leaving the source free of the sequence. This is the same split-literal trick
+        // `docs/testing.md` records for a guard that would otherwise match its own text.
+        const OPEN: &str = concat!("/", "*");
+        const CLOSE: &str = concat!("*", "/");
+
+        // A block comment goes, including across lines, and the lines it spanned still exist.
+        let out = strip_comments(&format!(
+            "let a = 1;\n{OPEN} secret\n   spans {CLOSE}\nlet b = 2;\n"
+        ));
+        assert!(!out.contains("secret"), "a block comment must be removed");
+        assert!(!out.contains("spans"), "a block comment spans lines");
+        assert!(
+            out.contains("let b = 2;"),
+            "code after a block comment must survive"
+        );
+        assert_eq!(
+            out.lines().count(),
+            4,
+            "a block comment must leave its lines behind, blanked rather than deleted"
+        );
+
+        // A block OPENER inside a line comment must not open a block. `///` doc comments containing a glob
+        // are ordinary in this repository, and this is the case that made the round necessary.
+        let out = strip_comments(&format!(
+            "/// named by no `tools{OPEN}/check.sh`, so it is never run\nlet after = 1;\n"
+        ));
+        assert!(
+            out.contains("let after = 1;"),
+            "a block opener inside a line comment must not open a block comment, or everything \
+             after it vanishes from the stripped text and every guard reading this file is checking \
+             a file that ends there"
+        );
+
+        // The VACUITY floor: the three cases above must leave something to read, or they would pass
+        // against a function returning "".
+        assert!(
+            strip_comments("let x = 1;\n").contains("let x = 1;"),
+            "unstripped code must survive, or every assertion above is vacuous"
+        );
+    }
+
+    /// And the case the function CANNOT get right, pinned so it is a decision rather than a surprise.
+    ///
+    /// A block-comment marker inside a STRING literal is not a comment, and this stripper has no
+    /// string model, so it treats one as an open. MEASURED on the real repository: a doc comment in
+    /// `money.rs` carried the glob `tools` + star + `/check.sh`, the scan ended at depth 1, and the rest of
+    /// that file was invisible.
+    ///
+    /// THE GUARD IS THAT THE TREE DOES NOT CONTAIN ONE, not that the function handles it. That is the
+    /// cheaper obligation and it is the one that actually holds: measuring the 38 files under
+    /// `server/src` found ZERO that end inside a block comment, so today no caller is affected. A
+    /// future file that does is a failure here, naming itself, rather than a set of other guards
+    /// quietly reading a truncated file.
+    #[test]
+    fn no_source_file_leaves_the_comment_scan_inside_a_block() {
+        // The same walk the callers use, so this cannot pass by reading a different set of files.
+        let files = source_files();
+        assert!(
+            files.len() > 20,
+            "only {} source file(s) were found, so this check is not reading the crate",
+            files.len()
+        );
+
+        // THE FILE THIS GUARD LIVES IN IS EXCLUDED, and that is a deliberate trade rather than an
+        // oversight. A guard about comment markers cannot read its own source safely: the message it
+        // prints NAMES the marker, so its own string literals contain the thing it hunts - the
+        // "guard that satisfies itself" shape this file records elsewhere, here in its inverse
+        // (a guard that FIRES on itself). MEASURED, on the first version of this test: the needle it
+        // chose was a line of its own `format!` string, the scan had blanked part of it, and the
+        // guard reported `doc_claims.rs` as the offender - a false positive on the file it was
+        // written in, while the tree was clean.
+        //
+        // `money.rs` excludes itself from its own `UPDATE wallets` scan for the same reason, so the
+        // pattern is established here rather than invented. The cost is stated: a runaway comment in
+        // THIS file would not be caught by THIS check. Every other guard in this file reads
+        // `strip_comments` output too, so such a defect would surface as their failure instead.
+        let this_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("doc_claims.rs");
+
+        let mut offenders: Vec<String> = Vec::new();
+        for path in &files {
+            if path == &this_file {
+                continue;
+            }
+            let raw = std::fs::read_to_string(path).unwrap_or_default();
+            // Re-derive the end state. `strip_comments` returns text, not its state, so the property
+            // is measured by what the scan DID to the tail: if the last meaningful line of the input
+            // is absent from the output, the scan was still inside a comment when the file ended.
+            let stripped = strip_comments(&raw);
+
+            // THE NEEDLE IS THE LAST NON-COMMENT LINE LONG ENOUGH TO BE EVIDENCE, and getting this
+            // right took two measurements that both looked like a working guard.
+            //
+            // First version: compare the LAST non-blank line, which in most Rust files is `}`, using
+            // `stripped.contains(tail)`. MEASURED: a runaway blanked the whole tail and the guard
+            // said nothing, because `contains("}")` is true of any file with a brace in it. A
+            // one-character needle makes the check a test of the alphabet.
+            //
+            // Second version: keep the last non-comment line but SKIP the file when that line is
+            // shorter than twelve characters - to avoid firing on `}` everywhere. MEASURED: the same
+            // ragged file has `}` as its last non-comment line, because a closing brace comes after
+            // the code, so the file was SKIPPED and the runaway went unnoticed again. A skip meant to
+            // suppress a false positive suppressed the true positive too.
+            //
+            // So the needle is chosen by SCANNING BACK for a line that is long enough to be
+            // distinctive, rather than taking the very last one or giving up. `}` is still skipped as
+            // a needle; the file is not skipped.
+            let tail = raw
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| {
+                    // The opener is built with `concat!` for the reason the test inputs above are:
+                    // spelled out, this line would defeat the stripper that reads this very file.
+                    !l.is_empty() && !l.starts_with("//") && !l.starts_with(concat!("/", "*"))
+                })
+                .rev()
+                .find(|l| l.len() >= 12);
+            if let Some(tail) = tail {
+                let survived = stripped.lines().any(|l| l.trim() == tail);
+                if !survived {
+                    offenders.push(format!(
+                        "{}: a line of code ({:?}) did not survive the scan, so the file ends inside \
+                         a block comment opened earlier - a block-comment opener inside a string literal, which \
+                         `strip_comments` cannot distinguish from a real comment. Every guard that \
+                         reads this file is checking a TRUNCATED file - the text after that point is \
+                         invisible to all of them. The fix is in the SOURCE (write the glob as \
+                         `check.sh` under `tools/`), not in the stripper",
+                        path.display(),
+                        tail.chars().take(60).collect::<String>()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these files defeat the comment scan, so every guard that reads them is checking a \
+             truncated file: {offenders:#?}"
+        );
+    }
 }
