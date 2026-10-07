@@ -311,29 +311,125 @@ function for.
 
 ## 10. Contact and complaints
 
-**NOT YET WRITTEN — this section is a requirements list, not a clause.** It says what must
-be true; it does not yet say it, and it names no channel. That distinction matters because
-the launch table below asserts an abuse contact is enforced by "Terms + an abuse contact",
-and today this document contains **no address, URL or named form anywhere** (checked, not
-assumed: a scan for any email or http URL in this file returns zero).
+> 🚫 **NOT PUBLISHABLE AS IT STANDS — the bracketed tokens below are placeholders, not
+> values.** This section is now written as a clause, but it cannot be published until
+> every `[[...]]` token in it is replaced with a real value. A reader or a release
+> script should treat any surviving `[[...]]` token in this file as a **launch blocker**,
+> not as typography. See "Before publishing this section" below.
 
-Required before launch:
+**10.1 Who you are contracting with.** These terms are between you and
+**[[OWNER_LEGAL_NAME]]**, operating the apikita service. Our contact details are set out in
+10.2.
 
-- A real channel that is monitored.
-- Response expectation.
-- **A stated path for content or billing complaints**, since both will occur.
+**10.2 How to contact us.** You may contact us at **[[ABUSE_EMAIL]]**. This is the single
+monitored address for the service: use it for abuse reports, content complaints, billing
+complaints and security reports alike. Label the subject line with the category of your
+report where you can, so it is routed correctly.
 
-**Why it cannot be written from this repository.** The address must be one that is actually
-monitored, and no mailbox exists — `docs/abuse-runbook.md` tracks the same item as open,
-and there is no `abuse@` anywhere in the tree (checked). Writing a plausible-looking
-address into a legal document would be worse than the gap, because the Terms would then
-make a promise no one is keeping — the same failure mode this document's own warning about
-"a policy claiming something the code does not do" describes.
+**10.3 We will acknowledge and respond.** For an abuse or content report, we respond within
+the periods below. They are the response times in
+[`abuse-runbook.md`](abuse-runbook.md) §"Severity and response time" and are not restated
+here as a separate or different commitment.
+
+| Your report | Our response |
+| --- | --- |
+| An upstream provider notifies us of prohibited use | **Immediately** — hours |
+| A clear spam or fraud pattern at volume | Same day |
+| Suspected key sharing or limit circumvention | Within a few days |
+| A consumer complaint about content | Within a week |
+
+**Those four are the runbook's four.** There is no fifth row here on purpose: the runbook
+classifies abuse and content reports, and it does not classify billing complaints or data
+requests. **10.6 and 10.7 therefore state no response time**, and an earlier draft of this
+section gave them one — "within a few days", borrowed from the third row above. That would
+have been a service level invented here for the convenience of having a number in every
+cell, in a document whose own launch table warns about "a policy claiming something the
+code does not do". If a response time for billing or data requests is wanted, it belongs in
+the runbook first and this table second.
+
+**10.4 A response is not an outcome.** What we will do about a report is governed by
+[`abuse-runbook.md`](abuse-runbook.md) §"Response procedure" and §"What we will NOT do",
+and the consequences of an acceptable-use violation by §4 above. In particular: we
+**suspend before we terminate**, because suspension is reversible; we do **not** read your
+prompts to investigate a report, because not storing them is a promise this document makes
+in §5; and where a finding is uncertain we restrict and monitor rather than terminate. A
+report from you does not by itself entitle you to a particular action against another
+account.
+
+**10.5 Content complaints.** If content produced through an account breaches §4
+(Acceptable use), report it to the address in 10.2 with the account or key involved, the
+time, and what was produced. **Report content, not prompts** — we hold no prompt log to
+check a claim against, so a report is assessed from behavioural records (volume, key and
+IP patterns, usage aggregates), not from the text. Do not send us a third party's personal
+data that the report does not require. Where a report is upheld, the action taken is one of
+those in 10.4. A complaint about content that the **upstream provider** generated is in
+part outside our control: §1 (The service) and §5 (Data and privacy) explain that we route,
+and the provider's own handling applies.
+
+**10.6 Billing complaints.** Send billing complaints to the same address, quoting the order
+id, the top-up date and — if you can — the ledger entry. We will check the ledger against
+the payment rail and correct anything that is genuinely wrong on our side: a settled
+top-up that did not credit, a charge for tokens the provider did not generate, or a
+misapplied limit. **Three outcomes are settled policy and will not change on complaint**:
+
+- **Deposits and unused credit are non-refundable during operation, with no exception**
+  (§3). A billing complaint can correct a wrong balance; it cannot convert credit back into
+  money while we are operating.
+- **Credit expires 2 years after the deposit that created it, per deposit** (§3), and the
+  expiry sweep sends no notice beforehand.
+- **If we close the service, every balance above USD 2.00 is paid out**, the rail you paid
+  on decides the payout method, and balances at or below USD 2.00 are discharged on request
+  with us covering the fee (§7). That is the one thing that overrides the non-refundable
+  clause above.
+
+**10.7 Requests about your data.** Requests to see, export, correct or delete your data go
+to the address in 10.2 and are handled under [`data-retention.md`](data-retention.md)
+§"Access and deletion requests". You do not have to use email to see or export your own
+data — your dashboard and the bot already show your profile, balance, usage and keys, and
+`GET /api/export` downloads your own records as JSON — but a request sent to 10.2 will be
+actioned. **One limit is stated up front rather than explained afterwards: the ledger
+cannot be deleted on request.** It is immutable by design, and it is the record both we and
+you rely on in a billing complaint. Account deletion anonymises where it can and leaves
+the ledger intact.
+
+**10.8 A report does not suspend anything automatically.** Sending a complaint does not
+pause billing, hold a balance or stop an account. If you need usage stopped, revoke the API
+key from your dashboard first — that takes effect immediately — and then tell us.
+
+### Before publishing this section
+
+Nothing here is a value yet. Substitute all three, then delete this checklist and the
+warning block above:
+
+| Placeholder | Replace with | Where it also appears |
+| --- | --- | --- |
+| `[[ABUSE_EMAIL]]` | A mailbox that is **actually monitored** at the response times in 10.3 | `abuse-runbook.md` §Open items records the same gate, and `launch-checklist.md` "Publish the Terms of Service" |
+| `[[OWNER_LEGAL_NAME]]` | The contracting entity: the owner's legal name, or the PT if the entity decision goes that way | `launch-checklist.md` §Gate 0 "Decide the contracting entity" |
+| `[[RESPONSE_HOURS]]` | Only if the response times get a numeric form; the canonical table is in `abuse-runbook.md` §"Severity and response time" | `abuse-runbook.md` §"Severity and response time" |
+
+**Three places describe this one gate, and they were reconciled when this section was written.**
+`launch-checklist.md` "Publish the Terms of Service" and `abuse-runbook.md` §Open items both
+used to say this section was "a requirements list, not a clause" — true when written, and false
+from the moment it became one. Both were corrected in that change, and both kept their item
+**unticked**, because the half of the gate that moved was the wording and the half that did not
+is whether a monitored mailbox exists.
+
+**So the remaining step is the substitution above, not another reconciliation pass.** Filling in
+`[[ABUSE_EMAIL]]` with a real address is the whole of what publishes this section; if you find
+yourself editing prose in the other two documents to match, something has drifted and the drift
+is the thing to look at.
+
+**Why the placeholders are there and not an address.** The address must be one that is
+actually monitored, and no mailbox exists — `abuse-runbook.md` tracks the same item as
+open, and no `abuse` address exists anywhere in the tree (checked). Writing a
+plausible-looking address into a legal document would be worse than the gap, because the
+Terms would then make a promise no one is keeping — the same failure mode this document's
+own warning about "a policy claiming something the code does not do" describes.
 
 **The dependency is a decision plus a mailbox**, not code. Until both exist, the launch
-table row for the abuse contact is **unmet on the Terms half as well as the operational
-half**, and this heading is the place that says so out loud rather than reading as a
-finished clause.
+table row for the abuse contact below is **unmet on the Terms half as well as the
+operational half**. The clause above is what that half will publish; the tokens are what
+still stops it.
 
 ## What must be true at launch
 

@@ -153,6 +153,23 @@ export const requests = [
   // is the most consequential kind of wrong thing this file can say - and it was the
   // single occurrence of the string `withdraw` in the whole tree, here.
   { request: 'Delete a review', how: 'Reviews cannot be posted or withdrawn yet, so there is nothing published to remove. This is the one right on this page with no working path, and it stays on the page rather than disappearing so the gap is visible rather than inferred' },
+  // Every row above names a route a customer can already take, and none of them
+  // reaches a person. A disclosure that lists rights without naming a channel is
+  // not a complete one: the rows tell someone what they may ask for and leave them
+  // with nowhere to ask. The address is a PLACEHOLDER on purpose. No mailbox
+  // exists - docs/terms-of-service.md's "Contact and complaints" section and
+  // docs/abuse-runbook.md both track the same open item - and a plausible-looking
+  // address here would be worse than the gap, because it would promise customers a
+  // channel nobody is reading.
+  //
+  // The token is an ALLOWED one rather than a stray edit: `[[PRIVACY_EMAIL]]` has a row in
+  // tests/no-placeholders-ship.test.ts's PENDING map, which is what keeps it legal while still
+  // failing on a placeholder nobody is waiting on. It names the pending address HERE, in a
+  // comment, rather than in the `how` string - that guard's second half fails if the token is
+  // BUILT INTO dist/, and a value in this table is on its way to a customer. The row below is
+  // therefore honest about the channel existing without showing a customer a token.
+  // Pending address: [[PRIVACY_EMAIL]]
+  { request: 'Contact us', how: 'Write to the address on this page for anything here — including a complaint. Not open yet: no mailbox exists, so this address is being set up and is monitored from launch' },
 ];
 
 /** Every disclosure array, for a test that wants to check coverage across all. */

@@ -229,13 +229,25 @@ PocketBase admin UI to reach for: that service does not exist.
 - [ ] Thresholds for behavioural abuse signals — **starting values exist** in
       [`ip-tracking.md`](ip-tracking.md) §Abuse signals; they need tuning against real
       traffic before they are trusted.
-- [ ] An abuse-report contact, published in the terms. **Two halves, both missing.**
-      There is no mailbox (no `abuse@` anywhere in the tree — checked) and no page that
-      publishes one: [`terms-of-service.md`](terms-of-service.md) §10 "Contact and
-      complaints" is a requirements list, not a clause, and that document contains no
-      address, URL or named form at all. §10 now says so explicitly rather than reading
-      as a finished clause. Writing a plausible address would be worse than the gap —
+- [ ] An abuse-report contact, published in the terms. **Two halves, both still open.**
+      There is no mailbox (no `abuse@` anywhere in the tree — checked) and no published
+      channel: [`terms-of-service.md`](terms-of-service.md) §10 "Contact and complaints"
+      is now written as a **clause** — 10.1 to 10.8, with its response times taken from
+      this document's own severity table — but every contact detail in it is a
+      **placeholder token** (`[[ABUSE_EMAIL]]`, `[[OWNER_LEGAL_NAME]]`), and that document
+      contains no address, URL or named form at all. §10 says so explicitly rather than
+      reading as a finished clause. Writing a plausible address would be worse than the gap —
       the Terms would promise a channel nobody monitors, which is the exact failure the
       doc's own warning about "a policy claiming something the code does not do" names.
       **Neither half is code**, so this cannot be closed from this repository.
+      > **What changed here, and why the item did not.** This said "§10 is a requirements
+      > list, not a clause" — true then, false once §10 became one. The half of the gate
+      > that MOVED is the wording; the half that did not is whether a monitored mailbox
+      > exists, which is still no. A gate whose description is corrected must not read as a
+      > gate that closed, so the item stays unticked and this note is what says so.
+      > **Three places describe this one gate and move together:** this item,
+      > [`launch-checklist.md`](launch-checklist.md)'s "Publish the Terms of Service", and
+      > §10's own "Before publishing this section" checklist. The first two were corrected
+      > in the same change that rewrote §10; correcting one and not the others leaves a
+      > reader holding two live descriptions of one gate.
 - [ ] Whether abuse detection warrants a limited-retention prompt sampling policy.
