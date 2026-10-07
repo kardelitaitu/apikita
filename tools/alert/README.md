@@ -325,11 +325,14 @@ something that is already wired — and it hides that the real remaining gap is 
 
 ```
 $ sh tools/alert/probe.sh --check db_disk
-probe: NOT CHECKED - 1 of the doc's 10 alerts still needs a surface this cannot reach:
+probe: NOT CHECKED - 1 of the 11 alerts in alerts.tsv still needs a surface this cannot reach:
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
 ```
 
-`probe.sh` states the remainder itself on every run, and it is the authority — not this table.
+`probe.sh` states the remainder itself on every run, and it is the authority — not this table. The
+line is quoted here **verbatim**, and it changed when the count above it was corrected: this block
+used to read *"1 of the doc's 10 alerts"*, which was wrong on both numbers — the registry has 11, and
+the doc's table has 12 rows because one of them is a privacy statement rather than an alert.
 
 The one that remains is `relay_5xx`, which needs nginx **access logs**, deliberately disabled for
 privacy (`docs/edge-relay.md`, `docs/data-retention.md`). Enabling them to satisfy an alert would

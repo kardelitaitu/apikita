@@ -654,7 +654,7 @@ fi
 # to sit here said it needed "HTTP counters over a 5-minute window (same access logs)",
 # which was true before the counter existed and is now stale.
 cat >&2 <<'NOTCHECKED'
-probe: NOT CHECKED - 1 of the doc's 10 alerts still needs a surface this cannot reach:
+probe: NOT CHECKED - 1 of the 11 alerts in alerts.tsv still needs a surface this cannot reach:
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
 probe:                             The relay is a SEPARATE deployment; the backend never sees its
 probe:                             status codes, so no server-side check can answer this one.

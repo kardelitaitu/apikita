@@ -515,6 +515,126 @@ else
     done
 fi
 
+# --- the COUNTS the tool's own README states -----------------------------------
+#
+# WHY THIS IS HERE, and it is the third time this one file has been wrong. The section above compares
+# `alerts.tsv` against `docs/observability.md` - the registry against the specification. It never read
+# `tools/alert/README.md`, which five other files point a reader at and no guard had ever opened.
+# MEASURED before this was added, that README stated FOUR different counts for one reality:
+#
+#   "The doc's table has 9 alerts"        - the registry had 11
+#   "complete for all ten"                - the registry had 11
+#   "Covered: 6 of 10. Not covered: 4"    - 10 of 11 were reachable
+#   "--list | all 10 definitions"         - alert.sh --list prints 11 rows
+#
+# The coverage sentence is the one that matters, because it pointed the WRONG WAY: three rows
+# (`all_providers_unhealthy`, `db_disk`, `error_rate`) had gained a `/api/admin/metrics` path and the
+# table still said "No". Understating coverage tells an operator to wire an alert that is already
+# wired, and it hides that the real remaining gap is a single one.
+#
+# SO THIS ASSERTS THE COUNTS, from the files rather than from memory, and it asserts them PER SOURCE -
+# because the whole failure was three true numbers being used interchangeably:
+#
+#   alerts.tsv definitions        the registry; `alert.sh --list` prints one row each
+#   probe.sh --list named checks  what the prober has a code path for (fewer, by design)
+#
+# The floors mirror the guard above: a scan that matched nothing would make every comparison below
+# vacuous, so a parse that reads too little FAILS rather than passing quietly.
+README="$REPO/tools/alert/README.md"
+if [ ! -f "$README" ]; then
+    fail "cannot read $README, so the counts it states were not compared"
+else
+    TSV_DEFS=$(grep -v '^#' "$TSV" | grep -v '^id' | grep -c .)
+    PROBE_NAMED=$(sh "$PROBE" --list 2>/dev/null | grep -E '^probe: [a-z_]+ +(covered|skipped)' | grep -c .)
+
+    if [ "$TSV_DEFS" -lt 8 ]; then
+        fail "parsed $TSV_DEFS alerts.tsv definitions - too few to be real, so the comparison below would be vacuous"
+    fi
+    if [ "$PROBE_NAMED" -lt 4 ]; then
+        fail "parsed $PROBE_NAMED probe.sh --list checks - too few to be real, so the comparison below would be vacuous"
+    fi
+
+    # Every "<N> alerts"/"<N> definitions" claim must be the registry count.
+    #
+    # A CORRECTION QUOTES THE OLD NUMBER, and this guard must not fire on one - the same distinction
+    # `docs/testing.md` records for a note about a bad citation, which cannot itself contain one. Two
+    # shapes are therefore skipped: a line inside a blockquote (`>`, which is how the corrections in
+    # this file are written) and a line that says "said"/"states"/"was" about the number, i.e. reports
+    # it as history rather than asserting it. Without this the guard fires on its own explanation.
+    BAD_COUNT=$(grep -nE '\b[0-9]+\b (alerts|definitions)' "$README" \
+        | grep -v '^[0-9]*:>' \
+        | grep -viE '(said|says|was|were|had|would|used to|no longer)' \
+        | grep -vE "\b$TSV_DEFS\b (alerts|definitions)" || true)
+    if [ -n "$BAD_COUNT" ]; then
+        echo "$BAD_COUNT" | while IFS= read -r row; do
+            fail "$README states a count of alerts or definitions that is not the registry's $TSV_DEFS: $row"
+        done
+    fi
+
+    # THE TABLE, ROW BY ROW - and this replaces a check that did not work.
+    #
+    # The first version was `grep -qF "**$TSV_DEFS**"`, which asks only whether the right number
+    # appears SOMEWHERE. MEASURED: changing one occurrence to a wrong number still passed, because
+    # four other occurrences were correct. That is the vacuous-guard shape this repository keeps
+    # finding - a check satisfied by a copy of the thing rather than by the thing.
+    #
+    # What the failure actually looked like was a TABLE, so the assertion is per row: each of the
+    # three counts is named, and each equals the number measured from the file it describes. A row
+    # carrying the right number for the wrong noun is the exact defect, so the noun is pinned too.
+    for row in \
+        "Alert definitions|$TSV_DEFS" \
+        "Checks \`probe.sh --list\` prints|$PROBE_NAMED"
+    do
+        label=${row%%|*}
+        want=${row#*|}
+        got=$(grep -F "| $label |" "$README" | head -1 | sed -n 's/.*| \*\*\([0-9][0-9]*\)\*\* |.*/\1/p')
+        if [ -z "$got" ]; then
+            fail "$README has no \"$label\" row stating a bolded count. The table that names the numbers is what makes a wrong one visible; deleting the row must not be how a stale count is fixed."
+        elif [ "$got" != "$want" ]; then
+            fail "$README's \"$label\" row states $got, and the file it describes yields $want. A number that is right about one source and attached to another is the defect this table exists to expose."
+        fi
+    done
+
+    # AND NO OCCURRENCE MAY CARRY A WRONG NUMBER - which is not the same as "the right number appears".
+    #
+    # MEASURED, three times, and each version of this check was defeated by a different shape:
+    #
+    #   v1  `grep -qF "**$TSV_DEFS**"`          - a mutation of ONE occurrence passed: four others
+    #                                             were still right.
+    #   v2  `grep -qF "all **$TSV_DEFS**"`      - same bug one line down: the phrase occurs twice.
+    #   v3  `grep -oE '\*\*[0-9]+\*\* (alerts|definitions)'` - did not match `all **11**:`, where a
+    #                                             COLON follows the number rather than a noun.
+    #
+    # The lesson each time is the same and is why this is now shape-agnostic: a count in bold is a
+    # claim wherever it sits, and `\*\*11\*\*` followed by a colon is as much a count of the registry
+    # as one followed by the word "alerts". So the pattern is the BOLD NUMBER ALONE, and the
+    # exemption is the one place a number in bold is not a count of the registry or the prober - it
+    # is a row label in a table ("| 9 |"), which is not bolded and so never reaches here.
+    #   ... and a FOURTH shape, which was not the pattern but the plumbing:
+    #   `echo "$WRONG" | sort -u | while read -r w; do fail "..."; done`
+    #       `fail` sets FAILED=1, and a `while read` at the END OF A PIPELINE runs in a SUBSHELL -
+    #       so the message printed and the counter did not move. The script reported the violation
+    #       and exited 0. This is the exact trap this file's own comment at the top warns about
+    #       ("a `while read` in a pipeline runs in a SUBSHELL, so the missing names are collected
+    #       into a file rather than a variable"), and knowing the rule did not stop me writing it.
+    #       A here-document keeps the loop in the CURRENT shell.
+    WRONG=$(grep -oE '\*\*[0-9]+\*\*' "$README" \
+        | grep -vE "\*\*($TSV_DEFS|$PROBE_NAMED)\*\*" | sort -u || true)
+    if [ -n "$WRONG" ]; then
+        while IFS= read -r w; do
+            [ -n "$w" ] || continue
+            fail "$README states the bolded count $w, and neither $TSV_DEFS (the registry) nor $PROBE_NAMED (the prober's checks) is that. Every bolded number in this file is a count of one of the two, so a new one is either a new fact - which needs its own source of truth - or a stale number."
+        done <<EOF
+$WRONG
+EOF
+    fi
+
+    # And both counts must still be STATED, so deleting the claims is not a way to pass.
+    grep -qF "all **$TSV_DEFS**" "$README" || {
+        fail "$README no longer states the registry count in prose (expected 'all **$TSV_DEFS**'). A document that names the number in only one place is one edit from disagreeing with itself."
+    }
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "alert-check: the alert delivery contract is BROKEN (see above)" >&2
     exit 1
