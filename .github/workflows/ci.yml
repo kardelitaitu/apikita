@@ -1027,6 +1027,25 @@ jobs:
       - name: Check the shell hazards that destroy a measurement
         run: sh tools/shell-hazards/check.sh
 
+      # EVERY `[PASS]` THE BENCHMARK PRINTS MUST BE EARNED.
+      #
+      # MEASURED over two rounds: three of its four scenarios printed `[PASS]` from a fixed string
+      # that no measurement could change. Scenario 3 printed it beside `Success Rate: 37.76%`, against
+      # a documented target of `>= 99.9%`, and would have printed it at 0%. Scenario 4's `{}` was the
+      # scenario's INPUT, not its result. And `Estimated Socket RAM` was `(concurrency * 35) / 1024` -
+      # arithmetic on two constants, where `35` is the document's own PASS CRITERION, printed as a
+      # passing reading.
+      #
+      # WHY A GATE: the binary has NO test coverage, and the only check coupling it to anything reads
+      # its CLI rather than its output, so three of four scenarios drifted with nothing watching.
+      #
+      # WHAT IT DOES NOT CATCH, because the tool was falsified against its own subject and two
+      # mutations survive: a threshold changed to a vacuous one (`>= 10000` to `>= 0`) still looks
+      # like a comparison, and deleting an `else` arm is missed when another `else` is nearby. It
+      # catches the shape that actually occurred - a verdict with no value and no branch at all.
+      - name: Check the benchmark verdicts are earned
+        run: sh tools/benchmark-verdicts/check.sh
+
       # The CI document must describe the pipeline that actually runs.
       #
       # docs/ci-cd.md listed TEN stages while the workflow ran TWENTY-SIX: the seven
