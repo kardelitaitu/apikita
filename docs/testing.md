@@ -550,6 +550,23 @@ So a mutation result is only evidence once three things hold, and each is cheap:
     command. A restore that silently failed leaves a mutation in the tree, and the next
     round reads mutated source as if it were real.
 
+**AND A FROZEN COPY OF THE TREE CANNOT RUN EVERY GUARD, which is a trap in the VERIFICATION step rather
+than in the mutation.** `git archive HEAD` into a scratch directory is the cheapest way to test a
+revision without racing whatever else is writing to the tree, and it is why the readings in this file
+are taken that way. But the archive carries **no `.git`**, so any guard that asks git a question fails
+there and passes on the real tree.
+
+MEASURED: `citation-lines.test.ts` runs `git log -1 --format=%cs <file>` to check that a page states the
+date its source document last changed. In a frozen copy every such lookup fails with
+`git returned no date for ...; this guard cannot check anything` - a RED result, a clear message, and
+nothing whatsoever wrong with the revision under test. A round that read it as a defect would spend its
+length on a scratch directory.
+
+The rule is to run the frozen copy for the suite that does not need history and to take the
+history-dependent guards from the real tree, or to `git worktree add` instead - which carries a real
+`.git` and is the better instrument whenever a guard has to read history. Neither is more correct than
+the other; they fail in different places, and knowing which is which is the whole of this paragraph.
+
 **AND THAT THIRD CONTROL CAUGHT ITS OWN AUTHOR, which is why it is worth an instance rather than a
 rule.** A probe stripped a phrase from FIVE files and restored only the ONE directory it had copied
 aside. The guard then reported a count of 2 statements where the baseline had 5 - a plausible-looking
