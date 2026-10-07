@@ -2039,3 +2039,68 @@ This is the **fifth** false negative in this session from a text assumption — 
 prefix, a line wrap, a `{` inside a format string, and now a blockquote marker. Each was a check that
 reported a problem where the file was correct. The pattern is stable enough to state: **when a
 text-matching check fails, read the text before believing it.**
+
+### "Reliable" measured: every panic site in production code, and why each is unreachable
+
+The objective names three words. Efficiency was settled a round ago — every published performance
+target is coupled to a check or delegated to a tool that can measure it. **Reliability** had never been
+measured at all, and the sharpest question under it is: **can this server panic?**
+
+GREP IS USELESS FOR THIS. `\.unwrap\(\)|\.expect\(|panic!` returns **1440** hits in `server/src`, and
+essentially all of them are test code — test modules dominate the file count, and a test `expect` is
+correct. The number that matters is the one after excluding `#[cfg(test)]`, and getting that right took
+**four attempts**:
+
+| attempt | production sites | what was wrong |
+| --- | --- | --- |
+| grep for panic macros | 1440 | counted test code |
+| mark on `#[cfg(test)]`, clear at a lower depth | 62 | nested `mod` handling |
+| the same, with a sticky marker | 49 | still wrong |
+| **string-aware brace scan** | **30** | — |
+
+The third failure is the instructive one. A **second** `#[cfg(test)]` nested inside the first module
+overwrote the depth marker, which then cleared early and left the rest of the outer test module reading
+as production. The fourth attempt fixed that — and then a brace **inside a string literal** unbalanced
+the count, so `error.rs` ended at depth `-1`. Only after skipping strings, char literals and comments
+did the number settle, and it settles at **30**.
+
+**What the 30 are, by kind:**
+
+| sites | where | why it cannot fire |
+| --- | --- | --- |
+| 15 | `test_support.rs` | test-only helpers; never on a request path |
+| 6 | `db.rs`, `ip_tracking.rs` | `and_hms_opt(0, 0, 0)` from a **literal** — `None` needs hour > 23 |
+| 4 | `doc_schema.rs`, `doc_claims.rs` | guard assertions over the schema text |
+| 1 | `ip_tracking.rs` | `Hmac::new_from_slice(salt)` — HMAC accepts **any** key length |
+| 1 | `identity/email.rs` | a literal RFC 5322 address |
+| 1 | `main.rs` | `trusted_proxy_cidrs validated at load` |
+| 1 | `routes/auth.rs` | a test-override lock, cleared by a guard on panic too |
+| 1 | `upstream/client.rs` | `builder.build()` at **startup**, not per request |
+
+**Every one is infallible by construction or runs before the server serves.** The `and_hms_opt(0, 0, 0)`
+sites are the clearest: the `Option` is always `Some`, so the `expect` is a documented invariant rather
+than a guard. The HMAC one is the same shape — `new_from_slice` returns an error only for invalid key
+lengths, and HMAC has none.
+
+**And nothing on the request path panics.** `panic = "abort"` is **deliberately absent**, and
+`server/Cargo.toml` states why in the terms that matter here: a panic inside one tokio task is caught at
+the task boundary and the process survives, so an `abort` policy would convert *"one request died"* into
+*"every in-flight request died"*. The comment closes with the condition on revisiting it — *"If it is
+ever taken, it must come with a measurement"* — which is a decision recorded rather than a default
+inherited.
+
+So the reliability picture is: **30 production panic sites, every one infallible by construction or
+startup-only, and a panic policy chosen so that even a bug in one handler cannot take the service down.**
+There is no `catch_panic` layer because the runtime already provides the boundary.
+
+**A false positive in this very section, worth recording.** The first check for the abort policy was
+`/panic\s*=\s*"abort"/` against `server/Cargo.toml`. It matched — the **comment** explaining that
+`panic = "abort"` is deliberately absent. The assertion reported the opposite of the truth, and the file's
+own text was the thing that disproved it. Sixth false negative this session from a text match, and the
+same shape as the others: **the pattern found the words, not the setting.**
+
+**Why the four-attempt sequence is worth keeping.** Each wrong classifier produced a *plausible* number
+— 1440, 62, 49 — and each was a measurement artefact rather than a finding. The 1440 would have read as
+a codebase riddled with panics; the 49 still named functions called `the_forgery_tool_sends_...` as
+production. A count is not a finding until the classifier has been checked against a case whose answer
+is known, and the case here was `money.rs`, whose `#[cfg(test)] mod tests` opens at a line I could read.
