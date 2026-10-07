@@ -633,6 +633,28 @@ controls pass and the run reads as a clean survivor. The rule is to filter on th
 the exact test name** (`db::tests::a_zero_reservation_...`) rather than a stem guessed from the
 function under test, and to print the test NAMES that ran, not just the counts - a stem that has
 quietly started matching unrelated words is then visible in the output rather than inferred from it.
+
+**AND THE HARDER VARIANT: a filter that matches a RELATED test, so the survivor looks like a finding
+about the CODE.** The case above is caught by printing the names - they are obviously the wrong tests.
+This one is not. MEASURED, probing whether `docs/business/02-pricing.md`'s price table is checked
+against the shipped rates:
+
+```
+filter every_rate_in_the_price_card   ->  every_rate_in_the_price_card_is_its_cny_source_times_the_stated_fx
+filter pricing                        ->  the_pricing_document_restates_the_shipped_card
+```
+
+Two guards, one subject, different halves of it. The first checks that each rate in `config/apikita.toml`
+IS its own CNY conversion; the second checks that the DOCUMENT restates the shipped card. Changing a
+figure in the document therefore leaves the first guard green - correctly, it does not read the
+document - and reading that `ok` as "the doc is unchecked" is a false finding about the codebase.
+
+The name-based control does not help here, because the name that runs is a real and plausible one. What
+settles it is running the mutation against the **WHOLE suite** before concluding anything: MEASURED, the
+unfiltered run failed and named `the_pricing_document_restates_the_shipped_card`. So the rule is not
+only "filter on the exact name" - it is **confirm a survivor unfiltered before writing it up**, because
+a filter that selects the wrong RELATED guard produces exactly the shape of a real gap.
+
 The pathology is the same one this file keeps recording in the code under test: a check that reads
 plausible while measuring something else.
 
