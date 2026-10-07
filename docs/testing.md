@@ -550,6 +550,21 @@ So a mutation result is only evidence once three things hold, and each is cheap:
     command. A restore that silently failed leaves a mutation in the tree, and the next
     round reads mutated source as if it were real.
 
+**AND THAT THIRD CONTROL CAUGHT ITS OWN AUTHOR, which is why it is worth an instance rather than a
+rule.** A probe stripped a phrase from FIVE files and restored only the ONE directory it had copied
+aside. The guard then reported a count of 2 statements where the baseline had 5 - a plausible-looking
+number, and one a reader could easily have written up as "the guard's vacuity check is too strict".
+The tree was not damaged (the mutation ran in a throwaway worktree, which is the other reason to use
+one), but the READING was wrong, and it was wrong in the direction that produces a finding about the
+guard rather than about the probe.
+
+What surfaced it was not care. It was that the restored number did not match the baseline number, and
+the difference was small enough to look like a real result. So the third control is not only about
+leaving the tree clean: it is what makes the RESTORED RUN comparable to the BASELINE RUN, and without
+that comparison every later reading in the same session is suspect. Hash the files the mutation
+touched, restore with `git checkout --`, hash again, and diff - rather than re-running a copy command
+and trusting it.
+
 **A FOURTH: with `cargo test` and no `--lib`, there is more than one result line, and the first one
 can be a pass while the run failed.** MEASURED, because it is the same trap as the `0 passed` case
 one level up and it is worse - the counts are real, the `ok` is real, and the suite still failed.
