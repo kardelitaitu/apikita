@@ -185,7 +185,7 @@ jobs:
       # Nothing is skipped or `#[ignore]`d: the former live-PocketBase exchange
       # test was replaced by a loopback stub, and the identity port has since
       # deleted that route and its stub entirely, so the suite reports
-      # 691 passed / 0 failed / 0 ignored. Identity is
+      # 692 passed / 0 failed / 0 ignored. Identity is
       # served natively by the crate - there is no PocketBase to reach at runtime.
       #
       # THE FIGURE IS PINNED, not remembered. This comment carried a count dated
@@ -1048,6 +1048,31 @@ jobs:
       # It catches the shape that actually occurred three times: a verdict with no value and no branch.
       - name: Check the benchmark verdicts are earned
         run: sh tools/benchmark-verdicts/check.sh
+
+      # THE LOAD TEST'S VERDICTS MUST BE EARNED, AND ITS CALIBRATION MUST WORK.
+      #
+      # `docs/benchmark.md` publishes six metrics-matrix rows and TWO were owned by nothing:
+      # Key Validation Latency (p99) <= 1.5 ms, and CPU Saturation at 200 req/s <= 40%. The
+      # in-process benchmark binary cannot produce either - it has no HTTP client, no latency
+      # histogram and no RSS/CPU sampling - and the document's own section 4 says so about
+      # itself: "these numbers are not a load test and must not be quoted as one." So two
+      # PUBLISHED bars had no owner. That is the same defect class as the `max_connections = 10`
+      # figure this repository already records: not a wrong number, a number nobody measured.
+      #
+      # `tools/loadtest/` is the owner. This step gates it, and it RUNS code rather than reading
+      # it - which is the difference from the step above, and the reason for a second gate.
+      # MEASURED: the first pid sampler built for the harness was rejected by the Windows
+      # PowerShell parser and returned null from every call, which the harness reports
+      # downstream as "[NO DATA] the server process was never sampled" - for a healthy server,
+      # forever, on every run. It would have passed any source-shape check ever written. So this
+      # spawns a process that burns CPU and requires the sampler to observe the burn.
+      #
+      # The verdicts are FALSIFIED here rather than trusted: each is called with a measurement
+      # inside its bar and one outside it, and required to change kind, in BOTH directions - a
+      # verdict pinned to PASS and a verdict pinned to FAIL are the same defect with the sign
+      # flipped. MEASURED, ten mutations, all caught; the list is in the README beside the tool.
+      - name: Check the load test verdicts and calibration
+        run: sh tools/loadtest-check/check.sh
 
       # The CI document must describe the pipeline that actually runs.
       #

@@ -50,6 +50,8 @@ here must appear, and every name listed must exist.
 | [`doc-figures/`](doc-figures/README.md) | Every number a document states about a config key or a Rust constant is the number the code has. | Yes |
 | [`shell-hazards/`](shell-hazards/README.md) | The three shell constructs that make a guard unable to fail: a discarded verdict, a subshell flag, and `set -e`. | Yes |
 | [`benchmark-verdicts/`](benchmark-verdicts/README.md) | Every `[PASS]` the benchmark binary prints is earned by a comparison, not a fixed string. | Yes |
+| [`loadtest/`](loadtest/README.md) | The **real HTTP load test**: concurrent requests against a running server, a latency distribution with p50/p95/p99/max, and CPU/RSS sampling. It takes the two measurements [`docs/benchmark.md`](../docs/benchmark.md) publishes and **nothing here could produce** — the in-process binary has no client, no histogram and no sampler. | No — run against a running stack |
+| [`loadtest-check/`](loadtest-check/README.md) | Proves the load test's verdicts **flip** when their measurement crosses the bar, that both thresholds are the document's figures, and — by running it — that the **pid sampler reads a live process**. | Yes |
 | [`ci-docs-check/`](ci-docs-check/README.md) | Asserts the CI document describes the pipeline that actually runs — including this file. | Yes |
 
 ## Local scaffolding — not checks

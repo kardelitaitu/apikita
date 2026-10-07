@@ -98,6 +98,7 @@ and this table would still describe it in the present tense.
 | Check the figures the documents state | A number a document publishes about the code, that the code does not have | `benchmark.md` stated a pool size of 10 for the whole life of a file that has only ever opened 8, and the pass criterion built on it was never achievable |
 | Check the shell hazards that destroy a measurement | A guard that cannot fail: a captured command whose exit code is the verdict, a flag set inside a pipeline subshell, or `set -e` in a gate | Three guards in this repository named a defect they had found and exited 0 |
 | Check the benchmark verdicts are earned | A `[PASS]` a measurement cannot change | Three of the benchmark's four scenarios printed `[PASS]` from a fixed string; one printed `37.76%` beside a documented target of `>= 99.9%` |
+| Check the load test verdicts and calibration | A load test whose verdicts cannot fail, and a CPU sampler that silently reads nothing | `docs/benchmark.md` published a p99 bar and a CPU bar that **no code in the repository measured** — the in-process binary has no client, no histogram and no sampler. And the first pid sampler built for the harness returned `null` from every call, which the harness reports downstream as `[NO DATA]` — for a healthy server, forever, on every run |
 | **Check the CI documentation** | This table going stale | An understated pipeline sends people around CI |
 | Secret scan | A committed key, and an inlined `PUBLIC_*` secret | The value ships to every visitor |
 
@@ -214,7 +215,7 @@ So CI runs **bundled SQLite**, and the database is a file — no `services:`, no
 ```
 
 **There is no longer an ignored database tier.** `cargo test` is the whole suite:
-measured on the merged tree, `cargo test --lib` reports **691 passed / 0 failed /
+measured on the merged tree, `cargo test --lib` reports **692 passed / 0 failed /
 0 ignored**, where the previous arrangement reported 200 passed / 75 ignored and
 needed a live Postgres to run the difference.
 

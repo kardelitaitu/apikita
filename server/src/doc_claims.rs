@@ -4983,9 +4983,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("the CPU Saturation row no longer states a rate: {row}"));
             let after = &row[at + " at ".len()..];
             let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits
-                .parse::<f64>()
-                .unwrap_or_else(|_| panic!("could not read a rate out of the CPU Saturation row: {row}"))
+            digits.parse::<f64>().unwrap_or_else(|_| {
+                panic!("could not read a rate out of the CPU Saturation row: {row}")
+            })
         };
         let tool_rate = tool_constant("PUBLISHED_CPU_RATE_RPS");
         assert!(

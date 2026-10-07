@@ -71,10 +71,39 @@ three is not reproducible and the next reader cannot tell whether it still holds
 | Key validation p99 | $\le 1.5$ ms | *not yet measured* | — | — | — |
 | CPU at 200 req/s | $\le 40\%$ | *not yet measured* | — | — | — |
 
-The two rows above are **deliberately empty**. A plausible number would be worse than the gap, for the
-same reason `docs/terms-of-service.md` §10 leaves its contact tokens unfilled: a published figure nobody
-measured is a claim the repository cannot stand behind, and the metrics matrix is what an operator reads
-to decide whether the service is healthy.
+The two rows above are **deliberately empty**, and stay empty for the reason given below. What the
+harness HAS produced so far is in a different table, because it is a different claim:
+
+**Measured on the DEVELOPMENT host, which is NOT the deployment shape.** Windows 11 Pro, 32 logical
+cores, 61.7 GB RAM, node v22.23.2, release `apikita-server`, loopback, against a migrated scratch
+SQLite. `POST /v1/chat/completions` with a well-formed but unknown Bearer key — refused `401` at key
+lookup, so no upstream, no wallet and no write path. Taken with `tools/loadtest/loadtest.js`; the
+full transcript, the falsification commands and the limits are in
+[`tools/loadtest/README.md`](../tools/loadtest/README.md).
+
+| run | offered | achieved | p99 | server cores | % of 0.2 vCPU |
+| --- | --- | --- | --- | --- | --- |
+| published shape | 200 req/s | 200 req/s | **1.559 ms** | 0.045 | **22.28%** |
+| published shape | 200 req/s | 200 req/s | **1.145 ms** | — | — |
+| saturation | tight | 78,710 req/s | 1.443 ms | 11.681 | 5,840% |
+
+**Do not put those in the table above.** They do not satisfy this page's own rules — the generator
+shared the box with the server, and the server was not pinned to 0.2 vCPU — so they are not evidence
+about the deployment. What they ARE is evidence about the INSTRUMENT, and that is worth recording:
+
+* **A p99 that straddles the bar across runs at identical load is not resolving the bar.** These runs
+  land at 1.145 ms and 1.559 ms against a 1.5 ms target, and the difference between them is the
+  host's loopback client, not the server. The harness now measures its own client-side floor first and
+  **refuses to report a p99 verdict when that floor is at or above the bar** — MEASURED, one Node
+  process reported a p99 of **3.172 ms against a handler doing no work at all**.
+* **The CPU row is a normalisation, not a reading.** It is a percentage, so it needs a denominator,
+  and the only one this document's matrix is coherent against is the `0.2 vCPU` its header names. The
+  harness divides by that, prints which denominator it used, and prints core-equivalents beside it.
+
+So the two rows above remain blank **not** because nothing was measured, but because what was measured
+cannot answer the question they ask. A figure from the wrong box in those cells would be worse than the
+gap — and now there is a tool whose output says which of the two it is.
+
 
 ## If the measurement misses the target
 

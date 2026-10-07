@@ -156,3 +156,36 @@ server and never opens the database.
 1,000-stream run reported its result under the 500-stream heading. The message now interpolates the
 count that ran. The lesson is the same one this section keeps recording: a number written twice
 drifts, and the copy nobody re-reads is the one a reader trusts.
+
+### 4.1 What DOES produce the two rows the binary cannot
+
+The metrics matrix in §3 publishes six rows. Four are covered in code — the in-process binary behind
+them, a config constant, or a `tools/` sweep. **Two were covered by nothing, and this section is the
+part that changed:**
+
+| row | target | what measures it now |
+| :--- | :--- | :--- |
+| **Key Validation Latency (p99)** | `<= 1.5 ms` | `tools/loadtest/loadtest.js` — concurrent HTTP against a running server, a real latency distribution |
+| **CPU Saturation at 200 req/s** | `<= 40%` | the same tool — CPU and RSS sampled from the server PID for the duration of the run |
+
+```bash
+node tools/loadtest/loadtest.js --base-url http://127.0.0.1:8080 --pid <server-pid> --rps 200 --seconds 30
+```
+
+`tools/loadtest/README.md` carries the measured numbers, the falsification commands, and — the part
+worth reading before quoting anything — **what those numbers do not mean.** Two limits apply to both:
+
+* **The p99 is a round trip, not the server's key-validation time.** The row describes compute
+  (SHA-256, the 60s cache lookup, pre-flight arithmetic); a loopback client measures that PLUS the
+  client's own cost, the kernel's TCP path and the server's accept and parse. The tool measures its
+  own client-side floor on every run and **refuses to report a p99 verdict when that floor is at or
+  above 1.5 ms**, because a percentile the instrument cannot resolve is not a reading about the
+  server. MEASURED on the build host: one Node process recorded a p99 of **3.172 ms against a handler
+  doing no work at all**.
+* **The CPU percentage is a normalisation.** A percentage needs a denominator, and the only one this
+  matrix is coherent against is the `0.2 vCPU` its own header names — the row's `> 75%` warning and
+  `100% (Throttling)` critical columns are container-throttling semantics. The tool divides by that,
+  says so in its output, and prints core-equivalents beside it.
+
+Neither number is the deployment's. `docs/load-test.md` is how to take those: a machine separate from
+the server, with the server pinned to `--cpus=0.2`.
