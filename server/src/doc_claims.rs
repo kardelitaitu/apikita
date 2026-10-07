@@ -4583,6 +4583,52 @@ mod tests {
              is what the benchmark compares against.",
             constant("MIN_STREAMS_TARGET")
         );
+
+        // THE MEMORY TARGET, which is stated in the OPPOSITE direction and so needs its own read.
+        //
+        // The document's matrix row is `| **In-Flight Stream Memory** | $< 35\text{ KB / stream}$ | ...`
+        // — an UPPER bound, written with `<`, while the two above are lower bounds written `\ge`. A
+        // helper that reads only `\ge ` finds nothing here, which is why this guard checked two of the
+        // three benchmark constants for a round and not the third. `STREAM_KB_TARGET` said "the
+        // published per-stream memory TARGET" and printed it to an operator as "the doc's 35 KB
+        // target"; a reader comparing that sentence against the matrix has no way to tell a stale
+        // constant from a correct one.
+        let mut memory: Vec<f64> = Vec::new();
+        for line in doc.lines() {
+            let t = line.trim_start();
+            if t.starts_with('>') || t.contains("~~") {
+                continue;
+            }
+            if !line.contains("In-Flight Stream Memory") {
+                continue;
+            }
+            // Between dollars, and after the `<` — the bound's direction is not this guard's claim,
+            // only its magnitude is.
+            for (idx, _) in line.match_indices('<') {
+                let after = &line[idx + 1..];
+                let digits: String = after
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(v) = digits.parse::<f64>() {
+                    memory.push(v);
+                }
+            }
+        }
+        assert!(
+            !memory.is_empty(),
+            "no 'In-Flight Stream Memory' bound was found in docs/benchmark.md, so this guard is not \
+             reading the claim it was written for"
+        );
+        assert!(
+            memory.iter().any(|v| (*v - constant("STREAM_KB_TARGET")).abs() < 0.001),
+            "docs/benchmark.md publishes a per-stream memory bound of {memory:?} and STREAM_KB_TARGET \
+             is {}. The benchmark prints this constant to an operator as \"the doc's N KB target\", so \
+             a constant that is not the document's figure makes the projected RAM figure describe a \
+             bar nobody published.",
+            constant("STREAM_KB_TARGET")
+        );
     }
 
     /// A comment must not claim data goes to **Postgres**. There is none.
