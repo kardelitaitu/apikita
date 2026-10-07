@@ -1327,3 +1327,31 @@ scratch enumeration that guesses by basename will manufacture findings. Four did
 paragraphs above was deliberately **removed** rather than quoted: they are exactly the shape the guard
 looks for, and this file is scanned by the same family of checks. Writing an example of a bad citation
 requires describing it, not reproducing it.
+
+### A citation guard reads the first number of a range, and only the first
+
+`citations_in` finds `file.ext:NNN` in a Rust comment by scanning for the extension, walking back to
+the path, and reading **digits until they stop**. That is correct for the shape it was written for and
+blind to the shape the code actually uses in places — a range, `file.ext:NNN-MMM`.
+
+The extractor returns the path and the **first** number. The second is never read, so a range is
+validated at its opening line and at nothing else. Two consequences, and the second is the dangerous
+one:
+
+- **A range whose start is blank is caught**, which is what happened here. A constant added near the
+  top of `db.rs` moved every later line, and the guard reported two ranges pointing at a blank line
+  and a punctuation-only one.
+- **A range whose start still lands on something plausible is NOT caught**, and three of the five
+  ranges in that same comment were in exactly that state — shifted by the same amount, still
+  resolving to *some* line. Nothing distinguished them from correct ones. A citation that is wrong but
+  plausible is the failure mode the whole check exists for, and for a range the check cannot see it.
+
+**The fix was to remove the ranges rather than renumber them.** All five became symbol names —
+`reserve_balance_transaction`, `debit_usage_transaction`, `clamp_debit`, `record_usage` — which is
+what the guard's own failure message asks for and what survives the file growing.
+
+**Why this is worth a paragraph rather than a note.** The repository's answer to a drifted line number
+has been *"name the symbol"*, and this is a case where the guard's implementation quietly agreed with
+the weaker practice: it accepted ranges, so ranges accumulated, so five of them drifted at once. The
+lesson is not "ranges are bad" — it is that **a check which reads a prefix of its input lets the
+suffix rot**, and the place to look for that is any scanner that stops at the first match.

@@ -50,12 +50,29 @@ We must answer five concrete questions through empirical testing:
   - Single-writer serialisation on `topups` and `wallets` — `BEGIN IMMEDIATE` plus a
     conditional-`UPDATE` claim (the SQLite replacement for `SELECT ... FOR UPDATE`,
     which SQLite does not have).
-  - Connection pool saturation (`max_connections = 10` on 0.2 vCPU).
+  - Connection pool saturation (`max_connections = 8` on 0.2 vCPU — the value
+    `db.rs`'s `init_pool` actually sets).
   - Append-only write throughput on `ledger` and `usage_daily` upserts.
 * **Pass Criteria:**
   - Zero `SQLITE_BUSY` failures and zero write-transaction deadlocks.
   - Zero balance discrepancies: post-test reconciliation query returns 0 errors.
-  - $> 100\text{ settlements/sec}$ with connection pool size = 10.
+  - $> 100\text{ settlements/sec}$ with connection pool size = 8.
+
+> **These two figures said `10` until they were corrected, and nothing could have caught it.**
+> MEASURED: the code has never shipped `max_connections(10)` — `git log -S 'max_connections(10)'
+> -- server/src/db.rs` returns no commit — and the plan that specified the SQLite migration
+> (`plans/sqlite-migration.md`) states **8**, twice, alongside the contention measurement taken at 8.
+> The benchmark binary does not set a pool of its own, so there is no "different scenario" reading:
+> the number was simply wrong, and a pass criterion of *"> 100 settlements/sec at pool size 10"* was
+> never achievable against the shipped configuration.
+>
+> **Why it survived.** This document is triaged in `doc_claims.rs` as *"a record of one measurement,
+> not a contract"* — a reason about **line citations**, which is what that triage decides. A
+> configuration number stated as fact is a different kind of claim, and the triage reason does not
+> cover it. The nearest guard, `the_benchmark_doc_describes_a_command_the_binary_actually_has`,
+> couples this file to the **CLI**, not to the config, so nothing was ever looking at this digit.
+> `a_published_pool_size_is_the_pool_size_the_code_opens` now reads this line and the constant.
+
 
 ### Scenario 4: 100-Key Pool Under 429 Infiltration (Router Resilience)
 * **Target Endpoint:** Proxy router with 100 simulated upstream keys.
