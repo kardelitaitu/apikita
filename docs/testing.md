@@ -1430,3 +1430,44 @@ would have shipped reporting nothing.
 not "does it detect the bad input" but "does its detection survive the shell construct it is wrapped
 in". Counters, exit codes and arrays assigned inside a pipeline are all lost; the message may still
 print, which is what makes it look like it worked.
+
+### A pipeline reports the LAST command's exit code, so a gate can measure nothing
+
+The previous section records that a `while read` at the end of a pipeline runs in a subshell, so a
+counter assigned inside it is lost. This is the same construct failing in a **different and more
+dangerous** way, and it is worth separating because the symptom looks like success rather than
+silence.
+
+```sh
+$ DATABASE_URL="sqlite:///tmp/nope.db" sh tools/reconcile/reconcile.sh > /dev/null 2>&1; echo $?
+6
+$ DATABASE_URL="sqlite:///tmp/nope.db" sh tools/reconcile/reconcile.sh 2>&1 | tail -1 > /dev/null; echo $?
+0
+```
+
+The detector found a missing database and said so with exit **6**. Piped into `tail`, the shell reports
+**0** — because `$?` across a pipeline is the status of the **last** command, and `tail` succeeded at
+reading the output. A harness written that way cannot fail, and it will print `PASS` for a run whose
+subject exited non-zero. The detector is fine; the measurement is gone.
+
+**MEASURED, in this repository, in a throwaway script written to check the claim in this document.**
+Two reconcile cases were compared against `tools/reconcile-check/README.md` — *"a non-`sqlite` DSN |
+exit **2**"* and *"a missing database file | exit **6**"* — and both were reported as `MISMATCH`.
+Both are correct. The harness had appended `2>&1 | tail -2` to see the message, and that made every
+exit code `tail`'s. The finding was in the measurement, not in the tool.
+
+**The rule, for any harness that checks an exit code.** Never let the command under test be the
+non-final element of a pipeline. Capture the output to a file or a variable and let the command be the
+only thing whose status is read:
+
+```sh
+out=$(sh tools/reconcile/reconcile.sh 2>&1); rc=$?     # correct
+sh tools/reconcile/reconcile.sh 2>&1 | tail -2         # rc is tail's, always 0 here
+```
+
+**Why it belongs beside the subshell note.** Both are shell constructs that destroy the thing being
+measured, and both were found in the same round by mutating a guard and watching what it actually
+did. The subshell case fails by *not reporting* — the message prints and the counter does not move, so
+the guard exits 0 while naming a defect. This one fails by *reporting success* — the guard compares
+`0` against the expected code and finds nothing to complain about. Neither is visible by reading the
+guard; both are visible within one falsification attempt.
