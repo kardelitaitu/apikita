@@ -28,7 +28,13 @@ We must answer five concrete questions through empirical testing:
   - Pre-flight arithmetic and context window validation.
 * **Pass Criteria:**
   - $> 5,000\text{ req/sec}$ throughput on 0.2 vCPU.
-  - $p99 \le 2\text{ ms}$.
+  - $p99 \le 1.5\text{ ms}$ — the same figure as the **Key Validation Latency (p99)** row of the
+    metrics matrix below. This line previously stated a LARGER bar than the matrix, so the document
+    published two targets for one metric and neither the benchmark nor any guard read either. The
+    matrix figure is the one kept, because its warning and critical columns read as the refinement of
+    a single target. The superseded figure is quoted in the commit that reconciled them rather than
+    here: restating it as maths on this line put the old value back in the searchable text, which made
+    the guard that checks for exactly this contradiction unable to fail.
 
 ### Scenario 2: High-Concurrency SSE Streaming Passthrough (I/O & Memory Bound)
 * **Target Endpoint:** Active streaming proxy pipeline.

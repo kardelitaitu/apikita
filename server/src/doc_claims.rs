@@ -4680,6 +4680,116 @@ mod tests {
              moved.",
             constant("PUBLISHED_TTFT_ADDED_MS")
         );
+
+        // THE p99 ROW, AND THE DOCUMENT STATES IT TWICE WITH TWO DIFFERENT NUMBERS.
+        //
+        // This is the finding behind the guard rather than a tidy-up. MEASURED: `docs/benchmark.md`
+        // gives "Key Validation Latency (p99)" a target of `<= 1.5 ms` in the metrics matrix, AND a
+        // pass criterion of `p99 <= 2 ms` in Scenario 1's own section - one document, one metric, two
+        // bars - and nothing in the repository referenced EITHER. The benchmark measured an average
+        // and compared it to nothing.
+        //
+        // SO THIS ASSERTS TWO THINGS, and the second is the one that matters: the constant equals the
+        // MATRIX figure, and the document is FLAGGED if it still carries a second, different figure
+        // for the same metric. Reconciling the two is a decision about which bar is real, and this
+        // guard does not make it silently - it pins the choice that was made (the matrix, the later
+        // structured summary) and fails when the document contradicts it.
+        let mut latency_bar: Vec<f64> = Vec::new();
+        for line in doc.lines() {
+            let t = line.trim_start();
+            if t.starts_with('>') || t.contains("~~") {
+                continue;
+            }
+            if !line.contains("Key Validation Latency") {
+                continue;
+            }
+            for marker in ["\\le ", "\\ge ", "< ", "\\lt "] {
+                let mut rest = line;
+                while let Some(idx) = rest.find(marker) {
+                    let after = &rest[idx + marker.len()..];
+                    let digits: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.')
+                        .collect();
+                    if let Ok(v) = digits.parse::<f64>() {
+                        latency_bar.push(v);
+                    }
+                    rest = after;
+                }
+            }
+        }
+        assert!(
+            !latency_bar.is_empty(),
+            "no bound was found on the 'Key Validation Latency' row of docs/benchmark.md, so this guard \
+             is not reading the claim it was written for"
+        );
+        assert!(
+            latency_bar
+                .iter()
+                .any(|v| (*v - constant("PUBLISHED_P99_LATENCY_MICROS") / 1_000.0).abs() < 0.001),
+            "the 'Key Validation Latency (p99)' row of docs/benchmark.md states {latency_bar:?} ms and \
+             PUBLISHED_P99_LATENCY_MICROS is {} ms. The benchmark prints a latency verdict against that \
+             constant, so a reader comparing the printed line to the matrix is comparing one bar.",
+            constant("PUBLISHED_P99_LATENCY_MICROS") / 1_000.0
+        );
+
+        // THE SECOND FIGURE, WHICH MUST NOT BE THERE. Scenario 1's pass criteria are a DIFFERENT part
+        // of the same document, and MEASURED they stated a larger bar than the matrix for the same
+        // metric. This is the assertion that turns "one number stated twice" into "one number, and a
+        // contradiction if there is a second" - the whole point of the guard.
+        //
+        // EVERY CLAIM IS CHECKED, NOT ANY OF THEM, and that is a fix rather than a flourish. The first
+        // version asserted that SOME p99 line matched the constant - which the matrix row satisfies on
+        // its own, so MEASURED, changing the matrix to a different figure left the guard GREEN, and a
+        // second figure reintroduced in the scenario text left it green too. An `.any()` over a set of
+        // claims accepts one agreement as proof of all of them, which is the shape this file records
+        // as "the right thing appears somewhere" standing in for "every occurrence is right".
+        let mut scenario_bar: Vec<(&str, f64)> = Vec::new();
+        for line in doc.lines() {
+            let t = line.trim_start();
+            if t.starts_with('>') || t.contains("~~") {
+                continue;
+            }
+            // EVERY p99 latency claim in the document, matrix row included. The matrix row names the
+            // metric; a pass criterion just says `p99`. Both are claims about one number.
+            let is_claim = line.contains("Key Validation Latency")
+                || (line.contains("p99") && (line.contains("\\le ") || line.contains("<=")));
+            if !is_claim {
+                continue;
+            }
+            for marker in ["\\le ", "<="] {
+                if let Some(idx) = line.find(marker) {
+                    let after = &line[idx + marker.len()..];
+                    let digits: String = after
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.')
+                        .collect();
+                    if let Ok(v) = digits.parse::<f64>() {
+                        scenario_bar.push((line.trim(), v));
+                    }
+                    break;
+                }
+            }
+        }
+        assert!(
+            scenario_bar.len() >= 2,
+            "only {} p99 latency claim(s) were found in docs/benchmark.md and this guard expects at \
+             least the matrix row and one pass criterion. A scan that matches fewer is not reading the \
+             document, and the comparison below would pass over everything",
+            scenario_bar.len()
+        );
+        for (line, v) in &scenario_bar {
+            assert!(
+                (*v - constant("PUBLISHED_P99_LATENCY_MICROS") / 1_000.0).abs() < 0.001,
+                "docs/benchmark.md states a p99 latency target of {v} ms here: {line:?}. Every other \
+                 claim must be {} ms - the metrics matrix's figure, which this guard pins because it is \
+                 the later, structured summary. One metric with two targets is how a reader ends up \
+                 comparing a benchmark against a bar nobody else is using. Reconcile them, and change \
+                 PUBLISHED_P99_LATENCY_MICROS with the matrix if the other figure is the real one.",
+                constant("PUBLISHED_P99_LATENCY_MICROS") / 1_000.0
+            );
+        }
     }
 
     /// A comment must not claim data goes to **Postgres**. There is none.

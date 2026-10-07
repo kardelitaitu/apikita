@@ -80,10 +80,37 @@ async fn bench_hot_path_key_validation() {
     );
     println!("    Throughput : {:>10} ops/sec", ops_per_sec);
     println!("    Avg Latency: {:>10.3} µs/op", avg_latency_micros);
-    if ops_per_sec >= 10_000 {
-        println!("    Status     : [PASS] Exceeds 0.2 vCPU threshold (>10,000 ops/sec)\n");
+    if ops_per_sec >= MIN_HOT_PATH_OPS_PER_SEC {
+        println!(
+            "    Status     : [PASS] Exceeds 0.2 vCPU threshold (>{} ops/sec)\n",
+            MIN_HOT_PATH_OPS_PER_SEC
+        );
     } else {
-        println!("    Status     : [WARN] Below target\n");
+        println!(
+            "    Status     : [WARN] {ops_per_sec} ops/sec is below the {MIN_HOT_PATH_OPS_PER_SEC} \
+target\n"
+        );
+    }
+
+    // THE LATENCY ROW, which was measured and never compared.
+    //
+    // WHAT THIS COMPARES, and the limit stated rather than implied: an AVERAGE against a p99 bar. An
+    // average below the p99 target does not prove the 99th percentile is, so a PASS here means "the
+    // mean is inside the bar" - strictly weaker than the matrix's claim, and the honest version of a
+    // line that previously said nothing. Computing a real p99 needs a per-iteration histogram this
+    // loop does not keep; the caption says AVERAGE for that reason.
+    if avg_latency_micros <= PUBLISHED_P99_LATENCY_MICROS {
+        println!(
+            "    Latency    : [PASS] mean {avg_latency_micros:.3} µs/op is within the published p99 \
+<= {} ms (mean, not p99 - see the caveat above)\n",
+            PUBLISHED_P99_LATENCY_MICROS / 1_000.0
+        );
+    } else {
+        println!(
+            "    Latency    : [BELOW TARGET] mean {avg_latency_micros:.3} µs/op exceeds the published \
+p99 <= {} ms - the MEAN is already outside the percentile bar, so the p99 certainly is\n",
+            PUBLISHED_P99_LATENCY_MICROS / 1_000.0
+        );
     }
 }
 
@@ -208,6 +235,28 @@ const CHUNK_INTERVAL_MS: u64 = 5;
 /// Quoted from the matrix rather than derived, so a reader comparing the printed verdict against the
 /// document is comparing one bar and not two. `doc_claims` couples it to the row.
 const PUBLISHED_TTFT_ADDED_MS: u64 = 10;
+
+/// The hot-path throughput floor this scenario compares against, in ops/sec.
+///
+/// MEASURED: this was a bare `10_000` in the branch AND spelled out again in the message that branch
+/// prints (`">10,000 ops/sec"`), so the number was stated twice within four lines and the reader had
+/// no name to look up. It is not one of the matrix rows - the matrix's CPU row is a percentage, not a
+/// throughput - so it is named for the caption rather than coupled to a document figure.
+const MIN_HOT_PATH_OPS_PER_SEC: u64 = 10_000;
+
+/// The published p99 key-validation latency, in MICROSECONDS, from the metrics matrix.
+///
+/// WHY THIS EXISTS AT ALL, and why it is the matrix's figure rather than Scenario 1's. MEASURED:
+/// `docs/benchmark.md` states this metric TWICE and with two different numbers - Scenario 1's pass
+/// criteria say `p99 <= 2 ms` while the metrics matrix says `<= 1.5 ms` - and NOTHING in the
+/// repository referenced either. The scenario measured an AVERAGE and compared it to nothing.
+///
+/// THE MATRIX FIGURE IS THE ONE TAKEN because it is the later, structured summary of the same
+/// document, and because its warning and critical columns (5.0 / 20 ms) only make sense as the
+/// refinement of a single target. That is a choice, and it is recorded here rather than made silently:
+/// a reader who believes Scenario 1 governs should change this constant AND the matrix row together,
+/// which is what the coupling guard exists to make visible.
+const PUBLISHED_P99_LATENCY_MICROS: f64 = 1_500.0;
 
 /// The published webhook-signature throughput floor, in signatures per second.
 ///
