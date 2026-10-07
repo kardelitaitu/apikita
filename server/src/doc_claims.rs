@@ -4384,6 +4384,78 @@ mod tests {
         }
     }
 
+    /// `docs/benchmark.md` publishes the connection pool size as a capacity figure, so it must be the
+    /// pool size the code opens.
+    ///
+    /// WHY THIS EXISTS. MEASURED: that document said `max_connections = 10` — twice, once as what
+    /// Scenario 3 "stresses" and once inside its pass criterion, *"> 100 settlements/sec with
+    /// connection pool size = 10"* — while `db::POOL_MAX_CONNECTIONS` is **8**. No commit has ever
+    /// shipped 10 (`git log -S 'max_connections(10)' -- server/src/db.rs` is empty) and
+    /// `plans/sqlite-migration.md` states 8, once as the pool and once inside the contention
+    /// measurement that justifies the value. So the published figure was never true and the pass
+    /// criterion built on it was never achievable.
+    ///
+    /// WHY NOTHING CAUGHT IT, which is the part worth keeping. `benchmark.md` is TRIAGED as "a record
+    /// of one measurement, not a contract" — and that reason is about **line citations**, which is
+    /// what the triage list decides. A configuration number stated as fact is a different kind of
+    /// claim, and a reason about citations does not cover it. The nearest guard,
+    /// `the_benchmark_doc_describes_a_command_the_binary_actually_has`, couples this document to the
+    /// benchmark **binary's CLI**, not to the config. Between a triage reason that did not apply and
+    /// a sibling guard pointed elsewhere, the digit had no owner.
+    ///
+    /// WHAT IT READS. The document, and the constant — not a copy of either. A hardcoded 8 here would
+    /// be the hand-kept figure this repository has had to rebuild repeatedly, so the assertion is
+    /// equality between the two sources rather than a check of one against a literal.
+    #[test]
+    fn a_published_pool_size_is_the_pool_size_the_code_opens() {
+        let doc = std::fs::read_to_string(doc_path("benchmark.md"))
+            .expect("docs/benchmark.md must be readable, or this passes over nothing");
+
+        // Every `max_connections = N` and `pool size = N` in the document, in either shape it uses.
+        let mut stated: Vec<(&str, u32)> = Vec::new();
+        for line in doc.lines() {
+            let t = line.trim_start();
+            // A quoted correction may name the old value; those are not live claims.
+            if t.starts_with('>') || t.starts_with("~~") || t.contains("~~") {
+                continue;
+            }
+            for (needle, label) in [
+                ("max_connections = ", "max_connections ="),
+                ("connection pool size = ", "connection pool size ="),
+            ] {
+                let mut rest = line;
+                while let Some(idx) = rest.find(needle) {
+                    let after = &rest[idx + needle.len()..];
+                    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = digits.parse::<u32>() {
+                        stated.push((label, n));
+                    }
+                    rest = after;
+                }
+            }
+        }
+
+        assert!(
+            stated.len() >= 2,
+            "the scan found {} pool-size statement(s) in docs/benchmark.md and expects at least the \
+             two this guard was written for. A scan that matches nothing passes over everything.",
+            stated.len()
+        );
+
+        for (label, n) in &stated {
+            assert_eq!(
+                *n,
+                crate::db::POOL_MAX_CONNECTIONS,
+                "docs/benchmark.md states `{label} {n}` and the code opens \
+                 `db::POOL_MAX_CONNECTIONS` = {}. A published capacity figure that does not match \
+                 the shipped pool size makes every pass criterion derived from it unachievable — \
+                 which is exactly how the `10` here survived. Update the document and, if the pool \
+                 really should move, the constant — but they are one number stated twice, not two.",
+                crate::db::POOL_MAX_CONNECTIONS,
+            );
+        }
+    }
+
     /// A comment must not claim data goes to **Postgres**. There is none.
     ///
     /// WHY THIS EXISTS. `hash_token`'s doc comment said the plaintext "never reaches Postgres", and

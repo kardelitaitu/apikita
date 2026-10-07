@@ -56,6 +56,23 @@ use uuid::Uuid;
 /// sits beside the import rather than in a document somewhere.
 const _UUID_TEXTS_ARE_HYPHENATED: () = ();
 
+/// How many connections the application pool opens.
+///
+/// A named constant rather than a literal in the builder chain, for one reason: it is a number a
+/// **document states**. `docs/benchmark.md` publishes it as a capacity figure — "connection pool
+/// saturation (`max_connections = N`)" and a pass criterion of "> 100 settlements/sec with
+/// connection pool size = N". A literal can be read by a test only by parsing source text; a
+/// constant can be compared to the document directly, which is what
+/// `a_published_pool_size_is_the_pool_size_the_code_opens` does.
+///
+/// MEASURED: that document said **10** while this code said **8**, and nothing was looking. No
+/// commit has ever shipped 10, and the plan that specified the migration states 8 — so the published
+/// figure was never true, and the pass criterion attached to it was never achievable. That is what
+/// the constant exists to prevent recurring.
+///
+/// The reasoning behind the value itself is in `init_pool`'s doc comment below.
+pub const POOL_MAX_CONNECTIONS: u32 = 8;
+
 /// Opens the application pool.
 ///
 /// The options are not decoration. Each is a measured trap from the plan's
@@ -115,7 +132,7 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .foreign_keys(true);
 
     SqlitePoolOptions::new()
-        .max_connections(8)
+        .max_connections(POOL_MAX_CONNECTIONS)
         .connect_with(options)
         .await
 }
@@ -3936,15 +3953,22 @@ mod tests {
     /// The identity that ties the two rules together, derived from the code:
     ///
     ///   * `reserve_balance_transaction` already wrote `-held` when the
-    ///     request started (db.rs:276-284).
+    ///     request started.
     ///   * `debit_usage_transaction` releases the hold IN FULL - `released_idr`
-    ///     is the whole hold, or 0 when nothing was held (db.rs:326-343) - and
-    ///     charges what the clamp allows: `charged_idr` is
-    ///     `clamp_debit(cost, available).0` (db.rs:694-735 on the partial path;
-    ///     db.rs:390-402 passes the full cost on the settled path, where the
-    ///     guard already proved it affordable, so the clamp returns it whole).
-    ///   * `record_usage` writes `settlement_ledger_deltas(released, charged)`
-    ///     (db.rs:441).
+    ///     is the whole hold, or 0 when nothing was held - and charges what the
+    ///     clamp allows: `charged_idr` is `clamp_debit(cost, available).0` on the
+    ///     partial path, while the settled path passes the full cost, the guard
+    ///     having already proved it affordable, so the clamp returns it whole.
+    ///   * `record_usage` writes `settlement_ledger_deltas(released, charged)`.
+    ///
+    /// The five citations here were LINE RANGES into this same file, and they were
+    /// replaced by names for the reason `docs/testing.md` gives: a range into the file
+    /// that contains it re-points whenever anything above it grows, and `citations_in`
+    /// reads only the FIRST number of a range, so the guard could never have caught the
+    /// drift. Adding `POOL_MAX_CONNECTIONS` near the top of this file moved all five,
+    /// and the guard reported two of them as pointing at blank or punctuation-only lines.
+    /// The other three happened to still land somewhere plausible, which is the worse
+    /// outcome and the one a line number cannot rule out.
     ///
     /// So the whole request's net ledger move is
     ///
