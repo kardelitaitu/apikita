@@ -2104,3 +2104,65 @@ same shape as the others: **the pattern found the words, not the setting.**
 a codebase riddled with panics; the 49 still named functions called `the_forgery_tool_sends_...` as
 production. A count is not a finding until the classifier has been checked against a case whose answer
 is known, and the case here was `money.rs`, whose `#[cfg(test)] mod tests` opens at a line I could read.
+
+### Two `#[cfg(test)]` shapes that look like defects and are not
+
+Last round's classifier bug was caused by `#[cfg(test)]` appearing more than once in a file. **18** files
+have multiple occurrences, so each is worth a look — and **the pattern is legitimate in both shapes
+found.**
+
+**Shape 1: a gated ITEM, not a gated module.** `upstream/key_pool.rs` has seven `#[cfg(test)]`
+attributes and only one of them is on a `mod`:
+
+| line | what it gates |
+| --- | --- |
+| 39 | a struct field, `clock_offset` |
+| 71, 83 | an `impl` block and its `advance` method |
+| 168, 175 | a second struct's field, impl and `advance` |
+| 239 | `mod tests` |
+
+83 gated items across 34 files. The `clock_offset` field exists only under test so the pool can be
+driven through a virtual clock without a sleep, and its absence in production is the point.
+
+**Shape 2: the same method name on two different types.** A name-based shadow check flagged three
+cases, all `fn advance`, in `circuit_breaker.rs` and `key_pool.rs`. Reading them shows the opposite of
+duplication — the second delegates to the first:
+
+```
+KeyPoolPolicy::advance   -> *offset += elapsed          (owns the clock)
+KeyPool::advance         -> self.policy.advance(elapsed) (forwards)
+```
+
+Two types, one clock, no copied logic. A check that matched on names rather than types reported a
+finding that was not there — the same class as the other six text-matching false negatives this
+session, and worth adding because it is the first one where the *name* was the wrong key rather than
+the *punctuation*.
+
+### And the failure path, which is what "reliable" is really about
+
+The failure a wallet service actually sees is the database going away. MEASURED, all four parts:
+
+| where | what it does |
+| --- | --- |
+| connection setup | `journal_mode(WAL)`, `synchronous(Normal)`, `busy_timeout(5s)`, `foreign_keys(true)` |
+| `/health` on success | `200 {"status": "healthy", "database": "connected"}` |
+| `/health` on failure | `503 {"status": "degraded", "database": "database unavailable"}` — a **fixed string** |
+| the driver error | `error = %err` at `error!` level — to the LOG, never to the caller |
+
+The test that pins it, `a_database_failure_reports_degraded_without_leaking_the_driver_error`, asserts
+the status, the `status` field, and then scans the serialised body for **sixteen** leak strings —
+`apikita_probe`, `sqlite`, `unable to open`, `database file`, `secret`, `127.0.0.1`, `postgres`,
+`sqlx`, `connection`, `connect`, `refused`, `pool`, `timeout`, `timed out`, `os error`, `select` — and
+finally that the body contains **no ASCII digit at all**. `postgres` is in the list deliberately: if the
+constant ever regressed to naming an engine, the test still catches it.
+
+**Two of my own checks on this failed, and both were my regex.** One looked for the driver error being
+excluded by a pattern the code does not use; the other asked for a body-shape assertion written
+differently. The test names said what was covered, and reading the test confirmed it.
+
+**And two of this section's own numbers were wrong when first written.** It said 15 files where the
+count is 18, and 17 leak strings where the count is 16. The first came from my own earlier listing being
+truncated by a `-First 15` display limit — I recorded the size of the *output* as the size of the
+*sets*, which is the same mistake as the fixed-window slice two rounds ago. The second was arithmetic
+done by eye over a list of sixteen items. Both were caught by the verification pass, which is the only
+reason the section does not ship with them.
