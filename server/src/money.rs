@@ -1487,8 +1487,8 @@ mod tests {
     /// transcribes both that formula and `MidtransNotification` verbatim from `money.rs`. That is two
     /// copies of a SECURITY formula, the exact restatement shape this repository keeps finding - and
     /// unlike the price card or the retention windows, nothing read either copy. MEASURED: the tool is
-    /// named by no `tools/*/check.sh`, so it is never executed by CI. It is run by hand, against a
-    /// live server, which is the moment a drift is most expensive to diagnose.
+    /// named by no `check.sh` under `tools/`, so it is never executed by CI. It is run by hand, against
+    /// a live server, which is the moment a drift is most expensive to diagnose.
     ///
     /// WHAT A DRIFT WOULD LOOK LIKE, and why the wrong diagnosis is the likelier one. If the server's
     /// concatenation order changed, the tool would keep producing a syntactically valid signature that
@@ -1680,8 +1680,8 @@ mod tests {
              deserializes {struct_fields:?}. This struct has NO `deny_unknown_fields` and \
              `fraud_status` is an Option, so a renamed field does not error - the tool sends a key the \
              server ignores and the request either fails as `invalid_request` or is ACCEPTED with the \
-             value silently absent. The tool is named by no `tools/*/check.sh`, so this drift would \
-             surface only when someone ran it by hand and read a refusal as a broken webhook."
+             value silently absent. The tool is named by no `check.sh` under `tools/`, so this drift \
+             would surface only when someone ran it by hand and read a refusal as a broken webhook."
         );
     }
 }
