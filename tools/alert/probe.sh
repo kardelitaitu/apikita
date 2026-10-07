@@ -1,27 +1,42 @@
 #!/bin/sh
-# apikita alert probe - the three docs/observability.md alerts that need NO database.
+# apikita alert probe - the docs/observability.md alerts that need NO database.
 #
-# docs/observability.md:97-107 lists 9 alerts. tools/alert/check-alerts.sh runs the
-# three answerable with psql alone and PRINTS the rest as not-checked. Of those
-# seven, three never needed a metrics backend - they needed a prober:
+# MEASURED, because this header said "the three" while the script had grown to seven and its own
+# `--list` printed the seven. The counts below are read from the files, not remembered:
+#
+#   alerts.tsv            11 definitions   <- the registry; the single place a threshold lives
+#   this script            7 code paths     <- what `--list` prints, per check
+#   check-alerts.sh       11 definitions   <- names every one, and runs the database-backed set
+#
+# A script whose header understates what it does is the same defect as a document that
+# understates a pipeline: a reader trusts the number instead of the output.
+#
+# The checks that needed a prober rather than a database connection:
 #
 #   api_down          - external GET /health, alert after a 2-minute window of failures
 #   relay_down        - external check against the relay's own origin
 #   webhook_rejection - the server's captured stdout, counted for topup.rejected
+#   refund_refusal    - the same stdout, counted for refund.refused
+#   error_rate        - GET /api/admin/metrics, operator-authenticated
+#   all_providers_unhealthy - the same route: every endpoint's breaker open
+#   db_disk           - the same route: retention lag, which is the alert's own ACTION
 #
-# This script is that prober, and it opens NO DATABASE CONNECTION - deliberately.
-# The stack is being migrated from PostgreSQL to SQLite (a concurrent change under
-# server/), and an alert path that goes blind during a database migration is blind
-# at the worst possible moment. Nothing here knows what a DSN is.
+# A check that is configured but cannot run prints **skipped** and says why, which is the
+# property this directory exists for - see the note above `--list`.
+#
+# This script opens NO DATABASE CONNECTION - deliberately. The stack is being migrated from
+# PostgreSQL to SQLite (a concurrent change under server/), and an alert path that goes blind
+# during a database migration is blind at the worst possible moment. Nothing here knows what a
+# DSN is.
 #
 # Delivery is NOT reimplemented. Every firing is routed through alert.sh --alert <id>,
 # so the cooldown, the channel precedence and the delivery exit codes stay in ONE
 # place. See tools/alert/README.md.
 #
 # Usage:
-#   probe.sh                          # all three checks
+#   probe.sh                          # every check
 #   probe.sh --check api_down         # one check (repeatable)
-#   probe.sh --list                   # the three, and whether each can run
+#   probe.sh --list                   # every check, and whether each can run
 #   probe.sh --help
 #
 # Exit codes - check-alerts.sh's table, so an operator learns one numbering:
