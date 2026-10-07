@@ -250,6 +250,29 @@ if [ "$build_at" -ge "$tests_at" ]; then
 fi
 
 # AND THE DOCUMENT, in the same order, because a reader follows the table rather than the YAML.
+#
+# THE DOC SIDE NEEDED THE SAME UNIQUENESS ASSERTION AS THE WORKFLOW SIDE, and MEASURED, it did not have
+# one. The workflow rows are counted above; the table rows were read with `head -n 1` and trusted.
+# MEASURED: appending a SECOND `| Build website |` row at the END of the table - so the document's LAST
+# build row runs after the tests row - left this script at exit 0, while the equivalent duplicate in the
+# workflow FAILS with a message naming the count. One shape, two halves, one of them fixed.
+#
+# A duplicate in the table is the same defect as a duplicate in the workflow: the ordering assertion
+# compares the FIRST occurrence of each, so a later row can be wrong while the pair it reads is still
+# correctly ordered. The document is the half a reader reproduces, so it is the half where a wrong row
+# is most likely to be acted on.
+for pair in "Build website:$DOC" "Website contract tests:$DOC"; do
+    label=${pair%%:*}
+    file=${pair##*:}
+    n=$(grep -c "^| ${label} " "$file" || true)
+    if [ "$n" -ne 1 ]; then
+        echo "ci-docs-check: FAIL - docs/ci-cd.md has $n table row(s) starting '| ${label} '." >&2
+        echo "ci-docs-check:   The ordering check below reads only the FIRST, so a second row can run" >&2
+        echo "ci-docs-check:   the step in the wrong place while the pair it compares is still ordered." >&2
+        echo "ci-docs-check:   Exactly one row per step, or the order a reader reproduces is unchecked." >&2
+        exit 1
+    fi
+done
 doc_build=$(grep -n '^| Build website ' "$DOC" | head -n 1 | cut -d: -f1)
 doc_tests=$(grep -n '^| Website contract tests ' "$DOC" | head -n 1 | cut -d: -f1)
 if [ -n "$doc_build" ] && [ -n "$doc_tests" ] && [ "$doc_build" -ge "$doc_tests" ]; then
