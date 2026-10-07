@@ -1471,3 +1471,36 @@ did. The subshell case fails by *not reporting* — the message prints and the c
 the guard exits 0 while naming a defect. This one fails by *reporting success* — the guard compares
 `0` against the expected code and finds nothing to complain about. Neither is visible by reading the
 guard; both are visible within one falsification attempt.
+
+### No gate uses `set -e`, and every gate runs a command that fails on purpose
+
+Seventeen shell scripts under `tools/` open with `set -u`. **None uses `set -e`.** That is not an
+oversight and it is not documented anywhere, which makes it the kind of consistency a later tidy-up
+removes.
+
+```sh
+$ node -e "..."        # add -e to the existing `set -u` line, run the gate
+   tools/alert-check/check.sh    with set -eu: exit 1   *** ABORTS ***
+   tools/reconcile-check/check.sh with set -eu: exit 1  *** ABORTS ***
+   tools/backup-check/check.sh   with set -eu: exit 6   *** ABORTS ***
+```
+
+All three abort on a **clean tree**, where they exit 0 without it. MEASURED, and the reason is
+structural: every one of these scripts exists to run a **detector whose non-zero exit is the
+finding**. `reconcile.sh` returns 1 for drift, 2 for a bad DSN, 5 for a stranded hold, 6 for a missing
+file. A gate captures those codes and compares them; `set -e` would abort the gate the first time a
+detector reported exactly what the gate was built to look for.
+
+**So the two flags are not a pair and should not be treated as one.** `set -u` catches an unset
+variable, which is always a bug in a script like this. `set -e` turns an expected result into a fatal
+one. The distinction is the same one the `while read` and pipeline notes record: a shell construct
+that destroys the measurement, in this case by ending the script before it can compare anything.
+
+**What to do instead of adding `-e`.** Where a gate genuinely needs a command not to fail, it says so
+locally - `|| true`, or `if ! cmd; then`, or an explicit code comparison. Those are visible at the call
+site and carry their reason; a global `-e` would make every detector fatal and silence the ones that
+matter.
+
+**Why it is worth writing down.** The strongest argument for `set -e` is that it is the recommended
+default, so a reviewer who sees seventeen scripts without it will read the absence as an oversight
+rather than as the property being tested here. The measurement above is what makes it a decision.
