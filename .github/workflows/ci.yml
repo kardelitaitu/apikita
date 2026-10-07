@@ -986,6 +986,27 @@ jobs:
       - name: Check the wind-down payout report
         run: sh tools/wind-down-check/check.sh
 
+      # EVERY NUMBER A DOCUMENT STATES ABOUT THE CODE MUST BE THE NUMBER THE CODE HAS.
+      #
+      # docs/benchmark.md published a capacity figure of "connection pool size = 10" and a pass
+      # criterion built on it, while `db::POOL_MAX_CONNECTIONS` is 8. MEASURED: no commit has ever
+      # shipped 10, so the figure was never true and the criterion was never achievable.
+      #
+      # Nothing compared them and nothing could. The citation guard over docs/ checks LINE
+      # references; benchmark.md is excluded from it by a triage reason about CITATIONS ("a record
+      # of one measurement, not a contract"), so its numbers were unread for a different reason that
+      # the triage reason does not cover. The nearest guard couples that document to the benchmark
+      # BINARY's CLI, not to the config. The digit had no owner.
+      #
+      # The sweep reads every markdown file under docs/ for `<config_key> = <number>` and
+      # `<CONSTANT> = <number>`, and compares against config/apikita.toml and the server's `pub
+      # const`s. It has a floor (8 comparable statements, measured 10) because it also has a filter
+      # for statements about NON-SHIPPED settings - `config.rs` reads 0 as "off" for two keys, and
+      # three documents state `<key> = 0` while describing exactly that. A filter can hide a class of
+      # row, so a scan that finds too few FAILS rather than passing quietly.
+      - name: Check the figures the documents state
+        run: sh tools/doc-figures/check.sh
+
       # The CI document must describe the pipeline that actually runs.
       #
       # docs/ci-cd.md listed TEN stages while the workflow ran TWENTY-SIX: the seven

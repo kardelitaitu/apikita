@@ -95,6 +95,7 @@ and this table would still describe it in the present tense.
 | Check the rollback drill | A "rollback" that certifies a schema the old binary cannot run | The rehearsal proves nothing while printing PASS |
 | Check the alert delivery contract | A failed delivery that silences its own retry | Alerts stop arriving and nothing says so |
 | Check the wind-down payout report | A payout figure that is off by one IDR, or priced at a rate nobody froze | Closure is done by hand, so nothing downstream catches the mistake |
+| Check the figures the documents state | A number a document publishes about the code, that the code does not have | `benchmark.md` stated a pool size of 10 for the whole life of a file that has only ever opened 8, and the pass criterion built on it was never achievable |
 | **Check the CI documentation** | This table going stale | An understated pipeline sends people around CI |
 | Secret scan | A committed key, and an inlined `PUBLIC_*` secret | The value ships to every visitor |
 

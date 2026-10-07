@@ -47,6 +47,7 @@ here must appear, and every name listed must exist.
 | Tool | What it is for | Runs in CI |
 | --- | --- | --- |
 | [`compose-check/`](compose-check/README.md) | Validates the deployment definition and the invariants its comments call load-bearing. | Yes |
+| [`doc-figures/`](doc-figures/README.md) | Every number a document states about a config key or a Rust constant is the number the code has. | Yes |
 | [`ci-docs-check/`](ci-docs-check/README.md) | Asserts the CI document describes the pipeline that actually runs — including this file. | Yes |
 
 ## Local scaffolding — not checks
