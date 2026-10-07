@@ -1504,3 +1504,108 @@ matter.
 **Why it is worth writing down.** The strongest argument for `set -e` is that it is the recommended
 default, so a reviewer who sees seventeen scripts without it will read the absence as an oversight
 rather than as the property being tested here. The measurement above is what makes it a decision.
+
+### Four ways a schema sweep accuses correct code
+
+A sweep compared `server/migrations/*.sql` against the schema decisions recorded in
+`docs/plans/sqlite-migration.md`. It produced **four false positives and no real finding**, and each
+one is a different way to read the wrong thing. They are worth separating because the fix in every
+case was to change the *question*, not the answer.
+
+**1. Prose matching a type check.** The rule "no `REAL`/`FLOAT`/`NUMERIC`/`DECIMAL` column exists" was
+run against the whole file with a case-insensitive pattern. It matched **two comment lines**:
+
+```
+-- at most one code is live at a time - a real security property, since two live
+-- schema-inventory guard in `doc_claims.rs` would read as a real table: that
+```
+
+MEASURED: `git grep -E '\b(REAL|FLOAT|...)\b' server/migrations` returns nothing. The type is absent;
+the *word* is present, in prose, twice. **A check over source text must strip comments before it can
+be a check about code** — the same rule `strip_comments` exists for elsewhere in this repository.
+
+### Two comment strippers, two failure modes, and only one of them is worth guarding
+
+There are FOUR comment strippers here - one in `doc_claims.rs`, three in `website/tests` - and MEASURED,
+no test anywhere fed one an input. They are trusted components: every guard that reads stripped text
+reads *their* judgement about what is code. A stripper that removes too much makes those guards pass on
+code they never saw; too little makes them fire on prose; both are silent from the caller's side.
+
+They are two DIFFERENT DESIGNS, and the difference decides which failures are possible:
+
+**Character scanners** (`doc_claims.rs`, `credit-expiry-claim`, `session-body-claim`) walk the string
+with a `depth` counter. A block-comment OPENER reached outside a line comment opens a comment that is
+never closed, so the scanner ends "inside" it and everything after disappears. MEASURED: a doc comment
+carrying the glob `tools` + star + `/check.sh` did exactly that. `credit-expiry-claim` concatenates
+every file in walk order, so the runaway swallowed a whole module and the guard reported a missing
+`UPDATE` about a file nothing had touched.
+
+**Regex strippers** (`doc-counts`) use a non-greedy `/*...*/` replace. That cannot run away: an opener
+with no closer at all is simply not matched, and the text survives. MEASURED against eight inputs
+including the glob, a string holding half a marker, and a URL - all eight kept the code.
+
+Which is why the guard added for this lives in `doc_claims.rs` and scans `server/src`: that is where the
+character scanners read from, so one guard covers the reachable risk for three callers. Guarding the
+regex stripper would have been work on the shape that cannot fail.
+
+**AND THE REGEX FORM HAS ITS OWN, SMALLER HOLE, WHICH IS RECORDED RATHER THAN FIXED.** A `/*` inside one
+string and a `*/` inside a DIFFERENT string, with code between them, is a balanced pair the regex
+deletes - it cannot tell a marker in a string from a comment. MEASURED: `const a = "/*";` followed by
+`const b = "*/";` removes the line between them. Whether it is reachable is a separate question from
+whether it is possible, and MEASURED over the 81 files that stripper reads, NO file loses a line of
+code to it. So the hole is real, unreachable on this tree, and left alone - with the reason stated,
+because "unreachable today" and "cannot happen" are different claims and only the first is true.
+
+**2. A constraint that spans lines.** "Every nullable date column permits NULL explicitly" searched
+the remainder of the column's own line. **MEASURED: nine declarations** put the branch on the next
+line:
+
+```
+  revoked_at   TEXT CHECK (revoked_at IS NULL
+                           OR revoked_at GLOB '????-??-??T??:??:??*+00:00')
+```
+
+Every one of the nine is correct, and all nine were reported as violations. A declaration is not a
+line; it runs to the next column or the closing paren.
+
+**3. A column name is not a key — and this is the dangerous one.** Twenty names in this schema appear
+in **more than one table**: `id` ×13, `created_at` ×14, `account_id` ×14, `revoked_at` ×2,
+`expires_at` ×5, `day` ×3. A sweep that looks a column up **by name** will find the first match, which
+may be a different table's declaration entirely — so it can report a table as compliant using another
+table's constraint, or flag one using another's. The first version of this check did exactly that
+with `last_seen_at`, whose ordering made the naive lookup land on a `NOT NULL` occurrence while
+another table's was nullable.
+
+The repair is to parse **per table**: split each `CREATE TABLE` body on top-level commas (tracking
+paren depth, so a `CHECK (...)` containing a comma does not split a column), then verify each column
+inside its own table. Nothing may be looked up by name alone.
+
+**4. A format that is narrower on purpose.** "Every date column carries the datetime `GLOB`" flagged
+three `day` columns, which use `GLOB '????-??-??'` — a **date**, not a timestamp. They are day
+buckets (`key_ip_daily`, `key_ip_seen`, `usage_daily`), the plan specifies the date-only pattern for
+all three, and requiring a time component would be wrong. A rule about "date and time columns" has to
+accept that the two are different.
+
+**What the sweep did establish, on the second attempt.** With comments stripped, declarations read
+across line breaks, tables parsed individually, and the day format allowed: every date column is
+either `NOT NULL` or nullable **with an explicit `CHECK (col IS NULL OR col GLOB ...)` branch** —
+**ten** of them, each a state the column is genuinely in before something happens: `revoked_at`,
+`expires_at`, `last_used_at`, `settled_at`, `used_at`, `withdrawn_at`, `verified_at`, `consumed_at`,
+`credit_expires_at`, `credit_retired_at`. All six `*_idr` money columns are `INTEGER`. No
+floating-point storage type exists anywhere. The two composite primary keys are fully `NOT NULL`, so
+the plan's measured "trap 3" — a NULL in a composite key duplicating rows — is closed in the shipped
+schema.
+
+> **The count in this paragraph was wrong when first written, and the way it was wrong is the fifth
+> instance of the same mistake.** It said **seven**, from a pattern that required the NULL branch to
+> sit on the column's own line. Flattening the whitespace first finds **ten** — the three it missed
+> (`verified_at`, `credit_expires_at`, `credit_retired_at`) all live in the later migrations, where
+> the branch is wrapped. So the *list* in the first draft was also three short, and the sentence
+> meant to summarise the repair was itself an example of the defect it describes. Reading a
+> declaration as a line is the error, listed above as item 2; writing the summary is where it
+> recurred.
+
+**The lesson, which is not about SQL.** Four checks, four false positives, zero defects: the sweep was
+the unreliable component, not the schema. A checker that has not been run against known-good input has
+not been tested — it has only been written. Every one of these four would have been caught by pointing
+the check at a file whose answer was already known.
