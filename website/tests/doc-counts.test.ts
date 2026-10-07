@@ -175,7 +175,7 @@ test('every exported function in src/lib is called somewhere', () => {
  * So this figure is updated WITH the run that changes it. That is a smaller guarantee than the server
  * count now carries, and it is stated rather than implied.
  */
-const WEBSITE_TESTS = 232;
+const WEBSITE_TESTS = 236;
 
 /**
  * The server count, and the same kind of literal for the same reason.
@@ -309,6 +309,54 @@ test('every doc states the measured website test count', () => {
       `${file} must state "${needle}" (the suite reports ${WEBSITE_TESTS})`,
     );
   }
+});
+
+/**
+ * `WEBSITE_TESTS` CANNOT BE VERIFIED FROM INSIDE THIS SUITE, and this test records that rather than
+ * pretending otherwise.
+ *
+ * The server count has a link to reality: `cargo test --lib -- --list` enumerates the tests and runs
+ * none of them, so a test here can shell out and compare. `node --test` has NO LIST-ONLY MODE -
+ * `--test-only` selects tests marked `only`, it does not list - so there is no way to ask the runner
+ * how many tests it would run without running them, and a test cannot run the suite it lives in.
+ *
+ * THE OBVIOUS SUBSTITUTE DOES NOT WORK, and this is MEASURED rather than argued. Counting `test(`
+ * declarations in the files gives the WRONG NUMBER, in both directions:
+ *
+ *   anchored to line starts (`^\s*test(`)   219
+ *   every occurrence of `test(`            312
+ *   what the runner reports                235
+ *
+ * Neither matches, because these files mention `test(` in regexes (`.test(text)`), in assertions, and
+ * in prose, while some declarations are not at a line start. A guard asserting `WEBSITE_TESTS ===
+ * declarations` would therefore FAIL ON CORRECT CODE, which is worse than no guard - and it is the
+ * same failure the four-edit probe table in `docs/testing.md` describes.
+ *
+ * SO THIS ASSERTS A LOWER BOUND INSTEAD, which is the one thing a file scan can honestly establish:
+ * the constant cannot exceed the number of files that exist, and the suite cannot have SHRUNK past a
+ * floor without someone noticing. MEASURED when this was written: `WEBSITE_TESTS` read 232 while the
+ * runner reported 235, so the constant had drifted LOW and this bound would NOT have caught it. That
+ * is stated here because it is the honest limit of the check, not a claim that it closes the gap.
+ *
+ * WHAT CLOSES IT. The runner prints `# tests N` and `# pass N` on every run, and `docs/ci-cd.md` and
+ * the two READMEs quote those figures; a person landing a website test has the number in front of
+ * them. The website count is the one live figure in this repository that a machine cannot check from
+ * inside, and the fix is a CI step that runs the suite and compares the printed count to the constant
+ * - not a cleverer scan.
+ */
+test('WEBSITE_TESTS is not below the floor of what the test files can hold', () => {
+  const dir = join(root, 'website', 'tests');
+  const files = readdirSync(dir).filter((e) => e.endsWith('.test.ts'));
+  assert.ok(
+    files.length > 20,
+    `only ${files.length} test file(s) were found in ${dir}, so this check is not reading the suite`,
+  );
+  // One declaration per file is the floor a file scan can defend: every file here has at least one,
+  // and no file can hold fewer than one and still be a test file.
+  assert.ok(
+    WEBSITE_TESTS >= files.length,
+    `WEBSITE_TESTS is ${WEBSITE_TESTS} but there are ${files.length} test files, each of which must declare at least one test. The constant is below a bound that cannot be argued with, so it has drifted rather than being mis-set`,
+  );
 });
 
 test('no doc still claims a superseded count', () => {

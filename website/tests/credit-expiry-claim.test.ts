@@ -95,6 +95,27 @@ function tableDefinition(table: string): string {
  * do is fail OPEN: the callers assert on the stripped text, and a stripper that
  * returned "" would make every absence assertion pass, so each caller checks the
  * stripped length is still substantial.
+ *
+ * THE `//` CASE IS THE HARMLESS HALF, and a real failure is why this note exists.
+ * The damaging shape is a block-comment OPENER inside a string or an INLINE
+ * LITERAL, because it opens a comment the stripper then carries past the end of the
+ * file. MEASURED: a doc comment in `server/src/money.rs` contained the glob
+ * `tools/` + star + `/check.sh`, whose opener did exactly that. That file ended the
+ * stripper at depth 1, and because the callers concatenate every file in WALK ORDER
+ * and `money.rs` sorts before `reviews.rs`, the whole of `reviews.rs` was swallowed
+ * - so the check below reported that the withdrawal UPDATE does not exist, about a
+ * file nothing had touched. A `//` truncation loses one line; this loses
+ * everything AFTER it in the concatenation, which is every file the walk reaches
+ * later.
+ *
+ * So a block-comment opener in a doc comment is not cosmetic here. Write the glob
+ * as `check.sh` under `tools/`, and if a failure appears in a file this guard does
+ * not name, check the comment balance of the sources that sort BEFORE it.
+ *
+ * (This note had to satisfy its own rule. Writing it the obvious way NAMED the
+ * marker and re-armed the bug - the balance check reported depth 2 on the
+ * documentation of the defect - which is the second time in one round that this
+ * stripper proved its own point.)
  */
 function stripComments(source: string): string {
   let out = '';
