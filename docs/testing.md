@@ -1372,3 +1372,61 @@ has been *"name the symbol"*, and this is a case where the guard's implementatio
 the weaker practice: it accepted ranges, so ranges accumulated, so five of them drifted at once. The
 lesson is not "ranges are bad" — it is that **a check which reads a prefix of its input lets the
 suffix rot**, and the place to look for that is any scanner that stops at the first match.
+
+### A guard that reports correctly and exits 0
+
+`tools/alert-check/check.sh` gained a check for the counts stated in `tools/alert/README.md`. The
+first three versions did not work, and **each failed for a different reason** — the first two in the
+pattern, the third in the plumbing. Only the third is general enough to be worth writing down.
+
+**The pattern failures, briefly.** v1 asked `grep -qF "**$N**"` — does the right number appear
+*somewhere*. MEASURED: mutating one of five occurrences to a wrong number passed, because four were
+still right. v2 replaced it with `grep -qF "all **$N**"` and had the same bug one line down: the
+phrase occurs twice. The repair is to assert on **every occurrence**, not on the existence of one:
+`grep -o` the shape, then reject any match that is not the expected value.
+
+**The plumbing failure, which is the one to remember.** v3's reject-loop was written as:
+
+```sh
+echo "$WRONG" | sort -u | while IFS= read -r w; do
+    fail "..."
+done
+```
+
+`fail` prints the violation and sets `FAILED=1`. Inside a `while read` at the **end of a pipeline**
+that runs in a subshell, so the message appeared on stderr and the counter never moved. The script
+named the defect it had found and exited `0` — the guard's own verdict was the thing it could not
+report.
+
+The fix is a here-document, which keeps the loop in the current shell:
+
+```sh
+while IFS= read -r w; do fail "..."; done <<EOF
+$WRONG
+EOF
+```
+
+**This repository already said so, in a neighbouring tool.** `tools/ci-docs-check/check.sh` carries the
+comment *"A `while read` in a pipeline runs in a SUBSHELL, so the missing names are collected into a
+file rather than a variable - a counter assigned inside the loop would not survive it."* The rule was
+written down, by the same family of scripts, for the same reason, and did not prevent the same mistake
+in the script next to it. That is worth more than the fix: a documented trap is not a guarded one, and
+the way to make it guarded is to **mutate the guard and watch it fail** rather than to read it and
+agree.
+
+> **A note on this paragraph, because it was wrong when first written.** It said the warning was in
+> `alert-check/check.sh` "six hundred lines above" — attributing the quotation to the file whose bug
+> it explains. The phrase occurs twice in that file and **both occurrences were added by this same
+> change**, so the sentence cited as pre-existing evidence was one I had just written. The real
+> source is `tools/ci-docs-check/check.sh`, found by grepping the tree rather than by remembering.
+> A quotation asserted without looking is the defect class this whole repository is about, and it is
+> more embarrassing in a note about verification than the original bug was.
+
+**How it was found.** Not by reading. Three mutations of the document — two prose claims and one
+table row — were *not caught*, and chasing why led to the subshell. A guard accepted on inspection
+would have shipped reporting nothing.
+
+**The general rule.** A shell guard must be falsified like any other, and the failure to look for is
+not "does it detect the bad input" but "does its detection survive the shell construct it is wrapped
+in". Counters, exit codes and arrays assigned inside a pipeline are all lost; the message may still
+print, which is what makes it look like it worked.
