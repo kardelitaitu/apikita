@@ -1710,3 +1710,59 @@ written the intended fix in a comment without implementing it. That is the patte
 recording in the code under test, here in the guards: **a check that reads a prefix of its input lets
 the suffix rot**, whether the prefix is the first number of a line range, the first match of a pattern,
 or the first line of a declaration.
+
+### A invariant test that passes because nothing was there
+
+Two of this round's schema checks reported a **violation that did not exist**, and both came from the
+same mistake: a statement that matched **zero rows** succeeds and changes nothing, so a guard that
+reads only "did the statement run" cannot tell enforcement from emptiness.
+
+**1. `UPDATE` against a table with no row.**
+
+```
+UPDATE wallets SET balance_idr = -1 WHERE account_id = 'acc-1';
+```
+
+Reported as **accepted**, which read as *"the `CHECK (balance_idr >= 0)` backstop is missing"*. The
+seed had created an `accounts` row but **not** a `wallets` row — the fixture only ever existed in
+code that creates both, so my hand-built one created half. With the wallet row present the same
+statement is refused:
+
+```
+   balance now: 50000
+   set balance to -1: Runtime error: CHECK constraint failed: balance_idr >= 0
+   balance after:     50000
+```
+
+The invariant was never missing. The test had nothing to test it with.
+
+**2. A `DELETE` that appeared to pass a `RESTRICT`.**
+
+```
+DELETE FROM accounts WHERE id = 'acc-9';    -- with a funded wallet AND a ledger row
+```
+
+Reported as **accepted**, which read as *"`ON DELETE RESTRICT` is not working"*. It is working. The
+cause is that **`PRAGMA foreign_keys` is per-connection and defaults to OFF**, and a fresh `sqlite3`
+CLI session has it off:
+
+```
+   PRAGMA foreign_keys = 0   <- the CLI default
+   FK OFF: accepted  -> accounts now 0
+   FK ON : FOREIGN KEY constraint failed (19)
+           accounts now 1
+```
+
+MEASURED both ways on the same database in the same round. The server sets the pragma on every
+connection in `db.rs`, and `tools/sqlite-probes/` sets it in both of its Python probes — so the
+product is correct and **this is a harness default, not a defect**.
+
+**Why it is worth its own note.** Both mistakes point the same way: the test reported a problem, and
+the problem was the test. A check for an invariant must establish that the state the invariant is
+about **exists** before it asserts anything — which is the same rule as the empty-collection guards
+recorded elsewhere in this file, arrived at from the opposite direction. There, a scan that read
+nothing passed over an empty set; here, a statement that touched nothing looked like enforcement
+failing.
+
+**The fixture is the thing to suspect first.** In both cases the code was right and the hand-built
+state was wrong, in a way the test could not distinguish from the code being wrong.
