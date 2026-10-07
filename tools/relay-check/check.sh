@@ -259,18 +259,44 @@ if [ -f "$DOC_CONF" ]; then
     # figure, or letting the config and the doc disagree about which number exists at all, is caught;
     # editing one mention of a number that is repeated is not.
     #
-    # So each zone's burst is taken from the directive that names it. A zone used with two different
-    # bursts would be reported by the count below rather than silently taking the first.
-    zone_burst() { # zone_burst <zone> -> the burst value, or empty
-        sed -n "s/^[[:space:]]*limit_req[[:space:]]\+zone=$1[[:space:]]\+burst=\([0-9]\+\).*/\1/p" "$CONF" | sort -u | head -n 1
+    # So each zone's figures are read from the directives that name it, and a zone used with TWO
+    # DIFFERENT figures is reported rather than silently taking the first.
+    #
+    # MEASURED, and the paragraph above used to claim this was already true: it is not. The first
+    # version read `... | sort -u | head -n 1`, and `sort -u` does not help - two DIFFERENT values
+    # survive it and `head -n 1` then discards one. MEASURED: a second `limit_req zone=perwh
+    # burst=7` alongside the real `burst=1000` left this gate at exit 0, and so did a second
+    # `limit_req_zone ... zone=perwh ... rate=5r/s` alongside `rate=200r/s`.
+    #
+    # The floor below could not have caught either: it counts COMPARISONS, and a duplicate ADDS one
+    # rather than removing any. A count of how many times a loop ran cannot see a wrong value flowing
+    # through it.
+    #
+    # Both readers now return EVERY distinct value, and the caller fails if there is more than one.
+    # That is the check the paragraph promised and the code did not do.
+    zone_burst() { # zone_burst <zone> -> every distinct burst, one per line
+        sed -n "s/^[[:space:]]*limit_req[[:space:]]\+zone=$1[[:space:]]\+burst=\([0-9]\+\).*/\1/p" "$CONF" | sort -u
     }
-    zone_rate() { # zone_rate <zone> -> the declared rate, or empty
-        sed -n "s/.*zone=$1:[0-9a-z]*[[:space:]]\+rate=\([0-9]\+\)r\/s.*/\1/p" "$CONF" | head -n 1
+    zone_rate() { # zone_rate <zone> -> every distinct declared rate, one per line
+        sed -n "s/.*zone=$1:[0-9a-z]*[[:space:]]\+rate=\([0-9]\+\)r\/s.*/\1/p" "$CONF" | sort -u
+    }
+
+    # A zone whose figures are stated more than once, differently, is a config that disagrees with
+    # itself - and the doc comparison below could only ever check one of the two.
+    ambiguous() { # ambiguous <zone> <label> <values...>
+        z=$1; label=$2; shift 2
+        n=$(printf '%s\n' "$@" | grep -c . || true)
+        if [ "$n" -gt 1 ]; then
+            fail "the relay config gives zone=$z more than one $label ($(printf '%s ' "$@" | sed 's/ $//')). The doc comparison below can check only one of them, so a config that states two different figures is a config this gate cannot verify - settle on one."
+        fi
     }
 
     compared=0
     for z in $header_zones $address_zones; do
-        rate=$(zone_rate "$z")
+        # EVERY distinct value, then a single one is what the comparison may use.
+        rates=$(zone_rate "$z")
+        ambiguous "$z" "rate" $rates
+        rate=$(printf '%s\n' "$rates" | grep . | head -n 1 || true)
         if [ -n "$rate" ]; then
             compared=$((compared + 1))
             if ! grep -qE "(^|[^0-9])${rate}[[:space:]]*req/s" "$DOC_CONF"; then
@@ -284,7 +310,9 @@ if [ -f "$DOC_CONF" ]; then
         # `**30 req/s sustained, 60 burst**` satisfied it for 60 whatever the row said. MEASURED:
         # rewriting every burst figure in the doc to the words "many bursts" left that version at
         # exit 0.
-        burst=$(zone_burst "$z")
+        bursts=$(zone_burst "$z")
+        ambiguous "$z" "burst" $bursts
+        burst=$(printf '%s\n' "$bursts" | grep . | head -n 1 || true)
         if [ -n "$burst" ]; then
             compared=$((compared + 1))
             if ! grep -qE "(^|[^0-9])${burst}[[:space:]]*\*{0,2}[[:space:]]*burst" "$DOC_CONF"; then
