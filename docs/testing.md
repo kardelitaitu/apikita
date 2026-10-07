@@ -1855,3 +1855,48 @@ changes.
 third round in a row where direct measurement of the product found nothing, while the *tooling* built
 to measure it found real defects in itself. The asymmetry is now the strongest signal available: the
 code is in better shape than the apparatus used to inspect it.
+
+### A mutation reported as surviving, because the harness read the wrong exit status
+
+A guard was accused of a hole it did not have, and the accusation was the interesting defect.
+
+A doc guard was added to couple a constant in `server/src/bin/benchmark.rs` to a figure in
+`docs/benchmark.md`. Testing it by mutation — change the constant from the published figure, confirm
+the suite fails — reported:
+
+```
+   exit 0  *** NOT CAUGHT ***
+   docs/benchmark.md publishes a per-stream memory bound of [35.0] and STREAM_KB_TARGET is 99. The benc
+```
+
+The assertion's **own message printed, naming the right values**, in a run that reported success.
+That combination is the whole find: the check worked and the harness said it did not.
+
+**The cause is the pipeline exit status, for the third time in this session.** The harness ran:
+
+```js
+execFileSync('bash', ['-c', 'cargo test --lib the_benchmark_thresholds 2>&1 | tail -30'])
+```
+
+and treated a thrown error as the only failure signal. MEASURED on the same failing tree, both ways:
+
+| command | reported as failing |
+| --- | --- |
+| `cargo test --lib <filter> 2>&1` | **yes** |
+| `cargo test --lib <filter> 2>&1 \| tail -30` | **no** |
+
+`$?` is the last stage's, so `tail` returns 0 and the failing `cargo` run looks clean. The unfiltered
+run on the same mutation says `690 passed; 1 failed`, with the assertion's text. **The guard was
+correct the entire time.**
+
+**Why this is worth a section rather than a shrug.** Three things had to line up for it to be written
+down as a hole in the guard: the pipe, the thrown-status read, and a message that printed anyway. The
+first two are the hazard `tools/shell-hazards` exists to catch — and the harness was a `.cjs` file,
+which that gate does not scan, because it reads `tools/**/*.sh`. So the hazard was mechanized for one
+file type and the mutation harness was the other.
+
+**The rule, stated so it applies past this case.** A mutation result is a claim about the guard, and a
+claim needs the same treatment as any other: establish that the measurement *can* report the failure
+before believing a report of success. Here that means running the mutation with the suite's own exit
+status intact — no pipe, or `set -o pipefail`, or reading the output for the assertion text rather
+than trusting the code. An unfiltered run is the cheapest form and it is what settled this.
