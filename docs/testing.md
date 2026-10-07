@@ -1799,3 +1799,59 @@ failing.
 
 **The fixture is the thing to suspect first.** In both cases the code was right and the hand-built
 state was wrong, in a way the test could not distinguish from the code being wrong.
+
+### Four surfaces checked, and the most interesting thing was a comment
+
+A round spent looking for gaps in the binaries and the config found **none**, and the useful output is
+what was established rather than what was fixed.
+
+**Binary test coverage, measured.** `benchmark.rs` 0 tests out of 5 binaries — now guarded by
+`tools/benchmark-verdicts/`. The rest: `hold-sweep.rs` 17, `migrate.rs` 9, `usage-purge.rs` 3,
+`ip-purge.rs` 2.
+
+**The two low counts are counting the wrong thing.** `ip-purge.rs` has 2 tests because it is a
+**wrapper**: `run` calls `ip_tracking::purge_expired`, which carries five boundary tests of its own —
+`the_purge_keeps_the_window_and_removes_what_is_past_it`, the cutoff-day variant, the timestamp
+variant, and one each for link and auth attempts. Each asserts **both** directions: the row past the
+bound is deleted AND the row inside it is kept. A low count in a thin binary is not low coverage of
+the behaviour.
+
+**`migrate.rs` covers the refusal paths**, which is the right emphasis for a tool that runs before the
+server: an MSYS-style absolute URL is refused rather than creating the schema at a drive root, a
+Windows absolute and a relative path are both accepted, and preconditions reject a non-WAL journal
+and `foreign_keys` off separately.
+
+**`limit_reached` says `limit > 0 && used >= limit`** — zero means unlimited, and a key exactly on its
+ceiling is out, which the comment explains. `docs/website/06-api-keys-and-limits.md` states the same
+two facts independently (`A limit of 0 or null means "no limit of this kind"` and a row per field
+reading `0 = unlimited`), so the code and the customer contract agree by two separate statements
+rather than one restated.
+
+**And the best-maintained thing found this round is a comment nobody tests.** The
+`wallet_mutations_per_minute` block in `config/apikita.toml` documents that the key is **not
+enforced**, gives the arithmetic for when that stops mattering, and records a correction to its own
+earlier wording:
+
+```
+#     5/hour  <  10/minute        this key can never bind    (5/hour = 0.083/min)
+#     600/hour >  10/minute       this key WOULD bind, and nothing would enforce it
+#                                 (600/hour = 10/min, exactly - so the trigger is > 600)
+```
+
+MEASURED, every claim holds: `5/60 = 0.083`, the factor between the two caps is 120, `600/60` is
+exactly `10`, and at exactly 600 the per-minute key still cannot bind — because a cap is *exceeded*,
+not *met*, so the trigger really is `> 600`. The paragraph above the block also says *"It read '5 per
+hour is 5 per minute', which is not a true statement about the rate"* — the comment keeps its own
+correction rather than hiding it.
+
+**Why that is worth recording rather than moving past.** This repository's recurring defect is a claim
+that nothing checks. This is the opposite: a claim that nothing checks, that is **true**, and that
+carries the evidence for its own boundary. It is a useful model for the fixes made in the rounds
+around it — the ones that added measured numbers to comments had to be right, and this one shows the
+form: state the values, do the arithmetic in the comment, and name the boundary where the meaning
+changes.
+
+**The method note.** Four surfaces were checked this round and all four were correct. That is the
+third round in a row where direct measurement of the product found nothing, while the *tooling* built
+to measure it found real defects in itself. The asymmetry is now the strongest signal available: the
+code is in better shape than the apparatus used to inspect it.
