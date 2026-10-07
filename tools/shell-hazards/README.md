@@ -58,6 +58,33 @@ existing `set -u` line aborts three gates on a **clean** tree.
 `set -u` catches an unset variable, which is always a bug. `set -e` turns an expected result into a
 fatal one. The two flags are not a pair.
 
+### 4. A singleton read over a file whose match can repeat
+
+```sh
+LINE=$(grep -n 'some name' "$DOC" | head -n 1 | cut -d: -f1)   # the FIRST match, trusted as THE match
+```
+
+`head -n 1`, `head -1`, `grep -m 1` and `... | sort -u | head -n 1` reduce a multi-match file to one
+match, and every consumer then reasons about that value as though it were the file's value. It is safe
+while the match is unique and **silently wrong the moment it is not** — and nothing about the code
+changes when that happens.
+
+MEASURED three times in this repository, each found by injecting a duplicate:
+
+| guard | injected | what happened |
+| --- | --- | --- |
+| `ci-docs-check` | a second `- name: Build website` **after** the tests | passed — the *first* is still correctly ordered, so the step that actually runs last was unverified |
+| `alert-check` | a second `N of its M alerts are covered` figure | passed — never compared |
+| `relay-check` | a zone **declared** at two different rates | passed — checked at the first |
+
+`relay-check`'s carried a comment claiming the count below would catch it. The count counts
+**comparisons**, and a duplicate *adds* one rather than removing any, so it could never fire.
+
+**The distinction each repair makes matters, because a naive rule gets it wrong:** a file stating the
+**same** value twice is not an error; one stating two **different** values is. So the assertion is
+uniqueness of the **VALUE** (`sort -u | wc -l` is 1), never uniqueness of the mention. MEASURED after
+the fix: `rate=200` twice passes, `rate=200` and `rate=5` fails.
+
 ## What it does not flag, which is the whole design
 
 Hazard 1 has **five** live instances in this repository and **every one is correct**:

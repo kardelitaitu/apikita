@@ -74,6 +74,88 @@ const VALIDATED_CAPTURES = [
   ['tools/rollback/drill.sh', 'INTEG', /\[\s*"\$INTEG"\s*!=\s*"ok"\s*\]/, 'fails closed: empty is not "ok"'],
 ];
 
+/**
+ * HAZARD 4: a SINGLETON READ over a file whose match can legitimately occur more than once.
+ *
+ * `head -n 1` / `head -1` / `grep -m 1` / `... | sort -u | head -1` reduces a multi-match file to one
+ * match, and every consumer then reasons about that value as though it were the file's value. It is
+ * safe while the match is unique and silently wrong the moment it is not - and NOTHING about the code
+ * changes when that happens.
+ *
+ * MEASURED, three times in this repository, all found by injecting a duplicate:
+ *
+ *   ci-docs-check  a second `- name: Build website` AFTER the tests step passed, because the FIRST
+ *                  is still correctly ordered - so the step that actually runs last was unverified.
+ *   alert-check    a second `N of its M alerts are covered` figure was never compared.
+ *   relay-check    a zone DECLARED at two different rates was checked at the first. That one had a
+ *                  comment claiming the count below would catch it; the count counts COMPARISONS, so
+ *                  a duplicate ADDS one rather than removing any, and it can never fire.
+ *
+ * THE ASSERTION IS SITE-SPECIFIC, and that is a correction to this file's first version. A file-wide
+ * pattern was defeated by the very bug it polices: `alert-check` contains a SECOND `"$x" -ne 1` at an
+ * unrelated site, so deleting the uniqueness guard this list is about left the pattern matching - one
+ * of many, in the tool built to catch one of many. Each entry is therefore anchored to a distinctive
+ * fragment of ITS OWN guard.
+ *
+ * NOTE the distinction each repair makes, because a naive rule gets it wrong: a file stating the SAME
+ * value twice is not an error, only one stating two DIFFERENT values is. So the assertion is
+ * uniqueness of the VALUE (`sort -u | wc -l`), never uniqueness of the mention.
+ */
+const UNIQUENESS_ASSERTED = [
+  ['tools/ci-docs-check/check.sh', /the workflow has \$n step\(s\) named/, 'the step name must occur exactly once before `head -n 1` reads it'],
+  ['tools/alert-check/check.sh', /states an 'N of its M alerts are covered' figure \$N_STATED time/, 'the coverage figure must occur exactly once'],
+  ['tools/relay-check/check.sh', /the relay config gives zone=\$z more than one \$label/, 'every distinct rate/burst is returned and more than one FAILS'],
+];
+
+/**
+ * A read that reduces many matches to one, where the input is a FILE rather than a scalar.
+ *
+ * THE INPUT TEST WAS TOO NARROW IN THE FIRST VERSION, and it made two of the three entries in
+ * `UNIQUENESS_ASSERTED` unreachable - so the falsification of those entries passed for the wrong
+ * reason. MEASURED: `alert-check`'s coverage read is `tr ... < "$DOC" | ... | head -1`, where the
+ * variable is the SECOND word of a redirect rather than the argument of the reading command, and
+ * `probe.sh`'s marker read uses `"$doc"` lower-case. Neither matched a `$VAR_FILE`-shaped pattern.
+ *
+ * So the test is now: does the line reference ANY shell variable or quoted path at all? That is
+ * deliberately loose. Being loose costs a few listed entries with reasons; being narrow cost
+ * SILENCE, which is the failure this whole tool exists to prevent.
+ */
+const SINGLETON_READ = /head\s+(?:-n\s*)?1\b|grep\s+-m\s*1\b/;
+
+const FILE_ISH = /\$[A-Za-z_][A-Za-z0-9_]*|"[^"]*\.[a-z]{2,4}"|'[^']*\.[a-z]{2,4}'|\b[a-z_]+\.(md|tsv|yml|yaml|conf|toml|sql)\b/;
+
+/**
+ * Where a singleton read is CORRECT because the input is not a document whose match carries meaning
+ * - a JSON body from one API call, a scalar already extracted, or a LIST WHERE ONE IS THE POINT.
+ *
+ * Each needs its reason. Note the last kind carefully, because it is the one a reader will question:
+ * `ls -1t ... | head -n 1` is not taking one of many by accident, it is taking the NEWEST of many on
+ * purpose - the value is the ordering, not the match.
+ */
+const NOT_A_DOCUMENT = [
+  [/BODY_FILE/, 'a JSON response body from one API call; the field is unique by construction'],
+  [/header_zones|address_zones/, 'an already-extracted scalar, not a file'],
+  [/"\$CURL_ERR"|"\$ERR"/, 'the FIRST LINE of a command\'s stderr, which is what the message wants'],
+  [/ls\s+-1t.*\| head -n 1/, 'the newest file of many: the sort order IS the selection, so one of many is the intent'],
+];
+
+/**
+ * Where a singleton read IS over a document, and the risk is documented rather than removed.
+ *
+ * This is the weaker category and it is kept separate on purpose. `UNIQUENESS_ASSERTED` means the
+ * hazard cannot happen; this means it can, it was measured, and it fails LOUDLY rather than
+ * silently - which is the direction that matters, since a gate that cannot see the truth and
+ * reports a pass is the serious case.
+ *
+ * MEASURED for the one entry: `docs/deployment.md` mentions `run_wired_jobs` three times and only
+ * the first is the job list. If a summary sentence were added above it, the three-line window would
+ * be unrelated prose and EVERY job name would come back missing - a false positive with a message
+ * about the scheduler paragraph, not a false pass.
+ */
+const DOCUMENTED_RISK = [
+  ['tools/backup-check/check.sh', /THE ASSUMPTION THIS RESTS ON/, 'the first mention must be the list; a wrong window fails loudly, measured against three mentions'],
+];
+
 /** Below this the scan is not reading the tree. Measured: 19 scripts. */
 const FLOOR_SCRIPTS = 15;
 
@@ -88,6 +170,7 @@ function main() {
   let captureSites = 0;
   let subshellSites = 0;
   let setSites = 0;
+  let singletonSites = 0;
 
   for (const rel of files) {
     const text = fs.readFileSync(path.join(REPO, rel), 'utf8').split('\r\n').join('\n');
@@ -147,13 +230,58 @@ function main() {
           `explicit code comparison at the call site instead.`,
         );
       }
+
+      // --- hazard 4: a singleton read over a file whose match can repeat ---
+      if (SINGLETON_READ.test(line) && FILE_ISH.test(line)) {
+        singletonSites += 1;
+        const excused = NOT_A_DOCUMENT.find(([re]) => re.test(line));
+        if (excused) return;
+        // Has THIS file asserted uniqueness anywhere? The three known sites do it in different
+        // shapes, so the test is per-file and named, not per-line.
+        const known = UNIQUENESS_ASSERTED.find(([f]) => f === rel);
+        if (known) {
+          const [, assertion, why] = known;
+          if (!assertion.test(text)) {
+            problems.push(
+              `${where}  this file is listed as ASSERTING UNIQUENESS (${why}) but the assertion is gone. ` +
+              `A singleton read is safe only while the match is unique, and nothing in the code changes ` +
+              `when it stops being so.`,
+            );
+          }
+          return;
+        }
+        // A site whose risk is documented rather than removed: the note must still be there, or the
+        // assumption has been dropped silently - which is how this class keeps recurring.
+        const documented = DOCUMENTED_RISK.find(([f]) => f === rel);
+        if (documented) {
+          const [, note, why] = documented;
+          if (!note.test(text)) {
+            problems.push(
+              `${where}  this file is listed as DOCUMENTED RISK (${why}) but the note explaining it is ` +
+              `gone. An unenforced assumption that stops being written down is one nobody will check.`,
+            );
+          }
+          return;
+        }
+        problems.push(
+          `${where}  a singleton read over a file whose match can legitimately occur more than once.\n` +
+          `       ${shown}\n` +
+          `       \`head -1\`/\`grep -m1\` takes one match and every consumer then treats it as THE value ` +
+          `- so a duplicate is silently ignored. MEASURED three times here: a second workflow step, a ` +
+          `second coverage figure, and a zone declared at two rates were all read as the first.\n` +
+          `       Either assert the VALUE is unique before using it (\`... | sort -u | wc -l\` is 1) ` +
+          `and add the site to UNIQUENESS_ASSERTED, or establish some other reason the input cannot ` +
+          `repeat and add it to NOT_A_DOCUMENT.`,
+        );
+      }
     });
   }
 
   for (const p of problems) console.error(`shell-hazards: ${p}`);
   console.log(
     `shell-hazards: ${files.length} script(s); ${captureSites} pipelined capture(s) ` +
-      `(${VALIDATED_CAPTURES.length} validated), ${subshellSites} pipeline-subshell(s), ${setSites} set -e.`,
+      `(${VALIDATED_CAPTURES.length} validated), ${subshellSites} pipeline-subshell(s), ${setSites} set -e, ` +
+      `${singletonSites} singleton read(s) over a file (${UNIQUENESS_ASSERTED.length} asserting uniqueness).`,
   );
 
   if (problems.length) {

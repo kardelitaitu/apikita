@@ -510,11 +510,57 @@ KNOWN
         # The list lives in the open item that names `run_wired_jobs`; take that line and the
         # next two, which is where the wrapped names are. Deliberately NOT the whole item, so
         # the explanatory note below the list cannot supply a name the list dropped.
+        #
+        # THE ASSUMPTION THIS RESTS ON, stated because it is not enforced: the FIRST mention of
+        # `run_wired_jobs` in the document must be the list. MEASURED: the file has THREE mentions,
+        # and only the first is the paragraph read here - the other two are a note about the list
+        # and a cross-reference. A summary sentence added anywhere above would become the first
+        # mention, the three-line window would be a different paragraph entirely, and this check
+        # would compare the job names against unrelated prose.
+        #
+        # THAT FAILS LOUDLY rather than silently, which is why it is left as a documented
+        # assumption instead of a hard failure: a wrong window makes EVERY job "missing", so the
+        # comparison below fires with a message about the scheduler paragraph. It is a
+        # false-POSITIVE risk and not a false-negative one - the direction where a gate that cannot
+        # see the truth reports a pass would be the serious case, and this is not it.
+        #
+        # `tools/shell-hazards` lists this site for the same reason: a `head -n 1` whose match can
+        # repeat is safe only while it does not.
+        #
+        # AND THAT IS NOW CHECKED RATHER THAN ASSUMED, and the first version of this check did NOT
+        # work - MEASURED, which is why the shape below is what it is.
+        #
+        # v1 asserted "the line at LIST_AT names run_wired_jobs". That is satisfied by ANY line naming
+        # it, including the summary sentence the assumption is worried about, so MEASURED: a decoy
+        # paragraph added above the list left the assertion silent and only the `MISSING` loop spoke.
+        # It restated the grep that produced LIST_AT instead of testing the property that makes the
+        # window valid.
+        #
+        # WHAT THE WINDOW ACTUALLY RESTS ON is that the first mention is the paragraph carrying the
+        # JOB LIST - so the assertion is on the list, not on the name: the window must name at least
+        # two of the jobs `run_wired_jobs` calls. A decoy sentence naming the function has no jobs, so
+        # it fails here with a message about the CAUSE; the `MISSING` loop below would fail anyway,
+        # but it reports the SYMPTOM (six jobs missing) and sends the reader to the entrypoint script
+        # rather than to the paragraph that displaced the list.
+        #
+        # The count is deliberately not asserted to be 1: MEASURED, the document has three mentions and
+        # only the first is the list, so a uniqueness assertion would fail on CORRECT code.
+        MENTIONS=$(grep -c 'run_wired_jobs' "$DEP_DOC")
         LIST_AT=$(grep -n 'run_wired_jobs' "$DEP_DOC" | head -n 1 | cut -d: -f1)
         if [ -z "$LIST_AT" ]; then
             fail "docs/deployment.md no longer mentions run_wired_jobs, so the paragraph that tells an operator what the maintenance scheduler does has gone. The scheduler is a deployment step and the doc has to say so."
         fi
+        if [ "$MENTIONS" -lt 1 ]; then
+            fail "docs/deployment.md's run_wired_jobs mention count read as $MENTIONS while a line number was found, so the count and the line read disagree and one of them is measuring something else"
+        fi
         LIST=$(sed -n "${LIST_AT},$((LIST_AT + 2))p" "$DEP_DOC")
+        NAMED=0
+        for job in $CALLED; do
+            printf '%s\n' "$LIST" | grep -qF "$job" && NAMED=$((NAMED + 1))
+        done
+        if [ "${NAMED:-0}" -lt 2 ]; then
+            fail "the first mention of run_wired_jobs in docs/deployment.md (line $LIST_AT) is followed by a three-line window naming $NAMED of the jobs the function calls, so it is NOT the list paragraph - something was added above it and displaced the window. This is the documented assumption failing: the check reads the FIRST mention, so a summary sentence introduced earlier takes the window and the comparison below reports every job as missing against unrelated prose."
+        fi
         MISSING=""
         for job in $CALLED; do
             printf '%s\n' "$LIST" | grep -qF "$job" || MISSING="$MISSING $job"
