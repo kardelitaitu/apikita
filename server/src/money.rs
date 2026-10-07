@@ -1584,4 +1584,104 @@ mod tests {
             js_order.len()
         );
     }
+
+    /// The tool's PAYLOAD has to name the same fields this struct deserializes, and nothing checked
+    /// that either.
+    ///
+    /// The guard above couples the signature FORMULA. This couples the JSON, which is the other half
+    /// of what the tool forges, and it fails differently: `MidtransNotification` has no
+    /// `deny_unknown_fields` and `fraud_status` is `Option`, so a RENAMED field on either side does
+    /// not error at all. The tool sends a key the server ignores, the struct's field arrives as...
+    /// nothing, and the request fails as `invalid_request` or - worse, for an `Option` - is ACCEPTED
+    /// with the value silently absent. A missing `signature_key` would be refused; a missing
+    /// `fraud_status` would not, and the tool would keep reporting a successful forgery.
+    ///
+    /// So the assertion is on the SET of field names, and it is symmetric: a field added to the struct
+    /// and not to the tool fails, and the reverse fails too. `fraud_status` is included because the
+    /// tool does send it.
+    #[test]
+    fn the_forgery_tool_sends_the_fields_this_struct_deserializes() {
+        use std::fs;
+        use std::path::Path;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("server/ has a parent")
+            .to_path_buf();
+        let tool = root
+            .join("tools")
+            .join("fake-midtrans")
+            .join("send-webhook.mjs");
+        let js = fs::read_to_string(&tool)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", tool.display()));
+
+        // The struct's fields, from the declaration rather than restated.
+        let rust = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("money.rs"),
+        )
+        .expect("money.rs must be readable");
+        let at = rust
+            .find("pub struct MidtransNotification {")
+            .expect("the notification struct must still exist");
+        let body = &rust[at..];
+        // Start AFTER the opening brace, or the declaration line is parsed as a field named
+        // `struct MidtransNotification` - which is what the first version of this did, and it failed
+        // on correct code with that name in the diff.
+        let body = &body[body.find('{').expect("the declaration has a brace") + 1..];
+        let body = &body[..body.find("\n}").expect("the struct has a closing brace")];
+        let mut struct_fields: Vec<&str> = body
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("pub ")?;
+                Some(rest.split(':').next()?.trim())
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+        struct_fields.sort_unstable();
+
+        // The tool's returned object literal: the keys before the closing brace.
+        let payload_at = js
+            .find("  return {")
+            .expect("the tool must still return a payload object");
+        let payload = &js[payload_at..];
+        let payload = &payload[..payload.find('}').expect("the payload object closes")];
+        let mut js_fields: Vec<&str> = payload
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let t = l.trim();
+                let (key, _) = t.split_once(':')?;
+                let key = key.trim();
+                (!key.is_empty() && !key.contains(' ')).then_some(key)
+            })
+            .collect();
+        js_fields.sort_unstable();
+
+        // Vacuity guards first: either parse returning nothing would make the comparison trivially
+        // true, and both are one refactor away from doing exactly that.
+        assert!(
+            struct_fields.len() >= 5,
+            "only {} field(s) were parsed from MidtransNotification, so this is not looking at the \
+             struct: {struct_fields:?}",
+            struct_fields.len()
+        );
+        assert!(
+            js_fields.len() >= 5,
+            "only {} key(s) were parsed from the tool's payload, so this is not looking at its \
+             object literal: {js_fields:?}",
+            js_fields.len()
+        );
+
+        assert_eq!(
+            js_fields, struct_fields,
+            "tools/fake-midtrans/send-webhook.mjs sends {js_fields:?} but MidtransNotification \
+             deserializes {struct_fields:?}. This struct has NO `deny_unknown_fields` and \
+             `fraud_status` is an Option, so a renamed field does not error - the tool sends a key the \
+             server ignores and the request either fails as `invalid_request` or is ACCEPTED with the \
+             value silently absent. The tool is named by no `tools/*/check.sh`, so this drift would \
+             surface only when someone ran it by hand and read a refusal as a broken webhook."
+        );
+    }
 }
