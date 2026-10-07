@@ -1478,4 +1478,110 @@ mod tests {
             );
         }
     }
+
+    /// `tools/fake-midtrans` forges the signature this module verifies, and NOTHING checked that the
+    /// two agree.
+    ///
+    /// WHY THIS IS WORTH A GUARD. `tools/fake-midtrans/send-webhook.mjs` recomputes
+    /// `SHA512(order_id + status_code + gross_amount + server_key)` in JavaScript, and its README
+    /// transcribes both that formula and `MidtransNotification` verbatim from `money.rs`. That is two
+    /// copies of a SECURITY formula, the exact restatement shape this repository keeps finding - and
+    /// unlike the price card or the retention windows, nothing read either copy. MEASURED: the tool is
+    /// named by no `tools/*/check.sh`, so it is never executed by CI. It is run by hand, against a
+    /// live server, which is the moment a drift is most expensive to diagnose.
+    ///
+    /// WHAT A DRIFT WOULD LOOK LIKE, and why the wrong diagnosis is the likelier one. If the server's
+    /// concatenation order changed, the tool would keep producing a syntactically valid signature that
+    /// the server rejects. The person running it sees a webhook refused with `invalid signature`, and
+    /// the natural reading is that the WEBHOOK is broken - not that the FORGERY TOOL is out of date.
+    /// A guard that couples the two turns that into a failing test naming the file.
+    ///
+    /// WHAT THIS ASSERTS, and its honest limit. It compares the ORDER OF THE FOUR FIELD NAMES as each
+    /// file writes them, plus the hash algorithm - the parts a drift would change and a reader cannot
+    /// check across two languages. It does NOT execute the JavaScript, so it cannot prove the two
+    /// produce the same digest; it proves the two files name the same inputs in the same sequence,
+    /// which is what a change to either would have to alter. The end-to-end proof is the tool run by
+    /// hand against a server, and that is stated here rather than implied.
+    #[test]
+    fn the_forgery_tool_concatenates_the_signature_the_way_this_module_does() {
+        // Imported here rather than at the module head: the sibling test above brings them in at its
+        // own scope, and a module-level `use std::fs` would be an unused import for the non-test build.
+        use std::fs;
+        use std::path::Path;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("server/ has a parent")
+            .to_path_buf();
+        let tool = root
+            .join("tools")
+            .join("fake-midtrans")
+            .join("send-webhook.mjs");
+        let js = fs::read_to_string(&tool)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", tool.display()));
+
+        // The Rust side, taken from a call rather than restated: the parameter names in order.
+        let rust = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("money.rs"),
+        )
+        .expect("money.rs must be readable");
+        let at = rust
+            .find("pub fn compute_midtrans_signature(")
+            .expect("the signature function must still exist");
+        let sig = &rust[at..];
+        let params: Vec<&str> = sig[..sig.find(") ->").expect("a return type")]
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let name = l.trim().split(':').next()?.trim();
+                (!name.is_empty() && name != "pub fn compute_midtrans_signature(").then_some(name)
+            })
+            .collect();
+        assert_eq!(
+            params,
+            vec!["order_id", "status_code", "gross_amount", "server_key"],
+            "compute_midtrans_signature's parameters changed, so the tool's transcription and this \
+             guard are both describing a formula that no longer exists"
+        );
+
+        // The tool's four `.update(...)` calls, in order. `camelCase` is the JS spelling of the Rust
+        // snake_case above, so the comparison is on the camelCase names the tool actually uses.
+        let js_order: Vec<String> = js
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix(".update(")?;
+                let name = rest.split(')').next()?;
+                Some(name.to_string())
+            })
+            .collect();
+        let expected_js = vec!["orderId", "statusCode", "grossAmount", "serverKey"];
+        assert_eq!(
+            js_order, expected_js,
+            "tools/fake-midtrans/send-webhook.mjs concatenates {js_order:?} but money.rs computes \
+             SHA512(order_id + status_code + gross_amount + server_key). The tool is NOT run by any \
+             check script, so this drift would surface as a webhook refused with `invalid signature` \
+             and be read as a broken webhook rather than a stale forgery tool. Fix the order here, or \
+             fix the tool - and the README's transcription of the formula along with it."
+        );
+
+        // The algorithm, which is the other half of the agreement.
+        assert!(
+            js.contains("'sha512'") || js.contains("\"sha512\""),
+            "the tool no longer uses SHA-512, so it cannot forge what this module verifies"
+        );
+        assert!(
+            sig.contains("Sha512::new()"),
+            "compute_midtrans_signature no longer uses Sha512"
+        );
+
+        // Vacuity guard: an empty parse would make both comparisons above trivially true.
+        assert!(
+            !js_order.is_empty() && js_order.len() >= 4,
+            "only {} .update(...) call(s) were parsed from the tool, so the comparison above is not \
+             looking at the four-field concatenation it claims to check",
+            js_order.len()
+        );
+    }
 }
