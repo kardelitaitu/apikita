@@ -1900,3 +1900,39 @@ claim needs the same treatment as any other: establish that the measurement *can
 before believing a report of success. Here that means running the mutation with the suite's own exit
 status intact — no pipe, or `set -o pipefail`, or reading the output for the assertion text rather
 than trusting the code. An unfiltered run is the cheapest form and it is what settled this.
+
+### The hazards were mechanized for shell, and the codebase says that is enough
+
+A round planned to extend `tools/shell-hazards` to the Node gates, on the reasoning that the same three
+hazards apply there — the argument being that a mutation harness of my own had just read a piped
+command's exit status and reported a guard as failing to catch a mutation it caught.
+
+**The premise was false, and measuring it took one sweep.** Of the six Node files under `tools/`, the
+three that are **gates** require `node:fs` and `node:path` and nothing else:
+
+| gate | requires |
+| --- | --- |
+| `benchmark-verdicts/check.js` | `node:fs`, `node:path` |
+| `doc-figures/check.js` | `node:fs`, `node:path` |
+| `shell-hazards/check.js` | `node:fs`, `node:path` |
+
+**No Node file under `tools/` spawns a subprocess** — zero occurrences of `child_process`,
+`execSync`, `execFileSync`, `spawnSync` or `spawn(`. The remaining three files are `.mjs` fixtures
+(`fake-midtrans`, `fake-upstream`) that serve HTTP and are not gates at all.
+
+And the mirror case does not arise either: **no shell gate invokes `cargo`.** Six scripts mention it,
+and all six are message strings — `create it with 'cargo run --bin migrate' (from server/)` — which
+the scan confirms by stripping quoted text before matching. So the pipeline-exit-status hazard has no
+occurrence in any shipped gate, in either language.
+
+**What that means for the round-22 finding.** The mistake was real and worth recording, but it was in a
+**scratch script under `.agents/`**, which is gitignored — not in shipped code. Extending the gate would
+have added a rule that matches nothing, and a rule that matches nothing is the failure this repository
+has recorded four times: a check that cannot fail reads as a check that passes.
+
+**The rule this leaves, and it is the one worth keeping.** Before mechanizing a defect class, count its
+occurrences. A gate is justified by an instance it catches, not by an instance that is conceivable. The
+whole sweep is a recursive `readdirSync` over `tools/`, a `require` scan, and a regex for a `cargo`
+invocation with quoted text stripped first — three minutes of work, and cheaper than the gate would have
+been. It turned a plausible plan into a corrected one, which is the only reason this section exists
+rather than a fourth rule in `shell-hazards` that could never fire.
