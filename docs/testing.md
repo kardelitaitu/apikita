@@ -672,6 +672,23 @@ unfiltered run failed and named `the_pricing_document_restates_the_shipped_card`
 only "filter on the exact name" - it is **confirm a survivor unfiltered before writing it up**, because
 a filter that selects the wrong RELATED guard produces exactly the shape of a real gap.
 
+**A SURVIVOR HAS A SECOND EXPLANATION, and this one is not about the harness at all: the tool may not
+own the subject.** `tools/doc-figures` says so itself - it is a SWEEP that "finds statements nobody has
+written a dedicated guard for", and a finding in it "should usually become a guard". So a mutation that
+survives the sweep is expected when a dedicated guard already holds that figure.
+
+MEASURED, and it nearly became a written-up gap. Changing `db::POOL_MAX_CONNECTIONS` from 8 to 9, and
+separately changing `pool size = 8` in `docs/benchmark.md` to 12, both left `doc-figures` reporting
+`0 mismatch(es)` - and the pool figure is not even in its list of comparable statements. Read as a
+defect, that says the tool does not check the figure it was written for, which is exactly what its
+header says it does not do. The figure is covered by
+`a_published_pool_size_is_the_pool_size_the_code_opens`, and MEASURED, BOTH mutations fail that guard.
+
+So before writing up a survivor, ask **which guard owns this subject** - and if a tool documents its own
+scope, believe the document and test the owner instead. The tell is cheap: `--list`-style output naming
+what was compared. A subject absent from that list is either a gap or somebody else's job, and the two
+are told apart by finding the owner, not by re-reading the sweep.
+
 The pathology is the same one this file keeps recording in the code under test: a check that reads
 plausible while measuring something else.
 
@@ -1609,3 +1626,59 @@ schema.
 the unreliable component, not the schema. A checker that has not been run against known-good input has
 not been tested — it has only been written. Every one of these four would have been caught by pointing
 the check at a file whose answer was already known.
+
+### A reader that takes one of many must first establish there is only one
+
+Round 12 found the same defect in two shipped guards: a **singleton read** over a file where the thing
+read can legitimately occur more than once. Round 13 found a third, and this one had a comment
+claiming it was already handled.
+
+**The shape.** `head -n 1`, `head -1`, or `grep -m 1` reduces a multi-match file to one match. Every
+consumer then reasons about that one value as though it were the file's value. It is safe while the
+match is unique and silently wrong the moment it is not — and nothing about the code changes when that
+happens.
+
+**The three, and each was measured rather than reasoned about:**
+
+| site | the read | what a duplicate does |
+| --- | --- | --- |
+| `ci-docs-check`, the workflow build/test ordering | `grep -n '...Build website$' \| head -n 1` | a second `Build website` after the tests passes, because the *first* is still correctly ordered |
+| `alert-check`, the coverage figure | `grep -o '...alerts are covered' \| head -1` | a second, contradicting figure is never compared |
+| `relay-check`, a zone's rate | `sed -n '...rate=...' \| head -n 1` | a zone declared at two rates is checked at the first |
+
+**The third is the instructive one.** It read:
+
+```
+# So each zone's burst is taken from the directive that names it. A zone used with two different
+# bursts would be reported by the count below rather than silently taking the first.
+```
+
+The first half is true. The second half is **false**, and measurably so: the reader was
+`... | sort -u | head -n 1`, and `sort -u` does not help — two *different* values survive it and
+`head -n 1` discards one. The "count below" counts **comparisons**, and a duplicate *adds* one rather
+than removing any, so the floor can never fire on it. A count of how many times a loop ran cannot see
+a wrong value passing through it.
+
+So the comment described the right fix, next to code that did not do it. Both readers now return
+**every** distinct value, and the caller fails when there is more than one — which is the check the
+paragraph promised.
+
+**And the repair has to keep the right distinction.** A zone stating the *same* value twice is not an
+error; a zone stating two *different* values is. MEASURED after the fix:
+
+```
+   burst: perwh used at 1000 and 7          exit 1  CAUGHT
+   rate:  perwh declared at 200 and 5       exit 1  CAUGHT
+   burst: perwh used at 1000 TWICE          exit 0  correct
+   rate:  perwh declared at 200 TWICE       exit 0  correct
+```
+
+A rule of "the value must occur once" would fail the two controls, which are legitimate configs. The
+rule is **uniqueness of the VALUE**, not uniqueness of the mention.
+
+**Why this is worth a section of its own.** Three separate guards, written at three different times,
+each read one match and trusted it — and in one case the author had already identified the hazard and
+written the intended fix in a comment without implementing it. That is the pattern this file keeps
+recording in the code under test, here in the guards: **a check that reads a prefix of its input lets
+the suffix rot**, whether the prefix is the first number of a line range, the first match of a pattern,
+or the first line of a declaration.
