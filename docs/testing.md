@@ -1282,3 +1282,48 @@ are `Utc::now()` calls milliseconds apart and the two values came out equal. A t
 timestamps taken microseconds apart cannot distinguish "moved" from "carried over". Planting a
 timestamp known to be old on the row and requiring the value to CHANGE is what discriminates.
 
+### A note about a citation cannot itself contain one
+
+`server/src/db.rs` carried a comment explaining that a line-number citation had gone stale and been
+replaced by a symbol name. To make the lesson concrete it spelled the old citation out — a
+`db.rs`-relative line number, in backticks.
+
+That paragraph was correct, careful, and **failed the guard it was written about on the first
+unrelated edit after it was committed.** The reason is structural rather than careless:
+
+- `every_rust_comment_citation_points_at_code` scans Rust comments for `file:line` shapes and
+  resolves them against the file as it stands now. It cannot tell a citation from a **description**
+  of one, because both are the same characters.
+- The paragraph sits in `db.rs` and cites `db.rs`, so it is a citation **into its own file** — the
+  one kind whose target moves every time anything above it grows.
+- Adding 22 lines to `init_pool`, near the top of the file, shifted every later line in that file by
+  22 and left the cited one blank. The guard then reported the *description* as a citation pointing
+  at nothing.
+
+**The measurement that makes this worth writing down.** The cited line was not wrong when written: at
+the time it named the credit-expiry calendar-month test, and it really was that test's declaration
+line. It became wrong through an edit about 2500 lines away, in a different function, that had
+nothing to do with it. That is precisely the failure mode the guard exists for, reproduced on the
+note that documents it.
+
+**The rule.** A comment that explains why line citations are fragile must not carry one, not even in
+quotes or backticks, because the guard reads the text rather than the intent. Name the symbol, or
+describe the citation without spelling its number. The repaired paragraph says "it once carried a
+line-number citation into this same file" and gives no digits at all.
+
+**And the second one, which the same edit exposed.** `a_zero_reservation_holds_nothing_and_writes_nothing`
+carried a "Covers" citation to a line in `db.rs` that was **already not the code the test covers** —
+at that commit it was a doc comment about `identity_tokens`, not a declaration — so the citation had
+been pointing at a plausible-looking wrong place for as long as anyone could check. It only became
+*visible* when the line went blank. A citation can be wrong and stable; blankness is what a mechanical
+guard can detect, and correctness is not, which is the whole argument for naming symbols.
+
+**One trap in the sweeps for this.** A throwaway scan that resolves a cited path by **basename**
+reports false positives, because `routes/mod.rs` is not a file named `mod.rs` at the crate root, and
+a citation into `routes/mod.rs` resolves against the real file. The shipped guard uses full paths; a
+scratch enumeration that guesses by basename will manufacture findings. Four did, and none were real.
+
+**A note about this section, since it is the same defect one level up.** Every line number in the
+paragraphs above was deliberately **removed** rather than quoted: they are exactly the shape the guard
+looks for, and this file is scanned by the same family of checks. Writing an example of a bad citation
+requires describing it, not reproducing it.
