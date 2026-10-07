@@ -78,3 +78,12 @@ refused correctly (`proxy_buffering on`, `gzip on`, a deleted `/events` block; a
 hook whose failure is swallowed), and the measured results are now in those two READMEs.
 Nothing tests this paragraph — it was found by reading it against the directory listing,
 which is why the finding is recorded here rather than assumed to stay true.
+
+## Not checks
+
+[`fill-contacts/`](fill-contacts/README.md) is the one tool here that **checks nothing**. It fills the
+four owner-input placeholder tokens (`[[ABUSE_EMAIL]]`, `[[OWNER_LEGAL_NAME]]`, `[[PRIVACY_EMAIL]]`,
+`[[RESPONSE_HOURS]]`) across twelve occurrences in five files from one place, because they are all
+blocked on the same decision and filling them by hand is four chances to fill three. It has no
+`check.sh` and no CI step — it edits documents on the request of a human and has nothing to verify on
+every push.
