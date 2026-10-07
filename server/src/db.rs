@@ -85,6 +85,28 @@ const _UUID_TEXTS_ARE_HYPHENATED: () = ();
 /// it unset, connecting to an absent file fails with `unable to open database
 /// file` — which is the failure this wants, because a server that silently
 /// creates an empty, schema-less database fails later and far less legibly.
+///
+/// - `max_connections(8)` — the FIFTH setting, and this paragraph exists because the list above
+///   claimed to be complete without it. The chain below sets five things; four were justified and
+///   the pool size was left to speak for itself. A list that opens "each is a measured trap" and
+///   then omits its most consequential entry is worse than one that claims nothing, because the
+///   omission reads as *checked, nothing to say* rather than *not checked*.
+///
+///   WHAT THE NUMBER DOES NOT DO: it is not a write-concurrency dial. SQLite gives **one writer for
+///   the whole database**, so no value of it buys write throughput — it bounds how many callers may
+///   be *queueing* for that single writer. MEASURED in `docs/plans/sqlite-migration.md`: with this
+///   pool, a second `BEGIN IMMEDIATE` waits the full `busy_timeout` (5.53s) and then fails with
+///   `database is locked` (**code 5**) rather than waiting longer. The ceiling is therefore: a
+///   writer that cannot get in within 5s ERRORS. The transactions here are a handful of statements,
+///   which is why 8 is headroom rather than a live risk.
+///
+///   WHAT IT DOES: reads run concurrently under WAL, so the pool is real read concurrency and not
+///   only a waiter queue. Dropping it toward 1 would serialize every read behind every other read
+///   and shorten the write wait by nothing at all.
+///
+///   So the number is a judgement with a measured shape rather than a measured optimum. It has no
+///   test, and at this size it cannot have an honest one — what it needs is the paragraph above, so
+///   that the next person to change it knows which way the ceiling runs.
 pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::from_str(database_url)?
         .journal_mode(SqliteJournalMode::Wal)
@@ -748,13 +770,22 @@ pub async fn debit_usage_transaction(
     //        is pinned to return `(0, 0)` for that input by `a_zero_reservation_writes_no_release_row`,
     //        independently of this branch.
     //
-    //        THE CITATION IS BY NAME, not by line. It read `(db.rs:2609)` and pointed at an
-    //        `assert!` inside a DIFFERENT test - `credit_expiry_instant` - for as long as the two
-    //        tests have been lines apart. The guard that checks these citations accepted it, because
-    //        the wrong line was non-blank and looked like a plausible declaration; it only failed
-    //        when an unrelated edit made that line blank. A line number cannot be checked for being
-    //        the RIGHT line, only a plausible one, so this names the test instead - which is what
-    //        `docs/testing.md` asks for and what `tools/alert-check` enforces for `alerts.tsv`.
+    //        THE CITATION IS BY NAME, not by line. It once carried a line-number citation into this
+    //        same file, and that citation pointed at an `assert!` inside a DIFFERENT test -
+    //        `credit_expiry_instant` - for as long as the two tests were lines apart. The guard that
+    //        checks these citations accepted it, because the wrong line was non-blank and looked like
+    //        a plausible declaration; it only failed when an unrelated edit made that line blank. A
+    //        line number cannot be checked for being the RIGHT line, only a plausible one, so this
+    //        names the test instead - which is what `docs/testing.md` asks for and what
+    //        `tools/alert-check` enforces for `alerts.tsv`.
+    //
+    //        WHY THE OLD NUMBER IS NOT QUOTED HERE, which is a correction to this very paragraph.
+    //        It used to spell the stale citation out, so a reader could see what had gone wrong. That
+    //        made the *description* of a bad citation into a live one: the guard scans this comment,
+    //        finds a `file:line` shape, resolves it against the current file - and this paragraph
+    //        shifts every time anything above it grows, which is exactly why it was written. It
+    //        failed on the first unrelated edit after it was committed, for the reason it describes.
+    //        A note about a citation that cannot survive a line shift cannot itself contain one.
     //
     //    So the guard saves one no-op UPDATE on a path that already costs a transaction. Kept because
     //    it documents the intent, with this note so the next mutation sweep does not open the same
@@ -5198,7 +5229,8 @@ mod tests {
     }
 
     /// A reservation of zero (or less) holds nothing and writes nothing: the
-    /// guard short-circuits before any transaction is opened. Covers db.rs:900.
+    /// guard short-circuits before any transaction is opened. Covers
+    /// `reserve_balance_transaction` and the branch above the transaction in it.
     #[tokio::test]
     async fn a_zero_reservation_holds_nothing_and_writes_nothing() {
         let db = TestDb::new().await;
