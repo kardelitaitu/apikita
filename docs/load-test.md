@@ -19,8 +19,8 @@ page is the missing half — **how to take those two measurements.**
 | The server running | the whole point | `curl -s localhost:8080/health` returns `{"status":"healthy","database":"connected"}` |
 | A migrated database | the request path reads it | `DATABASE_URL=... cargo run --bin migrate` |
 | **A machine with the same CPU as production** | the target is stated per 0.2 vCPU | see "Why the box matters" below |
-| A load generator | concurrency, not a loop | the harness under `server/src/bin/` |
-| `ps`/`/proc` access to the server PID | CPU sampling | same host, not a container boundary |
+| A load generator | concurrency, not a loop | [`tools/loadtest/`](../tools/loadtest/README.md) — `node tools/loadtest/loadtest.js --help` |
+| `ps`/`/proc` access to the server PID | CPU sampling | the harness takes `--pid`; the same host is the simple case |
 
 **Do not run this against production.** The generator writes wallet rows through the proxy path. Use a
 restored copy — `tools/drill/drill.sh` produces exactly that, and `tools/reconcile/reconcile.sh` is how
