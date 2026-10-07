@@ -1039,10 +1039,13 @@ jobs:
       # WHY A GATE: the binary has NO test coverage, and the only check coupling it to anything reads
       # its CLI rather than its output, so three of four scenarios drifted with nothing watching.
       #
-      # WHAT IT DOES NOT CATCH, because the tool was falsified against its own subject and two
-      # mutations survive: a threshold changed to a vacuous one (`>= 10000` to `>= 0`) still looks
-      # like a comparison, and deleting an `else` arm is missed when another `else` is nearby. It
-      # catches the shape that actually occurred - a verdict with no value and no branch at all.
+      # WHAT IT DOES NOT CATCH, because the tool was falsified against its own subject: a threshold
+      # changed to a vacuous one (`>= 10000` to `>= 0`) still looks like a comparison, and an `else`
+      # arm made UNREACHABLE is missed when that arm's verdict carries its value - rule 1 is satisfied
+      # by the interpolation. The distinction is the point: this catches a verdict that cannot CHANGE,
+      # not one that can change but can no longer be reported. Reachability is a different defect.
+      #
+      # It catches the shape that actually occurred three times: a verdict with no value and no branch.
       - name: Check the benchmark verdicts are earned
         run: sh tools/benchmark-verdicts/check.sh
 

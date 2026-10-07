@@ -52,12 +52,30 @@ The key-auth `[PASS]` has no placeholder and is still correct, because line 83 b
 
 ## What it does NOT catch, and this was measured
 
-The tool was falsified against its own subject, and **two mutations survive**:
+The tool was falsified against its own subject. Two mutations survive, and **the second was
+mis-described in an earlier version of this file** — the correction matters more than the admission.
 
-- **`if ops_per_sec >= MIN_SIGS_PER_SEC` → `>= 0` is not caught.** `>= 0` is still a comparison; the
-  rule cannot tell a meaningful threshold from a vacuous one.
-- **Deleting the `else` arm of a verdict pair is not caught** when another `else` sits within the
-  window — which, in a file of if/else prints, it usually does.
+- **A threshold made vacuous: `if ops_per_sec >= MIN_SIGS_PER_SEC` → `>= 0` is not caught.** `>= 0`
+  is still a comparison; the rule cannot tell a meaningful threshold from a meaningless one.
+
+- **An `else` arm made unreachable is not caught, when the arm's verdict carries its value.** This was
+  written as *"deleting an `else` arm is not caught"*, which overstates the gap in one direction and
+  understates it in another. MEASURED, mutation by mutation:
+
+  | mutation | verdict affected | caught? |
+  | --- | --- | --- |
+  | `} else {` → `} if false {`, key-auth | `[WARN] Below target` — **no value in it** | **caught** |
+  | `} else {` → `} if false {`, signatures | `[BELOW FLOOR] {ops_per_sec} ...` | not caught |
+  | `} else {` → `} if false {`, pool | `[BELOW TARGET] success rate {success_pct:.2}%` | not caught |
+
+  The distinction is real: a verdict that **carries its measurement** is still earned under rule 1, so
+  barring it does not make it a literal. What the mutation breaks is **reachability** — the verdict
+  still prints, still carries the number, and can no longer be reported. That is a **different defect**,
+  and catching it needs reachability analysis this tool does not do.
+
+  So the honest statement is: **this catches a verdict that cannot change; it does not catch a verdict
+  that can change but can no longer be reached.** The earlier wording implied the tool was weaker than
+  it is on the first count and stronger than it is on the second.
 
 What it catches is the shape that **actually occurred three times**: a verdict with no value and no
 branch anywhere near it. That is a narrow rule, and being narrow is deliberate — a rule that guessed
@@ -75,7 +93,8 @@ what makes it a verdict is the comparison against `MIN_STREAMS_TARGET` beside it
 | reintroduce the round-17 literal `[PASS]` | **caught** |
 | reintroduce the fixed-clause streams verdict | **caught** |
 | change a threshold to `>= 0` | not caught — see above |
-| delete an `else` arm | not caught — see above |
+| bar a value-carrying arm behind `if false` | not caught — see above |
+| bar a valueless arm behind `if false` | **caught** |
 
 ## Related
 

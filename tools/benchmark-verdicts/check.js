@@ -34,16 +34,20 @@
 //
 //   A verdict line with NEITHER is a literal, and fails.
 //
-// WHAT IT DOES NOT CHECK, and a reader should not over-trust it. FALSIFIED AGAINST ITS OWN SUBJECT,
-// and two mutations survive:
+// WHAT IT DOES NOT CHECK, and a reader should not over-trust it. FALSIFIED AGAINST ITS OWN SUBJECT:
 //
-//   * `if ops_per_sec >= MIN_SIGS_PER_SEC` changed to `>= 0` is NOT caught. `>= 0` is still a
-//     comparison, and this rule cannot tell a meaningful threshold from a vacuous one.
-//   * Deleting the `else` arm of a verdict pair is NOT caught, when another `else` sits within the
-//     window - which, in a file of if/else prints, it usually does.
+//   * A threshold made vacuous - `if ops_per_sec >= MIN_SIGS_PER_SEC` changed to `>= 0` - is NOT
+//     caught. `>= 0` is still a comparison, and this rule cannot tell a meaningful threshold from a
+//     meaningless one.
+//   * An `else` arm made UNREACHABLE is NOT caught, when that arm's verdict carries its value.
+//     MEASURED: barring `[BELOW FLOOR] {ops_per_sec} ...` behind `if false` passes, because rule 1
+//     is satisfied by the interpolation. Barring `[WARN] Below target`, which has no value, IS
+//     caught. The distinction is the point: this catches a verdict that canNOT CHANGE, not one that
+//     can change but can no longer be reported. Reachability is a different defect and would need
+//     analysis this tool does not do.
 //
 // What it DOES catch is the shape that actually occurred three times: a verdict printed from a fixed
-// string with no value and no branch anywhere near it. That is a narrow rule and it is worth being
+// string with no value and no branch anywhere near it. That is a narrow rule, and it is worth being
 // narrow, because a rule that guessed at threshold quality would fire on correct code - the failure
 // mode this repository has now recorded in four separate tools.
 //
@@ -92,31 +96,48 @@ function main() {
   }
 
   const problems = [];
-  for (const v of verdicts) {
+  for (let idx = 0; idx < verdicts.length; idx += 1) {
+    const v = verdicts[idx];
     const interpolates = /\{[a-zA-Z_][a-zA-Z0-9_]*/.test(v.line);
 
     // Is this verdict one arm of a numeric branch?
     //
-    // THREE CORRECTIONS, each measured against the file rather than reasoned about. The verdicts
-    // come in three positions relative to their branch and one window cannot serve all of them:
+    // FOUR CORRECTIONS. The first three were window-tuning; the fourth removed the need for it, and
+    // the reason is worth keeping because each earlier version LOOKED right:
     //
-    //   1. The first version used `/if\s+[^;{}]*[<>]=?[^;{}]*\{/`, and `[^;{}]*` excludes the `{`
-    //      that `{:.2?}` puts in the println! ABOVE the branch - so the scan never reached the `if`
-    //      and flagged the key-auth `[PASS]`, which IS earned.
-    //   2. The second looked for the `else` in the BACKWARD window too, but for the PASS arm the
-    //      `else` is on the line AFTER it. A window ending at the verdict cannot contain it.
-    //   3. The third found the PASS arm and then flagged the WARN arm, because for THAT one the
-    //      `if` is further behind than the window reached and there is no `else` ahead.
+    //   1. `/if\s+[^;{}]*[<>]=?[^;{}]*\{/` - `[^;{}]*` excludes the `{` that `{:.2?}` puts in the
+    //      println! ABOVE the branch, so the scan never reached the `if` and flagged the key-auth
+    //      `[PASS]`, which IS earned.
+    //   2. The `else` was sought only in the BACKWARD window, but for a PASS arm it is on the line
+    //      AFTER. A window ending at the verdict cannot contain it.
+    //   3. A symmetric window then found the PASS arm and flagged the WARN arm, whose `if` is
+    //      further behind than the window reached.
+    //   4. A symmetric window ALSO let a surviving mutation through: deleting one arm's `else` was
+    //      missed because ANOTHER `else` sat within reach - and in a file of if/else prints, one
+    //      usually does. MEASURED: that mutation was recorded as a known gap in this tool's README.
     //
-    // So the test is symmetric: a comparison within reach EITHER WAY counts as the branch this
-    // verdict belongs to, and an `else` within reach either way counts as the sibling arm. That
-    // covers `if { A } else { B }` from both A and B without pretending to parse the block.
+    // THE FIX IS THE BOUNDARY, not a wider window. A verdict's `else` can only lie between it and the
+    // NEXT verdict - because the next verdict is by definition the sibling arm, and any later `else`
+    // belongs to a block this verdict is not in. So the interval tested is the verdict's OWN block
+    // plus the one before it, which covers both arms of a pair:
+    //
+    //   PASS arm   `if ... { println!(PASS) } else {`   -> the `else` is in its own block  (ahead)
+    //   failure arm `} else { println!(FAIL) }`         -> the `else` is in the PREVIOUS block
+    //
+    // MEASURED across all eight verdicts in the file: each PASS arm has its `else` ahead of it and no
+    // later `else` is needed; each failure arm has it in the preceding block. A window that reached
+    // further was satisfied by an unrelated `else`, which is exactly the mutation that survived.
+    //
+    // The `if` is still sought backwards over a bounded window, because a verdict's condition sits
+    // above it by however many lines the output block takes.
+    const nextAt = idx + 1 < verdicts.length ? verdicts[idx + 1].at : lines.length + 1;
+    const prevStart = idx > 0 ? verdicts[idx - 1].at : 0;
+    const ownBlock = lines.slice(v.at - 1, nextAt - 1).join('\n');
+    const prevBlock = lines.slice(prevStart - 1, v.at - 1).join('\n');
     const back = lines.slice(Math.max(0, v.at - 20), v.at).join('\n');
-    const ahead = lines.slice(v.at - 1, Math.min(lines.length, v.at + 6)).join('\n');
-    const both = back + '\n' + ahead;
     const hasComparison =
-      /if\s+[^\n]*[<>]=?\s*[0-9_]/.test(both) || /if\s+[^\n]*[<>]=?\s*[a-z_]/i.test(both);
-    const hasSiblingArm = /else\s*(\{|if)/.test(both);
+      /if\s+[^\n]*[<>]=?\s*[0-9_]/.test(back) || /if\s+[^\n]*[<>]=?\s*[a-z_]/i.test(back);
+    const hasSiblingArm = /else\s*(\{|if)/.test(ownBlock) || /else\s*(\{|if)/.test(prevBlock);
     const inBranch = hasComparison && hasSiblingArm;
 
     if (!interpolates && !inBranch) {
