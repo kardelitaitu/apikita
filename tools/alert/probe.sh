@@ -429,6 +429,38 @@ check_error_rate() {
             ;;
     esac
 
+    # THE OTHER TWO FIELDS ARE VALIDATED THE SAME WAY, and MEASURED, they were not.
+    #
+    # `RATE` has the case above; `ERRORS` and `RESPONSES` were read by the same `sed` and then used
+    # unchecked at the two messages below and in the alert body. A body that carries `error_rate` but
+    # not `server_errors` - which is what a RENAME on the server produces, and what this parser cannot
+    # tell apart from a genuinely absent field - left ERRORS empty while RATE parsed cleanly, so the
+    # gate passed the rate check and FIRED:
+    #
+    #     " of 100 responses are 5xx (0.42), above the 5% threshold"
+    #
+    # A sentence with no subject, sent to whoever is being paged, about a rate that was real. The
+    # reachability is what makes this worth a check rather than a comment: curl failure and a non-200
+    # are both caught above, so the remaining exposure is exactly a 200 whose shape changed - the
+    # case a schema edit produces and a test of THIS script would not see.
+    #
+    # Digits only, because both are counts. An empty value is the failure, and so is anything that is
+    # not a run of digits - the same rule the rate applies, one field over.
+    for pair in "server_errors:$ERRORS" "responses:$RESPONSES"; do
+        field=${pair%%:*}
+        value=${pair#*:}
+        case "$value" in
+            ''|*[!0-9]*)
+                echo "probe: FAILED error_rate: the metrics route answered 200 but '$field' did not parse (got '$value')." >&2
+                echo "probe:   The rate itself parsed, so without this the alert below fires with a" >&2
+                echo "probe:   missing figure in its message. /api/admin/metrics always sends it, so a" >&2
+                echo "probe:   field that does not parse means the payload shape changed." >&2
+                fail_with 6
+                return 0
+                ;;
+        esac
+    done
+
     # Compare in tenths of a percent using integer arithmetic: the threshold is 5%,
     # and shell has no float. `awk` is already a dependency of this directory.
     BREACH=$(awk -v r="$RATE" 'BEGIN { print (r > 0.05) ? "yes" : "no" }')
