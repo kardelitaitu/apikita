@@ -322,6 +322,20 @@ else
             fail "$REL no longer states an 'N of its M alerts are covered' figure. Either the sentence moved or it was deleted - and this block exists because that sentence carries the only evidence the checklist offers for alert coverage."
             continue
         fi
+
+        # ... AND IT MUST BE THE ONLY ONE, because the `head -1` above reads one occurrence and the
+        # comparison below trusts it.
+        #
+        # MEASURED, and this is the same hole as `ci-docs-check`'s ordering assertion: with a SECOND
+        # figure added that contradicts alerts.tsv, the check exits 0 - it compared the first and
+        # never saw the second. A document may state a count more than once; what it may not do is
+        # state a WRONG one, and reading one match cannot express that. This is the third place in
+        # this repository where "the right thing appears somewhere" stood in for "every occurrence is
+        # right", so it is asserted rather than assumed.
+        N_STATED=$(tr '\n' ' ' < "$DOC" | tr -d '\r' | grep -o '[0-9][0-9]* of its [0-9][0-9]* alerts are `covered' | grep -c . || true)
+        if [ "$N_STATED" -ne 1 ]; then
+            fail "$REL states an 'N of its M alerts are covered' figure $N_STATED time(s). Only the FIRST is read, so a second one can contradict tools/alert/alerts.tsv and pass. Keep one, or extend this check to compare every occurrence."
+        fi
         S_COVERED=$(printf '%s' "$STATED" | sed 's/^\([0-9][0-9]*\) of its.*/\1/')
         S_TOTAL=$(printf '%s' "$STATED" | sed 's/^[0-9][0-9]* of its \([0-9][0-9]*\) alerts.*/\1/')
         if [ "$S_COVERED" != "$COVERED" ] || [ "$S_TOTAL" != "$D_COUNT" ]; then

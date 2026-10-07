@@ -203,6 +203,33 @@ done
 build_at=$(grep -n '^      - name: Build website$' "$WORKFLOW" | head -n 1 | cut -d: -f1)
 tests_at=$(grep -n '^      - name: Website contract tests$' "$WORKFLOW" | head -n 1 | cut -d: -f1)
 
+# EACH STEP NAME MUST OCCUR EXACTLY ONCE, and this is the assertion that was missing.
+#
+# MEASURED: with a SECOND `- name: Build website` inserted AFTER the tests step, this script exited 0.
+# The `head -n 1` above takes the first occurrence - the legitimate early one - so the ordering
+# assertion compared a pair that was still correctly ordered while the workflow's LAST build ran
+# after the tests. The guard verified the wrong occurrence of the thing it was guarding.
+#
+# Neither of the two checks that follow could catch it: `-z` fires only on a MISSING step, and `-ge`
+# only on an INVERTED pair. A duplicate is neither. And `head -n 1` is what makes it invisible, so
+# the uniqueness has to be asserted rather than assumed.
+#
+# This is the same shape as `alert-check`'s count guard, which asked whether the right number
+# appeared SOMEWHERE while four other occurrences could be wrong. A check that reads one match out of
+# many must first establish that there is only one.
+for pair in "Build website:$WORKFLOW" "Website contract tests:$WORKFLOW"; do
+    step=${pair%%:*}
+    n=$(grep -c "^      - name: ${step}\$" "$WORKFLOW" || true)
+    if [ "$n" -ne 1 ]; then
+        echo "ci-docs-check: FAIL - the workflow has $n step(s) named '$step', and the ordering check" >&2
+        echo "ci-docs-check:   below reads only the FIRST with \`head -n 1\`. With more than one, it" >&2
+        echo "ci-docs-check:   compares that pair and not the one that actually runs last, so a" >&2
+        echo "ci-docs-check:   duplicate placed after 'Website contract tests' passes while leaving the" >&2
+        echo "ci-docs-check:   rendered-output test skipping on every run." >&2
+        exit 1
+    fi
+done
+
 # Both must exist, or the comparison below is vacuously true.
 if [ -z "$build_at" ] || [ -z "$tests_at" ]; then
     echo "ci-docs-check: FAIL - cannot find both '- name: Build website' (at '${build_at:-none}') and" >&2
