@@ -137,14 +137,50 @@ async fn bench_midtrans_signatures() {
 // Per-function rather than one file-level allow, because a blanket allow would
 // silence the lint for anything added here afterwards, and the point of the rule
 // lib.rs states is that the fence is for the NEXT site, not the current ones.
+/// Keys in the simulated pool. The scenario is named for this number.
+const POOL_KEYS: usize = 100;
+
+/// Requests driven through the pool.
+const SCENARIO_REQUESTS: usize = 5_000;
+
+/// How long a throttled key stays out of rotation, in milliseconds.
+///
+/// NOT the shipped cooldown. `docs/benchmark.md` describes this scenario as stressing "granular
+/// 5-second per-key cooldown" and lists "throttled keys automatically resume traffic after 5s
+/// cooldown" among its pass criteria, while this harness uses 50ms - one hundredth of it. That is a
+/// legitimate harness shortcut, because a 5s cooldown would make the run take hours, but it means the
+/// success rate below is NOT the number the document's criterion is about. Naming it here is what
+/// makes the difference visible instead of buried in a `.store()` call.
+const COOLDOWN_MS: i64 = 50;
+
+/// Attempts per request, in the harness.
+///
+/// ALSO NOT THE SHIPPED VALUE: `key_pool.max_key_attempts` is **3**, and this is **5**. The extra
+/// two attempts make the harness's success rate HIGHER than the real router's would be, so the gap
+/// between the measured rate and the documented 99.9% is, if anything, understated.
+const MAX_RETRIES: usize = 5;
+
+/// The published end-user success rate this scenario is meant to demonstrate.
+const PUBLISHED_PASS_PCT: f64 = 99.9;
+
 #[allow(clippy::arithmetic_side_effects)]
 async fn bench_100_key_pool_routing() {
     println!("--> [Scenario 3] Benchmarking 100-Key Pool Least-Loaded Routing & 429 Cooldown...");
-    println!("    Simulating 100 keys, 5,000 requests, 10% random 429 throttle rate...");
+    println!(
+        "    Simulating {POOL_KEYS} keys, {SCENARIO_REQUESTS} requests, 10% SYNTHETIC 429 rate..."
+    );
+    // THE WORD WAS "random" AND THE CODE IS NOT. MEASURED: the throttle condition is
+    // `(req_id + retries) % 10 == 0`, which fires for exactly 500 of 5,000 requests on the first
+    // attempt - the RATE is 10.0% as stated, and the DISTRIBUTION is a fixed arithmetic pattern with
+    // no RNG anywhere in the file. Saying "synthetic" is accurate about both.
+    println!(
+        "    Cooldown   : {COOLDOWN_MS}ms simulated (the documented criterion assumes 5000ms)"
+    );
+    println!("    Retries    : {MAX_RETRIES} per request (shipped max_key_attempts is 3)");
 
     // Create 100 keys
     let keys: Arc<Vec<BenchmarkKey>> = Arc::new(
-        (0..100)
+        (0..POOL_KEYS)
             .map(|_| BenchmarkKey {
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 cooldown_until: Arc::new(AtomicI64::new(0)),
@@ -152,7 +188,7 @@ async fn bench_100_key_pool_routing() {
             .collect(),
     );
 
-    let total_requests = 5_000;
+    let total_requests = SCENARIO_REQUESTS;
     let mut handles = Vec::with_capacity(total_requests);
     let start = Instant::now();
 
@@ -160,7 +196,7 @@ async fn bench_100_key_pool_routing() {
         let pool = Arc::clone(&keys);
         handles.push(tokio::spawn(async move {
             let mut retries = 0;
-            let max_retries = 5;
+            let max_retries = MAX_RETRIES;
 
             while retries < max_retries {
                 let now_millis = chrono::Utc::now().timestamp_millis();
@@ -181,7 +217,7 @@ async fn bench_100_key_pool_routing() {
                         // Mark short simulated cooldown (50ms) for the benchmark run
                         candidate
                             .cooldown_until
-                            .store(now_millis + 50, Ordering::Relaxed);
+                            .store(now_millis + COOLDOWN_MS, Ordering::Relaxed);
                         candidate.in_flight.fetch_sub(1, Ordering::Relaxed);
                         retries += 1;
                         sleep(Duration::from_millis(5)).await;
@@ -216,13 +252,40 @@ async fn bench_100_key_pool_routing() {
         successful, total_requests, elapsed
     );
     println!("    Throughput : {:>10} req/sec across 100 keys", rps);
-    println!(
-        "    Success Rate: {:>9.2}%",
-        (successful as f64 / total_requests as f64) * 100.0
-    );
-    println!(
-        "    Status     : [PASS] 100-key router absorbs 10% throttles without client failure\n"
-    );
+    let success_pct = (successful as f64 / total_requests as f64) * 100.0;
+    println!("    Success Rate: {:>9.2}%", success_pct);
+
+    // THE STATUS IS COMPUTED FROM THE MEASUREMENT, and it was not.
+    //
+    // MEASURED before this line existed: the status was a string literal -
+    // `"    Status     : [PASS] 100-key router absorbs 10% throttles without client failure"` - with
+    // no format placeholder and no branch on `successful`. The run printed `37.76%` and declared PASS
+    // in the same breath, and it would have declared PASS at 0%.
+    //
+    // AND 37.76% MISSES THE PUBLISHED TARGET. `docs/benchmark.md`'s pass criteria for this scenario
+    // are "End-user success rate >= 99.9%", "circuit breaker does not trip", and "throttled keys
+    // automatically resume traffic after 5s cooldown". The harness was asserting the first with a
+    // literal while measuring a number two orders of magnitude below it.
+    //
+    // WHAT THE NUMBER ACTUALLY MEANS, so the verdict is not over-read either: this harness gives each
+    // request `max_retries` attempts and marks it failed when the cooldown it planted outlasts them.
+    // A low rate here reports the HARNESS's retry budget against a synthetic throttle, not a measured
+    // end-user failure rate - which is why the verdict distinguishes the two rather than printing a
+    // bare PASS or FAIL.
+    let pass_mark = PUBLISHED_PASS_PCT;
+    if success_pct >= pass_mark {
+        println!("    Status     : [PASS] success rate {success_pct:.2}% meets the published >= {pass_mark}%\n");
+    } else {
+        println!(
+            "    Status     : [BELOW TARGET] success rate {success_pct:.2}% is under the published >= {pass_mark}%"
+        );
+        println!(
+            "    Note       : {successful}/{total_requests} requests exhausted the harness's {MAX_RETRIES} \
+             retries. This reports the RETRY BUDGET against a {COOLDOWN_MS}ms simulated cooldown, not a \
+             measured end-user failure rate: the doc's criterion assumes the shipped \
+             `key_pool.max_key_attempts` and the 5s cooldown.\n"
+        );
+    }
 }
 
 /// Scenario 4: Simulates 500 concurrent streaming SSE connections
