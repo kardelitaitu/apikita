@@ -1987,3 +1987,55 @@ So the gap is narrow and real: **a type-invalid bin constant is invisible to eve
 caught only in CI.** That is the right place for it to be caught, and it means the local loop cannot
 substitute for the build — which is worth knowing before a mutation is recorded as "not caught" when
 the reason is that nothing local compiles the file.
+
+### The metrics matrix, row by row, and the two rows that are owned by something else
+
+`docs/benchmark.md` publishes a six-row metrics matrix. Five rounds of work on the benchmark harness
+have been closing rows that nothing checked, so it is worth recording the state as a table rather than
+as a sequence of findings — and worth recording that **two rows are deliberately not owned by code.**
+
+| row | target | who owns it |
+| --- | --- | --- |
+| Max Concurrent Streams | $\ge 250$ | `MIN_STREAMS_TARGET`, coupled by `doc_claims` |
+| In-Flight Stream Memory | $< 35$ KB | `STREAM_KB_TARGET`, coupled by `doc_claims` |
+| Key Validation Latency (p99) | $\le 1.5$ ms | `PUBLISHED_P99_LATENCY_MICROS`, coupled |
+| Streaming TTFT | $\le 10$ ms | `PUBLISHED_TTFT_ADDED_MS`, coupled |
+| Ledger Drift | strictly 0 IDR | **`tools/reconcile/reconcile.sh`**, against the real database |
+| CPU Saturation at 200 req/s | $\le 40\%$ | **nothing — the harness cannot sample it** |
+
+MEASURED: the four coupled constants are each read two to four times inside
+`the_benchmark_thresholds_are_the_thresholds_the_document_publishes`, across twelve assertions. The CPU
+row appears in **no** `server/src` file and **no** gate under `tools/` — verified by grep returning
+nothing for `cpu saturat` — so the delegation is real rather than assumed.
+
+**The last two rows are not gaps, and the document says so.** Ledger Drift is delegated by name to the
+reconciler. The CPU row is unreachable from the harness *by construction*: the document states the
+binary "has no HTTP client, no latency histogram and no RSS/CPU sampling", and that "Real figures come
+from the drill and the reconcile tools against a running stack". A row whose quantity the tool cannot
+observe is not a row the tool failed to check.
+
+**Why this is worth writing down at all.** Twice while establishing it, a plausible reading was wrong:
+
+- An exact-string scan for the row figures matched `35` and reported the memory row as unowned, because
+  the constant is `35.0`. The value was right and the comparison was too literal.
+- A coupling scan that sliced a fixed window from the start of the guard found two of the four
+  constants and reported the other two as "constant only". The guard is 309 lines and the slice was
+  shorter. **The window was the bug, in a check written to find bugs.**
+
+Both were caught by reading the file rather than the scan's output, which is the same lesson this
+document has now recorded from four other directions: a scan's negative is a question, not an answer.
+
+**And a third, in the verification of this very section.** The claim that the CPU row is delegated was
+tested by flattening the document and matching `Real figures come from the drill`. It failed, because
+the sentence wraps across a line that begins `> ` — a **markdown blockquote marker**, not content — so
+the flattened text reads `Real figures come > from the drill`. The claim was true and the test was
+wrong. The fix is to strip the marker **before** joining lines:
+
+```
+doc.split('\n').map((l) => l.replace(/^>\s?/, '')).join(' ').replace(/\s+/g, ' ')
+```
+
+This is the **fifth** false negative in this session from a text assumption — a `\r`, a `//` comment
+prefix, a line wrap, a `{` inside a format string, and now a blockquote marker. Each was a check that
+reported a problem where the file was correct. The pattern is stable enough to state: **when a
+text-matching check fails, read the text before believing it.**
