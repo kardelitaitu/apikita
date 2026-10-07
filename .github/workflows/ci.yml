@@ -1007,6 +1007,26 @@ jobs:
       - name: Check the figures the documents state
         run: sh tools/doc-figures/check.sh
 
+      # THE SHELL CONSTRUCTS THAT DESTROY A MEASUREMENT.
+      #
+      # Three were made in this repository while writing guards, and each meant the guard could not
+      # fail:
+      #
+      #   `OUT=$(detector | tail -1)`   $? is tail's, so a non-zero detector reads as success.
+      #                                 MEASURED: reconcile.sh exits 6 for a missing database and
+      #                                 `... | tail -1` reports 0.
+      #   `... | while read; do F=1`    the loop is a subshell, so the flag is lost. The message
+      #                                 still prints, which is what makes it look like it worked.
+      #   `set -e`                      every gate runs detectors whose non-zero exit IS the
+      #                                 finding. MEASURED: adding -e aborts three gates on a CLEAN
+      #                                 tree.
+      #
+      # It does NOT flag the five correct pipelined captures already in tools/ - the rule is not
+      # "did it discard the exit code" but "is the captured value validated before it is trusted",
+      # and each of the five is, by name, with its validation asserted so deleting one fails.
+      - name: Check the shell hazards that destroy a measurement
+        run: sh tools/shell-hazards/check.sh
+
       # The CI document must describe the pipeline that actually runs.
       #
       # docs/ci-cd.md listed TEN stages while the workflow ran TWENTY-SIX: the seven
