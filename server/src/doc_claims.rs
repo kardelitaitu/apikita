@@ -4629,6 +4629,57 @@ mod tests {
              bar nobody published.",
             constant("STREAM_KB_TARGET")
         );
+
+        // THE TTFT ROW, which is a FIXED threshold the harness INJECTS rather than a measurement.
+        //
+        // `docs/benchmark.md` states `Streaming TTFT (Time to First Token) | Added delay <= 10 ms`, and
+        // MEASURED, TTFT was referenced NOWHERE in this repository - not the benchmark binary, not
+        // `tools/`, not `server/src` - while that binary's streaming scenario slept a per-chunk delay
+        // standing in for token inter-arrival. The row's quantity was the one thing the harness
+        // created and never compared.
+        //
+        // A THIRD COMPARISON SHAPE, which is why the helper above does not reach it: the two floors are
+        // `\ge `, the memory bound is `< `, and this one is `\le `. Three rows, three spellings, and a
+        // reader written for one of them finds nothing in the other two - the failure this file
+        // records as "a check that reads a prefix of its input", here in my own previous guard.
+        let mut ttft: Vec<f64> = Vec::new();
+        for line in doc.lines() {
+            let t = line.trim_start();
+            if t.starts_with('>') || t.contains("~~") {
+                continue;
+            }
+            if !line.contains("Streaming TTFT") {
+                continue;
+            }
+            for marker in ["\\le ", "\\ge ", "< ", "\\lt "] {
+                let mut rest = line;
+                while let Some(idx) = rest.find(marker) {
+                    let after = &rest[idx + marker.len()..];
+                    let digits: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.')
+                        .collect();
+                    if let Ok(v) = digits.parse::<f64>() {
+                        ttft.push(v);
+                    }
+                    rest = after;
+                }
+            }
+        }
+        assert!(
+            !ttft.is_empty(),
+            "no added-delay bound was found on the Streaming TTFT row of docs/benchmark.md, so this \
+             guard is not reading the claim it was written for"
+        );
+        assert!(
+            ttft.iter().any(|v| (*v - constant("PUBLISHED_TTFT_ADDED_MS")).abs() < 0.001),
+            "the Streaming TTFT row of docs/benchmark.md bounds the added delay at {ttft:?} ms and \
+             PUBLISHED_TTFT_ADDED_MS is {}. That constant is what the benchmark's streaming scenario \
+             prints as its TTFT verdict, quoted from this row rather than derived, so the two are one \
+             bar and a reader comparing the printed line against the document has no way to tell which \
+             moved.",
+            constant("PUBLISHED_TTFT_ADDED_MS")
+        );
     }
 
     /// A comment must not claim data goes to **Postgres**. There is none.
