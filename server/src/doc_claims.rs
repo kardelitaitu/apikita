@@ -210,6 +210,18 @@ const OPERATIONAL_DOCS: &[&str] = &[
     // the mislead this list exists to catch, and it costs more in a document that is executed than in
     // one that is read.
     "deploy-runbook.md",
+    // The load-test procedure, and it belongs here for the same reason as the runbook: an operator
+    // EXECUTES it. Its three phases and its "do not run this against production" rule are instructions
+    // rather than description, and it cites the metrics matrix and the drill by name - so a drifted
+    // citation would send a reader to the wrong row of the table they are measuring against, while they
+    // are holding a loaded system.
+    //
+    // IT IS ALSO THE ONE DOCUMENT HERE WHOSE NUMBERS ARE DELIBERATELY BLANK. Its two result rows read
+    // "not yet measured", because the figures those rows will carry are the p99 and CPU readings this
+    // repository has never taken. A plausible number would be worse than the gap - the same reasoning
+    // `terms-of-service.md` §10 uses for its contact tokens - and this list is what keeps somebody from
+    // later reading a blank as an oversight and filling it in.
+    "load-test.md",
     "local-development.md",
     "data-retention.md",
     "topology.md",
@@ -4790,6 +4802,199 @@ mod tests {
                 constant("PUBLISHED_P99_LATENCY_MICROS") / 1_000.0
             );
         }
+    }
+
+    /// The **load test's** two thresholds are the two rows the document publishes and nothing
+    /// covered.
+    ///
+    /// WHY THIS IS A THIRD GUARD, and the reason is the gap itself rather than tidiness. The guard
+    /// above couples five constants that live in the **benchmark binary**. `docs/benchmark.md`'s
+    /// metrics matrix has six rows, and MEASURED, TWO of them were covered by nothing anywhere in
+    /// this repository:
+    ///
+    ///   * **Key Validation Latency (p99)** — target `<= 1.5 ms`
+    ///   * **CPU Saturation at 200 req/s** — target `<= 40%`
+    ///
+    /// The other four have a benchmark scenario, a config coupling or a `tools/` sweep behind them.
+    /// These two had neither, and `bin/benchmark.rs` cannot produce either one: it is an in-process
+    /// capacity suite with no HTTP client, no latency histogram and no CPU sampler, and the
+    /// document's §4 says so about itself — "these numbers are not a load test and must not be
+    /// quoted as one". So the document published two bars that no code in the repository measured
+    /// and no check read. That is the same shape as the `max_connections = 10` defect this file
+    /// already records, one level up: not a wrong number, a number with no owner.
+    ///
+    /// `tools/loadtest/loadtest.js` is the owner now, and this is what makes the ownership real.
+    /// The load test's constants are NOT in this crate — it is a Node tool — so the guard reads them
+    /// out of the tool's SOURCE the same way the guard above reads them out of the benchmark binary:
+    /// by locating the declaration and taking its value, never by restating it here. A test that
+    /// hardcoded 1.5 would be a second place to update and would go stale exactly the way the claim
+    /// would without it.
+    ///
+    /// WHAT IT ASSERTS, in both directions for each row: the DOCUMENT states the figure, and the
+    /// TOOL's constant equals it. Changing either alone fails here. That is what stops the load
+    /// test's bar drifting away from the bar an operator reads in the matrix — the failure that
+    /// would let the tool report `[PASS]` against a target nobody published.
+    #[test]
+    fn the_loadtest_thresholds_are_the_thresholds_the_document_publishes() {
+        let doc = std::fs::read_to_string(doc_path("benchmark.md"))
+            .expect("docs/benchmark.md must be readable, or this passes over nothing");
+        let tool = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tools")
+                .join("loadtest")
+                .join("loadtest.js"),
+        )
+        .expect("tools/loadtest/loadtest.js must be readable, or this passes over nothing");
+
+        // The tool's constant, read from its declaration rather than restated here. Handles both
+        // `const NAME = 1.5;` and `const NAME = 40;`, including a trailing comment.
+        let tool_constant = |name: &str| -> f64 {
+            let at = tool
+                .find(&format!("const {name} ="))
+                .unwrap_or_else(|| panic!("tools/loadtest/loadtest.js no longer declares {name}"));
+            let rest = &tool[at..];
+            let raw = rest
+                .split('=')
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} has no assignment"))
+                .split(';')
+                .next()
+                .unwrap_or_default();
+            let digits: String = raw
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            digits
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}'s value is not a number: {raw:?}"))
+        };
+
+        // The matrix row's bound, read from the line that NAMES the metric. Every row of the matrix
+        // is written `<label> | <bound> | <warning> | <critical>`, and the bound is the FIRST
+        // comparison operator on the line, so reading only the first one is what keeps a warning or
+        // critical figure from being mistaken for the target — the failure the guard above records
+        // as "looking for digits after the label finds the next column".
+        //
+        // Both `\le ` (math, the two rows here) and `<=` (plain) are accepted, because the matrix
+        // writes its bounds in LaTeX while Scenario 1's pass criteria write them plainly, and a
+        // reader that knew only one spelling would silently find nothing in the other — which is the
+        // four-way probe table's lesson, restated.
+        let published = |label: &str| -> Vec<f64> {
+            let mut out = Vec::new();
+            for line in doc.lines() {
+                let t = line.trim_start();
+                // A struck-through or quoted figure is a correction, not a live claim.
+                if t.starts_with('>') || t.contains("~~") {
+                    continue;
+                }
+                if !line.contains(label) {
+                    continue;
+                }
+                for marker in ["\\le ", "<=", "\\ge ", ">=", "< ", "\\lt "] {
+                    if let Some(idx) = line.find(marker) {
+                        let after = &line[idx + marker.len()..];
+                        let digits: String = after
+                            .trim_start()
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || *c == '.')
+                            .collect();
+                        if let Ok(v) = digits.parse::<f64>() {
+                            out.push(v);
+                        }
+                        break;
+                    }
+                }
+            }
+            out
+        };
+
+        // --- Row: Key Validation Latency (p99) ------------------------------------
+        //
+        // The row is a CEILING written `\le 1.5`, so the document's figure is compared against the
+        // tool's constant directly, in milliseconds. `PUBLISHED_P99_LATENCY_MICROS` in the benchmark
+        // binary is the SAME bar in microseconds; that guard already ties it to this row, so this one
+        // does not re-derive it — it ties the ROW to the LOAD TEST, which is the coupling that was
+        // missing.
+        let p99_claims = published("Key Validation Latency");
+        assert!(
+            !p99_claims.is_empty(),
+            "no bound was found on the 'Key Validation Latency' row of docs/benchmark.md, so this \
+             guard is not reading the claim it was written for"
+        );
+        let tool_p99_ms = tool_constant("PUBLISHED_P99_LATENCY_MS");
+        assert!(
+            p99_claims.iter().any(|v| (*v - tool_p99_ms).abs() < 0.001),
+            "docs/benchmark.md's 'Key Validation Latency (p99)' row states {p99_claims:?} ms and \
+             tools/loadtest/loadtest.js carries PUBLISHED_P99_LATENCY_MS = {tool_p99_ms}. That \
+             constant is the bar the load test prints its p99 verdict against, and this row is the \
+             bar an operator reads, so they are one target stated twice. Update both or neither - \
+             a tool comparing against a bar nobody published is the defect this guard exists for."
+        );
+
+        // --- Row: CPU Saturation at 200 req/s -------------------------------------
+        //
+        // THE UNIT IS CHECKED TOO, and that is deliberate rather than pedantic. This row's figure is
+        // a PERCENTAGE, while the p99 row's is a millisecond count, and a guard that compared the
+        // two rows' numbers to each other's constants would happily accept a 40 read as a latency.
+        // Asserting the tool's constant is the same ORDER OF MAGNITUDE as the matrix's is what
+        // separates "the two agree" from "two numbers 40 and 1.5 were compared to the wrong rows".
+        let cpu_claims = published("CPU Saturation");
+        assert!(
+            !cpu_claims.is_empty(),
+            "no bound was found on the 'CPU Saturation' row of docs/benchmark.md, so this guard is \
+             not reading the claim it was written for"
+        );
+        let tool_cpu_pct = tool_constant("PUBLISHED_CPU_TARGET_PCT");
+        assert!(
+            cpu_claims.iter().any(|v| (*v - tool_cpu_pct).abs() < 0.001),
+            "docs/benchmark.md's 'CPU Saturation at 200 req/s' row states {cpu_claims:?}% and \
+             tools/loadtest/loadtest.js carries PUBLISHED_CPU_TARGET_PCT = {tool_cpu_pct}. The load \
+             test prints its CPU verdict as a percentage of the 0.2 vCPU this document's own header \
+             names, normalised for exactly that reason, so the row and the constant are one target."
+        );
+        assert!(
+            tool_cpu_pct > 1.0 && tool_p99_ms < 100.0,
+            "the load test's two thresholds look SWAPPED: PUBLISHED_CPU_TARGET_PCT is {tool_cpu_pct} \
+             and PUBLISHED_P99_LATENCY_MS is {tool_p99_ms}. The CPU row is a percentage in the tens \
+             and the latency row is a millisecond count in the single digits, so a value in the wrong \
+             one of those ranges means the two were assigned to each other's constants - which the \
+             equality assertions above CANNOT catch, because each would still match a figure that \
+             appears on some row of the document."
+        );
+
+        // --- The rate the CPU row is denominated at -------------------------------
+        //
+        // The row's name IS the figure: `CPU Saturation at 200 req/s`. Read from the row rather than
+        // restated, and compared to the constant the tool prints in its caveat, so a document that
+        // renames the row to a different rate cannot leave the tool telling an operator to re-run
+        // at a rate that no longer matches the published bar.
+        let rate = {
+            let row = doc
+                .lines()
+                .find(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with('>') && !l.contains("~~") && l.contains("CPU Saturation")
+                })
+                .expect("docs/benchmark.md must still carry a CPU Saturation row");
+            let at = row
+                .find(" at ")
+                .unwrap_or_else(|| panic!("the CPU Saturation row no longer states a rate: {row}"));
+            let after = &row[at + " at ".len()..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("could not read a rate out of the CPU Saturation row: {row}"))
+        };
+        let tool_rate = tool_constant("PUBLISHED_CPU_RATE_RPS");
+        assert!(
+            (rate - tool_rate).abs() < 0.001,
+            "docs/benchmark.md states the CPU row at {rate} req/s and tools/loadtest/loadtest.js \
+             carries PUBLISHED_CPU_RATE_RPS = {tool_rate}. The tool prints 're-run with --rps {tool_rate}' \
+             as the fix for a saturation-mode reading, so a row stated at a different rate would make \
+             that instruction point at a number the document no longer publishes."
+        );
     }
 
     /// A comment must not claim data goes to **Postgres**. There is none.
