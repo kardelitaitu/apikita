@@ -1936,3 +1936,54 @@ whole sweep is a recursive `readdirSync` over `tools/`, a `require` scan, and a 
 invocation with quoted text stripped first — three minutes of work, and cheaper than the gate would have
 been. It turned a plausible plan into a corrected one, which is the only reason this section exists
 rather than a fourth rule in `shell-hazards` that could never fire.
+
+### A guard that reads a file the test target never compiles
+
+`cargo test --lib` does **not compile `server/src/bin/`**, and a guard over the binaries therefore reads
+them as **text**. That is one sentence, and it explains a measurement that looked like a broken build.
+
+MEASURED, all three parts:
+
+| check | result |
+| --- | --- |
+| `cargo test --lib --no-run` mentions the bin | **no** — the library is all it builds |
+| a TYPE-INVALID constant in the bin breaks `--lib` compilation | **no** — it compiles cleanly |
+| `cargo test` (all targets) builds the bin | **yes** |
+
+So mutating a bin constant to `"ten"` produces **no build error**. The guard parses the declaration out
+of the text, fails to parse the number, and panics with *"`PUBLISHED_TTFT_ADDED_MS`'s value is not a
+number"*. A clean assertion, on a file that was never compiled.
+
+**Why this is worth writing down.** It was briefly read as *"exit 101 means it did not compile, so this
+is not a caught mutation"* — a rule applied several times in earlier rounds. That reading is wrong in
+two ways:
+
+- `cargo test` exits **101 for a FAILING TEST**, not only for a compile error. The two are
+  indistinguishable by exit code, and I had recorded them as one.
+- For a bin constant the compile-error case **cannot arise at all** under `--lib`, because the file is
+  not in the build. The mutation that "should" have failed to compile ran to completion.
+
+**The discriminator, since the exit code is not one.** A compile error never reaches the test phase, so
+the signal is the **presence or absence of a `test result:` line**, not the number 101. The `--lib`
+case here shows the subtler version: `test result: FAILED. 0 passed; 1 failed` with the bin untouched
+by the compiler, which is exactly what a working text-parsing guard produces.
+
+**And it generalises past this guard, with one boundary.** Every check in this repository that ranges
+over `server/src/bin/` reads it as text — `doc_claims` does, `benchmark-verdicts` does, `doc-figures`
+does not (it reads `server/src` and the config). So `cargo test --lib` alone cannot tell a well-formed
+bin constant from a malformed one: it never compiles the file, and the text readers only fail if the
+**text** stops matching what they expect.
+
+MEASURED, where that leaves the exposure:
+
+| command | catches a type-invalid bin constant? |
+| --- | --- |
+| `cargo test --lib` | **no** |
+| `cargo build --bins` | **yes** — `error[E0308]` |
+| any gate under `tools/` | **no** — none runs `cargo build` |
+| CI | **yes** — the workflow does build, covering the bins |
+
+So the gap is narrow and real: **a type-invalid bin constant is invisible to every local check and is
+caught only in CI.** That is the right place for it to be caught, and it means the local loop cannot
+substitute for the build — which is worth knowing before a mutation is recorded as "not caught" when
+the reason is that nothing local compiles the file.
