@@ -1711,6 +1711,39 @@ recording in the code under test, here in the guards: **a check that reads a pre
 the suffix rot**, whether the prefix is the first number of a line range, the first match of a pattern,
 or the first line of a declaration.
 
+### Not every unvalidated read is one of those, and the screen for it does not work
+
+The section above invites a mechanical follow-up: find every parsed value that nothing validates. That
+screen runs, and it is mostly wrong — which is worth recording so the next person does not re-run it and
+believe the output.
+
+MEASURED, over the shell gates: a scan for "assigned from a parse pipeline, then never named in a
+`case`/`-z`/`-f` test" returns roughly ten candidate pairs, and every one inspected was a false
+positive. Three shapes account for them:
+
+- **the value is validated by a COMMAND, not a test.** `drill.sh`'s `SCRATCH_PATH` is never compared to
+  anything — `mkdir -p` at the next line fails and calls `fail`. `SOURCE_PATH` and `DUMP` are checked
+  with `[ ! -f ]`. A `case` is one validation idiom among several.
+- **the value is derived from an already-validated one.** `LOW` and `LIVE_LOW` are the same `tr`
+  applied to two inputs; `LOW` carries the guard, `LIVE_LOW` is the comparison operand. Validating
+  both would be belt and braces, not a defect.
+- **the value reports rather than gates.** This is the one worth naming, because it looks the worst and
+  is the safest. MEASURED, in `tools/backup/backup.sh`: `SIZE` has a `-eq 0` check, and `ESIZE` and
+  `SHA` — read the same way, from the artifact — have none. That reads as the round-74 defect exactly.
+  It is not, because the artifact is verified FOUR times before either is read: the encryption
+  succeeded, it **decrypts back**, the plaintext **is** a SQLite file, and it **passes
+  `integrity_check`**. Nothing that reaches `ESIZE` can be empty, and neither value gates anything —
+  they are printed on the success line.
+
+  So the question that separates a real finding from the third shape is **what has already been
+  proven about the input when the read happens**, and what the value is used FOR afterwards. A read on
+  an unverified input that gates a decision is the defect; a read on a verified input that only
+  reports is a label.
+
+The screen is still worth running — it found the two real defects in rounds 73 and 74 — but its output
+is a list of QUESTIONS, not findings. Each candidate needs the input's provenance checked before it is
+called one.
+
 ### A invariant test that passes because nothing was there
 
 Two of this round's schema checks reported a **violation that did not exist**, and both came from the
