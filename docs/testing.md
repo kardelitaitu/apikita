@@ -727,6 +727,34 @@ The fixes that hold, in order of how well:
   parse, take the test module or the function body explicitly rather than the whole file - a parse that
   found its own region is the same bug one level up.
 
+**AND THERE IS A MILDER FORM THAT IS EASY TO SHIP BY ACCIDENT: an assertion that RESTATES ITS OWN
+GREP.** Not a guard satisfied by its own text - a guard that adds a check, believes it has strengthened
+something, and has in fact re-run the lookup that produced its input. It passes, it reads as diligence,
+and it cannot fail for the reason it claims.
+
+MEASURED, on `tools/backup-check`. A documented, unenforced assumption said the FIRST mention of
+`run_wired_jobs` in `docs/deployment.md` must be the scheduler paragraph, because a three-line window
+downstream is read from that line. The natural "fix" was:
+
+```sh
+sed -n "${LIST_AT}p" "$DEP_DOC" | grep -q 'run_wired_jobs' || fail "..."
+```
+
+`LIST_AT` came from `grep -n 'run_wired_jobs' | head -n 1`. So the check asserts that the line the grep
+found contains the string the grep searched for. MEASURED, a decoy sentence naming `run_wired_jobs`
+inserted at the top of the document - exactly the failure the assumption warns about - left this
+assertion SILENT; only the pre-existing symptom check fired.
+
+What replaced it asserts the PROPERTY the window rests on rather than the search that produced it: the
+three-line window must name at least two of the jobs `run_wired_jobs` actually calls. A decoy sentence
+names the function and no jobs, so it fails - with a message about the cause, where the old message
+reported the symptom (six jobs missing) and sent the reader to the entrypoint script instead of to the
+paragraph that displaced the list.
+
+THE TELL, and it is worth checking whenever an assertion is added to an existing lookup: **does this
+assertion's input come from the same expression it is testing?** If the needle and the haystack are
+produced by one expression, the assertion is a tautology with a failure message attached.
+
 **AND THE OBVIOUS SCREEN FOR THIS SHAPE DOES NOT WORK.** After finding it by hand, sweeping for it
 looks mechanical: find every assertion whose needle also appears in the file it searches. MEASURED
 across `server/src`, that screen returns **53 candidates in `config.rs` alone**, and the ones inspected
