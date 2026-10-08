@@ -2179,3 +2179,36 @@ truncated by a `-First 15` display limit — I recorded the size of the *output*
 *sets*, which is the same mistake as the fixed-window slice two rounds ago. The second was arithmetic
 done by eye over a list of sixteen items. Both were caught by the verification pass, which is the only
 reason the section does not ship with them.
+
+### The code graph is a second index, and it is stale by default
+
+`apikita` is indexed into a code knowledge graph (`list_projects` reports it), and a round used it for a
+purpose grep is bad at: finding shapes rather than names. Three queries, each cheap, each answering a
+question this document has otherwise answered by reading files:
+
+```
+MATCH (f:Function) WHERE f.recursive = true
+MATCH (f:Function) WHERE f.linear_scan_in_loop >= 1   -- the O(n^2) loop_depth misses
+MATCH (f:Function) WHERE f.transitive_loop_depth >= 3 -- polynomial-degree proxy
+```
+
+**What it found, and what it did not.** Eight recursive functions, six of them test or config helpers
+walking a TOML or document tree, two in the frontend's live store — and the live store's recursion
+(`connect` → `scheduleRetry` → `connect`) is a reconnect loop that is DELIBERATE and bounded:
+`nextRetryDelay` doubles from 1s and caps at 8s, `attempt` resets to 0 on `open`, and the `error`
+handler only recreates the stream when `readyState === CLOSED`. All three properties are asserted in
+`live.test.ts`. The `linear_scan_in_loop` sweep returned twelve rows and EVERY ONE was in
+`doc_claims`, whose tests scan documents — bounded by the input, run once, off the request path. The
+production hot path (`proxy.rs`) counts bytes in a single pass with no allocation.
+
+**So the round's answer was "clean", and the number that makes it usable is not the row count.** It is
+`check_index_coverage`'s `freshness`, which came back **`metadata_changed` on all six files checked**:
+the graph was indexed 33 commits ago. A `no_recorded_issue` coverage status is a best-effort signal and
+not a completeness proof, and a stale generation makes every structural negative provisional. The
+conclusion above rests on the SOURCE for each claim — `nextRetryDelay` read directly, the
+`linear_scan_in_loop` rows confirmed to be in test modules, `estimated_input_tokens` read in full — and
+not on the graph agreeing with itself.
+
+**The rule is the one this file applies to every other scanner.** A graph is a scan of the source made
+at a moment; its negative is a question, and its freshness is part of the answer. Cite the generation
+with any count taken from it, and read the source before reporting that something is absent.
