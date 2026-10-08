@@ -3676,6 +3676,38 @@ mod tests {
         let _ = root;
     }
 
+    /// Every file with one of `exts` under `root`, recursively, skipping the directories that hold
+    /// generated or vendored content.
+    fn files_under(root: &std::path::Path, exts: &[&str]) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, exts: &[&str], out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if matches!(
+                        name.as_str(),
+                        "node_modules" | "target" | ".git" | "dist" | ".astro"
+                    ) {
+                        continue;
+                    }
+                    walk(&path, exts, out);
+                } else if exts
+                    .iter()
+                    .any(|e| name.rsplit_once('.').is_some_and(|(_, ext)| ext == *e))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, exts, &mut out);
+        out.sort();
+        out
+    }
+
     /// A file with this basename, anywhere under `root`. Depth-first, and the shortest path
     /// wins so a tie between two same-named files resolves deterministically.
     fn find_by_name(root: &std::path::Path, base: &str) -> Option<std::path::PathBuf> {
@@ -4947,6 +4979,182 @@ mod tests {
             called.len(),
             RUNNABLE.len()
         );
+    }
+
+    /// A VERIFICATION TABLE THAT NAMES A TEST IS A PRESENT-TENSE CLAIM, and `docs/plans/` being
+    /// historical does not cover it.
+    ///
+    /// MEASURED, and it is why this guard exists. `docs/plans/sqlite-migration.md` §9 carries a
+    /// seven-row verification table whose preamble calls its rows **"evidence, not proposals"**. Row 4
+    /// read **`test: PASS`** and cited `concurrent_refunds_serialize_without_losing_the_write_lock`:
+    ///
+    ///   * the test appears in NO commit of this repository - `git log -S` searches the name and finds
+    ///     nothing, so it was never written rather than deleted;
+    ///   * the `AlreadyRefunded` variant it reports "four see" does not exist either;
+    ///   * and `refund_topup_transaction`, the function the row tests, was REMOVED by `374c2fd` when
+    ///     refunds changed from debited to refused.
+    ///
+    /// Of the six names the table cites, five resolve to live tests or functions. Only this row's two
+    /// do not - so the table is not a fiction, which is exactly what makes the one bad row dangerous:
+    /// it sits among checked neighbours and reads as checked.
+    ///
+    /// WHY THE EXISTING TRIAGE DOES NOT COVER IT. `docs/plans/` is excluded from the citation check on
+    /// the grounds that a plan's LINE NUMBERS were accurate when written and rewriting them would
+    /// destroy the record. That reason decides citations. A `test: PASS` verdict is a claim about what
+    /// the suite verifies NOW, and a reader deciding whether the read-then-write property is covered
+    /// consults this table.
+    ///
+    /// WHAT IS ALLOWED. Historical prose in these documents is untouched - past-tense narration about
+    /// the Postgres original, the PocketBase client, the phases as executed. This checks only the
+    /// NARROW shape: inside a `docs/plans/` verification table, a backticked identifier that is
+    /// introduced as a test and does not exist.
+    #[test]
+    fn a_plans_verification_table_does_not_cite_a_test_that_does_not_exist() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate has a parent")
+            .to_path_buf();
+        let plans = root.join("docs").join("plans");
+        let files = files_under(&plans, &["md"]);
+        assert!(
+            files.len() >= 2,
+            "only {} document(s) were found under docs/plans and this guard expects the historical \
+             plans. A walk that reads fewer is not reading the tree",
+            files.len()
+        );
+
+        // The suite's own test names, harvested from the source that declares them.
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let sources = files_under(&src_root, &["rs"]);
+        let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // AND EVERY IDENTIFIER THE SOURCE MENTIONS, not only the functions it declares. A verification
+        // table also backticks CONFIG KEYS - `allow_negative_balance_overdraft`,
+        // `default_max_output_tokens` - and MEASURED, a functions-only harvest reported both as
+        // missing. They are real: they appear in `db.rs` and `routes/proxy.rs`. The check is whether
+        // the name is ONE THE SUITE KNOWS, so the haystack is the whole source text rather than the
+        // `fn` declarations.
+        let mut mentioned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in &sources {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            for line in text.lines() {
+                let t = line.trim_start();
+                if let Some(rest) = t
+                    .strip_prefix("fn ")
+                    .or_else(|| t.strip_prefix("async fn "))
+                {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        declared.insert(name);
+                    }
+                }
+                for chunk in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    if chunk.len() >= 24 {
+                        mentioned.insert(chunk.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            declared.len() > 500,
+            "only {} function name(s) were harvested from server/src, so this guard is not reading \
+             the suite it compares against",
+            declared.len()
+        );
+
+        let mut missing: Vec<String> = Vec::new();
+        let mut inspected = 0usize;
+        for path in &files {
+            let doc = std::fs::read_to_string(path).unwrap_or_default();
+            let label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // A row that INTRODUCES an identifier as a test: `test: PASS` / `test: FAIL` / "the test
+            // `name`" / "test `name`". The word test (or the status prefix) is what makes the
+            // identifier a claim about the suite rather than a passing mention.
+            for line in doc.lines() {
+                // A CORRECTION IS EXEMPT, and this guard's own first run is why. The row was fixed to
+                // say the cited test "appears in NO commit of this repository" - and quoting the dead
+                // name to explain that it is dead re-armed the check, so the guard failed on the
+                // correction rather than on the defect. Same shape this file records from several
+                // directions: text that documents a fault reads to a scanner as the fault. A row that
+                // says SUPERSEDED, or states that nothing declares the name, is reporting history.
+                let corrected = line.contains("SUPERSEDED")
+                    || line.contains("appears in NO commit")
+                    || line.contains("does not exist")
+                    || line.contains("never existed");
+                if corrected {
+                    continue;
+                }
+                // WHICH LINES ARE CLAIMS, and getting this right took two corrections. The first
+                // version required the word "test" ON THE LINE; the second required a verdict marker
+                // (`test:` / `probe:` / `existing`) in the row. MEASURED, BOTH were too narrow and for
+                // the same reason: the table's rows do not share a vocabulary. One reads
+                // `**test: PASS** — \`name\``, another `**probe:** ... \`name\``, and three cite a test
+                // as the whole evidence with a section LINK where the verdict would be, so neither the
+                // word nor the marker is present. Only 3 of the 5 test-shaped identifiers survived
+                // either filter.
+                //
+                // The reliable signal is the CONTAINER, not the wording: a row of the verification
+                // table. Any table row in these documents that backticks a long snake_case identifier
+                // is naming something the plan claims about, and a name the suite does not declare is
+                // worth reporting whether it is introduced as a test or as a probe.
+                let is_table_row = line.trim_start().starts_with('|');
+                if !is_table_row {
+                    continue;
+                }
+                for cited in backticked_identifiers(line) {
+                    // Only identifiers shaped like a test name, so a config key or a SQL fragment in
+                    // the same row is not accused. Test names here are long, snake_case, and their
+                    // distinctive property is that they READ AS ENGLISH - which is what excludes the
+                    // `SELECT COUNT(*) ...` verification query the ledger row carries: it has
+                    // underscores and is long, and it is not a name. The character class below admits
+                    // only the snake_case alphabet, and a space or parenthesis ends the match.
+                    if cited.len() < 24 || !cited.contains('_') {
+                        continue;
+                    }
+                    if !cited
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    {
+                        continue;
+                    }
+                    inspected += 1;
+                    if !declared.contains(cited) && !mentioned.contains(cited) {
+                        missing.push(format!("{label}: {cited}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            inspected >= 4,
+            "only {inspected} test-shaped identifier(s) were found across the docs/plans verification \
+             tables, so this guard is not looking at the claims it was written for"
+        );
+        assert!(
+            missing.is_empty(),
+            "a docs/plans verification table introduces an identifier as a test that server/src does \
+             not declare: {missing:?}. These tables record what verifies the system NOW - their \
+             preamble calls the rows evidence rather than proposals - so a name here that no commit \
+             contains sends a reader to a test that does not exist. Correct the row to say what is \
+             actually true, or land the test"
+        );
+    }
+
+    /// Every `` `identifier` `` on a line.
+    fn backticked_identifiers(line: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('`') else { break };
+            out.push(&after[..close]);
+            rest = &after[close + 1..];
+        }
+        out
     }
 
     /// `tools/loadtest/loadtest.js` is the owner now, and this is what makes the ownership real.
