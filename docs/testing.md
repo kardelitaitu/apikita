@@ -1998,21 +1998,34 @@ as a sequence of findings — and worth recording that **two rows are deliberate
 | --- | --- | --- |
 | Max Concurrent Streams | $\ge 250$ | `MIN_STREAMS_TARGET`, coupled by `doc_claims` |
 | In-Flight Stream Memory | $< 35$ KB | `STREAM_KB_TARGET`, coupled by `doc_claims` |
-| Key Validation Latency (p99) | $\le 1.5$ ms | `PUBLISHED_P99_LATENCY_MICROS`, coupled |
+| Key Validation Latency (p99) | $\le 1.5$ ms | `PUBLISHED_P99_LATENCY_MICROS` (the binary) and `PUBLISHED_P99_LATENCY_MS` (the load test), both coupled |
 | Streaming TTFT | $\le 10$ ms | `PUBLISHED_TTFT_ADDED_MS`, coupled |
 | Ledger Drift | strictly 0 IDR | **`tools/reconcile/reconcile.sh`**, against the real database |
-| CPU Saturation at 200 req/s | $\le 40\%$ | **nothing — the harness cannot sample it** |
+| CPU Saturation at 200 req/s | $\le 40\%$ | **`tools/loadtest/`** — it starts the real server and samples CPU and RSS from its PID |
 
 MEASURED: the four coupled constants are each read two to four times inside
-`the_benchmark_thresholds_are_the_thresholds_the_document_publishes`, across twelve assertions. The CPU
-row appears in **no** `server/src` file and **no** gate under `tools/` — verified by grep returning
-nothing for `cpu saturat` — so the delegation is real rather than assumed.
+`the_benchmark_thresholds_are_the_thresholds_the_document_publishes`, across twelve assertions.
 
-**The last two rows are not gaps, and the document says so.** Ledger Drift is delegated by name to the
-reconciler. The CPU row is unreachable from the harness *by construction*: the document states the
-binary "has no HTTP client, no latency histogram and no RSS/CPU sampling", and that "Real figures come
-from the drill and the reconcile tools against a running stack". A row whose quantity the tool cannot
-observe is not a row the tool failed to check.
+**THE LAST TWO ROWS ARE NOT DELEGATED OUT OF THE REPOSITORY, and the distinction matters.** Ledger Drift
+is a database question and `reconcile.sh` answers it; CPU Saturation needed an instrument the benchmark
+binary does not have. Both are now owned, and each owner was built rather than assumed - the load test
+exists precisely because "the binary cannot measure this" was true and is not the same as "nobody can".
+
+**AND THE OWNERS' CONSTANTS ARE PINNED BY LITERALS, WHICH LOOKS LIKE THE BUG THIS FILE KEEPS FINDING.**
+`tools/loadtest-check/verdict-probe.js` asserts `PUBLISHED_P99_LATENCY_MS === 1.5`,
+`PUBLISHED_CPU_TARGET_PCT === 40`, `PUBLISHED_CPU_RATE_RPS === 200` and `PUBLISHED_VCPU === 0.2` - all
+hard-coded in the probe, and it never opens `docs/benchmark.md`. The document's name appears only in its
+comments. That is the shape of a check that restates its subject.
+
+MEASURED, and it is why the literals are correct here: mutating the DOCUMENT and the CONSTANT TOGETHER
+still fails. `$p99$ 1.5 -> 2.5 ms` in both places failed two `doc_claims` tests and `loadtest-check`;
+`0.2 -> 0.4 vCPU` in both places failed `loadtest-check`. So the probe is a **second source of truth**
+rather than a copy - it holds the value the document is supposed to state, independently of the document,
+which is the only arrangement in which a coordinated edit is detectable at all.
+
+The tell that separates the two: **does the pinned value come from the same file the check is about?**
+A literal in a check on file A that must equal a figure in B is an independent pin. A literal that came
+from A, asserting A, is the tautology this file records elsewhere.
 
 **Why this is worth writing down at all.** Twice while establishing it, a plausible reading was wrong:
 
