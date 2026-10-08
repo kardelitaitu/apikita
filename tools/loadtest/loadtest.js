@@ -161,6 +161,15 @@ const PUBLISHED_CPU_RATE_RPS = 200;
 const WIN_TICKS_PER_SECOND = 10_000_000;
 
 /**
+ * How many quanta a sampling interval must span before a CPU reading means anything.
+ *
+ * Not 1: a single sample can STRADDLE a quantum boundary and see two, which `measureCpuQuantumMs`
+ * records. Four is the figure the inline refusal used, named here so the exported predicate and the
+ * caller cannot disagree about it.
+ */
+const SAMPLE_INTERVAL_QUANTA = 4;
+
+/**
  * The PowerShell this tool shells out to for each sample.
  *
  * SEVERAL PORTABILITY FACTS ARE BAKED IN HERE, and every one was found by RUNNING it rather than by
@@ -258,6 +267,39 @@ function measureCpuQuantumMs() {
     if (increment > 400) break;
   }
   return 15.625;
+}
+
+/**
+ * Whether a sampling interval is far enough above this host's quantum to produce a CPU figure that
+ * means anything.
+ *
+ * A PURE FUNCTION, EXPORTED, AND THAT IS THE POINT. The refusal lived inline in `main`, behind the
+ * live-server reachability check, so MEASURED, no hermetic gate could reach it: running the tool with
+ * a deliberately tiny interval and a dead server stops at `is not answering` first, and running it
+ * with no server stops at `--base-url is required`. The rule is the subtle kind - too short an
+ * interval makes most samples read "no CPU consumed", the CPU figure comes out SMALL, and small
+ * passes a `<= 40%` bar - so it is exactly the rule that would regress unnoticed. Extracting it here
+ * is what lets `tools/loadtest-check` assert it the way it already asserts the two verdicts.
+ *
+ * THE MULTIPLIER IS NOT 1. `> quantum` is not enough: a sample that straddles a quantum boundary
+ * sees TWO quanta (recorded on `measureCpuQuantumMs`), so the caller demands several. Four is the
+ * figure the inline version used and is kept, rather than re-derived here.
+ */
+function sampleIntervalIsUsable(intervalMs, quantumMs) {
+  if (!Number.isFinite(intervalMs) || !Number.isFinite(quantumMs) || quantumMs <= 0) {
+    return { ok: false, why: 'the interval or the quantum was not a positive finite number' };
+  }
+  const minimum = quantumMs * SAMPLE_INTERVAL_QUANTA;
+  if (intervalMs < minimum) {
+    return {
+      ok: false,
+      minimumMs: Math.ceil(minimum),
+      why:
+        `most samples would read "no CPU consumed" and the CPU figure would come out small - ` +
+        `and small passes a <= ${PUBLISHED_CPU_TARGET_PCT}% bar`,
+    };
+  }
+  return { ok: true, minimumMs: Math.ceil(minimum) };
 }
 
 // ===========================================================================
@@ -550,12 +592,13 @@ async function main() {
   }
 
   const cpuQuantumMs = measureCpuQuantumMs();
-  if (sampleIntervalMs < cpuQuantumMs * 4) {
+  const usable = sampleIntervalIsUsable(sampleIntervalMs, cpuQuantumMs);
+  if (!usable.ok) {
     process.stderr.write(
       `loadtest: --sample-interval-ms ${sampleIntervalMs} is too close to this host's process-CPU ` +
-      `quantum of ${cpuQuantumMs} ms (MEASURED, not assumed). Below ~4x the quantum most samples ` +
-      `read "no CPU consumed" and the CPU figure comes out small — and small passes a <= ${PUBLISHED_CPU_TARGET_PCT}% bar. ` +
-      `Use at least ${Math.ceil(cpuQuantumMs * 4)} ms.\n`,
+      `quantum of ${cpuQuantumMs} ms (MEASURED, not assumed). Below ~${SAMPLE_INTERVAL_QUANTA}x the ` +
+      `quantum ${usable.why}. ` +
+      `Use at least ${usable.minimumMs} ms.\n`,
     );
     process.exit(3);
   }
@@ -887,6 +930,8 @@ module.exports = {
   PUBLISHED_CPU_TARGET_PCT,
   PUBLISHED_CPU_RATE_RPS,
   PUBLISHED_VCPU,
+  SAMPLE_INTERVAL_QUANTA,
+  sampleIntervalIsUsable,
   HISTOGRAM_BOUNDS,
   verdictP99,
   verdictCpu,

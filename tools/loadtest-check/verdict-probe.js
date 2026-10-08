@@ -132,8 +132,43 @@ need(m.PUBLISHED_CPU_RATE_RPS === 200,
 need(m.PUBLISHED_VCPU === 0.2,
   `PUBLISHED_VCPU is ${m.PUBLISHED_VCPU}; docs/benchmark.md's header states 0.2 vCPU`);
 
+// --- The sampling interval against the host's CPU quantum ------------------------
+//
+// WHY THIS IS ASSERTED HERE RATHER THAN LEFT TO THE TOOL. The refusal used to live inline in `main`,
+// behind the live-server reachability check. MEASURED: running the tool with a deliberately tiny
+// interval and a dead server stops at "is not answering" first, and running it with no server stops
+// at "--base-url is required" - so NO hermetic gate could reach it. That matters because the rule is
+// the subtle kind: too short an interval makes most samples read "no CPU consumed", the CPU figure
+// comes out SMALL, and small passes a <= 40% bar. A rule whose failure direction is a false PASS is
+// the one worth pinning, and it now has a pure function to pin.
+need(m.SAMPLE_INTERVAL_QUANTA > 1,
+  `SAMPLE_INTERVAL_QUANTA is ${m.SAMPLE_INTERVAL_QUANTA}; a single sample can straddle a quantum ` +
+  'boundary and see two, so the multiplier must be greater than 1');
+
+const quantum = 15.625; // the measured value the tool's own doc comment records
+const tooShort = m.sampleIntervalIsUsable(quantum, quantum);
+need(tooShort.ok === false,
+  'an interval of exactly one quantum was accepted; at that period most samples read "no CPU ' +
+  'consumed", the figure comes out small, and small PASSES the published bar');
+const fourQuanta = m.sampleIntervalIsUsable(quantum * 4, quantum);
+need(fourQuanta.ok === true,
+  `an interval of exactly ${m.SAMPLE_INTERVAL_QUANTA}x the quantum was rejected; the boundary is ` +
+  'inclusive because the tool says "at least" this figure');
+const justUnder = m.sampleIntervalIsUsable(quantum * 4 - 0.01, quantum);
+need(justUnder.ok === false,
+  'an interval just under the multiplier was accepted, so the boundary is not where it claims');
+need(m.sampleIntervalIsUsable(undefined, quantum).ok === false,
+  'an undefined interval was accepted');
+need(m.sampleIntervalIsUsable(1000, 0).ok === false,
+  'a zero quantum was accepted, which would make every interval look usable');
+need(tooShort.minimumMs === Math.ceil(quantum * m.SAMPLE_INTERVAL_QUANTA),
+  `the refusal does not report the minimum interval it demands (got ${tooShort.minimumMs}); the ` +
+  'operator is told to raise a number they cannot compute');
+
 for (const p of problems) console.error(`check.sh: FAIL - ${p}`);
 if (problems.length) process.exit(1);
 console.log('loadtest-check:   ok - both verdicts pass inside their bar and fail outside it, in both');
 console.log('loadtest-check:        directions; no-data never passes; an unresolvable p99 never passes;');
-console.log('loadtest-check:        the histogram merges by sum and reads back a known value.');
+console.log('loadtest-check:        the histogram merges by sum and reads back a known value;');
+console.log('loadtest-check:        and a too-short sampling interval is refused, which no live-server');
+console.log('loadtest-check:        run of the tool can be made to demonstrate.');
