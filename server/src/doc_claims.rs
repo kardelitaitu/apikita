@@ -4924,14 +4924,30 @@ mod tests {
              guard is not reading the claim it was written for"
         );
         let tool_p99_ms = tool_constant("PUBLISHED_P99_LATENCY_MS");
+        // EVERY CLAIM, NOT ANY OF THEM. This was an `.any()`, and MEASURED it was satisfiable by the
+        // matrix row alone: the document states this metric TWICE - the metrics matrix and the owner
+        // table further down - and mutating the OWNER TABLE's figure to 9.9 ms left the guard GREEN,
+        // because the matrix still said 1.5. An `.any()` over a set of claims accepts one agreement as
+        // proof of all of them, which is the shape this file records as "the right thing appears
+        // somewhere" standing in for "every occurrence is right". The count floor is what stops the
+        // fix degenerating into a scan that reads nothing.
         assert!(
-            p99_claims.iter().any(|v| (*v - tool_p99_ms).abs() < 0.001),
-            "docs/benchmark.md's 'Key Validation Latency (p99)' row states {p99_claims:?} ms and \
-             tools/loadtest/loadtest.js carries PUBLISHED_P99_LATENCY_MS = {tool_p99_ms}. That \
-             constant is the bar the load test prints its p99 verdict against, and this row is the \
-             bar an operator reads, so they are one target stated twice. Update both or neither - \
-             a tool comparing against a bar nobody published is the defect this guard exists for."
+            p99_claims.len() >= 2,
+            "only {} p99 claim(s) were found in docs/benchmark.md and this guard expects at least the \
+             metrics matrix row and the owner table. A scan that matches fewer is not reading the \
+             document, and the comparison below would pass over everything",
+            p99_claims.len()
         );
+        for claimed in &p99_claims {
+            assert!(
+                (*claimed - tool_p99_ms).abs() < 0.001,
+                "docs/benchmark.md states the p99 bar as {claimed} ms somewhere, and \
+                 tools/loadtest/loadtest.js carries PUBLISHED_P99_LATENCY_MS = {tool_p99_ms}. Every \
+                 statement of this metric must be that figure: the document states it in both the \
+                 metrics matrix and the owner table, and a reader who finds two different bars cannot \
+                 tell which one the tool compares against. All claims: {p99_claims:?}"
+            );
+        }
 
         // --- Row: CPU Saturation at 200 req/s -------------------------------------
         //
@@ -4947,13 +4963,26 @@ mod tests {
              not reading the claim it was written for"
         );
         let tool_cpu_pct = tool_constant("PUBLISHED_CPU_TARGET_PCT");
+        // EVERY CLAIM, for the reason the p99 block above records: this metric is stated twice, and
+        // MEASURED, mutating the OWNER TABLE's figure to 90% left the guard GREEN while the matrix
+        // still read 40.
         assert!(
-            cpu_claims.iter().any(|v| (*v - tool_cpu_pct).abs() < 0.001),
-            "docs/benchmark.md's 'CPU Saturation at 200 req/s' row states {cpu_claims:?}% and \
-             tools/loadtest/loadtest.js carries PUBLISHED_CPU_TARGET_PCT = {tool_cpu_pct}. The load \
-             test prints its CPU verdict as a percentage of the 0.2 vCPU this document's own header \
-             names, normalised for exactly that reason, so the row and the constant are one target."
+            cpu_claims.len() >= 2,
+            "only {} CPU claim(s) were found in docs/benchmark.md and this guard expects at least the \
+             metrics matrix row and the owner table. A scan that matches fewer is not reading the \
+             document, and the comparison below would pass over everything",
+            cpu_claims.len()
         );
+        for claimed in &cpu_claims {
+            assert!(
+                (*claimed - tool_cpu_pct).abs() < 0.001,
+                "docs/benchmark.md states the CPU saturation bar as {claimed}% somewhere, and \
+                 tools/loadtest/loadtest.js carries PUBLISHED_CPU_TARGET_PCT = {tool_cpu_pct}. The load \
+                 test prints its CPU verdict as a percentage of the 0.2 vCPU this document's own header \
+                 names, normalised for exactly that reason, so every statement of the row and the \
+                 constant are one target. All claims: {cpu_claims:?}"
+            );
+        }
         assert!(
             tool_cpu_pct > 1.0 && tool_p99_ms < 100.0,
             "the load test's two thresholds look SWAPPED: PUBLISHED_CPU_TARGET_PCT is {tool_cpu_pct} \
