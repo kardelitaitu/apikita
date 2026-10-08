@@ -1,5 +1,15 @@
 # Plan Audit
 
+**Status:** HISTORICAL - this is a record of an audit performed against the plan as it stood at the
+time, not a description of the system now. `doc_claims.rs` excludes it from the citation check on
+exactly that basis ("a historical record of a past audit"), and the two other historical documents
+carry a Status line saying so for the same reason. The line was missing here, which mattered: the
+audit's own present-tense sections — "What is genuinely solid" — read as current findings, and at
+least one figure no longer holds. MEASURED, the schema section says **15 tables** while
+`tools/sqlite-probes/validate-migration-schema.py` applies the shipped migrations and reports **21**,
+because four migrations have landed since. The findings below are what was true when they were
+written; read them as a dated audit, not as the current state.
+
 A deliberate review of the whole plan, asking whether it holds together rather than
 whether it is internally consistent. **The consistency checks pass** (332 links, no
 dead anchors, arithmetic reproduces). This document records the problems that

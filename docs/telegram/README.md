@@ -1,5 +1,11 @@
 # Telegram — Channel and Bot
 
+**Status:** NOT BUILT. `doc_claims.rs` excludes this file from the citation check as "the bot channel
+spec, for a bot that is not built", and that is the fact a reader needs first: nothing here is running.
+`server/` has no Telegram client, so every table and command below is a specification of intended
+behaviour rather than a description of the service. The line said so only in a table far down the page,
+which is why it is here.
+
 The Telegram surface: a channel with discussion rooms, plus a bot.
 
 > **Decision: payments via Telegram are DEFERRED.** Top-ups happen on the website

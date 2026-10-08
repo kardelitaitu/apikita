@@ -3344,6 +3344,64 @@ mod tests {
             );
         }
 
+        // A REASON THAT CALLS A DOCUMENT HISTORICAL MUST BE ECHOED IN THE DOCUMENT.
+        //
+        // MEASURED, and it is the failure the triage list can hide. `docs/plans/sqlite-migration.md`
+        // and `docs/plans/proxy-hot-path-audit.md` both carry a `**Status:**` line saying what they
+        // are, so a reader knows to read them as a log. `docs/plan-audit.md` was excluded as "a
+        // historical record of a past audit" and said NOTHING of the kind - its sections are headed
+        // "What is genuinely solid" and read as current findings. One of its figures no longer held:
+        // MEASURED, it states "15 tables" while `tools/sqlite-probes/validate-migration-schema.py`
+        // applies the shipped migrations and reports 21, because four migrations landed after the
+        // audit. `docs/cache-pricing-options.md` was excluded as "a design note for a cache that is
+        // not built" and opened with "The one open commercial decision", describing a capability as
+        // though it existed.
+        //
+        // The rule is the one the triage reason for `plans/sqlite-migration.md` already states about
+        // itself: the reason "only has to stop contradicting the status line". A reason that says
+        // HISTORICAL, SUPERSEDED or NOT BUILT contradicts a document that says nothing, because the
+        // only place a reader looks is the document.
+        for (name, reason) in TRIAGED {
+            let low = reason.to_ascii_lowercase();
+            let claims_historical = [
+                "historical",
+                "superseded",
+                "past audit",
+                "not built",
+                "is not built",
+                "not-built",
+            ]
+            .iter()
+            .any(|w| low.contains(w));
+            if !claims_historical {
+                continue;
+            }
+            let path = doc_path(name);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // The signal a reader actually meets in the first screen of the file.
+            let head: String = text.chars().take(2000).collect();
+            let head_low = head.to_ascii_lowercase();
+            let says_so = [
+                "status:",
+                "historical",
+                "superseded",
+                "not built",
+                "not-built",
+            ]
+            .iter()
+            .any(|w| head_low.contains(w));
+            assert!(
+                says_so,
+                "docs/{name} is triaged as historical or unbuilt - the recorded reason is {reason:?} \
+                 - but the document itself never says so in its opening. The two other historical \
+                 documents carry a `**Status:**` line for exactly this reason, and this one read as a \
+                 description of the present until it did. Either state it in the document, or correct \
+                 the reason to describe what the document actually is"
+            );
+        }
+
         // The vacuity guard, both directions: a list that matched nothing, or a
         // docs/ directory the read did not actually see, would pass over everything.
         assert!(

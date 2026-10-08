@@ -1,5 +1,11 @@
 # Cache-Heavy Usage — Options
 
+**Status:** AN OPTIONS NOTE FOR A CAPABILITY THAT IS NOT BUILT. `doc_claims.rs` excludes this file
+from the citation check as "a design note for a cache that is not built", and that exclusion is only
+honest if the file says so itself - it did not, which made a note about an unbuilt feature read as a
+description of shipped behaviour. Read the figures below as the arithmetic behind a decision that is
+still open, not as what the service does.
+
 The one open commercial decision. Every workload except cache-heavy is profitable at
 M = 2.00; this document lays out what can be done about the exception.
 
