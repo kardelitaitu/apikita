@@ -4823,6 +4823,132 @@ mod tests {
     /// and no check read. That is the same shape as the `max_connections = 10` defect this file
     /// already records, one level up: not a wrong number, a number with no owner.
     ///
+    /// AND THE SCENARIO LIST ITSELF: the document names four, the binary runs four, and they are not
+    /// the same four.
+    ///
+    /// MEASURED, and it is why this guard exists rather than a renumbering commit. `docs/benchmark.md`
+    /// titles its scenarios 1 to 4, and number 3 is **"Database & Ledger Contention (Database I/O
+    /// Bound)"**. The binary's `main` runs four benchmarks and labels them 1, 2, 3, 4 as well — but
+    /// its "3" is the **100-key pool**, which the document calls Scenario 4, and its "4" is the SSE
+    /// streaming loop, which the document calls Scenario 2. So the document's Scenario 3 is
+    /// UNIMPLEMENTED, and two of its three criteria (`zero SQLITE_BUSY failures`, `> 100
+    /// settlements/sec`) appear nowhere in the codebase except that line.
+    ///
+    /// That is worse than a missing figure, because the numbering makes it invisible: a reader
+    /// comparing `[Scenario 3]` output against "Scenario 3" in the document compares two different
+    /// things and has no way to tell. Two of the three criteria had no owner and the third is a
+    /// doc-only claim.
+    ///
+    /// WHAT THIS ASSERTS, and the choice stated rather than made silently: the document's scenario
+    /// TITLES are compared against a list here, and a title absent from the binary is reported. It
+    /// does NOT fail on the document's Scenario 3 being unimplemented — a scenario the harness cannot
+    /// run is a DECISION, and the document's own §4 says the binary "is not a load test". What fails
+    /// is a scenario DISAPPEARING from the document, or the document gaining one that nothing claims.
+    /// The unimplemented one is pinned BY NAME below so that removing it is deliberate, and its
+    /// criteria are recorded as unowned rather than left to look owned.
+    #[test]
+    fn the_documents_scenarios_and_the_binarys_scenarios_are_accounted_for() {
+        let doc = std::fs::read_to_string(doc_path("benchmark.md"))
+            .expect("docs/benchmark.md must be readable, or this passes over nothing");
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("bin")
+                .join("benchmark.rs"),
+        )
+        .expect("the benchmark binary must be readable, or this passes over nothing");
+
+        // The document's scenario titles, in order.
+        let titled: Vec<&str> = doc
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("### Scenario "))
+            .collect();
+        assert!(
+            titled.len() >= 4,
+            "only {} '### Scenario' heading(s) were found in docs/benchmark.md and this guard expects \
+             at least four. A scan that finds fewer is not reading the document",
+            titled.len()
+        );
+
+        // WHICH OF THEM THE BINARY CAN RUN. Matched on the distinguishing noun rather than the number,
+        // because the numbering is exactly what is wrong: "Hot-Path Key", "SSE Streaming", "100-Key
+        // Pool" and "Midtrans" are the phrasings both files use.
+        const RUNNABLE: &[(&str, &str)] = &[
+            ("Hot-Path Key", "bench_hot_path_key_validation"),
+            ("Midtrans", "bench_midtrans_signatures"),
+            ("100-Key Pool", "bench_100_key_pool_routing"),
+            ("SSE Streaming", "bench_concurrent_streaming_streams"),
+        ];
+        // THE ONE THE HARNESS DOES NOT RUN, named so its absence is a decision rather than an
+        // oversight. MEASURED: its three criteria are `zero SQLITE_BUSY failures`, `zero balance
+        // discrepancies` (owned by tools/reconcile, the launch Gate 2 money check) and `> 100
+        // settlements/sec with pool size = 8` - the last two of which appear in NO other file.
+        const UNRUNNABLE: &[&str] = &["Database & Ledger Contention"];
+
+        for needle in UNRUNNABLE {
+            assert!(
+                titled.iter().any(|t| t.contains(needle)),
+                "the document no longer carries the scenario {needle:?}. It is listed here as the one \
+                 the harness cannot run - its criteria are unowned by the binary on purpose, and the \
+                 document's §4 explains why. Removing the heading removes the only place those \
+                 criteria are stated; if that is intended, remove it from this list in the same edit."
+            );
+        }
+
+        let mut unclaimed: Vec<&str> = Vec::new();
+        for title in &titled {
+            let runnable = RUNNABLE.iter().any(|(noun, _)| title.contains(noun));
+            let excused = UNRUNNABLE.iter().any(|n| title.contains(n));
+            if !runnable && !excused {
+                unclaimed.push(title);
+            }
+        }
+        assert!(
+            unclaimed.is_empty(),
+            "docs/benchmark.md describes scenario(s) that are neither run by the benchmark binary nor \
+             listed as deliberately unrun: {unclaimed:?}. A scenario nobody runs and nobody lists is \
+             the state the document's Scenario 3 was in - measured, two of its three criteria appear \
+             in no other file, so a reader has no way to tell an unimplemented bar from a measured one"
+        );
+
+        // AND THE BINARY'S SIDE: every function it CALLS from main must be one of the four. A fifth
+        // benchmark added to `main` without a document heading is the same defect from the other end.
+        //
+        // EVERY LINE, NOT A SUBSTRING, and the first version of this assertion was a substring so it
+        // did not hold: MEASURED, commenting out `bench_100_key_pool_routing().await;` left the guard
+        // GREEN, because `contains("bench_100_key_pool_routing")` is true of the COMMENTED-OUT call.
+        // That is the same "the right thing appears somewhere" shortfall this file records from four
+        // other directions, and it is why the check below strips a line's leading `//` and requires
+        // the call to survive as CODE with an awaited invocation.
+        let main = {
+            let at = src.find("async fn main()").expect("main must exist");
+            let rest = &src[at..];
+            &rest[..rest.find("\n}").expect("main must close")]
+        };
+        let mut called: Vec<&str> = Vec::new();
+        for (_, fname) in RUNNABLE {
+            let awaited = format!("{fname}(");
+            let live = main.lines().any(|line| {
+                let code = line.trim_start();
+                !code.starts_with("//") && code.contains(&awaited)
+            });
+            if live {
+                called.push(fname);
+            }
+        }
+        assert_eq!(
+            called.len(),
+            RUNNABLE.len(),
+            "the benchmark binary's main runs only {} of the {} benchmark functions this guard knows \
+             about: {called:?}. A function that stopped being CALLED (commented out, or removed), or \
+             one added without a document heading, is the mismatch this test exists to make visible. \
+             A commented-out call does not count - that was measured as a hole in the first version \
+             of this assertion",
+            called.len(),
+            RUNNABLE.len()
+        );
+    }
+
     /// `tools/loadtest/loadtest.js` is the owner now, and this is what makes the ownership real.
     /// The load test's constants are NOT in this crate — it is a Node tool — so the guard reads them
     /// out of the tool's SOURCE the same way the guard above reads them out of the benchmark binary:
