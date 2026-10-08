@@ -40,6 +40,20 @@ const PENDING: Record<string, string> = {
   '[[PRIVACY_EMAIL]]':
     'the address a customer writes to about their data. No mailbox exists; docs/abuse-runbook.md ' +
     'tracks it as an owner input, the same one docs/terms-of-service.md §10 is blocked on.',
+  // THE THREE THE TERMS CARRY, which the scan above never saw because it walks `website/src` and these
+  // live in `docs/`. They are listed here rather than left unlisted for the reason the whole file
+  // exists: `docs/terms-of-service.md` §10 is where a placeholder reaches a CUSTOMER, and until this
+  // row existed, no assertion in the repository distinguished `[[ABUSE_EMAIL]]` - a tracked owner
+  // decision with a replacement table of its own - from `[[X]]`, a token somebody forgot.
+  '[[ABUSE_EMAIL]]':
+    'the monitored abuse mailbox. Terms §10.2, and docs/terms-of-service.md carries the replacement ' +
+    'table; docs/abuse-runbook.md §Open items records the same gate.',
+  '[[OWNER_LEGAL_NAME]]':
+    'the contracting entity, blocked on the same decision as the two above: ' +
+    'docs/launch-checklist.md §Gate 0 "Decide the contracting entity".',
+  '[[RESPONSE_HOURS]]':
+    'the first-response commitment, stated numerically only once the times have a numeric form; the ' +
+    'canonical table is in docs/abuse-runbook.md §"Severity and response time".',
 };
 
 /** The placeholder form: `[[UPPER_SNAKE]]`. Narrow on purpose - a markdown link is `[text](url)`. */
@@ -74,18 +88,43 @@ test('no UNKNOWN placeholder reaches a customer', () => {
 
   const unknown: string[] = [];
   const seenPending = new Set<string>();
-  for (const file of sources) {
+  const scan = (file: string, label: string): void => {
     const text = readFileSync(file, 'utf8');
     for (const m of text.matchAll(PLACEHOLDER)) {
       // The pending count is recorded from EVERY occurrence, including a comment: a token kept in a
       // comment is the safe form, and the staleness check below needs to see it there. What the
       // comment exemption decides is only whether the occurrence is a DEFECT.
       if (m[0] in PENDING) seenPending.add(m[0]);
+      // Markdown has no `//` comment form, so the exemption does not apply there.
+      if (file.endsWith('.md')) {
+        if (!(m[0] in PENDING)) unknown.push(`${label}: ${m[0]}`);
+        continue;
+      }
       if (isCommentLine(text, m.index)) continue;
       if (m[0] in PENDING) continue;
-      unknown.push(`${file.slice(SRC.length + 1)}: ${m[0]}`);
+      unknown.push(`${label}: ${m[0]}`);
     }
-  }
+  };
+
+  for (const file of sources) scan(file, file.slice(SRC.length + 1));
+
+  // THE DOCUMENTS ARE SCANNED TOO, and this is the part that was missing.
+  //
+  // MEASURED: replacing `[[ABUSE_EMAIL]]` in docs/terms-of-service.md §10 with `[[X]]` - a generic
+  // token that names no decision and ships to a customer - left this file GREEN at 3 passed. The
+  // documents were outside the scan, so the guard's own stated distinction ("a KNOWN gap with a
+  // tracked owner decision" versus "a half-finished edit, a token somebody forgot") was not applied
+  // where the token actually reaches a reader.
+  //
+  // It matters more here than in `src` because `tools/fill-contacts` WRITES to these documents: the
+  // tool's own output was the one place a placeholder could be introduced with no guard looking.
+  const docs = existsSync(DOCS) ? filesUnder(DOCS, ['.md']) : [];
+  assert.ok(
+    docs.length > 20,
+    `only ${docs.length} document(s) found under ${DOCS} - the document half of this scan is not ` +
+      'reading the tree',
+  );
+  for (const file of docs) scan(file, `docs/${file.slice(DOCS.length + 1)}`);
 
   assert.deepEqual(
     unknown,
@@ -144,6 +183,28 @@ test('the document that carries a pending workaround says what must change', () 
   assert.ok(start > 0, 'docs/terms-of-service.md has no §10 Contact and complaints');
   const next = tos.indexOf('\n## ', start + 1);
   const section = tos.slice(start, next === -1 ? undefined : next);
+
+  // EVERY TOKEN IN THE SECTION MUST BE A PENDING ONE, and that is the clause this test was missing.
+  //
+  // MEASURED BEFORE IT EXISTED: replacing `[[ABUSE_EMAIL]]` in §10 with `[[X]]` - a generic token
+  // that names no decision and ships to a customer - left this file GREEN, 3 passed / 0 failed. The
+  // assertion below it asks only whether the section NAMES a channel, and `[[X]]` is a match. So the
+  // test accepted any placeholder at all where its own header promises it distinguishes a KNOWN gap
+  // from "a half-finished edit, a token somebody forgot".
+  //
+  // The scan above does not cover this either: it walks `website/src`, and `docs/` is outside it -
+  // which matters because `tools/fill-contacts` WRITES to these documents, so the tool's output is
+  // the one place a placeholder can be introduced without any guard seeing it.
+  const tokens = section.match(PLACEHOLDER) ?? [];
+  const strangers = tokens.filter((t) => !(t in PENDING));
+  assert.deepEqual(
+    strangers,
+    [],
+    `docs/terms-of-service.md §10 carries placeholder(s) nobody is waiting on: ${strangers.join(', ')}. ` +
+      'A token that is not in PENDING is an unfinished edit rather than a tracked gap - and this is ' +
+      'the section a customer reads to find out how to complain. Fill it, or add it to PENDING with ' +
+      'the reason it cannot be filled here.',
+  );
 
   const namesChannel = /\[\[[A-Z0-9_]+\]\]/.test(section);
   const saysBlocked = /not yet|before publish|replac|placeholder|blocked/i.test(section);
