@@ -282,6 +282,45 @@ if [ -n "$doc_build" ] && [ -n "$doc_tests" ] && [ "$doc_build" -ge "$doc_tests"
     exit 1
 fi
 
+# A PROBE'S COUNT IS NOT RESTATED IN PROSE, because it drifts.
+#
+# MEASURED: `tools/sqlite-probes/validate-migration-schema.py` prints its own count, and FOUR documents
+# carried the figure it produced on the day each was written - docs/ci-cd.md twice, tools/README.md, and
+# docs/plans/sqlite-migration.md - all saying 32 while the run reports 38. The probe's OWN readme had
+# already learned this and says "Read the number off a run rather than from here", naming the SHAPE of
+# each assertion instead of the count. The other four did not.
+#
+# So the rule is not "the number must match" - that would put the figure in a fifth place and break
+# again on the next assertion added. It is that a count MUST NOT APPEAR next to the word it counts.
+PROBE="tools/sqlite-probes/validate-migration-schema.py"
+if [ ! -f "$PROBE" ]; then
+    echo "ci-docs-check: FAIL - $PROBE is missing, so this guard cannot check the claim it exists for." >&2
+    exit 1
+fi
+# The probe must actually PRINT a count, or the prohibition below protects nothing.
+if ! python3 "$PROBE" 2>/dev/null | grep -qE '^[0-9]+ checks, [0-9]+ failed'; then
+    echo "ci-docs-check: FAIL - $PROBE no longer prints a 'N checks, M failed' summary, so the rule that" >&2
+    echo "ci-docs-check:   no document restates it is guarding a figure that does not exist." >&2
+    exit 1
+fi
+for f in "$DOC" "$REPO/tools/README.md" "$REPO/docs/plans/sqlite-migration.md"; do
+    [ -f "$f" ] || continue
+    # A number immediately before the word it counts is the drifted shape. The plan's own explanatory
+    # line quotes the old figure while saying it is stale, which is the one legitimate mention.
+    BAD=$(grep -nE '[0-9]+ (invariant|checks)[a-z]* ' "$f" \
+        | grep -v 'the count on the day' \
+        | grep -v 'MEASURED, it now reports' \
+        | head -n 1)
+    if [ -n "$BAD" ]; then
+        echo "ci-docs-check: FAIL - ${f#$REPO/} restates an assertion count for $PROBE:" >&2
+        echo "ci-docs-check:   $BAD" >&2
+        echo "ci-docs-check:   That figure is what the probe produced the day the line was written, and the" >&2
+        echo "ci-docs-check:   probe gains assertions over time - MEASURED, four documents said 32 while the" >&2
+        echo "ci-docs-check:   run said 38. Name what the probe asserts, not how many assertions it made." >&2
+        exit 1
+    fi
+done
+
 echo "ci-docs-check: OK - all $COUNT workflow steps are named in docs/ci-cd.md, every check it advertises exists,"
 echo "ci-docs-check:      the build precedes the website contract tests in both files, and all $REAL_COUNT tool"
 echo "ci-docs-check:      directories are indexed in tools/README.md"

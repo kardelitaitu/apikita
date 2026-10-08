@@ -32,7 +32,7 @@ here must appear, and every name listed must exist.
 
 | Tool | What it is for | Runs in CI |
 | --- | --- | --- |
-| [`sqlite-probes/`](sqlite-probes/README.md) | Validates the shipped schema against the plan, and runs 32 invariant probes against it. | Yes |
+| [`sqlite-probes/`](sqlite-probes/README.md) | Validates the shipped schema against the plan, and runs its invariant probes against it. | Yes |
 
 ## Delivery — the things customers notice
 

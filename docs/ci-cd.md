@@ -52,7 +52,7 @@ anyway, so the check below can demand an exact match:
 | Stage | Purpose |
 | --- | --- |
 | Apply migrations to an empty database | Migrations apply cleanly, in order, to a database that is empty *literally* (deleted first) |
-| Validate the schema against the plan | The shipped schema still matches the plan's Appendix A, **and** 32 invariant probes pass against it |
+| Validate the schema against the plan | The shipped schema still matches the plan's Appendix A, **and** every invariant probe passes against it |
 | Probe the SQLite dialect assumptions the port rests on | `sqlite-port-probe.py` and `sqlite-timestamp-probe.py` exit 0. The plan says to run these "first, before writing any Rust"; CI ran only the third of the three, and this one had been failing on its own version banner since Python 3.14 removed `sqlite3.version` |
 
 #### The deployable artifacts actually work
@@ -735,7 +735,7 @@ Keep the free tier in mind when choosing a provider — see
 - [x] Whether the schema-drift check runs as a CI step or stays a local probe —
   **it runs as a CI step** (`Validate the schema against the plan`, immediately after
   the migrations-applied step). The answer for a money system is yes: the checker
-  compares the plan's Appendix A with the shipped migration AND runs 32 invariant
+  compares the plan's Appendix A with the shipped migration AND runs the invariant
   probes (every table STRICT, no REAL/FLOAT column, the CHECK constraints actually
   refusing bad rows, FK and RESTRICT behaviour). Answering the question was worth it
   on its own: the file had been **failing**, the plan was missing `topups.rail`, and

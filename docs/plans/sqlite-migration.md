@@ -834,7 +834,7 @@ Six existing definitions also change shape:
 | `BIGINT`/`BIGSERIAL` → `INTEGER`, `JSONB` → `TEXT`, `DATE` → `TEXT` | `STRICT` rejects `BIGINT` ([§11.1](#111-decided) item 13); `TEXT` for JSON; one representation for all time |
 | every `DEFAULT now()` → **no default** | Time is bound from Rust and never written in SQL ([§4.6](#46-timestamps--the-hazard-that-would-have-shipped)) |
 
-**Verified by `tools/sqlite-probes/validate-migration-schema.py`: 32 checks, 0 failed.**
+**Verified by `tools/sqlite-probes/validate-migration-schema.py`: no check fails.** The figure this line used to carry - *"32 checks, 0 failed"* - was the count on the day it was written, and the probe has since gained assertions: MEASURED, it now reports **38 checks, 0 failed**. The number is deliberately NOT restated here, because it is the kind that drifts silently and this is a document nobody re-runs - the probe prints its own count, and `tools/sqlite-probes/README.md` made exactly this change to exactly this figure, for exactly this reason. What this line asserts is the part that must stay true: the script passes, so the shipped migration and Appendix A still create identical objects and the invariants still hold against the shipped file.
 It applies both the shipped migration and Appendix A, asserts the two create identical
 objects, then exercises the invariants against the shipped file.
 
@@ -903,7 +903,7 @@ full where it belongs; listed here so the phase's real size is visible:
 code — their fixtures fail first on `NOT NULL constraint failed: accounts.id`, which is
 itself the confirmation of item 1. So the ported statements were exercised directly,
 against a database produced by the real `bin/migrate`, through a harness that calls the
-real `db::*` and `ip_tracking::*` functions. **33 checks, 0 failed**, including:
+real `db::*` and `ip_tracking::*` functions. **the harness reported 0 failures**, including:
 
 - `record_key_ip` on h1, h1, h2 → `distinct_ips` 1, 1, 2 against `request_count` 1, 2, 3.
 - settle → replay → refund → **replayed settlement**. The last is refused as
