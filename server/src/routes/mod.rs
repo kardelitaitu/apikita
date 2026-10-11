@@ -21,6 +21,7 @@ pub mod auth;
 pub mod events;
 pub mod health;
 pub mod keys;
+pub mod oversize;
 pub mod proxy;
 pub mod reviews;
 pub mod telegram;
@@ -510,6 +511,12 @@ pub fn create_router(state: AppState) -> Router {
     // NOT the same as METHOD_NOT_ALLOWED, which axum raises for a mounted path with the
     // wrong verb; that keeps its own status and is asserted separately in the route table.
     .fallback(unrouted)
+    // The body limit's 413 is produced during EXTRACTION, before any handler exists to give it the
+    // documented envelope - so the shape has to be fixed on the way out. Everything that is not a
+    // 413 passes through untouched; see `oversize` for why this could not be an `AppError` variant.
+    .layer(axum::middleware::map_response(
+        oversize::documented_oversize_response,
+    ))
     .with_state(state)
 }
 
@@ -1388,6 +1395,7 @@ mod tests {
             events,
             ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies,
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 

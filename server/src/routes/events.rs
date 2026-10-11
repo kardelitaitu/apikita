@@ -1007,6 +1007,7 @@ mod tests {
             events: Arc::new(RealtimeHub::new(config)),
             ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies: Arc::from(Vec::new().into_boxed_slice()),
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 

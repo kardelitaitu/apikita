@@ -573,6 +573,7 @@ mod tests {
                     events,
                     ip_salt: std::sync::Arc::new(crate::ip_tracking::DailySalt::new()),
                     trusted_proxies,
+                    tasks: crate::shutdown::TaskTracker::new(),
                 };
             }
         }

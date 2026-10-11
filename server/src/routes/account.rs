@@ -1517,6 +1517,7 @@ mod tests {
             config: Arc::new(config),
             ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies: Arc::from(trusted.into_boxed_slice()),
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 

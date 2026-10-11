@@ -94,6 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn_no_trusted_proxies();
     }
 
+    let tasks = apikita_server::shutdown::TaskTracker::new();
+
     let state = AppState {
         pool,
         config,
@@ -104,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // for why over-counting is the direction we accept.
         ip_salt: Arc::new(ip_tracking::DailySalt::new()),
         trusted_proxies,
+        tasks: Arc::clone(&tasks),
     };
 
     let app = routes::create_router(state);
@@ -121,13 +124,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the proxy handler. Without it every request would panic at runtime rather
     // than fail to compile, so it is load-bearing for IP tracking — and it is
     // the only reason `axum::serve` is not called with `app` directly.
+    //
+    // ---------------------------------------------------------------------
+    // TWO-PHASE SHUTDOWN, and the second phase is the one that is easy to miss.
+    //
+    // `with_graceful_shutdown` stops accepting and drains CONNECTIONS. It does NOT await detached
+    // `tokio::spawn` tasks, because those are owned by the runtime rather than by the connection that
+    // started them. This server bills and releases on detached tasks, so a shutdown that stopped at
+    // phase one could tell a customer their request completed while the settlement had not been
+    // written - the answer delivered and the wallet never debited, which is quieter than the stranded
+    // hold because nothing is left over to alert on.
+    //
+    // So: phase one drains connections, phase two drains the tracked detached work. The order is
+    // forced - draining tasks first would abandon in-flight requests that are still producing them.
+    //
+    // WHAT THIS DOES NOT DO. It does not make a SIGKILL survivable, and it does not remove the
+    // process-kill window that `routes/proxy.rs` documents as deliberate. `db::unpaired_hold_rows`,
+    // the `stranded_hold` alert and `hold-sweep --release` remain the backstop for anything this
+    // cannot finish - which is why those still have to exist.
+    //
+    // THE TIMEOUT IS BOUNDED ON PURPOSE. An unbounded drain turns a deploy into an outage: the
+    // orchestrator's own kill deadline arrives first, and it arrives without the log line that says
+    // what was abandoned. Two seconds is under the usual TERM-to-KILL grace and is long enough for a
+    // settlement that was going to finish at all.
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let shutdown_tasks = Arc::clone(&tasks);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        info!("shutdown: no longer accepting; draining in-flight connections");
+    })
     .await?;
 
+    // Phase two.
+    let abandoned = tasks.drain(DRAIN_TIMEOUT).await;
+    let _ = shutdown_tasks;
+    if abandoned == 0 {
+        info!("shutdown: every detached task finished; exiting cleanly");
+    } else {
+        // WARN, not ERROR, and not silent. Money-path work is being abandoned, and the operator needs
+        // the number to know whether `hold-sweep --release` has anything to find. A silent exit here
+        // would make the next `stranded_hold` alert the first anybody hears of it.
+        warn!(
+            abandoned,
+            timeout_secs = DRAIN_TIMEOUT.as_secs(),
+            "shutdown: detached work was still running when the drain expired. A settlement or hold \
+             release may not have been written; `hold-sweep --release` and the `stranded_hold` alert \
+             are the intended recovery"
+        );
+    }
+
     Ok(())
+}
+
+/// Resolve when the process is asked to stop.
+///
+/// SIGTERM is what an orchestrator sends (`docker stop`, a Kubernetes pod eviction, a systemd restart),
+/// and SIGINT is Ctrl-C. Both are handled because a deploy and a human both stop this process, and a
+/// handler for only one of them means the other path silently loses its drain.
+///
+/// NO SIGNAL HANDLER AT ALL would also "work" - the default action terminates the process - which is
+/// exactly what this replaced, and why the absence of one was not obvious from the outside: the
+/// container still stopped.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("installing a Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing a SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    // Windows has no SIGTERM, so the `docker stop` path on a Windows host is a hard terminate and
+    // this future never resolves. Declared rather than cfg'd out so the select below keeps one shape.
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl-C"),
+        _ = terminate => info!("received SIGTERM"),
+    }
 }
 
 fn warn_no_trusted_proxies() {

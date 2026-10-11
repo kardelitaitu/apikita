@@ -136,6 +136,12 @@ pub mod identity;
 pub mod ip_tracking;
 pub mod money;
 pub mod routes;
+/// The drain a graceful shutdown owes to work that is not attached to a connection.
+///
+/// A module of its own rather than a field on `AppState`, because the thing it holds - the count of
+/// detached money-path tasks and the wait for them - is the part that has to be right, and it is
+/// testable without a router, a database or a request.
+pub mod shutdown;
 /// Test-only, because it compensates for a decision that belongs to the tests and
 /// not to the binary: a test database is a temp file, so the money tests no longer
 /// need a live server and no longer have to be `#[ignore]`d. Compiled out of every

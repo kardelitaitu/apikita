@@ -929,6 +929,7 @@ mod tests {
             events,
             ip_salt: Arc::new(DailySalt::new()),
             trusted_proxies,
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 

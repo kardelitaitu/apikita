@@ -458,6 +458,7 @@ mod tests {
             events,
             ip_salt: std::sync::Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 

@@ -1826,6 +1826,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             ip_salt: std::sync::Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies: std::sync::Arc::from(Vec::new()),
+            tasks: crate::shutdown::TaskTracker::new(),
             config,
         }
     }

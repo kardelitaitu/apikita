@@ -70,6 +70,13 @@ pub struct AppState {
     /// `resolve_client_ip` for why an untrusted peer's forwarded header is
     /// ignored rather than believed.
     pub trusted_proxies: Arc<[IpCidr]>,
+    /// Counts the detached tasks a graceful shutdown must wait for.
+    ///
+    /// Every money-path `tokio::spawn` in this module registers here, because
+    /// `with_graceful_shutdown` drains CONNECTIONS and a detached task is owned by the runtime, not by
+    /// the connection that started it. See `crate::shutdown` for the full reasoning and for what this
+    /// does NOT close.
+    pub tasks: Arc<crate::shutdown::TaskTracker>,
 }
 
 /// Records which address a served request came from, against the key that
@@ -91,7 +98,12 @@ fn record_request_source(state: &AppState, key_id: Uuid, peer: SocketAddr, heade
     let hash = ip_hash(&state.ip_salt.salt_for_day(day), &ip);
 
     let pool = state.pool.clone();
+    // Counted, so a shutdown waits for the signal write rather than losing it. The comment above says
+    // losing one is recoverable - true - but "recoverable" and "fine to drop on every deploy" are
+    // different claims, and the deploy is the common case.
+    let guard = state.tasks.begin();
     tokio::spawn(async move {
+        let _guard = guard;
         if let Err(err) = record_key_ip(&pool, key_id, day, &hash).await {
             warn!(key_id = %key_id, error = %err, "Could not record the request source");
         }
@@ -127,6 +139,14 @@ struct ReservationGuard {
     reservation_ref: String,
     model: String,
     defused: bool,
+    /// So the fire-and-forget release this guard spawns in `Drop` is still counted by the shutdown
+    /// drain. `Drop` cannot reach `AppState`, so the tracker travels with the hold that needs it.
+    ///
+    /// OPTIONAL, and that is deliberate rather than lazy. Fourteen call sites construct this guard -
+    /// one production and thirteen in tests - and threading a tracker through all of them would make
+    /// every test construct something it does not assert on. `None` means "nobody is draining", which
+    /// is exactly true of a test, and the release still runs; only the COUNTING is skipped.
+    tasks: Option<Arc<crate::shutdown::TaskTracker>>,
 }
 
 impl ReservationGuard {
@@ -144,7 +164,14 @@ impl ReservationGuard {
             reservation_ref: reservation_ref.to_string(),
             model: model.to_string(),
             defused: false,
+            tasks: None,
         }
+    }
+
+    /// Attach the shutdown tracker, so a drain waits for this guard's release.
+    fn tracked_by(mut self, tasks: &Arc<crate::shutdown::TaskTracker>) -> Self {
+        self.tasks = Some(Arc::clone(tasks));
+        self
     }
 
     /// The settlement transaction has committed and credited the hold back in the
@@ -184,7 +211,15 @@ impl Drop for ReservationGuard {
         // `hold-sweep --release` operator action exist for. The compensation path is
         // deliberate recovery, not an oversight, and writing that here is what keeps a
         // reader of the comment above from believing the window is closed.
+        //
+        // THE GUARD IS TAKEN BEFORE THE SPAWN, and the comment above is why the ordering matters
+        // rather than being tidiness: a shutdown landing between `spawn` and the task's first poll
+        // would find a task that exists and a count that does not. `tasks.begin()` closes that
+        // window; what it cannot close is a SIGKILL, which is the case the sweep still owns.
+        // The tracker is optional, so a guard with none still releases - it just is not counted.
+        let guard = self.tasks.as_ref().map(|t| t.begin());
         tokio::spawn(async move {
+            let _guard = guard;
             release_quietly(&pool, account_id, reserved_idr, &reservation_ref, &model).await;
         });
     }
@@ -999,6 +1034,37 @@ fn upstream_error(
                 ),
             }
         }
+        // EVERY KEY ON EVERY ENDPOINT WAS THROTTLED, and this arm used to fall into the catch-all
+        // below, which made it a 500 `internal_error`.
+        //
+        // MEASURED: with an upstream scripting 429 forever, the client received `HTTP 500
+        // {"code":"internal_error"}` and no `Retry-After`, and the server's own log named the cause -
+        // `upstream rate limited every key status=500`.
+        //
+        // THAT CONTRADICTED THE DOCUMENT. docs/error-model.md:173: "429 (provider throttled) | Retry
+        // another key first; **only surface 503 if all fail**." The pool does retry another key first -
+        // the loop rotates up to `max_key_attempts` and this variant is only produced when every one of
+        // them was throttled - so the condition the document describes had been reached, and the
+        // documented answer is a 503.
+        //
+        // WHY THE OLD BEHAVIOUR LOOKED DEFENSIBLE, recorded because the test beside this function
+        // asserted it on purpose: a 503 reads as "come back later" and the concern was inviting a
+        // retry. That concern does not survive contact with the 503 path this arm now shares - it
+        // carries `Retry-After`, sourced from the pool's own shortest cooldown, so the client is told
+        // WHEN to return rather than left to guess. A 500 tells it to retry immediately or treat the
+        // service as broken, which is the worse of the two.
+        //
+        // A 429 is also the wrong answer here: the customer's key is fine and we are the throttled
+        // party, the same reasoning `docs/error-model.md:176` gives for never surfacing an upstream
+        // auth failure as a client 401.
+        UpstreamError::RateLimited => AppError::NoUpstreamAvailable {
+            retry_after_secs: no_upstream_retry_after(
+                upstream.shortest_cooldown_secs(model),
+                model,
+                "every key rate limited",
+                account_id,
+            ),
+        },
         other => AppError::Internal(other.to_string()),
     }
 }
@@ -1420,7 +1486,10 @@ pub async fn chat_completions(
         reserved_idr,
         &reservation_ref,
         &meta.model,
-    );
+    )
+    // So the release this guard may spawn in Drop is counted by the shutdown drain. The guard cannot
+    // reach `AppState`, so the tracker is attached here where both are in scope.
+    .tracked_by(&state.tasks);
 
     // Every admission check has passed and the hold is out of the wallet, so
     // this request is actually being served — which is what makes its source
@@ -1469,6 +1538,11 @@ pub async fn chat_completions(
     // upstream body over so the usage the upstream still reports is settled.
     let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
 
+    // THE MOST IMPORTANT REGISTRATION IN THIS FILE. This task bills the usage for an answer that has
+    // already been sent to the customer. If a shutdown drops it, the customer has their answer and the
+    // wallet was never debited - which is the opposite direction from the stranded hold, and quieter,
+    // because nothing is left over to alert on.
+    let settle_guard = state.tasks.begin();
     tokio::spawn(settle_after_stream(
         settle_rx,
         state.pool.clone(),
@@ -1482,6 +1556,7 @@ pub async fn chat_completions(
         // defuses the guard; on any earlier exit the guard's Drop is the safety
         // net that gives the hold back.
         guard,
+        settle_guard,
     ));
 
     Response::builder()
@@ -1542,7 +1617,13 @@ async fn settle_after_stream(
     // has already credited the hold back in its own transaction. A guard can
     // therefore never double-credit the wallet.
     mut guard: ReservationGuard,
+    // The shutdown-drain guard. Held for the WHOLE task, including every early return, so the count
+    // is released by Drop wherever this function exits - the same discipline as `ReservationGuard`,
+    // and for the same reason: an exit path that forgets would strand the counter and make every
+    // later shutdown wait out its full timeout.
+    task_guard: crate::shutdown::Guard,
 ) {
+    let _task_guard = task_guard;
     // Each arm reports only what the upstream actually said; the single rule below
     // then decides bill-or-wash, so there is exactly one place a hold can be
     // released and exactly one place a charge can be made.
@@ -3160,6 +3241,11 @@ mod tests {
             events,
             ip_salt: Arc::new(DailySalt::new()),
             trusted_proxies,
+            // A fresh tracker per test. Nothing drains it, which is the same position a test is in as
+            // the tests that pass `None` to `ReservationGuard::new`: the money-path work still runs,
+            // only the shutdown COUNTING is absent - and a test asserting on settlement does not want a
+            // drain racing it.
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 
@@ -3879,6 +3965,7 @@ mod tests {
                 "flash".to_string(),
                 held_idr,
                 guard,
+                state.tasks.begin(),
             )
             .await;
 
@@ -4194,6 +4281,7 @@ mod tests {
                 "flash".to_string(),
                 held_idr,
                 guard,
+                state.tasks.begin(),
             )
             .await;
 
@@ -4415,6 +4503,7 @@ mod tests {
                 "flash".to_string(),
                 held_idr,
                 guard,
+                state.tasks.begin(),
             )
             .await;
 
@@ -4602,6 +4691,7 @@ mod tests {
                 "flash".to_string(),
                 held_idr,
                 guard,
+                state.tasks.begin(),
             )
             .await;
 
@@ -4855,6 +4945,7 @@ mod tests {
                 "flash".to_string(),
                 held_idr,
                 guard,
+                state.tasks.begin(),
             )
             .await;
 
@@ -5557,12 +5648,29 @@ mod tests {
         };
         assert!(retry_after_secs >= 1);
 
-        // Rate-limited / server-error carry no provider URL, so they become a
-        // generic internal error rather than a 503 that would invite a retry.
-        assert!(matches!(
-            upstream_error(UpstreamError::RateLimited, "flash", account_id, &client),
-            AppError::Internal(_)
-        ));
+        // Every key throttled is a 503 with a Retry-After, NOT a 500.
+        //
+        // THIS ASSERTION USED TO REQUIRE `AppError::Internal`. MEASURED, that made the client receive
+        // `500 {"code":"internal_error"}` where docs/error-model.md:173 promises "only surface 503 if
+        // all fail" - and the condition was met, because `UpstreamError::RateLimited` is only produced
+        // after the pool has rotated through every key. The old comment justified the 500 as avoiding
+        // "a 503 that would invite a retry"; the 503 carries `Retry-After`, so it invites a retry AT A
+        // STATED TIME, which is the point.
+        let AppError::NoUpstreamAvailable { retry_after_secs } =
+            upstream_error(UpstreamError::RateLimited, "flash", account_id, &client)
+        else {
+            panic!(
+                "RateLimited means every key was throttled, which docs/error-model.md answers with a \
+                 503 - not the 500 this used to assert"
+            );
+        };
+        assert!(
+            retry_after_secs >= 1,
+            "a 503 must carry a Retry-After, or the client is left guessing when to return"
+        );
+
+        // A 4xx from the upstream that is neither 401/403 nor 429 is the caller's request, and stays
+        // internal: there is nothing for the client to wait for.
         assert!(matches!(
             upstream_error(
                 UpstreamError::ServerError(400),
@@ -6149,6 +6257,7 @@ mod tests {
             STREAM_MODEL.to_string(),
             reservation,
             guard,
+            crate::shutdown::TaskTracker::new().begin(),
         )
         .await;
 
@@ -6255,6 +6364,7 @@ mod tests {
             STREAM_MODEL.to_string(),
             reservation,
             guard,
+            crate::shutdown::TaskTracker::new().begin(),
         )
         .await;
 
@@ -6339,6 +6449,7 @@ mod tests {
             STREAM_MODEL.to_string(),
             reservation,
             guard,
+            crate::shutdown::TaskTracker::new().begin(),
         )
         .await;
 
@@ -6420,6 +6531,7 @@ mod tests {
             STREAM_MODEL.to_string(),
             reservation,
             guard,
+            crate::shutdown::TaskTracker::new().begin(),
         )
         .await;
 
@@ -6469,6 +6581,7 @@ mod tests {
             STREAM_MODEL.to_string(),
             reservation,
             guard,
+            crate::shutdown::TaskTracker::new().begin(),
         )
         .await;
 
@@ -6526,6 +6639,7 @@ mod tests {
             "ghost-model".to_string(), // routed moments ago, gone at settlement
             reservation,
             guard,
+            crate::shutdown::TaskTracker::new().begin(),
         )
         .await;
 
