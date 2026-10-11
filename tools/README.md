@@ -89,3 +89,9 @@ four owner-input placeholder tokens (`[[ABUSE_EMAIL]]`, `[[OWNER_LEGAL_NAME]]`, 
 blocked on the same decision and filling them by hand is four chances to fill three. It has no
 `check.sh` and no CI step — it edits documents on the request of a human and has nothing to verify on
 every push.
+
+[`vcpu-pin/`](vcpu-pin/README.md) is the same shape: it does not check anything, it **runs a command
+under a hard CPU rate cap**, which is the Windows analogue of `docker run --cpus=0.2`. It exists because
+`docs/load-test.md`'s targets are quoted per 0.2 vCPU and Docker is not always available, and because
+the usual substitute — pinning to one logical CPU — is **five times** that allowance on a 32-core host.
+It refuses to run uncapped rather than let a figure be taken under a condition it did not apply.
