@@ -176,6 +176,35 @@ forced always-true with the suite staying green, because no production path reac
 and both arms agree where tests do pass 0. `db.rs` documents this in place, with the reasoning and the
 current count — re-measured at **715 passed / 0 failed** (it read 664 when the suite was smaller).
 
+#### `reserve_balance_transaction` — the hold before every request (round 15)
+
+Five mutations. **Four caught, one equivalent** — and the equivalent one is the interesting result:
+
+| mutation | result |
+| --- | --- |
+| the hold is CREDITED instead of debited | **caught — 27 tests fail** |
+| no ledger row written for the hold | **caught — 27 tests fail** |
+| the zero-reservation guard removed | **caught — 2 tests fail** |
+| the reported balance zeroed | **caught** |
+| **the insufficient-balance path COMMITS instead of rolling back** | **EQUIVALENT** |
+
+**An equivalent mutation is not a gap, and proving which one it is requires driving the code.** The
+reading — the only statement executed is `try_debit`'s UPDATE and it matched no row, so the transaction
+holds no writes — is exactly the kind of reasoning this repository has learned not to trust on its own.
+So both versions were driven against a real database with a 100 balance and a 500 reservation, and the
+observables are **identical**: `Insufficient { balance_idr: 100 }`, balance 100, 1 ledger row.
+
+**Three attempts failed before that comparison worked**, and each failure mode is one a mutation harness
+invites:
+
+1. a heredoc mangled the anchor string, so the injection silently did nothing — *"no output"*, which reads
+   like *"no finding"*;
+2. the probe called `fund` without `wallet` first, so the fixture's own assertion panicked and the probe
+   never reached its print;
+3. the restore used a file copy through Python's **text mode**, which rewrote CRLF and left all 6,175
+   lines "modified". A restore that appears to work while dirtying the whole file is worse than a loud
+   failure; it now restores with `git checkout`, which is authoritative and immune to line endings.
+
 **A test of a shared function cannot see a caller that does not use it.** This is
 the blind spot that let three weaker session resolvers survive with every test
 green: `routes/mod.rs` pinned the idle bound by calling the resolver

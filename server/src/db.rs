@@ -1859,6 +1859,15 @@ pub async fn reserve_balance_transaction(
             // the detail the caller shows the customer, and failing it must not turn
             // a visible refusal into an opaque 500. Nothing was written, so there is
             // nothing to roll back beyond the empty transaction.
+            //
+            // MUTATION-VERIFIED, and it SURVIVES on purpose. Replacing the `rollback` below with
+            // `commit` leaves the whole library suite green - measured, not assumed - and that is an
+            // EQUIVALENT mutation rather than an untested path. The reason is checkable: `try_debit`'s
+            // one statement is an UPDATE that matched no row, so the transaction holds no writes, and
+            // ending an empty transaction either way changes no observable. Driven both ways against a
+            // real database with a 100 balance and a 500 reservation, the returned value, the wallet
+            // balance and the ledger row count are identical: `Insufficient { balance_idr: 100 }`,
+            // 100, 1. `rollback` is still what is written, because it states the intent.
             let balance_idr = read_balance(&mut tx, account_id).await.unwrap_or(0);
             tx.rollback().await?;
 
