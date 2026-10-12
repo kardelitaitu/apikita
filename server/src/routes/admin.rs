@@ -2994,4 +2994,79 @@ mod tests {
         assert_eq!(body["error"]["code"], json!("internal_error"), "{body}");
         db.close().await;
     }
+
+    /// TWO SUSPENDS OF ONE ACCOUNT, CONCURRENTLY: exactly one may report a successful revocation.
+    ///
+    /// WHY THIS EXISTS, and it is the sentence `suspend_account` was already making. Its comment says the
+    /// up-front write lock "is what serialises two concurrent suspends of one account: the second then
+    /// sees 'suspended' and refuses, instead of both reporting a successful revocation". MEASURED before
+    /// this test: nothing in the suite detected that lock's removal at this site - 0 of 8 runs against a
+    /// deferred `BEGIN` - because the neighbouring
+    /// `suspending_an_already_suspended_account_is_409_conflict` is SEQUENTIAL. It parks the account in the
+    /// suspended state with a direct UPDATE and then makes ONE request, so there is no interleaving to
+    /// lose and it passes under either lock.
+    ///
+    /// A BARRIER, NOT JUST SPAWNED TASKS. Four tasks that merely start together do not reliably overlap;
+    /// `Barrier::wait` holds every competitor until all four are ready, so the four transactions really do
+    /// contend. MEASURED with the barrier: the property holds on the shipped code (3 of 3 passes, always
+    /// one 200 and three 409), and replacing `BEGIN IMMEDIATE` with a deferred `BEGIN` makes this test
+    /// fail in 7 of 10 runs.
+    ///
+    /// SEVEN IN TEN IS THE HONEST NUMBER, stated rather than rounded up: whether a deferred transaction
+    /// actually loses the upgrade depends on interleaving, and this is a four-way race rather than a
+    /// deterministic ordering. The test is a real detector, not a certain one, and `db::begin_immediate`
+    /// carries the two tests that DO detect it every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_suspends_admit_exactly_one() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let victim = test_support::account(&pool).await;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let state = state.clone();
+            let headers = headers.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                render(suspend_account(State(state), Path(victim), headers)).await
+            }));
+        }
+
+        let mut revoked = 0;
+        let mut conflicted = 0;
+        for h in handles {
+            let (status, body) = h.await.expect("a suspend task panicked");
+            match status {
+                StatusCode::OK => revoked += 1,
+                StatusCode::CONFLICT => {
+                    assert_eq!(body["error"]["code"], json!("conflict"), "{body}");
+                    conflicted += 1;
+                }
+                other => panic!("unexpected status from a concurrent suspend: {other}"),
+            }
+        }
+
+        assert_eq!(
+            revoked, 1,
+            "exactly one of four concurrent suspends may report a successful revocation; {revoked} did, \
+             which is the double-report the up-front write lock exists to prevent"
+        );
+        assert_eq!(
+            conflicted, 3,
+            "the other three must see 'suspended' and refuse with 409"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?1")
+            .bind(victim.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("status");
+        assert_eq!(status, "suspended");
+        db.close().await;
+    }
 }

@@ -262,6 +262,35 @@ about the `account.rs`, `reviews.rs` and `admin.rs` sites, which have no concurr
 **A test that exists is not a test that detects**, and the only way to tell them apart is to apply the
 mutation and count.
 
+#### An admin site whose comment claimed a property nothing tested (round 19)
+
+`suspend_account` says the up-front lock *"is what serialises two concurrent suspends of one account: the
+second then sees 'suspended' and refuses, instead of both reporting a successful revocation."*
+
+MEASURED: **nothing detected that lock's removal at this site — 0 of 8 runs.** The neighbouring
+`suspending_an_already_suspended_account_is_409_conflict` is **sequential**: it parks the account in the
+suspended state with a direct UPDATE and then makes *one* request, so there is no interleaving to lose and
+it passes under either lock. Ten suspend-related tests existed; none of them raced.
+
+`two_concurrent_suspends_admit_exactly_one` now does, and it is measured the same way as the others:
+
+| | |
+| --- | --- |
+| shipped code | passes, **3 of 3**, always one `200` and three `409` |
+| deferred `BEGIN` | fails in **7 of 10** runs |
+
+**A barrier, not just spawned tasks.** Four tasks that merely start together do not reliably overlap;
+`Barrier::wait` holds every competitor until all four are ready, so the transactions genuinely contend.
+Even so, 7/10 is the honest figure and it is recorded rather than rounded up — a four-way race is a real
+detector, not a certain one.
+
+**A harness bug nearly hid this.** The first measurement of this test reported the *baseline* failing and
+the mutation detected 9/10, which is incoherent. The cause was a malformed injection through my own JS
+line-ending handling — the same class as rounds 15 and 18. Re-run with the harness proven to inject
+correctly, the numbers are the ones above. **The mutation harness remains the least trustworthy part of a
+mutation-testing exercise**, and every contradiction this session has been traced to it rather than to the
+code.
+
 **Two harness bugs preceded this conclusion, and both reported "SURVIVED":**
 
 | what I did | what it produced | why |
