@@ -219,15 +219,48 @@ checks the process and the database only. See [`docs/observability.md`](observab
 | All keys cooled down | Same — do not queue; fail fast |
 | Endpoint healthy but slow | Latency, not failure. Let the timeout decide |
 | Upstream returns 400 (bad request) | **Not** a provider fault — do not trip the circuit |
-| Upstream returns 401/403 | Key is bad — disable that key, do not trip the endpoint |
+| Upstream returns 401 | Key is bad — **park that key**, do not trip the endpoint |
+| Upstream returns 403 | Rotates to the next key, but does **not** park it — see below |
 
-**Distinguishing caller error from provider error is essential.** Tripping a
-circuit because one customer sent malformed JSON takes out the provider for
-everyone.
+**"Park" is a COOLDOWN, NOT A DISABLE, and the distinction matters.** A parked key
+returns after `cooldown_seconds` and is tried again. The earlier wording here said
+"disable that key", which reads as permanent and would mislead anyone reasoning about
+a revoked wholesale key: it comes back.
+
+**Which statuses park a key is a CONFIG decision — `key_pool.rate_limit_status` — and the
+shipped value is `[429, 401]`.** 429 is a saturated key and 401 is a rejected one; both
+must stop being the *most preferred* key, because selection is least-in-flight and a
+key that fails fast holds fewer leases and is therefore picked MORE often. The circuit
+breaker cannot catch either: it is per-ENDPOINT, and the endpoint is healthy.
+
+**403 is deliberately NOT in that set, and it is a real limitation rather than an
+oversight.** In this system a 403 already has a defined meaning on our OWN surface —
+[`docs/error-model.md`](error-model.md) documents `model_not_allowed` as "model absent
+from the key's allowlist", and that page spends a section on keeping 401 and 403 apart.
+An upstream 403 is therefore most consistent with a *request*-scoped refusal — this key
+may not serve this model — rather than a dead credential. Parking on every 403 would
+withdraw a working key from rotation for the cooldown because of one refused model.
+
+The cost of that choice is stated plainly rather than left implicit: **a genuinely revoked
+key that answers 403 instead of 401 keeps being selected.** `rate_limit_status` is matched
+on the status code alone and this layer does not parse the response body, so the two cases
+cannot be told apart here. If a provider is observed to answer 403 for revocations, the
+answer is to add 403 to `key_pool.rate_limit_status` — one config line — and accept that a
+model-not-allowed refusal also parks the key.
+
+**Keeping the two apart is essential.** Tripping a circuit because one customer sent
+malformed JSON takes out the provider for everyone.
 
 ## Open items
 
 - [x] Cooldown cap **900s**, multiplier **2.0** — see `config/apikita.toml`.
-- [ ] Whether 'all endpoints open' should queue briefly or fail immediately.
+- [x] **'All endpoints open' fails immediately; it does not queue.** This line used to read "whether
+  'all endpoints open' should queue briefly or fail immediately", which was STALE: the code has always
+  failed fast, and `client.rs` cites THIS section as its reason — *"Every key is cooling, or none is
+  configured. Do not queue: fail fast so the caller can retry (docs/failover.md, edge cases)"*. A doc
+  citing a decision it still lists as undecided is a reader trap. The reasoning matches the edge-case
+  table: a queued request holds a connection and a socket, which is the resource the cap exists to
+  bound, and a caller learns more from a 503 with `Retry-After` than from a request parked behind an
+  outage it cannot see.
 - [ ] A second provider to make Layer 3 real (blocked on resale terms).
 - [x] One global upstream timeout, **120s** — `config/apikita.toml` `[circuit_breaker]`.

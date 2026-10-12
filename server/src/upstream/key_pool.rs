@@ -253,29 +253,32 @@ mod tests {
     }
 
     #[test]
-    /// A key the upstream rejects as UNAUTHORISED is never parked, and that is
-    /// currently a hole rather than a decision.
+    /// The shipped config parks a key the upstream rejects as UNAUTHORISED.
     ///
-    /// `report_status` parks only a status in `rate_limit_status`, which the shipped
-    /// config sets to `[429]`. A wholesale key that has been revoked, or whose
-    /// provider-side quota has run out at the auth layer, answers 401 — which is not in
-    /// the set, so the slot is freed and the key stays selectable.
+    /// `report_status` parks a key only for a status in `rate_limit_status`. A wholesale key that has
+    /// been revoked, or whose provider-side quota has run out at the auth layer, answers **401** — so
+    /// whether 401 is in that set is the difference between the key being withdrawn from rotation and
+    /// it being handed out again immediately.
     ///
-    /// WORSE, IT IS SELF-REINFORCING. Selection is least in-flight, and a key that
-    /// fails fast is in flight for less time, so it has the fewest leases and is
-    /// therefore picked MORE often. The dead key drifts towards being the one every
-    /// request tries, and the caller's loop returns any HTTP response to the customer
-    /// rather than retrying, so a share of requests answers 401 from our own wholesale
-    /// layer. The circuit breaker does not catch it either: it is per-ENDPOINT, and the
-    /// endpoint is healthy - one key of several is not.
+    /// THE SHIPPED CONFIG SETS `[429, 401]`, AND THIS TEST IS WHAT KEEPS IT THAT WAY. It reads
+    /// `config/apikita.toml` rather than a fixture, because the fixture cannot see the file that was
+    /// changed: the sibling test below builds its pool with a literal `vec![429]` and therefore pins
+    /// the POOL's behaviour, not the CONFIG's. It passed UNCHANGED through the whole defect below,
+    /// which is exactly what happens to a test that does not read the thing that was fixed.
     ///
-    /// This test PINS the behaviour rather than changing it, because both fixes are
-    /// product decisions rather than bugs. Adding 401 to `rate_limit_status` is one
-    /// config line and stops the key being preferred, but the customer who drew it
-    /// still sees a 401. Retrying on 401 as the loop already retries on 429 removes that,
-    /// and costs an extra upstream call per attempt during an incident. Nobody has
-    /// chosen between them, so the honest state is recorded and visible.
-    /// The SHIPPED config parks a 401, which is what the change above relies on.
+    /// WHY 401 WAS ADDED, and the failure mode was worse than "a key gets retried". Selection is
+    /// LEAST IN-FLIGHT, and a key that fails fast is in flight for less time — so it holds the fewest
+    /// leases and is therefore picked MORE often. A dead key drifts towards being the one every request
+    /// tries. The circuit breaker cannot catch it either: that is per-ENDPOINT, and the endpoint is
+    /// healthy; one key of several is not. Adding 401 to the set is one config line and stops the
+    /// preference.
+    ///
+    /// WHAT THIS DOES NOT CLAIM, because the earlier version of this comment claimed the opposite and
+    /// had gone stale: parking is a COOLDOWN, not a permanent disable. The key returns after
+    /// `cooldown_seconds` and is tried again. Nor does it stop the customer who drew the dead key from
+    /// seeing a 401 on that attempt — retrying a 401 as the loop retries a 429 would remove that, at
+    /// the cost of an extra upstream call per attempt during an incident. That trade is still open;
+    /// what is settled is that the key must not stay the MOST PREFERRED one throughout.
     ///
     /// The test beside this one pins the POOL, and the pool is built with a literal
     /// vec![429] - so it cannot see config/apikita.toml and passed UNCHANGED after the
