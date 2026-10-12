@@ -3,9 +3,9 @@
 `docs/benchmark.md` publishes six metrics-matrix rows. **Four are verified in code.** Two are not, and
 cannot be by the in-process binary:
 
-| row | target | why the binary cannot own it |
+| row | target | why the in-process binary cannot own it |
 | --- | --- | --- |
-| Key Validation Latency (p99) | $\le 1.5$ ms | the binary has no HTTP client and no latency histogram |
+| Key Validation Latency (p99) | $\le 1.5$ ms | the in-process binary has no HTTP client and no latency histogram — see "Measuring the p99" below for the client that does |
 | CPU Saturation at 200 req/s | $\le 40\%$ | the binary has no RSS/CPU sampling |
 
 The document already says this and says it plainly: *"these numbers are not a load test and must not be
@@ -35,6 +35,60 @@ round: the whole benchmark suite runs on **one OS thread** precisely to model th
 So: **run the generator on a different machine from the server**, and pin the server to 0.2 vCPU
 (`--cpus=0.2` under Docker, or `cpulimit`). A generator sharing the CPU it is measuring reports its own
 contention as the server's latency.
+
+## Measuring the p99 — and why a Node client cannot
+
+**The 1.5 ms bar is below the floor of a Node load generator, so no amount of hardware fixes the Node
+route.** MEASURED (`tools/loadtest/loadtest.js:40-57`) against a handler doing NO work:
+
+| generator | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| one Node process | 1.208 ms | 2.095 ms | **3.172 ms** |
+| four Node processes | ~0.59 ms | ~1.5 ms | **~2.4 ms** |
+
+A no-op handler answering from memory, reported at 2.4 ms: that is the **instrument**, not the server.
+`tools/loadtest/` handles this honestly — it measures its own floor first and refuses a verdict when the
+floor is at or above the bar — which is why this row is still blank rather than filled with a
+fabrication.
+
+**A 16-core host and Docker both fail to fix this**, and it is worth saying why because the reflex is to
+reach for hardware: the constraint is the *measuring instrument*, not capacity. A client whose own floor
+exceeds the bar cannot resolve that bar on any machine.
+
+### The native client
+
+`server/src/bin/loadgen.rs` is a Rust HTTP client with no event loop, no GC and no dependency on a
+millisecond-resolution timer between the request and the reading. Build and use it:
+
+```sh
+cargo build --bin loadgen
+
+# ALWAYS measure the floor first, at the SAME concurrency as the run you intend to make.
+./target/debug/loadgen --base-url http://127.0.0.1:8080 --path /health --measure-floor --concurrency 8
+
+# Then the real run.
+./target/debug/loadgen --base-url http://127.0.0.1:8080 --path /v1/chat/completions --rate 200 --concurrency 8
+```
+
+It refuses a verdict when its own floor is at or above the target, retains every sample for a real
+percentile rather than a mean, and **prints the warm-up it discarded** — so a figure it produces can be
+attributed rather than trusted.
+
+**The floor scales with CONCURRENCY, so the two runs must match.** MEASURED against `/health`:
+
+| concurrency | floor p99 | server p99 |
+| --- | --- | --- |
+| 1 | 1.131 ms | 1.106 ms |
+| 4 | 1.290 ms | 1.236 ms |
+| 8 | 1.231 ms | 1.572 ms |
+| 16 | 1.377 ms | 1.597 ms |
+| 32 | 1.892 ms | 1.910 ms |
+
+Two things follow, and the second is the one that matters. First, the floor is essentially flat against
+*rate* at fixed concurrency (10-1000 req/s all land within 1.1-1.4 ms), so it is client-side queueing
+rather than throughput. Second, **past concurrency ~16 the floor crosses the bar** — so a run at 32
+workers cannot produce a p99 verdict about the server at all, and the tool says so rather than reporting
+its own contention as latency.
 
 ## The run
 
