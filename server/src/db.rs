@@ -774,8 +774,13 @@ pub async fn debit_usage_transaction(
     //
     //    THE `reserved_idr > 0` GUARD IS A SKIPPED STATEMENT, NOT A DECISION, and that is worth
     //    stating because mutation testing cannot see it. MEASURED: forcing this condition always-true
-    //    leaves the whole library suite at 664 passed / 0 failed. It is not an untested guard - it is
+    //    leaves the whole library suite at 715 passed / 0 failed. It is not an untested guard - it is
     //    an EQUIVALENT one, and the reason is checkable rather than a matter of reading:
+    //
+    //    (Re-measured at the current suite size. The figure here read 664 when the suite was smaller,
+    //    and re-running it is cheap: force the condition, run `cargo test --lib`. An equivalent
+    //    mutation stays equivalent as tests are ADDED, but a stale count reads as "nobody has checked
+    //    since", which is indistinguishable from an untested guard to the next reader.)
     //
     //      - The production path cannot reach the else arm at all. `proxy.rs:1395` takes
     //        `reserved_idr` from `ReservationResult::Held`, and `reserve_balance_transaction`

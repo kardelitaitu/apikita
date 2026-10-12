@@ -145,6 +145,37 @@ the real bound. A test for mid-stream revocation passed a mutation that set
 `revoked_at` a year in the future, because that is a state no code produces;
 it had tested an impossible state instead of the real failure.
 
+### The money path, mutation-tested (round 14)
+
+Thirteen mutations across `clamp_debit`, `settlement_ledger_deltas`, the SQL balance floor, the schema
+`CHECK`, and the release path. **All thirteen caught; none survived.** Recorded here so the evidence
+does not have to be regenerated, and so the numbers below can be checked:
+
+| target | mutation | result |
+| --- | --- | --- |
+| `clamp_debit` | cost floor removed / available floor removed / collects one more / shortfall zeroed / min-max swapped | **5 caught** |
+| `settlement_ledger_deltas` | release floor removed / **cost floor removed (the `i64::MIN` overflow)** / charge sign lost / release-charge swapped | **4 caught** |
+| debit SQL | `balance_idr >= ?` → `>` | **caught — 17 tests fail** |
+| debit SQL | the floor predicate removed | **caught — 40 tests fail** |
+| schema | `CHECK (balance_idr >= 0)` relaxed to `>= -1` | **caught** |
+| release | the zero-reservation early return removed | **caught** |
+| release | the release credit not written to the ledger | **caught — 17 tests fail** |
+
+The two large numbers are the point: the balance floor is not defended by one lucky assertion but by a
+broad surface, which is the difference between a guard and a coincidence.
+
+**One mutation that LOOKS like a survivor and is not.** `balance_idr >= 0` also appears **only in
+comments** in `db.rs` — four of them, all prose about the schema's CHECK. A harness that mutates the
+first textual match therefore edits documentation and changes no behaviour, and reports SURVIVED. That is
+the copy trap below in a cheaper form: not a second copy of code, but no code at all. **Check that the
+anchor is code before believing a survivor** — a one-line test of whether the match sits inside a
+`//` or `/* */`.
+
+**And one that IS equivalent, deliberately.** `reserved_idr > 0` in `debit_usage_transaction` can be
+forced always-true with the suite staying green, because no production path reaches the branch it guards
+and both arms agree where tests do pass 0. `db.rs` documents this in place, with the reasoning and the
+current count — re-measured at **715 passed / 0 failed** (it read 664 when the suite was smaller).
+
 **A test of a shared function cannot see a caller that does not use it.** This is
 the blind spot that let three weaker session resolvers survive with every test
 green: `routes/mod.rs` pinned the idle bound by calling the resolver
