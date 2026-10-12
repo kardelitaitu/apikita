@@ -17,6 +17,8 @@
 
 pub mod account;
 pub mod admin;
+#[cfg(test)]
+pub mod admin_auth_boundary;
 pub mod auth;
 pub mod events;
 pub mod hardening;
