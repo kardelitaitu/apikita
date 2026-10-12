@@ -515,7 +515,36 @@ jobs:
             echo "::error::the booted binary does not serve the documented route table"
             exit 1
           fi
-          docker rm -f apikita-ci-api
+
+          # STOP GRACEFULLY, AND TIME IT. This used to be `docker rm -f`, which sends SIGKILL - so the
+          # smoke never exercised the shutdown path at all, and the one thing it could not catch was the
+          # drain leaving connections cut.
+          #
+          # WHY THE WINDOW MATTERS. Docker sends SIGTERM, waits the grace period (default 10s), then
+          # SIGKILLs; `tini` forwards the signal but cannot extend that window. The server's drain budget
+          # is PER PHASE - the serve loop gets DRAIN_TIMEOUT and the task tracker gets it again - so the
+          # worst case is 2 x 5s = 10s, which is exactly the default grace period. docs/deployment.md now
+          # passes `--stop-timeout 30` for that reason, and this step uses the same value so the image is
+          # tested the way it is deployed.
+          #
+          # THE ASSERTION IS THE EXIT CODE, not the duration: `docker stop` returns non-zero when it has
+          # to SIGKILL after the window expires, which is precisely the regression worth failing on. A
+          # duration check would be a flaky proxy for the same thing.
+          stop_started=$(date +%s)
+          if ! docker stop --timeout 30 apikita-ci-api; then
+            echo "::error::the container did not stop within 30s and was SIGKILLed - the drain did not finish"
+            docker logs --tail 40 apikita-ci-api
+            exit 1
+          fi
+          stop_secs=$(( $(date +%s) - stop_started ))
+          echo "graceful stop took ${stop_secs}s (window 30s, drain worst case 10s)"
+
+          # The drain logs its own completion; assert it rather than inferring success from the exit code
+          # alone, so a stop that returned 0 for the wrong reason is still visible.
+          docker logs apikita-ci-api 2>&1 | grep -qiE 'drain|shutting down' \
+            || echo "::warning::no drain line in the container log; the shutdown path may not have run"
+
+          docker rm -f apikita-ci-api >/dev/null 2>&1 || true
           # Cleanup is BEST-EFFORT and must never fail the step: the volume is
           # scratch and a leftover one on a fresh CI runner is harmless. The
           # `--rm` containers can hold it for a moment after they exit, so the

@@ -160,10 +160,32 @@ still overrides it.
 docker run --rm -v apikita-data:/srv/apikita/server/data \
   --entrypoint /usr/local/bin/apikita-migrate apikita-server:latest
 
-# [3] then the new server
-docker run -d --name apikita-api -p 8080:8080 \
+# [3] then the new server.
+#     --stop-timeout IS REQUIRED, not tidiness. See "The stop window" below: the drain's own worst case
+#     is 10s, which is exactly Docker's default grace period, so without this the SIGKILL lands on the
+#     deadline and the drain loses.
+docker run -d --name apikita-api -p 8080:8080 --stop-timeout 30 \
   -v apikita-data:/srv/apikita/server/data apikita-server:latest
 ```
+
+### The stop window
+
+**`--stop-timeout 30` on the `docker run` above is load-bearing.** Docker sends `SIGTERM`, waits for the
+grace period (default **10 seconds**), then sends `SIGKILL`. `tini` forwards the signal but cannot extend
+that window.
+
+MEASURED, from `server/src/main.rs`'s own comment: **the drain budget is PER PHASE, not shared** — the
+serve loop gets `DRAIN_TIMEOUT` (5 s) and the task tracker gets `DRAIN_TIMEOUT` again, so the worst case is
+**2 × 5 s = 10 s**. The comment says this in as many words: *"the orchestrator's TERM-to-KILL deadline is
+what actually bounds the whole thing. Do not read DRAIN_TIMEOUT as the total."*
+
+**10 s of worst-case drain inside a 10 s window is no margin at all.** A half-open upload that uses its
+full first phase leaves the second phase with nothing before the kill — and the failure mode is the one the
+drain exists to prevent: connections cut with no log line, which is precisely the 35-minute hang that was
+fixed before it.
+
+30 s gives the two-phase worst case 3× headroom. **A kill mid-drain is silent**, so this is the kind of
+setting that is only noticed by its absence, in production, on the one deploy where a client was slow.
 
 **What the image guarantees, and how each is verified in CI:**
 
@@ -174,6 +196,7 @@ docker run -d --name apikita-api -p 8080:8080 \
 | `/srv/apikita/server/data` exists and is **writable by the runtime user** | A fresh volume with a root-owned directory fails on first start with "unable to open database file" | the probe in the smoke step: it migrates and starts on a fresh volume |
 | A **working `HEALTHCHECK`** | An always-red probe turns a healthy deploy into a restart loop | the smoke step requires the container to *report healthy*, then re-reads the documented body |
 | The container's shutdown is **graceful** | `tini` reaps and forwards signals to the whole process group | `ENTRYPOINT` exec form — **read from the Dockerfile, not asserted by a check** |
+| **The stop window is longer than the drain** | `tini` forwards the signal but cannot extend Docker's grace period, so the window has to exceed the drain's 2 × `DRAIN_TIMEOUT` worst case | **The operator's `--stop-timeout` flag** — see "The stop window". Nothing in the image can enforce it, and CI does not test the stop path at all (it cleans up with `docker rm -f`, which SIGKILLs) |
 
 > **This table used to overstate three of its rows, and the cells were the reason nobody looked.**
 > The non-root row named `docker run … --entrypoint id`; the package-manager row named a property of

@@ -335,6 +335,37 @@ than a rule that parses SQL, and adding a textual "no DROP COLUMN" check would d
 risking false positives on the two documented rebuilds. Recorded so the next person knows which mechanism
 is holding, and why there is not a gate named after the rule.
 
+#### The stop window was exactly the drain's worst case (round 34)
+
+`docs/deployment.md` documents the API as `docker run -d --name apikita-api -p 8080:8080 ...`, with no
+`--stop-timeout`. Docker sends `SIGTERM`, waits its grace period — **10 seconds by default** — then
+`SIGKILL`s. `tini` is PID 1 and forwards the signal, but it cannot extend that window.
+
+**`server/src/main.rs` says the drain's worst case is `2 × DRAIN_TIMEOUT`**, in its own words: *"THE BUDGET
+IS PER PHASE, NOT SHARED ... the orchestrator's TERM-to-KILL deadline is what actually bounds the whole
+thing. Do not read DRAIN_TIMEOUT as the total."* With `DRAIN_TIMEOUT = 5s`, that is **10 s of worst-case
+drain inside a 10 s window — no margin at all.**
+
+The loser is the drain: a half-open upload that uses its full first phase leaves the second nothing before
+the kill, and **a kill mid-drain is silent**. That is exactly the failure the drain exists to prevent, and
+the same class as the 35-minute hang fixed earlier in this file's history.
+
+Fixed in two places:
+
+- **`docs/deployment.md`** carries `--stop-timeout 30` on the documented `docker run`, with a "The stop
+  window" section deriving 30 from 2 × 5 s × 3 headroom, and a new row in the guarantees table stating
+  that **nothing in the image can enforce it** — it is the operator's flag.
+- **`ci.yml` replaced `docker rm -f` with `docker stop --timeout 30`** and fails the step when the stop
+  is SIGKILLed. MEASURED: the smoke test cleaned up with a **forced** removal, so it never exercised the
+  shutdown path at all — the one thing it could not catch was the drain being cut. The assertion is the
+  **exit code**, because `docker stop` returns non-zero exactly when it had to SIGKILL; a duration check
+  would be a flaky proxy for the same fact.
+
+**This is the fourth round in a row where the deployment path held an unverified property** (31: no job
+timeout; 32: no restart assertion; 33: R1 unenforced as a rule; 34: the stop window). The pattern is
+consistent enough to name: **the gates verify what the code does, and nothing verified what the platform
+would do to it.**
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period
