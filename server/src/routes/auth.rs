@@ -3297,8 +3297,24 @@ mod tests {
     /// path, and redeemed through `identity::tokens::consume` afterwards: asserting
     /// the row is gone by counting rows would pass against a delete that cleared the
     /// wrong account, and what matters is whether the LINK still works.
+    ///
+    /// TAKES `EnvLock`, AND THAT IS A CORRECTNESS FIX RATHER THAN TIDINESS. MEASURED before it did:
+    /// this test failed **5 runs in 10** at module scope, always with
+    /// `{"error":{"code":"rate_limited"...}}` on its THIRD `change_password` call — left: 429,
+    /// right: 204.
+    ///
+    /// The cause is a PROCESS-GLOBAL limiter, not this test. `TestLimitsGuard::set(2, 100)` at
+    /// `live_the_login_cap_refuses_a_guesser_after_the_conft...` installs a cap of TWO password-changing
+    /// requests, process-wide, for the duration of that test. The three tests that install it hold
+    /// `EnvLock`; this one did not, so it could run CONCURRENTLY with a cap of 2 in force and trip on
+    /// its third call. A flake that fails half the time is a flake that gets muted, and this one guards
+    /// password-reset revocation.
+    ///
+    /// The lock is the right fix rather than a bigger cap: `EnvLock` is what every other test touching
+    /// the global override already takes, and matching them is the whole of the change.
     #[tokio::test]
     async fn live_password_change_kills_an_outstanding_reset_link() {
+        let _lock = crate::routes::test_env::EnvLock::acquire();
         let db = TestDb::new().await;
         let pool = db.pool.clone();
         let account = live_account(&pool).await;
