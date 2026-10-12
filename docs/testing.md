@@ -239,6 +239,29 @@ argument:** with `IMMEDIATE` replaced by a deferred `BEGIN`, the new test detect
 where the old one detects it in **0 of 10**, and the full suite now fails **two** tests where it
 previously failed one — the telegram test and the wallet test, instead of only the telegram test.
 
+#### How strong is each guard test? (round 18, measured per-test)
+
+`begin_immediate` is called from **15 sites**, and **9 of them read before they write**, so the guard is
+load-bearing for those. Replacing `IMMEDIATE` with a deferred `BEGIN` therefore weakens all of them at
+once, and the question worth asking is not "is there a test" but **"how reliably does each test notice"**.
+Full suite run 10 times with the mutation:
+
+| test | detects it |
+| --- | --- |
+| `db::tests::a_hold_after_a_read_still_admits_exactly_one_of_many` | **10/10** |
+| `routes::telegram::tests::the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests` | **10/10** |
+| `routes::keys::tests::the_key_creation_cap_holds_under_concurrent_requests` | **5/10** |
+
+**The suite detects the regression 10/10**, so it is not flaky against it — but one of its tests is a coin
+flip on its own, and that is worth knowing before citing a single green run of *that* test as evidence.
+
+**A file-scoped heuristic was wrong twice here, in opposite directions.** Grepping each file for
+`async fn *concurrent*` said `routes/keys.rs` "has a test" and `routes/account.rs` "does not" — but the
+empirical run shows the keys test catches the mutation only half the time, and it says nothing at all
+about the `account.rs`, `reviews.rs` and `admin.rs` sites, which have no concurrency test in any file.
+**A test that exists is not a test that detects**, and the only way to tell them apart is to apply the
+mutation and count.
+
 **Two harness bugs preceded this conclusion, and both reported "SURVIVED":**
 
 | what I did | what it produced | why |

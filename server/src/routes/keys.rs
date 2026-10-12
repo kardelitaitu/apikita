@@ -2521,6 +2521,20 @@ mod tests {
     /// It is driven through the real handler rather than a helper, so the
     /// transaction the fix introduced is the one under test and not a stand-in for
     /// it.
+    ///
+    /// IT DETECTS THE LOCK-GUARD MUTATION ABOUT HALF THE TIME, which is worth stating rather than leaving
+    /// to be rediscovered. MEASURED: replacing `BEGIN IMMEDIATE` with a deferred `BEGIN` in
+    /// `db::begin_immediate` - the exact regression the helper exists to prevent - makes this test fail in
+    /// **5 of 10** runs. It is not weak for the reason this file's docstring worries about (a lenient
+    /// assertion): the assertion is exact. It is weak because whether a deferred transaction actually
+    /// loses the lock upgrade depends on interleaving, and 16 spawned tasks do not always produce the
+    /// losing one.
+    ///
+    /// So a GREEN run of this test is not evidence that the guard is intact. Two tests do detect that
+    /// mutation every time - `db::tests::a_hold_after_a_read_still_admits_exactly_one_of_many` and
+    /// `routes::telegram::tests::the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests`,
+    /// both 10/10 - and the file to read for the shape that makes a test able to see it is `db.rs`'s
+    /// `begin_immediate`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_key_creation_cap_holds_under_concurrent_requests() {
         let db = TestDb::new().await;
