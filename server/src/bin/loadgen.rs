@@ -436,7 +436,7 @@ fn connect(addr: &str, request: &[u8], buf: &mut Vec<u8>) -> Option<TcpStream> {
 }
 
 fn main() {
-    let args = match parse_args() {
+    let mut args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("loadgen: {e}");
@@ -496,6 +496,16 @@ fn main() {
     let mut effective_seconds = args.duration.as_secs().max(1);
     if args.measure_floor {
         effective_seconds = 3;
+        // THE WARM-UP IS CLAMPED TO A FRACTION OF THE FLOOR WINDOW, and this is a fix rather than a
+        // nicety. MEASURED on WSL: `--measure-floor` with the default 2s warm-up inside a 3s window left
+        // ZERO samples, and the tool printed `p50 NaN p95 NaN p99 NaN` before refusing the verdict. A
+        // floor run whose own warm-up consumes its measurement window cannot produce a floor at all.
+        //
+        // One third, so a 3s window keeps at least 2s of measurement even when start-up is slow.
+        let cap = Duration::from_secs(effective_seconds / 3).max(Duration::from_millis(150));
+        if args.warmup > cap {
+            args.warmup = cap;
+        }
         // A floor does not need the full offered rate, but it must not be so low that the generator
         // idles: the pipe has to stay busy or the reading becomes a measurement of the release schedule
         // rather than of the instrument. MEASURED: at a flat 200 req/s with 32 workers each worker fires
@@ -790,10 +800,16 @@ fn main() {
     );
     println!("  p50 {p50:.3} ms   p95 {p95:.3} ms   p99 {p99:.3} ms");
     println!(
-        "  box: {} logical CPUs — record this and the date in docs/load-test.md",
+        "  box: {} logical CPUs, load {} — record these and the date in docs/load-test.md",
         std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        // THE LOAD IS PART OF THE FIGURE, not decoration beside it. The floor is a property of the
+        // client AND the host, and this session measured a 20x swing from the environment alone: the
+        // same command read 13.7-23.7 ms while a crypto-miner was running and ~1.4 ms on a quiet box.
+        // A floor without the load is not reproducible, and the first table published in
+        // docs/load-test.md was withdrawn for exactly that reason.
+        host_load(),
     );
 
     println!();
@@ -806,6 +822,37 @@ fn main() {
         "  Confirm the floor first (`--measure-floor`). A verdict without it is a number that may be\n  \
          measuring this client rather than the server."
     );
+}
+
+/// The host's 1-minute load average as a fraction of its CPU count, or a stated reason it is unknown.
+///
+/// Linux only, deliberately. `sysinfo` and friends are a dependency this crate should not carry for a
+/// benchmark tool's convenience line, and `/proc/loadavg` is a read of one file. On Windows and macOS
+/// this returns None and the line says so - an honest "unknown" is worth more than a zero that reads as
+/// "idle", because the whole point of printing it is to tell a quiet box from a busy one.
+fn host_load() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
+            if let Some(first) = text.split_whitespace().next() {
+                if let Ok(load1) = first.parse::<f64>() {
+                    let ncpu = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    // Expressed against the CPU count, because "load 19" means idle on a 32-core box
+                    // and saturated on a 4-core one.
+                    return format!("{:.2}x CPUs ({load1:.2} on {ncpu})", load1 / ncpu as f64);
+                }
+            }
+        }
+        "unknown (could not read /proc/loadavg)".to_string()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "NOT AVAILABLE on this platform — a floor taken here cannot state its host state, so record \
+         the load by hand or take the reading on Linux"
+            .to_string()
+    }
 }
 
 /// A JSON string literal with the characters that would break the document escaped.
