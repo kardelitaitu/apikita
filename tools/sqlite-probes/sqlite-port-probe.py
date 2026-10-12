@@ -403,6 +403,91 @@ check("BEGIN IMMEDIATE accepted", t_begin_immediate_visible)
 
 
 # ---------------------------------------------------------------------------
+# STRICT tables — the invariant the PLAN calls "the single most important line"
+# ---------------------------------------------------------------------------
+#
+# WHY THIS SECTION EXISTS, and it was missing. docs/plans/sqlite-migration.md:1441 says every table is
+# `STRICT`, calls it "the single most important line in this appendix", and gives the reason: without it
+# `INTEGER` is only *affinity*, so a `REAL` lands in a money column silently. The plan also states the
+# requirement this creates - "Requires SQLite >= 3.37" (:694, :714, :1441).
+#
+# MEASURED: the suite had NO STRICT probe and nothing asserted the version. The single most important
+# invariant of the whole port was the one thing the probes did not measure, and the version requirement
+# was printed on the banner rather than checked - so a host with an older SQLite would run all 24 probes
+# green and then fail to create the first table.
+#
+# `sqlite_version_info` so the comparison is numeric: "3.9.0" > "3.37.0" as STRINGS, which would pass a
+# host that cannot run the schema at all.
+
+STRICT_MIN_VERSION = (3, 37, 0)
+
+
+def t_sqlite_version_supports_strict():
+    v = sqlite3.sqlite_version_info
+    if v < STRICT_MIN_VERSION:
+        raise AssertionError(
+            f"SQLite {sqlite3.sqlite_version} is older than "
+            f"{'.'.join(map(str, STRICT_MIN_VERSION))}, which every table's STRICT clause requires "
+            f"(docs/plans/sqlite-migration.md:1441). The schema cannot be created on this host."
+        )
+    return f"{sqlite3.sqlite_version} >= {'.'.join(map(str, STRICT_MIN_VERSION))}"
+
+
+check("SQLite version supports STRICT (>= 3.37)", t_sqlite_version_supports_strict)
+
+
+def t_strict_rejects_a_wrong_type():
+    """The money-column protection, measured: a TEXT value must not land in an INTEGER column."""
+    con = fresh()
+    con.execute("CREATE TABLE s (amount_idr INTEGER NOT NULL) STRICT")
+    con.execute("INSERT INTO s (amount_idr) VALUES (5000)")
+    try:
+        con.execute("INSERT INTO s (amount_idr) VALUES ('not a number')")
+    except sqlite3.IntegrityError as exc:
+        return f"rejected: {exc}"
+    raise AssertionError(
+        "a STRICT table ACCEPTED text in an INTEGER column, so the money rule is not structural"
+    )
+
+
+check("STRICT rejects a wrong type (the money-column rule)", t_strict_rejects_a_wrong_type)
+
+
+def t_non_strict_accepts_the_same_value():
+    """The control: without STRICT the same insert succeeds, so STRICT is what does the work.
+
+    Without this, the probe above would pass on a build where SQLite rejected the value for an
+    unrelated reason, and the result would not be evidence about STRICT at all.
+    """
+    con = fresh()
+    con.execute("CREATE TABLE loose (amount_idr INTEGER NOT NULL)")
+    con.execute("INSERT INTO loose (amount_idr) VALUES ('not a number')")
+    got = con.execute("SELECT amount_idr, typeof(amount_idr) FROM loose").fetchone()
+    return f"accepted as {got[0]!r} typeof={got[1]!r} - which is the silent corruption STRICT prevents"
+
+
+check("control: a NON-STRICT table accepts it", t_non_strict_accepts_the_same_value)
+
+
+def t_strict_rejects_a_real_in_a_money_column():
+    """The exact failure the plan names: a REAL in a money column.
+
+    This is the case `sqlite-migration.md:4.9` is about - a float reaching the wallet - and it is worth
+    probing separately from text because REAL is what an arithmetic slip actually produces.
+    """
+    con = fresh()
+    con.execute("CREATE TABLE s (amount_idr INTEGER NOT NULL) STRICT")
+    try:
+        con.execute("INSERT INTO s (amount_idr) VALUES (5000.5)")
+    except sqlite3.IntegrityError as exc:
+        return f"rejected a REAL in an INTEGER money column: {exc}"
+    raise AssertionError("a REAL was accepted into a STRICT INTEGER money column")
+
+
+check("STRICT rejects a REAL in a money column", t_strict_rejects_a_real_in_a_money_column)
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 print("=" * 78)

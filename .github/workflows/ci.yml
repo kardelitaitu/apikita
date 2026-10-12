@@ -1086,6 +1086,21 @@ jobs:
       - name: Check the fake upstream and payment tools
         run: node tools/fake-check/fake-check.js
 
+      # The probes behind a SHIPPED plan still run and still measure what the plan cites.
+      #
+      # docs/plans/sqlite-migration.md cites tools/sqlite-probes/ as the evidence for the whole SQLite
+      # port, and the port is shipped. Nothing re-ran them. MEASURED: the suite's banner printed the
+      # SQLite version and NOTHING checked it, while the plan requires >= 3.37 for the STRICT clause all
+      # 24 tables carry - so a host with an older library would run every probe green and then fail to
+      # create the first table.
+      #
+      # The plan calls STRICT "the single most important line in this appendix"; there was no STRICT
+      # probe. Four were added, and the gate names them so they cannot be removed quietly.
+      # MEASURED against three provocations - the STRICT probes dropped, a probe deleted, a probe made to
+      # crash - all caught.
+      - name: Check the SQLite probes behind the migration plan
+        run: sh tools/sqlite-probes-check/check.sh
+
       # The CI document must describe the pipeline that actually runs.
       #
       # docs/ci-cd.md listed TEN stages while the workflow ran TWENTY-SIX: the seven

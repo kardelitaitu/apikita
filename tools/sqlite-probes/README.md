@@ -36,6 +36,26 @@ The SQLite behaviours the port depends on, measured rather than recalled.
 | `SUM()` over `INTEGER` vs `REAL` | `integer` vs `real` | §4.6 |
 | `journal_mode = WAL` persists | yes | §4.3 |
 | `VACUUM INTO` inside a transaction | **refused** | §4.3 trap 4 |
+| Library version supports `STRICT` | **asserted, not printed** | §4.9 |
+| `STRICT` rejects TEXT in an `INTEGER` column | **rejected** | §4.9 |
+| `STRICT` rejects a **REAL** in a money column | **rejected** | §4.9 |
+| Control: a **non**-`STRICT` table accepts both | accepted | §4.9 |
+
+**The four `STRICT` rows are new, and their absence was a real hole.** §4.9 of the plan calls
+`STRICT` *"the single most important line in this appendix"* — without it `INTEGER` is only *affinity*,
+so a `REAL` lands in a money column silently — and the plan states the requirement it creates
+(**SQLite ≥ 3.37**). MEASURED before these were added: the suite had **no `STRICT` probe at all**, and
+the version was **printed on the banner rather than checked**. So a host with an older SQLite would run
+every probe green and then fail to create the first table.
+
+The version comparison is numeric (`sqlite_version_info`), because `"3.9.0" > "3.37.0"` as strings —
+which would pass exactly the host that cannot run the schema.
+
+The **control** row matters as much as the two rejection rows: without it, a probe that saw a value
+rejected would not know whether `STRICT` did it or something unrelated did.
+
+All four were mutation-tested — the version raised beyond the host, `STRICT` removed from the table, and
+the control table made `STRICT` too — and **each provocation was caught**.
 
 ## `sqlite-timestamp-probe.py`
 
