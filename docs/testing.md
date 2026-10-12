@@ -366,6 +366,29 @@ timeout; 32: no restart assertion; 33: R1 unenforced as a rule; 34: the stop win
 consistent enough to name: **the gates verify what the code does, and nothing verified what the platform
 would do to it.**
 
+#### Unbounded container logs on a 1 GB host (round 35)
+
+Docker's default `json-file` log driver has **no size limit**. A container's log therefore grows until the
+filesystem fills — and on this host a full disk takes down the **SQLite database**, not just the logging.
+
+**MEASURED: zero files in the repository mentioned a container log bound**, and neither service declared
+one. Two things made that easy to miss and worth recording:
+
+- **The steady state is tiny**, so it looks unnecessary. nginx sets `access_log off` in its relay config, so
+  it logs nothing per request; the scheduler emits 97 output statements over a nightly run — KB, not MB.
+- **The failure mode is not the steady state.** A job that starts failing retries every night; a container
+  in a restart loop writes as fast as the runtime allows. Both are exactly when the log matters most, and
+  both are when an unbounded file fills a small disk.
+
+**The host size is what decides it, and the repository states it:** `docs/cost-and-sizing.md` puts the
+edge relay on a *"~2 vCPU / 4 GB"* VPS and says *"start smaller than you think"*, with the API/proxy at
+**1 vCPU / 1 GB**. A few unbounded GB is material on that box.
+
+Fixed with `max-size: 10m` / `max-file: 3` on both services, and an assertion in `compose-check` that
+**also refuses `logging:` without `max-size`** — because a log driver with no size limit is the unbounded
+default with extra words, and a check that only looked for the key would pass it. Verified four ways: the
+unmodified file passes, and each removal fires with a message naming the service.
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period

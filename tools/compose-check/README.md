@@ -30,6 +30,7 @@ rather than with the script.
 | The relay config is mounted at `/etc/nginx/conf.d/default.conf` | nginx loads `conf.d/*.conf`; anywhere else it runs its **default** config, which buffers SSE (see [`tools/relay-check`](../relay-check/README.md)). |
 | The scheduler has **no** healthcheck | It serves nothing and listens on nothing, so any probe is theatre that reports unhealthy forever. |
 | **Every service has a `restart` policy** | A service that exits — a crash, a reboot, an OOM kill — stays **down** until an operator notices. For the nightly sweep that means the retention promise stops happening silently. Added in round 32: the word `restart` appeared **zero** times in this gate, and removing the policy from both services left it green. |
+| **Every service bounds its logs** | Docker's default `json-file` driver has **no size limit**, so a container's log grows until the filesystem fills — and on this host a full disk takes down the SQLite database, not just the logging. Added in round 35: **zero** files in the repository mentioned a container log bound. The check also refuses `logging:` without `max-size`, which is the unbounded default with extra words. |
 
 **Skips LOUDLY (exit 3) when Docker is unavailable**, never 0 — a silent pass on a
 machine that ran nothing is the failure mode this directory exists to catch.
@@ -40,6 +41,11 @@ Five mutations, each caught with a message naming the invariant and why it matte
 `working_dir` changed, the DSNs collapsed, the entrypoint mount made writable, the
 relay config mounted elsewhere, and the **data mount made read-only**. The unmodified
 file passes.
+
+**The log-bound assertion (round 35) was verified four ways**: the unmodified file passes, and removing
+`logging:` from nginx, removing it from the scheduler, or keeping it while dropping `max-size` each fail
+with a message naming the service. The last case matters because `logging:` without a size limit is the
+unbounded default with extra words, and a check that only looked for the key would pass it.
 
 **The restart assertion was mutation-tested on the way in, and its FIRST VERSION WAS WRONG.** It scanned
 forward from a container name and stopped at the first `restart:` anywhere after it, so removing **nginx's**

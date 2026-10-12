@@ -148,6 +148,43 @@ for svc in nginx scheduler; do
     fi
 done
 
+# 5c. EVERY SERVICE BOUNDS ITS LOGS. Added in round 35, and the reasoning is the DISK.
+#
+# Docker's default `json-file` driver has no size limit, so a container's log grows until the filesystem
+# fills - and on this host a full disk takes down the SQLite database, not just the logging. The volume is
+# small by design: `docs/cost-and-sizing.md` puts the edge relay on a "~2 vCPU / 4 GB" VPS and says "start
+# smaller than you think".
+#
+# MEASURED before adding this: ZERO files in the repository mentioned a container log bound, and neither
+# service had one. nginx sets `access_log off`, so its steady-state output is tiny - which is exactly why
+# the bound was easy to omit and why the assertion is on the CONFIG rather than on observed volume. The
+# case that matters is not the steady state: a crash loop or an upstream error storm writes as fast as the
+# runtime allows, and that is when an unbounded file is a risk AND when losing the oldest lines is worst.
+#
+# Checked on the RENDERED output, so a service that sets the driver by any valid spelling passes.
+for svc in nginx scheduler; do
+    if printf '%s\n' "$RENDERED" | grep -qE "^ +$svc:"; then
+        if ! printf '%s\n' "$RENDERED" | awk -v s="$svc" '
+            /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { inside = ($0 == "  " s ":") }
+            inside && /^    logging:/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            fail "service $svc declares no logging options; the default json-file driver has no size limit, so a crash loop or an error storm grows the log until the disk fills and takes the database with it"
+        fi
+        # And the bound must actually be a bound: `logging:` with no max-size is still unbounded.
+        if printf '%s\n' "$RENDERED" | awk -v s="$svc" '
+            /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { inside = ($0 == "  " s ":") }
+            inside && /max-size:/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            :
+        else
+            fail "service $svc has logging options but no max-size; a log driver without a size limit is the unbounded default with extra words"
+        fi
+    fi
+done
+
+
 # 6. EVERY `docker compose up` IN THE DOCS NAMES A SERVICE, OR THE DOC SAYS IT MEANS ALL.
 #
 # WHY. `docker compose up -d` with NO service starts EVERY service in the file. That was a
