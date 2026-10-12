@@ -133,6 +133,24 @@ first pid sampler built for this harness was rejected by the Windows PowerShell 
 never sampled`, for a healthy server, forever. It would have passed every source-shape check ever
 written.
 
+### The CPU sampler reads `/proc` on Linux, and that is not a portability nicety
+
+`sampleProcess` shells out to `powershell.exe` with `Win32_Process` on Windows. MEASURED: that sees only
+**Windows** pids, so it cannot sample a server running inside WSL — the pid does not exist in that
+namespace, every sample returns `null`, and the verdict is `[NO DATA]`. The mirror holds in WSL, where
+`powershell.exe` is not present at all.
+
+**That mattered more than it sounds.** The only way to pin a server to the documented **0.2 vCPU** on a
+32-core host is cgroup v2, which is Linux — and the Windows Job Object cannot express the value at all
+(1% granularity makes it 0.320 cores, 60% over, and `tools/vcpu-pin` refuses rather than substitute). So
+the one combination the CPU row requires was the one combination this harness could not sample. It now
+reads `/proc/<pid>/stat` (utime, stime) and `/proc/<pid>/statm` (resident pages) on Linux, verified
+against a known workload: a 0.3-second spin reported **0.310 s**, a ratio of 1.03.
+
+Fields 14 and 15 are read from the LAST `)` in the line rather than by splitting the whole file, because
+the `comm` field is parenthesised and may itself contain spaces — a process named `my (odd) name` would
+otherwise shift every index and produce a plausible number derived from the wrong fields.
+
 So this gate **runs things**:
 
 | assertion | how | why it is not a source read |

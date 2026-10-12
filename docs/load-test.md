@@ -10,7 +10,9 @@ cannot be by the in-process binary:
 
 The document already says this and says it plainly: *"these numbers are not a load test and must not be
 quoted as one... Real figures come from the drill and the reconcile tools against a running stack."* This
-page is the missing half — **how to take those two measurements.**
+page was written as the missing half — **how to take those two measurements — and both have now been
+taken.** They are in "Recording the result" below, with the caveat that they are a first honest data
+point rather than the deployment's number.
 
 ## What you need before starting
 
@@ -179,6 +181,20 @@ run of the same measurement against the **debug** binary gave **0.109 / 0.120 / 
 The conclusion is not "the debug number was wrong" — it was correct, and it is why this row was worth
 measuring. It is that **an unoptimised build's CPU cost is not the shipped one, and the two differ by
 2.2×.** A row recorded without saying which build produced it would be a row a reader could not use.
+
+**THE GAP IS `opt-level` AND NOTHING ELSE — established so nobody chases it.** A 2.2× difference between
+two builds could have been a debug-only assertion doing real work on the hot path, or a different code
+path compiled in. Three builds, same measurement, medians of 3 runs each, server pinned to 0.200 cores:
+
+| build | core-equivalents | % of 0.2 vCPU |
+| --- | --- | --- |
+| **A** opt-level 0 (plain debug) | 0.134 / 0.141 / 0.137 | **68.5%** |
+| **B** opt-level 3, *no* LTO, default codegen units | 0.062 / 0.064 / 0.067 | **32.0%** |
+| **C** release: opt-level 3 + thin LTO + `codegen-units = 1` | 0.061 / 0.063 / 0.062 | **31.0%** |
+
+**B ≈ C.** Optimisation alone accounts for the whole gap, and the release profile's LTO and
+single-codegen-unit settings buy about **one percentage point** on this path — they are worth having for
+the reasons `Cargo.toml` gives, but they are not what stands between passing and failing this row.
 
 Release figures: **0.2776 CPU-seconds per 1,000 requests**, peak RSS **9.70 MB** (down from 19.53 MB in
 debug), p99 **1.559 ms**.

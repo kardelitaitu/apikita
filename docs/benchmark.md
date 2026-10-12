@@ -160,17 +160,36 @@ drifts, and the copy nobody re-reads is the one a reader trusts.
 ### 4.1 What DOES produce the two rows the binary cannot
 
 The metrics matrix in §3 publishes six rows. Four are covered in code — the in-process binary behind
-them, a config constant, or a `tools/` sweep. **Two were covered by nothing, and this section is the
-part that changed:**
+them, a config constant, or a `tools/` sweep. **Two were covered by nothing; both are now measured, and
+this section is what changed:**
 
-| row | target | what measures it now |
-| :--- | :--- | :--- |
-| **Key Validation Latency (p99)** | `<= 1.5 ms` | `tools/loadtest/loadtest.js` — concurrent HTTP against a running server, a real latency distribution |
-| **CPU Saturation at 200 req/s** | `<= 40%` | the same tool — CPU and RSS sampled from the server PID for the duration of the run |
+| row | target | what measures it now | measured |
+| :--- | :--- | :--- | :--- |
+| **Key Validation Latency (p99)** | `<= 1.5 ms` | `tools/loadtest/loadtest.js` — concurrent HTTP against a running server, a real latency distribution | **1.198 ms** debug / **1.559 ms** release; see below |
+| **CPU Saturation at 200 req/s** | `<= 40%` | the same tool — CPU and RSS sampled from the server PID for the duration of the run | **27%** (release) — PASSES |
+
+**Both rows are now filled, in [`docs/load-test.md`](load-test.md), and neither was straightforward.**
 
 ```bash
 node tools/loadtest/loadtest.js --base-url http://127.0.0.1:8080 --pid <server-pid> --rps 200 --seconds 30
 ```
+
+**On the CPU row**, the first measurement of it FAILED — the debug build read **54.5% / 60% / 56.3%**,
+consistently over the bar — and `--release` reads **27%**. The difference is `opt-level`, established by
+measuring a third build (opt-level 3, no LTO) rather than assumed: it lands at 32.0%, beside release's
+31.0%. So the row passes, and the release profile's LTO buys about one percentage point rather than
+being what makes it pass.
+
+**On the p99 row**, debug and release land 0.36 ms apart while the instrument's own floor is ~0.8 ms, so
+both are "near 1.5 ms" rather than decisively on one side. That is a limit of a round-trip measurement
+without a server-side timer, and `docs/load-test.md` says so rather than picking the better number.
+
+**A capability gap had to be closed to measure the CPU row at all.** The sampler shelled out to
+PowerShell's `Win32_Process`, which sees only Windows pids — so it could not sample a server inside WSL,
+and `powershell.exe` does not exist there either. Since the exact 0.2-vCPU pin needs cgroup v2 and
+therefore Linux, the one combination the row requires was the one the tool could not sample. It now
+reads `/proc/<pid>/stat` on Linux, verified against a known workload (a 0.3-second spin reported
+0.310 s).
 
 `tools/loadtest/README.md` carries the measured numbers, the falsification commands, and — the part
 worth reading before quoting anything — **what those numbers do not mean.** Two limits apply to both:
