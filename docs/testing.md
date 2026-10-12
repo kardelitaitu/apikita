@@ -227,6 +227,18 @@ about telegram link codes — a path that *does* read before writing.
 `reserve_balance_transaction` and the overdraw test will still pass while the lock upgrade becomes
 losable. It is recorded in `db.rs` at the helper, where an edit would land.
 
+**FIXED in round 17 — and the fix is a test, not a production change.** The first instinct (recorded at
+the end of round 16) was to add a read to `reserve_balance_transaction`, which would have meant editing
+the money path to serve a test. The actual cause pointed somewhere better: the guard is load-bearing for a
+transaction that **reads before it writes**, so what was missing was a test with that shape, and the
+production code needs nothing.
+
+`a_hold_after_a_read_still_admits_exactly_one_of_many` does `begin_immediate` → `SELECT` → the guarded
+`UPDATE`, which is what a caller with a preceding lookup produces. **Verified by mutation rather than by
+argument:** with `IMMEDIATE` replaced by a deferred `BEGIN`, the new test detects it in **10 of 10** runs
+where the old one detects it in **0 of 10**, and the full suite now fails **two** tests where it
+previously failed one — the telegram test and the wallet test, instead of only the telegram test.
+
 **Two harness bugs preceded this conclusion, and both reported "SURVIVED":**
 
 | what I did | what it produced | why |

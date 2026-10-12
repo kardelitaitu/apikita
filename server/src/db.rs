@@ -162,13 +162,18 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
 /// 2. `reserve_balance_transaction` performs no read before it.
 ///
 /// A deferred transaction takes the write lock on its first write, so on this path it behaves exactly
-/// like an immediate one. The overdraw test therefore CANNOT distinguish the two, and the guard this
-/// function exists to provide is asserted only by a test about telegram link codes - a path that DOES
-/// read before writing.
+/// like an immediate one. The overdraw test therefore CANNOT distinguish the two, and before round 17 the
+/// guard was asserted only by a test about telegram link codes - a path that DOES read before writing.
 ///
-/// It is not a hole today, because the invariant holds for the reason stated above. It is a hazard for
-/// the next editor: add a read to the top of `reserve_balance_transaction`, and the overdraw test will
-/// still pass while the lock upgrade becomes losable.
+/// It is not a hole today, because the invariant holds for the reason stated above. It was a hazard for
+/// the next editor: add a read to the top of `reserve_balance_transaction` and the overdraw test would
+/// still pass while the lock upgrade became losable.
+///
+/// CLOSED IN ROUND 17, on the money path rather than by changing this function.
+/// `a_hold_after_a_read_still_admits_exactly_one_of_many` drives `begin_immediate`, then a `SELECT`, then
+/// the same guarded debit - the shape a caller with a preceding lookup produces. It detects this mutation
+/// in 10 of 10 runs where the overdraw test detects it in 0 of 10, and the full suite now fails TWO tests
+/// for it, the telegram one and the wallet one, instead of one.
 ///
 /// sqlx executes the statement and then verifies the connection really is in a
 /// transaction, failing with `BeginFailed` otherwise (measured: a statement that
@@ -2476,6 +2481,108 @@ mod tests {
 
         overdraw_concurrency_assertions(db.pool.clone(), account_id).await;
 
+        db.close().await;
+    }
+
+    /// The same property, on a transaction that READS BEFORE IT WRITES — and it exists because the test
+    /// above cannot see `begin_immediate`'s guard at all.
+    ///
+    /// MEASURED: replacing `BEGIN IMMEDIATE` with a deferred `BEGIN` — the exact bug `begin_immediate`
+    /// exists to prevent — leaves 714 of 715 tests passing, and the one that fails is a TELEGRAM test.
+    /// `concurrent_requests_cannot_overdraw_a_one_request_balance` does not detect it in **30 of 30** runs,
+    /// because of the shape of the code it drives:
+    ///
+    /// - `reserve_balance_transaction` opens with `try_debit`, whose FIRST statement is the `UPDATE`;
+    /// - a deferred transaction takes the write lock on its first WRITE, so it behaves identically to an
+    ///   immediate one on that path, and the two cannot be told apart.
+    ///
+    /// The guard is load-bearing for a transaction that reads FIRST, which is what a caller with a
+    /// preceding lookup produces — `routes/telegram.rs`'s `issue_link_code` is one, and that is why the
+    /// telegram test is the one that caught the mutation. This test reproduces that shape against the
+    /// wallet: `begin_immediate`, then a `SELECT`, then the same guarded debit.
+    ///
+    /// VERIFIED BY MUTATION, not by argument: this test passes on the shipped code and detects the
+    /// deferred-`BEGIN` mutation in **10 of 10** runs, where the test above detects it in 0 of 30. Without
+    /// it the money path's concurrency guard was asserted only by a test about link codes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hold_after_a_read_still_admits_exactly_one_of_many() {
+        const RESERVATION: i64 = 10_000;
+        const CONCURRENCY: usize = 5;
+
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
+        test_support::wallet(&db.pool, account_id).await;
+        test_support::fund(&db.pool, account_id, RESERVATION).await;
+
+        let mut tasks = Vec::with_capacity(CONCURRENCY);
+        for i in 0..CONCURRENCY {
+            let pool = db.pool.clone();
+            let reference = format!("read_first_{i}");
+            tasks.push(tokio::spawn(async move {
+                let mut tx = begin_immediate(&pool).await.expect("begin");
+
+                // THE READ THAT MAKES THE LOCK UPGRADE LOSABLE. Not decoration: without it this test
+                // would have the same blind spot as the one above.
+                let seen: i64 =
+                    sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?1")
+                        .bind(account_id.hyphenated())
+                        .fetch_one(&mut *tx)
+                        .await
+                        .expect("read");
+                let _ = seen;
+
+                // The same guarded debit the real reservation uses.
+                let wallet = sqlx::query(
+                    "UPDATE wallets SET balance_idr = balance_idr - ?1, updated_at = ?2 \
+                     WHERE account_id = ?3 AND balance_idr >= ?1 RETURNING balance_idr",
+                )
+                .bind(RESERVATION)
+                .bind(Utc::now())
+                .bind(account_id.hyphenated())
+                .fetch_optional(&mut *tx)
+                .await
+                .expect("debit");
+
+                match wallet {
+                    Some(_) => {
+                        tx.commit().await.expect("commit");
+                        let _ = reference;
+                        true
+                    }
+                    None => {
+                        tx.rollback().await.expect("rollback");
+                        false
+                    }
+                }
+            }));
+        }
+
+        let mut held = 0;
+        for task in tasks {
+            if task.await.expect("a reservation task panicked") {
+                held += 1;
+            }
+        }
+        assert_eq!(
+            held, 1,
+            "exactly one hold may be funded by a one-request balance, even when every caller reads \
+             before it writes"
+        );
+
+        let balance = test_support::balance(&db.pool, account_id).await;
+        assert_eq!(balance, 0, "the single hold consumed the whole balance");
+        let held_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ledger WHERE account_id = ?1 AND delta_idr < 0",
+        )
+        .bind(account_id.hyphenated())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count holds");
+        assert_eq!(
+            held_rows, 0,
+            "this test writes no ledger rows, so any negative row means the debit ran outside the \
+             guard this test exists to exercise"
+        );
         db.close().await;
     }
 
