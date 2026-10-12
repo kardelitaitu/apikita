@@ -2522,13 +2522,23 @@ mod tests {
     /// transaction the fix introduced is the one under test and not a stand-in for
     /// it.
     ///
-    /// IT DETECTS THE LOCK-GUARD MUTATION ABOUT HALF THE TIME, which is worth stating rather than leaving
-    /// to be rediscovered. MEASURED: replacing `BEGIN IMMEDIATE` with a deferred `BEGIN` in
+    /// IT DETECTS THE LOCK-GUARD MUTATION RARELY, which is worth stating rather than leaving to be
+    /// rediscovered. MEASURED: replacing `BEGIN IMMEDIATE` with a deferred `BEGIN` in
     /// `db::begin_immediate` - the exact regression the helper exists to prevent - makes this test fail in
-    /// **5 of 10** runs. It is not weak for the reason this file's docstring worries about (a lenient
-    /// assertion): the assertion is exact. It is weak because whether a deferred transaction actually
-    /// loses the lock upgrade depends on interleaving, and 16 spawned tasks do not always produce the
-    /// losing one.
+    /// **1 of 10** runs, or **3 of 10** with a `tokio::sync::Barrier` added before the burst. It is not
+    /// weak for the reason this file's docstring worries about (a lenient assertion): the assertion is
+    /// exact. It is weak because the burst is not as simultaneous as it looks.
+    ///
+    /// THE GUARD UNDERNEATH IT DOES HOLD, measured rather than assumed. Driving the same race at
+    /// TRANSACTION level - `begin_immediate`, then `enforce_creation_cap_in`, then an INSERT, with a
+    /// barrier and 16 callers genuinely inside their transactions - the cap held at 10 rows against a
+    /// limit of 10 in **11 of 11** runs, 8 of them with the mutation applied and verified live. So this
+    /// test's flakiness is a property of this TEST, not evidence the cap is unprotected.
+    ///
+    /// WHAT DIFFERS IS THE PRE-TRANSACTION READ: `create_key` calls `resolve_account_from_cookie` before
+    /// `begin_immediate`, and a test cannot interpose on a read that happens inside the handler, so the
+    /// tasks arrive staggered. That is the likeliest cause and is NOT proven - what is proven is that the
+    /// transaction-level shape holds.
     ///
     /// So a GREEN run of this test is not evidence that the guard is intact. Two tests do detect that
     /// mutation every time - `db::tests::a_hold_after_a_read_still_admits_exactly_one_of_many` and

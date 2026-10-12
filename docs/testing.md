@@ -249,6 +249,38 @@ changed nothing, and reported SURVIVED. The gate is line 35. Rounds 14 and 24 re
 the reliable anchor is the **whole statement** (`return status === 'active';`), which cannot appear in
 prose.
 
+#### The keys cap: a weak detector, and the guard underneath it holds (round 30)
+
+Round 18 measured `the_key_creation_cap_holds_under_concurrent_requests` as detecting the deferred-`BEGIN`
+mutation in **5 of 10** runs — a coin flip. Round 19's suspend test had gone from 2/10 to 7/10 by adding a
+barrier, so the barrier was the obvious suspect here. **It is not the whole story:**
+
+| variant | detected the mutation |
+| --- | --- |
+| as shipped (16 spawned tasks, no barrier) | **1/10** |
+| with a `Barrier::new(16)` before the burst | **3/10** |
+
+A barrier helps but leaves it weak, so the cause is elsewhere. **Driving the same race at TRANSACTION level
+— `begin_immediate` → `enforce_creation_cap_in` → `INSERT`, with a barrier and 16 callers genuinely inside
+their transactions — the cap held at `rows=10` against `limit=10` in 11 of 11 runs, including 8 with the
+mutation applied.** The mutation was verified live: the round-17 control test fails with it, exactly as
+measured.
+
+**So the cap is not defended only by the flaky test.** What differs is what happens BEFORE the transaction:
+the handler does `resolve_account_from_cookie`, a database read, before `begin_immediate`, so its 16 tasks
+arrive staggered — and a test cannot interpose on a read that happens inside the handler.
+
+**Stated as a limit rather than a conclusion:** the transaction-level probe shows the guard holds when
+callers are genuinely concurrent; the handler-level test detects a change to it only sometimes. Whether the
+handler test's weakness is the pre-transaction read specifically, or the handler test simply being a
+weaker instrument in general, was **not** established — and is not claimed.
+
+**Two harness failures preceded this**, both of a kind this section already records: the probe's seed
+INSERT invented a column (`api_keys` has no `updated_at`, the same mistake as round 21), and a second run
+injected the probe twice so every deferred case failed to compile — an error that prints as
+`error[E0428]` and could be misread as "the cap held". Fixing the harness was what turned "no output" into
+a measurement.
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period
