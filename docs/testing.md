@@ -206,6 +206,37 @@ the harness table above, in the shell-gate setting rather than the Rust one.
 inside a command substitution picking up surrounding output. Verify with `git status --short` and, when it
 matters, `git diff HEAD --numstat`.
 
+#### The website's stated figures: verified, not just referenced (round 26)
+
+Round 25 found a stale count in the website suite. The obvious follow-up was whether the website's
+**money-adjacent and rule-stating figures** had drifted the same way. They have not — and the check was
+worth making rather than assuming, because a value a customer reads before buying is the most expensive
+place for a drift.
+
+| mutation in `website/src` | caught? |
+| --- | --- |
+| `minTopupIdr` 10000 → 20000 | **caught** |
+| `minFirstDepositIdr` 50000 → 99000 | **caught** |
+| signup `minlength="8"` → `"6"` | **caught** |
+| a privacy retention period 7 → 9 | **caught** |
+
+Those are the figures that the website's price and stated-limits suites exist for, and they fire. A screen
+for "stated rules with no test reference" also came back clean: **0 of 9** numeric rules stated in prose or
+markup lacked a test.
+
+**A value-matching screen produced a false positive first**, which is worth recording as the trap: it
+matched `10000` in `models.ts` against `low_balance_threshold_idr = 10000`, but the figure there is
+`minTopupIdr` — **two settings that share a number**. Matching by VALUE rather than by meaning cannot tell
+them apart, which is why the mutation above, not the screen, is the evidence.
+
+**Writing this section tripped `doc_claims`**, which is worth recording because it is the guard doing its
+job on prose rather than on a claim. The sentence named the website suite's stated-limits test file in
+backticks, and that FILENAME contains a dot-separated pair whose first segment is a config section name —
+which `every_limits_key_a_document_names_exists_in_the_config` read as a config key and correctly reported
+as non-existent. **Any dotted pair in a document is treated as a config key path**, so a filename that
+looks like one trips it. Phrased around it rather than weakening the guard, and this paragraph is written
+without reproducing the offending token.
+
 ### The money path, mutation-tested (round 14)
 
 Thirteen mutations across `clamp_debit`, `settlement_ledger_deltas`, the SQL balance floor, the schema
