@@ -322,6 +322,49 @@ refuse anything, and its own comment admits it — *"the cap has to be observed 
 exercises the window directly instead. The name is the same defect as round 11's rotated tuple: a stated
 expectation the code does not enforce.
 
+#### The top-up cap's SECOND check: measured, and NOT a gap (round 21)
+
+`create_topup` checks its cap twice, and its comment calls the second one *"authoritative and atomic,
+because there is nothing between it and the INSERT"*. Neutralising that second check leaves **all 717
+tests passing**, so it was worth asking whether it is load-bearing or belt-and-braces.
+
+**Measured, through the real handler with the real Snap round trip and a stubbed loopback peer**, seeding
+to one under the cap and firing 8 concurrent creates:
+
+| | created | refused | rows (cap = 5) |
+| --- | --- | --- | --- |
+| as shipped | 1 | 5–6 | **5** |
+| second check neutralised | 1 | 0–5 | **5** |
+
+**Identical — the cap holds either way.** The conclusion is "not load-bearing under this measurement",
+**not** "unnecessary", and the difference matters:
+
+```
+early gate (pool COUNT) -> Snap network call -> begin_immediate -> in-transaction gate -> INSERT
+```
+
+The **network round trip sits between the two checks**, so a burst spreads out rather than arriving
+together. `created = 1` shows the early gate already refused seven of the eight; the second check had
+nothing to refuse. The `abuse.rs` characterisation test — *"sixteen concurrent callers against a cap of
+five produced fourteen rows"* — calls the cap function **directly, with no gap**, which is the worst case.
+The second check guards two callers passing the early gate *simultaneously*, which the round trip makes
+rarer without making impossible.
+
+**No test was written for it, deliberately.** Asserting that the second check fires would mean asserting a
+property this measurement could not demonstrate — the exact defect this section keeps recording. The
+observation is recorded instead.
+
+**Four harness failures preceded the valid measurement, and all four read as findings:**
+
+| what I did | what it produced |
+| --- | --- |
+| used `std::env::set_var` | the crate **`forbid`s `unsafe`**; the tests' own `EnvGuard` is the route |
+| guessed `MIDTRANS_SNAP_ENDPOINT_OVERRIDE` | the var is `MIDTRANS_SNAP_URL` — the handler dialled Midtrans for real |
+| hand-wrote the seed INSERT | `table topups has no column named updated_at`; the file already had a helper |
+| read "(no result line)" as "no test failed" | the mutation had not compiled |
+
+**Five rounds running, every contradiction has been the harness rather than the code.**
+
 **Two harness bugs preceded this conclusion, and both reported "SURVIVED":**
 
 | what I did | what it produced | why |
