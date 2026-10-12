@@ -1074,6 +1074,18 @@ jobs:
       - name: Check the load test verdicts and calibration
         run: sh tools/loadtest-check/check.sh
 
+      # The two fake services do what their READMEs say.
+      #
+      # fake-upstream publishes a six-row failure-injection table and fake-midtrans claims to compute the
+      # Midtrans signature "exactly the way the server does" - both are contracts that nothing executed.
+      # The last three gate defects found in this repository were all in tooling CI never ran, so these
+      # are run rather than read: the injection rows against a live instance, and the signature against
+      # the server's own pinned vector (server/src/money.rs:1005).
+      # MEASURED against three mutations - a fail branch returning 200, a midstream cut removed, and the
+      # signature's field order swapped - all caught.
+      - name: Check the fake upstream and payment tools
+        run: node tools/fake-check/fake-check.js
+
       # The CI document must describe the pipeline that actually runs.
       #
       # docs/ci-cd.md listed TEN stages while the workflow ran TWENTY-SIX: the seven
