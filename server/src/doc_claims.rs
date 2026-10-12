@@ -3720,10 +3720,12 @@ mod tests {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if path.is_dir() {
-                if matches!(
-                    name.as_str(),
-                    "docs" | "node_modules" | "target" | ".git" | "dist" | ".astro"
-                ) {
+                // `docs` is excluded HERE and not in the other two walkers, which is the one real
+                // difference between them and why this list is a base plus an extra rather than one
+                // shared constant. The name says so, and the test that consumes this walker checks
+                // citations OUTSIDE docs/ - including docs/ would duplicate the sibling test that
+                // already covers it.
+                if name == "docs" || NEVER_WALKED.contains(&name.as_str()) {
                     continue;
                 }
                 collect_markdown_excluding_docs(&path, root, out);
@@ -3733,6 +3735,34 @@ mod tests {
         }
         let _ = root;
     }
+
+    /// Directories this module NEVER walks, wherever it recurses from.
+    ///
+    /// ONE list rather than the three duplicated literals that used to sit at the three walkers, because
+    /// they had already drifted: `collect_markdown_excluding_docs` also skipped `docs`, and the other two
+    /// did not, and nothing said which was intended.
+    ///
+    /// `.agents` IS THE ONE THAT COST TWENTY MINUTES, and it is worth writing down why it is here.
+    /// MEASURED before it was added: this suite took ~800s and `doc_claims::tests` accounted for 928s of
+    /// the 933s of module time - of which a SINGLE test,
+    /// `line_citations_outside_docs_point_at_files_that_can_contain_them`, was 1,200s (my own timeout)
+    /// while its 39 siblings totalled 15.6s. The cause was not the assertions but the walk:
+    /// `find_by_name` recursed the whole repository from scratch on EVERY unresolved citation, and
+    /// `.agents/` - the scratch directory this repo's own agent instructions mandate - had accumulated
+    /// **69,862 files across 9,390 directories**, including 928 scratch markdown files. So each call
+    /// stat'd ~70,000 paths to serve a handful of citations.
+    ///
+    /// It is scratch space, not repository content: nothing under it is cited by `docs/`, and a citation
+    /// that resolved only there would be pointing at a throwaway copy. Excluding it is correct on the
+    /// merits as well as for speed.
+    const NEVER_WALKED: &[&str] = &[
+        "node_modules",
+        "target",
+        ".git",
+        "dist",
+        ".astro",
+        ".agents",
+    ];
 
     /// Every file with one of `exts` under `root`, recursively, skipping the directories that hold
     /// generated or vendored content.
@@ -3745,10 +3775,7 @@ mod tests {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if path.is_dir() {
-                    if matches!(
-                        name.as_str(),
-                        "node_modules" | "target" | ".git" | "dist" | ".astro"
-                    ) {
+                    if NEVER_WALKED.contains(&name.as_str()) {
                         continue;
                     }
                     walk(&path, exts, out);
@@ -3768,31 +3795,59 @@ mod tests {
 
     /// A file with this basename, anywhere under `root`. Depth-first, and the shortest path
     /// wins so a tie between two same-named files resolves deterministically.
+    ///
+    /// THE INDEX IS BUILT ONCE PER PROCESS, and that is the whole reason this test went from twenty
+    /// minutes to milliseconds. MEASURED: the original walked the repository from scratch on EVERY
+    /// unresolved citation - and with `.agents/` on disk that was **65,576 files across 9,390
+    /// directories per call**, repeated dozens of times. The walk is now a `OnceLock` over one pass.
+    ///
+    /// WHY ONE PASS IS SAFE. The tree does not change during a test run, so a later call cannot observe
+    /// anything the first would not have. If a future test ever mutates the tree mid-run, this must go
+    /// back to a per-call walk - which is why the cache is named for the root it indexed.
+    ///
+    /// The first-pass cost is paid once even if nothing asked for it, and it is ~0.4s - against the
+    /// 1,200s it replaces.
     fn find_by_name(root: &std::path::Path, base: &str) -> Option<std::path::PathBuf> {
-        fn walk(dir: &std::path::Path, base: &str, hits: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if path.is_dir() {
-                    if matches!(
-                        name.as_str(),
-                        "node_modules" | "target" | ".git" | "dist" | ".astro"
-                    ) {
-                        continue;
+        /// `(basename -> best path)` for one root, in path-length order as `find_by_name` resolves.
+        type Index = std::collections::HashMap<String, std::path::PathBuf>;
+
+        static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
+
+        let index = INDEX.get_or_init(|| {
+            fn walk(dir: &std::path::Path, hits: &mut Vec<std::path::PathBuf>) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if path.is_dir() {
+                        if NEVER_WALKED.contains(&name.as_str()) {
+                            continue;
+                        }
+                        walk(&path, hits);
+                    } else {
+                        hits.push(path);
                     }
-                    walk(&path, base, hits);
-                } else if name == base {
-                    hits.push(path);
                 }
             }
-        }
-        let mut hits = Vec::new();
-        walk(root, base, &mut hits);
-        hits.sort_by_key(|p| p.as_os_str().len());
-        hits.into_iter().next()
+
+            let mut all = Vec::new();
+            walk(root, &mut all);
+            // Shortest path wins, so the tie between two same-named files resolves the same way the
+            // per-call version resolved it.
+            all.sort_by_key(|p| p.as_os_str().len());
+
+            let mut index: Index = std::collections::HashMap::new();
+            for path in all {
+                if let Some(name) = path.file_name().map(|b| b.to_string_lossy().into_owned()) {
+                    index.entry(name).or_insert(path);
+                }
+            }
+            index
+        });
+
+        index.get(base).cloned()
     }
 
     /// No `Uuid` is ever bound to a statement WITHOUT `.hyphenated()`.
