@@ -74,21 +74,38 @@ It refuses a verdict when its own floor is at or above the target, retains every
 percentile rather than a mean, and **prints the warm-up it discarded** — so a figure it produces can be
 attributed rather than trusted.
 
-**The floor scales with CONCURRENCY, so the two runs must match.** MEASURED against `/health`:
+**The floor must be measured at the SAME CONCURRENCY as the run**, and the reason is not a tidy scaling
+curve — it is that the floor is dominated by **variance**. The first table published here claimed a
+monotonic rise with concurrency (1.131 / 1.290 / 1.231 / 1.377 / **1.892** ms at concurrency 1/4/8/16/32),
+and that was wrong.
 
-| concurrency | floor p99 | server p99 |
-| --- | --- | --- |
-| 1 | 1.131 ms | 1.106 ms |
-| 4 | 1.290 ms | 1.236 ms |
-| 8 | 1.231 ms | 1.572 ms |
-| 16 | 1.377 ms | 1.597 ms |
-| 32 | 1.892 ms | 1.910 ms |
+**MEASURED, and it retracts the row above:** on the same host, 7 trials at each concurrency gave medians
+of **1.30 / 2.06 / 2.07 / 1.25 / 1.42 ms** — noisy, non-monotonic, and **concurrency 32 landed UNDER the
+1.5 ms bar**. Individual runs swung **1.14–7.77 ms for an identical configuration**. The quoted 1.892 ms
+was a one-shot artifact, and two conclusions drawn from it are withdrawn: the floor does not rise
+reliably with concurrency, and "past concurrency 16 it crosses the bar" was not reproducible.
 
-Two things follow, and the second is the one that matters. First, the floor is essentially flat against
-*rate* at fixed concurrency (10-1000 req/s all land within 1.1-1.4 ms), so it is client-side queueing
-rather than throughput. Second, **past concurrency ~16 the floor crosses the bar** — so a run at 32
-workers cannot produce a p99 verdict about the server at all, and the tool says so rather than reporting
-its own contention as latency.
+**What replaces it is a rule rather than a table: a single run on this host is a coin flip, so every
+figure recorded here must be a median of repeated interleaved trials, with the host's CPU stated.** The
+table above was taken while a crypto-miner was running — the same command read **13.7–23.7 ms** under
+that load and ~1.4 ms quiet, a 20× swing from the environment alone.
+
+**AND THE FLOOR'S COMPOSITION MATTERED MORE THAN ITS LEVEL.** Instrumenting the original generator
+split each request slot into *timer lateness* versus *actual RTT*: the sleep-timer overshoot was
+**p50 ~7–8 ms / p99 ~15–16 ms** — an order of magnitude larger than the latency being measured, since
+RTT itself was p99 1.34 ms at concurrency 8. It was never request cost. It was N independent per-worker
+sleep schedules waking late and colliding, which is why the figure swung so wildly.
+
+The generator was subsequently rebuilt on **one shared release schedule** (a token bucket, so lateness
+does not compound with N) over **pre-connected `TcpStream`s** instead of a `reqwest` call per request.
+The author reports a floor of **0.48–0.78 ms, flat across concurrency 1→32**.
+
+**THAT FIGURE IS NOT VERIFIED IN THIS DOCUMENT.** It was measured on a host the author's own report
+describes as contaminated, and I could not reproduce it: every attempt since has found the machine
+carrying unrelated load (a separate project's build process holding ~18 cores). The instrument refuses
+to take a floor reading on a busy host, which is the correct behaviour and also why the claim stands
+unconfirmed. **Treat it as reported, not established, until it is measured on a quiet box with the CPU
+stated.**
 
 ## The run
 
