@@ -51,6 +51,36 @@ for p in sqlite-port-probe.py sqlite-timestamp-probe.py validate-migration-schem
     echo "sqlite-probes-check:   ok - $p ran (exit 0)"
 done
 
+# --- EVERY probe must ASSERT, not just print ---------------------------------
+#
+# "Ran (exit 0)" is not the same as "checked something". MEASURED: `sqlite-timestamp-probe.py` used to
+# print `(want N)` beside every measurement and compare none of them — patching it so a value
+# contradicted its own printed `want` still exited 0. It reported the timestamp hazard, which
+# `docs/plans/sqlite-migration.md` calls "the finding most likely to have caused a production incident",
+# while being unable to notice that hazard changing.
+#
+# So each probe must emit at least one verdict line. The patterns differ by script — `[PASS ]` with a
+# TRAILING PAD in the port probe (`f"[{status:5}]"`), bare `[PASS]` in the other two, and one of them
+# indents by two spaces — so the match allows whitespace INSIDE the brackets as well as before them.
+# MEASURED: without the inner `[[:space:]]*` this counted 5 of the port probe's 28 verdicts, because only
+# the 5 `[ERROR]` lines happened to be unpadded. A guard against under-reporting that under-reports is
+# the defect it was written to catch.
+for p in sqlite-port-probe.py sqlite-timestamp-probe.py validate-migration-schema.py; do
+    [ -f "$PROBES/$p" ] || continue
+    # CAPTURE FIRST, COUNT SECOND — do not pipe the command into grep. `n=$(python3 ... | grep -c ...)`
+    # captures the LAST stage's status, so a probe that CRASHED would pass this check with a count from
+    # whatever grep saw. The run-ability loop above already fails on a non-zero exit, but a hazard here
+    # would be masked even so, and `tools/shell-hazards/check.sh` flagged the piped form for exactly that
+    # reason. Reading the output into a variable first keeps the two questions separate.
+    verdict_out=$(python3 "$PROBES/$p" 2>&1)
+    n=$(printf '%s\n' "$verdict_out" | grep -cE '^[[:space:]]*\[[[:space:]]*(PASS|FAIL|ERROR)[[:space:]]*\]' || true)
+    if [ "${n:-0}" -eq 0 ]; then
+        fail "$p prints no [PASS]/[FAIL]/[ERROR] verdict at all, so its exit code says only that Python ran. A probe that cannot fail is not evidence for the plan that cites it"
+    else
+        echo "sqlite-probes-check:   ok - $p emits $n verdict line(s)"
+    fi
+done
+
 # --- the port probe's own results --------------------------------------------
 OUT=$(python3 "$PROBES/sqlite-port-probe.py" 2>&1)
 

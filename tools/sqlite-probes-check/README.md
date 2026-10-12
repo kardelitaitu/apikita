@@ -50,13 +50,32 @@ with 32 `STRICT` occurrences** — so the invariant is load-bearing, not decorat
 ## What the gate asserts, and why each is a behaviour
 
 1. **All three probes run and exit 0.** A probe that crashes cites nothing.
-2. **The port probe reports ≥ 28 probes.** `[ERROR]` rows are *expected* — they are the Postgres-syntax
+2. **Every probe emits at least one `[PASS]`/`[FAIL]`/`[ERROR]` verdict** — because "ran (exit 0)" is not
+   the same as "checked something". MEASURED counts on this host: **28 / 8 / 39**.
+3. **The port probe reports ≥ 28 probes.** `[ERROR]` rows are *expected* — they are the Postgres-syntax
    probes, where SQLite rejecting the statement IS the documented result. The count is the signal: a
    suite that silently shrinks is how coverage disappears.
-3. **The four `STRICT` probes are present, by name.** So a future edit cannot quietly remove the one
+4. **The four `STRICT` probes are present, by name.** So a future edit cannot quietly remove the one
    measurement the plan's most important line depends on.
-4. **The version precondition holds on this host**, reported as a failure about *the host* rather than
+5. **The version precondition holds on this host**, reported as a failure about *the host* rather than
    about the assertion.
+
+### The probe that printed verdicts it never checked
+
+Assertion 2 exists because of a specific finding. `sqlite-timestamp-probe.py` printed `(want N)` beside
+every measurement and compared none of them — **MEASURED: patching it so a value contradicted its own
+printed `want` still exited 0.** It documents the timestamp hazard that `docs/plans/sqlite-migration.md`
+calls *"the finding most likely to have caused a production incident"*, while being unable to notice that
+hazard changing.
+
+It now has **8 assertions and a real exit code**, and its section 3 was corrected while doing so: the line
+read `(want 1)` under the heading *"Same instant, two formats, is NOT equal"*. The two strings differ at
+position 10, where `'T'` (0x54) sorts above `' '` (0x20), so they are **never** equal as text — the
+expectation contradicted its own heading and could not be satisfied. It reads `(want 0)` now, with the
+reason recorded beside it.
+
+**That is two defects in one 137-line file, both of the same shape: a stated expectation that the code
+never enforced.**
 
 ## Proving it can fail
 
@@ -65,9 +84,19 @@ with 32 `STRICT` occurrences** — so the invariant is load-bearing, not decorat
 | the four `STRICT` probes dropped from the suite | **caught** — reports 24 probes and names the missing invariant |
 | a probe file deleted | **caught** — "the plan cites a result nothing can reproduce" |
 | a probe made to crash | **caught** — "$p exited 1" |
+| **a probe's verdict lines removed** (back to printing only) | **caught** — "prints no verdict at all, so its exit code says only that Python ran" |
 
 Each message names the condition rather than the symptom, because a gate that fails without saying what
 broke sends the next reader back to the source.
+
+**One was verified by accident, which is worth recording.** While testing the last provocation, a
+`git checkout --` on the *uncommitted* probe restored it to its committed, assertion-free state — and this
+gate immediately failed and named the probe. That is the end-to-end behaviour working on a real
+regression rather than an injected one.
+
+**And `tools/shell-hazards/check.sh` caught a hazard in this gate while it was being written:**
+`n=$(python3 ... | grep -c ...)` captures the *last* stage's status, so a crashing probe would have been
+counted from whatever `grep` happened to see. It captures the output first now.
 
 ## What it does NOT check
 

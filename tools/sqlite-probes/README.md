@@ -74,6 +74,24 @@ outranks the space-format value. Up to ~24 hours of extra session life, silently
 Also confirms that with a *uniform* RFC3339-offset format, ordering is correct even when
 the fractional part varies in length. Plan reference: §4.6.
 
+**It asserts its expectations as of this round; it used to only print them.** The script wrote
+`(want N)` beside every measurement and compared none of them — MEASURED: patching it so a value
+contradicted its own printed `want` still exited **0**. It now has **8 assertions and a real exit code**,
+so a change in SQLite's comparison behaviour fails the probe instead of printing a number for a human to
+notice.
+
+**Two corrections were made to it while adding those assertions**, both the same shape — a stated
+expectation the code never enforced:
+
+| line | was | is | why |
+| --- | --- | --- | --- |
+| §2 `expires_at > now` | `(want 0)` | **`(want 1)`** | `want 0` describes *correct* behaviour; the observed `1` **is the hazard this probe exists to demonstrate**, so the assertion records the hazard and fails if it ever *disappears* |
+| §3 same instant, two formats | `(want 1)` | **`(want 0)`** | it sat under the heading *"is NOT equal"* and could never be satisfied — the strings differ at position 10, where `'T'` sorts above `' '` |
+
+The distinction in §2 is worth reading before changing it: the probe demonstrates a comparison that gets
+the answer *wrong*, so a "healthier" reading there would mean the hazard had stopped reproducing and the
+schema's format enforcement no longer load-bearing.
+
 ## `validate-migration-schema.py`
 
 The schema gate, and the only script here that inspects the shipped artefact rather
