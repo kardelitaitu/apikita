@@ -389,6 +389,36 @@ Fixed with `max-size: 10m` / `max-file: 3` on both services, and an assertion in
 default with extra words, and a check that only looked for the key would pass it. Verified four ways: the
 unmodified file passes, and each removal fires with a message naming the service.
 
+#### 1.25 GB of temp files from one source, on the host that holds the database (round 36)
+
+Chasing memory limits for the compose services led somewhere sharper. The relay's settings, read together
+rather than one at a time:
+
+| setting | value | what it actually bounds |
+| --- | --- | --- |
+| `client_max_body_size` | 25m | the largest body accepted |
+| `limit_conn connperip` | 50 **per IP** | concurrent connections from **one** source |
+| `proxy_max_temp_file_size` | 1024m (default, unset) | a per-request cap no endpoint here can reach |
+| `proxy_request_buffering` | on (default) | **a full body is written to disk before forwarding** |
+
+**50 connections × 25 MB = 1.25 GB of buffered request bodies from a single source** — on a VPS this
+repository sizes at *"~2 vCPU / 4 GB"*. The per-IP cap does not bound the total, since N sources each get
+their own 50, and the rate limits shape **admission, not occupancy**: `rate=30r/s` says how often a new
+request is admitted, not how long a slow one may hold a buffer.
+
+The temp directory is on the container filesystem, which is the host disk — **the same disk as the SQLite
+database**. That is round 35's failure shape in a different costume, which is why it was worth chasing.
+
+Fixed with `proxy_max_temp_file_size 8m` and `client_body_buffer_size 128k`. **8 MB is 4× the largest body
+the API accepts** (`max_body_bytes = 2097152`, 2 MiB), so it cannot refuse anything the server would have
+accepted.
+
+**What I deliberately did not touch.** `config/apikita.toml` records the 25m-vs-2MiB gap as a *"KNOWN
+INCONSISTENCY ... Reconciling that is a product decision this line cannot make alone."* My change bounds
+the **buffering**, not the **acceptance**: `client_max_body_size` stays 25m, a 3 MiB body still passes the
+relay and is still refused by the server, and the deferred decision stays deferred. Verified rather than
+assumed, because accidentally resolving someone else's product decision is worse than leaving it open.
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period
