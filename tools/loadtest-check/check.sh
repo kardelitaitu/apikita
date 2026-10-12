@@ -252,6 +252,50 @@ else
     echo "loadtest-check:   ok - an unrecognised flag exits $UNKNOWN_RC and names the flag"
 fi
 
+# --- the native load client's calibration ----------------------------------------
+#
+# THE SAME RULE, APPLIED TO `server/src/bin/loadgen.rs`. That binary exists because the Node harness's
+# own floor sits above the published bar, and its trustworthiness rests on the same three mechanisms
+# the Node tool has: a floor measured before the server, a refusal when that floor is at or above the
+# target, and a warm-up it says is discarded. Its 366 lines READ correctly - `process::exit(4)` is
+# right there - and MEASURED, one of those mechanisms does not fire on the interface automated
+# consumers use (see loadgen-probe.js's header; the `--json` branch returns before the floor verdict).
+# A source read would have reported the refusal present. The run reports it absent. That is the whole
+# argument for this gate, made a second time, against a second tool.
+#
+# THE BINARY IS OPTIONAL, AND ITS ABSENCE SKIPS RATHER THAN FAILS. This gate must not require a Rust
+# toolchain - it is documented as running "in under a second in a pipeline that may not have one", and
+# `check.sh` exits 3 only for an unreadable file it needs. So a missing `loadgen` binary SKIPS this
+# block, loudly, and the other checks still run. The same applies to a runner with no server: the
+# probe prints its skips and exits 0, having still exercised the checks that need nothing listening.
+#
+# The binary is searched in the two places cargo puts it, so the gate works whether it ran
+# `cargo build` or `cargo build --release`.
+echo ""
+echo "loadtest-check: the native load client's calibration (server/src/bin/loadgen.rs)"
+LOADGEN=""
+for candidate in "$REPO/server/target/debug/loadgen.exe" "$REPO/server/target/release/loadgen.exe" \
+                 "$REPO/server/target/debug/loadgen" "$REPO/server/target/release/loadgen"; do
+    if [ -x "$candidate" ]; then
+        LOADGEN="$candidate"
+        break
+    fi
+done
+
+if [ -z "$LOADGEN" ]; then
+    echo "loadtest-check:   SKIPPED - no loadgen binary under server/target/{debug,release}/."
+    echo "loadtest-check:   Build it with: (cd server && cargo build --bin loadgen)"
+    echo "loadtest-check:   The load client's calibration is NOT covered on this runner. Stated rather"
+    echo "loadtest-check:   than passed over: a silent skip is a green tick over nothing."
+else
+    # The port is passed explicitly. 17432 is the one this gate's own recipe starts a server on, and
+    # the probe SKIPS the live checks when nothing answers there while still running the two that need
+    # no server (a closed port exits 3; a nonsense flag exits 2).
+    if ! node "$REPO/tools/loadtest-check/loadgen-probe.js" "$LOADGEN" "${LOADGEN_BASE_URL:-http://127.0.0.1:17432}"; then
+        FAIL=1
+    fi
+fi
+
 echo ""
 if [ "$FAIL" -ne 0 ]; then
     echo "loadtest-check: FAIL - see the violations above." >&2
