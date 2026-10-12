@@ -144,6 +144,14 @@ struct Args {
     /// The status a request must return to count as a success. `0` means "accept any status", which is
     /// the old behaviour and is kept only for measuring a path whose status is genuinely irrelevant.
     expect_status: u16,
+    /// The HTTP method. Defaults to GET, which is right for the floor path (`/health`) and WRONG for the
+    /// endpoint this client exists to measure - see the note where the request is built.
+    method: String,
+    /// A request body, sent with `Content-Length` and `Content-Type: application/json` when non-empty.
+    body: String,
+    /// Extra headers, each a complete `Name: value` line. The one that matters in practice is
+    /// `Authorization`, because the row being measured is an unauthenticated key lookup.
+    headers: Vec<String>,
     /// Measure the client's own floor instead of driving the server.
     measure_floor: bool,
     json: bool,
@@ -162,6 +170,11 @@ fn parse_args() -> Result<Args, String> {
         // failure - the check exists to catch a path that is not answering at all, and the caller states
         // what "answering" means for their endpoint.
         expect_status: 0,
+        // GET is right for the floor path and wrong for the measured endpoint, so it is the DEFAULT
+        // rather than the only option. See the note where the request is built.
+        method: "GET".into(),
+        body: String::new(),
+        headers: Vec::new(),
         measure_floor: false,
         json: false,
     };
@@ -214,6 +227,32 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("--expect-status: {e}"))?;
                 2
             }
+            "--method" => {
+                let m = need(i)?.to_uppercase();
+                // A short allow-list rather than any token, so a typo becomes an error instead of a
+                // request line the server answers 400 to - which would then be timed as a success.
+                if !["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"].contains(&m.as_str()) {
+                    return Err(format!("--method must be an HTTP method, got {m}"));
+                }
+                a.method = m;
+                2
+            }
+            "--body" => {
+                a.body = need(i)?.clone();
+                2
+            }
+            "--header" => {
+                let h = need(i)?.clone();
+                // Reject anything that is not a single `Name: value` line: a malformed header produces a
+                // request the server rejects, and the rejection would be timed as latency.
+                if !h.contains(':') || h.contains('\r') || h.contains('\n') {
+                    return Err(format!(
+                        "--header must be a single `Name: value` line, got {h:?}"
+                    ));
+                }
+                a.headers.push(h);
+                2
+            }
             "--seconds" => {
                 a.duration =
                     Duration::from_secs(need(i)?.parse().map_err(|e| format!("--seconds: {e}"))?);
@@ -251,7 +290,14 @@ fn parse_args() -> Result<Args, String> {
                      \x20                about the server.\n\
                      --expect-status  the status a request must return to count as a success (0 = any).\n\
                      \x20                Set this for an endpoint whose status you know: without it a run\n\
-                     \x20                against a 405 is timed and reported as the endpoint's latency.\n\n\
+                     \x20                against a 405 is timed and reported as the endpoint's latency.\n\
+                     --method         HTTP method, default GET. GET is right for the floor path; the\n\
+                     \x20                measured endpoint is usually POST.\n\
+                     --body           request body, sent with Content-Length and a JSON content type.\n\
+                     --header         an extra `Name: value` line. Repeatable; use it for Authorization.\n\n\
+                     MEASURING A REAL ENDPOINT, so the run is about the server rather than the router:\n  \
+                     loadgen --path /v1/chat/completions --method POST --expect-status 401 \\\n    \
+                     --header 'Authorization: Bearer sk-unknown' --body '{{}}' --rate 200\n\n\
                      EXIT CODES: 0 ok   2 bad arguments   3 target unreachable\n\
                      \x20           4 floor too high to resolve the target\n\
                      \x20           5 no samples   6 too many requests failed for a p99 to mean anything\n"
@@ -455,10 +501,32 @@ fn main() {
     };
     let addr = format!("{host}:{port}");
 
+    let method = args.method.as_str();
+    let body = args.body.as_str();
+    let headers = &args.headers;
+
     // The request is built ONCE. Rebuilding the header block per request would put the formatting cost
     // inside the timed region, which is the client measuring itself.
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n")
-        .into_bytes();
+    //
+    // THE METHOD AND BODY MATTER, and this is not a convenience. MEASURED against this server:
+    // `GET /v1/chat/completions` answers **405** - the route is POST-only - so a GET-only client was
+    // timing the router's rejection path and could have reported it as the endpoint's latency. The
+    // default stays GET because `/health` is the floor path and a bare GET is right for it; a run
+    // against a real endpoint must say POST and give a body.
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n");
+    if !body.is_empty() {
+        request.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    for h in headers.iter() {
+        request.push_str(&format!("{h}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    let request = request.into_bytes();
 
     // A reachability check before anything else. Measuring an address nothing is listening on produces
     // a fast, clean, meaningless run of connection refusals.

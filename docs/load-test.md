@@ -66,8 +66,13 @@ cargo build --bin loadgen
 # ALWAYS measure the floor first, at the SAME concurrency as the run you intend to make.
 ./target/debug/loadgen --base-url http://127.0.0.1:8080 --path /health --measure-floor --concurrency 8
 
-# Then the real run.
-./target/debug/loadgen --base-url http://127.0.0.1:8080 --path /v1/chat/completions --rate 200 --concurrency 8
+# Then the real run. THE METHOD AND HEADER MATTER: this route is POST-only, and without them the
+# client times the router's 405 rejection and reports it as the endpoint's latency. MEASURED: a bare
+# GET to /v1/chat/completions answers 405.
+./target/debug/loadgen --base-url http://127.0.0.1:8080 --path /v1/chat/completions \
+  --method POST --expect-status 401 \
+  --header 'Authorization: Bearer sk-unknown-not-a-real-key' --body '{}' \
+  --rate 200 --concurrency 8
 ```
 
 It refuses a verdict when its own floor is at or above the target, retains every sample for a real
@@ -103,9 +108,29 @@ The author reports a floor of **0.48–0.78 ms, flat across concurrency 1→32**
 **THAT FIGURE IS NOT VERIFIED IN THIS DOCUMENT.** It was measured on a host the author's own report
 describes as contaminated, and I could not reproduce it: every attempt since has found the machine
 carrying unrelated load (a separate project's build process holding ~18 cores). The instrument refuses
-to take a floor reading on a busy host, which is the correct behaviour and also why the claim stands
-unconfirmed. **Treat it as reported, not established, until it is measured on a quiet box with the CPU
-stated.**
+to take a floor reading on a busy host, which is the correct behaviour and also why the claim stood
+unconfirmed.
+
+**IT IS NOW VERIFIED. Independent reproduction, medians of 7 trials per concurrency, on a quiet host
+(22% CPU), same box:**
+
+| concurrency | floor p99 (median) | range across 7 trials |
+| --- | --- | --- |
+| 1 | **0.664 ms** | 0.624–0.718 |
+| 4 | **0.698 ms** | 0.637–0.746 |
+| 8 | **0.658 ms** | 0.615–0.738 |
+| 16 | **0.681 ms** | 0.635–0.872 |
+| 32 | **0.675 ms** | 0.605–0.941 |
+
+**Spread across concurrency 1→32 is 0.040 ms** — flatter even than the 0.11 ms reported. The ranges are
+0.6–0.9 ms, against the **1.14–7.77 ms swing** the old generator showed for an identical configuration.
+The instrument's floor is now well under the 1.5 ms bar and effectively independent of concurrency,
+which is the property that matters: a floor that moves with N cannot be compared against a bar quoted
+at some other N.
+
+**What this still is NOT.** It is a debug build on Windows over loopback at ~200 req/s. A floor is a
+statement about the *instrument*; it says nothing about server throughput, and nothing here has been
+measured on the 0.2 vCPU deployment shape. The two rows in "Recording the result" remain blank.
 
 ## The run
 
@@ -139,11 +164,53 @@ three is not reproducible and the next reader cannot tell whether it still holds
 
 | metric | target | measured | box | vCPU | date |
 | --- | --- | --- | --- | --- | --- |
-| Key validation p99 | $\le 1.5$ ms | *not yet measured* | — | — | — |
+| Key validation p99 | $\le 1.5$ ms | **1.198 ms** | Linux (WSL2), 32 logical cores, Ryzen 9 7950X, loopback, debug `apikita-server`, load 0.01x CPUs | **0.200** (cgroup v2 `cpu.max = 20000 100000`) | 2026-10-13 |
 | CPU at 200 req/s | $\le 40\%$ | *not yet measured* | — | — | — |
 
-The two rows above are **deliberately empty**, and stay empty for the reason given below. What the
-harness HAS produced so far is in a different table, because it is a different claim:
+**The first row is filled, and here is exactly what it is and is not.**
+
+The run drove `POST /v1/chat/completions` with an unknown `Bearer` key, answered `401` at key lookup — so
+it exercises key validation, the hold and the refusal, with **no upstream, no wallet and no write**. That
+is the path this row is about. 3000 samples, 0 errors, achieved 199.5 of 200 req/s.
+
+**It is a valid reading because the instrument's own floor was measured first, at the same concurrency,
+and landed below the bar: 0.803 ms.** The server's own CPU over the run was 2,506,436 µs against 17 s of
+wall time — 0.147 cores averaged, inside the 0.2 quota, with 2 of 213 periods throttled.
+
+**What it is NOT.** The box is 32 cores, not the deployment shape; the generator shared the host with the
+server, which the section above says not to do — with the server capped to 0.2 cores and the generator
+free, the contention that warning is about is largely avoided, but this is **not** the documented
+two-machine protocol. It is a debug build over loopback. Treat 1.198 ms as a first honest data point for
+this row, not as the deployment's number.
+
+### How 0.2 vCPU was pinned, because the obvious tools cannot
+
+`tools/vcpu-pin/` (a Windows Job Object) **refuses** this value: its granularity is 1% of total, so on 32
+cores the nearest expressible rate is 0.320 cores — 60% over, and the tool declines to substitute rather
+than make every figure optimistic.
+
+**cgroup v2's `cpu.max` expresses it exactly**, on any core count: `20000 100000` **is** 0.20 cores. It
+needs root, and it needs the quota applied to the server's pid. MEASURED against a 3-second spin:
+`usage_usec 622639` = **0.208 cores** with `nr_throttled 31` of 31 periods — the cap bit.
+
+```sh
+mkdir -p /sys/fs/cgroup/loadtest
+echo 20000 100000 > /sys/fs/cgroup/loadtest/cpu.max    # 0.20 cores, exact
+echo $SERVER_PID  > /sys/fs/cgroup/loadtest/cgroup.procs
+```
+
+**One trap:** `echo $$` inside a subshell writes the *parent's* pid, so the process you meant to cap never
+enters the cgroup. It reported `usage_usec 1008` against a 2-second spin, which reads as "capped
+perfectly" and means "nothing was capped". Check `nr_throttled` is non-zero before believing a run.
+
+The two rows below the table remain blank, and the section that follows explains why they are a different
+claim.
+
+**The CPU row is still empty, and it stays empty for the reason below.** This sentence used to say *"the
+two rows above are deliberately empty"* — now false, since the p99 row is filled. It is corrected rather
+than deleted so a reader who saw the earlier version knows which changed.
+
+What the NODE harness has produced is in a different table, because it is a different claim:
 
 **Measured on the DEVELOPMENT host, which is NOT the deployment shape.** Windows 11 Pro, 32 logical
 cores, 61.7 GB RAM, node v22.23.2, release `apikita-server`, loopback, against a migrated scratch

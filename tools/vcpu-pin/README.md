@@ -72,8 +72,42 @@ Windows CPU rate control takes **hundredths of a percent**, but the round-trip t
 whole percent. On a 32-core box that is **0.32 core-equivalents minimum** — so `--cpu 0.2` is **not
 expressible** and is refused with the arithmetic, rather than silently rounded.
 
-**To measure the documented 0.2 vCPU shape, use a box with fewer cores**: 0.2 vCPU on a 16-core host is
-1.25%, which is expressible. The refusal names this.
+### The refusal is correct, and it is NOT the end of the road
+
+This file used to say *"to measure the documented 0.2 vCPU shape, use a box with fewer cores"*. That was
+true of the Windows Job Object and wrong as guidance, because there is a route that needs no different
+hardware at all.
+
+**cgroup v2's `cpu.max` expresses a fractional quota exactly, on any core count.** It takes
+`<quota_us> <period_us>`, so `20000 100000` **is** 0.20 of one CPU — not rounded, not substituted.
+
+MEASURED, and this is the whole argument: a 3-second spin loop pinned that way consumed
+**`usage_usec 622639` = 0.208 cores**, with **`nr_throttled 31` of 31 periods**. The cap bit, and the
+figure landed on the target.
+
+```sh
+# Requires root: /sys/fs/cgroup is rw but not writable by an unprivileged user.
+mkdir -p /sys/fs/cgroup/loadtest
+echo 20000 100000 > /sys/fs/cgroup/loadtest/cpu.max     # 0.20 cores, exactly
+echo $$ > /sys/fs/cgroup/loadtest/cgroup.procs          # from INSIDE the process to be capped
+```
+
+**One trap, because it cost a measurement:** `echo $$` in a subshell writes the *parent's* pid, so the
+process you meant to cap never enters the cgroup. The first attempt here reported `usage_usec 1008`
+against a 2-second spin — which reads like "the cap works wonderfully" and actually means "nothing was
+capped". Use `$BASHPID`, or `echo` from inside the process being measured, and **check `nr_throttled`
+is non-zero** before believing the run.
+
+**So the two tools are complementary, not redundant:**
+
+| | expresses 0.2 vCPU on 32 cores? | needs privilege? |
+| --- | --- | --- |
+| Job Object (`vcpu-pin.js`) | **no** — 1% floor, 60% over | no |
+| cgroup v2 `cpu.max` | **yes** — exactly | **root** |
+
+Prefer the Job Object where 1% granularity suffices and on Windows, where cgroups do not exist. Reach
+for the cgroup when the target is fractional and a privileged shell is available. Only fall back to
+"fewer cores" when neither is true.
 
 ## Related
 
