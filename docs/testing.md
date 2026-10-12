@@ -205,6 +205,39 @@ invites:
    lines "modified". A restore that appears to work while dirtying the whole file is worse than a loud
    failure; it now restores with `git checkout`, which is authoritative and immune to line endings.
 
+#### The money-path concurrency test cannot see its own guard being removed (round 16)
+
+`begin_immediate` issues `BEGIN IMMEDIATE` so that a transaction takes SQLite's write lock up front.
+Replacing `IMMEDIATE` with a deferred `BEGIN` — the exact bug the helper exists to prevent — leaves
+**714 of 715 tests passing**, and the single failure is
+`routes::telegram::tests::the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests`.
+
+**`concurrent_requests_cannot_overdraw_a_one_request_balance` does not detect it in 30 of 30 runs**, and
+that is deterministic rather than flaky. The mechanism:
+
+- `try_debit`'s **first statement is the `UPDATE`**, a write;
+- `reserve_balance_transaction` performs **no read before it**;
+- a deferred transaction takes the write lock on its first *write*, so on this path it behaves exactly
+  like an immediate one.
+
+So the test is correct and simply cannot distinguish the two, and the guard is asserted only by a test
+about telegram link codes — a path that *does* read before writing.
+
+**This is a hazard for the next editor, not a hole today.** Add a read to the top of
+`reserve_balance_transaction` and the overdraw test will still pass while the lock upgrade becomes
+losable. It is recorded in `db.rs` at the helper, where an edit would land.
+
+**Two harness bugs preceded this conclusion, and both reported "SURVIVED":**
+
+| what I did | what it produced | why |
+| --- | --- | --- |
+| passed `null` as the cargo filter | "710 filtered out" — 5 tests ran, not 715 | the mutation was never tested; SURVIVED was read as *"the tests do not catch it"* |
+| ran the concurrency test alone, 5 times | 0/5 failed | correct as far as it went, but 5 runs cannot separate "cannot detect" from "detects rarely" |
+
+The first is the dangerous one: **SURVIVED and "my harness did not run the test" are indistinguishable
+without checking the collected-test count.** The 30-run measurement is what separated them, and it is why
+the conclusion is "deterministic" rather than "flaky".
+
 **A test of a shared function cannot see a caller that does not use it.** This is
 the blind spot that let three weaker session resolvers survive with every test
 green: `routes/mod.rs` pinned the idle bound by calling the resolver

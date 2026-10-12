@@ -152,6 +152,24 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
 /// rather than a consequence of statement ordering, so a later edit that adds a
 /// read to the top of one of these functions cannot reintroduce the trap.
 ///
+/// MEASURED, and this is the part worth knowing before trusting a green suite on the money path.
+/// Replacing `IMMEDIATE` with a deferred `BEGIN` leaves 714 of 715 tests passing, and the one that fails
+/// is `routes::telegram::tests::the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests`,
+/// not the wallet test. `concurrent_requests_cannot_overdraw_a_one_request_balance` does not detect it
+/// in 30 of 30 runs, and that is deterministic rather than flaky, for two reasons:
+///
+/// 1. `try_debit`'s FIRST statement is the `UPDATE`, a write.
+/// 2. `reserve_balance_transaction` performs no read before it.
+///
+/// A deferred transaction takes the write lock on its first write, so on this path it behaves exactly
+/// like an immediate one. The overdraw test therefore CANNOT distinguish the two, and the guard this
+/// function exists to provide is asserted only by a test about telegram link codes - a path that DOES
+/// read before writing.
+///
+/// It is not a hole today, because the invariant holds for the reason stated above. It is a hazard for
+/// the next editor: add a read to the top of `reserve_balance_transaction`, and the overdraw test will
+/// still pass while the lock upgrade becomes losable.
+///
 /// sqlx executes the statement and then verifies the connection really is in a
 /// transaction, failing with `BeginFailed` otherwise (measured: a statement that
 /// does not open one is refused), so a typo here is loud rather than silent.
