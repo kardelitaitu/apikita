@@ -365,6 +365,37 @@ observation is recorded instead.
 
 **Five rounds running, every contradiction has been the harness rather than the code.**
 
+#### The proxy and the pricing: 10 mutations, 10 caught (round 22)
+
+`routes/proxy.rs` is the product — 6,733 lines, 50 async fns — and had not been mutation-tested. The money
+arithmetic turned out to live in `money.rs` and `config.rs`, not the proxy.
+
+| target | mutation | result |
+| --- | --- | --- |
+| `settlement_plan` | no usage bills instead of washing | **caught — 6 tests** |
+| `settlement_plan` | usage washes instead of billing | **caught — 6 tests** |
+| `calculate_token_cost_idr` | divisor 1M → 1k | **caught — 13 tests** |
+| | the input rate ignored | **caught — 15 tests** |
+| | cache tokens not charged | **caught — 7 tests** |
+| | the output rate ignored | **caught — 10 tests** |
+| | the multiplier not applied | **caught — 14 tests** |
+| | `ceil` → `floor` (rounding the charge down) | **caught — 16 tests** |
+| | output tokens omitted from the sum | **caught — 10 tests** |
+| `calculate_preflight_reservation_idr` | the hold ignores `max_output_tokens` | **caught — 8 tests** |
+
+**Every place a silent change would lose or invent money is pinned, and pinned redundantly.** The
+invariants that carry it are named for the property rather than the input: `the_hold_is_a_ceiling_over_
+settlement_for_every_cache_split`, `a_cached_token_is_never_also_billed_as_an_input_token`,
+`a_full_length_response_never_costs_more_than_its_reservation`, `the_hold_covers_the_model_rate_charge_
+whatever_the_endpoint_override` — the last being the one that distinguishes the hold's per-endpoint rates
+from settlement's model rates.
+
+**One harness bug, same shape as always.** The first run classified every caught mutation as
+`did-not-compile`, because the check was `/^error(\[|:)/m` — which matches cargo's trailing
+`error: test failed, to rerun pass --lib`, printed on **every** test failure. The tell was the result line
+reading "6 failed" while the classifier said the crate had not built. **A mutation that ran is not a
+mutation that compiled**, and the reliable signal is that a `test result:` line exists at all.
+
 **Two harness bugs preceded this conclusion, and both reported "SURVIVED":**
 
 | what I did | what it produced | why |
