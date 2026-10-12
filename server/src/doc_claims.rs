@@ -379,6 +379,21 @@ mod tests {
             // It takes SOME naming row rather than the first, because the document has
             // three tables that mention these names and only the retention one carries a
             // period.
+            //
+            // WHAT IT STILL DOES NOT CATCH, MEASURED: it is `rows matching the NAME` then
+            // `any row stating the period`, so it is a per-NAME check and not a
+            // per-(name, period) one. `key_ip_seen` / `7 days` has THREE matching rows -
+            // its own, plus the `Link-redemption attempts` and `auth_attempts` rows, which
+            // cite `key_ip_seen` in their prose - and all three contain `7 days`, so
+            // changing the key_ip_seen row alone leaves two still satisfying this. MEASURED:
+            // moving `key_ip_seen` to 14 days and `usage_daily` to 12 months both SURVIVE.
+            // What it DOES catch is a period disappearing entirely: 4 of 4 measured
+            // (7 / 24 / 30 / 90 days removed from the whole document).
+            //
+            // Left as it is deliberately rather than tightened: pairing the name to its
+            // period inside the row would need a mapping this file does not have, and the
+            // check's value is that the WINDOW CONSTANT is pinned outright below. Recorded
+            // so the residual is known rather than rediscovered as a gap.
             let promised = doc
                 .lines()
                 .map(str::trim)

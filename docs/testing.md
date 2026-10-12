@@ -227,6 +227,32 @@ because it ran the suite regardless of whether the mutation applied. That is the
 keeps finding, written into my own script — the fix is to locate the anchor first and **refuse a verdict**
 when it is absent.
 
+#### `doc_claims`: the retention check, measured in both directions (round 28)
+
+`the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period
+to the constant its sweep uses. Its comment describes the check as taking *"SOME naming row rather than the
+first"*, and records a past defect where **two rows sharing a number were indistinguishable** — changing
+the per-request window from 90 to 60 days passed because `key_ip_daily` also said 90.
+
+Measured both directions:
+
+| mutation | result |
+| --- | --- |
+| a period **removed** from the whole document (7 / 24 / 30 / 90) | **4 of 4 caught** |
+| a period moved to the **wrong row** (`key_ip_seen` 7 → 14 days) | **SURVIVED** |
+| `usage_daily` 24 months → 12 months | **SURVIVED** |
+
+**The survivors have a precise cause, verified rather than assumed.** The check is
+`rows.filter(row contains table).any(row contains stated)` — per row **name**, not per (name, period) pair.
+For `key_ip_seen` / `7 days` there are **three** matching rows, and all three contain `7 days`, because the
+`Link-redemption attempts` and `auth_attempts` rows **cite `key_ip_seen` in their prose**. Changing one row
+leaves two still satisfying the check.
+
+So the residual limitation is narrower than "the period appears elsewhere": it is **rows that
+cross-reference each other's table names**. The document fix the comment describes — every row naming the
+table it governs — closed the original case; this one survives it, and is now recorded rather than
+rediscovered.
+
 #### The 183-file phantom dirty tree, and why it is benign (round 27)
 
 `git status --porcelain | wc -l` under WSL reports **183 modified files** while Windows git reports **0**,
