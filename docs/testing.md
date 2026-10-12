@@ -291,6 +291,37 @@ correctly, the numbers are the ones above. **The mutation harness remains the le
 mutation-testing exercise**, and every contradiction this session has been traced to it rather than to the
 code.
 
+#### A cap that cannot fire, because a stricter constraint shadows it (round 20)
+
+`review_per_hour = 3` is documented as a **requirement**, and `docs/server/api-spec.md` publishes
+`429 past the hourly cap` as a documented error. **MEASURED: it cannot occur.**
+
+The cap counts rows in `reviews` for one account. `reviews_account_uniq ON reviews (account_id)` allows
+that account **at most one row, ever** — so the counted value is permanently 0 or 1 against a limit of 3.
+A burst from one account produces ONE creation and every other request takes the edit path, which skips
+the cap:
+
+```
+6 concurrent writes from one account  ->  [200,200,200,200,200,200]  review_rows=1  history_rows=5
+                                          reproducible across 5 runs
+```
+
+**What bounds this endpoint is the one-review-per-account index, not the cap.** The cap remains as a
+second bound that would take effect if that rule were relaxed, and the module docstring now says so.
+
+**This is a different shape from the rest of the audit.** Rounds 16–19 found tests that could not see
+their guard; this is a guard that cannot fire, shadowed by a stricter constraint. Both are the same
+underlying question — *does this assertion ever decide anything?* — asked from opposite ends.
+
+**A screen narrowed it to exactly one site.** Of the six per-table caps, the other five count a quantity
+with **no uniqueness constraint bounding it first** (`topups`, `api_keys`, `link_code_issues` all allow
+many rows per account), so they can fire. `review_per_hour` is the only one shadowed.
+
+**And the existing test's name overstates it:** `creating_reviews_past_the_hourly_cap_is_refused` cannot
+refuse anything, and its own comment admits it — *"the cap has to be observed across accounts"* — then
+exercises the window directly instead. The name is the same defect as round 11's rotated tuple: a stated
+expectation the code does not enforce.
+
 **Two harness bugs preceded this conclusion, and both reported "SURVIVED":**
 
 | what I did | what it produced | why |

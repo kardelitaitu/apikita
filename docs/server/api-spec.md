@@ -647,8 +647,17 @@ a caller names somebody else's account — the body carries only content.
   requirement rather than a setting: a review endpoint with no limit is a
   moderation problem from its first request.
 
+  **MEASURED: this cap cannot refuse, and the `429` below cannot be returned.** The cap counts rows in
+  `reviews` for one account, and `reviews_account_uniq` allows that account at most ONE row ever — so the
+  counted value is permanently 0 or 1 against a limit of 3. A burst from one account produces one creation
+  and takes the edit path for the rest (6 concurrent writes measured: `[200,200,200,200,200,200]`,
+  `review_rows=1`, `history_rows=5`, reproducible across 5 runs). What bounds this endpoint is the
+  **one-review-per-account index**, not the cap. The cap stays as a second bound that would take effect if
+  that rule were relaxed; it is not the moderation control. Kept in the spec rather than deleted because
+  the endpoint IS limited — just by a different mechanism than the paragraph implies.
+
 Errors: `401` without a session; `422` for a rating outside 1-5 or an overlong
-body; `429` past the hourly cap.
+body; `429` past the hourly cap — **unreachable, see above**.
 
 ### `POST /api/reviews/withdraw`
 

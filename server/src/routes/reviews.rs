@@ -47,6 +47,21 @@
 //! limit" (the entry is removed in the same change that adds this module). The
 //! cap runs inside the write transaction, so the COUNT and the write are
 //! serialised and a burst cannot slip past a stale read.
+//!
+//! MEASURED, AND THE PARAGRAPH ABOVE OVERSTATES WHAT THIS SITE CAN DO. The cap counts rows in `reviews`
+//! for one account, and `reviews_account_uniq ON reviews (account_id)` allows that account **at most one
+//! row, ever**. So the number this cap compares is permanently 0 or 1 against a limit of 3, and it
+//! **cannot refuse**. A burst from one account produces ONE creation and every other request takes the
+//! edit path, which skips the cap entirely - measured: 6 concurrent writes give
+//! `[200,200,200,200,200,200]` with `review_rows=1 history_rows=5`, reproducibly across 5 runs. There is
+//! no burst reading a stale number here to serialise; the unique index bounds it, and the index is
+//! stricter than the cap.
+//!
+//! The cap is therefore a SECOND, UNREACHABLE bound at this site rather than the protection the paragraph
+//! describes. It is kept - it costs one COUNT on a path that runs once per account, and it is the
+//! mechanism that would bound this table if the one-review-per-account rule were ever relaxed - but a
+//! reader should not mistake it for the moderation control. `docs/server/api-spec.md` publishes
+//! `429 past the hourly cap` as a documented error, and **that error cannot occur**.
 
 use axum::extract::State;
 use axum::http::HeaderMap;
