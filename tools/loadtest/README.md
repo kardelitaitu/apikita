@@ -178,6 +178,14 @@ MEASURED, all ten caught, gate green before and after:
 | the worker's histogram boundaries drift (×1.08 → ×1.09) | **caught** |
 | the worker's top boundary becomes `Infinity` (JSON sends `null`) | **caught** |
 | the unknown-flag refusal is removed | **caught** |
+| `sampleProcess` returns `null` unconditionally | **caught, on BOTH platforms** |
+
+**That last row is the one that closed a hole.** The sampler assertion used to skip on Linux, which was
+correct while the sampler was Windows-only — and became a hole when the sampler learned `/proc`. The gate
+printed `SKIPPED - the sampler reads Win32_Process, and this is Linux`, so CI (`ubuntu-latest`) ran the
+gate **without asserting anything about the sampler**. It is now unconditional, and verified that a
+null-returning sampler fails the gate on Windows *and* in WSL. Removing a skip is only an improvement if
+the check that replaces it can still fail, so that was tested rather than assumed.
 
 The Rust half of the threshold coupling is
 `the_loadtest_thresholds_are_the_thresholds_the_document_publishes` in `server/src/doc_claims.rs`,

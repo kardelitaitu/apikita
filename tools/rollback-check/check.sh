@@ -322,22 +322,55 @@ else
 fi
 
 # --- 5. it skips LOUDLY without sqlite3 --------------------------------------
-# Built from the real PATH with the directory holding sqlite3 removed. Shadowing with a
-# non-executable file would still let `command -v` succeed and only fail at the call.
-SQLITE_PATH=$(command -v sqlite3 2>/dev/null)
-SQLITE_DIR=$(cd -- "$(dirname -- "$SQLITE_PATH")" 2>/dev/null && pwd) || SQLITE_DIR=$(dirname -- "$SQLITE_PATH")
-NEWPATH=""
-OLDIFS=$IFS; IFS=:
-for d in ${PATH:-}; do
-    [ -n "$d" ] || d="."
-    rd=$(cd -- "$d" 2>/dev/null && pwd) || rd="$d"
-    [ "$rd" = "$SQLITE_DIR" ] && continue
-    NEWPATH="${NEWPATH}${NEWPATH:+:}$d"
+# A PATH that has everything the drill needs EXCEPT sqlite3, built as a directory of symlinks.
+#
+# WHY NOT SIMPLY REMOVE sqlite3's DIRECTORY FROM PATH, which is what this did first. MEASURED on
+# Ubuntu 24.04: `/bin` is a SYMLINK to `/usr/bin` (usrmerge), and `sh`, `sed`, `grep`, `awk` and `openssl`
+# all live in that SAME directory. So the strip either
+#
+#   * removed only the one spelling the code had resolved (`/bin`), leaving `/usr/bin` on PATH — the
+#     drill found sqlite3 anyway, ran to completion, exited 0, and this check reported
+#     "the drill PASSED with no sqlite3 on PATH - a silent pass on a machine that ran nothing",
+#     which is a TRUE sentence about a FALSE setup: the drill was accused of a failure it had not
+#     committed, and the harness was at fault; or
+#   * removed every directory holding sqlite3, which removed `sh` itself and produced exit **127**
+#     ("sh: command not found") — so the drill was never even invoked.
+#
+# Neither tests the drill. A symlink farm does: link every tool except sqlite3, point PATH at it alone,
+# and the drill gets a working shell and no sqlite3. MEASURED that way it exits **3** and prints
+# "sqlite3 is not installed or not on PATH", which is what its own header promises.
+#
+# SHADOWING WAS REJECTED TOO, and the original comment's reason still holds: a non-executable file named
+# `sqlite3` earlier on PATH makes `command -v` SUCCEED, so the drill proceeds and dies at the CALL with
+# exit 4 rather than 3. That tests the wrong thing.
+#
+# The farm omits sqlite3 by name rather than by directory, so it works on usrmerge and on a split /bin
+# alike, and it fails loudly if a tool the drill needs is missing from the source directory.
+_farm_bin=$(mktemp -d) || fail "mktemp is unavailable, so the no-sqlite3 PATH cannot be built"
+_farm_ok=0
+for _tool_dir in /usr/bin /bin; do
+    [ -d "$_tool_dir" ] || continue
+    for _f in "$_tool_dir"/*; do
+        _b=$(basename -- "$_f")
+        [ "$_b" = "sqlite3" ] && continue
+        [ -e "$_farm_bin/$_b" ] && continue
+        ln -s -- "$_f" "$_farm_bin/$_b" 2>/dev/null && _farm_ok=$((_farm_ok + 1))
+    done
 done
-IFS=$OLDIFS
+[ "$_farm_ok" -gt 0 ] || fail "the no-sqlite3 PATH has no tools in it, so the drill could not run and this check would measure nothing"
+
+# PROVEN, not assumed: `sh` must be resolvable and sqlite3 must not be.
+if ! PATH="$_farm_bin" command -v sh >/dev/null 2>&1; then
+    fail "the no-sqlite3 PATH cannot resolve sh, so the drill cannot be invoked and this check tests nothing"
+fi
+if PATH="$_farm_bin" command -v sqlite3 >/dev/null 2>&1; then
+    fail "could not build a PATH without sqlite3 (still found at $(PATH="$_farm_bin" command -v sqlite3)), so the check below cannot test anything"
+fi
+
 ensure_work
-NOPATH_OUT=$(PATH="$NEWPATH" sh "$DRILL" --target rollback_check_nosqlite_scratch.db 2>&1)
+NOPATH_OUT=$(PATH="$_farm_bin" sh "$DRILL" --target rollback_check_nosqlite_scratch.db 2>&1)
 NOPATH_RC=$?
+rm -rf "$_farm_bin"
 if [ "$NOPATH_RC" -eq 0 ]; then
     fail "the drill PASSED with no sqlite3 on PATH - a silent pass on a machine that ran nothing"
 elif [ "$NOPATH_RC" -ne 3 ]; then

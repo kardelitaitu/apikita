@@ -170,24 +170,26 @@ fi
 # every run. No source-shape check can see that. This starts a process that BURNS CPU and requires the
 # sampler to observe the burn.
 #
-# It is skipped, loudly, where the sampler cannot apply — the sampler is Windows-specific
-# (`Win32_Process`), and a CI runner on Linux has no such counter. A SKIP THAT IS PRINTED is not the
-# same as a check that silently does nothing; a skip that is silent is the failure mode this
-# repository writes gates against.
+# IT RUNS ON EVERY PLATFORM NOW, and this used to skip on Linux. The skip was correct when the sampler
+# was Windows-only (`Win32_Process`), and it became a hole the moment the sampler learned `/proc`:
+# MEASURED, the gate reported
+#
+#     SKIPPED - the sampler reads Win32_Process, and this is Linux.
+#     The CPU verdict is NOT covered on this platform.
+#
+# ...while `sampler-probe.js` passed on Linux when run by hand. So the ONE platform CI actually uses
+# (`.github/workflows/ci.yml:20` is `runs-on: ubuntu-latest`) was the one where the branch went
+# untested, and the gate was green over it. The skip is printed, which is why it was visible at all -
+# but a printed skip is still a skip.
+#
+# `sampleProcess` branches on `process.platform` itself, so the probe exercises whichever branch the
+# host has. Keep it unconditional: a future platform with neither `/proc` nor PowerShell will show up
+# as a probe FAILURE, which is the direction that gets noticed.
 echo ""
 echo "loadtest-check: the pid sampler reads a live process and sees its CPU move"
-case "$(uname -s 2>/dev/null || echo unknown)" in
-    MINGW*|MSYS*|CYGWIN*|Windows*)
-        if ! node "$REPO/tools/loadtest-check/sampler-probe.js" "$HARNESS"; then
-            FAIL=1
-        fi
-        ;;
-    *)
-        echo "loadtest-check:   SKIPPED - the sampler reads Win32_Process, and this is $(uname -s)."
-        echo "loadtest-check:   The CPU verdict is NOT covered on this platform. That is stated rather"
-        echo "loadtest-check:   than passed over: a silent skip is a green tick over nothing."
-        ;;
-esac
+if ! node "$REPO/tools/loadtest-check/sampler-probe.js" "$HARNESS"; then
+    FAIL=1
+fi
 
 # --- the two histogram definitions agree ----------------------------------------
 #

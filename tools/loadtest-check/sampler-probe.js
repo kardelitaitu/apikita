@@ -38,12 +38,19 @@ if (!harnessPath) {
  * `require.main === module` guard keeps `main` from firing on import — so a plain `require` is
  * enough, and it is what `check.sh` uses for the verdict assertions.
  *
- * THE PID SAMPLER IS NOT EXPORTED, and deliberately: it is Windows-specific (`Win32_Process`) and
- * exporting it would invite a caller to use it from a platform where it cannot work. So this probe
- * reads the function out of the source by evaluating the module's own prefix — the same technique
- * `.agents/`-style scratch probes use — and the gate is the only thing ever doing it. That is a
- * deliberate trade: `check.sh` runs this file, and a broken `sampleProcess` fails here rather than in
- * a load test somebody trusted.
+ * THE PID SAMPLER IS NOT EXPORTED, and that is still deliberate — but the reason has changed and the
+ * old one was wrong. It used to read *"it is Windows-specific (`Win32_Process`) and exporting it would
+ * invite a caller to use it from a platform where it cannot work."* MEASURED: `sampleProcess` now
+ * branches on platform and works on **both** — it shells out to `Win32_Process` on Windows and reads
+ * `/proc/<pid>/stat` on Linux, and this probe passes on either (verified on Windows and in WSL).
+ *
+ * So the reason it stays unexported is narrower: it is an internal of the harness, and a caller who
+ * needs a CPU reading should run the harness rather than reimplement the normalisation around it.
+ *
+ * It is still read out of the source by evaluating the module's own prefix, so that a broken sampler
+ * fails HERE rather than in a load test somebody trusted. That the probe runs the same file on both
+ * platforms is what keeps the `/proc` branch covered: CI on Linux exercises it, and a Windows run
+ * exercises the `Win32_Process` branch, from one assertion.
  */
 function loadSampler(path) {
   const src = fs.readFileSync(path, 'utf8');

@@ -118,8 +118,27 @@ else
     if [ "$(head -c 6 "$ART")" = "SQLite" ]; then
         fail "the artifact is a PLAINTEXT SQLite database; docs/backup-and-restore.md requires encryption at rest"
     fi
-    if sqlite3 "$ART" "SELECT 1" >/dev/null 2>&1; then
-        fail "sqlite3 could OPEN the artifact unencrypted"
+    # ASK SQLITE TO READ SOMETHING, NOT TO ANSWER ARITHMETIC.
+    #
+    # This line used to be `sqlite3 "$ART" "SELECT 1"`, and that test could not fail: MEASURED on
+    # sqlite3 3.45.1, `SELECT 1` exits **0** for random bytes, for a text file, for an EMPTY file and for
+    # a real database alike, because it never touches the file. So the assertion reported
+    #
+    #     FAIL - sqlite3 could OPEN the artifact unencrypted
+    #
+    # for a correctly encrypted artifact — it would have reported it for ANY artifact. The failure was
+    # in the test, not the backup, and it is the "a check that cannot pass" mirror of this repository's
+    # usual "a check that cannot fail": a verdict produced by an assertion that does not examine the
+    # subject.
+    #
+    # `.tables` READS THE FILE. MEASURED against the same artifact: a real SQLite database exits 0 and
+    # lists its tables; the encrypted one exits **1** with `Error: file is not a database`. That is the
+    # distinction the check was reaching for.
+    #
+    # `PRAGMA integrity_check` would work too (it errors with "file is not a database (26)"), and using
+    # a read is what makes this a statement about the FILE rather than about the CLI's argument parsing.
+    if sqlite3 "$ART" ".tables" >/dev/null 2>&1; then
+        fail "sqlite3 could READ TABLES from the artifact, so it is not encrypted"
     fi
 fi
 
@@ -315,15 +334,35 @@ else
 
     # Each side, one table per line, so the failure can name the offender instead of
     # printing two jumbled lists.
-    MISSING_IN_SHELL=$(comm -23 <(printf '%s\n' "$RUST_TABLES") <(printf '%s\n' "$SHELL_TABLES"))
+    #
+    # NO PROCESS SUBSTITUTION HERE, and that is a portability fix rather than a style choice.
+    # `<(...)` is a BASH feature; this script declares `#!/bin/sh` and CI runs it as
+    # `sh tools/backup-check/check.sh`, and on Ubuntu `/bin/sh` is dash. MEASURED there:
+    #
+    #     tools/backup-check/check.sh: 318: Syntax error: "(" unexpected
+    #
+    # dash does not parse the line AT ALL — it is a syntax error, not a runtime failure — so the script
+    # ABORTED at this point and every assertion after it, including both table comparisons, never ran.
+    # The gate still printed a verdict, which is what made it quiet: the failure it reported was the
+    # one from BEFORE this line, and the absence of everything after was invisible.
+    #
+    # Variables plus two temp files do the same job in POSIX sh. `awk` rather than `comm` because the
+    # inputs are unsorted and a sorted-file requirement is another silent way to compare nothing.
+    _RC_TMP=$(mktemp) || fail "mktemp is unavailable, so the retention comparison cannot run"
+    _SH_TMP=$(mktemp) || fail "mktemp is unavailable, so the retention comparison cannot run"
+    printf '%s\n' "$RUST_TABLES" | sed '/^$/d' | sort -u > "$_RC_TMP"
+    printf '%s\n' "$SHELL_TABLES" | sed '/^$/d' | sort -u > "$_SH_TMP"
+
+    MISSING_IN_SHELL=$(awk 'NR==FNR { seen[$0]; next } !($0 in seen)' "$_SH_TMP" "$_RC_TMP")
     if [ -n "$MISSING_IN_SHELL" ]; then
         fail "the Rust retention sweep deletes from these tables and the PRODUCTION sweep does not: $(printf '%s' "$MISSING_IN_SHELL" | tr '\n' ' '). server/src/bin/usage-purge.rs is NOT shipped in the server image, so the entrypoint is what runs: a table present only in the Rust sweep is swept in tests and NEVER in production, which is how expired identity links accumulated while every check stayed green."
     fi
 
-    MISSING_IN_RUST=$(comm -13 <(printf '%s\n' "$RUST_TABLES") <(printf '%s\n' "$SHELL_TABLES"))
+    MISSING_IN_RUST=$(awk 'NR==FNR { seen[$0]; next } !($0 in seen)' "$_RC_TMP" "$_SH_TMP")
     if [ -n "$MISSING_IN_RUST" ]; then
         fail "the PRODUCTION sweep deletes from these tables and the Rust sweep does not: $(printf '%s' "$MISSING_IN_RUST" | tr '\n' ' '). A table the entrypoint deletes that no Rust code or test covers is a retention window with no measurement behind it - it cannot appear in the lag report, so a sweep that stopped would be invisible."
     fi
+    rm -f "$_RC_TMP" "$_SH_TMP"
 
     # WHAT THIS CANNOT SEE, stated rather than left as an absence. The comparison is
     # over TABLE NAMES, so it catches a table that exists on one side and not the
