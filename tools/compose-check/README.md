@@ -29,6 +29,7 @@ rather than with the script.
 | The **entrypoint** and **reconcile** mounts are read-only | This service must never write the repo's source. |
 | The relay config is mounted at `/etc/nginx/conf.d/default.conf` | nginx loads `conf.d/*.conf`; anywhere else it runs its **default** config, which buffers SSE (see [`tools/relay-check`](../relay-check/README.md)). |
 | The scheduler has **no** healthcheck | It serves nothing and listens on nothing, so any probe is theatre that reports unhealthy forever. |
+| **Every service has a `restart` policy** | A service that exits — a crash, a reboot, an OOM kill — stays **down** until an operator notices. For the nightly sweep that means the retention promise stops happening silently. Added in round 32: the word `restart` appeared **zero** times in this gate, and removing the policy from both services left it green. |
 
 **Skips LOUDLY (exit 3) when Docker is unavailable**, never 0 — a silent pass on a
 machine that ran nothing is the failure mode this directory exists to catch.
@@ -39,6 +40,13 @@ Five mutations, each caught with a message naming the invariant and why it matte
 `working_dir` changed, the DSNs collapsed, the entrypoint mount made writable, the
 relay config mounted elsewhere, and the **data mount made read-only**. The unmodified
 file passes.
+
+**The restart assertion was mutation-tested on the way in, and its FIRST VERSION WAS WRONG.** It scanned
+forward from a container name and stopped at the first `restart:` anywhere after it, so removing **nginx's**
+policy found the *scheduler's* and reported nginx as covered — the gate stayed green for the wrong
+service. It is now scoped by the rendered YAML's indentation (services at 2 spaces, their keys at 4), and
+verified to fire three ways: nginx alone, scheduler alone, and both. **A check that passes for the wrong
+subject is the same defect as one that cannot fail.**
 
 The data-mount case was **missed by the first version of this check** and found by
 mutation testing the check itself — which is the argument for doing it.

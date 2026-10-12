@@ -110,6 +110,44 @@ if printf '%s\n' "$RENDERED" | awk '/apikita-scheduler/{f=1} f&&/healthcheck:/{p
     fail "the scheduler has a healthcheck; it serves nothing and listens on nothing, so the probe would be theatre that reports unhealthy forever"
 fi
 
+# 5b. EVERY SERVICE HAS A RESTART POLICY, and this assertion did not exist until it was missed.
+#
+# WHY IT EXISTS. docker-compose.yml declares `restart: unless-stopped` on both services, and the
+# scheduler's own comment at line 207 gives the reason: "Nightly cadence needs it back after a reboot, and
+# `unless-stopped` matches every other service here."
+#
+# MEASURED: the word `restart` appeared ZERO times in this gate, so removing the policy from BOTH services
+# left it green. A service with no restart policy that exits - a crash, a reboot, an OOM kill - stays DOWN
+# until an operator notices, which for a nightly retention sweep means the sweep silently stops happening
+# and the published retention promise quietly becomes false. That is the failure mode this header says it
+# exists for ("in ways that fail at 03:00 in production rather than at review time"), and it was the one
+# property of a two-service deployment nothing asserted.
+#
+# Checked on the RENDERED output, like the read_only checks above: `docker compose config` normalises the
+# key, so this is a statement about what the daemon would run rather than about the file's spelling.
+#
+# SCOPED BY INDENTATION, and the first version was not - it scanned forward from the container name and
+# stopped at the FIRST `restart:` anywhere after it, which for `nginx` found the SCHEDULER's policy and
+# reported the service as covered. MEASURED, and it is why the check below is written this way: with only
+# `nginx`'s policy removed the gate stayed green, while removing `scheduler`'s alone failed correctly. A
+# check that passes for the wrong service is the same defect as one that cannot fail.
+#
+# In the rendered YAML a service's keys are indented deeper than its name, so the block runs from the
+# service line until the next line at the same-or-shallower indentation.
+for svc in nginx scheduler; do
+    if printf '%s\n' "$RENDERED" | grep -qE "^ +$svc:"; then
+        # The rendered tree is: services at 2-space indent, a service's keys at 4, their children deeper.
+        # So a service's block is 2-space `<name>:` until the next line indented exactly 2 that ends in `:`.
+        if ! printf '%s\n' "$RENDERED" | awk -v s="$svc" '
+            /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { inside = ($0 == "  " s ":") }
+            inside && /^    restart:/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            fail "service $svc has no restart policy; a crash or a reboot would leave it down until an operator notices, which for the nightly sweep means the retention promise stops happening silently"
+        fi
+    fi
+done
+
 # 6. EVERY `docker compose up` IN THE DOCS NAMES A SERVICE, OR THE DOC SAYS IT MEANS ALL.
 #
 # WHY. `docker compose up -d` with NO service starts EVERY service in the file. That was a
