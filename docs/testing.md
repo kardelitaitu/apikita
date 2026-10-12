@@ -8,6 +8,19 @@ and the measurements are here so nobody builds them again.
 Run everything with `cd server && cargo test` (the website has its
 own: `cd website && npm test`).
 
+**`cargo test --lib` collects 712 of the 716 `#[test]`-family markers in `server/src` — that gap is
+expected, and it was reconciled rather than assumed.** The other **31** markers live in `src/bin/`, which
+are *separate binaries*; `--lib` does not run those, and `cargo test` without `--lib` does. The remaining
+four are an artefact of counting markers with a regular expression, not missing tests: one function sits
+more than a few lines below its attribute, and three test names are duplicated across **different
+modules** — legitimate in Rust, and cargo collects every one (verified by module path, e.g.
+`routes::keys::tests::` and `routes::proxy::tests::` share a name and both run).
+
+Worth knowing if you count tests yourself: `#[tokio::test]` does **not** match
+`#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`, which six concurrency tests use. A pattern
+without an optional argument group under-counts them, and the six then look like tests cargo collects but
+the source does not declare.
+
 **Those two are the commands CI runs, and the second one builds first for a reason.** `npm test` is
 `npm run build && node --test ...`, not the test run alone: one of the website suites reads the
 RENDERED pages under `website/dist`, so running the tests without a build makes that suite report a

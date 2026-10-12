@@ -187,6 +187,25 @@ gate **without asserting anything about the sampler**. It is now unconditional, 
 null-returning sampler fails the gate on Windows *and* in WSL. Removing a skip is only an improvement if
 the check that replaces it can still fail, so that was tested rather than assumed.
 
+### The table above was RE-VERIFIED, not trusted
+
+A mutation table is a claim about the gate, and this repository has twice found such a claim overstated
+elsewhere. So all ten were re-applied and the gate re-run: **10 of 10 caught**, each with a message that
+names the defect rather than the symptom.
+
+| mutation | the gate's own message |
+| --- | --- |
+| `verdictP99` pinned to pass | `verdictP99(3.0, 1.5) returned PASS, expected BELOW TARGET` |
+| `verdictCpu` pinned to pass | `verdictCpu(0.20, 0.2, 40) gave PASS/100, expected BELOW TARGET/100` |
+| `NO DATA` returns `ok: true` | `verdictP99(null, 1.5) returned NO DATA/ok=true, expected NO DATA and not-…` |
+| worker boundaries ×1.08→×1.09 | `the parent and the worker declare DIFFERENT histogram boundaries` |
+| unknown-flag refusal removed | `an unrecognised flag exited 3 but did not say why` |
+| `sampleProcess` returns `null` | `the sampler returned null for a process that is definitely alive` |
+
+**No row was overstated.** Worth noting because the opposite was the expectation: the last three gate
+defects found in this repository were all checks that could not fail or could not run, so a table claiming
+ten catches deserved checking rather than repeating.
+
 The Rust half of the threshold coupling is
 `the_loadtest_thresholds_are_the_thresholds_the_document_publishes` in `server/src/doc_claims.rs`,
 which also asserts the two constants are not **swapped** — an equality check alone cannot catch a
