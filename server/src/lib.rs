@@ -135,6 +135,8 @@ pub mod error;
 pub mod identity;
 pub mod ip_tracking;
 pub mod money;
+#[cfg(test)]
+pub mod money_adversarial;
 pub mod routes;
 /// The drain a graceful shutdown owes to work that is not attached to a connection.
 ///
