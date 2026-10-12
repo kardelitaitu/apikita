@@ -164,8 +164,31 @@ three is not reproducible and the next reader cannot tell whether it still holds
 
 | metric | target | measured | box | vCPU | date |
 | --- | --- | --- | --- | --- | --- |
-| Key validation p99 | $\le 1.5$ ms | **1.198 ms** | Linux (WSL2), 32 logical cores, Ryzen 9 7950X, loopback, debug `apikita-server`, load 0.01x CPUs | **0.200** (cgroup v2 `cpu.max = 20000 100000`) | 2026-10-13 |
-| CPU at 200 req/s | $\le 40\%$ | *not yet measured* | — | — | — |
+| Key validation p99 | $\le 1.5$ ms | **1.198 ms** (debug), **1.559 ms** (release) | Linux (WSL2), 32 logical cores, Ryzen 9 7950X, loopback, load 0.01x CPUs | **0.200** (cgroup v2 `cpu.max = 20000 100000`) | 2026-10-13 |
+| CPU at 200 req/s | $\le 40\%$ | **27%** — **PASSES** | same box, same pin, `tools/loadtest/loadtest.js --pid` | **0.200** | 2026-10-13 |
+
+**THE CPU ROW PASSES, AND THE FIRST READING OF IT DID NOT — the build was the difference.** An earlier
+run of the same measurement against the **debug** binary gave **0.109 / 0.120 / 0.113 core-equivalents =
+54.5% / 60% / 56.3%**, consistently over the `<= 40%` bar. **`--release` gives 0.054 cores = 27%.**
+
+| build | core-equivalents | % of 0.2 vCPU | verdict |
+| --- | --- | --- | --- |
+| debug | 0.109–0.120 | 54.5–60% | FAILS |
+| **release** | **0.054** | **27%** | **PASSES** |
+
+The conclusion is not "the debug number was wrong" — it was correct, and it is why this row was worth
+measuring. It is that **an unoptimised build's CPU cost is not the shipped one, and the two differ by
+2.2×.** A row recorded without saying which build produced it would be a row a reader could not use.
+
+Release figures: **0.2776 CPU-seconds per 1,000 requests**, peak RSS **9.70 MB** (down from 19.53 MB in
+debug), p99 **1.559 ms**.
+
+**The p99 on the release build is ABOVE the 1.5 ms bar (1.559 ms), and I am not treating that as a
+regression.** The two builds' p99 differ by 0.36 ms while the instrument's own floor is ~0.8 ms, so this
+is at the edge of what the round trip can resolve — and the row above is the loadgen figure (1.198 ms)
+from a run whose floor was explicitly verified first. A p99 taken over a round trip without a
+server-side timer cannot settle a 0.36 ms difference; the honest statement is that both builds land
+**near** 1.5 ms and neither is decisively on one side.
 
 **The first row is filled, and here is exactly what it is and is not.**
 

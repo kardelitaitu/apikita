@@ -160,6 +160,11 @@ const PUBLISHED_CPU_RATE_RPS = 200;
 // and small passes a `<= 40%` bar.
 const WIN_TICKS_PER_SECOND = 10_000_000;
 
+// USER_HZ is 100 on every Linux this runs on, so /proc's utime+stime are hundredths of a second.
+// Not read from `getconf CLK_TCK` because that is a subprocess per run for a value that has been
+// constant for decades, and a wrong value here would scale every CPU figure silently.
+const PROC_TICKS_PER_SECOND = 100;
+
 /**
  * How many quanta a sampling interval must span before a CPU reading means anything.
  *
@@ -197,6 +202,16 @@ const SAMPLE_SCRIPT_TEMPLATE = (pid) =>
 /**
  * Reads one process's monotonic CPU and resident size. Returns null if it is gone or unreadable.
  *
+ * TWO PLATFORMS, AND THE LINUX ONE EXISTS BECAUSE THE WINDOWS ONE CANNOT CROSS THE BOUNDARY.
+ * MEASURED: this tool shells out to `powershell.exe` with `Win32_Process`, which sees only WINDOWS pids.
+ * A server running inside WSL therefore cannot be sampled from a Node process on the Windows side — the
+ * pid does not exist in that namespace, every sample returns null, and the CPU verdict reports
+ * `[NO DATA]`. The mirror is true in WSL: `powershell.exe` is not there at all.
+ *
+ * So a 0.2-vCPU pin, which needs cgroup v2 and therefore Linux, was UNMEASURABLE with this harness — the
+ * one combination the CPU row actually requires. `/proc` closes it: `/proc/<pid>/stat` fields 14 and 15
+ * are utime and stime in clock ticks, and `/proc/<pid>/statm` field 2 is resident pages.
+ *
  * MEASURED FAILURE THIS GUARDS: an earlier version built the command with string concatenation
  * inside `[Console]::Out.Write(...)` and PowerShell's `pwsh -Command` PARSER rejected it — the
  * escaped quotes did not survive the shell boundary — so every sample returned null and the run
@@ -206,6 +221,38 @@ const SAMPLE_SCRIPT_TEMPLATE = (pid) =>
  * no sample ever succeeds, and tells the caller which pid it could not read.
  */
 function sampleProcess(pid) {
+  return process.platform === 'linux' ? sampleProcessProcfs(pid) : sampleProcessWindows(pid);
+}
+
+/** Linux: `/proc` rather than a subprocess, so a sample costs one file read. */
+function sampleProcessProcfs(pid) {
+  try {
+    const fs = require('node:fs');
+    // `stat` fields are space-separated EXCEPT the comm field, which is parenthesised and may itself
+    // contain spaces. Splitting from the LAST ')' is the way to avoid mis-indexing on a process named
+    // "my (odd) name"; taking field 14/15 after it is utime/stime.
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const close = stat.lastIndexOf(')');
+    if (close < 0) return null;
+    const fields = stat.slice(close + 2).split(' ');
+    // After comm, field 3 is state - so utime (field 14) is index 11, stime (15) index 12.
+    const utime = Number(fields[11]);
+    const stime = Number(fields[12]);
+    if (!Number.isFinite(utime) || !Number.isFinite(stime)) return null;
+    // `statm` field 2 is resident pages; convert with the page size.
+    let rssBytes = 0;
+    try {
+      const statm = fs.readFileSync(`/proc/${pid}/statm`, 'utf8').trim().split(/\s+/);
+      rssBytes = Number(statm[1]) * 4096;
+    } catch { /* RSS is not the verdict; a missing statm must not void the CPU reading */ }
+    return { cpuSeconds: (utime + stime) / PROC_TICKS_PER_SECOND, rssBytes };
+  } catch {
+    return null;
+  }
+}
+
+/** Windows: `Win32_Process` via PowerShell. Unchanged in behaviour; split out for the platform branch. */
+function sampleProcessWindows(pid) {
   try {
     const out = execFileSync(
       'powershell.exe',
