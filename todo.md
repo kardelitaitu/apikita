@@ -175,9 +175,10 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
     - [ ] Run it against the **production** database once provisioned; that is the real RTO measurement.
     <!-- alert-scheduling: wired -->
     - [ ] Alerts (webhook rejection, ledger drift, API down, circuit open) — **the code half is done**;
-          what remains is a deployment decision. **10 of its 11 alerts are `covered`** in
-          [`tools/alert/alerts.tsv`](tools/alert/alerts.tsv) — the exception is `relay_5xx`,
-          `needs-metrics` because it cannot be derived from the database or `/health` alone — and the
+          what remains is a deployment decision. **10 of its 12 alerts are `covered`** in
+          [`tools/alert/alerts.tsv`](tools/alert/alerts.tsv) — the exceptions are `relay_5xx`,
+          `needs-metrics` because it cannot be derived from the database or `/health` alone, and
+          `proxy_undercharge`, whose signal is a server log line neither script reads — and the
           four named above are checked by
           [`tools/alert/probe.sh`](tools/alert/probe.sh) (`api_down`, `webhook_rejection`,
           `all_providers_unhealthy` — the "circuit open" one) and

@@ -289,15 +289,28 @@ why one number kept being wrong:
 
 | what | count | read from |
 | --- | --- | --- |
-| Alert definitions | **11** | `alerts.tsv`, the registry |
+| Alert definitions | **12** | `alerts.tsv`, the registry |
 | Checks `probe.sh --list` prints | **7** | its own output, one row per check |
-| Definitions `check-alerts.sh` names | **11** | the dispatch, which covers the registry |
+| Definitions `check-alerts.sh` fires | **3** | `grep 'fire "' check-alerts.sh` — `ledger_drift`, `stranded_hold`, `balance_negative` |
 
-The gap between 7 and 11 is not missing coverage and must not read as such: `probe.sh` covers the
-seven that need a prober, and `check-alerts.sh` covers all eleven, including the three
-(`ledger_drift`, `balance_negative`, `stranded_hold`) that need a database connection and so are
-deliberately absent here. **A count that is right about one of those and silent about which is the
-defect that produced this table**, so the column is the part that matters.
+**The third row said 11 and that was never true.** MEASURED: `check-alerts.sh` names exactly three
+registry ids — the database-backed ones, which is what it exists for. The other entries are delivered by
+`probe.sh` (7), by `reconcile.sh` (which supplies the vault predicates this file calls), or by nothing at
+all. "The dispatch, which covers the registry" described an intention rather than a measurement, and the
+guard that checks these counts had been accepting it because 11 was also, coincidentally, the registry
+size at the time.
+
+The gap between 7 and 12 is not missing coverage and must not read as such: `probe.sh` covers the seven
+that need a prober, and `check-alerts.sh` covers the three (`ledger_drift`, `balance_negative`,
+`stranded_hold`) that need a database connection and so are deliberately absent from the prober.
+**A count that is right about one of those and silent about which is the defect that produced this
+table**, so the column is the part that matters.
+
+**`proxy_undercharge` is the twelfth definition and the one that is neither.** It is not a prober check
+and not a SQL-path check: its signal is a server LOG line (`Proxy request UNDERCHARGED`), and neither
+script reads the server log for anything but `topup.rejected`. It is the same structural position as
+`relay_5xx` — genuinely alertable, needing a surface neither script has — which is why it carries
+`needs-metrics` in the registry rather than `covered`.
 
 The registry's eleventh entry is `stranded_hold`, which the doc specifies in prose at lines
 141-175 with the same force ("**Incident - investigate, then credit**").
@@ -314,8 +327,9 @@ The registry's eleventh entry is `stranded_hold`, which the doc specifies in pro
 | 8 | **DB disk >80%** (106) | **Yes, via `/api/admin/metrics`** | The retention lag is served in-process, and retention is the alert's own ACTION rather than its trigger. **Skipped without `PROBE_OPERATOR_COOKIE`.** |
 | 9 | **Error rate >5%** (107) | **Yes, via `/api/admin/metrics`** | Same route and same caveat as rows 6 and 8. |
 | + | **Stranded holds** (141-175) | **Yes** | Via `reconcile.sh`'s copy of the `hold-sweep` predicate. |
+| + | **Proxy undercharge** | **No** | The signal is a server log line, and neither script reads the server log for anything but `topup.rejected`. Same position as **Relay 5xx**: alertable, but it needs a surface neither script has. The ledger cannot show it — the debit was clamped, so `balance = SUM(delta)` still holds and `ledger_drift` stays 0 — and the error-rate counter cannot either, because an undercharge returns 200. |
 
-**MEASURED: 11 definitions, 10 of them reachable today, 1 not.** This paragraph said "**Covered: 6 of
+**MEASURED: 12 definitions, 10 of them reachable today, 2 not.** This paragraph said "**Covered: 6 of
 10. Not covered: 4 of 10**" and gave three reasons that had all stopped being true — three rows gained
 a `/api/admin/metrics` path and the table was never updated with them.
 
@@ -325,7 +339,7 @@ something that is already wired — and it hides that the real remaining gap is 
 
 ```
 $ sh tools/alert/probe.sh --check db_disk
-probe: NOT CHECKED - 1 of the 11 alerts in alerts.tsv still needs a surface this cannot reach:
+probe: NOT CHECKED - 2 of the 12 alerts in alerts.tsv still need a surface this cannot reach:
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
 ```
 
@@ -341,13 +355,13 @@ trade a privacy decision for an operational one, and that is not this script's t
 Wiring it is a call to `alert.sh --alert <id>` once the surface exists — no change to the transport,
 and no change to `probe.sh`.
 
-The delivery **mechanism**, though, is complete for all **11**: `alerts.tsv` carries every alert's
+The delivery **mechanism**, though, is complete for all **12**: `alerts.tsv` carries every alert's
 threshold and action, so wiring a metrics backend means calling `alert.sh --alert <id>` — no change to
 the transport. `alert.sh --list` shows all eleven with their coverage, including the ones nothing
 currently fires, and reads the registry rather than a hand-kept copy of it.
 
 > **`alert.sh --list` and `probe.sh --list` are different listings, and both are correct.** The first
-> prints every definition from `alerts.tsv` (**11**); the second prints the checks the prober has a code
+> prints every definition from `alerts.tsv` (**12**); the second prints the checks the prober has a code
 > path for (**7**). This paragraph said "all ten" and the coverage section said "9 alerts" — one
 > number, three different things it could have meant. The counts are now stated per-source.
 
@@ -407,7 +421,7 @@ re-run with **no** shim on `PATH`, so exit codes and error text are psql's own.
 | e2 | Sink returns HTTP 500 | **exit 3**; `webhook delivery FAILED (HTTP 500)` |
 | e3 | After one delivery and two failures, the state dir holds **only** the successful key | a failed delivery did not consume the cooldown |
 | f | Stranded hold: a `reserve_probe-*` row, `-1234`, backdated 2h, wallet reduced by the same amount | **the drift query returned 0** (structurally blind, as the doc says); `check-alerts.sh` **exit 1** and fired **`stranded_hold`**, not `ledger_drift`; `hold-sweep.exe` independently reported the same hold; cleanup restored drift to 0 and left 0 probe rows |
-| g | `--list` | all **11** definitions with threshold and coverage (measured: the output has 11 data rows, one per `alerts.tsv` entry) |
+| g | `--list` | all **12** definitions with threshold and coverage (measured: the output has 11 data rows, one per `alerts.tsv` entry) |
 | h | Unknown alert id | **exit 4**, with the known ids listed |
 | i | No `psql` on PATH and no docker | **exit 3** |
 | i2 | Real `psql` failure (`DATABASE_URL` at a nonexistent database) | **exit 4**; `reconcile: psql failed (exit 2)` |

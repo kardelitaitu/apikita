@@ -24,6 +24,8 @@ pub mod events;
 pub mod hardening;
 pub mod health;
 pub mod keys;
+#[cfg(test)]
+pub mod limits_lock_invariant;
 pub mod oversize;
 pub mod proxy;
 pub mod reviews;

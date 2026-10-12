@@ -632,12 +632,19 @@ else
     #       ("a `while read` in a pipeline runs in a SUBSHELL, so the missing names are collected
     #       into a file rather than a variable"), and knowing the rule did not stop me writing it.
     #       A here-document keeps the loop in the CURRENT shell.
+    # A THIRD SOURCED COUNT, added when `proxy_undercharge` entered the registry. The rule above -
+    # "every bolded number is a count of the registry or the prober" - was true when there were two
+    # sources and became a false alarm when `tools/alert/README.md` began stating how many alerts
+    # `check-alerts.sh` itself FIRES. That is a real, measured third fact: `grep 'fire "' check-alerts.sh`
+    # returns three ids. Its home is here rather than in the README, because a number whose only
+    # justification is the prose around it is the thing this whole check exists to prevent.
+    CHECK_FIRES=$(grep -oE 'fire "[a-z_]+"' "$REPO/tools/alert/check-alerts.sh" | sort -u | wc -l | tr -d ' ')
     WRONG=$(grep -oE '\*\*[0-9]+\*\*' "$README" \
-        | grep -vE "\*\*($TSV_DEFS|$PROBE_NAMED)\*\*" | sort -u || true)
+        | grep -vE "\*\*($TSV_DEFS|$PROBE_NAMED|$CHECK_FIRES)\*\*" | sort -u || true)
     if [ -n "$WRONG" ]; then
         while IFS= read -r w; do
             [ -n "$w" ] || continue
-            fail "$README states the bolded count $w, and neither $TSV_DEFS (the registry) nor $PROBE_NAMED (the prober's checks) is that. Every bolded number in this file is a count of one of the two, so a new one is either a new fact - which needs its own source of truth - or a stale number."
+            fail "$README states the bolded count $w, and none of $TSV_DEFS (the registry), $PROBE_NAMED (the prober's checks) or $CHECK_FIRES (the ids check-alerts.sh fires) is that. Every bolded number in this file is a count of one of those three, so a new one is either a new fact - which needs its own source of truth, added above - or a stale number."
         done <<EOF
 $WRONG
 EOF

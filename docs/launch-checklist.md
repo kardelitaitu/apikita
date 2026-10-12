@@ -395,9 +395,10 @@ statement is false.**
       unauthenticated-body leak rules.
 <!-- alert-scheduling: wired -->
 - [ ] Alerts configured: webhook rejection, ledger drift, API down, circuit open.
-      **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`: **10 of its 11
-alerts are `covered`**, and the one exception is `relay_5xx`, which is `needs-metrics` because
-it cannot be derived from the database or `/health` alone. (This line said "9 of 10" until it
+      **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`: **10 of its 12
+alerts are `covered`**, and the two exceptions are `relay_5xx` (`needs-metrics`) and
+`proxy_undercharge` (the signal is a server log line, so neither script reaches it). Neither can be
+derived from the database or `/health` alone. (This line said "9 of 10" until it
 was measured: the table has grown since, and nothing tied the sentence to the file - see
 `todo.md`, which now cites the same numbers.) "Configured" also means a delivery channel and
 a schedule, which are deployment decisions. **The code half is done AND THE COUPLING IS NOW IN PLACE** -

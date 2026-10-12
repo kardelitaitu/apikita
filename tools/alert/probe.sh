@@ -4,7 +4,7 @@
 # MEASURED, because this header said "the three" while the script had grown to seven and its own
 # `--list` printed the seven. The counts below are read from the files, not remembered:
 #
-#   alerts.tsv            11 definitions   <- the registry; the single place a threshold lives
+#   alerts.tsv            12 definitions   <- the registry; the single place a threshold lives
 #   this script            7 code paths     <- what `--list` prints, per check
 #   check-alerts.sh       11 definitions   <- names every one, and runs the database-backed set
 #
@@ -59,6 +59,10 @@ set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 ALERT_SH="$SCRIPT_DIR/alert.sh"
+# The registry, named once. `probe.sh` counts its `needs-metrics` rows for the NOT CHECKED summary, so
+# this path is load-bearing rather than decorative - an unset variable printed "0 of the 0 alerts"
+# rather than failing, which is the wrong direction for a count to be wrong in.
+REGISTRY="$SCRIPT_DIR/alerts.tsv"
 
 # --- knobs (every one overridable so the checks are testable without a 2-minute wait)
 API_URL="${PROBE_API_URL:-http://127.0.0.1:8080}"
@@ -685,11 +689,26 @@ fi
 # and served at GET /api/admin/metrics, so it is a real check now. The line that used
 # to sit here said it needed "HTTP counters over a 5-minute window (same access logs)",
 # which was true before the counter existed and is now stale.
-cat >&2 <<'NOTCHECKED'
-probe: NOT CHECKED - 1 of the 11 alerts in alerts.tsv still needs a surface this cannot reach:
+# THE COUNT AND THE LIST ARE DERIVED, NOT TYPED. This block used to hardcode "1 of the 11 alerts",
+# and both halves went stale without anything failing: the registry grew to 12 when `proxy_undercharge`
+# was added, and this line still said 11. It was caught only because `tools/alert-check` compares the
+# README's quoted transcript against the file - the transcript was accurate, which is what made the
+# script's own number the thing that was wrong.
+#
+# So the number is counted from `alerts.tsv` and the names come from it too. The reasons stay prose,
+# because a reason is not derivable - but a NAME that is not in the registry can no longer be printed.
+UNREACHABLE=$(grep -v '^#' "$REGISTRY" 2>/dev/null | grep -v '^id' | awk -F'\t' '$6 == "needs-metrics" { print $1 }')
+UNREACHABLE_N=$(printf '%s\n' "$UNREACHABLE" | grep -c . || true)
+TOTAL_N=$(grep -v '^#' "$REGISTRY" 2>/dev/null | grep -v '^id' | grep -c . || true)
+
+cat >&2 <<NOTCHECKED
+probe: NOT CHECKED - $UNREACHABLE_N of the $TOTAL_N alerts in alerts.tsv still need a surface this cannot reach:
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
 probe:                             The relay is a SEPARATE deployment; the backend never sees its
 probe:                             status codes, so no server-side check can answer this one.
+probe:   proxy_undercharge       - a server LOG line ("Proxy request UNDERCHARGED"). The ledger cannot
+probe:                             show it (the debit was clamped, so drift stays 0) and the error-rate
+probe:                             counter cannot either (it returns 200), so the log is the only trace.
 probe: Full table and the reasons: tools/alert/README.md. Every definition: alert.sh --list
 NOTCHECKED
 
