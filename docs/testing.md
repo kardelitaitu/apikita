@@ -170,6 +170,42 @@ a finding:
    or the filter matched nothing; both mean *no evidence*, which is not *no finding*.
 3. **Restore with `git checkout`**, and confirm `git status` is clean, rather than copying a file back.
 
+#### The gate suite: five gates verified against a broken subject (round 24)
+
+Rounds 6–8 found three gates reporting wrong verdicts, all by running them against a broken subject. The
+same test applied to the rest:
+
+| gate | subject broken | result |
+| --- | --- | --- |
+| `backup-check` | the `openssl enc` step removed | **caught** |
+| `reconcile-check` | the drift comparison inverted (`<>` → `=`) | **caught** — "a wallet that disagrees with its ledger must exit 1, got 0" |
+| `drill-check` | every `return 5` (the live-target refusal) neutralised | **caught**, 3 failures |
+| `wind-down-check` | the eligibility rule altered | **caught** — names the rule that broke |
+| `relay-check` | `proxy_buffering off` → `on` | **caught** — "a buffering relay looks connected" |
+
+**`drill-check`'s third failure is the one worth reading:**
+`the protected database was DELETED OR EMPTIED - the guard promises nothing is touched`. The gate verifies
+the **consequence**, not just the exit code — it noticed the protected database was actually
+destroyed. A gate that only compared exit codes would have passed that mutation.
+
+**Five attempts produced no-ops before the real anchors were found**, and the reason is instructive:
+
+| my anchor | why it changed nothing |
+| --- | --- |
+| `refuse` → `accept` | 1 of 14 occurrences, in a comment |
+| `eligible` → `always_eligible` | 1 of 9, in a comment |
+| `exit 3` → `exit 0` | `exit 3` appears **only inside `say "… (exit 3)"`** message strings |
+| `exit 5` → `exit 0` | `exit 5` appears **only in comments**; the guard uses `return 5` |
+| `X-Accel-Buffering` | **occurs zero times in the repository** |
+
+**Every one of those reported "NOT CAUGHT" — the same signal as a genuine broken gate.** The distinction
+is only visible by grepping the anchor's occurrence count and checking whether it sits in code. That is
+the harness table above, in the shell-gate setting rather than the Rust one.
+
+**And three times the shell reported a dirty tree that was clean** — `git status --porcelain | wc -l`
+inside a command substitution picking up surrounding output. Verify with `git status --short` and, when it
+matters, `git diff HEAD --numstat`.
+
 ### The money path, mutation-tested (round 14)
 
 Thirteen mutations across `clamp_debit`, `settlement_ledger_deltas`, the SQL balance floor, the schema
