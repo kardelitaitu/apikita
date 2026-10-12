@@ -206,6 +206,52 @@ the harness table above, in the shell-gate setting rather than the Rust one.
 inside a command substitution picking up surrounding output. Verify with `git status --short` and, when it
 matters, `git diff HEAD --numstat`.
 
+#### The website's non-file-reading suites are sound too (round 27)
+
+My screen labelled **13 website suites "RESTATED"** because they call no `readFileSync`. That label was
+wrong, and the way it was wrong is worth recording: those suites **`import` and exercise real modules** —
+`rate-limit.test.ts` pulls in `retry-wait.ts`, `api.ts` and `errors.ts` and asserts on the renderers the
+islands actually call, which is stronger than reading a file as text. The screen measured *file IO*, not
+*coverage*.
+
+Settled by mutation instead, with anchors read from the modules:
+
+| mutation | caught? |
+| --- | --- |
+| `parseRetryAfter` stops validating its input | **caught** |
+| the retry message drops the wait it was given | **caught** |
+| a service-status state name changed | **caught** |
+
+**Three of four anchors missed on the first attempt**, and the harness still printed "caught" for all four
+because it ran the suite regardless of whether the mutation applied. That is the same defect the audit
+keeps finding, written into my own script — the fix is to locate the anchor first and **refuse a verdict**
+when it is absent.
+
+#### The 183-file phantom dirty tree, and why it is benign (round 27)
+
+`git status --porcelain | wc -l` under WSL reports **183 modified files** while Windows git reports **0**,
+on the same checkout with the same bytes on disk. `git diff --ignore-cr-at-eol` between them is **empty**,
+so the only difference is line endings — but an unexplained 183-file diff is exactly the kind of thing that
+either hides a real change or gets reported as one.
+
+**The cause is a config difference, not a repository defect:**
+
+| | `core.autocrlf` | sees |
+| --- | --- | --- |
+| Windows git | `true` | 0 modified — normalises CRLF↔LF transparently |
+| WSL git | unset | 183 modified — the working copies are CRLF, the objects are LF |
+
+**CI is correct.** `git ls-files --eol` shows every file as **`i/lf`** — stored as LF in the object
+database — and a Linux runner leaves `autocrlf` false, so a CI checkout is LF. The `.gitattributes` file
+pins `text eol=lf` only for the files that *execute* in a Linux container (shell, SQL, YAML, TOML), which
+is the deliberate decision its own header explains; `.md`, `.rs` and `.json` are not pinned and follow the
+platform default.
+
+**What this cost, three times this round:** `wc -l` on a `git status` inside WSL reported 183, 183 and 12
+modified files for a clean tree, and each reading was momentarily treated as real. The authoritative checks
+are `git status --short` and `git diff HEAD --numstat` — and when the two platforms disagree, compare with
+`git diff --ignore-cr-at-eol` before concluding anything.
+
 #### The website's stated figures: verified, not just referenced (round 26)
 
 Round 25 found a stale count in the website suite. The obvious follow-up was whether the website's
