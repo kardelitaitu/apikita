@@ -358,14 +358,43 @@ expect("a bot review (telegram, no account) is accepted",
 # and change what the documents are describing.
 _reviews_ddl = con.execute(
     "SELECT sql FROM sqlite_master WHERE type='table' AND name='reviews'").fetchone()[0]
-results.append(("reviews.account_id is declared ON DELETE SET NULL",
-                "ON DELETE SET NULL" in _reviews_ddl.replace("\n", " "),
-                "the FK action the retention documents reason about"))
-results.append(("reviews_telegram_uniq is partial on account_id IS NULL",
-                "reviews_telegram_uniq" in con.execute(
-                    "SELECT COALESCE(group_concat(sql), '') FROM sqlite_master "
-                    "WHERE type='index' AND name='reviews_telegram_uniq'").fetchone()[0],
-                "the partial index that makes account_id IS NULL mean 'bot-authored'"))
+# THE TUPLE ORDER IS (ok, name, detail), AND THESE TWO HAD IT ROTATED. MEASURED: they were written as
+# (description, condition, detail), so the report loop - `for ok, name, detail in results` - gave `ok`
+# the DESCRIPTION STRING, which is always truthy. Both checks printed `[PASS] True` on every run and
+# could never increment `bad`, which is the counter the exit code uses.
+#
+# A non-empty string is truthy, so this is the "a check that cannot fail" defect in its purest form: the
+# condition WAS still evaluated, and `"ON DELETE SET NULL" in ddl` genuinely flips to False when the
+# clause is removed - but the verdict ignored the result. PROVEN by rebuilding `reviews` with `ON DELETE
+# RESTRICT`, the exact violation this check exists to catch, and watching the validator still report
+# "38 checks, 0 failed" and exit 0.
+#
+# It survived because `[PASS] True` reads as a passing assertion rather than as a malformed row, and
+# because a tuple of the wrong shape is not a syntax error in Python. The `tuple_shape` check at the
+# bottom of this file now makes that shape a FAILURE rather than a curiosity.
+results.append((
+    "ON DELETE SET NULL" in _reviews_ddl.replace("\n", " "),
+    "reviews.account_id is declared ON DELETE SET NULL",
+    "the FK action the retention documents reason about"))
+results.append((
+    "reviews_telegram_uniq" in con.execute(
+        "SELECT COALESCE(group_concat(sql), '') FROM sqlite_master "
+        "WHERE type='index' AND name='reviews_telegram_uniq'").fetchone()[0],
+    "reviews_telegram_uniq is partial on account_id IS NULL",
+    "the partial index that makes account_id IS NULL mean 'bot-authored'"))
+
+# THE ASSERTION IS THE `WHERE` CLAUSE, NOT THE INDEX'S NAME, and the check above is not enough on its own.
+# MEASURED: replacing the index with a PLAIN `CREATE UNIQUE INDEX reviews_telegram_uniq ON
+# reviews(account_id)` satisfies the name test identically, while the description beside it claims to
+# verify "the partial index that makes account_id IS NULL mean 'bot-authored'". The name is what a
+# careless migration KEEPS; the clause is what it drops.
+_uniq_sql = con.execute(
+    "SELECT COALESCE(group_concat(sql), '') FROM sqlite_master "
+    "WHERE type='index' AND name='reviews_telegram_uniq'").fetchone()[0].replace("\n", " ")
+results.append((
+    "WHERE" in _uniq_sql.upper() and "ACCOUNT_ID IS NULL" in _uniq_sql.upper(),
+    "reviews_telegram_uniq carries its partial WHERE clause",
+    ("the clause itself: " + _uniq_sql.strip()[:90]) if _uniq_sql else "(the index is absent)"))
 
 print("\n--- STRICT implies NOT NULL on PRIMARY KEY columns ---")
 expect("NULL refused in a composite PRIMARY KEY",
@@ -452,6 +481,37 @@ results.append(("id" in cols and "created_at" in cols,
 
 print()
 print("=" * 78)
+
+# EVERY RESULT IS THREE VALUES AND `ok` IS A BOOL, CHECKED BEFORE ANYTHING IS REPORTED.
+#
+# This exists because two rows were written as (description, condition, detail) - the first two rotated -
+# and the reporting loop unpacked them positionally, giving `ok` a non-empty STRING, which is always
+# truthy. Both rows printed `[PASS] True` forever and could not increment `bad`, the counter the exit
+# code uses, so a schema that dropped `ON DELETE SET NULL` from `reviews` still passed. PROVEN by
+# rebuilding the table with RESTRICT.
+#
+# A guard rather than a convention because the failure is invisible: `[PASS] True` reads as a passing
+# assertion, and a tuple of the wrong shape is not a Python error. This makes it one.
+_shape_problems = []
+for i, item in enumerate(results):
+    if not isinstance(item, tuple) or len(item) != 3:
+        _shape_problems.append(f"result {i} is {type(item).__name__} of length "
+                               f"{len(item) if isinstance(item, tuple) else '?'}, expected a 3-tuple")
+        continue
+    ok, name, _detail = item
+    if not isinstance(ok, bool):
+        _shape_problems.append(f"result {i} ({name!r}) has ok={ok!r} of type {type(ok).__name__}, "
+                               f"expected bool - a truthy string makes the check unfailable")
+    if not isinstance(name, str) or not name:
+        _shape_problems.append(f"result {i} has a non-string or empty name: {name!r}")
+
+if _shape_problems:
+    for p in _shape_problems:
+        print(f"[FAIL] malformed result: {p}")
+    print("=" * 78)
+    print(f"{len(results)} results, {len(_shape_problems)} malformed")
+    sys.exit(1)
+
 bad = 0
 for ok, name, detail in results:
     print(f"[{'PASS' if ok else 'FAIL':4}] {name}\n        -> {detail}")
