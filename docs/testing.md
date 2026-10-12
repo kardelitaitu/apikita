@@ -305,6 +305,36 @@ states a SHA-pinning policy — `cargo audit` covers *dependencies*, not *workfl
 it would impose a convention the project has not adopted. Worth a decision, not worth an unrequested
 change.
 
+#### Migration compatibility (R1): unenforced as a rule, and covered in effect (round 33)
+
+`docs/deployment.md` states **R1**: migrations must be additive and backward compatible, with `DROP COLUMN`,
+`RENAME COLUMN`/`RENAME TABLE`, `ALTER COLUMN ... SET NOT NULL`, type changes and `DROP TABLE` all named as
+*"never allowed in one step"*. The stakes are the deploy order — migrate, then deploy — so a breaking
+migration runs against a server that still queries the old shape.
+
+**Nothing enforces R1 as a rule.** No gate names it; `doc_claims` reads the migrations for *schema
+inventory*, not for compatibility. So the question worth answering was whether a violation would land
+silently. Five probes, each adding a migration the rule forbids:
+
+| probe | what noticed |
+| --- | --- |
+| `ALTER TABLE api_keys DROP COLUMN rate_limit_rpm` | **3 tests failed** — they read that column |
+| rename `api_keys` + rebuild + `DROP TABLE` | **104 tests failed** |
+| `ALTER TABLE review_history RENAME COLUMN replaced_at` | **2 tests failed** — `reviews.rs` writes it |
+| `DROP TABLE review_sessions` (a table no Rust source writes) | **caught** by `a_table_rebuilt_by_a_later_migration_says_so_in_the_file_that_discards_it` |
+
+**Every case was caught, and the reason is worth stating precisely: it is coverage, not enforcement.** The
+suite catches a breaking migration because something in the repository reads what changed — and a check of
+all 66 schema columns found **every one is referenced somewhere in Rust**, so there is no unreferenced
+column to slip through. The fourth probe is the strongest result, because `review_sessions` is schema-only
+and was still caught: that guard requires a migration discarding a table to be **declared in a map**, so a
+genuine second rebuild has to be added consciously.
+
+**No gate was added, deliberately.** R1 is enforced in effect by tests that assert relationships rather
+than a rule that parses SQL, and adding a textual "no DROP COLUMN" check would duplicate coverage while
+risking false positives on the two documented rebuilds. Recorded so the next person knows which mechanism
+is holding, and why there is not a gate named after the rule.
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period
