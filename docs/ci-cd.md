@@ -35,6 +35,26 @@ anyway, so the check below can demand an exact match:
 | Install cargo-audit | The dependency-audit binary |
 | Install website dependencies | `node_modules` |
 
+### The job timeout, and why there is one
+
+The workflow runs every stage in **one job** with `timeout-minutes: 45`. MEASURED before that was added:
+36 steps, 30 of them a build, a test suite, a Docker build or a container smoke, and **zero**
+`timeout-minutes` anywhere in the file. GitHub's default per-job timeout is **360 minutes**, so one step
+that never returns — a `cargo test` blocked on a file lock, a `docker run` on a container that stays up, an
+HTTP call with no client timeout — would block every step after it and burn the full six hours before
+failing. The only shell-level bound in the file was a single `timeout 20` around one container smoke.
+
+**That is the same defect this repository writes gates against**, in the pipeline that runs them: a check
+whose failure mode is "never finishes" rather than "reports red".
+
+45 is derived from measured work rather than a template — the 14 tool gates take ~150 s, `cargo test --lib`
+~20 s, and a cold runner adds two Docker image builds, `npm ci` and the website build, so a clean run is
+15–25 minutes with roughly 2× headroom.
+
+**It does not make a hang legible.** A step killed by this bound reports a cancelled job rather than the
+specific check that stuck, and the gates that shell out to containers have no per-step bound of their own.
+It is the coarse, always-present floor.
+
 #### Correctness of the code
 
 | Stage | Purpose |

@@ -19,6 +19,28 @@ jobs:
   checks:
     runs-on: ubuntu-latest
 
+    # A JOB-LEVEL BOUND, because without one a hang costs SIX HOURS.
+    #
+    # MEASURED before adding this: the workflow had 36 steps, 30 of them a build, a test suite, a Docker
+    # build or a container smoke, and **zero** `timeout-minutes` anywhere. GitHub's default per-job
+    # timeout is 360 minutes, so one step that never returns - a `cargo test` blocked on a file lock, a
+    # `docker run` on a container that stays up, an HTTP call with no client timeout - would block every
+    # step after it and burn the whole window before failing. That is the same defect this repository
+    # writes gates against: a check whose failure mode is "never finishes" rather than "reports red".
+    #
+    # The only shell-level bound in the file was a single `timeout 20` around one container smoke.
+    #
+    # 45 IS CHOSEN FROM MEASURED WORK, not from a template. On this machine the 14 tool gates take
+    # ~150 s, `cargo test --lib` ~20 s and a warm `cargo build --tests` under 4 s; a cold CI runner adds
+    # the Rust toolchain install, two Docker image builds, `npm ci` and the website build. That is a
+    # 15-25 minute job on a clean runner, so 45 gives roughly 2x headroom for a slow day while still
+    # bounding a hang at a fraction of the 6-hour default.
+    #
+    # WHAT IT DOES NOT COVER: a step that hangs but is killed by this timeout still reports as a
+    # cancelled job rather than as a specific failing check, and the individual gates that shell out to
+    # containers have no per-step bound of their own. A job timeout is the coarse, always-present bound.
+    timeout-minutes: 45
+
     # No service container and no DATABASE_URL: SQLite is bundled, so the database
     # is a file. Nothing here needs a second process, and the test suite needs no
     # environment at all — see the integration step below.

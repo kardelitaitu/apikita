@@ -281,6 +281,30 @@ injected the probe twice so every deferred case failed to compile — an error t
 `error[E0428]` and could be misread as "the cap held". Fixing the harness was what turned "no output" into
 a measurement.
 
+#### The pipeline that runs the checks had no bound on itself (round 31)
+
+The audit had never examined `docker-compose.yml`, the Dockerfiles or `.github/workflows/ci.yml` — what
+actually ships and what runs the gates. Most of the deployment path is covered (`compose-check`,
+`backup-check`, and CI building and smoking the maintenance image directly), but the workflow had a
+property nothing checked:
+
+**36 steps, 30 of them a build, a test suite, a Docker build or a container smoke, and ZERO
+`timeout-minutes` anywhere in a 1,124-line file.** GitHub's default per-job timeout is **360 minutes**, so
+one step that never returns — a `cargo test` blocked on a file lock, a `docker run` on a container that
+stays up, an HTTP call with no client timeout — blocks every later step and burns six hours before
+failing. The only shell-level bound was a single `timeout 20` around one container smoke.
+
+**That is this repository's own defect class, in the pipeline that runs the gates**: a check whose failure
+mode is "never finishes" rather than "reports red". Fixed with `timeout-minutes: 45`, derived from
+measured work (~150 s for the 14 gates, ~20 s for `cargo test --lib`, plus two Docker builds and `npm ci`
+on a cold runner) rather than from a template.
+
+**Not fixed, and recorded as a judgement rather than a defect:** the four actions are tag-pinned
+(`@v4`, `@stable`, `@v2`) rather than SHA-pinned, and a tag is mutable upstream. Nothing in this repository
+states a SHA-pinning policy — `cargo audit` covers *dependencies*, not *workflow actions* — so tightening
+it would impose a convention the project has not adopted. Worth a decision, not worth an unrequested
+change.
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period
