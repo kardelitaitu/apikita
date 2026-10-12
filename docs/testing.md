@@ -145,6 +145,31 @@ the real bound. A test for mid-stream revocation passed a mutation that set
 `revoked_at` a year in the future, because that is a state no code produces;
 it had tested an impossible state instead of the real failure.
 
+### Before you trust a mutation result, check the HARNESS
+
+Rounds 14–23 mutation-tested the money path, the guards and the pricing. **Every contradiction that came
+up was the harness, never the code** — nine rounds of it. The failure modes repeat, and each one reads as
+a finding:
+
+| what the harness did | what it looked like |
+| --- | --- |
+| an anchor matched text inside a **comment** | SURVIVED — "the guard is unprotected" |
+| an anchor **missed** entirely (wrong indentation) | SURVIVED — "nothing detects this" |
+| the anchor matched a **second, unrelated call site** | SURVIVED or caught, at random |
+| a positional argument was `null`/empty | 5 tests ran instead of 715; SURVIVED read as a real gap |
+| a replacement asked for **identical** `from`/`to` | "caught" for a mutation that never applied |
+| the mutation did not **compile** | "(no result line)" read as "no test failed" |
+| the classifier keyed on `/^error/` | cargo's *trailing* `error: test failed` marked every **caught** mutation `did-not-compile` |
+| a restore used a text-mode file copy | every line "modified"; a restore that looks clean but is not |
+
+**The three checks that make a result usable**, and they are cheap:
+
+1. **Assert the mutation LANDED**, by reading the line back — not by `includes()`, which a comment can
+   satisfy. Anchor on a full statement that cannot appear in prose.
+2. **Require a `test result:` line** before drawing any conclusion. No line means the crate did not build
+   or the filter matched nothing; both mean *no evidence*, which is not *no finding*.
+3. **Restore with `git checkout`**, and confirm `git status` is clean, rather than copying a file back.
+
 ### The money path, mutation-tested (round 14)
 
 Thirteen mutations across `clamp_debit`, `settlement_ledger_deltas`, the SQL balance floor, the schema
@@ -395,6 +420,38 @@ from settlement's model rates.
 `error: test failed, to rerun pass --lib`, printed on **every** test failure. The tell was the result line
 reading "6 failed" while the classifier said the crate had not built. **A mutation that ran is not a
 mutation that compiled**, and the reliable signal is that a `test result:` line exists at all.
+
+#### `ReservationGuard`: five mutations, five caught, in both directions (round 23)
+
+The guard releases a hold on `Drop`, and `defuse()` stops it releasing again once settlement has credited
+the hold back. The two failure modes are opposite, and both are money:
+
+| mutation | direction | caught by |
+| --- | --- | --- |
+| drop always releases, ignoring `defuse` | **credits the hold TWICE** | **7 tests** |
+| drop never releases | **strands the customer's money** | 1 test |
+| `defuse()` does not set the flag | double credit | **7 tests** |
+| the released amount is zeroed | strands it | 1 test |
+| the release is not called at all | strands it | 1 test |
+
+**The asymmetry is right:** inventing money trips seven tests, stranding it trips one. The named tests
+carry exactly these properties — `a_defused_guard_never_credits_the_hold_a_second_time`,
+`an_undefused_guard_releases_the_hold_so_an_aborted_request_strands_nothing`,
+`a_failed_settlement_releases_the_hold_rather_than_stranding_it`,
+`a_partial_settlement_through_the_caller_claims_the_hold_and_never_credits_twice`.
+
+**The guard also states what it does NOT guarantee**, in place: "THE GUARANTEE ENDS AT THE PROCESS". A
+dropped *future* always gets its spawned task run, but a SIGKILL between the debit and the compensating
+credit leaves an unpaired hold — which is what `db::unpaired_hold_rows` detects, what the `stranded_hold`
+alert fires on, and what the hold sweep's `--release` operator action exists for. **Documented recovery,
+not an oversight**, which is the distinction that keeps the comment above it from being read as a closed
+window.
+
+**And a second harness trap, of the kind this section keeps recording.** All five guards anchors missed on
+the first attempt: I assumed 10-space indentation where the file uses 8, and `tokio::spawn(async move {`
+appears at **two** sites — so an anchor that did match could still have landed on the wrong one. Anchors
+are now extracted from the printed source and scoped with a region marker, which is what made the run
+above trustworthy.
 
 **Two harness bugs preceded this conclusion, and both reported "SURVIVED":**
 
