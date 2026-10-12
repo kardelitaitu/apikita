@@ -19,6 +19,7 @@ pub mod account;
 pub mod admin;
 pub mod auth;
 pub mod events;
+pub mod hardening;
 pub mod health;
 pub mod keys;
 pub mod oversize;
@@ -436,7 +437,10 @@ pub const ROUTE_ARRAY_SHAPE_IS_IMPOSSIBLE: &[&str] = &[
 ];
 
 pub fn create_router(state: AppState) -> Router {
-    routes!(
+    // The macro expands to a `Router::new()....with_state(..)` EXPRESSION, so it is bound here rather
+    // than returned directly: the hardening layers have to wrap it from outside, and they need the
+    // config, which is only reachable through `state`.
+    let router = routes!(
         .route("/health", get(health::health_check));
         // Operator-only operational counts. NOT on /health: that body is pinned
         // because the deploy gate parses it, and a leak test forbids ANY digit in an
@@ -514,10 +518,18 @@ pub fn create_router(state: AppState) -> Router {
     // The body limit's 413 is produced during EXTRACTION, before any handler exists to give it the
     // documented envelope - so the shape has to be fixed on the way out. Everything that is not a
     // 413 passes through untouched; see `oversize` for why this could not be an `AppError` variant.
+    //
+    // THIS IS APPLIED BEFORE `hardening`, so it sits INSIDE the concurrency and timeout layers and
+    // still sees the body-limit rejection. Reversing the order would put the 413 outside the layers
+    // that produce it and the envelope would be lost.
     .layer(axum::middleware::map_response(
         oversize::documented_oversize_response,
     ))
-    .with_state(state)
+    .with_state(state.clone());
+    // The inbound hardening is applied OUTSIDE everything above, so a request that cannot get a
+    // concurrency slot is refused before it is timed or buffered. See `hardening` for why all three
+    // layers are needed and what each one bounds that the others do not.
+    hardening::apply(router, &state.config.server)
 }
 
 /// The path literals `create_router`'s `routes!` invocation actually expanded.

@@ -39,6 +39,13 @@ pub struct AppConfig {
     pub circuit_breaker: CircuitBreakerConfig,
     pub streaming: StreamingConfig,
     pub network: NetworkConfig,
+    /// Inbound limits this server enforces on itself: concurrency, header-read time and body size.
+    ///
+    /// `serde(default)` because every one of these has a safe value and an older config predates the
+    /// section — and because the defaults ARE the shipped numbers, so a config without `[server]` gets
+    /// the same hardening a config with it does.
+    #[serde(default)]
+    pub server: ServerConfig,
     pub models: Vec<ModelConfig>,
 }
 
@@ -51,6 +58,71 @@ pub struct NetworkConfig {
     /// recorded. `docs/ip-tracking.md` — the header is client-controlled, and
     /// trusting it blindly lets a caller pin its own recorded address.
     pub trusted_proxy_cidrs: Vec<String>,
+}
+
+/// Inbound limits the server enforces on ITSELF.
+///
+/// WHY THIS SECTION EXISTS. `docs/topology.md:50` states the relay is *"a cost and load boundary, not
+/// a security boundary"* and that **"Both endpoints must be hardened"** — the backend needs *"its own
+/// rate limits, body caps"*. MEASURED before this section existed: it had none of the three.
+///
+///   * 800 half-open connections were accepted and held with **zero timeouts in 30 seconds**, while
+///     `/health` kept answering. A slowloris needs no credentials, and `max_connections_per_account`
+///     does not gate it — that limit applies to `/events` only, after the session resolves.
+///   * a half-open client made SHUTDOWN hang for **2,101 seconds**, because `with_graceful_shutdown`
+///     waits for connections to finish and such a connection never finishes.
+///   * the 2 MiB body cap was axum's own `DefaultBodyLimit` default, set nowhere in this repository.
+///
+/// Every value here is a DECISION recorded in one place rather than a framework default inherited by
+/// accident. `config/apikita.toml` states the same three numbers and is what the server loads; this
+/// struct's `Default` exists so the `Deserialize` path cannot produce a weaker server than the file.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerConfig {
+    /// Maximum requests being served at once, across all connections.
+    ///
+    /// A cap, not a queue: a request over the limit is refused rather than parked, because a parked
+    /// request still holds a connection and a socket, which is the resource this exists to bound.
+    ///
+    /// SIZED FROM THE DOCUMENTED BOX, not from this machine. `docs/cost-and-sizing.md:49` says
+    /// streaming connections cost "kilobytes each, not megabytes" and the target is a 0.2 vCPU
+    /// container. 512 concurrent is generous for that shape while keeping worst-case socket memory
+    /// well inside it; the point is a number that was chosen rather than one that was reached.
+    pub max_concurrent_requests: usize,
+
+    /// How long a client has to send its complete request HEADERS, in seconds.
+    ///
+    /// THE SLOWLORIS DEFENCE, and the one whose absence was measured: a client that opens a socket and
+    /// sends a partial request line was otherwise held indefinitely. 10 seconds is far longer than any
+    /// real client needs (a browser sends headers in one packet) and far shorter than the damage a
+    /// slow-loris can do. nginx's `client_header_timeout` defaults to 60s; this is deliberately tighter
+    /// because it is the backend's own defence, not the edge's.
+    pub header_read_timeout_seconds: u64,
+
+    /// Maximum request body the server will read, in bytes.
+    ///
+    /// THIS WAS AXUM'S DEFAULT AND IS NOW A DECISION. MEASURED: the boundary was exactly 2,097,153
+    /// bytes — axum-core's `DefaultBodyLimit`, described in its own source as "the default limit of
+    /// 2MB" and set by no line in this repository.
+    ///
+    /// 2 MiB keeps the shipped behaviour deliberately: this makes the number explicit and tested rather
+    /// than changing what clients experience.
+    ///
+    /// KNOWN INCONSISTENCY, stated rather than silently fixed: the relay allows
+    /// `client_max_body_size 25m`, so a 3 MiB body passes the relay and is refused here. Reconciling
+    /// that is a product decision this field cannot make on its own.
+    pub max_body_bytes: usize,
+}
+
+impl Default for ServerConfig {
+    /// The SHIPPED values, so a config that predates `[server]` boots with the same hardening rather
+    /// than none. A hardening limit that could be absent by accident is not a limit.
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: 512,
+            header_read_timeout_seconds: 10,
+            max_body_bytes: 2 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

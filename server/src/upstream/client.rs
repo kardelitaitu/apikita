@@ -809,6 +809,11 @@ mod tests {
             network: NetworkConfig {
                 trusted_proxy_cidrs: vec![],
             },
+            // The shipped hardening defaults. These tests drive the upstream client directly and never
+            // mount a router, so the layers are not exercised here - `routes::hardening` has its own
+            // tests for that. `default()` rather than literals so a change to the shipped numbers does
+            // not have to be mirrored into a test that does not care about them.
+            server: crate::config::ServerConfig::default(),
             models,
         }))
     }

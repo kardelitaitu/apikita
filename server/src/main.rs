@@ -165,21 +165,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // because phase one used its 5s and phase two found the tracker already empty. A shared budget
     // would need `Instant` arithmetic that this does not, and the orchestrator's TERM-to-KILL grace is
     // what actually bounds the whole thing. Do not read DRAIN_TIMEOUT as the total.
+    //
+    // THE CLOCK STARTS WHEN THE SIGNAL ARRIVES, NOT WHEN THE SERVER DOES, and the first version of this
+    // got that wrong in the most expensive way available.
+    //
+    // MEASURED: `timeout(DRAIN_TIMEOUT, serving)` wraps the SERVE LOOP, so the deadline ran from
+    // startup. The server listened on :18152, served /health, and then exited by itself 5.009 seconds
+    // later with NO signal and NO client - a five-second lifespan. The warning it printed blamed "a
+    // slow or half-open client" when the cause was that nothing had called anything.
+    //
+    // A WSL test had passed moments earlier ONLY because the script sent SIGTERM within ~5s of startup,
+    // which is the coincidence that hid it. The lesson is not "test more" - it is that a timeout must
+    // be stated over the interval it actually governs, and this one governed the process lifetime.
+    //
+    // So the signal is awaited FIRST and the deadline applied to the drain that follows it. The signal
+    // fires exactly once, so a `Notify` is enough to share it between the graceful handler and this
+    // await without either one consuming it from the other.
     const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let signalled = Arc::new(tokio::sync::Notify::new());
     let serving = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        shutdown_signal().await;
-        info!("shutdown: no longer accepting; draining in-flight connections");
+    .with_graceful_shutdown({
+        let signalled = Arc::clone(&signalled);
+        async move {
+            shutdown_signal().await;
+            info!("shutdown: no longer accepting; draining in-flight connections");
+            signalled.notify_waiters();
+        }
     });
 
-    // PHASE ONE, BOUNDED. `IntoFuture` is what lets the same deadline cover the serve loop; the trait
-    // has to be in scope for `.into_future()`, and without it the call is a compile error rather than a
-    // silent no-op - which is the good direction for this to fail in.
+    // RUN UNTIL SIGNALLED, THEN BOUND THE DRAIN - and the two must be raced, not sequenced.
+    //
+    // THE BUG THIS REPLACES, because it is the same mistake twice in one function. `axum::serve(..)`
+    // returns a LAZY future: it does not listen until it is polled. An earlier version awaited the
+    // signal first and only then polled it, so the server never bound its listener and never served -
+    // MEASURED: `/health` failed after 305 seconds with the process alive, and removing every layer did
+    // not help because the layers were never the cause.
+    //
+    // Before that, the timeout wrapped the serve loop from STARTUP, giving the process a five-second
+    // lifespan. Both failures came from applying a deadline to the wrong interval.
+    //
+    // The shape that is correct: `select!` the running server against the signal. `serving` is polled
+    // from the first moment, so it listens; the signal branch fires when one arrives; and only THEN
+    // does a clock start, over the drain.
     use std::future::IntoFuture;
+    // `IntoFuture` is what makes the serve loop raceable; the trait has to be in scope for
+    // `.into_future()`, and without it the call is a compile error rather than a silent no-op - the
+    // good direction for this to fail in.
     let mut serving = std::pin::pin!(serving.into_future());
+
+    tokio::select! {
+        // The server ran to completion on its own, which means the listener failed rather than a signal
+        // arriving. Report it and fall through to the drain.
+        result = &mut serving => {
+            match result {
+                Ok(()) => info!("shutdown: the listener closed without a signal"),
+                Err(err) => warn!(error = %err, "shutdown: the server stopped with an error"),
+            }
+        }
+        // A signal arrived. The graceful handler has already been notified by the same event, so the
+        // serve loop is winding down; the deadline below starts HERE rather than at startup.
+        _ = signalled.notified() => {}
+    }
+
+    // PHASE ONE, BOUNDED - and the clock starts at the signal.
     let connections_drained = match tokio::time::timeout(DRAIN_TIMEOUT, &mut serving).await {
         Ok(Ok(())) => true,
         Ok(Err(err)) => {

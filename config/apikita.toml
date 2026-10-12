@@ -389,6 +389,66 @@ key_metadata_cache_seconds = 60
 trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128", "172.21.0.0/16"]
 
 # ===========================================================================
+# INBOUND LIMITS — what this server enforces on ITSELF
+# ===========================================================================
+#
+# WHY THIS SECTION EXISTS. docs/topology.md:50 states the relay is "a cost and
+# load boundary, not a security boundary" and that "Both endpoints must be
+# hardened" — the backend needs "its own rate limits, body caps". MEASURED
+# before this section existed: it had none of the three.
+#
+#   * 800 half-open connections were accepted and held with ZERO timeouts in 30
+#     seconds, while /health kept answering. A slowloris needs no credentials,
+#     and `max_connections_per_account` does not gate it — that limit applies to
+#     /events only, after the session resolves.
+#   * a single half-open client made SHUTDOWN hang for 2,101 SECONDS, because
+#     with_graceful_shutdown waits for connections to finish and such a
+#     connection never finishes.
+#   * the 2 MiB body cap was axum's own DefaultBodyLimit, set by no line in this
+#     repository — so an axum upgrade could have changed it silently.
+#
+# Every value here is a DECISION in one place rather than a framework default
+# inherited by accident.
+[server]
+
+# Maximum requests being served at once, across all connections.
+#
+# A CAP, NOT A QUEUE: a request over the limit is refused rather than parked,
+# because a parked request still holds a connection and a socket — the resource
+# this exists to bound.
+#
+# SIZED FROM THE DOCUMENTED BOX. docs/cost-and-sizing.md:49 says streaming
+# connections cost "kilobytes each, not megabytes" and the target is a 0.2 vCPU
+# container. 512 concurrent is generous for that shape while keeping worst-case
+# socket memory well inside it. The point is a number that was CHOSEN rather
+# than one that was reached.
+max_concurrent_requests = 512
+
+# How long a client has to send its complete request HEADERS, in seconds.
+#
+# THE SLOWLORIS DEFENCE, and the one whose absence was measured: a client that
+# opens a socket and sends a partial request line was otherwise held
+# indefinitely. 10 seconds is far longer than any real client needs (a browser
+# sends headers in one packet) and far shorter than the damage a slow-loris can
+# do. nginx's client_header_timeout defaults to 60s; this is deliberately
+# tighter because it is the BACKEND's own defence, not the edge's.
+header_read_timeout_seconds = 10
+
+# Maximum request body the server will read, in bytes.
+#
+# THIS WAS AXUM'S DEFAULT AND IS NOW A DECISION. MEASURED: the boundary was
+# exactly 2,097,153 bytes — axum-core's DefaultBodyLimit, described in its own
+# source as "the default limit of 2MB" and set by nothing here.
+#
+# 2 MiB KEEPS THE SHIPPED BEHAVIOUR DELIBERATELY. This makes the number explicit
+# and tested rather than changing what clients experience.
+#
+# KNOWN INCONSISTENCY, stated rather than silently fixed: the relay allows
+# client_max_body_size 25m, so a 3 MiB body passes the relay and is refused
+# here. Reconciling that is a product decision this line cannot make alone.
+max_body_bytes = 2097152
+
+# ===========================================================================
 # REALTIME (SSE)
 # ===========================================================================
 
