@@ -227,6 +227,28 @@ because it ran the suite regardless of whether the mutation applied. That is the
 keeps finding, written into my own script — the fix is to locate the anchor first and **refuse a verdict**
 when it is absent.
 
+#### The three largest website suites, and the last unexamined surface (round 29)
+
+`admin.test.ts` (79 assertions), `dashboard-form.test.ts` (108) and `auth-flow.test.ts` (38) were the last
+suites this audit had not exercised. All three `import` and drive real modules, and all three detect drift:
+
+| module | mutation | caught by |
+| --- | --- | --- |
+| `admin.ts` | the suspend state gate inverted | *"only an active account can be suspended, only a suspended one resumed"* |
+| `dashboard-form.ts` | the allowlist inverted (permits what it should deny) | *"an empty allowlist permits nothing"* |
+| `dashboard-form.ts` | `allowsModel` always allows | same, plus the model-access summary rule |
+| `auth-flow.ts` | the password floor lowered | *"password rules are stated up front, and the same rule for both pages"* |
+| `auth-flow.ts` | the confirmation check removed | *"the confirmation must match the password, before anything is sent"* |
+
+**The mutations are behavioural, and the failure messages name the rule rather than the input** — which is
+what makes them useful when they fire at 2am.
+
+**And the prose trap caught me for the third time in this audit.** My first two mutations replaced the
+FIRST textual occurrence of `'active'` and `'suspended'` in `admin.ts` — line 21, inside a doc comment —
+changed nothing, and reported SURVIVED. The gate is line 35. Rounds 14 and 24 recorded the same mistake;
+the reliable anchor is the **whole statement** (`return status === 'active';`), which cannot appear in
+prose.
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period
