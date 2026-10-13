@@ -1,9 +1,16 @@
 //! The authorization boundary for the admin account-control verbs, asserted THROUGH THE ROUTER.
 //!
-//! WHY THIS EXISTS. An audit measured that **23 of 37 mounted routes are never exercised as an HTTP
+//! WHY THIS EXISTS. An audit measured that **most mounted routes are never exercised as an HTTP
 //! path**: their wiring is proven only by a generic "this route matched - it is not a 404/405" table
 //! row in `routes::tests`. That table is deliberate about its scope and says so, but the consequence is
 //! that a handler can lose its authorization check and every test stays green.
+//!
+//! THE AUDIT FIGURE USED TO BE HERE AS "23 of 37", AND IT HAD GONE STALE. MEASURED against `ROUTES`
+//! when this was written: **38** routes are mounted, not 37, and nine of them sit under `/api/admin`.
+//! Nothing guarded the number - the inventory guard compares two LISTS rather than counting them - so
+//! it drifted by one unnoticed the first time a route was added, which is exactly what `config.rs`
+//! warns a count in a comment does. The test below pins the two counts that remain, so a reader now
+//! gets the number from a check rather than from prose.
 //!
 //! The highest-risk instance is `POST /api/admin/accounts/{id}/suspend` and its two siblings: the
 //! security-critical account-control verbs, driven by nothing through the router.
@@ -237,4 +244,43 @@ async fn an_operator_session_gets_past_the_authorization_layer() {
     );
 
     db.close().await;
+}
+
+/// THE TWO COUNTS THE HEADER STATES, READ FROM `ROUTES` RATHER THAN FROM PROSE.
+///
+/// The header carried "23 of 37 mounted routes" as an unaudited figure, and the 37 had become 38 the
+/// first time somebody added a route. The inventory guard
+/// (`the_route_inventory_matches_the_mounted_table`) compares ROUTES against MOUNTED_BY_THE_MACRO -
+/// two lists, not a count - so it passes either way and would not have noticed.
+///
+/// THIS PINS THE NUMBER RATHER THAN REPEATING IT. The header's argument is about SCALE - most routes
+/// are never driven as an HTTP path, which is why the wiring gap matters - so a reader who takes "37"
+/// for current will misjudge how much of the surface is unexercised.
+///
+/// A NEW ROUTE FLAILS HERE ON PURPOSE, and re-measuring is the fix: the count IS the audit, so a
+/// route added without a test is a change to the number this round measured.
+#[test]
+fn the_admin_boundary_header_states_the_route_count_it_ships() {
+    use crate::routes::ROUTES;
+
+    let mounted = ROUTES
+        .lines()
+        .filter(|line| line.trim_start().starts_with(".route("))
+        .count();
+    assert_eq!(
+        mounted,
+        38,
+        "the header says 38 routes are mounted; if ROUTES carries a different number now, the header is stale again - recompute it and the admin share, then edit the header"
+    );
+
+    let admin = ROUTES
+        .lines()
+        .filter(|line| line.trim_start().starts_with(".route("))
+        .filter(|line| line.contains("/api/admin"))
+        .count();
+    assert_eq!(
+        admin,
+        9,
+        "the header says nine routes sit under /api/admin; three of them are the account-control verbs this file asserts through the router"
+    );
 }
