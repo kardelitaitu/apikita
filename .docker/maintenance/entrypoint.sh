@@ -882,7 +882,7 @@ run_alert_checks() {
     fi
 
     # ALERT_STATE_DIR must PERSIST or the cooldown resets every run and pages
-    # repeatedly for one incident - README.md:121-122. It is pinned in the compose
+    # repeatedly for one incident - tools/alert/README.md:121-122. It is pinned in the compose
     # file onto the data volume; this only warns if someone unset it to a tmpfs.
     if [ -z "${ALERT_STATE_DIR:-}" ]; then
         log "job alerts: WARNING - ALERT_STATE_DIR is unset, so the cooldown falls back to /tmp and does not survive a restart; one incident may page once per run"

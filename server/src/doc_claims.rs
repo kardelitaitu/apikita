@@ -2975,6 +2975,122 @@ mod tests {
             problems.join("\n  ")
         );
     }
+
+    /// Every file under `dir`, recursively, skipping the generated and vendored directories.
+    fn collect_all_files(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        out: &mut Vec<std::path::PathBuf>,
+    ) {
+        let _ = root;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if NEVER_WALKED.contains(&name.as_str()) {
+                    continue;
+                }
+                collect_all_files(&path, root, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    /// A BARE BASENAME THAT MATCHES SEVERAL FILES IS A CITATION THAT CAN RESOLVE WRONG.
+    ///
+    /// `find_by_name` resolves `account.rs:388` by BASENAME, because that is how these documents
+    /// write it and how a reader resolves it - and its own note says ambiguity is accepted rather
+    /// than flagged. Existence is all it decides, so a name shared by several files is resolved by
+    /// "shortest path wins" and the citation silently means whichever one that is.
+    ///
+    /// MEASURED, and it had already happened: `.docker/maintenance/entrypoint.sh` cited bare
+    /// `README.md:121-122` in a comment about the ALERT COOLDOWN resetting. That is
+    /// `tools/alert/README.md`, whose lines 121-122 read "a cooldown that silently resets pages
+    /// repeatedly". The bare name matches FORTY files, and shortest-path-wins picked the repository
+    /// root README, whose 121 is a "Repository layout" heading. The citation was non-blank, in
+    /// range, and about something else entirely.
+    ///
+    /// THE RULE IS THAT A CITATION INTO A SHARED BASENAME MUST NAME ITS DIRECTORY, and it is a
+    /// SOURCE rule rather than a resolution rule: a path with a slash is unambiguous by
+    /// construction, so this asks the citation to say what it already knows. It cannot decide
+    /// whether a QUALIFIED path is the right file - nothing mechanical can - but it removes the one
+    /// case where the wrong file is chosen silently.
+    #[test]
+    fn a_citation_into_a_shared_basename_names_its_directory() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+        // Every basename that occurs more than once, which is what makes a bare citation ambiguous.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_all_files(&root, &root, &mut files);
+        assert!(
+            files.len() > 100,
+            "only {} files were walked, so this cannot see the real basename population",
+            files.len()
+        );
+        for path in &files {
+            if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
+                *seen.entry(name).or_insert(0) += 1;
+            }
+        }
+        let shared: Vec<&String> = seen
+            .iter()
+            .filter(|(_, n)| **n > 1)
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            !shared.is_empty(),
+            "no basename occurs twice, so this test cannot fail - which means it is reading the wrong tree"
+        );
+
+        // The citation walker's own file list, built the same way it builds it.
+        let mut cited_files: Vec<std::path::PathBuf> = Vec::new();
+        collect_markdown_excluding_docs(&root, &root, &mut cited_files);
+        for rel in [
+            "tools/wind-down/report.sh",
+            ".docker/maintenance/entrypoint.sh",
+            ".github/workflows/ci.yml",
+            "server/Cargo.toml",
+            "server/migrations/20260925000000_initial_schema.sql",
+            "server/migrations/20260930000001_credit_expiry.sql",
+        ] {
+            cited_files.push(root.join(rel));
+        }
+        cited_files.push(root.join("config/apikita.toml"));
+
+        let mut problems: Vec<String> = Vec::new();
+        for path in &cited_files {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let shown = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (i, line) in text.lines().enumerate() {
+                for (target, _) in citations_in(line) {
+                    let bare = !target.contains('/');
+                    if bare && shared.iter().any(|s| s.as_str() == target) {
+                        problems.push(format!(
+                            "{shown}:{} cites `{target}` with no directory, and that basename matches {} files - so it resolves to whichever one has the shortest path, which may not be the one meant",
+                            i + 1,
+                            seen.get(&target).copied().unwrap_or(0)
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "these citations name a directory-shared basename without saying which file:\n  {}",
+            problems.join("\n  ")
+        );
+    }
     /// THE ENV NAMES THE CONFIG NEEDS ARE THE ONES `.env.example` OFFERS, minus its
     /// DOCUMENTED EXCEPTIONS.
     ///
@@ -4326,11 +4442,22 @@ mod tests {
         //
         // `server/Cargo.toml` is here for the same reason and has one citation, to
         // `docs/topology.md`.
+        // AND THE MIGRATIONS, which are the schema of record and carry NINE citations between them.
+        // MEASURED: `20260925000000_initial_schema.sql` cited `identity.md:100` for "Google
+        // guarantees a verified address" while line 100 is about the citation guard's own rules;
+        // the claim it meant is at 131, which explains the very CHECK the comment sits above.
+        //
+        // THESE FILES ARE EDITED AFTER THEY SHIP, which is unusual and worth checking rather than
+        // assuming: `git log --follow` shows the initial schema taking four commits, so a comment
+        // here is not frozen and a citation in it can be repaired. A migration that may never be
+        // touched again would be the wrong place to demand one.
         for rel in [
             "tools/wind-down/report.sh",
             ".docker/maintenance/entrypoint.sh",
             ".github/workflows/ci.yml",
             "server/Cargo.toml",
+            "server/migrations/20260925000000_initial_schema.sql",
+            "server/migrations/20260930000001_credit_expiry.sql",
         ] {
             files.push(root.join(rel));
         }

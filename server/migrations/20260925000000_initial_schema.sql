@@ -49,7 +49,7 @@ CREATE TABLE identities (
   -- A password identity must carry a hash; an OAuth identity must not.
   CHECK ((provider = 'password') = (password_hash IS NOT NULL)),
 
-  -- Google guarantees a verified address (identity.md:100). Encode that so an
+  -- Google guarantees a verified address (architecture/identity.md:131). Encode that so an
   -- unverified Google identity cannot exist, rather than trusting the callback.
   CHECK (provider <> 'google' OR email_verified = 1)
 ) STRICT;

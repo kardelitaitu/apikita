@@ -106,7 +106,7 @@ this directory exists to catch.
 `tools/drill-check/` also exercises this drill, and its header claims to test that "a
 DRIFTED source FAILS" -- so it looked as though the restored-drift assertion might be pinned
 there even though it is not pinned here. It is not: neutering `if [ "$RESTORED_RC" -ne 0 ]`
-at `drill.sh:643` leaves **both** `rollback-check` and `drill-check` green.
+at `tools/rollback/drill.sh:675` leaves **both** `rollback-check` and `drill-check` green.
 
 That makes the restored-drift the most consequential of the four. It is the assertion that
 fails when the RESTORED database does not reconcile, which is the failure the drill exists to
