@@ -32,6 +32,34 @@ instance covers every case.
 | Token rate | `?tps=200` | `x-fake-tps: 200` | Chunks per second on the happy path |
 | First-token delay | `?delay=8000` | `x-fake-delay-ms: 8000` | Delay used by `fail=slow` |
 | Cut length | `?chunks=3` | `x-fake-chunks: 3` | Content chunks sent before a mid-stream cut (clamped to 3–5) |
+| **Per-key failure** | — | `x-fake-key-fail: sk-bad=429` | That **key** gets the status; every other key streams normally. A comma-separated map (`sk-a=429,sk-b=401`) names several |
+
+### Per-key failure, and why it exists
+
+The rows above make a failure a property of the **request**. The server's failover doctrine makes it a
+property of the **key**: a `429` (or anything in `key_pool.rate_limit_status`, which ships as `[429, 401]`)
+parks **that key** and rotates to the next, while a `5xx` trips the **endpoint**. A fake that answers every
+key the same way cannot tell those apart, so it could exercise only half of the doctrine.
+
+MEASURED: `server/src/upstream/client.rs` tests key rotation with a bespoke inline `TcpListener` — see
+`a_401_from_the_upstream_rotates_to_the_next_key` — because this fake never read `Authorization` at all.
+The behaviour this README names first, *"the proxy's key cooldown ... paths are testable"*, was the one the
+tool could not model.
+
+`x-fake-key-fail` maps a **bearer token** to the status that key receives:
+
+```bash
+# sk-bad is parked, sk-good streams - which is what makes rotation observable
+curl -sS -N http://127.0.0.1:8787/v1/chat/completions \
+  -H 'authorization: Bearer sk-bad' \
+  -H 'x-fake-key-fail: sk-bad=429' \
+  -d '{"model":"flash","stream":true,"messages":[]}'
+```
+
+Requests with no `Authorization`, or a token the map does not name, keep the behaviour of the rows above —
+so the map is opt-in and nothing existing changed. A `401` body says `invalid_api_key` rather than
+`server_error`, because the server classifies on **status** and the body should not contradict it.
+
 
 SSE chunk shape, terminated by `data: [DONE]`:
 

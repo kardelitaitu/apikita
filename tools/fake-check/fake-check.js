@@ -309,6 +309,39 @@ async function checkFakeUpstream(port) {
     if (viaHeader.status !== 429) fail(`x-fake-fail: 429 answered ${viaHeader.status}`);
     else ok('the x-fake-fail header form works');
 
+    // PER-KEY FAILURE - the row the README names first and the fake could not express.
+    //
+    // The server's doctrine is per-KEY for a rate limit and per-ENDPOINT for a 5xx. A fake that answers
+    // every key the same way cannot distinguish them, so this asserts the distinction: one key is parked,
+    // another streams. MEASURED before it existed: `client.rs` used a bespoke inline TcpListener for key
+    // rotation because the fake never read `Authorization`.
+    const keyed = (token, map) => post('', map ? { authorization: `Bearer ${token}`, 'x-fake-key-fail': map } : { authorization: `Bearer ${token}` });
+
+    const parked = await keyed('sk-bad', 'sk-bad=429');
+    if (parked.status !== 429) fail(`a key mapped to 429 answered ${parked.status}, so rotation cannot be exercised`);
+    else ok('a key mapped to 429 is parked (rate_limit_error)');
+
+    const rotated = await keyed('sk-good', 'sk-bad=429');
+    if (rotated.status !== 200) fail(`an UNMAPPED key answered ${rotated.status} while another key was parked - rotation would see no difference`);
+    else ok('an unmapped key still streams while another key is parked');
+
+    const twoKeys = await keyed('sk-good', 'sk-bad=429,sk-good=500');
+    if (twoKeys.status !== 500) fail(`a two-key map did not reach the second key: answered ${twoKeys.status}`);
+    else ok('a two-key map names each key independently');
+
+    const unauth = await post('');
+    if (unauth.status !== 200) fail(`a request with no Authorization answered ${unauth.status}; the map must be opt-in`);
+    else ok('the key map is opt-in: no Authorization means normal streaming');
+
+    const authBody = await keyed('sk-bad', 'sk-bad=401');
+    let authType = null;
+    try { authType = JSON.parse(authBody.body)?.error?.type ?? null; } catch { /* not json */ }
+    if (authBody.status !== 401 || authType !== 'invalid_request_error') {
+      fail(`a 401 body should read invalid_request_error, got status ${authBody.status} type ${authType}`);
+    } else {
+      ok('a 401 body says invalid_request_error, not server_error');
+    }
+
     const both = await post('?fail=500', { 'x-fake-fail': '429' });
     if (both.status !== 500) fail(`query flag must WIN over the header: asked ?fail=500 with x-fake-fail: 429, got ${both.status}`);
     else ok('the query flag WINS over the header when both are present');

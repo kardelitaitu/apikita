@@ -28,6 +28,47 @@ function positive(n, fallback) {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
+/**
+ * PER-KEY FAILURE INJECTION, which this fake claimed to support and did not.
+ *
+ * THE CLAIM, from its own README: "so the proxy's key cooldown, circuit breaker and mid-stream abort paths
+ * are testable without touching a real provider."
+ *
+ * WHAT IT COULD NOT DO. It never looked at `Authorization`, so a `429` was a property of the REQUEST rather
+ * than of the KEY. MEASURED: `server/src/upstream/client.rs` tests key rotation with a bespoke inline
+ * `TcpListener` instead — `a_401_from_the_upstream_rotates_to_the_next_key` — because the fake cannot
+ * express "this key is parked, that one works". The one behaviour the README names first was the one the
+ * tool could not model.
+ *
+ * WHY IT MATTERS. The server's failover doctrine is per-KEY for a rate limit and per-ENDPOINT for a 5xx
+ * (client.rs's own module doc). A fake that returns the same status to every key cannot distinguish the
+ * two, so it can only ever exercise half the doctrine.
+ *
+ * HOW IT WORKS. `x-fake-key-fail` maps a BEARER TOKEN to the status that key receives. The token is
+ * matched from the `Authorization: Bearer <token>` header the server sends (client.rs::send).
+ *
+ *   x-fake-key-fail: sk-bad=429        the key `sk-bad` gets 429; others stream normally
+ *   x-fake-key-fail: sk-a=429,sk-b=500 map two keys; anything unlisted streams
+ *
+ * Requests with no `Authorization` header and no map entry keep the existing behaviour, so every current
+ * row is unaffected.
+ */
+function keyFailure(headers) {
+  const spec = headers['x-fake-key-fail'];
+  if (typeof spec !== 'string' || spec.length === 0) return null;
+  const auth = headers['authorization'];
+  if (typeof auth !== 'string') return null;
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  for (const pair of spec.split(',')) {
+    const [key, status] = pair.split('=').map((s) => (s ?? '').trim());
+    if (key && key === token) {
+      const code = Number(status);
+      return Number.isInteger(code) && code >= 100 && code <= 599 ? code : null;
+    }
+  }
+  return null;
+}
+
 // Query flags win over the equivalent headers.
 function behaviour(url, headers) {
   const q = url.searchParams;
@@ -37,16 +78,24 @@ function behaviour(url, headers) {
     tps: positive(pick('tps', 'x-fake-tps'), 30),
     delayMs: positive(pick('delay', 'x-fake-delay-ms'), 5000),
     chunks: clamp(Math.trunc(positive(pick('chunks', 'x-fake-chunks'), 4)), 3, 5),
+    keyFail: keyFailure(headers),
   };
 }
 
 function errorBody(status, message) {
-  const rateLimited = status === 429;
+  // Three kinds, because the server classifies on STATUS and the body should not contradict it. A 401 is
+  // neither a rate limit nor a server fault: `rate_limit_status` in the server's config lists `[429, 401]`,
+  // so both park a key, but an OpenAI-shaped 401 says `invalid_api_key`, and mislabelling it
+  // `server_error` would make a key problem look like an upstream outage to anyone reading the body.
+  const kind =
+    status === 429 ? { type: 'rate_limit_error', code: 'rate_limit_exceeded' }
+    : status === 401 || status === 403 ? { type: 'invalid_request_error', code: 'invalid_api_key' }
+    : { type: 'server_error', code: 'internal_error' };
   return JSON.stringify({
     error: {
       message,
-      type: rateLimited ? 'rate_limit_error' : 'server_error',
-      code: rateLimited ? 'rate_limit_exceeded' : 'internal_error',
+      type: kind.type,
+      code: kind.code,
     },
   });
 }
@@ -83,6 +132,21 @@ const server = http.createServer(async (req, res) => {
   }
 
   req.resume(); // drain the request body; the fake ignores its content
+
+  // PER-KEY failure first, so one key can be parked while another streams - which is the only way to
+  // exercise the server's per-KEY rotation (see keyFailure above). It takes precedence over the request-wide
+  // `fail`, because a map that named this key is the more specific instruction.
+  if (b.keyFail !== null) {
+    res.writeHead(b.keyFail, { 'content-type': 'application/json' });
+    res.end(
+      errorBody(
+        b.keyFail,
+        b.keyFail === 429 ? 'fake upstream: rate limited for this key' : 'fake upstream: this key is refused',
+      ),
+    );
+    log(`inject ${b.keyFail} for the presented key`);
+    return;
+  }
 
   if (b.fail === '429' || b.fail === '500') {
     const status = Number(b.fail);
