@@ -3737,6 +3737,32 @@ mod tests {
                 TRIAGED.iter().any(|(n, _)| n == name),
                 "docs/{name} is neither citation-checked nor listed as deliberately not checked. Every document needs a decision: if an operator would be misled by a citation here that points somewhere else, add it to OPERATIONAL_DOCS; if not, add it to TRIAGED with the reason. A hand-kept list fails silently in exactly this direction."
             );
+            // AND THE OTHER DIRECTION, WHICH WAS MISSING AND IS THE ONE THAT DECAYS.
+            //
+            // Every check below iterates TRIAGED and READS the document it names. Both reads are
+            // silent on a missing file - one is `let Ok(text) = ... else { continue }`, the other is
+            // `read_to_string(..).unwrap_or_default()` - so a triage entry whose document has been
+            // deleted passes BOTH, and its reason goes on describing a file that is not there.
+            //
+            // MEASURED: deleting `docs/plan-audit.md`, which TRIAGED names by hand, left this test
+            // green. The failure that hides is the one the list is for: an entry saying "historical"
+            // or "superseded" is a claim ABOUT a document, and a claim about a document that does
+            // not exist cannot be read as anything but still-true.
+            //
+            // The loop above walks the DISK and caught a document with no entry; this walks the LIST
+            // and catches an entry with no document. Only the second decays quietly, which is why it
+            // needed saying rather than assuming.
+            for (name, _) in TRIAGED {
+                let path = doc_path(name);
+                assert!(
+                path.is_file(),
+                "TRIAGED names `{name}` and docs/{name} does not exist. An excluded document that was deleted leaves a reason describing nothing, and every check below reads that file with a fallback that treats it as empty rather than as missing."
+            );
+            }
+            assert!(
+                !TRIAGED.is_empty(),
+                "TRIAGED is empty, so the loop above checked no document at all"
+            );
         }
 
         // A REASON THAT CALLS A DOCUMENT HISTORICAL MUST BE ECHOED IN THE DOCUMENT.
