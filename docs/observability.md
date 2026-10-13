@@ -248,6 +248,16 @@ work — `db_disk` said "any age-based table" while the struct measured three of
 Both were fixed by hand, in the same commit as the code or the claim that made them true.
 The threshold and the coverage verdict exist ONLY in the TSV; this table has no column for
 either, which is why it is the TSV a reader should treat as the definition.
+
+**One more thing IS now checked, and it is the same shape one level down.** Every `alerts.tsv`
+row cites a row of THIS table by its **title**, and nothing verified that the title exists here —
+so renaming a row would leave its citations pointing at nothing while still reading as plausible
+references, which is the failure the no-line-numbers rule prevents for line citations. MEASURED,
+and it had already happened: `error_rate` cited `the "Error rate" row` while the row here reads
+**Error rate >5%**, and the TSV's own `title` column for that alert agrees with this table — so the
+row disagreed with ITSELF and `alert-check` was green. The gate now resolves every quoted title
+against this file and requires **all** of them, not a floor: a floor of 8 was written first and
+MEASURED to pass while a single citation had silently stopped being read.
 rather than once per run.
 
 **And they run on a schedule.** `.docker/maintenance/` invokes both nightly, so a breach

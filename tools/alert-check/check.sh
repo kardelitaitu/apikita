@@ -284,6 +284,40 @@ else
         fail "$STOPPED alerts.tsv citation(s) still use a LINE NUMBER (docs/observability.md:N). A line citation re-points at its neighbour the moment a row is added, which already happened to 9 of 11 of them - cite the row by name instead"
     fi
 
+    # AND EVERY QUOTED ROW TITLE MUST EXIST IN THE DOCUMENT.
+    #
+    # The citation above forbids a LINE NUMBER, which is right, and the replacement
+    # shape names a row by its TITLE. Nothing checked that the title is one the
+    # document actually has, so a renamed row leaves every citation to it pointing at
+    # nothing while still reading as a plausible reference - the same failure the line
+    # rule exists to prevent, one level up.
+    #
+    # MEASURED, and it had already happened: `error_rate` cited `the "Error rate" row`
+    # while the document's row reads `**Error rate >5%**`, and the TSV's own `title`
+    # column for that same alert says `Error rate >5%` - so the row disagreed with
+    # ITSELF, and this gate was green throughout.
+    UNRESOLVED=""
+    while IFS= read -r title; do
+        [ -n "$title" ] || continue
+        grep -qF "**$title**" "$OBS" || UNRESOLVED="$UNRESOLVED\n  $title"
+    done <<EOF
+$(grep -v '^#' "$TSV" | grep -v '^id' | cut -f7 | sed -n 's/.*the "\([^"]*\)" row.*/\1/p')
+EOF
+    if [ -n "$UNRESOLVED" ]; then
+        fail "alerts.tsv cites these observability row titles, and the document has no such row:$UNRESOLVED"
+    fi
+    # A scan that found no titles at all would pass the loop above by finding nothing, so
+    # the count is asserted too. Zero here means the citation format moved and this check
+    # stopped reading it, which is the failure mode a vacuous guard has.
+    TITLED=$(grep -v '^#' "$TSV" | grep -v '^id' | cut -f7 | sed -n 's/.*the "\([^"]*\)" row.*/\1/p' | grep -c .)
+    # EVERY ROW, not a floor. A floor of 8 was written first and MEASURED to be wrong:
+    # changing ONE citation to a shape the sed cannot read left 11 of 12 parsed, the floor
+    # passed, and the gate exited 0 with that alert unverified. The comparison must be to
+    # the registry size, so one unreadable citation is a failure rather than a rounding error.
+    ROWS=$(grep -v '^#' "$TSV" | grep -v '^id' | grep -c .)
+    if [ "$TITLED" -ne "$ROWS" ]; then
+        fail "$TITLED of $ROWS alerts.tsv citations name a row title. Every row must, or the check above silently skips the ones it cannot read - MEASURED by changing a single citation and watching a floor of 8 pass"
+    fi
     # -----------------------------------------------------------------------
     # AND THE COVERAGE COUNT THE PROSE STATES, which nothing compared.
     # -----------------------------------------------------------------------
