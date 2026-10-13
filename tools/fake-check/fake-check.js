@@ -224,16 +224,53 @@ async function checkFakeUpstream(port) {
   srv.stderr.on('data', (d) => { log += d; });
 
   const base = `http://127.0.0.1:${port}`;
+  /**
+   * The body this helper sends is the one the SERVER sends, not a convenient one.
+   *
+   * `stream_options: { include_usage: true }` is what `client.rs::prepare_body` inserts, and the fake now
+   * honours it the way a real upstream does. This helper omitted it, so it modelled a caller that does not
+   * exist - and when the fake started respecting the opt-in, the usage assertion failed against a request
+   * the server would never make. Sending the real shape is what keeps this gate a check on the fake's
+   * behaviour rather than on a fixture's.
+   */
+  const realBody = () => JSON.stringify({
+    model: 'flash',
+    messages: [{ role: 'user', content: 'hi' }],
+    stream: true,
+    stream_options: { include_usage: true },
+  });
+
+  /**
+   * A usage BLOCK, not the word "usage".
+   *
+   * THE FAKE'S OWN CANNED TEXT CONTAINS THE WORD *usage* - "settles usage from the final chunk" - so
+   * `/usage/.test(body)` is true of EVERY stream, and three assertions written that way were vacuous:
+   * "happy path carried usage", "midstream carried no usage", and the published-numbers check. MEASURED
+   * while gating the usage opt-in: a no-opt-in stream reported `hasUsage=true` because the substring
+   * matched the CHUNK CONTENT. A usage block is a JSON OBJECT key, so that is what is asserted now.
+   */
+  const usageBlock = (body) => {
+    for (const line of body.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const j = JSON.parse(line.slice(6));
+        if (j && typeof j === 'object' && 'usage' in j) return j.usage;
+      } catch { /* not a json line */ }
+    }
+    return null;
+  };
+
   const post = async (query, headers = {}) => {
     try {
       const r = await fetch(`${base}/v1/chat/completions${query}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...headers },
-        body: JSON.stringify({ model: 'flash', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+        body: realBody(),
       });
-      return { status: r.status, body: await r.text() };
+      const body = await r.text();
+      return { status: r.status, body, usage: usageBlock(body) };
     } catch (e) {
-      return { status: 'ERR', body: String(e.cause ? e.cause.code || e.message : e.message) };
+      return { status: 'ERR', body: String(e.cause ? e.cause.code || e.message : e.message), usage: null };
     }
   };
 
@@ -253,9 +290,40 @@ async function checkFakeUpstream(port) {
     const chunks = (happy.body.match(/^data: /gm) || []).length;
     if (happy.status !== 200 || chunks < 3) fail(`happy path: status ${happy.status}, ${chunks} chunks`);
     if (!happy.body.includes('[DONE]')) fail('happy path did not end with [DONE]');
-    if (!/usage/.test(happy.body)) fail('happy path carried no usage block');
-    if (happy.status === 200 && chunks >= 3 && happy.body.includes('[DONE]') && /usage/.test(happy.body)) {
+    if (happy.usage === null) fail('happy path carried no usage block');
+    if (happy.status === 200 && chunks >= 3 && happy.body.includes('[DONE]') && happy.usage !== null) {
       ok(`happy path streams ${chunks} chunks, ends [DONE], carries usage`);
+    }
+
+    // THE USAGE OPT-IN IS HONOURED, which is what makes the real upstream's behaviour representable.
+    //
+    // `client.rs::prepare_body` calls the missing-usage case "THE ONE ERROR AN ARBITRAGE GATEWAY CANNOT
+    // MAKE" - the block is emitted only when `stream_options.include_usage` is present, and settlement
+    // reads that block. The fake used to emit it unconditionally, so a caller that skipped the opt-in got
+    // a usage block anyway and the failure could not be expressed by this tool at all.
+    //
+    // Two directions, because a one-sided check would pass on a fake that ALWAYS omitted it.
+    const noOptIn = await (async () => {
+      try {
+        const r = await fetch(`${base}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'flash', messages: [], stream: true }), // no stream_options
+        });
+        return await r.text();
+      } catch (e) { return String(e.message); }
+    })();
+    if (usageBlock(noOptIn) !== null) {
+      fail('a request WITHOUT stream_options.include_usage still carried a usage block, so the gateway\'s no-usage path is unreachable through this tool');
+    } else {
+      ok('a request without the usage opt-in gets no usage block (the real upstream behaviour)');
+    }
+
+    const forced = await post('', { 'x-fake-usage': 'omit' });
+    if (forced.usage !== null) {
+      fail('x-fake-usage: omit still carried a usage block');
+    } else {
+      ok('x-fake-usage: omit removes the usage block while still finishing [DONE]');
     }
 
     // THE FIXED USAGE NUMBERS, read from the README and compared against a LIVE response.
@@ -281,10 +349,7 @@ async function checkFakeUpstream(port) {
     if (!readmeUsage) {
       fail('could not read the published usage numbers out of tools/fake-upstream/README.md, so the billing contract is unchecked');
     } else {
-      const m = happy.body.match(/"usage"\s*:\s*\{[^}]*\}/g);
-      const last = m ? m[m.length - 1] : null;
-      let got = null;
-      try { got = last ? JSON.parse('{' + last + '}').usage : null; } catch { /* unparseable */ }
+      const got = happy.usage;
       const same = got
         && got.prompt_tokens === readmeUsage.prompt_tokens
         && got.completion_tokens === readmeUsage.completion_tokens
@@ -370,8 +435,8 @@ async function checkFakeUpstream(port) {
       fail(`?fail=midstream delivered ${midChunks} chunks over a raw socket, but the README's row says the default cut is 3-5`);
     }
     if (mid.includes('[DONE]')) fail('?fail=midstream included [DONE], but the README says the cut is before it');
-    if (/usage/.test(mid)) fail('?fail=midstream included a usage block, but the README says there is none');
-    if (midChunks >= 3 && midChunks <= 5 && !mid.includes('[DONE]') && !/usage/.test(mid)) {
+    if (usageBlock(mid) !== null) fail('?fail=midstream included a usage block, but the README says there is none');
+    if (midChunks >= 3 && midChunks <= 5 && !mid.includes('[DONE]') && usageBlock(mid) === null) {
       ok(`?fail=midstream sent ${midChunks} chunks then cut, with no [DONE] and no usage`);
     }
 

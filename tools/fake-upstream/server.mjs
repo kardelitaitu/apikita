@@ -79,6 +79,9 @@ function behaviour(url, headers) {
     delayMs: positive(pick('delay', 'x-fake-delay-ms'), 5000),
     chunks: clamp(Math.trunc(positive(pick('chunks', 'x-fake-chunks'), 4)), 3, 5),
     keyFail: keyFailure(headers),
+    // `x-fake-usage: omit` forces the usage block to be omitted, so a test can reach the gateway's
+    // no-usage path without constructing a body that lacks the opt-in.
+    omitUsage: String(headers['x-fake-usage'] ?? '').toLowerCase() === 'omit',
   };
 }
 
@@ -131,7 +134,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  req.resume(); // drain the request body; the fake ignores its content
+  // THE BODY IS READ NOW, where it used to be discarded with `req.resume()`. The usage opt-in lives in it
+  // (`stream_options.include_usage`), and a fake that never looks cannot model the upstream that omits the
+  // block. Collected as text so a malformed body is not an exception.
+  let rawBody = '';
+  for await (const chunk of req) rawBody += chunk;
 
   // PER-KEY failure first, so one key can be parked while another streams - which is the only way to
   // exercise the server's per-KEY rotation (see keyFailure above). It takes precedence over the request-wide
@@ -202,19 +209,47 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  res.write(
-    `data: ${JSON.stringify({
-      id,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model: 'fake-upstream',
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      usage: USAGE,
-    })}\n\n`,
-  );
+  // THE USAGE BLOCK IS CONDITIONAL, because that is what a real OpenAI-compatible upstream does.
+  //
+  // `client.rs::prepare_body` says why this matters, in its own words: the block is emitted "on SSE only
+  // when this opt-in is present; otherwise they assume a human is watching and omit it. Settlement reads
+  // that block ... and settles nothing without it, so a stream that skipped the opt-in would deliver
+  // tokens and bill zero - THE ONE ERROR AN ARBITRAGE GATEWAY CANNOT MAKE."
+  //
+  // This fake always emitted it, so the failure that comment names was unrepresentable: a test could not
+  // ask "what does the gateway do when the opt-in is honoured by nobody". MEASURED: the server handles it
+  // correctly (`proxy.rs` calls `finish_status(0)` rather than settling, and three tests cover it), and the
+  // fix here is what lets that behaviour be driven end-to-end against something upstream-shaped.
+  //
+  // The opt-in is read from the REQUEST BODY, which this fake previously never parsed ("the fake ignores
+  // its content"). `x-fake-usage: omit` forces the omission regardless, so a test that needs the failure
+  // does not have to construct a body.
+  const wantsUsage = b.omitUsage
+    ? false
+    : (() => {
+        try {
+          const opts = JSON.parse(rawBody)?.stream_options;
+          return !!(opts && typeof opts === 'object' && opts.include_usage === true);
+        } catch {
+          return false;
+        }
+      })();
+
+  if (wantsUsage) {
+    res.write(
+      `data: ${JSON.stringify({
+        id,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: 'fake-upstream',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        usage: USAGE,
+      })}\n\n`,
+    );
+  }
   res.write('data: [DONE]\n\n');
   res.end();
-  log(`done, usage ${JSON.stringify(USAGE)}`);
+  log(wantsUsage ? `done, usage ${JSON.stringify(USAGE)}` : 'done, NO usage (the opt-in was not requested)');
 });
 
 server.on('clientError', (err, socket) => {
