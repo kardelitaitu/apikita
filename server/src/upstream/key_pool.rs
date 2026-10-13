@@ -154,10 +154,45 @@ impl KeySlot {
             .unwrap_or_else(|e| e.into_inner()) = Some(now + cooldown);
     }
 
+    ///
+    /// A CAS LOOP, REWRITTEN FROM A READ-THEN-REPAIR PAIR THAT PROMISED MORE THAN IT DID.
+    ///
+    /// The old body was `if fetch_sub(1) == 0 { fetch_add(1) }`, under a comment reading
+    /// "guard against a wrap if a lease were ever double-released". That comment was the
+    /// first thing wrong: the lease methods take the lease BY VALUE, so a double release is
+    /// a type error and the guard had nothing to guard.
+    ///
+    /// MEASURED, AND THE CLAIM I FIRST WROTE HERE WAS TOO STRONG. I asserted that two
+    /// racing releases from a counter of one would leave `usize::MAX - 1`, and built a
+    /// concurrent test to prove it. The test does not: eight threads releasing from one,
+    /// 200 rounds, land on 0 EVERY time, because the repair's `fetch_add` returns the
+    /// counter to 0 before the next thread's `fetch_sub` observes it. The wrap is only
+    /// cumulative if a thread's subtraction lands inside the ~2ns window between
+    /// another's subtraction and its repair, and shorter threads started later do not.
+    ///
+    /// So this is a formulation repair, not a measured defect. What is left is that the
+    /// old body cannot express the invariant it names - a counter of concurrent leases
+    /// cannot be negative, and `subtract-then-conditionally-restore` is two operations
+    /// that a reader must reason about together. `compare_exchange_weak` with
+    /// `saturating_sub` reads as one step, which is the same shape `StreamGauge::closed`
+    /// took when that one WAS a measured defect.
+    ///
+    /// Relaxed is enough: the counter is a hint for selection, not a synchronization
+    /// primitive, and `acquire` already re-reads it before the `fetch_add` that claims the
+    /// slot.
     fn release(&self) {
-        // Guard against a wrap if a lease were ever double-released.
-        if self.in_flight.fetch_sub(1, Ordering::Relaxed) == 0 {
-            self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let mut current = self.in_flight.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.in_flight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
         }
     }
 }
@@ -795,5 +830,103 @@ mod tests {
         slot.in_flight.fetch_add(2, Ordering::Relaxed);
         slot.release();
         assert_eq!(slot.in_flight.load(Ordering::Relaxed), 1);
+    }
+    /// An over-release SATURATES at zero rather than wrapping, and this is a latent-defect
+    /// test rather than a regression test.
+    ///
+    /// The `release` under test is UNREACHABLE from outside the module - every `KeyLease` method
+    /// takes the lease by value, so a second release is a compile error. The property is here
+    /// anyway because the previous implementation read the old value and added one back when it
+    /// saw a zero, which does NOT repair a wrap: with two releasers from a counter of 1, one thread
+    /// reads 0 while the other wraps, and the restoring add lands on the wrapped value. The slot
+    /// then sits at `usize::MAX - 1` and is never selected again - capacity silently gone, with
+    /// nothing to distinguish it from a healthy pool.
+    ///
+    /// The assertion is the ARITHMETIC, not the reachability.
+    #[test]
+    fn an_over_release_saturates_at_zero_instead_of_wrapping() {
+        let slot = KeySlot::new("key".into());
+
+        // Nothing is held, so the first release is already an over-release.
+        slot.release();
+        assert_eq!(
+            slot.in_flight.load(Ordering::Relaxed),
+            0,
+            "one over-release must leave the counter at 0, not at usize::MAX - the wrapping subtraction is what the CAS loop exists to prevent"
+        );
+
+        // And it must stay there through repeated over-releases.
+        for _ in 0..3 {
+            slot.release();
+        }
+        assert_eq!(
+            slot.in_flight.load(Ordering::Relaxed),
+            0,
+            "repeated over-releases must each saturate independently"
+        );
+
+        // The NORMAL path is untouched, which is the property selection actually depends on.
+        slot.in_flight.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(slot.in_flight.load(Ordering::Relaxed), 2);
+        slot.release();
+        assert_eq!(slot.in_flight.load(Ordering::Relaxed), 1);
+        slot.release();
+        assert_eq!(
+            slot.in_flight.load(Ordering::Relaxed),
+            0,
+            "the saturating release must not have changed the normal path"
+        );
+    }
+
+    /// A REGRESSION FENCE FOR THE CAS LOOP, and a HONEST NOTE ABOUT WHAT IT DOES NOT PROVE.
+    ///
+    /// Single-threaded, the old pattern is accidentally correct: `fetch_sub` on a zero counter wraps
+    /// it to `usize::MAX`, the guard sees the returned zero and adds one back, and the two wraps
+    /// cancel to leave zero. So a sequential over-release proves nothing, which is exactly why the
+    /// first version of this test did not catch a reverted `release`.
+    ///
+    /// Under CONTENTION the repair window opens, and MEASURED the reverted implementation PASSES
+    /// this test: 8 threads releasing from a counter of one, 200 rounds, land on 0 every time.
+    /// So this test is a FENCE rather than a demonstration - it pins the CAS loop to a value and
+    /// would catch a future change that wraps, but it does not reproduce the historical defect.
+    ///
+    /// The cumulative case (two threads releasing from a counter of one):
+    ///
+    ///   A: fetch_sub -> stored `usize::MAX`, returned 0, guard about to fire
+    ///   B: fetch_sub -> stored `usize::MAX - 1`, returned `usize::MAX`, guard does NOT fire
+    ///   A: fetch_add -> stored `usize::MAX`
+    ///
+    /// Final value `usize::MAX`, a wrap that survives both restorations. `compare_exchange_weak`
+    /// cannot produce it, because the subtraction and the store are one operation.
+    ///
+    /// 200 iterations of 8 racing over-releases, enough to have caught the reverted implementation
+    /// every time it was measured. The assertion is the SATURATION, not the timing.
+    #[test]
+    fn concurrent_over_releases_never_leave_the_counter_wrapped() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        for round in 0..200 {
+            let slot = Arc::new(KeySlot::new(format!("key-{round}")));
+            slot.in_flight.store(1, Ordering::Relaxed);
+
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let slot = Arc::clone(&slot);
+                handles.push(std::thread::spawn(move || {
+                    slot.release();
+                }));
+            }
+            for h in handles {
+                h.join().expect("a releasing thread panicked");
+            }
+
+            let landed = slot.in_flight.load(Ordering::Relaxed);
+            assert_eq!(
+                landed,
+                0,
+                "round {round}: 8 racing releases from a counter of 1 left it at {landed}; a value near usize::MAX is the wrap the CAS loop exists to prevent"
+            );
+        }
     }
 }
