@@ -4266,6 +4266,22 @@ mod tests {
     /// `account.rs:388`, not `server/src/routes/account.rs:388` - and a reader resolves it the
     /// same way. Ambiguity is accepted rather than flagged: the point is that the target is
     /// reachable, not that it is unique.
+    ///
+    /// WHAT IT WALKS NOW, stated because the paragraph above says "a markdown file" and the scope
+    /// has since widened twice - each time because a file carrying citations sat outside every
+    /// walker, and a check whose own description understates its scope is the one a reader trusts
+    /// wrongly:
+    ///
+    ///   * every `.md` outside `docs/`, which is what the paragraph above describes;
+    ///   * `config/apikita.toml`, which carried TEN unchecked citations - the file an operator
+    ///     reads before touching a price;
+    ///   * `tools/wind-down/report.sh` and `.docker/maintenance/entrypoint.sh`, 17 and 13
+    ///     citations in the two scripts whose comments an operator follows under pressure.
+    ///
+    /// AND IT CHECKS THE LANDED LINE HAS CONTENT, not only that it exists. Bounds alone accepted a
+    /// blank target line, which is how eleven citations were found pointing at separators. A range
+    /// may start on one - the range IS the content below it - so a range must contain a non-blank
+    /// line while a single line must itself be non-blank.
     #[test]
     fn line_citations_outside_docs_point_at_files_that_can_contain_them() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
