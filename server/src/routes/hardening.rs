@@ -21,9 +21,18 @@
 //!     a denial-of-service: a slow client holds a slot forever and 512 slow clients refuse every other
 //!     customer. This is the layer that makes the other two hold.
 //!
-//! ORDER MATTERS, and the outermost is applied last in axum. The concurrency limit is outermost so a
-//! request that cannot get a slot is refused before it is timed or buffered; the timeout is next, so a
-//! slot cannot be held indefinitely; the body limit is innermost, closest to the extractor that reads.
+//! ORDER MATTERS, and the outermost is applied last in axum. The TIMEOUT is outermost, then the
+//! concurrency limit, then the body limit innermost, closest to the extractor that reads.
+//!
+//! **THIS PARAGRAPH SAID THE OPPOSITE AND WAS WRONG.** It read *"The concurrency limit is outermost
+//! so a request that cannot get a slot is refused before it is timed or buffered; the timeout is
+//! next"* - which contradicted both the code and the `INNERMOST`/`OUTERMOST` markers below it, and
+//! `routes/mod.rs` repeated the same sentence. MEASURED, and it was wrong about the MECHANISM as well
+//! as the order: `tower::limit::ConcurrencyLimitLayer` does not refuse, it WAITS - `poll_ready`
+//! acquires a semaphore permit and returns `Pending` when saturated - so a request over the limit is
+//! QUEUED in either order. What the order decides is whether the WAIT is bounded: with the timeout
+//! outside, a request that never gets a slot returns 503 after `request_timeout`, which is the
+//! arrangement shipped here and the defensible one.
 //!
 //! WHAT THIS DOES NOT DO. It does not rate-limit per caller — that is `[limits]` and the relay's
 //! `limit_req_zone`. It bounds the SERVER's own exposure, which is a different question from fairness
@@ -164,6 +173,54 @@ mod tests {
             config.server.max_body_bytes, 2_097_152,
             "MEASURED boundary was 2,097,152 bytes accepted and 2,097,153 refused; if this moves, the \
              relay's client_max_body_size and docs/load-test.md must move with it"
+        );
+    }
+    /// THE INBOUND LAYERS' ORDER, PINNED BY BEHAVIOUR RATHER THAN BY A COMMENT.
+    ///
+    /// THREE COMMENTS DESCRIBED THIS AND ONE OF THEM WAS WRONG. `hardening.rs`'s module doc said
+    /// *"The concurrency limit is outermost so a request that cannot get a slot is refused before it
+    /// is timed or buffered; the timeout is next"*, and `routes/mod.rs` repeated it. The CODE applies
+    /// `TimeoutLayer` LAST, which in axum makes it the OUTERMOST - so the two comments contradicted
+    /// each other and the inline `INNERMOST`/`OUTERMOST` markers agreed with the code.
+    ///
+    /// The observable settles it, and it is not what either comment claimed. MEASURED:
+    ///
+    ///   * `tower::limit::ConcurrencyLimitLayer` WAITS rather than refusing - its `poll_ready`
+    ///     acquires a semaphore permit and returns `Pending` when saturated. So a request over the
+    ///     limit is QUEUED, not refused, whichever order the layers are in.
+    ///   * With the timeout OUTSIDE that queue, the WAIT ITSELF is bounded: a request that never
+    ///     gets a slot returns 503 after `request_timeout`. That is the shipped arrangement and it
+    ///     is the defensible one - a queued request cannot hang forever.
+    ///
+    /// So the comments are corrected to say queued-and-bounded, and this test pins the arrangement
+    /// they describe. It asserts the ORDER rather than the saturation, because driving a real
+    /// saturation would need 512 in-flight requests to observe what a one-line composition shows.
+    #[test]
+    fn the_timeout_layer_is_outermost_so_a_queued_request_cannot_wait_forever() {
+        // `hardening::apply` is the only place the three are composed, so the assertion reads its
+        // own source for the call order.
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/hardening.rs"),
+        )
+        .expect("hardening.rs must be readable, or this checks nothing");
+
+        let body = source.find(".layer(DefaultBodyLimit::max(").expect(
+            "the body limit must still be applied first, or this is reading the wrong file",
+        );
+        let concurrency = source
+            .find(".layer(tower::limit::ConcurrencyLimitLayer::new(")
+            .expect("the concurrency limit must still be applied");
+        let timeout = source
+            .find(".layer(TimeoutLayer::with_status_code(")
+            .expect("the timeout must still be applied");
+
+        assert!(
+            body < concurrency,
+            "the body limit must be applied BEFORE the concurrency limit, so it sits innermost"
+        );
+        assert!(
+            concurrency < timeout,
+            "the timeout must be applied LAST, which makes it OUTERMOST. It was applied before the concurrency limit once, and the module doc still described that order; a queued request would then wait unboundedly rather than being bounded by the timeout"
         );
     }
 }

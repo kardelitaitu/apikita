@@ -532,9 +532,12 @@ pub fn create_router(state: AppState) -> Router {
         oversize::documented_oversize_response,
     ))
     .with_state(state.clone());
-    // The inbound hardening is applied OUTSIDE everything above, so a request that cannot get a
-    // concurrency slot is refused before it is timed or buffered. See `hardening` for why all three
-    // layers are needed and what each one bounds that the others do not.
+    // The inbound hardening is applied OUTSIDE everything above, so the timeout bounds the whole
+    // request INCLUDING a wait for a concurrency slot. The comment here used to say a request
+    // "is refused before it is timed or buffered", which was wrong twice: `tower`'s concurrency
+    // limiter WAITS rather than refusing, and the timeout is outside it, so a queued request is
+    // bounded by the timeout rather than refused ahead of it. See `hardening` for the correction
+    // and for why all three layers are needed and what each bounds that the others do not.
     //
     // The WHOLE config, not `&state.config.server`: the request timeout has to be the upstream's
     // allowance, which lives under `[circuit_breaker]`. Passing only the server section is what let the
