@@ -29,6 +29,33 @@ provider exists).
 
 An endpoint is a `(url + upstream_model)` pair with a key pool.
 
+**Those two strings ARE the endpoint, and both are now checked at config load** —
+along with the endpoint's `name`, which is what every message about it uses to say
+*which* one is meant. Before that, the validator checked `weight` for finiteness and
+the rate overrides for sign, which is everything except the parts that address the
+provider:
+
+| Field | Refused at load when | What it cost to discover at runtime instead |
+| --- | --- | --- |
+| `upstream_model` | empty or blank | `prepare_body` writes `"model": ""`; the provider refuses **every** request on that endpoint, and the operator hears it from a customer |
+| `url` | not an absolute `http(s)` URL | the client rejects it as a relative address, so it arrives as a TRANSPORT error, the breaker trips, and the endpoint leaves rotation — indistinguishable from the provider being down |
+| `name` | empty, or duplicated **within one model** | the routing log, the health report and a `no-endpoint-serves-model` error all identify an endpoint by name, so a blank or duplicated one makes the single message an operator needs ambiguous |
+| `api_key_envs` | empty while `weight > 0` | the endpoint can never serve, its breaker is never exercised so it stays Closed forever, and it votes healthy in `all_endpoints_unhealthy` — masking a real outage |
+
+**Keys are exempt at `weight = 0`; `url` and `upstream_model` are not.** The asymmetry
+is deliberate. A placeholder names a key nobody has bought yet, so `.env.example`
+cannot document it and refusing one would reject the config that ships. But every
+weight-0 placeholder the shipped config carries *already* has a real url and a real
+model, so enforcing those unconditionally costs nothing today and buys the guarantee
+that **raising a weight is a one-line, safe edit** — `secondary` exists precisely to
+be activated when a second provider's terms are read.
+
+**None of these consult the network.** A validator that called the provider would make
+starting the server depend on a third party, which is the same reason `/health` never
+checks upstream. Whether a provider actually *serves* the configured name remains a
+runtime fact, and a 404 from every endpoint is reported as the configuration fault it
+is — see Layer 3 below.
+
 | State | Behaviour |
 | --- | --- |
 | **Closed** (healthy) | Normal routing |

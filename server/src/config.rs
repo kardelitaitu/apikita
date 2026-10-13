@@ -1123,7 +1123,126 @@ impl AppConfig {
             // An override is what the reservation is sized from, so a 0 or
             // negative one would under-reserve silently. A MISSING override
             // falls back to the model's rate, so only a present value is checked.
+            // DUPLICATE ENDPOINT NAMES ARE REJECTED PER MODEL, and the scope is the
+            // model rather than the file because that is the scope everything else uses:
+            // the routing loop walks one model's endpoints, and an endpoint name is only
+            // ever compared within that walk. Two models may legitimately each have a
+            // \"primary\" - that is the shipped config's own shape, where every model buys
+            // from the same three suppliers.
+            {
+                let mut seen: Vec<&str> = Vec::new();
+                for endpoint in &model.endpoints {
+                    if seen.contains(&endpoint.name.as_str()) {
+                        return Err(format!(
+                            "Model {} has two endpoints named {}: the name is what the streaming \
+                             log, the health report and a no-endpoint-serves-model error use to \
+                             say WHICH endpoint is meant, so a duplicate makes the one message an \
+                             operator needs ambiguous at the moment they need it",
+                            model.name, endpoint.name
+                        )
+                        .into());
+                    }
+                    seen.push(&endpoint.name);
+                }
+            }
             for endpoint in &model.endpoints {
+                // THE THREE FIELDS THAT ROUTE, AND NOTHING CHECKED ANY OF THEM.
+                //
+                // An endpoint is only ever used through three strings — `url`,
+                // `upstream_model` and `name` — and until now the validator looked at
+                // none of them. It checked `weight` for finiteness and the rate overrides
+                // for sign, which is to say it checked everything EXCEPT the parts that
+                // address the provider.
+                //
+                // WHY THAT IS WORSE THAN A MISSING CHECK IN GENERAL, and the reason this
+                // belongs here rather than at the use site: all three failures are
+                // discovered by a PAYING CUSTOMER, mid-flight, as an upstream error. There
+                // is no boot-time signal and no alert, because from the router's side an
+                // endpoint with a typo looks exactly like a provider having a bad day:
+                //
+                //   * empty or blank `upstream_model` -> `prepare_body` writes
+                //     `"model": ""`. Every request on that endpoint is refused by the
+                //     provider, which is the pool-wide 404 the router now reports as a
+                //     configuration fault — found by a customer, not by the operator who
+                //     typed it.
+                //   * a URL with no scheme, or blank -> `send` builds
+                //     `"/chat/completions"` (or `"api.x.com/v1/chat/completions"`), which
+                //     reqwest rejects as a relative URL. That arrives as a TRANSPORT error,
+                //     so `record_failure` trips the breaker and the endpoint is taken out
+                //     of rotation for a config typo — indistinguishable from the provider
+                //     being down.
+                //   * a duplicate endpoint `name` within a model -> the name is what
+                //     `UpstreamStream::endpoint_name` reports, what the "Proxy streaming
+                //     from upstream" log line carries, and what a `NoEndpointServesModel`
+                //     entry uses to say WHICH rewrite is wrong. Two endpoints sharing one
+                //     makes all three ambiguous at exactly the moment an operator is
+                //     reading them to find the fault.
+                //
+                // WHAT THIS DELIBERATELY DOES NOT DO is reach the network. A validator that
+                // called the provider would turn a config load into a startup dependency
+                // on a third party, and `/health` is forbidden from checking upstream for
+                // the same reason (docs/failover.md: an upstream outage must not look like
+                // a dead server). So these are SHAPE checks only: a non-empty name and
+                // model, and a URL that is absolute http(s). Whether the provider actually
+                // serves the name stays a runtime fact.
+                if endpoint.name.trim().is_empty() {
+                    return Err(format!(
+                        "Model {} has an endpoint with an empty name: the name identifies the \
+                         endpoint in the routing log, in a health report and in a \
+                         no-endpoint-serves-model error, so it cannot be blank",
+                        model.name
+                    )
+                    .into());
+                }
+                if endpoint.upstream_model.trim().is_empty() {
+                    return Err(format!(
+                        "Model {} endpoint {} has an empty upstream_model: it is written into \
+                         every request body as \"model\", so the provider would refuse every \
+                         call to this endpoint - discovered by a customer rather than here",
+                        model.name, endpoint.name
+                    )
+                    .into());
+                }
+                // ABSOLUTE http(s) ONLY. A relative or scheme-less URL is not a provider
+                // address; reqwest rejects it and the endpoint's breaker absorbs the
+                // failure as though the provider were down.
+                if !(endpoint.url.starts_with("http://") || endpoint.url.starts_with("https://")) {
+                    return Err(format!(
+                        "Model {} endpoint {} has a url that is not an absolute http(s) URL: \
+                         {}. A scheme-less or empty URL is rejected by the HTTP client as a \
+                         relative address, which trips the circuit breaker and removes the \
+                         endpoint from rotation as if the provider were down",
+                        model.name, endpoint.name, endpoint.url
+                    )
+                    .into());
+                }
+                // URL AND MODEL ARE **NOT** EXEMPTED AT WEIGHT 0, unlike the key check below,
+                // and the asymmetry is deliberate. An unrouted placeholder cannot misroute
+                // anything, so refusing it for a blank model or URL would cost nothing
+                // operationally — the argument for exemption is convenience, and it is
+                // weak enough to refuse: MEASURED, every weight-0 placeholder the config
+                // ships already carries a real url and a real upstream_model, so
+                // unconditional enforcement rejects nothing today.
+                //
+                // What it BUYS is the guarantee that raising a weight is a one-line,
+                // safe edit. `secondary` in the shipped config is a placeholder whose
+                // resale terms are unread and whose intended meaning is "raise this weight
+                // when a second provider exists". The moment an operator does, the endpoint
+                // starts routing with data that has never been validated; with these
+                // checks unconditional it has been validated since the moment it was
+                // written, and the one line that activates it is the only thing that had to
+                // change. That is the same structural reason the cache-rate bound is a
+                // rule here rather than a comment.
+                if endpoint.weight > 0.0 && endpoint.api_key_envs.is_empty() {
+                    return Err(format!(
+                        "Model {} endpoint {} is routable (weight {}) but lists no \
+                         api_key_envs: it can never serve a request, and because its breaker \
+                         is never exercised it stays Closed forever and can mask a real \
+                         outage of the endpoints that do serve",
+                        model.name, endpoint.name, endpoint.weight
+                    )
+                    .into());
+                }
                 // An override is what the reservation is sized from, so a NaN here
                 // under-reserves by the same route a zero does, and for the same
                 // reason: the "<= 0" test below is false for it.
@@ -1623,6 +1742,217 @@ mod tests {
             .expect_err("an empty model list must be refused")
             .to_string();
         assert!(err.contains("At least one model"), "got {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The three fields that ADDRESS a provider: url, upstream_model, name
+    // -----------------------------------------------------------------------
+
+    /// Every one of these loads a REAL config and breaks exactly one field, so the
+    /// failure is provably caused by the field and not by a hand-built fixture that
+    /// would pass whatever the validator happened to check.
+    fn loadable_config() -> AppConfig {
+        AppConfig::load_from_file("../config/apikita.toml")
+            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
+            .expect("config/apikita.toml must load")
+    }
+
+    /// AN EMPTY upstream_model WRITES \"model\": \"\" INTO EVERY REQUEST BODY, so the
+    /// provider refuses every call on that endpoint. The operator learned it from a
+    /// customer, mid-flight; this makes it a boot error naming the field.
+    #[test]
+    fn an_empty_upstream_model_is_refused_at_validate() {
+        for bad in ["", "   "] {
+            let mut config = loadable_config();
+            config.models[0].endpoints[0].upstream_model = bad.to_string();
+            let err = config
+                .validate()
+                .expect_err("an empty upstream_model must be refused")
+                .to_string();
+            assert!(
+                err.contains("empty upstream_model"),
+                "got {err} for upstream_model={bad:?}"
+            );
+        }
+    }
+
+    /// A SCHEME-LESS URL IS NOT A PROVIDER ADDRESS. reqwest rejects it as relative, the
+    /// failure arrives as a TRANSPORT error, and the endpoint's breaker trips — so a
+    /// config typo is indistinguishable from the provider being down.
+    #[test]
+    fn a_url_without_a_scheme_is_refused_at_validate() {
+        for bad in ["", "api.example.com/v1", "ftp://api.example.com/v1"] {
+            let mut config = loadable_config();
+            config.models[0].endpoints[0].url = bad.to_string();
+            let err = config
+                .validate()
+                .expect_err("a non-absolute-http url must be refused")
+                .to_string();
+            assert!(
+                err.contains("not an absolute http(s) URL"),
+                "got {err} for url={bad:?}"
+            );
+        }
+    }
+
+    /// BOTH SCHEMES ARE ACCEPTED, so the rule is "absolute http(s)" and not "https only
+    /// because that is what the shipped file happens to use". A local development stack
+    /// talks to a fake upstream over plain http.
+    #[test]
+    fn both_http_and_https_urls_are_accepted() {
+        let mut config = loadable_config();
+        config.models[0].endpoints[0].url = "http://127.0.0.1:8787/v1".to_string();
+        config
+            .validate()
+            .expect("a plain-http URL is a real address and must be accepted");
+    }
+
+    /// A BLANK ENDPOINT NAME HIDES THE ENDPOINT FROM EVERY MESSAGE that is supposed to
+    /// identify it — the routing log, the health report, and a
+    /// no-endpoint-serves-model error.
+    #[test]
+    fn a_blank_endpoint_name_is_refused_at_validate() {
+        for bad in ["", "  "] {
+            let mut config = loadable_config();
+            config.models[0].endpoints[0].name = bad.to_string();
+            let err = config
+                .validate()
+                .expect_err("a blank endpoint name must be refused")
+                .to_string();
+            assert!(err.contains("empty name"), "got {err} for name={bad:?}");
+        }
+    }
+
+    /// TWO ENDPOINTS SHARING A NAME make the one message an operator needs ambiguous at
+    /// the moment they need it: "endpoint primary answered 404" cannot say which.
+    ///
+    /// SCOPED PER MODEL, and the positive control below asserts the scope, because the
+    /// shipped config gives EVERY model a "primary" — a file-wide uniqueness rule would
+    /// reject the config that ships.
+    #[test]
+    fn a_duplicate_endpoint_name_within_a_model_is_refused() {
+        let mut config = loadable_config();
+        let model = &mut config.models[0];
+        assert!(
+            model.endpoints.len() >= 2,
+            "the fixture needs two endpoints to collide them"
+        );
+        let first = model.endpoints[0].name.clone();
+        model.endpoints[1].name = first.clone();
+        let err = config
+            .validate()
+            .expect_err("a duplicate endpoint name within a model must be refused")
+            .to_string();
+        assert!(
+            err.contains("two endpoints named"),
+            "got {err} for a duplicated {first:?}"
+        );
+    }
+
+    /// THE POSITIVE CONTROL FOR THE SCOPE: the same name in two DIFFERENT models is
+    /// legal, and the shipped config relies on it.
+    #[test]
+    fn the_same_endpoint_name_in_two_models_is_accepted() {
+        let config = loadable_config();
+        let names: Vec<&str> = config
+            .models
+            .iter()
+            .filter_map(|m| m.endpoints.first().map(|e| e.name.as_str()))
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert!(
+            sorted.len() < names.len(),
+            "the shipped config must actually contain a repeated endpoint name across \
+             models, or this control proves nothing: {names:?}"
+        );
+        config
+            .validate()
+            .expect("a name repeated ACROSS models is the shipped shape and must load");
+    }
+
+    /// A ROUTABLE ENDPOINT WITH NO KEYS CANNOT SERVE, and its breaker is never exercised
+    /// so it stays Closed forever — which lets it vote healthy in
+    /// `all_endpoints_unhealthy` and mask a real outage of the endpoints that DO serve.
+    /// That is the exact shape the shipped config carried until `secondary` was moved to
+    /// weight 0, and the alert was structurally unable to fire.
+    #[test]
+    fn a_routable_endpoint_with_no_keys_is_refused() {
+        let mut config = loadable_config();
+        let endpoint = &mut config.models[0].endpoints[0];
+        assert!(
+            endpoint.weight > 0.0,
+            "the fixture must target a ROUTED endpoint, or the weight-0 exemption passes it"
+        );
+        endpoint.api_key_envs.clear();
+        let err = config
+            .validate()
+            .expect_err("a routable endpoint with no keys must be refused")
+            .to_string();
+        assert!(err.contains("lists no"), "got {err}");
+    }
+
+    /// THE ASYMMETRY: keys are exempt at weight 0, url and model are NOT, and this pins
+    /// that rather than assuming it.
+    ///
+    /// An unrouted endpoint cannot misroute a request, so exempting its route data would
+    /// be defensible — but MEASURED, every weight-0 placeholder the shipped config carries
+    /// already has a real url and a real upstream_model, so unconditional enforcement
+    /// rejects nothing today, and it buys the guarantee that RAISING A WEIGHT IS A
+    /// ONE-LINE SAFE EDIT. `secondary` is a placeholder whose meaning is "activate this
+    /// when a second provider exists"; the moment an operator raises its weight it starts
+    /// routing, and with these checks unconditional its data has been valid since the
+    /// moment it was written.
+    ///
+    /// The KEY requirement IS exempt, for the opposite reason: a placeholder names an env
+    /// var whose key nobody has bought yet, so `.env.example` cannot document it and the
+    /// config could not ship. That is a real cost, so it is refused only for endpoints
+    /// that are actually routed.
+    #[test]
+    fn weight_zero_exempts_keys_but_not_url_or_model() {
+        // Each mutation is a SEPARATE load, because the borrow checker will not hold
+        // a mutable endpoint borrow across a validate() that needs the whole config —
+        // and taking them one at a time also keeps each assertion about exactly one
+        // field, so a failure names its own cause.
+        let mut config = loadable_config();
+        {
+            let endpoint = &mut config.models[0].endpoints[0];
+            assert!(
+                endpoint.weight > 0.0,
+                "the fixture must start at a routable weight"
+            );
+            endpoint.weight = 0.0;
+            endpoint.api_key_envs.clear();
+        }
+        // Keys are the exemption, so this alone must pass.
+        config
+            .validate()
+            .expect("a weight-0 endpoint with no keys must validate: a placeholder names a key nobody has bought");
+
+        let mut config = loadable_config();
+        {
+            let endpoint = &mut config.models[0].endpoints[0];
+            endpoint.weight = 0.0;
+            endpoint.url = String::new();
+        }
+        let err = config
+            .validate()
+            .expect_err("a weight-0 endpoint still needs a real url")
+            .to_string();
+        assert!(err.contains("not an absolute http(s) URL"), "got {err}");
+
+        let mut config = loadable_config();
+        {
+            let endpoint = &mut config.models[0].endpoints[0];
+            endpoint.weight = 0.0;
+            endpoint.upstream_model = String::new();
+        }
+        let err = config
+            .validate()
+            .expect_err("a weight-0 endpoint still needs a real upstream_model")
+            .to_string();
+        assert!(err.contains("empty upstream_model"), "got {err}");
     }
 
     /// A non-positive price multiplier would size every reservation from zero,
