@@ -4317,9 +4317,20 @@ mod tests {
         // `.sh` only, and not `.py`/`.js`/`.ts`: those are covered where they live - the website
         // suite reads its own sources and the probes are exercised by `sqlite-probes-check` - and
         // widening this walk to every text file would make the floor below meaningless.
+        // AND THE DEPLOYMENT FILES, which carry citations nothing else reads. MEASURED: the
+        // workflow has TEN, and two of them were wrong by a wide margin - `ci.yml` cited
+        // `docs/ci-cd.md:372` for a question that had MOVED to 758, and `api-spec.md:466-470` for
+        // the health rule, which is at 809. Both pointed at blank lines or an unrelated section,
+        // and neither was checked by anything: the workflow is not markdown, not TOML and not
+        // Rust, so every walker in this file stepped over it.
+        //
+        // `server/Cargo.toml` is here for the same reason and has one citation, to
+        // `docs/topology.md`.
         for rel in [
             "tools/wind-down/report.sh",
             ".docker/maintenance/entrypoint.sh",
+            ".github/workflows/ci.yml",
+            "server/Cargo.toml",
         ] {
             files.push(root.join(rel));
         }

@@ -164,7 +164,7 @@ jobs:
       # probes against the shipped migration: every table STRICT, no REAL/FLOAT column, the
       # CHECK constraints actually refusing bad rows, FK and RESTRICT behaviour.
       #
-      # It had never run in CI. docs/ci-cd.md:372 asked the question outright - "Whether the
+      # It had never run in CI. docs/ci-cd.md:758 asked the question outright - "Whether the
       # schema-drift check runs as a CI step or stays a local probe ... no workflow step
       # invokes it yet". Answering it found the file had been FAILING: the plan was missing
       # the `topups.rail` column, and because the drift check exits before the invariants,
@@ -302,7 +302,7 @@ jobs:
 
           # And it must stay HEALTHY when the upstream providers are unreachable.
           #
-          # docs/server/api-spec.md:466-470 states the rule and why: an upstream outage
+          # docs/server/api-spec.md:809-811 states the rule and why: an upstream outage
           # must not look like a dead server and trigger a restart loop. The CI container
           # has no route to any provider either, so this is the real condition rather than
           # a simulation - and the assertion is that a green health is the CORRECT answer
