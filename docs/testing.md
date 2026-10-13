@@ -513,6 +513,39 @@ can hit its file-descriptor limit first. nginx logs *"worker_connections are not
 **So the ceiling is an acknowledged open item rather than a silent default**, in both the config — where a
 reader would look for it — and the Sizing section whose claim it qualifies.
 
+#### The Telegram redemption path: orderings and predicates, all guarded (round 40)
+
+The deployment seam was exhausted after nine rounds, so this one moved to a surface the audit had never
+touched: **the bot endpoint that redeems a Telegram link code** — unauthenticated by cookie, guarded by a
+bot token, and an account-binding primitive.
+
+`redeem_link_code` documents its own order in a way that is unusual and checkable:
+
+> *"The caller must be the bot before anything else is read: a cookie or an absent header is not a bot
+> credential. Checked before the code's shape so an unauthenticated caller learns nothing at all, not even
+> whether their input was well formed."*
+
+and then:
+
+> *"3. Claim the code. **The predicate IS the guard**: expired, used and unknown all fail to produce a row."*
+
+Four mutations, each a single-line change with a security consequence:
+
+| mutation | caught by |
+| --- | --- |
+| the bot-token check moved **after** the shape check | `redemption_requires_the_bot_token`, `a_missing_bot_token_refuses_rather_than_allows` |
+| the bot-token check removed entirely | the same two |
+| the `used_at IS NULL` predicate dropped (code becomes **reusable**) | `a_code_is_single_use`, `every_kind_of_bad_code_produces_the_same_refusal` |
+| the `expires_at > ?` predicate dropped (**expired codes redeem**) | `expired_and_unknown_codes_are_refused`, plus the same enumeration test |
+
+**All four caught, and the test names are the point rather than the count.** `redemption_requires_the_bot_token`
+enforces the ordering claim directly, and `every_kind_of_bad_code_produces_the_same_refusal` is the
+**anti-oracle** property — every bad code looks identical, which is what makes "learns nothing at all" true
+rather than aspirational.
+
+**The orderings and predicates are earned.** This is the shape the audit has been checking for since round
+16, and here the comments describe what the code does.
+
 hyper's HTTP/1 builder; it is not wired, and it is no longer claimed.
 
 #### `doc_claims`: the retention check, measured in both directions (round 28)
