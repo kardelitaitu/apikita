@@ -2597,6 +2597,79 @@ mod tests {
         );
     }
 
+    /// THE COOLDOWN FIGURES `docs/failover.md` STATES ARE THE ONES THE CONFIG SHIPS.
+    ///
+    /// THE DOC NAMES THREE NUMBERS AS FACTS - `After cooldown_seconds (default 30)`, `capped at
+    /// 900s`, and in the open-items list `Cooldown cap 900s, multiplier 2.0 - see
+    /// config/apikita.toml`. The last one CROSS-REFERENCES the config, which reads like a
+    /// coupling and is not one: prose that points at a file is not a check on it, and nothing
+    /// compared the two. Editing `cooldown_max_seconds = 900` to 600 would leave all three
+    /// sentences wrong and every test green.
+    ///
+    /// THE SAME GAP `the_shipped_config_parks_a_401` CLOSED for `rate_limit_status`: a
+    /// documented value with no reader. The upstream tests cannot see it either -
+    /// `circuit_breaker.rs`'s fixture builds its own `cfg()` with a literal 900 and `client.rs`
+    /// has its own copy, so both pin the BREAKER's arithmetic against numbers no operator ships.
+    ///
+    /// READ FROM BOTH FILES rather than asserting a literal here: a third copy of 900 in this
+    /// test would be one more thing to update and one more thing to disagree.
+    #[test]
+    fn the_failover_document_states_the_cooldowns_the_config_ships() {
+        let config = read_repo_file("config/apikita.toml");
+        let doc = read_repo_file("docs/failover.md");
+
+        /// The value of a top-level `key = value` line, as a string.
+        fn shipped(config: &str, key: &str) -> String {
+            config
+                .lines()
+                .find_map(|line| {
+                    let line = line.trim();
+                    if line.starts_with('#') {
+                        return None;
+                    }
+                    let rest = line.strip_prefix(key)?.trim_start();
+                    let rest = rest.strip_prefix('=')?.trim();
+                    Some(rest.split_whitespace().next().unwrap_or("").to_string())
+                })
+                .unwrap_or_else(|| {
+                    panic!("the shipped config must still state {key}, or this passes over nothing")
+                })
+        }
+
+        let base = shipped(&config, "cooldown_seconds");
+        let cap = shipped(&config, "cooldown_max_seconds");
+        let multiplier = shipped(&config, "cooldown_multiplier");
+
+        // Every one is non-empty, so a parse that silently produced "" cannot make the
+        // assertions below vacuous.
+        for (key, value) in [
+            ("cooldown_seconds", &base),
+            ("cooldown_max_seconds", &cap),
+            ("cooldown_multiplier", &multiplier),
+        ] {
+            assert!(
+                !value.is_empty(),
+                "{key} parsed as an empty string, which would make this guard meaningless"
+            );
+        }
+
+        // The defaults sentence: `After `cooldown_seconds` (default 30)`. Matched with the
+        // parentheses because the bare digits 30 appear elsewhere in the document.
+        assert!(
+            doc.contains(&format!("(default {base})")),
+            "docs/failover.md must state the shipped base cooldown of {base}s; it is currently written as a literal that nothing compares to config/apikita.toml"
+        );
+
+        // The cap: `capped at **900s**` and the open-items row `cap **900s**, multiplier **2.0**`.
+        assert!(
+            doc.contains(&format!("capped at **{cap}s**")),
+            "docs/failover.md must state the shipped cooldown cap of {cap}s, because the document is what an operator reads"
+        );
+        assert!(
+            doc.contains(&format!("cap **{cap}s**, multiplier **{multiplier}**")),
+            "the open-items row must name the shipped cap {cap}s and multiplier {multiplier}: it cross-references config/apikita.toml and so reads like a coupling"
+        );
+    }
     /// The pricing document restates the shipped card, and is bound to the config.
     ///
     /// `docs/business/02-pricing.md` carries a table with the IDR off-peak and peak figures
