@@ -579,6 +579,42 @@ key fails every signature, so unrelated tests needed a successful webhook and br
 than the other three, which is why the key tests were checked **directly** rather than accepted from the
 mutation result.
 
+#### The account export: a scoping bug survived the mutation, and the mutation was wrong (round 42)
+
+The last untouched route surface was the account export — personal data, and the test
+that guards it is one of the strongest in the suite: two accounts with **distinct balances** (999,999 IDR so
+a scoping bug is visible rather than coincidentally equal), a **net-of-settlement** figure so the export is
+proven to read the wallet rather than echo a constant, a forbidden-substring list (`key_hash`, `token_hash`,
+`pb_user_id`, `snap_token`, `password`, `ip_hash`), and an assertion that the other account's balance never
+appears.
+
+Three mutations on the handler's scoping, and the first result looked like a real finding:
+
+| mutation | first result |
+| --- | --- |
+| ledger loses `WHERE account_id = ?` | caught |
+| **wallet** loses `WHERE account_id = ?` | **SURVIVED** |
+| **accounts** row loses `WHERE id = ?` | **SURVIVED** |
+
+**Both "SURVIVED" results were order-invisible no-ops, not gaps.** The wallet is read with `fetch_optional`
+and the account row with `fetch_one` — both take the **first** row, the test creates `mine` first, and SQLite
+returns rows in rowid order with no `ORDER BY`. So an unscoped query still returned `mine`'s wallet, and the
+mutation changed nothing. This is the round-27 defect again: **a mutation that cannot change behaviour is
+evidence of nothing.**
+
+**Proven rather than argued.** Re-ran with the other account created **first**, alongside a control that
+swapped the order with no query mutation:
+
+```
+unscoped wallet + other created first  ->  CAUGHT by the same test
+order swap ALONE (control)             ->  passes, so the swap is not what failed it
+```
+
+So the test does cover the class the distinct-balance fixture exists for, and the export is sound. What the
+round actually bought is a **third data point in the "mutation survived" pattern this audit keeps hitting**:
+round 14's `is_operator`, round 27's prosaic anchors, and now two queries whose apparent immunity was an
+artifact of row order. **A SURVIVED result has to be diagnosed before it is believed, in both directions.**
+
 hyper's HTTP/1 builder; it is not wired, and it is no longer claimed.
 
 #### `doc_claims`: the retention check, measured in both directions (round 28)
