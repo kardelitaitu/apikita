@@ -909,7 +909,7 @@ mod tests {
             }
         }
     }
-    /// config/apikita.toml:267-270: off-peak is exactly half of peak, and
+    /// `config/apikita.toml`: off-peak is exactly half of peak, and
     /// billing_basis="peak" reserves at the PEAK rate so a request can never
     /// lose money.
     #[test]
@@ -938,12 +938,12 @@ mod tests {
             assert_eq!(
                 peak_rate / 2.0,
                 off_peak_rate,
-                "config/apikita.toml:267 - off-peak is exactly HALF of peak"
+                "config/apikita.toml:698 - off-peak is exactly HALF of peak"
             );
         }
     }
 
-    /// config/apikita.toml:269 - the reservation uses the PEAK rate even when
+    /// config/apikita.toml:698 - the reservation uses the PEAK rate even when
     /// the request will settle off-peak, so the hold can never under-reserve.
     #[test]
     fn the_reservation_uses_the_peak_rate_even_off_peak() {

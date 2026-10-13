@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
-            "docs/server/api-spec.md:366 - 200 only when the process AND the database are reachable"
+            "docs/server/api-spec.md:809 - 200 only when the process AND the database are reachable"
         );
         assert_eq!(
             body["status"], "degraded",
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::OK,
-            "docs/server/api-spec.md:366 - 200 only when the process AND the database are reachable"
+            "docs/server/api-spec.md:809 - 200 only when the process AND the database are reachable"
         );
         assert_eq!(
             body,
@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::OK,
-            "docs/server/api-spec.md:366 - 200 only when the process AND the database are reachable"
+            "docs/server/api-spec.md:809 - 200 only when the process AND the database are reachable"
         );
         assert_eq!(
             body,
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
-            "docs/server/api-spec.md:366 - 200 only when the process AND the database are reachable"
+            "docs/server/api-spec.md:809 - 200 only when the process AND the database are reachable"
         );
         assert_eq!(
             body["status"], "degraded",
