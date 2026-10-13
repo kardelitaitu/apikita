@@ -647,7 +647,19 @@ impl UpstreamClient {
             .iter()
             // weight > 0.0 matches the routing loop: an endpoint that is never
             // selected cannot be the thing a retry is waiting on.
-            .filter(|endpoint| endpoint.weight > 0.0)
+            //
+            // NOTE THAT THIS IS NARROWER THAN THE HEALTH FILTER ON PURPOSE, because the two
+            // answer different questions. `all_endpoints_unhealthy` asks "can this model be
+            // served?" and excludes a keyless endpoint from that answer - a placeholder at
+            // a positive weight can never answer and its breaker never trips, so it would
+            // vote "available" and mask a real outage of the provider that IS serving.
+            //
+            // THIS ONE ASKS "how long until a retry could succeed?", and a keyless endpoint
+            // still has a BREAKER that can be cooling. Its own cooldown is the earliest
+            // moment its side of the problem frees, which is the number an operator reading
+            // the 503 wants. So the key filter that is load-bearing for the alert is not
+            // needed here, and adding it would silently drop a real cooldown from the
+            // answer - the defect the `match` below was written to repair.
             .filter_map(|endpoint| {
                 let breaker = endpoint.breaker.remaining_cooldown();
                 let keys = endpoint.pool.shortest_key_cooldown();
