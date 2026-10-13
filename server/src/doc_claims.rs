@@ -2597,7 +2597,7 @@ mod tests {
         );
     }
 
-    /// THE COOLDOWN FIGURES `docs/failover.md` STATES ARE THE ONES THE CONFIG SHIPS.
+    /// THE NUMBERS `docs/failover.md` STATES ARE THE ONES THE CONFIG SHIPS.
     ///
     /// THE DOC NAMES THREE NUMBERS AS FACTS - `After cooldown_seconds (default 30)`, `capped at
     /// 900s`, and in the open-items list `Cooldown cap 900s, multiplier 2.0 - see
@@ -2614,17 +2614,34 @@ mod tests {
     /// READ FROM BOTH FILES rather than asserting a literal here: a third copy of 900 in this
     /// test would be one more thing to update and one more thing to disagree.
     #[test]
-    fn the_failover_document_states_the_cooldowns_the_config_ships() {
+    fn the_failover_document_states_the_numbers_the_config_ships() {
         let config = read_repo_file("config/apikita.toml");
         let doc = read_repo_file("docs/failover.md");
 
-        /// The value of a top-level `key = value` line, as a string.
-        fn shipped(config: &str, key: &str) -> String {
+        /// The value of `key = value` inside a named table, TABLE-AWARE on purpose.
+        ///
+        /// A TABLE-BLIND VERSION WAS WRITTEN FIRST AND RETURNED THE WRONG NUMBER, which is the
+        /// finding this qualification is made of: `request_timeout_seconds` appears TWICE in the
+        /// shipped config, as `[email] request_timeout_seconds = 10` and
+        /// `[circuit_breaker] request_timeout_seconds = 120`, and `docs/failover.md`'s row is about
+        /// the second. A search that takes the first match would have pinned the document to the EMAIL
+        /// timeout - and every assertion below would have read as passing while describing a different
+        /// setting. The failure message said `must state the shipped upstream timeout of 10s`, which is
+        /// how the collision was found rather than assumed away.
+        fn shipped(config: &str, table: &str, key: &str) -> String {
+            let mut current = String::new();
             config
                 .lines()
                 .find_map(|line| {
                     let line = line.trim();
                     if line.starts_with('#') {
+                        return None;
+                    }
+                    if let Some(name) = line.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                        current = name.to_string();
+                        return None;
+                    }
+                    if current != table {
                         return None;
                     }
                     let rest = line.strip_prefix(key)?.trim_start();
@@ -2636,9 +2653,9 @@ mod tests {
                 })
         }
 
-        let base = shipped(&config, "cooldown_seconds");
-        let cap = shipped(&config, "cooldown_max_seconds");
-        let multiplier = shipped(&config, "cooldown_multiplier");
+        let base = shipped(&config, "circuit_breaker", "cooldown_seconds");
+        let cap = shipped(&config, "circuit_breaker", "cooldown_max_seconds");
+        let multiplier = shipped(&config, "circuit_breaker", "cooldown_multiplier");
 
         // Every one is non-empty, so a parse that silently produced "" cannot make the
         // assertions below vacuous.
@@ -2669,7 +2686,24 @@ mod tests {
             doc.contains(&format!("cap **{cap}s**, multiplier **{multiplier}**")),
             "the open-items row must name the shipped cap {cap}s and multiplier {multiplier}: it cross-references config/apikita.toml and so reads like a coupling"
         );
+
+        // AND THE UPSTREAM TIMEOUT, which is the SAME SHAPE one row further down the same list:
+        // \`- [x] One global upstream timeout, **120s** - config/apikita.toml [circuit_breaker]\`.
+        // A second number stated as fact beside another cross-reference that is not a check. It was
+        // found by sweeping every numeric key in the config against the documents that name it,
+        // rather than by reading - the cooldown row above was fixed because it was NOTICED, and
+        // noticing is not a method.
+        let timeout = shipped(&config, "circuit_breaker", "request_timeout_seconds");
+        assert!(
+            !timeout.is_empty(),
+            "request_timeout_seconds parsed as an empty string, which would make this vacuous"
+        );
+        assert!(
+            doc.contains(&format!("One global upstream timeout, **{timeout}s**")),
+            "docs/failover.md must state the shipped upstream timeout of {timeout}s, because this row cross-references config/apikita.toml and so reads like a coupling"
+        );
     }
+
     /// The pricing document restates the shipped card, and is bound to the config.
     ///
     /// `docs/business/02-pricing.md` carries a table with the IDR off-peak and peak figures
