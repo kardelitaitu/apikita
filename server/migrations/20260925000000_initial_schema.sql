@@ -92,7 +92,8 @@ CREATE TABLE sessions (
   expires_at   TEXT NOT NULL CHECK (expires_at GLOB '????-??-??T??:??:??*+00:00'),
   -- NEW. The register specifies "30d absolute, 7d idle" but the Postgres schema
   -- had no column for the idle bound, so only the absolute half was enforceable
-  -- (auth.rs:255 notes this). Adding it now, while the schema is being rewritten.
+  -- (docs/decisions.md:97 states the pair). Adding it now, while the schema is
+-- being rewritten.
   last_seen_at TEXT NOT NULL CHECK (last_seen_at GLOB '????-??-??T??:??:??*+00:00'),
   revoked_at   TEXT CHECK (revoked_at IS NULL
                            OR revoked_at GLOB '????-??-??T??:??:??*+00:00'),

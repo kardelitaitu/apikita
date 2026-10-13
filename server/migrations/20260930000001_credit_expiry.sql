@@ -14,7 +14,7 @@
 --
 -- WHY THE DATE GOES ON `topups` AND NOT ON A NEW TABLE. A deposit's own date is
 -- the instant it SETTLED, and `topups.settled_at` already records exactly that,
--- bound from Rust in `credit_topup_transaction` (`server/src/db.rs:167`). The
+-- bound from Rust in `credit_topup_transaction` (`db.rs`). The
 -- expiry instant is therefore a pure function of a row that already exists:
 -- `settled_at + 24 months`. A second table would be a copy of `topups` that
 -- could disagree with it.
