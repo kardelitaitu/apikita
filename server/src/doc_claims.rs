@@ -4122,12 +4122,33 @@ mod tests {
 
         // A RECURSIVE WALK NEEDS A FLOOR, per the note at the top of this module: if the
         // walk silently reads nothing, every assertion below passes over an empty set. The
-        // floor is set with slack below the measured 35, so ordinary editing does not trip
-        // it but a broken walk does.
+        // floor is set with slack below the real count, so ordinary editing does not trip it
+        // but a broken walk does.
+        //
+        // The comment here said "the measured 35" while the floor is 25, and the real figure
+        // moved when the config joined the walk: MEASURED, it is now 45. Slack is the point -
+        // a floor AT the count fires on ordinary editing, which is the shape this module's
+        // other floors were measured to be wrong in - so the number in this comment is stated
+        // as the day's measurement rather than as a target.
         const MIN_CITATIONS_EXPECTED: usize = 25;
 
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         collect_markdown_excluding_docs(&root, &root, &mut files);
+
+        // AND THE SHIPPED CONFIG, WHICH IS NOT MARKDOWN AND WAS THEREFORE OUTSIDE EVERY
+        // CITATION WALKER IN THIS FILE.
+        //
+        // MEASURED: `config/apikita.toml` carries TEN line citations - `docs/decisions.md:76`,
+        // `docs/topology.md:39` and `:50`, `docs/cost-and-sizing.md:49`, and six into
+        // `config/provider1.md`. The walkers above are markdown by construction and by name, so
+        // none of them reads a TOML file. MEASURED by mutation: truncating `provider1.md` from
+        // 145 lines to 80 left the citation `provider1.md:90` pointing past the end of the file,
+        // and all 45 doc_claims tests stayed green.
+        //
+        // That is the identical failure the guard above exists to catch - a citation that no
+        // longer reaches its target - and it was reachable through the one file an operator reads
+        // before touching a price. The rule does not stop applying because the file is TOML.
+        files.push(root.join("config").join("apikita.toml"));
 
         let mut checked = 0usize;
         let mut problems: Vec<String> = Vec::new();
