@@ -1934,6 +1934,134 @@ pub async fn release_reservation_transaction(
     Ok(Some(new_balance))
 }
 
+/// The wallet balance, or 0 for an account with no wallet row.
+///
+/// ZERO RATHER THAN AN ERROR, and the caller decides what it means. For the adjustment handler
+/// a zero is ambiguous - "no wallet" and "an empty wallet" need different responses - which is
+/// why `adjust_balance_transaction` distinguishes them itself rather than asking this.
+/// This exists for the AUDIT DETAIL, where the figure before the change is what makes the entry
+/// reproducible and a missing wallet is honestly reported as a starting point of zero.
+pub async fn read_wallet_balance(pool: &SqlitePool, account_id: Uuid) -> Result<i64, AppError> {
+    let balance: Option<i64> =
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_optional(pool)
+            .await?;
+    Ok(balance.unwrap_or(0))
+}
+/// What an operator balance adjustment did, or why it was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdjustOutcome {
+    /// The wallet moved and the ledger row was appended.
+    Applied { new_balance: i64 },
+    /// The account has no wallet row, so there is nothing to adjust.
+    NoWallet,
+    /// A negative delta that the balance cannot cover. NOT clamped, unlike a usage
+    /// settlement: an operator asking to take 50,000 from a 1,000 wallet has made an
+    /// arithmetic mistake, and silently taking 1,000 would confirm the wrong action.
+    Insufficient { balance_idr: i64 },
+}
+
+/// A balance adjustment: one ledger row, atomic with the wallet update.
+///
+/// THE ONLY PRODUCTION PATH THAT MOVES MONEY WITHOUT A MIDTRANS WEBHOOK OR A CUSTOMER
+/// REQUEST, and the four rules it implements are written down in `docs/admin-surface.md`:
+/// write a ledger row rather than editing a balance; do it in ONE transaction; require a
+/// note; and record WHICH operator acted. Each is a separate argument below.
+///
+/// WHY IT IS A `reason = 'adjustment'` ROW AND NOT AN UPDATE. `wallets.balance_idr` is a
+/// CACHE of `SUM(ledger.delta_idr)`, and reconciliation is the check that the two agree.
+/// Editing the balance directly makes the ledger sum disagree with it FOREVER, and the
+/// repair is a hand-written ledger row - which is this function. The schema's `reason`
+/// CHECK already permits `adjustment`, so nothing new is needed to record it.
+///
+/// THE NEGATIVE CASE IS REFUSED, NOT CLAMPED, and the contrast with `settle_partial_usage`
+/// is deliberate rather than an inconsistency. That path clamps because the money is ALREADY
+/// SPENT - the tokens were delivered and the debit must reflect what was actually collected.
+/// Here nothing has happened yet: taking 50,000 from a 1,000 wallet is a mistake in the
+/// operator's arithmetic, and a clamp would both hide the mistake and register a completed
+/// action that was not the one requested. `CHECK (balance_idr >= 0)` would refuse the UPDATE
+/// anyway, and the goal is to refuse it with a message that names the shortfall rather than
+/// as an opaque constraint violation.
+///
+/// ZERO IS REFUSED TOO. An adjustment of 0 writes a ledger row that moves nothing, which is
+/// indistinguishable in an audit from a real action whose delta was mistyped - so it is a
+/// validation error at the handler rather than a no-op here.
+pub async fn adjust_balance_transaction(
+    pool: &SqlitePool,
+    account_id: Uuid,
+    delta_idr: i64,
+    note: &str,
+) -> Result<AdjustOutcome, AppError> {
+    let mut tx = begin_immediate(pool).await?;
+
+    // A POSITIVE delta is an INSERT-free credit: a wallet that does not exist yet is
+    // created at zero and then credited, which keeps `balance = SUM(ledger)` true from
+    // the first row. A NEGATIVE delta finds no row and reports NoWallet, because there
+    // is no balance to take from - creating a zero wallet only to refuse the debit would
+    // leave a rows-artefact behind for an action that did nothing.
+    let existing: Option<i64> =
+        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let balance_idr = match existing {
+        Some(balance) => balance,
+        None if delta_idr > 0 => {
+            sqlx::query(
+                "INSERT INTO wallets (account_id, balance_idr, updated_at) VALUES (?, 0, ?)",
+            )
+            .bind(account_id.hyphenated())
+            .bind(Utc::now())
+            .execute(&mut *tx)
+            .await?;
+            0
+        }
+        None => return Ok(AdjustOutcome::NoWallet),
+    };
+
+    // A DEBIT THE BALANCE CANNOT COVER IS A REFUSAL WITH THE FIGURES, not a clamp.
+    // `checked_sub` rather than `-` for the same reason every other money site uses it:
+    // release builds do not check overflow, and a saturated i64 would arrive at the UPDATE
+    // as a plausible number.
+    let Some(new_balance) = balance_idr.checked_add(delta_idr) else {
+        return Ok(AdjustOutcome::Insufficient { balance_idr });
+    };
+    if new_balance < 0 {
+        return Ok(AdjustOutcome::Insufficient { balance_idr });
+    }
+
+    // `balance_idr = ?` rather than `+= ?`: the new value is computed above from the
+    // balance read under this transaction's write lock, so the assignment and the ledger
+    // row's `balance_after` are the SAME figure. An `+=` would re-read a value that could
+    // not have changed, and stating it twice invites them to disagree if that ever stops
+    // being true.
+    sqlx::query("UPDATE wallets SET balance_idr = ?, updated_at = ? WHERE account_id = ?")
+        .bind(new_balance)
+        .bind(Utc::now())
+        .bind(account_id.hyphenated())
+        .execute(&mut *tx)
+        .await?;
+
+    // THE NOTE IS THE LEDGER'S `ref`, so it travels WITH the money rather than beside it.
+    // A note kept only in `admin_audit` would be lost by anything reading the ledger -
+    // including the reconciliation tool and the wind-down report - and those are exactly
+    // the readers an unexplained adjustment most needs to explain itself to.
+    sqlx::query(
+        "INSERT INTO ledger (account_id, delta_idr, reason, ref, balance_after, created_at) \
+         VALUES (?, ?, 'adjustment', ?, ?, ?)",
+    )
+    .bind(account_id.hyphenated())
+    .bind(delta_idr)
+    .bind(note)
+    .bind(new_balance)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(AdjustOutcome::Applied { new_balance })
+}
 /// Records usage the wallet could not cover in full, and returns what was lost.
 ///
 /// Runs on the transaction `debit_usage_transaction` already opened: the guarded
@@ -5597,6 +5725,197 @@ mod tests {
         db.close().await;
     }
 
+    // -----------------------------------------------------------------------
+    // adjust_balance_transaction: the one production path that moves money
+    // outside a webhook or a customer request
+    // -----------------------------------------------------------------------
+
+    /// A CREDIT APPENDS A LEDGER ROW AND THE WALLET AGREES WITH THE SUM.
+    ///
+    /// The reconciliation gate is the assertion that matters here, not the balance:
+    /// an adjustment that moved the wallet without a ledger row would leave the account
+    /// permanently drifted, and `docs/admin-surface.md` names that anti-pattern first.
+    #[tokio::test]
+    async fn an_adjustment_keeps_the_wallet_equal_to_the_ledger_sum() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account_id, 50_000).await;
+
+        let outcome = adjust_balance_transaction(&db.pool, account_id, 7_500, "goodwill credit")
+            .await
+            .expect("a positive adjustment applies");
+        assert_eq!(
+            outcome,
+            AdjustOutcome::Applied {
+                new_balance: 57_500
+            }
+        );
+
+        // THE GATE, not a hand-computed balance: `ledger_drift_rows` is the same
+        // predicate tools/reconcile ships, so this cannot pass while reconciliation fails.
+        assert_eq!(
+            ledger_drift_rows(&db.pool, account_id).await,
+            0,
+            "an adjustment must leave balance_idr equal to SUM(ledger.delta_idr)"
+        );
+        assert_eq!(test_support::balance(&db.pool, account_id).await, 57_500);
+
+        // AND THE ROW IS `adjustment`, so an auditor can find it by reason rather than by
+        // diffing every row. The note travels in `ref`, which is what makes the row
+        // self-explaining to a reader who has only the ledger.
+        let (reason, delta, reference): (String, i64, Option<String>) = {
+            let row = sqlx::query(
+                "SELECT reason, delta_idr, ref FROM ledger WHERE account_id = ? ORDER BY id DESC LIMIT 1",
+            )
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .expect("the adjustment row");
+            (
+                row.try_get("reason").unwrap(),
+                row.try_get("delta_idr").unwrap(),
+                row.try_get("ref").unwrap(),
+            )
+        };
+        assert_eq!(reason, "adjustment");
+        assert_eq!(delta, 7_500);
+        assert_eq!(reference.as_deref(), Some("goodwill credit"));
+        db.close().await;
+    }
+
+    /// A DEBIT LARGER THAN THE BALANCE IS REFUSED, NOT CLAMPED, AND NOTHING MOVES.
+    ///
+    /// The contrast with `settle_partial_usage` is the point: that path clamps because the
+    /// money is already spent. Here nothing has happened, so a clamp would both hide an
+    /// arithmetic mistake and register an action nobody asked for. The assertion is on the
+    /// LEDGER as well as the balance, because a refusal that still wrote a row would be a
+    /// refusal in name only.
+    #[tokio::test]
+    async fn a_debit_the_balance_cannot_cover_is_refused_and_writes_nothing() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account_id, 1_000).await;
+
+        let before_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count the ledger");
+
+        let outcome = adjust_balance_transaction(&db.pool, account_id, -50_000, "typo")
+            .await
+            .expect("a refusal is an outcome, not an error");
+        assert_eq!(
+            outcome,
+            AdjustOutcome::Insufficient { balance_idr: 1_000 },
+            "the refusal must carry the balance, or the operator cannot tell a typo from a decision"
+        );
+
+        assert_eq!(
+            test_support::balance(&db.pool, account_id).await,
+            1_000,
+            "a refused adjustment must not move the wallet"
+        );
+        let after_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("recount the ledger");
+        assert_eq!(
+            after_rows, before_rows,
+            "a refused adjustment must write no ledger row"
+        );
+        db.close().await;
+    }
+
+    /// A DEBIT THAT LANDS EXACTLY ON ZERO IS ALLOWED. The refusal is on a NEGATIVE
+    /// result, not on emptying the wallet, and the schema's `CHECK (balance_idr >= 0)`
+    /// permits zero - so refusing it here would invent a stricter rule than the
+    /// documented one.
+    #[tokio::test]
+    async fn a_debit_that_empties_the_wallet_exactly_is_allowed() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account_id, 2_500).await;
+
+        let outcome = adjust_balance_transaction(&db.pool, account_id, -2_500, "close out")
+            .await
+            .expect("an exact drain applies");
+        assert_eq!(outcome, AdjustOutcome::Applied { new_balance: 0 });
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A NEGATIVE DELTA ON AN ACCOUNT WITH NO WALLET ROW IS `NoWallet`, NOT A CREATED
+    /// ZERO WALLET. Creating one to refuse the debit would leave a rows-artefact behind
+    /// for an action that did nothing, and that artefact would appear in the account
+    /// listing as a wallet the customer never had.
+    #[tokio::test]
+    async fn a_debit_against_no_wallet_creates_no_row() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
+
+        let outcome = adjust_balance_transaction(&db.pool, account_id, -100, "nothing here")
+            .await
+            .expect("a missing wallet is an outcome");
+        assert_eq!(outcome, AdjustOutcome::NoWallet);
+        let wallets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count wallets");
+        assert_eq!(wallets, 0, "a refused debit must not conjure a wallet row");
+        db.close().await;
+    }
+
+    /// A POSITIVE DELTA ON AN ACCOUNT WITH NO WALLET DOES create one, and it is funded in
+    /// the same transaction - so `balance = SUM(ledger)` is true from the first row rather
+    /// than only after a later top-up.
+    #[tokio::test]
+    async fn a_credit_to_an_account_without_a_wallet_creates_and_funds_it() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
+
+        let outcome = adjust_balance_transaction(&db.pool, account_id, 4_000, "goodwill")
+            .await
+            .expect("a credit creates the wallet");
+        assert_eq!(outcome, AdjustOutcome::Applied { new_balance: 4_000 });
+        assert_eq!(test_support::balance(&db.pool, account_id).await, 4_000);
+        assert_eq!(
+            test_support::ledger_sum(&db.pool, account_id).await,
+            4_000,
+            "the wallet and the ledger must agree from the first row"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A HUGE CREDIT SATURATES OR IS REFUSED RATHER THAN WRAPPING INTO A NEGATIVE.
+    ///
+    /// This is the arithmetic guard, and it is the reason the function uses `checked_add`.
+    /// Release builds do not check overflow, so a wrap would arrive at the UPDATE as a
+    /// plausible number - or, worse, as a NEGATIVE one that the CHECK would refuse with an
+    /// opaque 500 instead of a message naming the amount.
+    #[tokio::test]
+    async fn a_credit_that_would_overflow_is_refused_not_wrapped() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account_id, 1_000).await;
+
+        let outcome = adjust_balance_transaction(&db.pool, account_id, i64::MAX, "overflow")
+            .await
+            .expect("an unrepresentable credit is an outcome");
+        assert_eq!(
+            outcome,
+            AdjustOutcome::Insufficient { balance_idr: 1_000 },
+            "an amount that cannot be added must be refused, never wrapped"
+        );
+        assert_eq!(test_support::balance(&db.pool, account_id).await, 1_000);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
     /// A settlement whose reported hold was reserved against a wallet that does
     /// not exist releases NOTHING and still records the usage: crediting a hold
     /// the ledger never took would create money. This is the no-wallet guard in

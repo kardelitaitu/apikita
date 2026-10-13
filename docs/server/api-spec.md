@@ -33,7 +33,7 @@ so an anonymous call is a no-op rather than an error.
 | Live | `GET /events` (SSE) | cookie |
 | Proxy | `POST /v1/chat/completions` | **API key** |
 | **Bot** ⚠ | `POST /api/bot/link` ✅, `GET /api/bot/account` ⚠, `GET /api/bot/reviews/mine` ⚠, `POST /api/bot/notify-topup` ⚠ | **bot token** |
-| **Admin** | `GET /api/admin/accounts/:id`; `POST /api/admin/accounts/:id/suspend`; `POST /api/admin/accounts/:id/resume` (**alias `/restore`**) | **cookie + operator flag** |
+| **Admin** | `GET /api/admin/accounts/:id`; `POST /api/admin/accounts/:id/suspend`; `POST /api/admin/accounts/:id/resume` (**alias `/restore`**); `POST /api/admin/accounts/:id/adjust` (**money**) | **cookie + operator flag** |
 | Ops | `GET /health` | none |
 
 **⚠ MARKED ROUTES ARE DESIGNED, NOT BUILT.** Three endpoints in the table above have a
@@ -890,6 +890,7 @@ with the same session cookie and every guard is enforced here, server-side.
 | `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'`; **revokes sessions and keys atomically**; one `admin_audit` row in the same transaction |
 | `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; audits it; does not restore keys |
 | `POST /api/admin/accounts/:id/restore` | `admin::resume_account` | **Alias of `/resume`** — same handler, same `action='resume'` audit row |
+| `POST /api/admin/accounts/:id/adjust` | `admin::adjust_account` | **The only money-moving admin action.** Body `{delta_idr, reason, note}`. Writes one `ledger` row with `reason='adjustment'` and the explanation as its `ref`, **atomic with the wallet update**; refuses a debit the balance cannot cover (with both figures) and refuses `delta_idr: 0`; requires an explanation of at least 12 characters; `admin_audit` action `'adjust'` carries both balances. Self-action refused |
 | `GET /api/admin/metrics` | `health::operator_metrics` | Operational counts: `server_errors`, `responses`, `error_rate` (null when nothing has been served), `unhealthy_models` (models with no usable endpoint), and `retention` (whether any age-based table holds a row past its window, naming it). Backs the `error_rate`, `all_providers_unhealthy` and `db_disk` alerts |
 
 **`/resume` and `/restore` are two spellings of one action.** Both are mounted;
@@ -986,7 +987,7 @@ documented cost of the key-metadata cache and is **not closed by these routes**.
 
 | Endpoint | Effect |
 | --- | --- |
-| `POST /api/admin/accounts/:id/adjust` | Money: ledger row, `reason='adjustment'` |
+| ~~`POST /api/admin/accounts/:id/adjust`~~ | **Built.** See the Admin table above |
 | ~~`POST /api/admin/topups/:id/refund`~~ | **Not planned.** The wallet-debiting refund machinery was removed — see [the webhook section](#post-webhooksmidtrans). A refund happens at the rail, never against the wallet |
 | `POST /api/admin/keys/:id/revoke` | `revoked_at` (the customer route `POST /api/keys/:id/revoke` exists today) |
 | `POST /api/admin/accounts/:id/logout-all` | Revoke all sessions |

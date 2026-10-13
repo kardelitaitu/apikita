@@ -380,6 +380,7 @@ pub const ROUTES: &str = r#"
 .route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
 .route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
 .route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
+.route("/api/admin/accounts/{id}/adjust", post(admin::adjust_account));
 // Webhooks
 .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
 // Proxy
@@ -499,6 +500,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
         .route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
         .route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
+        .route("/api/admin/accounts/{id}/adjust", post(admin::adjust_account));
         // Webhooks
         .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
         // Proxy
@@ -618,6 +620,7 @@ pub const MOUNTED_BY_THE_MACRO: &[&str] = routes!(@paths
     .route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
     .route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
     .route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
+.route("/api/admin/accounts/{id}/adjust", post(admin::adjust_account));
     // Webhooks
     .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
     // Proxy
@@ -1637,6 +1640,11 @@ mod tests {
             "/api/admin/accounts/00000000-0000-0000-0000-000000000000/resume",
             "",
         ),
+        (
+            "POST",
+            "/api/admin/accounts/00000000-0000-0000-0000-000000000000/adjust",
+            "{}",
+        ),
         ("POST", "/webhooks/midtrans", "{}"),
         ("POST", "/v1/chat/completions", ""),
     ];
@@ -2185,16 +2193,16 @@ mod tests {
         // looks self-consistent.
         assert_eq!(
             declared.len(),
-            37,
-            "create_router mounts a different number of routes than the 37 this test was \
+            38,
+            "create_router mounts a different number of routes than the 38 this test was \
              last reconciled against. If that is deliberate, update this number AND the \
              MOUNTED doc comment that states the row count - both, or the next reader \
              trusts a stale one."
         );
         assert_eq!(
             mounted_set.len(),
-            40,
-            "MOUNTED declares a different number of ROWS than the 40 this test was last \
+            41,
+            "MOUNTED declares a different number of ROWS than the 41 this test was last \
              reconciled against. Rows, not routes: /api/topups, /api/keys and /api/reviews each \
              carry GET+POST, so each contributes two rows from one `.route(` call, while the rest \
              including /auth/logout and /auth/logout-all are single-method. A mismatch here \

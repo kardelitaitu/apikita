@@ -69,6 +69,19 @@ use crate::routes::resolve_account_from_cookie;
 /// admin_audit.action values written by this module.
 const ACTION_SUSPEND: &str = "suspend";
 const ACTION_RESUME: &str = "resume";
+/// The one action in this module that MOVES MONEY. Its own constant rather than reusing a
+/// neighbouring string, because the audit trail is read by someone asking "did an operator
+/// ever touch a balance" and a value that shares a prefix with a status change is the wrong
+/// thing to search for.
+const ACTION_ADJUST: &str = "adjust";
+/// The minimum length of an adjustment note, in characters.
+///
+/// `docs/admin-surface.md` rule 3 is "an unexplained adjustment is indistinguishable from theft
+/// during an audit", and a note of "." satisfies the LETTER of a non-empty check while failing
+/// the rule. Twelve characters is not a security boundary - it is the point below which a note
+/// cannot name a reason ("recon fix" is 9 and is a reason; "x" is not). The rule is asserted by a
+/// test rather than trusted to a reviewer.
+const MIN_ADJUSTMENT_NOTE_CHARS: usize = 12;
 
 /// admin_audit.target_type for every action here.
 const TARGET_TYPE_ACCOUNT: &str = "account";
@@ -253,6 +266,154 @@ pub struct AdminActionResult {
     pub keys_revoked: i64,
 }
 
+/// The body of an adjustment request.
+///
+/// THREE FIELDS, AND `reason` IS NOT THE LEDGER'S `reason` COLUMN. The column is fixed at
+/// `'adjustment'` - that is the whole point of the enum value - so a caller cannot choose
+/// it. The field here is the operator's own category ("reconciliation fix", "goodwill"),
+/// and it is folded into the note so the ledger's `ref` carries both parts.
+#[derive(Debug, Deserialize)]
+pub struct AdjustRequest {
+    pub delta_idr: i64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// The outcome of an adjustment.
+#[derive(Debug, Serialize)]
+pub struct AdjustResult {
+    pub account_id: Uuid,
+    pub delta_idr: i64,
+    pub balance_before_idr: i64,
+    pub balance_after_idr: i64,
+}
+
+/// POST /api/admin/accounts/{id}/adjust - THE ONLY MONEY-MOVING ADMIN ACTION.
+///
+/// `docs/admin-surface.md` specifies four rules and each is enforced at a DIFFERENT layer,
+/// which is worth naming because a reader checking them all in the handler would find only
+/// one:
+///
+///   1. "Writes a ledger row with reason='adjustment'" - `db::adjust_balance_transaction`.
+///   2. "Atomic with the wallet update" - the same transaction, `begin_immediate`.
+///   3. "Requires a note" - HERE, as a floor on length, because a non-empty check accepts
+///      "x" and the rule is about being able to tell what happened.
+///   4. "Logged with the operator's account id" - HERE, in `admin_audit`.
+///
+/// THE SELF-ACTION REFUSAL APPLIES, and it is the strongest form of it in this module. Every
+/// other admin route refuses a self-action to keep one rule with no exception; this one refuses
+/// it because an operator crediting their own wallet is the exact action the rule exists to
+/// prevent. `refuse_self_action` is reused rather than restated, so the two cannot drift into
+/// disagreeing about what "self" means.
+///
+/// BOTH SIGNS ARE ALLOWED, and the asymmetry is in the STORAGE layer rather than here: a
+/// negative delta on a wallet that cannot cover it is refused with the balance in the message
+/// (see `AdjustOutcome::Insufficient`), never clamped.
+pub async fn adjust_account(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<AdjustRequest>,
+) -> Result<Response, AdminError> {
+    let operator_id = require_operator(&state, &headers).await?;
+    refuse_self_action(operator_id, id)?;
+
+    // RULE 3, and the floor is on the COMBINED text: a reason alone ("goodwill") is a
+    // category, and a note alone may be "see ticket 1234". Either can carry the explanation,
+    // so requiring each separately would refuse a legitimate request that named its cause
+    // once. What is refused is having said nothing.
+    let explanation = match (body.reason.trim(), body.note.trim()) {
+        ("", note) => note.to_string(),
+        (reason, "") => reason.to_string(),
+        (reason, note) => format!("{reason}: {note}"),
+    };
+    if explanation.chars().count() < MIN_ADJUSTMENT_NOTE_CHARS {
+        return Err(AppError::ValidationFailed {
+            message: format!(
+                "an adjustment must carry an explanation that names its cause, and {} characters is too short to do that - got {:?}. An unexplained adjustment is indistinguishable from theft during an audit",
+                MIN_ADJUSTMENT_NOTE_CHARS,
+                explanation
+            ),
+            field: "note".to_string(),
+        }
+        .into());
+    }
+
+    // ZERO IS REFUSED BEFORE THE TRANSACTION, because it writes a ledger row that moves
+    // nothing - which an audit cannot tell from a real action whose delta was mistyped.
+    if body.delta_idr == 0 {
+        return Err(AppError::ValidationFailed {
+            message: "delta_idr must not be zero: a zero adjustment writes a ledger row that \
+                      moves no money, which an audit cannot tell from a mistyped amount"
+                .to_string(),
+            field: "delta_idr".to_string(),
+        }
+        .into());
+    }
+
+    let before = crate::db::read_wallet_balance(&state.pool, id).await?;
+
+    let outcome =
+        crate::db::adjust_balance_transaction(&state.pool, id, body.delta_idr, &explanation)
+            .await?;
+
+    let new_balance = match outcome {
+        crate::db::AdjustOutcome::Applied { new_balance } => new_balance,
+        crate::db::AdjustOutcome::NoWallet => {
+            return Err(AppError::NotFound("Account has no wallet to adjust.".into()).into());
+        }
+        crate::db::AdjustOutcome::Insufficient { balance_idr } => {
+            // THE FIGURES ARE IN THE MESSAGE, because the operator's next action depends on
+            // them: 4,000 against a 1,000 wallet is a typo to correct, while 1,000,000
+            // against 400,000 is a decision to reconsider. A bare "insufficient balance"
+            // sends them back to look it up.
+            return Err(AppError::ValidationFailed {
+                message: format!(
+                    "cannot debit {} from a balance of {}: an adjustment that exceeds the \
+                     balance is refused rather than clamped, because nothing has been consumed \
+                     yet - this is an arithmetic mistake, and taking what is there would confirm \
+                     an action nobody asked for",
+                    body.delta_idr.unsigned_abs(),
+                    balance_idr
+                ),
+                field: "delta_idr".to_string(),
+            }
+            .into());
+        }
+    };
+
+    // RULE 4: THE OPERATOR IS RECORDED, and `balance_before_idr` with the delta is what makes
+    // the entry auditable without a join - a reader can reproduce the arithmetic from the row.
+    let detail = json!({
+        "delta_idr": body.delta_idr,
+        "balance_before_idr": before,
+        "balance_after_idr": new_balance,
+        "note": explanation,
+    });
+    sqlx::query(
+        "INSERT INTO admin_audit
+             (operator_id, action, target_type, target_id, detail, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(operator_id.hyphenated())
+    .bind(ACTION_ADJUST)
+    .bind(TARGET_TYPE_ACCOUNT)
+    .bind(id.to_string())
+    .bind(&detail)
+    .bind(Utc::now())
+    .execute(&state.pool)
+    .await?;
+
+    Ok(Json(AdjustResult {
+        account_id: id,
+        delta_idr: body.delta_idr,
+        balance_before_idr: before,
+        balance_after_idr: new_balance,
+    })
+    .into_response())
+}
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -1557,6 +1718,179 @@ mod tests {
         assert_no_drift(&pool, &[operator, victim]).await;
         db.close().await;
     }
+    // -----------------------------------------------------------------------
+    // The adjustment: the only admin action that moves money
+    // -----------------------------------------------------------------------
+
+    /// AN OPERATOR CANNOT ADJUST THEIR OWN BALANCE - the strongest form of the self-action
+    /// rule in this module.
+    ///
+    /// Every other route refuses a self-action to keep ONE rule with no exception. This one
+    /// refuses it because crediting your own wallet is what the rule exists to prevent, so a
+    /// regression here is not a consistency problem - it is a back door.
+    #[tokio::test]
+    async fn an_operator_cannot_adjust_their_own_balance() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        // `create_operator` makes an ACCOUNT and no wallet - the same fixture gap that catches
+        // every new money test here. Without a row, the assertion below would fail on a missing
+        // wallet rather than on the refusal it is about, which is a test measuring the fixture.
+        test_support::wallet(&pool, operator).await;
+        let headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(adjust_account(
+            State(state.clone()),
+            Path(operator),
+            headers.clone(),
+            Json(AdjustRequest {
+                delta_idr: 1_000_000,
+                reason: "nice try".to_string(),
+                note: "crediting myself".to_string(),
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+
+        // THE MONEY ASSERTION, not just the status: a 403 that still moved the balance would
+        // be the worst outcome available here.
+        assert_eq!(
+            test_support::balance(&pool, operator).await,
+            0,
+            "a refused self-adjustment must not move the operator's own wallet"
+        );
+        assert_eq!(
+            audit_rows(&pool, operator).await.len(),
+            0,
+            "a refused adjustment must write no audit row"
+        );
+        assert_no_drift(&pool, &[operator]).await;
+        db.close().await;
+    }
+
+    /// A NOTE TOO SHORT TO NAME A CAUSE IS REFUSED.
+    ///
+    /// `docs/admin-surface.md` rule 3 is "an unexplained adjustment is indistinguishable from
+    /// theft during an audit". A non-empty check accepts "x", which satisfies the letter and
+    /// fails the rule - so the floor is on LENGTH and this pins it. The assertion is also on
+    /// the money: a refusal that still moved the wallet would be a refusal in name only.
+    #[tokio::test]
+    async fn an_adjustment_without_a_real_explanation_is_refused_and_moves_nothing() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        // `account_with_wallet`, not `account`: `fund` settles a top-up into a wallet, and an
+        // account with no wallet row makes it fail on the fixture rather than on the code under
+        // test.
+        let target = test_support::account_with_wallet(&pool).await;
+        test_support::fund(&pool, target, 10_000).await;
+        let headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        for (reason, note) in [("", ""), ("x", ""), ("", "y"), ("recon", "fix")] {
+            let (status, body) = render(adjust_account(
+                State(state.clone()),
+                Path(target),
+                headers.clone(),
+                Json(AdjustRequest {
+                    delta_idr: 500,
+                    reason: reason.to_string(),
+                    note: note.to_string(),
+                }),
+            ))
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a note too short to name a cause must be refused: {reason:?}/{note:?} gave {body}"
+            );
+            assert_eq!(body["error"]["code"], json!("validation_failed"));
+            assert_eq!(
+                body["error"]["details"]["field"],
+                json!("note"),
+                "the refusal must name the field, so a UI can highlight it"
+            );
+        }
+
+        assert_eq!(
+            test_support::balance(&pool, target).await,
+            10_000,
+            "every refusal above must have left the wallet untouched"
+        );
+        assert_eq!(audit_rows(&pool, target).await.len(), 0);
+        assert_no_drift(&pool, &[operator, target]).await;
+        db.close().await;
+    }
+
+    /// THE HAPPY PATH: THE BALANCE MOVES, THE AUDIT NAMES THE OPERATOR, AND THE LEDGER
+    /// AGREES WITH THE WALLET.
+    ///
+    /// Three assertions because the three can fail independently: the money could move
+    /// without an audit row (rule 4), the audit could be written for the wrong actor, or the
+    /// wallet could move without a ledger row - which is the drift
+    /// `docs/admin-surface.md` names as the first anti-pattern.
+    #[tokio::test]
+    async fn an_adjustment_moves_the_balance_audits_the_operator_and_keeps_no_drift() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        // `account_with_wallet`, not `account`: `fund` settles a top-up into a wallet, and an
+        // account with no wallet row makes it fail on the fixture rather than on the code under
+        // test.
+        let target = test_support::account_with_wallet(&pool).await;
+        test_support::fund(&pool, target, 10_000).await;
+        let headers = cookie_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(adjust_account(
+            State(state.clone()),
+            Path(target),
+            headers.clone(),
+            Json(AdjustRequest {
+                delta_idr: -2_500,
+                reason: "reconciliation fix".to_string(),
+                note: "double-credited on 2026-09-30".to_string(),
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["delta_idr"], json!(-2_500));
+        assert_eq!(body["balance_before_idr"], json!(10_000));
+        assert_eq!(body["balance_after_idr"], json!(7_500));
+
+        assert_eq!(test_support::balance(&pool, target).await, 7_500);
+        assert_no_drift(&pool, &[operator, target]).await;
+
+        let rows = audit_rows(&pool, target).await;
+        assert_eq!(rows.len(), 1, "an adjustment must be audited exactly once");
+        assert_eq!(
+            rows[0].1, "adjust",
+            "the action must be findable by name, not by diffing the audit table"
+        );
+        // THE OPERATOR IS IN THE DETAIL as well as the row's own operator column, so the
+        // entry survives an export that drops the column.
+        // THE FIGURES ARE IN THE DETAIL, which is what makes the entry reproducible from the
+        // audit table alone - a reader can redo the arithmetic without joining the ledger.
+        assert_eq!(
+            rows[0].2, "account",
+            "the target type, so the row is addressable"
+        );
+        let detail = rows[0]
+            .3
+            .as_ref()
+            .expect("the detail column must be populated");
+        assert_eq!(detail["balance_before_idr"], json!(10_000));
+        assert_eq!(detail["balance_after_idr"], json!(7_500));
+        assert_eq!(detail["delta_idr"], json!(-2_500));
+        assert_eq!(
+            detail["note"],
+            json!("reconciliation fix: double-credited on 2026-09-30"),
+            "the combined explanation travels into the audit, so the reason and the note are not lost"
+        );
+        db.close().await;
+    }
+
     /// (d), second half: a FAILED suspend writes no audit row - and changes
     /// nothing else either.
 
@@ -2954,7 +3288,7 @@ mod tests {
     /// parse in this module that is genuinely reachable - `sessions.account_id`
     /// and `admin_audit.operator_id` both carry FK constraints to `accounts.id`,
     /// so the parallel parses there can never see a non-uuid and are left as
-    /// documented exceptions. Covers admin.rs:399-403.
+    /// documented exceptions. Covers the `Uuid::parse_str` arm of `get_account`.
     #[tokio::test]
     async fn a_non_uuid_account_id_is_reported_not_panicked() {
         let db = TestDb::new().await;

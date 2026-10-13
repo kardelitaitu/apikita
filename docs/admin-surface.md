@@ -25,7 +25,7 @@ writes** — the platform does not refund (see
 
 ## What exists today
 
-**Five admin routes are implemented** (`server/src/routes/admin.rs`, mounted in
+**Six admin routes are implemented** (`server/src/routes/admin.rs`, mounted in
 `server/src/routes/mod.rs`). Everything else in this document is **planned, not
 built** — the status of each item is marked where it appears.
 
@@ -206,10 +206,11 @@ the holes appear.
 
 ## Money actions — the ones that need care
 
-> **Status: NOT IMPLEMENTED.** `/adjust` does not exist in
-> `server/src/routes/mod.rs`. This is design for the "with revenue" phase, kept
-> because the rules are the hard part. Until it exists, money actions are SQL by
-> the owner, documented — see [Rollout](#rollout).
+> **Status: IMPLEMENTED.** `/adjust` is mounted in `server/src/routes/mod.rs` and served by
+> `admin::adjust_account`. The four rules below are each enforced at a DIFFERENT layer — the
+> handler, the transaction, or the schema — and each is named where it is asserted, so a
+> reader checking them all in one place would find only some of them. What is deliberately
+> NOT built is the two-person rule for large adjustments; see [Rollout](#rollout).
 
 **One action moves money outside the Midtrans webhook: the adjustment.** It is
 necessary, and it is dangerous.
@@ -230,13 +231,35 @@ POST /api/admin/accounts/:id/adjust
 { "delta_idr": -5000, "reason": "reconciliation fix", "note": "..." }
 ```
 
-Rules:
+Rules, and the layer each is enforced at — a reader checking them all in the handler would
+find only two:
 
 1. **Writes a ledger row** with `reason='adjustment'`, delta, and `balance_after`.
-2. **Atomic with the wallet update** — same transaction.
-3. **Requires a note.** An unexplained adjustment is indistinguishable from theft
-   during an audit.
-4. **Logged with the operator's account id**, not just the affected account.
+   *Enforced in `db::adjust_balance_transaction`.* The note travels in the row's `ref`, so it
+   is readable by anything that reads the ledger — including `tools/reconcile` and the
+   wind-down report — rather than only by a reader who joins `admin_audit`.
+2. **Atomic with the wallet update** — same transaction. *`begin_immediate`, the same
+   write-lock-first pattern every other money path uses.*
+3. **Requires a note.** An unexplained adjustment is indistinguishable from theft during an
+   audit. *`MIN_ADJUSTMENT_NOTE_CHARS` in the handler.* The floor is on LENGTH rather than
+   emptiness, because `"x"` satisfies a non-empty check while failing the rule.
+4. **Logged with the operator's account id**, not just the affected account. *An
+   `admin_audit` row with `action = 'adjust'`, carrying both balances so the entry is
+   reproducible without a join.*
+
+**Two refusals are part of the contract, and neither is a clamp:**
+
+- **A debit larger than the balance is REFUSED with both figures**, not clamped. This is the
+  opposite of what `settle_partial_usage` does, deliberately: there the money is already spent
+  and the debit must reflect what was taken; here nothing has happened, so a debit that cannot
+  be covered is an arithmetic mistake, and taking what is there would confirm an action nobody
+  asked for.
+- **`delta_idr: 0` is refused.** A zero adjustment writes a ledger row that moves nothing,
+  which an audit cannot distinguish from a real action whose amount was mistyped.
+
+**An operator cannot adjust their OWN balance** — `refuse_self_action`, the same guard every
+other admin route uses. It matters most here: crediting your own wallet is precisely what the
+rule exists to prevent, so a regression is not a consistency problem but a back door.
 
 ### Refund — not offered
 
@@ -338,12 +361,16 @@ See [`observability.md`](observability.md).
 | Phase | Surface | Status |
 | --- | --- | --- |
 | **Launch** | Read-only + suspend/restore. Money actions via SQL by the owner, documented | **Routes and UI built** — the operator console at `/admin`; `/keys/:id/revoke` on the admin path is still planned (the customer route exists) |
-| **With revenue** | Adjustments as an endpoint, with notes and audit. **Not refunds** — the platform does not refund | Not built |
+| **With revenue** | Adjustments as an endpoint, with notes and audit. **Not refunds** — the platform does not refund | **Built** — `POST /api/admin/accounts/:id/adjust`, with the two refusals and the note floor described above. The **second-operator threshold is NOT built**, so a single operator can still make any size of adjustment |
 | **Later** | Second-operator threshold, more roles, broader operator dashboards | Not built |
 
-**Starting read-only is deliberate.** The dangerous actions are the money ones, and
-they should be implemented once there is revenue to misfile — not on day one when
-nobody but the owner is operating and a mis-keyed adjustment is easy to spot.
+**Starting read-only was deliberate, and the money action landed before there was revenue
+to misfile.** That ordering is worth recording because it is the opposite of what this
+document originally argued: the note above used to say the dangerous actions should wait
+until revenue existed. What changed is that the RULES were the hard part and they are now
+enforced in code rather than described in prose — so the remaining risk is a single
+operator mis-keying an amount, which the audit trail makes recoverable and the refusal of
+an over-balance debit makes hard to do by accident.
 
 ## Open items
 
