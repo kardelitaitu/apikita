@@ -3338,9 +3338,11 @@ mod tests {
             .filter(|p| p.extension().is_some_and(|e| e == "sql"))
             .collect();
         entries.sort();
-        for path in entries {
+        // `&entries`, because the second pass below reads the same file list again - and reading
+        // it again is the point. A copy taken here would not catch what THIS loop failed to see.
+        for path in &entries {
             files += 1;
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let text = std::fs::read_to_string(path).unwrap_or_default();
             for line in text.lines() {
                 if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
                     let name = rest
@@ -3379,12 +3381,55 @@ mod tests {
             files >= 2,
             "only {files} migration file(s) were read, so a table created by a later migration would be invisible to this test."
         );
+        // THE TABLE COUNT IS PARSEABLE EXACTLY, SO IT IS NOT A FLOOR. This was
+        // `tables.len() >= 14` against TWENTY-ONE real tables - and the comment beside it said
+        // nineteen, which is how a hand-written count goes stale. MEASURED: re-indenting seven
+        // `CREATE TABLE` lines so the prefix match above stopped seeing them left 14, the floor
+        // passed, and every assertion after it stayed green - while each of those seven tables
+        // silently stopped being checked for disclosure. The loop below cannot notice, because it
+        // iterates the tables the parse FOUND.
+        //
+        // The reference is a scan that does NOT share the strict parser's assumption. A second
+        // pass of the same `strip_prefix("CREATE TABLE ")` would be no reference at all -
+        // MEASURED: with the floor written that way, re-indenting seven definitions made BOTH
+        // counts drop together and the check stayed green, which is exactly the vacuity it was
+        // added to prevent. What is checked instead is a PROPERTY the strict parse must satisfy
+        // but does not compute: every table it finds must also be named in `privacy.ts` as a
+        // `covers` entry, or the disclosure loop below would panic on it. The union of the two
+        // hand-kept lists is therefore the set of tables that CAN be parsed - and it is compared
+        // to what was parsed, in both directions, with no count in the comparison at all.
+        let accounted: Vec<&str> = DISCLOSED
+            .iter()
+            .map(|(t, _)| *t)
+            .chain(UNUSED.iter().map(|(t, _)| *t))
+            .collect();
+        let unaccounted: Vec<&String> = tables
+            .iter()
+            .filter(|t| !accounted.contains(&t.as_str()))
+            .collect();
         assert!(
-            // Nineteen tables, so the floor is fourteen. A floor AT the count records the
-            // current scope rather than guarding it.
-            tables.len() >= 14,
-            "only {} table(s) were read from the migrations, so this test is not looking at the real schema.",
-            tables.len()
+            unaccounted.is_empty(),
+            "the strict parse found {unaccounted:?} in the migrations and neither hand-kept list names them, so the loop below would panic OR - if the parse is what lost tables - these were never checked. Parsed: {tables:?}"
+        );
+        // ONE ENTRY IS DELIBERATELY NOT A TABLE. `UNUSED` carries `wallets_pending_rebuild` with
+        // the reason that NO MIGRATION CREATES IT - a placeholder kept so the map has an entry
+        // that is not a live table. MEASURED: this check reported it on its first run, which is
+        // the assertion working rather than a false positive. It is named here so the exemption
+        // is a decision with a reason rather than a loosened comparison.
+        const NOT_A_TABLE: &[&str] = &["wallets_pending_rebuild"];
+        let missing: Vec<&str> = accounted
+            .iter()
+            .filter(|t| !NOT_A_TABLE.contains(*t))
+            .filter(|t| !tables.iter().any(|parsed| parsed == *t))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these tables are in DISCLOSED or UNUSED and the parser did not find them in the migrations: {missing:?}. Either a migration was corrupted, or the prefix match stopped recognising how a definition is written - and the disclosure loop below cannot tell, because it only walks what the parse returned."
+        );
+        assert!(
+            !tables.is_empty(),
+            "no tables parsed at all, so the disclosure loop below checks nothing"
         );
 
         for table in &tables {
