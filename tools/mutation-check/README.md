@@ -32,6 +32,30 @@ cannot skip. The other thirteen exit 3.
 Not asserted, deliberately: what the gate checks or whether its subject is right. That is the gate's own
 business, and a check on it would duplicate every other README here.
 
+## This gate's own check was audited, because a grep can be fooled
+
+`exit 3` is found with a regex, and round 27 of this repository's audit found four anchors that matched text
+inside a comment — a check that reports ok for a reason that is not there. So this gate's check was verified
+rather than assumed, in two ways:
+
+**Statically.** Every gate's `exit 3` occurrences were listed with their line number and whether that line
+is a comment. No gate's only occurrence is prose.
+
+**Behaviourally, which is what settled it.** Every optional-tool gate was run twice — once normally, and once
+under a stripped `PATH` holding the coreutils the gates need and *not* the tool under test. Two controls
+guard each run: **does the stripped shell execute at all**, and **is the tool genuinely absent**. Without
+those, a result of `0` is indistinguishable from a run that never happened.
+
+**Result: 12 of 12 gates exit 3, each with a message naming the missing tool.**
+
+The first attempt at that measurement reported twelve defects because its stripped `PATH` was empty — a
+harness fault reading as "nothing failed", which is the defect this repository writes gates against. The
+controls are what distinguish the two.
+
+`rollback-check` still does more than this gate does: it asserts the skip path **in its own suite**
+(`with no sqlite3 the drill must skip loudly with exit 3`), so a future edit that breaks the skip fails the
+gate itself rather than waiting for an audit.
+
 ## Two false starts, recorded because they are the reason the gate is shaped this way
 
 **It began as a mutation-harness checker.** Round 42 believed a mutation result that a checklist would have

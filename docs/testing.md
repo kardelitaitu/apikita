@@ -3175,3 +3175,35 @@ matches — none outside the whitelisted correction notes.
 **The WSL environmental limit was already on record and I nearly re-derived it from scratch:** that distro
 cannot run Docker and cannot build the website. `compose-check` and the website suite are Windows-only
 operations. A suite run from WSL is not a measurement of this codebase.
+
+
+#### The new gate was audited, and its check is behavioural (round 45)
+
+`mutation-check` asserts that every optional-tool gate has an `exit 3`. That is a GREP, and a grep can be
+satisfied by a comment (round 27) or by a branch that cannot be taken. So the check itself was audited two
+ways.
+
+**Statically:** every gate's `exit 3` occurrences were listed with their line and whether that line is a
+comment. No gate's only occurrence is prose, and `rollback-check` goes further — it *asserts* the skip path
+in its own test suite (`with no sqlite3 the drill must skip loudly with exit 3`), which is stronger than
+anything this gate does.
+
+**Behaviourally, which is what settled it.** Every optional-tool gate was run twice: once normally, and once
+under a stripped `PATH` containing the coreutils the gates need **and not the tool under test**. Two controls
+guard each run — *does the stripped shell execute at all*, and *is the tool genuinely absent* — because
+without them a result of `0` is indistinguishable from a run that never happened.
+
+**12 of 12 gates exit 3 with a message naming the missing tool.**
+
+**And the first attempt at that measurement was a harness fault of exactly the kind this audit exists to
+catch**, which is why the controls are there:
+
+- Its first form built the stripped `PATH` from Windows-side `command -v`, which WSL cannot resolve, so the
+  directory was empty and **every gate reported `without=0`** — twelve apparent defects that were one broken
+  harness. `0` reads as "nothing failed"; the control reported an empty string every time.
+- Its second form was written as an inline `wsl -- bash -c "…"` and was destroyed by PowerShell's backtick
+  and `$()` handling, which truncated the string into a syntax error. **Round 4's rule, re-earned: write the
+  script to a file rather than inlining it.** A `.agents/test-skip-path.sh` worked first time.
+
+**So the round's result is that the check is sound, and the way that was established matters more than the
+result.** A grep was validated against behaviour rather than trusted because it was plausible.
