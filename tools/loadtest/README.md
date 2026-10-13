@@ -21,6 +21,7 @@ Exit `0` every verdict passed, `1` a verdict is `[BELOW TARGET]`, `3` a prerequi
 | --- | --- | --- |
 | Key Validation Latency (p99) | `<= 1.5 ms` | **nobody** |
 | CPU Saturation at 200 req/s | `<= 40%` | **nobody** |
+| In-Flight Stream Memory | `< 35 KB / stream` | **nobody** — RSS was sampled and the stream count was not known |
 
 `server/src/bin/benchmark.rs` cannot produce either, and says so about itself — it is an in-process
 capacity suite on one OS thread with no HTTP client, no latency histogram and no sampling, and the
@@ -100,6 +101,34 @@ as one in the output.
 `docs/load-test.md` for how to take those: a machine separate from the server, with the server pinned
 to `--cpus=0.2`.
 
+## The stream-memory row, and the divisor it needed
+
+`docs/benchmark.md`'s Scenario 2 states `< 35 KB per stream`, and until now this tool sampled RSS while
+never knowing how many streams it was serving — so the two figures existed side by side and nobody
+divided them. `docs/cost-and-sizing.md` had it as an open item in those words.
+
+`--operator-cookie` lets the tool read `peak_streams` from `GET /api/admin/metrics`. Three things
+about the result are deliberate:
+
+- **The count comes from the SERVER, not from this generator.** The generator knows what it SENT;
+  the server knows what it is HOLDING. They differ exactly where the measurement matters — requests
+  still in flight when the run ends. A client-side count would also be a property of this tool rather
+  than of the service, so it could not be compared against anything measured elsewhere.
+- **The baseline is read BEFORE the load.** `peak_streams` is a process-lifetime high-water mark, so
+  a server that already served a burst reports that older peak. The delta is what makes the figure
+  attributable to *these* requests.
+- **Either input missing is `NO DATA`, never a number.** No cookie, a non-200, or a run that opened
+  no streams the server counted each report why — an RSS figure divided by zero streams would be an
+  infinity, and one divided by a guessed stream count would be worse: plausible and wrong.
+
+The output prints the divisor beside the quotient, so a reader who disagrees with the division can
+redo it — the same convention the CPU row follows in printing raw core-equivalents.
+
+> **What this does not do.** The published row is about a *deployed* instance under the Scenario 2
+> workload (`50 -> 1,000` concurrent streams, a mock upstream at 30 tok/s). A local run against a
+> server whose upstream is a placeholder authenticates, is refused at the provider, and counts **zero**
+> streams — which is reported as NO DATA rather than as a pass. The remaining work is a run against a
+> real stack with a working upstream, and it is recorded as open rather than implied.
 ## Falsifying the verdicts
 
 A verdict that cannot be made to fail on demand is a verdict nobody has tested. `--target-p99-ms` and

@@ -125,9 +125,29 @@ compare() {
     fi
 }
 
-echo "loadtest-check: the two published thresholds, document vs tool"
+echo "loadtest-check: the three published thresholds, document vs tool"
 compare "Key Validation Latency (p99)" "PUBLISHED_P99_LATENCY_MS" "Key Validation Latency"
 compare "CPU Saturation at 200 req/s" "PUBLISHED_CPU_TARGET_PCT" "CPU Saturation"
+# THE IN-FLIGHT MEMORY ROW, added with the verdict it guards. Without this the tool could compare
+# against a bar the document no longer publishes and every live run would report a confident
+# verdict against a number nobody can find — the `max_connections = 10` defect the load-test
+# README already names as the reason this tool exists.
+# THE IN-FLIGHT MEMORY ROW IS PROSE, NOT A MATRIX ROW, so it is read directly rather than through
+# `compare`. `doc_figure` scans for a bare number after `<`/`<=`, and the document states this one
+# inside LaTeX — `$< 35\text{ KB}$ per stream` — where the number is followed by `\text`, which the
+# scanner stops on. Teaching `doc_figure` LaTeX would be a parser for one row; reading the one line
+# is the smaller, more honest coupling. The `$<` is still asserted, so a document that stopped
+# stating a bound fails here rather than silently comparing nothing.
+STREAM_KB_DOC=$(awk '/\$< *[0-9]+\\text\{ *KB\}\$/ { n = $0; sub(/.*\$</, "", n); sub(/\\text.*/, "", n); gsub(/ /, "", n); print n; exit }' "$DOC")
+STREAM_KB_TOOL=$(tool_figure "PUBLISHED_STREAM_KB")
+if [ -z "$STREAM_KB_DOC" ] || [ "$STREAM_KB_DOC" != "$STREAM_KB_TOOL" ]; then
+    echo "loadtest-check: FAIL - In-Flight Stream Memory: docs/benchmark.md states $< ${STREAM_KB_DOC:-<unreadable>} KB per stream and tools/loadtest/loadtest.js carries PUBLISHED_STREAM_KB = ${STREAM_KB_TOOL:-<unreadable>}" >&2
+    echo "loadtest-check:   The tool prints a KB/stream verdict against its constant. One target stated" >&2
+    echo "loadtest-check:   twice, so update both or neither." >&2
+    FAIL=1
+else
+    echo "loadtest-check:   ok - In-Flight Stream Memory: document and tool both say <= $STREAM_KB_DOC KB"
+fi
 
 # The row's own name carries the rate the CPU figure is denominated at, and the tool prints that
 # rate back to a reader as the fix for a saturation-mode reading.
@@ -303,7 +323,7 @@ if [ "$FAIL" -ne 0 ]; then
     echo "loadtest-check: FAIL - see the violations above." >&2
     exit 1
 fi
-echo "loadtest-check: OK - the load test's two thresholds match docs/benchmark.md, both verdicts fail"
-echo "loadtest-check:      when their measurement leaves the bar, the pid sampler reads a live process,"
+echo "loadtest-check: OK - the load test's three thresholds match docs/benchmark.md, every verdict fails"
+echo "loadtest-check:      when its measurement leaves the bar, the pid sampler reads a live process,"
 echo "loadtest-check:      the histogram definitions agree, and an unknown flag is refused."
 exit 0

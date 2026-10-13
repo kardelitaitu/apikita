@@ -157,13 +157,15 @@ Adding server capacity fixes nothing and doubles the bill.
 
 - [ ] Actual prices from Northflank for the target instance sizes.
 - [ ] Confirm the Cloudflare Pages free tier covers this usage.
-- [ ] Measure real memory per concurrent stream. **The INSTRUMENT half is done**: the claim
-  above — *"The only thing that grows with load is in-flight streaming buffers"* — is now
-  measurable, because `active_streams` and `peak_streams` on `GET /api/admin/metrics`
-  ([observability.md](observability.md)) report the level and the high-water mark. **The
-  MEASUREMENT is still open**: pairing that peak with an RSS reading to get KB/stream.
-  `docs/benchmark.md` publishes 35 KB/stream as the target and `tools/loadtest` samples RSS,
-  so both figures now exist; nobody has driven them together against a deployed instance.
+- [ ] Measure real memory per concurrent stream against a DEPLOYED instance. **The instrument
+  and the arithmetic are both done**: `active_streams` / `peak_streams` on
+  `GET /api/admin/metrics` ([observability.md](observability.md)) report the level and the
+  high-water mark, and `tools/loadtest` now reads that peak (`--operator-cookie`) and divides
+  it into its own RSS sample, reporting **KB per stream** against the `< 35 KB` row of
+  [benchmark.md](benchmark.md). **What is still open is the RUN**: the published row is about a
+  deployed instance under Scenario 2's `50 -> 1,000` concurrent streams against a working
+  upstream. Locally the upstream is a placeholder, so a run authenticates, is refused at the
+  provider, counts **zero** streams, and reports NO DATA rather than a pass.
 - [x] ~~Decide whether Postgres runs as a managed add-on or self-hosted.~~ **Moot** —
   the port to embedded SQLite removed the decision along with the service
   ([§Stack](../README.md#stack), [`plans/sqlite-migration.md`](plans/sqlite-migration.md)).

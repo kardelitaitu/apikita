@@ -82,6 +82,33 @@ need(m.verdictCpu(0.05, 0.2, 40).kind === 'PASS' && m.verdictCpu(0.05, 1.0, 40).
   && m.verdictCpu(0.5, 0.2, 40).kind === 'BELOW TARGET' && m.verdictCpu(0.5, 1.0, 40).kind === 'BELOW TARGET',
   'verdictCpu must divide by the vCPU denominator it is given');
 
+// --- In-Flight Stream Memory ---------------------------------------------------
+//
+// Added with the verdict itself, because a verdict this gate does not drive is a verdict nobody
+// has tested — the exact gap this file exists to close, and the reason it drives the functions
+// rather than grepping for their shape. The row is `In-Flight Stream Memory | < 35 KB / stream`.
+const kbIn = m.verdictKbPerStream(20, 35, 'test');
+const kbOut = m.verdictKbPerStream(80, 35, 'test');
+need(kbIn.kind === 'PASS', `verdictKbPerStream(20, 35) returned ${kbIn.kind}, expected PASS`);
+need(kbIn.ok === true, 'verdictKbPerStream(20, 35).ok should be true');
+need(kbOut.kind === 'BELOW TARGET', `verdictKbPerStream(80, 35) returned ${kbOut.kind}, expected BELOW TARGET`);
+need(kbOut.ok === false, 'verdictKbPerStream(80, 35).ok should be false');
+// EXACTLY ON THE BAR IS INSIDE IT: the row reads `<= 35`, not `< 35`. An off-by-one here would
+// fail a service that is precisely within its published budget.
+need(m.verdictKbPerStream(35, 35, 'test').kind === 'PASS', 'exactly 35 KB must PASS: the row is `<=`');
+// THE SAME MEASUREMENT AT TWO BARS, which is the flip the row is about.
+need(m.verdictKbPerStream(20, 35, 'test').kind === 'PASS' && m.verdictKbPerStream(20, 10, 'test').kind === 'BELOW TARGET',
+  'the same 20 KB measurement must PASS at a 35 KB bar and FAIL at a 10 KB bar');
+// NO DATA IS NEVER A PASS, and it is the outcome for three distinct causes that must each
+// report why rather than collapsing into one unactionable line.
+for (const v of [null, Number.NaN, Number.POSITIVE_INFINITY]) {
+  const nd = m.verdictKbPerStream(v, 35, 'test');
+  need(nd.ok === false, `verdictKbPerStream(${v}) reported ok=true - an unmeasured figure must never pass`);
+  need(nd.kind === 'NO DATA', `verdictKbPerStream(${v}) kind was ${nd.kind}, expected NO DATA`);
+}
+// THE REASON TRAVELS THROUGH, so an operator learns WHICH input was missing.
+need(m.verdictKbPerStream(null, 35, 'no operator cookie was given').text.includes('no operator cookie'),
+  'the NO DATA text must carry the caller reason rather than a generic message');
 // --- An unresolvable p99 is NEVER a pass ----------------------------------------
 //
 // This is the instrument-floor verdict. It exists because a single Node process measured a p99 of

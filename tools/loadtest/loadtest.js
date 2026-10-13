@@ -131,6 +131,19 @@ const PUBLISHED_CPU_TARGET_PCT = 40;
 const PUBLISHED_VCPU = 0.2;
 
 /**
+ * The published in-flight memory target, from `docs/benchmark.md`'s
+ * `In-Flight Stream Memory | < 35 KB / stream` row.
+ *
+ * COPIED RATHER THAN DERIVED, and `server/src/doc_claims.rs` already couples the document's other
+ * published figures to the constants that print them. The direction of the coupling matters: the
+ * DOCUMENT is the specification here, so a change to this constant without a change to the
+ * document would be the defect — the same one `max_connections = 10` was, a number with no owner.
+ * `tools/loadtest-check/check.sh` reads the document and asserts this constant matches it, so the
+ * two cannot drift.
+ */
+const PUBLISHED_STREAM_KB = 35;
+
+/**
  * The request rate the CPU row is stated at, from the row's name, `CPU Saturation at 200 req/s`.
  *
  * The harness OFFERS the server this work and measures the CPU it costs. It is not a floor and not a
@@ -387,6 +400,34 @@ function verdictCpu(coreEquivalents, vcpu, targetPct) {
 }
 
 /**
+ * Compares measured KB per concurrent stream against the published bar.
+ *
+ * FALSIFIABLE like its siblings: `--target-kb-per-stream` overrides the published constant, so
+ * the same measurement flips `[PASS]` to `[BELOW TARGET]` when the bar moves. A verdict nobody
+ * has made fail is a verdict nobody has tested — `docs/loadtest/README.md` records the exact
+ * override commands for the other two rows and the gate performs the flip mechanically.
+ *
+ * `NO DATA` IS NOT A PASS, and it is the honest outcome for three distinct situations that must
+ * not be collapsed into one number:
+ *   * the stream count could not be read (no operator cookie, or a non-200 from the route);
+ *   * the run opened no streams the server counted, so the divisor is zero;
+ *   * RSS was not sampled at all, because no `--pid` was given.
+ * Each reports why, so a reader is never left with a bare 'no data' they cannot act on.
+ */
+function verdictKbPerStream(kbPerStream, targetKb, why) {
+  if (kbPerStream === null || !Number.isFinite(kbPerStream)) {
+    return {
+      ok: false,
+      kind: 'NO DATA',
+      text: `${why} — docs/benchmark.md publishes a <= ${targetKb} KB/stream target, and nothing was compared against it`,
+    };
+  }
+  const rounded = Number(kbPerStream.toFixed(3));
+  return kbPerStream <= targetKb
+    ? { ok: true, kind: 'PASS', text: `${rounded} KB/stream is within the published <= ${targetKb} KB` }
+    : { ok: false, kind: 'BELOW TARGET', text: `${rounded} KB/stream EXCEEDS the published <= ${targetKb} KB` };
+}
+/**
  * The verdict for a p99 the INSTRUMENT cannot resolve.
  *
  * Deliberately `ok: false`, so the process exit code is non-zero and a caller cannot mistake "I
@@ -426,6 +467,7 @@ function parseArgs(argv) {
     '--pid': 'number', '--sample-interval-ms': 'number',
     '--keep-alive': 'flag', '--no-keep-alive': 'flag',
     '--target-p99-ms': 'number', '--target-cpu-pct': 'number',
+    '--operator-cookie': 'string', '--target-kb-per-stream': 'number',
     '--measure-floor': 'flag', '--no-measure-floor': 'flag', '--floor-seconds': 'number',
     '--json': 'string', '--help': 'flag',
   };
@@ -595,6 +637,7 @@ async function main() {
   const targetCpuPct = args['--target-cpu-pct'] ?? PUBLISHED_CPU_TARGET_PCT;
   const overridingP99 = args['--target-p99-ms'] !== undefined;
   const overridingCpu = args['--target-cpu-pct'] !== undefined;
+  const overridingStreamKb = args['--target-kb-per-stream'] !== undefined;
 
   const pid = args['--pid'] ?? null;
   const workers = args['--workers'] ?? 4;
@@ -638,6 +681,18 @@ async function main() {
     process.exit(3);
   }
 
+  // --- the stream-count baseline, read BEFORE the load ---------------------------
+  //
+  // The peak is a PROCESS-LIFETIME high-water mark, so a server that has already served a
+  // burst reports that older peak throughout this run. Reading it before the load is what
+  // makes the delta attributable to THESE requests rather than to whatever ran earlier —
+  // without it, a KB/stream figure from a quiet run against a busy server would divide this
+  // run's RSS by the previous peak. Primed with a fallback of 0 so a failed read degrades to
+  // "no baseline", which is reported rather than silently treated as zero.
+  const streamsBefore = await readPeakStreams(baseUrl, args['--operator-cookie']);
+  if (!streamsBefore.ok) {
+    progress(`stream-count baseline NOT read (${streamsBefore.why}) — the KB/stream row will report NO DATA`);
+  }
   const cpuQuantumMs = measureCpuQuantumMs();
   const usable = sampleIntervalIsUsable(sampleIntervalMs, cpuQuantumMs);
   if (!usable.ok) {
@@ -673,6 +728,21 @@ async function main() {
   const sampling = await sampler;
   const wallMs = Date.now() - startedAt;
 
+  // --- the stream count for THIS run, read after the load stopped -----------------
+  //
+  // Read AFTER `stopped` so the peak includes every stream this run opened. The delta against
+  // the pre-load baseline is what makes the figure attributable to these requests; the server's
+  // peak is a process-lifetime high-water mark and would otherwise carry an earlier burst into
+  // this run's arithmetic.
+  //
+  // A NEGATIVE DELTA IS IMPOSSIBLE and is clamped rather than reported, because the peak cannot
+  // fall — if it appears to, the read raced the run's own start and the honest answer is 0 new
+  // streams, which then reports NO DATA rather than a fabricated divisor.
+  const streamsAfter = await readPeakStreams(baseUrl, args['--operator-cookie']);
+  const peakStreamsThisRun = streamsAfter.ok && streamsBefore.ok
+    ? Math.max(0, streamsAfter.peakStreams - streamsBefore.peakStreams)
+    : null;
+
   const failedWorkers = results.filter((r) => !r).length;
   const hist = mergeHistograms(results.map((r) => r && r.histogram));
   const completed = results.reduce((a, r) => a + (r ? r.completed : 0), 0);
@@ -701,6 +771,14 @@ async function main() {
   const samplingWindowMs = sampling.samples.reduce((a, s) => a + s.dWallMs, 0);
   const coreEquivalents = samplingWindowMs > 0 ? cpuSeconds / (samplingWindowMs / 1000) : null;
   const rssPeak = sampling.samples.reduce((a, s) => Math.max(a, s.rssBytes), 0);
+  // KB PER STREAM, the figure docs/benchmark.md publishes a 35 KB target for and nothing had
+  // ever computed: RSS was sampled and the stream count was not known. `null` on either side
+  // propagates rather than defaulting, so a run that could not read the count reports NO DATA
+  // instead of a plausible number built on a divisor of one.
+  const peakKbPerStream =
+    rssPeak > 0 && peakStreamsThisRun !== null && peakStreamsThisRun > 0
+      ? rssPeak / 1024 / peakStreamsThisRun
+      : null;
   const rssLast = sampling.samples.length ? sampling.samples[sampling.samples.length - 1].rssBytes : null;
   const achievedRps = loadMs > 0 ? (completed / loadMs) * 1000 : 0;
   const cpuPer1kRequests = completed > 0 ? (cpuSeconds / completed) * 1000 : null;
@@ -724,7 +802,16 @@ async function main() {
   }
 
   const cpuVerdict = verdictCpu(coreEquivalents, PUBLISHED_VCPU, targetCpuPct);
-  const allOk = p99Verdict.ok && cpuVerdict.ok;
+  const targetStreamKb = args['--target-kb-per-stream'] ?? PUBLISHED_STREAM_KB;
+  // The reason string is built from whichever input was missing, so the NO DATA line names the
+  // actual cause instead of a generic 'not measured'.
+  const streamKbWhy = !sampling.samples.length
+    ? 'the server process was never sampled (no --pid), so RSS was not read'
+    : peakStreamsThisRun === null
+      ? `the stream count was not read (${streamsAfter.ok ? 'no pre-load baseline' : streamsAfter.why})`
+      : 'the run opened no streams the server counted';
+  const streamKbVerdict = verdictKbPerStream(peakKbPerStream, targetStreamKb, streamKbWhy);
+  const allOk = p99Verdict.ok && cpuVerdict.ok && streamKbVerdict.ok;
 
   if (failedWorkers > 0) {
     progress(`WARNING: ${failedWorkers} of ${workers} worker process(es) produced no result`);
@@ -794,6 +881,20 @@ async function main() {
     if (cpuPer1kRequests !== null) line(`    CPU per 1k requests: ${cpuPer1kRequests.toFixed(4)} CPU-seconds`);
     line(`    Peak RSS           : ${rssPeak ? `${(rssPeak / 2 ** 20).toFixed(2)} MB` : 'not read'}`);
     line(`    Final RSS          : ${rssLast ? `${(rssLast / 2 ** 20).toFixed(2)} MB` : 'not read'}`);
+    // THE STREAM COUNT AND THE FILE-LEVEL FIGURE, printed together so the division is auditable
+    // rather than asserted: a reader who disagrees with the denominator can redo it from these
+    // two lines. Same convention as the CPU row, which prints raw core-equivalents beside the
+    // normalised percentage.
+    if (peakStreamsThisRun === null) {
+      line(`    Streams (peak, run) : NO DATA — ${streamsAfter.ok ? 'no pre-load baseline' : streamsAfter.why}`);
+      line('    KB per stream      : NO DATA — an RSS figure without a stream count is not a KB/stream');
+    } else if (peakStreamsThisRun === 0) {
+      line('    Streams (peak, run) : 0 — this load opened no streams the server counted.');
+      line('    KB per stream      : NO DATA — dividing by zero streams would report an infinity.');
+    } else {
+      line(`    Streams (peak, run) : ${peakStreamsThisRun}`);
+      line(`    KB per stream      : ${peakKbPerStream.toFixed(3)} KB (peak RSS / peak concurrent streams)`);
+    }
   }
   line(`    This generator     : ${workerCpuSeconds.toFixed(3)} CPU-seconds across ${workers} process(es)`);
   line('');
@@ -822,6 +923,18 @@ async function main() {
   if (overridingCpu) {
     line(`           NOTE: the bar was OVERRIDDEN on the command line (--target-cpu-pct ${targetCpuPct}); the`);
     line(`           document publishes ${PUBLISHED_CPU_TARGET_PCT}%. This run is a falsification test, not a reading.`);
+  }
+  line('');
+  line('  [In-Flight Stream Memory]');
+  line(`    [${streamKbVerdict.kind}] ${streamKbVerdict.text}`);
+  if (peakKbPerStream !== null && peakStreamsThisRun !== null && peakStreamsThisRun > 0) {
+    line(`           Divisor: peak RSS ${(rssPeak / 2 ** 20).toFixed(2)} MB over a peak of ${peakStreamsThisRun} concurrent streams.`);
+    line('           The denominator is the SERVER\'s count, not this generator\'s, so it includes requests');
+    line('           still in flight when the load stopped.');
+  }
+  if (overridingStreamKb) {
+    line(`           NOTE: the bar was OVERRIDDEN on the command line (--target-kb-per-stream ${targetStreamKb}); the`);
+    line(`           document publishes ${PUBLISHED_STREAM_KB} KB. This run is a falsification test, not a reading.`);
   }
   line('');
 
@@ -899,6 +1012,12 @@ async function main() {
       cpuPer1kRequests: cpuPer1kRequests === null ? null : Number(cpuPer1kRequests.toFixed(6)),
       peakRssBytes: rssPeak || null,
       finalRssBytes: rssLast || null,
+      // THE DIVISOR IS PUBLISHED BESIDE THE QUOTIENT, so a consumer can redo the division rather
+      // than trust it. A bare kbPerStream is a number nobody can audit; these two lines are the
+      // same convention the CPU row follows when it prints raw core-equivalents beside the
+      // normalised percentage.
+      peakStreamsThisRun,
+      kbPerStream: peakKbPerStream === null ? null : Number(peakKbPerStream.toFixed(3)),
       cpuQuantumMs,
     },
     client: { cpuSeconds: Number(workerCpuSeconds.toFixed(4)), processCount: workers },
@@ -907,13 +1026,15 @@ async function main() {
       cpuTargetPct: PUBLISHED_CPU_TARGET_PCT,
       cpuRateRps: PUBLISHED_CPU_RATE_RPS,
       vcpu: PUBLISHED_VCPU,
+      streamKb: PUBLISHED_STREAM_KB,
       source: 'docs/benchmark.md#3-metrics-matrix--thresholds',
     },
-    targetsUsed: { p99LatencyMs: targetP99Ms, cpuTargetPct: targetCpuPct },
-    overridden: { p99LatencyMs: overridingP99, cpuTargetPct: overridingCpu },
+    targetsUsed: { p99LatencyMs: targetP99Ms, cpuTargetPct: targetCpuPct, kbPerStream: targetStreamKb },
+    overridden: { p99LatencyMs: overridingP99, cpuTargetPct: overridingCpu, kbPerStream: overridingStreamKb },
     verdicts: {
       p99: { kind: p99Verdict.kind, ok: p99Verdict.ok, measuredMs: measuredP99Ms, targetMs: targetP99Ms },
       cpu: { kind: cpuVerdict.kind, ok: cpuVerdict.ok, measuredPct: cpuVerdict.pct, targetPct: targetCpuPct, vcpu: PUBLISHED_VCPU },
+      kbPerStream: { kind: streamKbVerdict.kind, ok: streamKbVerdict.ok, measured: peakKbPerStream === null ? null : Number(peakKbPerStream.toFixed(3)), targetKb: targetStreamKb },
       allOk,
     },
   };
@@ -949,6 +1070,69 @@ function probeReachable(baseUrl, reqPath, headers, body) {
 }
 
 /**
+ * Read `peak_streams` from the server, so RSS can be divided by it.
+ *
+ * THE OPEN ITEM THIS CLOSES, named in `docs/cost-and-sizing.md`: the sizing argument rests on
+ * "The only thing that grows with load is in-flight streaming buffers", and `docs/benchmark.md`
+ * publishes **35 KB/stream** as the target. Until now the two figures existed side by side and
+ * nobody divided them — this tool sampled RSS and never knew how many streams it was serving.
+ *
+ * WHY THE SERVER MUST SUPPLY IT RATHER THAN THE GENERATOR COUNTING ITS OWN REQUESTS. The
+ * generator knows what it SENT; the server knows what it is HOLDING. They differ exactly where
+ * the measurement matters: requests still in flight when the run ends, and streams the server
+ * refused. Counting client-side would also make the figure a property of this tool rather than
+ * of the service, so it could not be compared against anything measured elsewhere.
+ *
+ * RETURNS `null` WHEN IT CANNOT BE READ, NEVER 0. A zero would produce `peakKbPerStream =
+ * Infinity` or a divide-by-zero, and — worse — a plausible-looking KB/stream computed against
+ * an endpoint that was never reached. `null` propagates to a named `[NO DATA]` line, which is
+ * the same rule the CPU sampler follows for an unreadable pid.
+ *
+ * THE ROUTE IS OPERATOR-AUTHENTICATED, so a cookie is required. Without one this returns null
+ * and the KB/stream row reports NO DATA rather than guessing — the honest outcome, since the
+ * alternative would be to publish a memory figure with no stream count behind it.
+ */
+function readPeakStreams(baseUrl, cookie) {
+  return new Promise((resolve) => {
+    if (!cookie) { resolve({ ok: false, why: 'no operator cookie was given' }); return; }
+    let url;
+    try { url = new URL('/api/admin/metrics', baseUrl); }
+    catch (e) { resolve({ ok: false, why: `bad URL: ${e.message}` }); return; }
+    const req = http.request(
+      { host: url.hostname, port: url.port, path: url.pathname, method: 'GET',
+        headers: { Cookie: cookie }, timeout: 5000 },
+      (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            resolve({ ok: false, why: `HTTP ${res.statusCode} (401 = bad or expired cookie, 403 = not an operator)` });
+            return;
+          }
+          try {
+            const parsed = JSON.parse(body);
+            const peak = parsed.peak_streams;
+            const active = parsed.active_streams;
+            // `Number.isInteger` rather than a truthiness test: `0` is a legitimate peak (a
+            // server that has served nothing), and `!peak` would reject it as missing.
+            if (!Number.isInteger(peak) || !Number.isInteger(active)) {
+              resolve({ ok: false, why: 'the payload carried no integer peak_streams' });
+              return;
+            }
+            resolve({ ok: true, peakStreams: peak, activeStreams: active });
+          } catch (e) {
+            resolve({ ok: false, why: `the metrics payload was not JSON: ${e.message}` });
+          }
+        });
+      },
+    );
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, why: 'the metrics read timed out' }); });
+    req.on('error', (err) => resolve({ ok: false, why: err.message }));
+    req.end();
+  });
+}
+/**
  * The histogram boundaries, shared with the workers.
  *
  * Duplicated from `loadtest-worker.js` rather than imported, because the worker is spawned as a
@@ -982,6 +1166,8 @@ module.exports = {
   HISTOGRAM_BOUNDS,
   verdictP99,
   verdictCpu,
+  verdictKbPerStream,
+  PUBLISHED_STREAM_KB,
   verdictUnresolvable,
   percentileFromHistogram,
   mergeHistograms,
