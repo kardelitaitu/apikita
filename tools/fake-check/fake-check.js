@@ -120,6 +120,97 @@ function checkMidtransSignature() {
   else ok('field order is load-bearing (swapping order_id and status_code changes the digest)');
 }
 
+/**
+ * THE PAYLOAD MUST MATCH ITS SIGNATURE, which the check above cannot see.
+ *
+ * WHY THIS EXISTS. `checkMidtransSignature` evaluates the fake's `computeSignature` against the server's
+ * pinned vector, which proves the FUNCTION is right. It never sends anything, so drift between what is
+ * SIGNED and what is SENT is invisible to it. MEASURED, by mutation, in the round this was added:
+ *
+ *   signing `grossAmount` while the body sends `finalGrossAmount`   -> SURVIVED
+ *   renaming the body's `order_id` to `order_id_camel`               -> SURVIVED
+ *
+ * The consequence, since the server recomputes the signature over what it reads from the body: a drifted
+ * payload is a webhook the real server answers **401 invalid signature**. An operator following the
+ * README gets a refusal with no explanation, and the tool's stated purpose - "the signature the server
+ * computes" - is false.
+ *
+ * HOW IT CHECKS WITHOUT NETWORK. `buildNotification` is evaluated from source the same way
+ * `computeSignature` is, so the assertion runs the real code rather than a copy. The notification is then
+ * re-verified with the REAL server check: recompute the digest over the body's own fields and compare it
+ * to the body's `signature_key`. That is the same pair `money.rs::verify_midtrans_signature` compares,
+ * applied to the fake's own output.
+ */
+function checkNotificationMatchesItsSignature() {
+  const src = fs.readFileSync(path.join(REPO, 'tools/fake-midtrans/send-webhook.mjs'), 'utf8').replace(/\r\n/g, '\n');
+
+  const take = (name) => {
+    const start = src.indexOf(`function ${name}(`);
+    if (start === -1) return null;
+    const end = src.indexOf('\n}', start);
+    return end === -1 ? null : src.slice(start, end + 2);
+  };
+
+  const pieces = [take('computeSignature'), take('buildNotification')];
+  if (pieces.some((p) => p === null)) {
+    fail('could not extract computeSignature and buildNotification from send-webhook.mjs — the payload check would otherwise compare against a copy');
+    return;
+  }
+
+  let build;
+  try {
+    const mod = { exports: {} };
+    // eslint-disable-next-line no-new-func
+    new Function('crypto', 'process', 'module', `${pieces[0]}\n${pieces[1]}\nmodule.exports = buildNotification;`)(crypto, process, mod);
+    build = mod.exports;
+  } catch (e) {
+    fail(`buildNotification could not be evaluated: ${e.message}`);
+    return;
+  }
+  if (typeof build !== 'function') {
+    fail('send-webhook.mjs exposes no buildNotification after evaluation');
+    return;
+  }
+
+  // Driven for every scenario the tool advertises, including the ones signed with the wrong key,
+  // because a wrong-key webhook is REJECTED and must be - that is not drift.
+  for (const scenario of ['settlement', 'bad-signature', 'wrong-amount', 'refund']) {
+    const prev = process.env.MIDTRANS_SERVER_KEY;
+    process.env.MIDTRANS_SERVER_KEY = 'SB-Mid-server-TEST12345';
+    let n;
+    try {
+      n = build(scenario, { orderId: 'topup_vector_order', amount: '50000.00' });
+    } catch (e) {
+      fail(`buildNotification(${scenario}) threw: ${e.message}`);
+      continue;
+    } finally {
+      if (prev === undefined) delete process.env.MIDTRANS_SERVER_KEY;
+      else process.env.MIDTRANS_SERVER_KEY = prev;
+    }
+
+    // THE PAYLOAD'S OWN FIELDS, re-signed. This is exactly what the server does.
+    const expected = crypto.createHash('sha512')
+      .update(String(n.order_id))
+      .update(String(n.status_code))
+      .update(String(n.gross_amount))
+      .update('SB-Mid-server-TEST12345')
+      .digest('hex');
+
+    if (scenario === 'bad-signature') {
+      // Deliberately forged elsewhere: it MUST NOT verify, and if it does, the fake's "invalid" case
+      // is not invalid at all.
+      if (n.signature_key === expected) fail(`bad-signature verified anyway, so the tool's forged case is not one: ${scenario}`);
+      else ok(`bad-signature is genuinely forged (${scenario})`);
+      continue;
+    }
+    if (n.signature_key !== expected) {
+      fail(`the ${scenario} payload's signature_key does not match its OWN body fields — the tool would post a webhook the server answers 401`);
+    } else {
+      ok(`the ${scenario} payload signs exactly what it sends (${scenario})`);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // fake-upstream: every row of its failure-injection table
 // ---------------------------------------------------------------------------
@@ -233,6 +324,7 @@ async function checkFakeUpstream(port) {
 (async () => {
   console.log('fake-check: the two fake services do what their READMEs say');
   checkMidtransSignature();
+  checkNotificationMatchesItsSignature();
   await checkFakeUpstream(Number(process.env.FAKE_CHECK_PORT || 18799));
 
   console.log('');

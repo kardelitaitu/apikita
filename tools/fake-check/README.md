@@ -23,9 +23,24 @@ nothing at all.
 
 **`fake-midtrans` — the signature, against the server's own vector.** The tool claims to compute the
 Midtrans signature *"exactly the way the server does"*, so the check compares it against
-`VECTOR_SIG` in `server/src/money.rs:1005`, which that file describes as computed by `sha512sum` and
+`VECTOR_SIG` in `server/src/money.rs`, which that file describes as computed by `sha512sum` and
 `hashlib` outside the crate — independent ground truth. It also asserts field order is load-bearing,
 because a digest that survives swapping two fields is not a signature.
+
+**`fake-midtrans` — the payload signs exactly what it SENDS.** The signature check above proves the
+function is right; it cannot see the payload. MEASURED, by mutation, in the round this was added, and both
+**survived** the gate:
+
+| mutation | before |
+| --- | --- |
+| the signature is over `grossAmount` while the body sends `finalGrossAmount` | **SURVIVED** |
+| the body's `order_id` renamed to `order_id_camel` | **SURVIVED** |
+
+So `buildNotification` is now evaluated from source the same way, and the notification is **re-signed over
+its own body fields** — the same pair `money.rs::verify_midtrans_signature` compares — for every scenario
+the tool advertises. `bad-signature` is asserted in the *other* direction: it must NOT verify, or the tool's
+forged case is not forged. The consequence the gap allowed is a webhook the real server answers **401**,
+with no explanation to the operator following the README.
 
 **`fake-upstream` — every row of its failure-injection table**, against a live instance:
 
@@ -66,6 +81,9 @@ A gate that cannot fail is the defect this check exists to prevent, so it was mu
 | the `429`/`500` branch returns `200` | **caught** |
 | `?fail=midstream` stops cutting | **caught** |
 | the signature's field order is swapped in the real tool | **caught** |
+| the payload signs a **different amount** than it sends | **caught** (added with the payload check) |
+| the body's `order_id` is **renamed** | **caught** (added with the payload check) |
+| the signature is replaced by a literal | **caught** (added with the payload check) |
 
 The first attempt at this missed both anchors and proved nothing, and a mutation of `errorBody`'s
 `rateLimited` flag was **not** caught — correctly, because that flag only selects the error *type string*
@@ -74,6 +92,10 @@ about the gate, and saying so is the point.
 
 ## What it does NOT check
 
-It does not drive `fake-midtrans` end-to-end against a running server — the signature formula is checked
-directly instead, which is the part that can drift silently. The webhook path itself is covered by the
-server's own tests, which use their own fixtures.
+It does not drive `fake-midtrans` end-to-end against a running server, and MEASURED, no test or drill
+consumes the fake either — so nothing posts it. That bounds the payload check's value: a drift is a tool an
+operator runs by hand getting a 401, not a suite silently passing. It is checked anyway, because the README
+promises the tool computes the signature "exactly the way the server does" and that promise was being
+asserted only on the function, never on the body. The webhook path itself is covered by the server's own
+tests, which use their own fixtures.
+
