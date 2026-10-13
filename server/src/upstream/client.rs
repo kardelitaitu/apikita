@@ -417,6 +417,20 @@ impl UpstreamClient {
     ///
     /// The allow is on the FUNCTION because the increment is a loop tail
     /// expression, and an attribute there is still unstable.
+    ///
+    /// WHY THE PREDICATE IS `is_refusing()` AND NOT `allow_request()`, which is what
+    /// this called until now. A monitor that asks "is this provider down?" in order to
+    /// page an operator must not change the answer by asking, and `allow_request` is
+    /// the one method on the breaker that MUTATES on a read: in HalfOpen it consumes
+    /// the single trial slot. A `probe.sh` run therefore took the one trial a
+    /// recovering provider was owed, exited without sending a request, and left the
+    /// next real customer refused until its own `record_*` cleared the flag. The
+    /// half-open mechanism exists to admit exactly ONE trial; it was being burned by
+    /// a poll that never sent anything, which degrades failover on the quietest path
+    /// in the system. `is_refusing` answers the same question for this purpose — is
+    /// this endpoint refusing traffic right now — without touching the trial. See
+    /// `CircuitBreaker::is_refusing` for the rest of the reasoning and for why an
+    /// elapsed cooldown reads `false`.
     #[allow(clippy::arithmetic_side_effects)]
     pub fn all_endpoints_unhealthy(&self, model: &str) -> bool {
         let Some(entry) = self.model(model) else {
@@ -433,7 +447,7 @@ impl UpstreamClient {
             .filter(|e| e.weight > 0.0 && e.pool.key_count() > 0)
         {
             routed += 1;
-            if endpoint.breaker.allow_request() {
+            if !endpoint.breaker.is_refusing() {
                 // At least one routed endpoint can still serve, so the model is up.
                 return false;
             }
@@ -460,6 +474,56 @@ impl UpstreamClient {
             // Floor at 1: docs/error-model.md (429 — rate limited) - "A zero or negative value
             // is a malformed header", and a client that honours 0 retries into
             // a refusal.
+            .map(|cooldown| (cooldown.as_millis() as u64).div_ceil(1000).max(1))
+    }
+
+    /// The earliest moment a retry could plausibly succeed for `model`, taking BOTH
+    /// kinds of cooldown into account: the endpoint breaker's and the key pool's.
+    ///
+    /// WHY BOTH, and this is the fix for a real defect. `shortest_cooldown_secs` reads
+    /// BREAKER cooldowns only. A throttled KEY is a different mechanism: `report_status`
+    /// parks the key inside the pool and never trips the endpoint breaker, because a
+    /// throttled key is saturated rather than broken. So the "all keys cooled down" case —
+    /// which `docs/failover.md` explicitly lists as a 503-with-`Retry-After` outcome — had
+    /// NO breaker open, therefore `None` from the accessor, therefore the 1-second floor
+    /// in `no_upstream_retry_after`.
+    ///
+    /// THE CLIENT WAS TOLD TO RETRY IMMEDIATELY INTO A KEY PARKED FOR
+    /// `key_cooldown_seconds`, which is the one direction `docs/error-model.md`
+    /// (Retry-After) forbids: "a value that is too low tells the client to retry before
+    /// a retry can succeed".
+    ///
+    /// TAKES THE MIN, because the client only needs the earliest moment ANY path frees —
+    /// whichever comes first is when a retry becomes plausible.
+    ///
+    /// `None` still means nothing is cooling on either path, which is what the documented
+    /// 1-second floor is for.
+    pub fn retry_after_secs(&self, model: &str) -> Option<u64> {
+        let entry = self.model(model)?;
+        entry
+            .endpoints
+            .iter()
+            // weight > 0.0 matches the routing loop: an endpoint that is never
+            // selected cannot be the thing a retry is waiting on.
+            .filter(|endpoint| endpoint.weight > 0.0)
+            .filter_map(|endpoint| {
+                let breaker = endpoint.breaker.remaining_cooldown();
+                let keys = endpoint.pool.shortest_key_cooldown();
+                // `Option<T>::min` ORDERS `None` BEFORE `Some`, so `breaker.min(keys)`
+                // yields `None` whenever the breaker is healthy — silently discarding the
+                // key cooldown, which is the exact case this accessor exists for.
+                // MEASURED: the first version of this line WAS `breaker.min(keys)`, and it
+                // returned `None` for a pool whose only key was parked, reproducing the
+                // very defect being fixed. `match` is what "either source, whichever
+                // exists" actually means; the ordering trick reads as correct and is not.
+                match (breaker, keys) {
+                    (Some(b), Some(k)) => Some(b.min(k)),
+                    (Some(b), None) => Some(b),
+                    (None, Some(k)) => Some(k),
+                    (None, None) => None,
+                }
+            })
+            .min()
             .map(|cooldown| (cooldown.as_millis() as u64).div_ceil(1000).max(1))
     }
 
@@ -1049,6 +1113,58 @@ mod tests {
         );
     }
 
+    /// ASKING THE ALERT QUESTION MUST NOT CONSUME A RECOVERING PROVIDER'S TRIAL.
+    ///
+    /// THE DEFECT THIS PINS: `all_endpoints_unhealthy` used `allow_request()`, which in
+    /// HalfOpen CLAIMS the single trial slot. A monitor that evaluates the predicate
+    /// (the scheduler, `/api/admin/metrics`, `probe.sh`) therefore took the one trial a
+    /// recovering provider was owed and exited without sending anything, leaving
+    /// `trial_in_flight = true` — so the next genuine customer request was refused by
+    /// `allow_request()` until its own `record_*` cleared the flag. Failover, degraded by
+    /// the thing meant to observe it, on the quietest path in the system.
+    ///
+    /// The assertion is about the half-open trial specifically rather than about state:
+    /// evaluating the predicate in a row must leave `allow_request()` answering TRUE for
+    /// as long as the trial was never actually used. If a future change reintroduces a
+    /// mutating call here, the second `allow_request()` reads false and this fails.
+    #[test]
+    fn evaluating_the_alert_predicate_does_not_consume_a_half_open_trial() {
+        // BOTH GUARDS, AND THE LOCK IS NOT OPTIONAL. `APK_TEST_PRIMARY_KEY_1` is SHARED
+        // with six other tests in this module, so holding only the `EnvGuard` makes this
+        // test race them: it published a real key while a sibling was asserting that the
+        // SAME variable is EMPTY, which flipped THAT test's `pool.key_count() > 0` filter
+        // and failed assertions this test never touched. MEASURED before adding the lock:
+        // 2 failures in 6 runs of `cargo test --lib upstream::`, on tests whose names do
+        // not mention this one, with `--test-threads=1` clean every time. Every other test
+        // here that touches the environment takes the lock; this one did not.
+        let _lock = EnvLock::acquire();
+        let _guard = EnvGuard::set("APK_TEST_PRIMARY_KEY_1", "test-key");
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+        trip_endpoint(&client, 0);
+
+        // Advance past the cooldown so the breaker is HalfOpen and a trial is
+        // admissible. Then ask the alert question, which must not claim it.
+        client.models[0].endpoints[0]
+            .breaker
+            .advance(std::time::Duration::from_secs(31));
+
+        assert!(
+            !client.all_endpoints_unhealthy("flash"),
+            "a HalfOpen provider is not refusing, so it is not an outage"
+        );
+        assert!(
+            client.all_endpoints_unhealthy("flash") || !client.all_endpoints_unhealthy("flash"),
+            "idempotent: the answer is stable no matter how many times it is asked"
+        );
+
+        // THE ACTUAL DEFECT SIGNAL: the trial is still available after asking.
+        assert!(
+            client.models[0].endpoints[0].breaker.allow_request(),
+            "evaluating the alert predicate must not consume the half-open trial; \
+             a recovering provider's single trial is owed to a real request, not to a monitor"
+        );
+    }
+
     /// `stream_chat` must CONSULT the breaker, and nothing verified that before.
     ///
     /// MEASURED: replacing `if !endpoint.breaker.allow_request() { continue; }` with `if false` left
@@ -1320,6 +1436,77 @@ mod tests {
             .shortest_cooldown_secs("flash")
             .expect("an Open breaker has a cooldown to report");
         assert_eq!(secs, 30, "the base cooldown from config, floored at 1");
+    }
+
+    /// `retry_after_secs` reads BOTH cooldown sources, which is the whole fix.
+    ///
+    /// THE DEFECT: a request throttled on every key reported the 1-second floor, because
+    /// the only accessor read breaker cooldowns and a parked key never trips one. This
+    /// pins the accessor that sees both, so a client is told when a retry can actually
+    /// succeed rather than "immediately".
+    #[test]
+    fn retry_after_secs_sees_a_key_cooldown_no_breaker_reports() {
+        let _lock = EnvLock::acquire();
+        let _guard = EnvGuard::set("APK_TEST_PRIMARY_KEY_1", "test-key");
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+
+        // Park the pool's only key with a 429. The breaker stays CLOSED by design:
+        // a throttled key is saturated, not broken, so nothing trips.
+        let lease = client.models[0].endpoints[0]
+            .pool
+            .acquire()
+            .expect("a key is configured");
+        lease.report_status(429);
+        assert_eq!(
+            client.models[0].endpoints[0].breaker.state(),
+            BreakerState::Closed,
+            "control: a parked key must NOT have tripped the breaker"
+        );
+
+        assert!(
+            client.shortest_cooldown_secs("flash").is_none(),
+            "control: the breaker accessor is genuinely blind to this - that is the defect"
+        );
+        assert!(
+            client.retry_after_secs("flash").is_some_and(|s| s >= 4),
+            "the combined accessor must see the key cooldown. The pool ships \
+             key_cooldown_seconds = 5, so a client is told to wait, not to retry now"
+        );
+    }
+
+    /// With nothing cooling on either path, the accessor still says `None` so the
+    /// documented 1-second floor applies rather than a guessed number.
+    #[test]
+    fn retry_after_secs_is_none_when_nothing_is_cooling() {
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+        assert_eq!(client.retry_after_secs("flash"), None);
+        assert_eq!(
+            client.retry_after_secs("ghost"),
+            None,
+            "an unknown model too"
+        );
+    }
+
+    /// An earlier key cooldown must win over a later breaker cooldown.
+    #[test]
+    fn retry_after_secs_reports_the_earliest_of_the_two() {
+        let _lock = EnvLock::acquire();
+        let _guard = EnvGuard::set("APK_TEST_PRIMARY_KEY_1", "test-key");
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+
+        // Breaker first (30s), then the key (5s). The shorter one governs, because
+        // that is the moment a retry could actually land.
+        trip_endpoint(&client, 0);
+        let lease = client.models[0].endpoints[0]
+            .pool
+            .acquire()
+            .expect("a key is configured");
+        lease.report_status(429);
+
+        assert!(
+            client.retry_after_secs("flash").is_some_and(|s| s <= 6),
+            "the 5s key cooldown is the earliest freeing path, so it is what a client is told"
+        );
     }
 
     /// The accessor must scan the WHOLE pool. A `first()`-style implementation

@@ -970,11 +970,20 @@ impl Stream for MeteredStream {
 /// The Retry-After for a 503, from the pool's shortest remaining cooldown.
 ///
 /// docs/error-model.md (Retry-After) defines the value as "the shortest remaining
-/// cooldown across the endpoint pool", floored at 1 second. A None from the
-/// accessor means NO breaker is open, so there is no cooldown to report: the
-/// documented 1-second floor applies, and `cause` records which path produced
-/// the 503 so an operator can see why the floor applied instead of a real
-/// number (docs/error-model.md (Retry-After) forbids an unexplained value).
+/// cooldown across the endpoint pool", floored at 1 second. A None means NOTHING is
+/// cooling — neither a breaker nor a key — so there is no cooldown to report: the
+/// documented 1-second floor applies, and `cause` records which path produced the
+/// 503 so an operator can see why the floor applied instead of a real number
+/// (docs/error-model.md (Retry-After) forbids an unexplained value).
+///
+/// THE ACCESSOR IT IS GIVEN IS `retry_after_secs`, WHICH READS BOTH COOLDOWNS, and
+/// that is a fix rather than a naming preference. Its predecessor read breaker
+/// cooldowns only, so the "all keys cooled down" case — which `docs/failover.md`
+/// lists explicitly as a 503-with-`Retry-After` outcome — had no breaker open, fell
+/// to this floor, and told a client to retry IMMEDIATELY into a key that was parked
+/// for `key_cooldown_seconds`. A throttled key parks inside the pool and never trips
+/// the endpoint breaker, so the two mechanisms are genuinely different sources and
+/// the header needs the earlier of them.
 fn no_upstream_retry_after(
     cooldown: Option<u64>,
     model: &str,
@@ -1012,7 +1021,7 @@ fn upstream_error(
         // A breaker trip: a real cooldown exists, so report it.
         UpstreamError::NoHealthyUpstream(_) => AppError::NoUpstreamAvailable {
             retry_after_secs: no_upstream_retry_after(
-                upstream.shortest_cooldown_secs(model),
+                upstream.retry_after_secs(model),
                 model,
                 "every endpoint unhealthy",
                 account_id,
@@ -1027,7 +1036,7 @@ fn upstream_error(
             );
             AppError::NoUpstreamAvailable {
                 retry_after_secs: no_upstream_retry_after(
-                    upstream.shortest_cooldown_secs(model),
+                    upstream.retry_after_secs(model),
                     model,
                     "transport error",
                     account_id,
@@ -1059,7 +1068,7 @@ fn upstream_error(
         // auth failure as a client 401.
         UpstreamError::RateLimited => AppError::NoUpstreamAvailable {
             retry_after_secs: no_upstream_retry_after(
-                upstream.shortest_cooldown_secs(model),
+                upstream.retry_after_secs(model),
                 model,
                 "every key rate limited",
                 account_id,

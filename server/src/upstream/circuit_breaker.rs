@@ -109,6 +109,46 @@ impl CircuitBreaker {
         }
     }
 
+    /// Would a request be refused *right now*, judged WITHOUT perturbing the
+    /// breaker?
+    ///
+    /// SAME SIDE-EFFECT-FREE REQUIREMENT AS `remaining_cooldown`, AND THE REASON
+    /// THIS EXISTS RATHER THAN THE ALERT PREDICATE CALLING `allow_request`.
+    /// `all_endpoints_unhealthy` is the `all_providers_unhealthy` ALERT condition,
+    /// reached from `metrics_payload`, `/api/admin/metrics` and
+    /// `tools/alert/probe.sh`. Asking a question in order to page an operator is
+    /// the case where the answer must not change the thing it asks about — but
+    /// `allow_request` is a MUTATING call in the one state that matters: in
+    /// HalfOpen it consumes the single trial slot (`trial_in_flight = true`).
+    ///
+    /// MEASURED WHAT THAT COST: a monitor that evaluated the predicate took the
+    /// one half-open trial and exited, leaving `trial_in_flight = true` so the
+    /// next real customer was refused until its own `record_*` cleared the flag.
+    /// The half-open mechanism exists to admit exactly ONE trial and it was being
+    /// burned by a poll that never sent a request — degrading failover, which is
+    /// the only thing this whole module is for, on the quietest possible path.
+    ///
+    /// WHAT IT REPORTS, precisely: `true` when the state is Open AND the cooldown
+    /// has not elapsed — the only answer the alert predicate needs. Unlike
+    /// `state()` it does NOT promote an elapsed-cooldown Open breaker to HalfOpen,
+    /// and unlike `allow_request` it never takes a trial. A breaker whose cooldown
+    /// elapsed reads `false` here even though it is still nominally Open, and that
+    /// is deliberate: a trial is plausible immediately, so it is not a cause to
+    /// page. It is the same 1-second-floor reasoning `no_upstream_retry_after`
+    /// applies for the opposite question.
+    pub fn is_refusing(&self) -> bool {
+        let inner = self.lock();
+        if inner.state != BreakerState::Open {
+            return false;
+        }
+        // A cooldown that has already elapsed means a retry is plausible NOW, so
+        // the breaker is open on paper but is not refusing anything.
+        match inner.open_until {
+            Some(until) => self.now(&inner) < until,
+            None => false,
+        }
+    }
+
     /// How long until this breaker's Open window ends, or `None` when no Open
     /// window is in effect (the breaker is Closed, or already HalfOpen).
     ///
@@ -234,8 +274,16 @@ impl CircuitBreaker {
     }
 
     /// Test-only: advance this breaker's virtual clock.
+    ///
+    /// `pub(crate)` rather than private so a test OUTSIDE this module can drive it.
+    /// The predicate that had to be checked — `all_endpoints_unhealthy` in `client.rs` —
+    /// lives in the sibling module, and the defect it carried (consuming a half-open
+    /// trial on a read) is only observable once the breaker has been advanced past its
+    /// cooldown into HalfOpen. A private clock would have forced that test to sleep 30
+    /// real seconds or to reconstruct the breaker's internals, which is how a
+    /// regression test ends up not being written.
     #[cfg(test)]
-    fn advance(&self, elapsed: Duration) {
+    pub(crate) fn advance(&self, elapsed: Duration) {
         let mut inner = self.lock();
         inner.clock_offset += elapsed;
     }

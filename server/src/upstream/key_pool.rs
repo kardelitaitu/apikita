@@ -204,6 +204,39 @@ impl KeyPool {
     pub fn max_attempts(&self) -> usize {
         self.policy.max_attempts
     }
+
+    /// The shortest remaining cooldown across this pool's parked keys, or `None`
+    /// when no key is parked.
+    ///
+    /// THE MISSING HALF OF `Retry-After`. `docs/failover.md` promises **503 +
+    /// `Retry-After`** for "all keys cooled down", and `docs/error-model.md` defines the
+    /// value as "the shortest remaining cooldown across the endpoint pool". The
+    /// implementation read only the ENDPOINT BREAKER's cooldown, and a key cooldown
+    /// never trips a breaker — it parks the key. So the case the document names produced
+    /// `None`, fell to the 1-second floor, and told the client to retry immediately,
+    /// which is precisely the direction `docs/error-model.md` calls unsafe ("a value that
+    /// is too low tells the client to retry before a retry can succeed"). The client
+    /// retried into its own parked key.
+    ///
+    /// Read-only like `CircuitBreaker::remaining_cooldown`, and for the same reason:
+    /// taking this measurement must not change what it measures.
+    pub fn shortest_key_cooldown(&self) -> Option<Duration> {
+        let now = self.policy.now();
+        self.keys
+            .iter()
+            .filter_map(|slot| {
+                // Poison is recovered rather than propagated, exactly as
+                // `KeySlot::is_cooling` does: this runs on the reporting path and one
+                // panicking thread must not turn a metric read into a failure.
+                let until = (*slot
+                    .cooldown_until
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()))?;
+                Some(until.saturating_duration_since(now))
+            })
+            .filter(|left| !left.is_zero())
+            .min()
+    }
 }
 
 /// One in-flight use of a key. Reporting it frees the slot exactly once; the
@@ -409,6 +442,92 @@ mod tests {
         let after_500 = pool.acquire().expect("500 does not park the key");
         assert_eq!(after_500.key(), "key-1");
         after_500.report_success();
+    }
+
+    // -------------------------------------------------------------------
+    // shortest_key_cooldown: the half of Retry-After the breaker cannot see
+    // -------------------------------------------------------------------
+
+    /// THE DEFECT THIS PINS: a 503 caused by every key being parked used to report a
+    /// 1-second `Retry-After`, because only the endpoint breaker was consulted and a
+    /// parked key never trips one. The client was told to retry immediately into a key
+    /// parked for the full cooldown — the one direction `docs/error-model.md` calls
+    /// unsafe. A parked pool must report the REAL wait.
+    #[test]
+    fn a_parked_pool_reports_its_real_cooldown_not_zero() {
+        let pool = pool(2, 30);
+        assert_eq!(
+            pool.shortest_key_cooldown(),
+            None,
+            "an unparked pool has no cooldown to report, which is what the 1s floor is for"
+        );
+
+        let a = pool.acquire().expect("key-0");
+        a.report_status(429);
+        assert!(
+            pool.shortest_key_cooldown()
+                .is_some_and(|d| d.as_secs() >= 29),
+            "a 429-parked key must report a real ~30s wait, not zero: this is the number the \
+             client's Retry-After is built from"
+        );
+
+        // A non-rate-limit status does not park, so it must not manufacture a wait.
+        let b = pool.acquire().expect("key-1");
+        b.report_status(500);
+        assert!(
+            pool.shortest_key_cooldown()
+                .is_some_and(|d| d.as_secs() >= 29),
+            "key-0 is still parked, so the pool still has a wait"
+        );
+    }
+
+    /// The SHORTEST wait wins, because that is the earliest moment a retry could succeed.
+    #[test]
+    fn the_shortest_key_cooldown_is_the_one_reported() {
+        let pool = KeyPool::new(
+            vec!["key-0".to_string(), "key-1".to_string()],
+            30,
+            vec![429],
+            3,
+        );
+
+        let a = pool.acquire().expect("key-0");
+        a.report_status(429);
+
+        // Advance 20s, then park the second key: it now has 30s left while key-0 has 10.
+        pool.advance(Duration::from_secs(20));
+        let b = pool.acquire().expect("key-1");
+        b.report_status(429);
+
+        let reported = pool
+            .shortest_key_cooldown()
+            .expect("both keys are parked, so there is a wait");
+        assert!(
+            reported.as_secs() <= 11,
+            "the EARLIEST freeing key governs: key-0 has ~10s left, key-1 has ~30s, and a client \
+             told 30 would wait three times longer than it needed to. Reported {reported:?}"
+        );
+    }
+
+    /// A cooldown that has fully elapsed is NOT a wait: reporting it would tell a client to
+    /// retry in one second into a key that is already usable.
+    #[test]
+    fn an_elapsed_key_cooldown_reports_no_wait() {
+        let pool = pool(1, 30);
+        let a = pool.acquire().expect("key-0");
+        a.report_status(429);
+        assert!(pool.shortest_key_cooldown().is_some());
+
+        pool.advance(Duration::from_secs(31));
+        assert_eq!(
+            pool.shortest_key_cooldown(),
+            None,
+            "the key is usable again, so there is nothing to wait for"
+        );
+        assert!(
+            pool.acquire().is_some(),
+            "and the control: the key really did come back"
+        );
     }
 
     #[test]
