@@ -306,11 +306,19 @@ that need a prober, and `check-alerts.sh` covers the three (`ledger_drift`, `bal
 **A count that is right about one of those and silent about which is the defect that produced this
 table**, so the column is the part that matters.
 
-**`proxy_undercharge` is the twelfth definition and the one that is neither.** It is not a prober check
-and not a SQL-path check: its signal is a server LOG line (`Proxy request UNDERCHARGED`), and neither
-script reads the server log for anything but `topup.rejected`. It is the same structural position as
-`relay_5xx` — genuinely alertable, needing a surface neither script has — which is why it carries
-`needs-metrics` in the registry rather than `covered`.
+**TWO definitions are neither, and the registry is what says so.** `relay_5xx` and `proxy_undercharge` both
+carry `needs-metrics` rather than `covered`, which is why the arithmetic above does not close at 7 + 3 + the
+entry the next paragraph names: the gap between the prober checks and the registry holds two entries.
+
+This paragraph used to call `proxy_undercharge` the sole definition that is neither, and the sentence
+immediately after it said `relay_5xx` was in "the same structural position" — so it contradicted itself one
+line later. MEASURED against `alerts.tsv`: **two** rows read `needs-metrics`. The registry count was right
+and `alert-check`'s guard on the counts passed, because that guard pins the **numbers** word-by-word and
+says nothing about a quantifier in a sentence.
+
+`proxy_undercharge` is the entry of those two with no other account anywhere: its signal is a server LOG line
+(`Proxy request UNDERCHARGED`), and neither script reads the server log for anything but `topup.rejected`.
+`relay_5xx` is the other, needing a surface (nginx status counts) that neither script reaches either.
 
 The registry's eleventh entry is `stranded_hold`, which the doc specifies in prose at lines
 141-175 with the same force ("**Incident - investigate, then credit**").
@@ -335,24 +343,41 @@ a `/api/admin/metrics` path and the table was never updated with them.
 
 **Understating is not the safe direction, which is why this is corrected rather than left.** A table
 saying an alert is unwired, when it is merely waiting for a cookie, sends an operator to wire
-something that is already wired — and it hides that the real remaining gap is a single alert.
+something that is already wired — and it hides what the real remaining gaps are. The wording here used
+to claim only one gap remained, which is the quantifier defect again: **two** entries are unwired, and
+`probe.sh --check` prints both by name on every run.
 
 ```
 $ sh tools/alert/probe.sh --check db_disk
 probe: NOT CHECKED - 2 of the 12 alerts in alerts.tsv still need a surface this cannot reach:
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
+probe:                             The relay is a SEPARATE deployment; the backend never sees its
+probe:                             status codes, so no server-side check can answer this one.
+probe:   proxy_undercharge       - a server LOG line ("Proxy request UNDERCHARGED"). The ledger cannot
+probe:                             show it (the debit was clamped, so drift stays 0) and the error-rate
+probe:                             counter cannot either (it returns 200), so the log is the only trace.
 ```
+
+**This block says "2 of the 12" and used to list only ONE of them.** MEASURED by running the command: the
+real output names `relay_5xx` **and** `proxy_undercharge`. The block is labelled *"quoted here verbatim"* a
+few lines above, so a truncated quote is the worst version of the defect this section exists to correct — a
+reader checking the claim against the tool would have found a contradiction and had no way to tell which
+side was wrong.
 
 `probe.sh` states the remainder itself on every run, and it is the authority — not this table. The
 line is quoted here **verbatim**, and it changed when the count above it was corrected: this block
 used to read *"1 of the doc's 10 alerts"*, which was wrong on both numbers — the registry has 11, and
 the doc's table has 12 rows because one of them is a privacy statement rather than an alert.
 
-The one that remains is `relay_5xx`, which needs nginx **access logs**, deliberately disabled for
-privacy (`docs/edge-relay.md`, `docs/data-retention.md`). Enabling them to satisfy an alert would
-trade a privacy decision for an operational one, and that is not this script's trade to make.
+**The two that remain are `relay_5xx` and `proxy_undercharge`**. This paragraph used to name only
+`relay_5xx` as remaining, while quoting an output that names both — the same contradiction as the
+singular phrasing corrected above, in a second place. `relay_5xx` needs nginx **access logs**, deliberately
+disabled for privacy (`docs/edge-relay.md`, `docs/data-retention.md`): enabling them to satisfy an alert
+would trade a privacy decision for an operational one, and that is not this script's trade to make.
+`proxy_undercharge` needs the server log line `Proxy request UNDERCHARGED` to be read by something, and
+neither script reads the log for anything but `topup.rejected`.
 
-Wiring it is a call to `alert.sh --alert <id>` once the surface exists — no change to the transport,
+Wiring either is a call to `alert.sh --alert <id>` once the surface exists — no change to the transport,
 and no change to `probe.sh`.
 
 The delivery **mechanism**, though, is complete for all **12**: `alerts.tsv` carries every alert's

@@ -585,6 +585,39 @@ else
         done
     fi
 
+    # THE QUANTIFIER, WHICH THE NUMBERS GUARD CANNOT SEE.
+    #
+    # The block above pins the COUNTS word by word and is thorough about it. MEASURED while correcting the
+    # README: it said "`proxy_undercharge` is ... **the one** that is neither" and, further down,
+    # "**the one that remains** is `relay_5xx`" - while `alerts.tsv` marked TWO rows `needs-metrics` and
+    # `probe.sh --check` printed both by name. Every COUNT was right, so every guard passed, and the file
+    # contradicted itself in prose. A reader reasoning from "the one" wires one surface and believes they
+    # are done.
+    #
+    # The registry is the ground truth for how many there are, so a sentence calling the uncovered set
+    # singular is checked against it. The screening list is deliberately narrow - the two shapes that
+    # ASSERT the quantity, not the ones that report it as history - because this file's own corrections
+    # quote the old wording, and a guard that fires on its own explanation is the defect it is here to stop.
+    UNCOVERED_N=$(printf '%s\n' "$NEEDS_METRICS_TSV" | grep -c . || true)
+    if [ "$UNCOVERED_N" -gt 1 ]; then
+        # STRIP THE MARKDOWN FIRST, and WIDEN THE PATTERN, because the first version of this guard did
+        # neither and could not fire. MEASURED, twice:
+        #   1. the sentence it exists to catch reads "is the twelfth definition **and the one** that is
+        #      neither" - the emphasis markers sat between "one" and "that", so `is the one (that|...)`
+        #      never matched; and
+        #   2. the word BEFORE "the one" is "and", not "is", so even unbolted the pattern missed it.
+        # A planted restore of the exact defect SURVIVED both versions. The pattern now keys on
+        # `the one that|which` with any preceding word, which is the phrase that actually makes the claim.
+        SINGULAR=$(sed 's/[*`]//g' "$README" \
+            | grep -nE 'the one (that|which) (is|are|needs|remains)|is a single (alert|definition)|gap is a single' \
+            | grep -viE '(said|says|was|were|had|would|used to|no longer|used to read|wording here|paragraph said)' || true)
+        if [ -n "$SINGULAR" ]; then
+            echo "$SINGULAR" | while IFS= read -r row; do
+                fail "$README calls the uncovered set singular, but alerts.tsv marks $UNCOVERED_N rows needs-metrics. A count that is right with a quantifier that is wrong still sends an operator to wire one surface when there are $UNCOVERED_N: $row"
+            done
+        fi
+    fi
+
     # THE TABLE, ROW BY ROW - and this replaces a check that did not work.
     #
     # The first version was `grep -qF "**$TSV_DEFS**"`, which asks only whether the right number
