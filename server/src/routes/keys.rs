@@ -1794,6 +1794,135 @@ mod tests {
         db.close().await;
     }
 
+    /// ONE UNDECODABLE KEY ROW IS SKIPPED AND LOGGED, NOT FATAL AND NOT A PANIC.
+    ///
+    /// THE CONTRACT THIS PINS was introduced when the UUID decodes stopped panicking, and it was
+    /// asserted in a COMMENT with nothing verifying it - so a later edit could have changed
+    /// `filter_map` back to `map(...)?` and the whole listing would have started failing for
+    /// every customer whose account had one bad row, with the comment still promising the
+    /// opposite.
+    ///
+    /// THE PROPERTY IS THE COUNT: three keys exist, one is undecodable, and the listing must
+    /// return the OTHER TWO. Asserting only that the call succeeded would pass for a
+    /// `filter_map` that dropped everything, which is why the numbers are here.
+    #[tokio::test]
+    async fn an_undecodable_key_row_is_skipped_and_the_rest_are_still_listed() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (first_id, _, _) =
+            create_key_via_handler(&state, &headers, "first", vec!["flash".into()], 0).await;
+        let (second_id, _, _) =
+            create_key_via_handler(&state, &headers, "second", vec!["flash".into()], 0).await;
+
+        // A THIRD ROW WHOSE `id` IS NOT A UUID, written through SQL because the API cannot
+        // produce one. `api_keys.id` is `TEXT PRIMARY KEY` with no format constraint, which is
+        // exactly why this is reachable in a real database.
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO api_keys (id, account_id, key_hash, prefix, models, created_at) \
+             VALUES ('not-a-uuid', ?, 'undecodable-hash', 'apk_broken', '[]', ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("the schema accepts a non-UUID api_keys.id");
+
+        let res = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("one bad row must not fail the listing")
+            .into_response();
+        let body: Value = json_body(res).await;
+        let keys = body.as_array().expect("a JSON array of keys");
+
+        assert_eq!(
+            keys.len(),
+            2,
+            "the two decodable keys must still be listed. Dropping EVERYTHING would also satisfy \
+             a looser assertion, so the count is the property"
+        );
+        for id in [first_id, second_id] {
+            let wanted = serde_json::to_value(id).expect("id serialises");
+            assert!(
+                keys.iter().any(|k| k["id"] == wanted),
+                "key {id} must appear in the listing"
+            );
+        }
+        // AND THE BAD ROW IS ABSENT, which is the other half of "skipped": a listing that
+        // returned three rows could not have skipped anything.
+        assert!(
+            !keys.iter().any(|k| k["prefix"] == "apk_broken"),
+            "the undecodable row must not appear"
+        );
+        db.close().await;
+    }
+
+    /// AN UNDECODABLE USAGE ROW LOWERS THE REPORT INSTEAD OF FAILING IT.
+    ///
+    /// THE OTHER HALF OF THE SKIP CONTRACT. A spend row whose `api_key_id` cannot be decoded is
+    /// dropped, so the key is listed with the spend that COULD be read rather than the endpoint
+    /// returning 500 for the customer's whole dashboard. That is a real trade - the figure is
+    /// then too low - which is why it is logged and why this test asserts BOTH: the listing
+    /// succeeds, AND the readable key is still there.
+    ///
+    /// THE FK MAKES THE FIXTURE AWKWARD AND THAT IS INFORMATIVE: `usage_daily.api_key_id`
+    /// references `api_keys(id)`, so a malformed usage row needs a malformed KEY row to point
+    /// at - which is exactly the situation in a real database, where the bad id came first and
+    /// propagated. The two defects travel together.
+    #[tokio::test]
+    async fn an_undecodable_usage_row_does_not_fail_the_key_listing() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (good_id, _, _) =
+            create_key_via_handler(&state, &headers, "good", vec!["flash".into()], 0).await;
+        sqlx::query(
+            "INSERT INTO api_keys (id, account_id, key_hash, prefix, models, created_at) \
+             VALUES ('not-a-uuid', ?, 'broken-hash', 'apk_broken', '[]', ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .expect("the schema accepts a non-UUID api_keys.id");
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens, \
+             cache_read_tokens, output_tokens, cost_idr) VALUES (?, 'not-a-uuid', ?, 10, 0, 5, 999)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(crate::ip_tracking::today_utc())
+        .execute(&pool)
+        .await
+        .expect("the FK is satisfied by the malformed key row");
+
+        let res = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("an undecodable usage row must not fail the listing")
+            .into_response();
+        let body: Value = json_body(res).await;
+        let keys = body.as_array().expect("a JSON array of keys");
+
+        // THE READABLE KEY IS STILL REPORTED with ITS OWN spend, unaffected by the bad row.
+        let wanted = serde_json::to_value(good_id).expect("id serialises");
+        let listed = keys
+            .iter()
+            .find(|k| k["id"] == wanted)
+            .expect("the readable key must still be listed");
+        assert_eq!(
+            listed["spend_used_idr"],
+            serde_json::json!(0),
+            "the dropped row belongs to the BROKEN key, so the good key's spend is untouched"
+        );
+        db.close().await;
+    }
+
     /// LIST REPORTS REAL SPEND: list_keys returns spend_used_idr from
     /// usage_daily, not a hardcoded 0.
     #[tokio::test]
