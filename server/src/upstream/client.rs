@@ -261,6 +261,27 @@ struct EndpointEntry {
     /// The pair is what makes the ratio meaningful, in the same way `ServerErrorCounter`
     /// needed a denominator before an error RATE could be alerted on.
     failed: AtomicU64,
+    /// Summed TIME-TO-FIRST-BYTE for served requests, in milliseconds.
+    ///
+    /// `docs/observability.md` lists `proxy_upstream_latency_ms` with the reason
+    /// "distinguish our latency from theirs", and `docs/failover.md` names an
+    /// `endpoint_circuit_state`-style table beside it - and NEITHER EXISTED. Both documents
+    /// described a metric that no code produced, which is the same defect class as an alert
+    /// with no signal: a reader budgets for information they do not have.
+    ///
+    /// TTFB, NOT TOTAL DURATION, and the choice is forced by what this service does. The
+    /// response is a STREAM whose length is the model's answer; a total duration would
+    /// mostly measure how many tokens the customer asked for, not how fast the provider is.
+    /// Time to first byte is the part of the wait the PROVIDER owns - queueing, routing,
+    /// cold-start - and it is the only figure that is comparable across requests of
+    /// different sizes.
+    ///
+    /// A SUM AND NOT A HISTOGRAM. A mean needs two integers and answers "is this endpoint
+    /// slow", which is the question the document asks. Percentiles need a ring buffer whose
+    /// memory is a function of traffic, and `docs/observability.md` already records that the
+    /// error-rate counter could not have a real time window for the same reason. The mean is
+    /// honest about being a mean.
+    latency_sum_ms: AtomicU64,
 }
 
 /// One configured model with its endpoints.
@@ -385,6 +406,7 @@ impl UpstreamClient {
                         supports_stream_options: endpoint.supports_stream_options,
                         served: AtomicU64::new(0),
                         failed: AtomicU64::new(0),
+                        latency_sum_ms: AtomicU64::new(0),
                     })
                     .collect(),
             })
@@ -442,6 +464,33 @@ impl UpstreamClient {
                         endpoint.served.load(Ordering::Relaxed),
                         endpoint.failed.load(Ordering::Relaxed),
                     )
+                })
+            })
+            .collect()
+    }
+
+    /// Mean time-to-first-byte per endpoint, in whole milliseconds, or `None` for an
+    /// endpoint that has not served anything since the process started.
+    ///
+    /// `None` IS NOT `0`, the same rule `error_rate` documents: an endpoint with no
+    /// served requests has an UNKNOWN latency, and reporting zero would make it look like
+    /// the FASTEST endpoint in the pool - the exact inversion of the truth, on the one
+    /// metric whose purpose is to compare providers.
+    ///
+    /// The mean is integer division and therefore floors. That is deliberate: a fraction of
+    /// a millisecond is below the resolution of the thing being measured (a network round
+    /// trip), and an integer keeps the payload stable to diff.
+    pub fn endpoint_latency_ms(&self) -> Vec<(String, Option<u64>)> {
+        self.models
+            .iter()
+            .flat_map(|model| {
+                model.endpoints.iter().map(|endpoint| {
+                    let served = endpoint.served.load(Ordering::Relaxed);
+                    let sum = endpoint.latency_sum_ms.load(Ordering::Relaxed);
+                    // `checked_div` rather than `/`: a zero denominator is the case this
+                    // exists to report as None, and doing it in one expression means there is
+                    // no path where a division by zero is even expressible.
+                    (endpoint.name.clone(), sum.checked_div(served))
                 })
             })
             .collect()
@@ -672,6 +721,11 @@ impl UpstreamClient {
             // post-loop check with this flag set means exactly that.
             let mut throttled_out = false;
             for _ in 0..endpoint.pool.max_attempts() {
+                // STARTED PER ATTEMPT, not per request, and that placement is the point: a
+                // 429 on the first key rotates to a second, and the wait for the first key
+                // belongs to neither endpoint's latency. Timing the whole attempt loop would
+                // charge the answering endpoint for a throttled key it does not own.
+                let attempt_started = std::time::Instant::now();
                 let Some(lease) = endpoint.pool.acquire() else {
                     // Every key is cooling, or none is configured. Do not
                     // queue: fail fast so the caller can retry
@@ -699,6 +753,16 @@ impl UpstreamClient {
                             // `served: 0` beside a healthy breaker is a silent failover that
                             // never happened.
                             endpoint.served.fetch_add(1, Ordering::Relaxed);
+                            // THE LATENCY OF A SERVED REQUEST, measured around the ONE call
+                            // that reaches the provider. `attempt_started` is taken inside the
+                            // attempt loop so a retry on a throttled key does not fold the
+                            // first key's wait into the endpoint's figure - the endpoint that
+                            // answered is the only one whose latency this is.
+                            let ttfb_ms =
+                                attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            endpoint
+                                .latency_sum_ms
+                                .fetch_add(ttfb_ms, Ordering::Relaxed);
                             return Ok(UpstreamStream::new(response, endpoint.name.clone(), lease));
                         }
 
@@ -2261,6 +2325,70 @@ mod tests {
         let traffic = upstream.endpoint_traffic();
         assert_eq!(traffic[0].1, 0, "nothing was served");
         assert_eq!(traffic[0].2, 1, "the refusal is charged to the endpoint");
+    }
+
+    // -------------------------------------------------------------------
+    // endpoint_latency_ms: the metric docs/observability.md promised and nobody built
+    // -------------------------------------------------------------------
+
+    /// AN ENDPOINT THAT HAS SERVED NOTHING REPORTS `None`, NOT `Some(0)`.
+    ///
+    /// This is the assertion that matters most in this group, because zero is not a
+    /// neutral default here - it makes an unmeasured endpoint look like the FASTEST one in
+    /// the pool, which is the exact inversion of the truth on the metric whose stated
+    /// purpose is "distinguish our latency from theirs". A reader comparing providers would
+    /// pick the one that had never answered.
+    #[test]
+    fn an_endpoint_that_has_served_nothing_reports_no_latency() {
+        let _lock = EnvLock::acquire();
+        let _key = EnvGuard::set("APK_TEST_PRIMARY_KEY_1", "test-key");
+        let client = client(vec![model("flash", vec![endpoint("primary", 1.0)])]);
+
+        assert_eq!(
+            client.endpoint_latency_ms(),
+            vec![("primary".to_string(), None)],
+            "an endpoint with no served requests must report None, never 0ms"
+        );
+    }
+
+    /// A SERVED REQUEST PRODUCES A REAL MEAN, measured around the call that reached the
+    /// provider rather than around the whole request.
+    #[tokio::test]
+    async fn a_served_request_records_a_latency() {
+        let url = upstream_answering("200 OK", "").await;
+        let upstream = client_pointed_at(&url);
+
+        upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect("the upstream answers 200");
+
+        let latency = upstream.endpoint_latency_ms();
+        assert_eq!(latency.len(), 1);
+        assert!(
+            latency[0].1.is_some(),
+            "a served request must produce a measured mean, not None: {:?}",
+            latency[0]
+        );
+    }
+
+    /// A FAILED ATTEMPT MUST NOT RECORD A LATENCY. The figure is time-to-FIRST-BYTE for a
+    /// request that was SERVED; folding a refusal into it would drag the mean toward the
+    /// speed of the error path, which is fast precisely because nothing was generated.
+    #[tokio::test]
+    async fn a_failed_attempt_records_no_latency() {
+        let url = upstream_answering("500 Internal Server Error", "{}").await;
+        let upstream = client_pointed_at(&url);
+
+        let _ = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await;
+
+        assert_eq!(
+            upstream.endpoint_latency_ms(),
+            vec![("solo".to_string(), None)],
+            "a 5xx is not a served request, so it must not contribute to the mean"
+        );
     }
 
     /// A 404 IS ENDPOINT-SCOPED, SO IT FAILS OVER — the fix this test exists for.

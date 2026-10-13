@@ -110,11 +110,53 @@ pub(crate) struct RejectionSnapshot<'a> {
     pub requests: u64,
 }
 
+/// Fold the two per-endpoint slices into the payload rows: one object per endpoint, so a
+/// reader cannot mis-align two arrays and an absent latency is `null` rather than `0`.
+///
+/// SHARED BY THE FULL PAYLOAD AND THE DEGRADED ONE. The retention read can fail without
+/// taking the counters with it, and that path builds its own JSON - so a second copy of this
+/// fold would be exactly the duplicate-rule that drifts toward the weaker reading. `0` instead
+/// of `null` is the weaker reading: it would make an endpoint that has never answered look
+/// like the fastest in the pool.
+fn endpoint_report(
+    traffic: &[(String, u64, u64)],
+    latency_ms: &[(String, Option<u64>)],
+) -> Vec<serde_json::Value> {
+    traffic
+        .iter()
+        .map(|(name, served, failed)| {
+            let mean_latency_ms = latency_ms
+                .iter()
+                .find(|(latency_endpoint, _)| latency_endpoint == name)
+                .and_then(|(_, ms)| *ms);
+            json!({
+                "endpoint": name,
+                "served": served,
+                "failed": failed,
+                "mean_latency_ms": mean_latency_ms,
+            })
+        })
+        .collect()
+}
+/// Per-endpoint figures, grouped so the payload does not take one slice per measurement.
+///
+/// TWO PARALLEL SLICES WOULD BE THE TRAP HERE, and it is the one `endpoint_traffic`'s own
+/// doc warns about: served/failed/latency arrive from three separate counters, and a caller
+/// that passed them in the wrong order - or that zipped lists of different lengths - would
+/// publish a fast endpoint's latency against a slow endpoint's name, compiling cleanly. One
+/// struct with named fields makes that unexpressible.
+pub(crate) struct EndpointSnapshot<'a> {
+    /// `(endpoint, served, failed)` in config order.
+    pub traffic: &'a [(String, u64, u64)],
+    /// `(endpoint, mean_time_to_first_byte_ms)`; `None` for one that has served nothing.
+    pub latency_ms: &'a [(String, Option<u64>)],
+}
+
 pub(crate) fn metrics_payload(
     counter: &crate::error::ServerErrorCounter,
     money: &crate::error::MoneyCounter,
     unhealthy_models: &[String],
-    endpoint_traffic: &[(String, u64, u64)],
+    endpoints: EndpointSnapshot<'_>,
     rejections: RejectionSnapshot<'_>,
     retention: &crate::db::RetentionLag,
     today: chrono::NaiveDate,
@@ -123,6 +165,8 @@ pub(crate) fn metrics_payload(
     let responses = counter.responses();
     let undercharges = money.undercharges();
     let undercharged_idr = money.undercharged_idr();
+    let endpoint_traffic = endpoints.traffic;
+    let endpoint_latency_ms = endpoints.latency_ms;
     let rejection_counts = rejections.counts;
     let rejection_rate = rejections.rate;
     let rejection_requests = rejections.requests;
@@ -219,14 +263,7 @@ pub(crate) fn metrics_payload(
         // Rounded to 4 decimals like error_rate, so the payload is stable to diff.
         "rejection_rate": rejection_rate.map(|rate| (rate * 10_000.0).round() / 10_000.0),
         "proxy_requests": rejection_requests,
-        "endpoint_traffic": endpoint_traffic
-            .iter()
-            .map(|(name, served, failed)| json!({
-                "endpoint": name,
-                "served": served,
-                "failed": failed,
-            }))
-            .collect::<Vec<_>>(),
+        "endpoint_traffic": endpoint_report(endpoint_traffic, endpoint_latency_ms),
         // The db_disk alert's REAL question (the "DB disk" row of the Alerts table in
         // docs/observability.md): its condition
         // column says "volume usage" but its ACTION says "check retention". This is the
@@ -330,7 +367,7 @@ pub async fn operator_metrics(
                     .map(|rate| (rate * 10_000.0).round() / 10_000.0),
                 "proxy_requests": crate::error::rejection_counter().requests(),
                 "unhealthy_models": crate::routes::proxy::models_with_no_healthy_endpoint(),
-                "endpoint_traffic": crate::routes::proxy::endpoint_traffic(),
+                "endpoint_traffic": endpoint_report(&crate::routes::proxy::endpoint_traffic(), &crate::routes::proxy::endpoint_latency_ms()),
                 "retention": { "behind": null, "error": "the retention read failed" },
             }))
             .into_response());
@@ -341,7 +378,10 @@ pub async fn operator_metrics(
         crate::error::server_error_counter(),
         crate::error::money_counter(),
         &crate::routes::proxy::models_with_no_healthy_endpoint(),
-        &crate::routes::proxy::endpoint_traffic(),
+        EndpointSnapshot {
+            traffic: &crate::routes::proxy::endpoint_traffic(),
+            latency_ms: &crate::routes::proxy::endpoint_latency_ms(),
+        },
         RejectionSnapshot {
             counts: &crate::error::rejection_counter().counts(),
             rate: crate::error::rejection_counter().rejection_rate(),
@@ -944,7 +984,10 @@ mod tests {
             &counter,
             &money,
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -966,7 +1009,10 @@ mod tests {
             &counter,
             &money,
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -980,6 +1026,53 @@ mod tests {
             payload["undercharged_idr"],
             json!(90_200),
             "the SUM is the actionable half and must be the figure an operator is paged on"
+        );
+    }
+
+    /// LATENCY IS FOLDED INTO EACH ENDPOINT ROW, and an unmeasured endpoint reports NULL.
+    ///
+    /// The null case is the one worth pinning: `0` would make an endpoint that has never
+    /// answered look like the FASTEST in the pool, which is the exact inversion of the truth
+    /// on the metric whose stated purpose is comparing providers.
+    #[test]
+    fn the_payload_folds_latency_into_each_endpoint_row() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let traffic = vec![
+            ("primary".to_string(), 40u64, 2u64),
+            ("secondary".to_string(), 0u64, 0u64),
+        ];
+        // primary has a measured mean; secondary has never served, so it is absent from
+        // the latency list entirely.
+        let latency = vec![("primary".to_string(), Some(120u64))];
+
+        let payload = metrics_payload(
+            &crate::error::ServerErrorCounter::default(),
+            &Default::default(),
+            &[],
+            EndpointSnapshot {
+                traffic: &traffic,
+                latency_ms: &latency,
+            },
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
+            &Default::default(),
+            today,
+        );
+
+        let rows = payload["endpoint_traffic"]
+            .as_array()
+            .expect("endpoint_traffic is an array");
+        assert_eq!(rows.len(), 2, "one row per endpoint, latency folded in");
+        assert_eq!(rows[0]["endpoint"], json!("primary"));
+        assert_eq!(rows[0]["mean_latency_ms"], json!(120));
+        assert_eq!(rows[1]["endpoint"], json!("secondary"));
+        assert!(
+            rows[1]["mean_latency_ms"].is_null(),
+            "an endpoint that has served nothing must report NULL, not 0ms, or it sorts as the fastest: {}",
+            rows[1]["mean_latency_ms"]
         );
     }
 
@@ -997,7 +1090,10 @@ mod tests {
             &crate::error::ServerErrorCounter::default(),
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1019,7 +1115,10 @@ mod tests {
             &crate::error::ServerErrorCounter::default(),
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[("rate_limited".to_string(), 1)],
                 rate: Some(0.25),
@@ -1046,7 +1145,10 @@ mod tests {
             &counter,
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &rejections.counts(),
                 rate: rejections.rejection_rate(),
@@ -1071,7 +1173,10 @@ mod tests {
             &crate::error::ServerErrorCounter::default(),
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1097,7 +1202,10 @@ mod tests {
             &counter,
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1121,7 +1229,10 @@ mod tests {
             &counter,
             &Default::default(),
             &[],
-            &traffic,
+            EndpointSnapshot {
+                traffic: &traffic,
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1160,7 +1271,10 @@ mod tests {
             &counter,
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1184,7 +1298,10 @@ mod tests {
             &counter,
             &Default::default(),
             &down,
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1210,7 +1327,10 @@ mod tests {
             &crate::error::ServerErrorCounter::default(),
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1240,7 +1360,10 @@ mod tests {
             &clean,
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1270,7 +1393,10 @@ mod tests {
             &mixed,
             &Default::default(),
             &[],
-            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,

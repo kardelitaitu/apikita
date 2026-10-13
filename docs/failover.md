@@ -258,7 +258,7 @@ ceiling and strands the hold.
 | Circuit state per endpoint | `endpoint_circuit_state{endpoint}` |
 | Trips | `endpoint_circuit_opened_total{endpoint}` |
 | Key cooldowns | `key_cooldown_total{endpoint}` |
-| Upstream latency | `proxy_upstream_latency_ms{endpoint}` |
+| Upstream latency | `mean_latency_ms` inside each `endpoint_traffic` row on `GET /api/admin/metrics` - time-to-first-byte, and `null` for an endpoint that has served nothing |
 
 **`/health` must NOT check upstream providers.** An upstream outage would then look
 like a dead server, and a naive orchestrator would restart it in a loop. `/health`

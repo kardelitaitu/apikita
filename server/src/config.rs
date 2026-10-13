@@ -1034,8 +1034,9 @@ impl AppConfig {
             //     hold   = estimated_input * input_peak
             //     charge = input * input_peak + cache_read * cache_read_peak
             //
-            // So the hold is a ceiling over settlement - which proxy.rs:1002 states
-            // outright, without qualification - ONLY while
+            // So the hold is a ceiling over settlement - which the sizing rule in
+            // `calculate_preflight_reservation_idr` assumes outright, without
+            // qualification - ONLY while
             // cache_read_peak <= input_peak. Flip that inequality and the ceiling
             // INVERTS: a request whose prompt is mostly cache hits settles above its
             // own hold. That is the same stranded-hold shape a cheaper endpoint
@@ -2428,8 +2429,9 @@ mod tests {
     ///
     /// The hold prices the whole prompt at the input rate; settlement splits the
     /// same tokens and charges the cache subset at its own rate. The hold is a
-    /// ceiling over settlement ONLY while cache_read_peak <= input_peak, and
-    /// proxy.rs:1002 already claims it is one without qualification. This asserts
+    /// ceiling over settlement ONLY while cache_read_peak <= input_peak, and the
+    /// sizing rule in `calculate_preflight_reservation_idr` already assumes it is one
+    /// without qualification. This asserts
     /// the claim directly, as a relation between the two figures the validator now
     /// refuses to let diverge.
     ///

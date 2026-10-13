@@ -72,7 +72,8 @@ did not agree to. Log token **counts**, never content.
 >
 > **What an operator has instead is `GET /api/admin/metrics`** (operator-only), and it does
 > NOT serve these names. Its payload is `server_errors`, `responses`, `error_rate`,
-> `unhealthy_models`, `endpoint_traffic` and `retention` — a different shape, read from
+> `unhealthy_models`, `endpoint_traffic`, `undercharges`, `rejections`, `rejection_rate`,
+> `proxy_requests` and `retention` — a different shape, read from
 > in-process counters and one database query, not from a time-series store. So a reader who
 > greps for `topups_settled_total` finds this table and nothing that produces it.
 >
@@ -129,9 +130,22 @@ Keep it small. Three categories:
 | Metric | Why |
 | --- | --- |
 | `http_requests_total` by status | Baseline |
-| `proxy_requests_total` by model, by outcome | Product usage. **Partly real:** `endpoint_traffic` on `GET /api/admin/metrics` counts served/failed per endpoint, which is the routing half of this row. The per-model breakdown and the rejection-reason split below are still uncomputed |
-| `proxy_upstream_latency_ms` | Distinguish our latency from theirs |
-| `active_streams` | The memory driver |
+| `endpoint_traffic` on `GET /api/admin/metrics` | Per endpoint, in config order: `served`, `failed` and `mean_latency_ms`. This is `proxy_requests_total`'s routing half. **Still uncomputed: a per-MODEL breakdown** — the counts are per endpoint, and a model's total is the sum over its endpoints. The rejection-reason split is in the table below |
+| `proxy_upstream_latency_ms` | **Real, as `mean_latency_ms` inside each `endpoint_traffic` row.** Time-to-FIRST-BYTE, not total duration: the response is a stream whose length is the model's answer, so a total duration would mostly measure how many tokens the customer asked for. TTFB is the part of the wait the PROVIDER owns, and the only figure comparable across requests of different sizes |
+| `active_streams` | The memory driver. **Still uncomputed** — nothing counts in-flight streams |
+
+**`mean_latency_ms` IS `null` FOR AN ENDPOINT THAT HAS SERVED NOTHING, never `0`.** An
+unmeasured endpoint would otherwise sort as the *fastest* in the pool, which is the exact
+inversion of the truth on the one metric whose stated purpose is comparing providers.
+
+**It is a MEAN and not a percentile**, and that is a limit rather than a rounding detail: a
+p99 needs a ring buffer whose memory is a function of traffic — the same reason this document
+already records for why `error_rate` has no real time window. A mean says "this endpoint is
+slower", which is the question the row asks; it will not show a tail.
+
+**A failed attempt contributes no latency.** The figure is TTFB for a request that was
+SERVED; folding a refusal into it would drag the mean toward the speed of the error path,
+which is fast precisely because nothing was generated.
 
 ### Rejection reasons
 

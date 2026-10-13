@@ -322,6 +322,20 @@ pub fn endpoint_traffic() -> Vec<(String, u64, u64)> {
     upstream.endpoint_traffic()
 }
 
+/// Mean time-to-first-byte per endpoint for the metrics payload, in whole milliseconds.
+///
+/// THE SAME LAZY-INITIALISATION RULE as its neighbours: the upstream client is built on the
+/// first proxied request, so an EMPTY list before then is the honest answer rather than a
+/// list of zeros. `docs/observability.md` names `proxy_upstream_latency_ms` with the reason
+/// "distinguish our latency from theirs", and until now no code produced it - this is the
+/// row's implementation, not a new invention.
+pub fn endpoint_latency_ms() -> Vec<(String, Option<u64>)> {
+    let Some(upstream) = UPSTREAM.get() else {
+        return Vec::new();
+    };
+    upstream.endpoint_latency_ms()
+}
+
 /// Whether `model` is permitted for a key whose stored allowlist is
 /// `allowed_models`.
 ///
