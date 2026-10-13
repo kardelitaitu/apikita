@@ -3400,5 +3400,35 @@ collapsing back — both caught. **And a third that should not.** Changing the u
 and every keyless request in the gate sends no map. Its observable sibling — the map parking on presence
 rather than on the token — is caught by `an UNMAPPED key answered 429 while another key was parked`.
 
+#### The gateway's worst error was unrepresentable, and three usage checks were vacuous (round 52)
+
+`client.rs::prepare_body` sets `stream_options.include_usage` and explains why in its own words: the block is
+emitted only with the opt-in, *"settlement ... settles nothing without it, so a stream that skipped the
+opt-in would deliver tokens and **bill zero — the one error an arbitrage gateway cannot make**."*
+
+**The fake emitted the block unconditionally.** So the failure the comment names could not be expressed by
+the tool at all — nobody could ask *"what does the gateway do when the opt-in is honoured by nobody?"* The
+server's side was already defended (`proxy.rs` calls `finish_status(0)` rather than settling, and three tests
+cover it); what was missing was a way to **drive** that behaviour against something upstream-shaped.
+
+Fixed: the fake reads the request body and omits the block when the opt-in is absent, with
+`x-fake-usage: omit` to force the failure without constructing a body.
+
+**And gating it found that THREE of the gate's own checks were vacuous.** The fake's canned content contains
+the word *usage* — *"settles usage from the final chunk"* — so `/usage/.test(body)` is true of **every**
+stream, and three assertions were written that way: the happy path's "carries usage", the mid-stream "no
+usage", and the published-numbers check. They had reported ok for three rounds while asserting nothing.
+A usage block is a JSON object **key**, so that is what is asserted now.
+
+**The round's evidence, including the control that matters:** three mutations — usage emitted
+unconditionally, **usage never emitted**, and a published number changed — all caught. The second is the
+control: it proves the opt-in check is two-sided, and a fake that always omitted the block would fail the
+happy path rather than pass it silently.
+
+**What this round is really about.** The fake's own README is what found the gap, the fake's own canned text
+is what broke the checks, and the server's own comment is what named the stakes. Nothing new was inspected
+that wasn't already in the repository — the question was what the three documents each assumed about the
+other two, and none of them had ever been compared.
+
 
 
