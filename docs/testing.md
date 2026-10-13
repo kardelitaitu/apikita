@@ -3361,5 +3361,44 @@ default 4→3 also survives, correctly, because 3 is inside the documented range
 ceiling moved outside it fails. **Diagnosing the survivor is what turned a false gap into a confirmation
 that the assertion is right** — round 42's lesson, applied before recording rather than after.
 
+#### The fake claimed to test key cooldown and could not (round 51)
+
+The README opens: *"so the proxy's key cooldown, circuit breaker and mid-stream abort paths are testable
+without touching a real provider."* Two of those three were firmly there. The first was not, and the way to
+find out was to ask what the fake would need in order to be true — a **key**.
+
+**It never read `Authorization` at all.** So a `429` was a property of the *request*, not of the *key*, and
+the fake could not express "this key is parked, that one works". MEASURED rather than asserted:
+`server/src/upstream/client.rs` tests key rotation with a bespoke inline `TcpListener` — see
+`a_401_from_the_upstream_rotates_to_the_next_key`, which exists because *"the config lists 401 in
+`rate_limit_status` ... every step of that is code the suite could read and none of it was code the suite
+RAN"*. The behaviour this README names first was the one the tool could not model.
+
+**Why it matters doubles:** the server's doctrine is per-**key** for a rate limit and per-**endpoint** for a
+5xx. A fake answering every key identically cannot distinguish them, so it could exercise half of the
+doctrine — and the more consequential half.
+
+**Added `x-fake-key-fail`**, mapping a bearer token to the status that key receives:
+
+```bash
+-H 'authorization: Bearer sk-bad'  -H 'x-fake-key-fail: sk-bad=429'   # this key is parked
+-H 'authorization: Bearer sk-good' -H 'x-fake-key-fail: sk-bad=429'   # ...and this one streams
+```
+
+Verified against a live instance before being gated: `sk-bad` → **429 `rate_limit_error`**, `sk-good` →
+**200 and streaming**, a two-key map reaches each key independently, and requests with no `Authorization`
+keep the rows' existing behaviour — so the map is **opt-in** and nothing that exists today changed. A `401`
+body now says `invalid_api_key` rather than `server_error`, because the server classifies on **status** and
+a body that contradicts it would make a key problem read like an upstream outage.
+
+Five gate rows assert it, and the gate now covers **26 of the fake-upstream README's rows** where it covered
+6 before round 49.
+
+**Two mutations to prove the new rows can fail:** a two-key map applied to every key, and the 401 kind
+collapsing back — both caught. **And a third that should not.** Changing the unreachable line in
+`keyFailure` *survived*, which is correct: that branch is only reached when `x-fake-key-fail` is present,
+and every keyless request in the gate sends no map. Its observable sibling — the map parking on presence
+rather than on the token — is caught by `an UNMAPPED key answered 429 while another key was parked`.
+
 
 
