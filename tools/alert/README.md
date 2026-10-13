@@ -290,7 +290,7 @@ why one number kept being wrong:
 | what | count | read from |
 | --- | --- | --- |
 | Alert definitions | **12** | `alerts.tsv`, the registry |
-| Checks `probe.sh --list` prints | **7** | its own output, one row per check |
+| Checks `probe.sh --list` prints | **8** | its own output, one row per check |
 | Definitions `check-alerts.sh` fires | **3** | `grep 'fire "' check-alerts.sh` — `ledger_drift`, `stranded_hold`, `balance_negative` |
 
 **The third row said 11 and that was never true.** MEASURED: `check-alerts.sh` names exactly three
@@ -306,19 +306,27 @@ that need a prober, and `check-alerts.sh` covers the three (`ledger_drift`, `bal
 **A count that is right about one of those and silent about which is the defect that produced this
 table**, so the column is the part that matters.
 
-**TWO definitions are neither, and the registry is what says so.** `relay_5xx` and `proxy_undercharge` both
-carry `needs-metrics` rather than `covered`, which is why the arithmetic above does not close at 7 + 3 + the
-entry the next paragraph names: the gap between the prober checks and the registry holds two entries.
+**ONE definition is neither, and it used to be two.** `relay_5xx` carries `needs-metrics` rather than
+`covered`, which is why the arithmetic above does not close at 8 + 3 + the entry the next paragraph names:
+the gap between the prober checks and the registry holds one entry.
 
-This paragraph used to call `proxy_undercharge` the sole definition that is neither, and the sentence
-immediately after it said `relay_5xx` was in "the same structural position" — so it contradicted itself one
-line later. MEASURED against `alerts.tsv`: **two** rows read `needs-metrics`. The registry count was right
-and `alert-check`'s guard on the counts passed, because that guard pins the **numbers** word-by-word and
-says nothing about a quantifier in a sentence.
+**`proxy_undercharge` MOVED FROM "neither" TO COVERED, and the move is the whole point of this section.**
+It carried `needs-metrics` because its signal was a server LOG line (`Proxy request UNDERCHARGED`) that
+neither script reads for anything but `topup.rejected` — alertable in principle and unreadable in practice.
+The money layer now COUNTS it (`MoneyCounter` in `server/src/error.rs`, incremented by
+`settle_partial_usage`) and serves it on the same operator route `error_rate` already reads, so
+`probe.sh --check proxy_undercharge` has a real number to compare against zero.
 
-`proxy_undercharge` is the entry of those two with no other account anywhere: its signal is a server LOG line
-(`Proxy request UNDERCHARGED`), and neither script reads the server log for anything but `topup.rejected`.
-`relay_5xx` is the other, needing a surface (nginx status counts) that neither script reaches either.
+**It needed its own counter rather than a new query, and the reason is worth keeping:** the ledger cannot
+show an undercharge — the debit was CLAMPED, so `balance = SUM(delta)` still holds and `ledger_drift` stays
+0 — and `error_rate` cannot either, because the request returned 200. An undercharge is a SUCCESS whose
+money is short, which is exactly the shape that hides. The counterpart to `refund_refusal` is now
+symmetrical rather than half of it being unreadable.
+
+This paragraph has now been wrong in both directions, which is why it names the count rather than a
+quantifier: it first called `proxy_undercharge` the sole definition that is neither while the next sentence
+said `relay_5xx` was in "the same structural position" (self-contradicting), and the number it carried
+was 2 until this change made it 1.
 
 The registry's eleventh entry is `stranded_hold`, which the doc specifies in prose at lines
 141-175 with the same force ("**Incident - investigate, then credit**").
@@ -335,49 +343,48 @@ The registry's eleventh entry is `stranded_hold`, which the doc specifies in pro
 | 8 | **DB disk >80%** (106) | **Yes, via `/api/admin/metrics`** | The retention lag is served in-process, and retention is the alert's own ACTION rather than its trigger. **Skipped without `PROBE_OPERATOR_COOKIE`.** |
 | 9 | **Error rate >5%** (107) | **Yes, via `/api/admin/metrics`** | Same route and same caveat as rows 6 and 8. |
 | + | **Stranded holds** (141-175) | **Yes** | Via `reconcile.sh`'s copy of the `hold-sweep` predicate. |
-| + | **Proxy undercharge** | **No** | The signal is a server log line, and neither script reads the server log for anything but `topup.rejected`. Same position as **Relay 5xx**: alertable, but it needs a surface neither script has. The ledger cannot show it — the debit was clamped, so `balance = SUM(delta)` still holds and `ledger_drift` stays 0 — and the error-rate counter cannot either, because an undercharge returns 200. |
+| + | **Proxy undercharge** | **Yes, via `/api/admin/metrics`** | `probe.sh` reads the `undercharges` counter the money layer writes when a settlement is clamped. **Skipped, not passed, without `PROBE_OPERATOR_COOKIE`.** The ledger cannot show it (a clamped debit leaves `balance = SUM(delta)` intact, so `ledger_drift` stays 0) and the error-rate counter cannot either (the request returned 200), which is why it needed a counter of its own. |
 
-**MEASURED: 12 definitions, 10 of them reachable today, 2 not.** This paragraph said "**Covered: 6 of
+**MEASURED: 12 definitions, 11 of them reachable today, 1 not.** This paragraph said "**Covered: 6 of
 10. Not covered: 4 of 10**" and gave three reasons that had all stopped being true — three rows gained
-a `/api/admin/metrics` path and the table was never updated with them.
+a `/api/admin/metrics` path and the table was never updated with them. It then read 10/2 until
+`proxy_undercharge` gained its counter and `probe.sh` a check for it, which is the change this section
+records rather than merely counts.
 
 **Understating is not the safe direction, which is why this is corrected rather than left.** A table
 saying an alert is unwired, when it is merely waiting for a cookie, sends an operator to wire
-something that is already wired — and it hides what the real remaining gaps are. The wording here used
-to claim only one gap remained, which is the quantifier defect again: **two** entries are unwired, and
-`probe.sh --check` prints both by name on every run.
+something that is already wired — and it hides what the real remaining gaps are. The wording here has
+been wrong at both extremes, which is why it now states the count: it once claimed only one gap remained
+when there were **two**, and this change brought it back to **one**. `probe.sh --check` prints the
+remainder by name on every run, so the file never has to be trusted for it.
 
 ```
 $ sh tools/alert/probe.sh --check db_disk
-probe: NOT CHECKED - 2 of the 12 alerts in alerts.tsv still need a surface this cannot reach:
+probe: NOT CHECKED - 1 of the 12 alerts in alerts.tsv still need a surface this cannot reach:
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
 probe:                             The relay is a SEPARATE deployment; the backend never sees its
 probe:                             status codes, so no server-side check can answer this one.
-probe:   proxy_undercharge       - a server LOG line ("Proxy request UNDERCHARGED"). The ledger cannot
-probe:                             show it (the debit was clamped, so drift stays 0) and the error-rate
-probe:                             counter cannot either (it returns 200), so the log is the only trace.
 ```
 
-**This block says "2 of the 12" and used to list only ONE of them.** MEASURED by running the command: the
-real output names `relay_5xx` **and** `proxy_undercharge`. The block is labelled *"quoted here verbatim"* a
-few lines above, so a truncated quote is the worst version of the defect this section exists to correct — a
-reader checking the claim against the tool would have found a contradiction and had no way to tell which
-side was wrong.
+**This block says "1 of the 12" and has been wrong at every value it has held.** MEASURED by running the
+command, each time: it first listed only `relay_5xx` while the header said "2 of the 12"; then it listed
+both correctly at 2, until `proxy_undercharge` gained a real counter and the header should have said 1.
+The block is labelled *"quoted here verbatim"* a few lines above, so a stale quote is the worst version of
+the defect this section exists to correct — a reader checking the claim against the tool would have found a
+contradiction and had no way to tell which side was wrong.
 
 `probe.sh` states the remainder itself on every run, and it is the authority — not this table. The
 line is quoted here **verbatim**, and it changed when the count above it was corrected: this block
 used to read *"1 of the doc's 10 alerts"*, which was wrong on both numbers — the registry has 11, and
 the doc's table has 12 rows because one of them is a privacy statement rather than an alert.
 
-**The two that remain are `relay_5xx` and `proxy_undercharge`**. This paragraph used to name only
+**THE ONE THAT REMAINS IS `relay_5xx`.** `proxy_undercharge` was the second until it gained a counter
+and a check; this paragraph used to name both, and before that only
 `relay_5xx` as remaining, while quoting an output that names both — the same contradiction as the
 singular phrasing corrected above, in a second place. `relay_5xx` needs nginx **access logs**, deliberately
 disabled for privacy (`docs/edge-relay.md`, `docs/data-retention.md`): enabling them to satisfy an alert
 would trade a privacy decision for an operational one, and that is not this script's trade to make.
-`proxy_undercharge` needs the server log line `Proxy request UNDERCHARGED` to be read by something, and
-neither script reads the log for anything but `topup.rejected`.
-
-Wiring either is a call to `alert.sh --alert <id>` once the surface exists — no change to the transport,
+Wiring it is a call to `alert.sh --alert <id>` once the surface exists — no change to the transport,
 and no change to `probe.sh`.
 
 The delivery **mechanism**, though, is complete for all **12**: `alerts.tsv` carries every alert's
@@ -387,7 +394,7 @@ currently fires, and reads the registry rather than a hand-kept copy of it.
 
 > **`alert.sh --list` and `probe.sh --list` are different listings, and both are correct.** The first
 > prints every definition from `alerts.tsv` (**12**); the second prints the checks the prober has a code
-> path for (**7**). This paragraph said "all ten" and the coverage section said "9 alerts" — one
+> path for (**8**). This paragraph said "all ten" and the coverage section said "9 alerts" — one
 > number, three different things it could have meant. The counts are now stated per-source.
 
 ## What is deliberately NOT alerted

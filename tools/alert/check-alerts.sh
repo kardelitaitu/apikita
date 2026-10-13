@@ -305,6 +305,12 @@ check-alerts:   all_providers_unhealthy - COVERED BY tools/alert/probe.sh (GET /
 check-alerts:                        alerts when a model has NO usable endpoint).
 check-alerts:   db_disk            - COVERED BY tools/alert/probe.sh (the retention report on
 check-alerts:                        /api/admin/metrics; a table holding a row past its window).
+check-alerts:   proxy_undercharge  - COVERED BY tools/alert/probe.sh (GET /api/admin/metrics as
+check-alerts:                        an operator; the undercharges counter, which the money layer
+check-alerts:                        writes when a settlement is clamped). No SQL can answer it:
+check-alerts:                        a clamped debit leaves balance = SUM(delta) intact, so
+check-alerts:                        ledger_drift stays 0, and the request returned 200, so
+check-alerts:                        error_rate cannot see it either.
 check-alerts:   relay_5xx          - NOT COVERED BY ANYTHING. nginx access-log status counts;
 check-alerts:                        access logs are disabled for privacy (docs/edge-relay.md).
 check-alerts:                        Needs a metrics backend, and it is the one real gap.

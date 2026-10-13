@@ -3442,6 +3442,13 @@ same structural position"*. Three separate places made the same singular claim, 
 labelled **"quoted here verbatim"** — printed `probe.sh`'s real output with `2 of the 12` and then listed
 **one** of the two. MEASURED by running the command.
 
+> **Dated measurement — the count has since moved to ONE.** `proxy_undercharge` gained a real counter
+> (`MoneyCounter` in `server/src/error.rs`, written by `settle_partial_usage`) and a `probe.sh` check that
+> reads it, so `alerts.tsv` now marks one row `needs-metrics`. The paragraph above is kept as the record
+> of what the defect was rather than edited to match, because the lesson it carries — a quantifier that
+> three places agreed on and that no guard checked — is unaffected by which rows are unwired today. What
+> changed is the count, and `alert-check` guards that separately.
+
 **Every count was right, so `alert-check`'s number guard passed.** It pins the counts word by word and is
 thorough about it; it says nothing about a quantifier in a sentence.
 

@@ -92,7 +92,7 @@ MODE="run"
 
 usage() {
     echo "probe: usage: probe.sh [--check <id>]... | --list | --help" >&2
-    echo "probe: checks: api_down, relay_down, webhook_rejection, refund_refusal, error_rate, all_providers_unhealthy, db_disk (no database access at all)" >&2
+    echo "probe: checks: api_down, relay_down, webhook_rejection, refund_refusal, error_rate, all_providers_unhealthy, db_disk, proxy_undercharge (no database access at all)" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -137,6 +137,14 @@ if [ "$MODE" = "list" ]; then
             "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
     fi
     if [ -n "$OPERATOR_COOKIE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "proxy_undercharge" "covered" \
+            "the undercharge counters on $API_URL/api/admin/metrics; alerts when money the wallet could not cover went uncollected"
+    else
+        printf 'probe: %-20s %-8s %s\n' "proxy_undercharge" "skipped" \
+            "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+    fi
+
+    if [ -n "$OPERATOR_COOKIE" ]; then
         printf 'probe: %-20s %-8s %s\n' "all_providers_unhealthy" "covered" \
             "GET $API_URL/api/admin/metrics as an operator; alerts when a model has NO usable endpoint"
     else
@@ -172,7 +180,7 @@ esac
 if [ -n "$CHECKS" ]; then
     for id in $CHECKS; do
         case "$id" in
-            api_down|relay_down|webhook_rejection|refund_refusal|error_rate|all_providers_unhealthy|db_disk) ;;
+            api_down|relay_down|webhook_rejection|refund_refusal|error_rate|all_providers_unhealthy|db_disk|proxy_undercharge) ;;
             *) echo "probe: unknown check: $id" >&2
                echo "probe: known checks: api_down, relay_down, webhook_rejection, refund_refusal, error_rate, all_providers_unhealthy, db_disk" >&2
                exit 2 ;;
@@ -475,6 +483,83 @@ check_error_rate() {
         echo "probe: OK  error_rate: $RATE ($ERRORS of $RESPONSES) is within the 5% threshold"
     fi
 }
+
+# --- check: proxy_undercharge --------------------------------------------------
+# Threshold from alerts.tsv: "any (>=1 in the window)".
+#
+# THIS ROW WAS needs-metrics for as long as it existed, because its signal was a server
+# LOG line that neither script reads for anything but topup.rejected. The money layer now
+# counts it (server/src/error.rs::MoneyCounter, written by settle_partial_usage) and
+# serves it on the SAME operator route error_rate reads, so the gap is closed.
+#
+# WHY IT NEEDS ITS OWN COUNTER AND CANNOT BE DERIVED FROM THE ONES THAT EXIST:
+#   * the ledger cannot show it - the debit was CLAMPED, so balance = SUM(delta) still
+#     holds and ledger_drift stays 0. A clamped settlement is arithmetically perfect,
+#     which is exactly why it is invisible to the money gate.
+#   * error_rate cannot either - the request returned 200. An undercharge is a SUCCESS
+#     whose money is short.
+#
+# The counterpart to refund_refusal is now genuinely symmetrical rather than half of it
+# being unreadable.
+#
+# ZERO IS A REAL AND GOOD READING, not "no data". Unlike error_rate's null for an empty
+# window, this counter is expected to be zero on a healthy service, so 0 passes and a
+# MISSING figure is the failure (the same rule error_rate's parse check uses).
+check_proxy_undercharge() {
+    if [ -z "$OPERATOR_COOKIE" ]; then
+        echo "probe: skipped proxy_undercharge: PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+        return 0
+    fi
+
+    BODY_FILE="$TMP/probe-metrics.$$.json"
+    CODE=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+        --connect-timeout "$HTTP_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -H "Cookie: $OPERATOR_COOKIE" \
+        "$API_URL/api/admin/metrics" 2>"$CURL_ERR")
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        REASON=$(first_err "curl exit $RC")
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED proxy_undercharge: the metrics route did not answer ($REASON)" >&2
+        fail_with 4
+        return 0
+    fi
+    if [ "$CODE" != "200" ]; then
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED proxy_undercharge: /api/admin/metrics returned HTTP $CODE (401 = bad or expired cookie, 403 = not an operator)" >&2
+        fail_with 4
+        return 0
+    fi
+
+    # Pull both fields without a JSON parser, the same way error_rate does: the payload
+    # is flat, so a targeted grep is honest and sufficient.
+    EVENTS=$(sed -n 's/.*"undercharges":[[:space:]]*\([0-9]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    IDR=$(sed -n 's/.*"undercharged_idr":[[:space:]]*\([0-9]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+
+    # A body carrying one figure but not the other is a schema edit neither this script
+    # nor a test of it would otherwise notice. A silently-missing value would parse as
+    # empty and read as zero, which SUPPRESSES the alert.
+    for pair in "undercharges=$EVENTS" "undercharged_idr=$IDR"; do
+        name=${pair%%=*}
+        value=${pair#*=}
+        case "$value" in
+            ''|*[!0-9]*)
+                rm -f "$BODY_FILE"
+                echo "probe: FAILED proxy_undercharge: the metrics route answered 200 but '$name' did not parse (got '$value')." >&2
+                echo "probe:   /api/admin/metrics always sends both, so something changed the payload." >&2
+                fail_with 4
+                return 0
+                ;;
+        esac
+    done
+
+    if [ "$EVENTS" -gt 0 ]; then
+        echo "probe: ALERT proxy_undercharge: $EVENTS clamped settlement(s), $IDR IDR never collected since start"
+        fire proxy_undercharge "$EVENTS request(s) answered with money the wallet could not cover ($IDR IDR uncollected). The ledger still balances, so only this counter shows it. Check the reservation size against the model rates."
+    else
+        echo "probe: OK  proxy_undercharge: 0 undercharges, 0 IDR uncollected"
+    fi
+}
 # --- check: relay_down --------------------------------------------------------
 # Threshold is "1 failed external check": ONE request, no window. Any HTTP answer at
 # all means the relay is up - a 502/504 is relay_5xx's alert (still unchecked), not
@@ -662,6 +747,7 @@ run_check() {
         db_disk) check_db_disk ;;
         webhook_rejection) check_webhook_rejection ;;
         refund_refusal) check_refund_refusal ;;
+        proxy_undercharge) check_proxy_undercharge ;;
     esac
     return 0
 }
@@ -706,9 +792,6 @@ probe: NOT CHECKED - $UNREACHABLE_N of the $TOTAL_N alerts in alerts.tsv still n
 probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
 probe:                             The relay is a SEPARATE deployment; the backend never sees its
 probe:                             status codes, so no server-side check can answer this one.
-probe:   proxy_undercharge       - a server LOG line ("Proxy request UNDERCHARGED"). The ledger cannot
-probe:                             show it (the debit was clamped, so drift stays 0) and the error-rate
-probe:                             counter cannot either (it returns 200), so the log is the only trace.
 probe: Full table and the reasons: tools/alert/README.md. Every definition: alert.sh --list
 NOTCHECKED
 

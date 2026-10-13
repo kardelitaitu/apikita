@@ -95,6 +95,7 @@ pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
 /// closes that gap: the two cannot drift.
 pub(crate) fn metrics_payload(
     counter: &crate::error::ServerErrorCounter,
+    money: &crate::error::MoneyCounter,
     unhealthy_models: &[String],
     endpoint_traffic: &[(String, u64, u64)],
     retention: &crate::db::RetentionLag,
@@ -102,6 +103,8 @@ pub(crate) fn metrics_payload(
 ) -> serde_json::Value {
     let server_errors = counter.server_errors();
     let responses = counter.responses();
+    let undercharges = money.undercharges();
+    let undercharged_idr = money.undercharged_idr();
 
     // `None` for an empty window, never 0.0. A zero would read as "perfectly
     // healthy" and suppress the alert on a service that has simply served nothing
@@ -149,6 +152,22 @@ pub(crate) fn metrics_payload(
         // on the first proxied request — and is deliberately not the same as a list of
         // zeros. The route is operator-authenticated, so endpoint names are safe here;
         // the public /health route must never carry them.
+        // MONEY CONSUMED AND NEVER COLLECTED. This is the `proxy_undercharge` alert's
+        // number, and it had no metric for as long as the alert has existed — the signal
+        // was an `error!` log line that only a human reading logs at that moment could
+        // see. An unalerted money event is the defect class this repository treats as
+        // worst, so it is counted in the money layer and reported here.
+        //
+        // BOTH NUMBERS, because either alone is useless. The COUNT says how often a
+        // customer ran out mid-answer; the IDR SUM says what it cost. A single 200 IDR
+        // shortfall is noise, forty of them totalling 90,000 IDR is a customer being
+        // served premium answers for free — and only the sum distinguishes the two.
+        //
+        // ZERO IS A REAL AND GOOD READING HERE, unlike `error_rate`, which reports null
+        // for an empty window. No undercharges is the normal state and reporting it as
+        // null would make the alert treat a healthy service as unmeasured.
+        "undercharges": undercharges,
+        "undercharged_idr": undercharged_idr,
         "endpoint_traffic": endpoint_traffic
             .iter()
             .map(|(name, served, failed)| json!({
@@ -242,6 +261,12 @@ pub async fn operator_metrics(
                 "server_errors": counter.server_errors(),
                 "responses": counter.responses(),
                 "error_rate": counter.error_rate(),
+                // Present in the DEGRADED payload too, and deliberately: an operator
+                // paged during an incident must still see whether money is leaking, and
+                // omitting it here would make the field disappear exactly when it
+                // matters most.
+                "undercharges": crate::error::money_counter().undercharges(),
+                "undercharged_idr": crate::error::money_counter().undercharged_idr(),
                 "unhealthy_models": crate::routes::proxy::models_with_no_healthy_endpoint(),
                 "endpoint_traffic": crate::routes::proxy::endpoint_traffic(),
                 "retention": { "behind": null, "error": "the retention read failed" },
@@ -252,6 +277,7 @@ pub async fn operator_metrics(
 
     Ok(Json(metrics_payload(
         crate::error::server_error_counter(),
+        crate::error::money_counter(),
         &crate::routes::proxy::models_with_no_healthy_endpoint(),
         &crate::routes::proxy::endpoint_traffic(),
         &retention,
@@ -833,6 +859,39 @@ mod tests {
         );
     }
 
+    /// THE PAYLOAD CARRIES THE MONEY NUMBER THE `proxy_undercharge` ALERT NAMES.
+    ///
+    /// Both halves, because either alone is useless: the COUNT says how often a customer
+    /// ran out mid-answer, the SUM says what it cost. A single 200 IDR shortfall is
+    /// noise; forty totalling 90,000 IDR is a customer served premium answers for free.
+    #[test]
+    fn the_payload_carries_the_undercharge_count_and_amount() {
+        let counter = crate::error::ServerErrorCounter::default();
+        let money = crate::error::MoneyCounter::default();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        // ZERO IS A REAL AND GOOD READING, unlike error_rate's null for an empty window:
+        // no undercharges is the normal state, and reporting it as null would make the
+        // alert treat a healthy service as unmeasured.
+        let payload = metrics_payload(&counter, &money, &[], &[], &Default::default(), today);
+        assert_eq!(payload["undercharges"], json!(0));
+        assert_eq!(payload["undercharged_idr"], json!(0));
+        assert!(
+            !payload["undercharges"].is_null(),
+            "a healthy service must report 0, never null"
+        );
+
+        money.record_undercharge(200);
+        money.record_undercharge(90_000);
+        let payload = metrics_payload(&counter, &money, &[], &[], &Default::default(), today);
+        assert_eq!(payload["undercharges"], json!(2));
+        assert_eq!(
+            payload["undercharged_idr"],
+            json!(90_200),
+            "the SUM is the actionable half and must be the figure an operator is paged on"
+        );
+    }
+
     /// THE PAYLOAD CARRIES PER-ENDPOINT TRAFFIC, and it is a LIST rather than an object
     /// keyed by endpoint for a reason worth pinning: an EMPTY list means the upstream
     /// client has not been built yet, which is a different observation from "every
@@ -843,7 +902,14 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
 
         // No traffic yet: an EMPTY LIST, present as a key, never missing.
-        let payload = metrics_payload(&counter, &[], &[], &Default::default(), today);
+        let payload = metrics_payload(
+            &counter,
+            &Default::default(),
+            &[],
+            &[],
+            &Default::default(),
+            today,
+        );
         assert_eq!(
             payload["endpoint_traffic"],
             json!([]),
@@ -855,7 +921,14 @@ mod tests {
             ("primary".to_string(), 4100u64, 12u64),
             ("secondary".to_string(), 0u64, 0u64),
         ];
-        let payload = metrics_payload(&counter, &[], &traffic, &Default::default(), today);
+        let payload = metrics_payload(
+            &counter,
+            &Default::default(),
+            &[],
+            &traffic,
+            &Default::default(),
+            today,
+        );
         let entries = payload["endpoint_traffic"]
             .as_array()
             .expect("endpoint_traffic is an array");
@@ -884,6 +957,7 @@ mod tests {
         // Healthy: an EMPTY list, not a missing key, so a consumer can always index it.
         let payload = metrics_payload(
             &counter,
+            &Default::default(),
             &[],
             &[],
             &Default::default(),
@@ -902,6 +976,7 @@ mod tests {
         ];
         let payload = metrics_payload(
             &counter,
+            &Default::default(),
             &down,
             &[],
             &Default::default(),
@@ -922,6 +997,7 @@ mod tests {
         // An EMPTY counter: the fresh-deploy case.
         let payload = metrics_payload(
             &crate::error::ServerErrorCounter::default(),
+            &Default::default(),
             &[],
             &[],
             &Default::default(),
@@ -946,6 +1022,7 @@ mod tests {
         clean.record_response();
         let payload = metrics_payload(
             &clean,
+            &Default::default(),
             &[],
             &[],
             &Default::default(),
@@ -970,6 +1047,7 @@ mod tests {
         mixed.record_error();
         let payload = metrics_payload(
             &mixed,
+            &Default::default(),
             &[],
             &[],
             &Default::default(),

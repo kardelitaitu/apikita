@@ -2046,6 +2046,21 @@ async fn settle_partial_usage(
         "Usage settled PARTIALLY: balance could not cover the reported cost"
     );
 
+    // COUNTED HERE, and this is the only place it can be counted correctly.
+    //
+    // The `shortfall_idr <= 0` return above is why: a concurrent top-up can land between
+    // the failed debit and the retry, in which case the cost WAS collected in full and
+    // this is an ordinary settlement. The log line and the counter both sit AFTER that
+    // test, so neither can report a shortfall that did not happen — a counter above the
+    // guard would make the alert fire on a successful settlement, which is the failure
+    // mode that gets an alert muted.
+    //
+    // It is also after the COMMIT, deliberately. An undercharge that was rolled back is
+    // not an undercharge: the usage was never recorded and the money is still owed on a
+    // later request. Counting before the commit would report money as lost that the
+    // transaction gave back.
+    crate::error::money_counter().record_undercharge(shortfall_idr);
+
     Ok(UsageSettlement::Partial {
         new_balance,
         debited_idr,
@@ -5414,6 +5429,149 @@ mod tests {
             .await
             .expect("count ledger rows");
         assert_eq!(ledger, 0, "a zero reservation must write no ledger rows");
+        db.close().await;
+    }
+
+    /// THE UNDERCHARGE COUNTER MOVES ON A REAL CLAMPED SETTLEMENT, and the two
+    /// controls below are what make it a measurement rather than a coincidence.
+    ///
+    /// `proxy_undercharge` has been a named alert with no metric for as long as it has
+    /// existed: its signal was an `error!` log line nothing read. This drives the money
+    /// path against a live database and asserts the counter moves by the amount the
+    /// ledger says was lost — so the number an operator is paged on is the same figure
+    /// the transaction recorded.
+    ///
+    /// Read BEFORE the assertion and again after, rather than comparing to zero: the
+    /// counter is process-global and a sibling test may have fired it, so an absolute
+    /// value would be flaky for a reason unrelated to this code.
+    #[tokio::test]
+    async fn a_clamped_settlement_moves_the_undercharge_counter() {
+        let money = crate::error::money_counter();
+        let before_events = money.undercharges();
+        let before_idr = money.undercharged_idr();
+
+        let db = TestDb::new().await;
+        // A wallet with 1 IDR against a 1,000 IDR cost: the clamp is exercised for
+        // real rather than being the shortfall<=0 branch.
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        // Funded through the real top-up path rather than by writing balance_idr: a
+        // direct UPDATE would leave the ledger disagreeing with the balance, which is the
+        // very invariant the reconciliation gate checks. 1 IDR is the smallest amount the
+        // money-in path can settle, and it makes the clamp bite while the claim stays
+        // legitimately funded.
+        test_support::fund(&db.pool, account_id, 1).await;
+        let key_id = test_support::api_key(&db.pool, account_id).await;
+        assert_eq!(
+            test_support::balance(&db.pool, account_id).await,
+            1,
+            "control: the wallet holds exactly one rupiah"
+        );
+
+        let outcome = debit_usage_transaction(
+            &db.pool,
+            account_id,
+            Some(key_id),
+            "flash",
+            200,
+            0,
+            150,
+            1_000,
+            Some("undercharge_ref"),
+            // NO HOLD TAKEN, so there is none to release. Passing a positive
+            // `reserved_idr` here would CREDIT the wallet by that amount at step 0 —
+            // money the ledger never received — and the balance assertions below would
+            // then be measuring the fixture's own error rather than the clamp.
+            0,
+        )
+        .await
+        .expect("a settlement the wallet cannot cover is a recorded outcome");
+
+        // CONTROL 1, and it must come first: if the settlement did not clamp, the
+        // assertion below would pass vacuously on a shared counter.
+        match &outcome {
+            UsageSettlement::Partial { shortfall_idr, .. } => {
+                assert_eq!(
+                    *shortfall_idr, 999,
+                    "a 1,000 IDR cost against a 1 IDR balance"
+                );
+            }
+            other => panic!("expected a partial settlement, got {other:?}"),
+        }
+
+        // CONTROL 2: the ledger's NET is zero — the funding credited 1 and the clamped
+        // debit took exactly that 1 back — so the account ends where it started. That is
+        // the invariant: a clamped settlement loses the CUSTOMER nothing they had, and
+        // the shortfall is revenue the business never collected.
+        assert_eq!(
+            test_support::ledger_sum(&db.pool, account_id).await,
+            0,
+            "fund(+1) then debit(-1): the ledger nets to zero and balance_idr equals it"
+        );
+        assert_eq!(
+            test_support::balance(&db.pool, account_id).await,
+            0,
+            "the wallet is empty, which is what 'the balance could not cover it' means"
+        );
+
+        assert_eq!(
+            money.undercharges(),
+            before_events + 1,
+            "one clamped settlement must be ONE event"
+        );
+        assert_eq!(
+            money.undercharged_idr(),
+            before_idr + 999,
+            "the counter must carry the SAME figure the ledger and the log line carry"
+        );
+        db.close().await;
+    }
+
+    /// A settlement that is NOT clamped must not move the counter: the recording sits
+    /// after the `shortfall_idr <= 0` guard in the money layer, so a request whose
+    /// balance covered its cost is invisible to the money metrics.
+    #[tokio::test]
+    async fn a_full_settlement_moves_no_undercharge_counter() {
+        let money = crate::error::money_counter();
+        let before_events = money.undercharges();
+        let before_idr = money.undercharged_idr();
+
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        test_support::fund(&db.pool, account_id, 100_000).await;
+        let key_id = test_support::api_key(&db.pool, account_id).await;
+
+        let outcome = debit_usage_transaction(
+            &db.pool,
+            account_id,
+            Some(key_id),
+            "flash",
+            200,
+            0,
+            150,
+            1_000,
+            Some("full_ref"),
+            0,
+        )
+        .await
+        .expect("a funded settlement succeeds");
+
+        match &outcome {
+            UsageSettlement::Settled { new_balance } => {
+                assert_eq!(*new_balance, 99_000, "the cost was taken in full");
+            }
+            other => panic!("expected a full settlement, got {other:?}"),
+        }
+
+        assert_eq!(
+            money.undercharges(),
+            before_events,
+            "no clamp means no event: a counter that moves on healthy traffic gets muted"
+        );
+        assert_eq!(
+            money.undercharged_idr(),
+            before_idr,
+            "and the IDR figure must not move either"
+        );
         db.close().await;
     }
 

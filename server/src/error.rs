@@ -242,6 +242,95 @@ pub fn server_error_counter() -> &'static ServerErrorCounter {
     COUNTER.get_or_init(ServerErrorCounter::default)
 }
 
+/// WHAT AN UNDERCHARGE IS, precisely, because the alert has named it for a while as
+/// `needs-metrics` and the reason it could not fire was that nothing COUNTED it.
+///
+/// A request whose reported usage exceeded the balance it could be taken from. The
+/// answer was already streamed, so the tokens were genuinely consumed: the debit is
+/// CLAMPED to the balance, the real usage counters are recorded in full, and the
+/// difference is **money consumed and never collected**. The shortfall is real
+/// revenue the business does not get.
+///
+/// WHY IT IS ITS OWN COUNTER AND NOT PART OF THE ERROR RATE. Every one of these is
+/// already an `error!` log line, and an unalerted `error!` is exactly the defect this
+/// repository writes gates against — a refund-nobody-sees, a drift-nobody-sees. A log
+/// line reaches an operator only if somebody is reading logs at that moment; a counter
+/// reaches the metrics payload, which the alert tooling can read without a log
+/// scraper. Same shape as `ServerErrorCounter`: the smallest primitive that makes the
+/// number real.
+///
+/// WHY THE SUM AND NOT ONLY THE COUNT. A single undercharge of 200 IDR is noise; 40
+/// undercharges totalling 90,000 IDR is a customer running their account to zero and
+/// being served a premium answer for free. The AMOUNT is the part that makes it
+/// actionable, and `docs/business/05-risk.md` R3 already names under-charging as a
+/// HIGH risk — with no figure attached, because there was nothing to attach.
+#[derive(Debug, Default)]
+pub struct MoneyCounter {
+    /// How many settlements were clamped.
+    undercharges: AtomicU64,
+    /// The sum of the uncollected shortfalls, in IDR.
+    undercharged_idr: AtomicU64,
+}
+
+impl MoneyCounter {
+    /// One clamped settlement, carrying the shortfall that was not collected.
+    ///
+    /// THE IDR ACCUMULATION REALLY SATURATES, and the first version of this function did
+    /// not. It used `fetch_add`, which WRAPS — and the comment above it claimed saturation
+    /// anyway, so the code and its own explanation disagreed and only a test could tell.
+    /// MEASURED: two `i64::MAX` shortfalls left the counter at `u64::MAX - 1`, i.e. the
+    /// worst possible loss reported as 18 quintillion short of the true figure.
+    ///
+    /// This is money arithmetic in a build where `[profile.release]` leaves
+    /// overflow-checks OFF, so nothing would have panicked: the number would simply be
+    /// wrong, silently, on the one alert whose whole purpose is to say how much was lost.
+    ///
+    /// The loop is a compare-and-swap rather than a `fetch_add` with a check, because
+    /// check-then-act is a lost-update race between the load and the store — and this
+    /// counter is written from the detached settlement task, which can be concurrent.
+    /// A failed CAS retries against the new value, so no increment is ever dropped.
+    pub fn record_undercharge(&self, shortfall_idr: i64) {
+        self.undercharges.fetch_add(1, Ordering::Relaxed);
+        if shortfall_idr <= 0 {
+            return;
+        }
+        let add = shortfall_idr as u64;
+        let mut current = self.undercharged_idr.load(Ordering::Relaxed);
+        loop {
+            // `saturating_add`, so the counter maxes out instead of wrapping to a
+            // number that reads as no loss at all.
+            match self.undercharged_idr.compare_exchange_weak(
+                current,
+                current.saturating_add(add),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn undercharges(&self) -> u64 {
+        self.undercharges.load(Ordering::Relaxed)
+    }
+
+    pub fn undercharged_idr(&self) -> u64 {
+        self.undercharged_idr.load(Ordering::Relaxed)
+    }
+}
+
+/// The process-wide money counter. See `MoneyCounter`.
+///
+/// A `OnceLock` for the same reason as `server_error_counter`: the counter is
+/// incremented on the settlement path, which is a detached task with no request
+/// handler to thread a parameter through, so a global cannot be forgotten at the
+/// call site.
+pub fn money_counter() -> &'static MoneyCounter {
+    static COUNTER: std::sync::OnceLock<MoneyCounter> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(MoneyCounter::default)
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
@@ -325,6 +414,85 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{header, HeaderMap};
     use serde_json::{json, Value as Json};
+
+    /// THE UNDERCHARGE COUNTER IS NOT THE SAME OBJECT AS THE ERROR COUNTER, and a
+    /// shared counter would make the money number move on every 5xx - which is the
+    /// failure mode that gets an alert muted: the figure is right some of the time and
+    /// nobody can tell when.
+    #[test]
+    fn the_money_counter_counts_events_and_idr_independently() {
+        let money = MoneyCounter::default();
+        assert_eq!(money.undercharges(), 0);
+        assert_eq!(
+            money.undercharged_idr(),
+            0,
+            "zero is a real and GOOD reading here, unlike error_rate's null for an empty window"
+        );
+
+        money.record_undercharge(200);
+        money.record_undercharge(90_000);
+        assert_eq!(money.undercharges(), 2);
+        assert_eq!(
+            money.undercharged_idr(),
+            90_200,
+            "the SUM is the actionable half: 2 events of 200 is noise, and the total is what an operator pages on"
+        );
+    }
+
+    /// A ZERO OR NEGATIVE shortfall must not move the IDR figure, because the caller
+    /// only reaches this after the `shortfall_idr <= 0` guard - and if a future edit moves
+    /// the call above that guard, a concurrent top-up (a settled-in-full request, not an
+    /// undercharge) must not inflate the number.
+    #[test]
+    fn a_non_positive_shortfall_adds_no_idr() {
+        let money = MoneyCounter::default();
+        money.record_undercharge(0);
+        money.record_undercharge(-50);
+        assert_eq!(
+            money.undercharges(),
+            2,
+            "both were reported, so both are events"
+        );
+        assert_eq!(
+            money.undercharged_idr(),
+            0,
+            "but neither lost any money, so the IDR figure must not move"
+        );
+    }
+
+    /// THE AMOUNT SATURATES RATHER THAN WRAPS. This is money arithmetic in a release
+    /// build with overflow-checks OFF, so a wrap would turn the largest loss in the
+    /// service's history into a small or NEGATIVE number - the worst day reading as its
+    /// best.
+    #[test]
+    fn a_huge_shortfall_saturates_instead_of_wrapping() {
+        let money = MoneyCounter::default();
+        // THREE, not two, and the arithmetic is why: 2 * i64::MAX is
+        // 18_446_744_073_709_551_614, which is u64::MAX - 1 and therefore REPRESENTABLE.
+        // Two would prove nothing about saturation — the first version of this test used
+        // two and its expected value was simply wrong, which is how the defective
+        // implementation below it passed. Three does overflow the counter.
+        money.record_undercharge(i64::MAX);
+        money.record_undercharge(i64::MAX);
+        money.record_undercharge(i64::MAX);
+        assert_eq!(
+            money.undercharged_idr(),
+            u64::MAX,
+            "an overflowing total must SATURATE at the counter's ceiling. A wrapping \
+             fetch_add lands on a small number here, and a large loss would then read as \
+             a small one on the single alert whose job is to say how much was lost"
+        );
+
+        // CONTROL: the saturation is a ceiling, not a frozen counter — a further
+        // increment must still be absorbed without changing the value.
+        money.record_undercharge(i64::MAX);
+        assert_eq!(
+            money.undercharged_idr(),
+            u64::MAX,
+            "once saturated it stays saturated rather than wrapping to a small number"
+        );
+        assert_eq!(money.undercharges(), 4, "but every event is still counted");
+    }
 
     /// The literal contract from docs/error-model.md:35-50.
     ///
