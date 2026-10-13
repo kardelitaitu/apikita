@@ -86,6 +86,28 @@ pub enum UpstreamError {
     RateLimited,
     /// The upstream answered with a non-retryable status (4xx).
     ServerError(u16),
+    /// Every routed endpoint answered 404 for the model it was asked for.
+    ///
+    /// SEPARATE FROM `ServerError(404)` BECAUSE THE TWO MEAN DIFFERENT THINGS. A 404 from
+    /// ONE endpoint is a statement about THAT PROVIDER — `upstream_model` is per-endpoint
+    /// by design, so provider A may not carry `deepseek-flash` while provider B carries the
+    /// same product under a different name — and it is therefore a FAILOVER signal that
+    /// the next endpoint may well satisfy. A 404 from EVERY routed endpoint is a statement
+    /// about the CONFIGURATION: no endpoint in the pool serves the name being rewritten
+    /// to, and no retry will change that. Only the second reaches this variant.
+    ///
+    /// Deliberately not `ServerError`: that status is documented as "the caller's request,
+    /// not a provider fault" and surfaces as a client 4xx. A pool-wide model mismatch is
+    /// OUR configuration error, and docs/error-model.md classifies an operational
+    /// misconfiguration as a 5xx, so the customer is not told their valid request was bad.
+    NoEndpointServesModel {
+        /// The product model the caller asked for.
+        model: String,
+        /// The per-endpoint upstream names that refused, in routing order, so an operator
+        /// can see WHICH rewrite is wrong without a second investigation. Each entry is
+        /// `endpoint=upstream_model`.
+        tried: Vec<String>,
+    },
     /// The only failure was a network-level one; no HTTP status was seen.
     Transport(String),
 }
@@ -97,6 +119,11 @@ impl fmt::Display for UpstreamError {
             Self::NoHealthyUpstream(model) => write!(f, "no healthy upstream for model: {model}"),
             Self::RateLimited => write!(f, "upstream rate limited every key"),
             Self::ServerError(status) => write!(f, "upstream returned status {status}"),
+            Self::NoEndpointServesModel { model, tried } => write!(
+                f,
+                "no endpoint serves model {model}; tried {}",
+                tried.join(", ")
+            ),
             Self::Transport(err) => write!(f, "upstream transport error: {err}"),
         }
     }
@@ -548,6 +575,14 @@ impl UpstreamClient {
         let mut unhealthy = false;
         let mut rate_limited = false;
         let mut transport = None;
+        // Endpoints that answered 404 for the model they were asked for, as
+        // `endpoint=upstream_model` pairs. A 404 is ENDPOINT-SCOPED here — the whole point
+        // of `upstream_model` is that two providers may carry the same product under
+        // different names — so it is collected and the loop CONTINUES rather than
+        // returning. Only when every routed endpoint has refused does this become an
+        // error, and it becomes `NoEndpointServesModel` (a 5xx: a config fault) rather
+        // than `ServerError(404)` (a 4xx: the caller's fault).
+        let mut model_refused: Vec<String> = Vec::new();
 
         for endpoint in entry
             .endpoints
@@ -603,6 +638,23 @@ impl UpstreamClient {
                             break;
                         }
 
+                        // 404 IS ENDPOINT-SCOPED AND THE OTHERS ARE NOT, and that
+                        // distinction is the fix this arm used to get wrong. Every 4xx here
+                        // used to return immediately on the grounds that "the caller's
+                        // request is bad, so a different provider would refuse it too".
+                        // That reasoning holds for 400/422 — a malformed body is malformed
+                        // everywhere — but NOT for 404, because the model NAME is rewritten
+                        // per endpoint from `upstream_model`. Provider A answering "no such
+                        // model" says nothing about provider B, and the config exists
+                        // precisely so two providers can spell the same product differently.
+                        // So a 404 records the refusal and ROTATES to the next endpoint.
+                        if status == 404 {
+                            lease.report_status(status);
+                            model_refused
+                                .push(format!("{}={}", endpoint.name, endpoint.upstream_model));
+                            break;
+                        }
+
                         // Any other 4xx is the caller's request, not a provider
                         // fault: do not trip the breaker, do not retry a
                         // different provider with the same bad body.
@@ -613,12 +665,24 @@ impl UpstreamClient {
             }
         }
 
+        // A POOL-WIDE 404 IS A CONFIGURATION FAULT, so it is classified AFTER the
+        // provider-health outcomes but BEFORE the catch-all. The order matters: if one
+        // endpoint refused the model and ANOTHER was circuit-open, the outage is the
+        // more informative answer, because fixing the config would not have served the
+        // request while the endpoint was down. It outranks the catch-all because
+        // `NoHealthyUpstream` would send an operator looking for an outage that does not
+        // exist — every endpoint answered fine, with a 404.
         if unhealthy {
             Err(UpstreamError::NoHealthyUpstream(model.to_string()))
         } else if rate_limited {
             Err(UpstreamError::RateLimited)
         } else if let Some(err) = transport {
             Err(UpstreamError::Transport(err))
+        } else if !model_refused.is_empty() {
+            Err(UpstreamError::NoEndpointServesModel {
+                model: model.to_string(),
+                tried: model_refused,
+            })
         } else {
             Err(UpstreamError::NoHealthyUpstream(model.to_string()))
         }
@@ -1973,6 +2037,128 @@ mod tests {
         assert!(
             upstream.models[0].endpoints[0].breaker.allow_request(),
             "the caller own bad request must NOT trip the provider breaker"
+        );
+    }
+
+    /// A 404 IS ENDPOINT-SCOPED, SO IT FAILS OVER — the fix this test exists for.
+    ///
+    /// THE DEFECT: every non-5xx 4xx returned immediately, on the reasoning that "the
+    /// caller request is bad, so another provider would refuse it too". That holds for a
+    /// malformed body and does NOT hold for a 404, because `upstream_model` is rewritten
+    /// PER ENDPOINT by design — two providers legitimately spell the same product
+    /// differently. So one provider not carrying a name said nothing about the next one,
+    /// and returning early turned a working failover pool into a hard failure.
+    #[tokio::test]
+    async fn a_404_from_one_endpoint_fails_over_to_the_next() {
+        let refuses = upstream_answering("404 Not Found", r#"{"error":"no such model"}"#).await;
+        let serves = upstream_answering("200 OK", "").await;
+
+        let _lock = EnvLock::acquire();
+        let _a = EnvGuard::set("APK_TEST_FIRST_KEY_1", "first-key");
+        let _b = EnvGuard::set("APK_TEST_SECOND_KEY_1", "second-key");
+
+        let mut first = endpoint("first", 1.0);
+        first.url = refuses;
+        let mut second = endpoint("second", 1.0);
+        second.url = serves;
+
+        let upstream = client(vec![model("flash", vec![first, second])]);
+
+        let result = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await;
+
+        match result {
+            Ok(stream) => assert_eq!(
+                stream.endpoint_name(),
+                "second",
+                "a 404 from the first endpoint must ROTATE to the second, because the \
+                 model name is rewritten per endpoint and the second may carry it"
+            ),
+            Err(err) => panic!(
+                "a 404 is endpoint-scoped, so the loop must fail over rather than abort, got {err:?}"
+            ),
+        }
+
+        // The refusing endpoint must NOT have tripped its breaker: a missing model name
+        // is a config fact about that provider, not a sign it is unhealthy. Taking it out
+        // of rotation would remove capacity for every OTHER model it serves correctly.
+        assert!(
+            upstream.models[0].endpoints[0].breaker.allow_request(),
+            "a 404 must not trip the breaker - the endpoint is up and answered"
+        );
+    }
+
+    /// When EVERY routed endpoint 404s, the error names the mapping rather than
+    /// pretending the caller sent something bad.
+    #[tokio::test]
+    async fn a_404_from_every_endpoint_names_the_configuration_fault() {
+        let url = upstream_answering("404 Not Found", r#"{"error":"no such model"}"#).await;
+        let upstream = client_pointed_at(&url);
+
+        let err = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect_err("a pool-wide 404 is not a success");
+
+        match &err {
+            UpstreamError::NoEndpointServesModel { model, tried } => {
+                assert_eq!(model, "flash", "the PRODUCT model, not the rewritten name");
+                assert_eq!(
+                    tried.len(),
+                    1,
+                    "every refusing endpoint is reported so an operator sees which rewrite is wrong"
+                );
+                assert!(
+                    tried[0].starts_with("solo="),
+                    "each entry is endpoint=upstream_model, got {:?}",
+                    tried[0]
+                );
+            }
+            other => panic!(
+                "a pool-wide 404 must be NoEndpointServesModel (a config fault), not {other:?}; \
+                 ServerError(404) would blame the caller for our wrong upstream_model"
+            ),
+        }
+
+        // And it must NOT be reported as an outage: every endpoint answered fine.
+        assert!(
+            !matches!(err, UpstreamError::NoHealthyUpstream(_)),
+            "sending an operator after a nonexistent outage is the failure this variant exists to prevent"
+        );
+    }
+
+    /// A 400 is still refused immediately — the fix must not have widened the arm.
+    ///
+    /// This is the guard against over-correcting: making 404 fail over is only right
+    /// because the model NAME is endpoint-scoped. A malformed body is malformed
+    /// everywhere, so failing over would spend a second upstream call on a request that
+    /// cannot succeed, and the caller would be billed for it.
+    #[tokio::test]
+    async fn a_404_failing_over_does_not_make_a_400_fail_over() {
+        let refuses = upstream_answering("400 Bad Request", r#"{"error":"bad body"}"#).await;
+        let serves = upstream_answering("200 OK", "").await;
+
+        let _lock = EnvLock::acquire();
+        let _a = EnvGuard::set("APK_TEST_FIRST_KEY_1", "first-key");
+        let _b = EnvGuard::set("APK_TEST_SECOND_KEY_1", "second-key");
+
+        let mut first = endpoint("first", 1.0);
+        first.url = refuses;
+        let mut second = endpoint("second", 1.0);
+        second.url = serves;
+
+        let upstream = client(vec![model("flash", vec![first, second])]);
+
+        let err = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect_err("a 400 must be refused, not failed over");
+
+        assert!(
+            matches!(err, UpstreamError::ServerError(400)),
+            "a malformed body is the caller fault at every provider, so it must abort \
+             the loop rather than try the next endpoint, got {err:?}"
         );
     }
 

@@ -113,7 +113,33 @@ is genuinely added (its own company, its own terms), then:
 | --- | --- |
 | Endpoint circuit open | Its weight drops to 0; others absorb traffic |
 | All endpoints open | Return **503** with `Retry-After` |
-| Provider returns a model-not-found | Mark that endpoint unhealthy for that model |
+| Provider returns a model-not-found (404) | **Rotate to the next endpoint**; if every endpoint 404s, return **500** naming the configuration fault |
+
+**A 404 now fails over, and the row above used to claim something the code did not do.**
+It read "mark that endpoint unhealthy for that model", which describes a mechanism that
+has never existed — there is no per-model health map, and the breaker is per-ENDPOINT, so
+a per-model verdict has nowhere to live. What the code actually did was worse than the
+document's gap: **every non-5xx 4xx returned immediately**, so a 404 from one provider
+aborted the request instead of trying the next one.
+
+That was wrong for a structural reason. `upstream_model` is rewritten **per endpoint** —
+that is the entire point of the `(url + upstream_model)` pair, and the config exists so
+two suppliers can spell the same product differently. So "this provider does not carry
+that name" is a statement about ONE supplier and says nothing about the pool, which makes
+it a failover signal; treating it as a caller error turned a working failover pool into a
+hard failure on whichever provider happened to be tried first.
+
+**The arm is now split by exactly that distinction.** A 404 records the refusal
+(`endpoint=upstream_model`) and rotates; **every other 4xx still aborts immediately**,
+because a malformed body is malformed at every provider and retrying it would spend a
+second upstream call on a request that cannot succeed. A 404 does **not** trip the
+breaker: the endpoint is up and answered, and taking it out of rotation would remove
+capacity for every OTHER model it serves correctly.
+
+When *every* routed endpoint refuses, the result is a **500** naming the configuration
+fault — not a 503 (a retry cannot succeed; every endpoint is healthy) and not a 404 (the
+caller's request was valid and OUR `upstream_model` is wrong). The endpoint list is
+logged for the operator and withheld from the client, because it names providers.
 
 **A provider must not be used until its resale terms are read.** There is no
 `resale_permitted` flag — this line used to claim the config enforces the rule with
@@ -218,7 +244,8 @@ checks the process and the database only. See [`docs/observability.md`](observab
 | Single provider, circuit open | Nothing to fail over to -> **503 + Retry-After** |
 | All keys cooled down | Same — do not queue; fail fast |
 | Endpoint healthy but slow | Latency, not failure. Let the timeout decide |
-| Upstream returns 400 (bad request) | **Not** a provider fault — do not trip the circuit |
+| Upstream returns 400 (bad request) | **Not** a provider fault — do not trip the circuit, do not fail over |
+| Upstream returns 404 (model not found) | **Endpoint-scoped**: rotate to the next endpoint. All 404 -> 500 config fault |
 | Upstream returns 401 | Key is bad — **park that key**, do not trip the endpoint |
 | Upstream returns 403 | Rotates to the next key, but does **not** park it — see below |
 

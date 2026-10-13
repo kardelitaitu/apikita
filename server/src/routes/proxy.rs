@@ -1074,6 +1074,38 @@ fn upstream_error(
                 account_id,
             ),
         },
+        // EVERY ENDPOINT ANSWERED 404 FOR THE MODEL IT WAS ASKED FOR.
+        //
+        // THIS IS OUR CONFIGURATION FAULT, NOT THE CALLER'S, and it used to fall into the
+        // catch-all below as a 500 `internal_error` — which is at least the right STATUS
+        // (docs/error-model.md: our problem, not the client's) but a bad CODE, because
+        // "our bug" tells an operator to look for a defect rather than at
+        // `upstream_model` in the config. It also carried the joined endpoint names into
+        // the client-visible message via `Internal(other.to_string())`, which
+        // `docs/error-model.md` rule 1 forbids: an upstream error must not leak provider
+        // identity.
+        //
+        // The status stays 500 deliberately. 503 would claim a retry could succeed, and
+        // the whole point of this variant is that it cannot: every endpoint is up and
+        // answered, and the model name being rewritten to is not one any of them serves.
+        UpstreamError::NoEndpointServesModel {
+            model: asked,
+            tried,
+        } => {
+            error!(
+                account_id = %account_id,
+                model = %asked,
+                tried = %tried.join(", "),
+                "no routed endpoint serves the configured upstream model name; \
+                 check upstream_model for this model in config/apikita.toml"
+            );
+            // The DETAIL IS WITHHELD, exactly as the transport arm withholds its URL: the
+            // tried list names endpoints and their upstream model names, which is provider
+            // identity. The operator gets it in the log line above.
+            AppError::Internal(format!(
+                "no configured upstream serves model {asked}; the mapping is wrong, not the request"
+            ))
+        }
         other => AppError::Internal(other.to_string()),
     }
 }

@@ -170,8 +170,19 @@ provider we may switch away from.
 | --- | --- |
 | 400 (bad request from client) | 400 `invalid_request`, our wording |
 | 401/403 (our provider key is bad) | 500 or 503 — **this is our problem, not the client's** |
+| 404 (model not found at ONE provider) | **Failover**: `upstream_model` is per-endpoint, so the next provider may carry it |
+| 404 (model not found at EVERY provider) | 500 — our `upstream_model` mapping is wrong. The endpoint list is logged, never sent |
 | 429 (provider throttled) | Retry another key first; only surface 503 if all fail |
 | 5xx | Try another endpoint; else 503 |
+
+**A 404 is the one 4xx that is NOT the caller's fault, and the distinction is
+structural.** Every other 4xx aborts the loop immediately, because a malformed body is
+malformed at every provider and retrying it would spend a second upstream call on a
+request that cannot succeed. But the model NAME is rewritten per endpoint from
+`upstream_model` — that is what the `(url + upstream_model)` pair is for — so one
+provider saying "no such model" is a fact about THAT supplier only. It rotates. When
+every endpoint refuses, the fault is ours: the request was valid and the mapping is
+wrong, which is why that answer is a 500 and not a 404.
 
 **An upstream auth failure must never surface as a client 401.** The customer's key
 is fine; our provider key is not. Returning 401 would send them chasing a

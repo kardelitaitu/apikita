@@ -60,8 +60,9 @@ struct Policy {
     ///
     /// THIS IS THE ONE FIELD THAT WAS PARSED, VALIDATED, DOCUMENTED — AND NEVER READ.
     /// `ModelEndpoint::concurrency_per_key` reached `KeyPool` through exactly one path
-    /// and that path was `client.rs:695` setting it to 0 in a test fixture. So every
-    /// endpoint in the shipped config, including the comment at `apikita.toml:771`
+    /// and that path was the `endpoint_at` test fixture in `upstream/client.rs` setting it
+    /// to 0. So every endpoint in the shipped config, including the comment beside the
+    /// `concurrency_per_key` key in `config/apikita.toml`,
     /// describing the intended semantics as "the ceiling the provider enforces for ONE
     /// key", governed nothing.
     ///

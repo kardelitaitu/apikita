@@ -22,8 +22,9 @@
 //! then report it as a defect. The first version of this file made exactly that mistake: it released
 //! all 40 burst refs when only the successful ones had been reserved, and the wallet grew by 21,000.
 //!
-//! VERIFIED, not assumed: the only PRODUCTION callers are `proxy.rs:1734` (settle) and `proxy.rs:1881`
-//! (release), both reached only with the reservation this request took. Every other call site is inside
+//! VERIFIED, not assumed: the only PRODUCTION callers are `settle_after_stream` (settle) and
+//! `release_quietly` (release), both in `routes/proxy.rs` and both reached only with the reservation
+//! this request took. Every other call site is inside
 //! a `mod tests` block. So the contract is enforced by construction on the production path.
 //!
 //! EVERY TEST ASSERTS ITS OWN PRECONDITION FIRST. An earlier attempt measured nothing at all because
@@ -325,8 +326,9 @@ async fn settling_for_less_than_the_hold_returns_the_difference() {
 /// releases that hold a SECOND time and credits the wallet. That is `release_reservation_transaction`
 /// crediting unconditionally, reached through settlement.
 ///
-/// What protects the money is therefore NOT the function - it is that only `proxy.rs:1734` calls it, once
-/// per request, with the reservation that request took. This test pins that boundary so the assumption
+/// What protects the money is therefore NOT the function - it is that only `settle_after_stream` in
+/// `routes/proxy.rs` calls it, once per request, with the reservation that request took. This test pins
+/// that boundary so the assumption
 /// is recorded rather than implied: a SECOND settlement of the same ref moves the balance UPWARD, and
 /// anyone who later adds a retry must handle that.
 ///
