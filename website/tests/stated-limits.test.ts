@@ -660,6 +660,47 @@ test('every numeric retention period the privacy page publishes is the one that 
     privacy.retention.length >= 15,
     `privacy.ts publishes only ${privacy.retention.length} retention rows; this test's table was written against fifteen, so it is no longer reading the page it was written for`,
   );
+
+  // --- AND EVERY PUBLISHED ROW IS ONE OF THE ROWS NAMED ABOVE ----------------
+  //
+  // THE DIRECTION THIS FILE WAS MISSING, and it is the direction the file's own
+  // header argues for. Everything above walks the CONSTANTS and finds the page row
+  // that should state each one; nothing walked the PAGE and asked whether every row
+  // it publishes is accounted for. The guard above only checks the TOTAL, so a
+  // SIXTEENTH row stating a period no constant backs is invisible.
+  //
+  // MEASURED: adding `{ what: 'Zzz unchecked row', keep: '99 days', why: ... }`
+  // left this file at 4 pass / 0 fail. A page row claiming a ninety-nine-day
+  // window that no sweep implements is precisely the failure the header names --
+  // "a promise kept by the document and broken by the code" -- and it would have
+  // shipped.
+  //
+  // The named set is built from the fragments the checks above actually use, so
+  // this cannot drift from them: a fragment added there is covered here without a
+  // second edit. `keep: 'Kept indefinitely...'` style rows are in `unnumbered` and
+  // are therefore named too; the check is about COVERAGE, not about digits.
+  const named = [...pairs.map(([f]) => f), ...unnumbered];
+  const uncovered = privacy.retention
+    .map((r: { what: string }) => r.what)
+    .filter((what: string) => !named.some((fragment) => what.includes(fragment)));
+  // FOUR ROWS ARE CHECKED BY THEIR OWN BLOCKS rather than through a fragment in
+  // either list -- the link-code grace, the Logs range, and the two identity-link
+  // lifetimes share the one "Email verification and password-reset links" row. They
+  // are named here so the exemption is explicit and countable rather than an
+  // unexplained remainder.
+  const checked_by_their_own_block = [
+    'Telegram link codes',
+    'Logs',
+    'Email verification and password-reset links',
+  ];
+  const genuinely_uncovered = uncovered.filter(
+    (what: string) => !checked_by_their_own_block.some((f) => what.includes(f)),
+  );
+  assert.deepEqual(
+    genuinely_uncovered,
+    [],
+    `privacy.ts publishes these retention rows and no check in this file compares them to anything: ${genuinely_uncovered.join('; ')}. Either add the row to the table above with the constant that backs it, or - if its period is deliberately prose - add it to \`unnumbered\` (no digits) or name it in \`checked_by_their_own_block\`. A row publishing a number that nothing implements is a promise the code does not keep.`,
+  );
   assert.equal(
     matched.length,
     pairs.length,
