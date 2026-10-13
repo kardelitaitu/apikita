@@ -182,10 +182,35 @@ test('every line citation under website/src points at a line that exists', () =>
       problems.push(`${c.from}:${c.fromLine} cites ${c.path}, which is not a file in this repository`);
       continue;
     }
-    const lines = readFileSync(target, 'utf8').split('\n').length;
+    const all = readFileSync(target, 'utf8').split('\n');
+    const lines = all.length;
     if (c.start < 1 || c.end > lines) {
       problems.push(
         `${c.from}:${c.fromLine} cites ${c.path}:${c.start}${c.end === c.start ? '' : `-${c.end}`} but that file has ${lines} lines`,
+      );
+      continue;
+    }
+
+    // AND THE LINE IT LANDS ON MUST HAVE SOMETHING ON IT, which bounds alone did not check.
+    //
+    // The test below this one already refuses a citation into RUST that lands on a body rather
+    // than a declaration - a stronger rule. It applies to `.rs` only, so a citation into a
+    // MARKDOWN file was covered by the bounds above and by nothing else.
+    //
+    // MEASURED: `TopUpForm.astro` cites `docs/website/04-payments.md:70`, which is real content.
+    // Changing it to `:75` - a blank separator line - passed this file at 6 pass / 0 fail. Its
+    // own header records TEN drifted citations found by hand when it was written, one of them
+    // "a blank line", so the shape is known here and was still unchecked.
+    //
+    // A RANGE MAY START ON A SEPARATOR, for the same reason as in `server/src/doc_claims.rs`:
+    // `:71-88` naming a section begins on the blank line that sets it off, and the range IS the
+    // content below it. So a range must contain a non-blank line anywhere, while a single line
+    // must itself be non-blank.
+    const span = all.slice(c.start - 1, c.end);
+    if (span.every((l) => l.trim() === '')) {
+      const what = c.end === c.start ? 'that line' : 'every line of that range';
+      problems.push(
+        `${c.from}:${c.fromLine} cites ${c.path}:${c.start}${c.end === c.start ? '' : `-${c.end}`}, and ${what} is blank - the citation reaches nothing`,
       );
     }
   }

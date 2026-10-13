@@ -19,7 +19,7 @@ export function toIsoDay(date: Date): string {
 /**
  * The `?from=&to=` query string for the daily breakdown, ending `on` (inclusive).
  *
- * docs/server/api-spec.md:302: "Both bounds are ISO `YYYY-MM-DD`; **anything else is
+ * docs/server/api-spec.md:347: "Both bounds are ISO `YYYY-MM-DD`; **anything else is
  * a `422`** naming the field". server/src/routes/account.rs:248-250 parses with
  * `%Y-%m-%d` and nothing else, so a relative shorthand like `-30d` — what this
  * island used to send — is a guaranteed 422 and the page never renders a row.
