@@ -2825,6 +2825,156 @@ mod tests {
             "docs/deployment.md's worst-case arithmetic must be 2 x {secs} = {total} s, because the document uses that total to tell an operator how to size --stop-timeout, and a wrong total means a SIGKILL mid-drain - which the document itself calls silent"
         );
     }
+
+    /// Every `path.rs:NNN-MMM` on one line, as (path, start, end).
+    fn rust_ranges_in(line: &str) -> Vec<(String, usize, usize)> {
+        let mut out = Vec::new();
+        for m in line.match_indices(".rs:") {
+            let at = m.0;
+            let after = &line[at + 4..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let Ok(start) = digits.parse::<usize>() else {
+                continue;
+            };
+            let Some(rest) = after[digits.len()..].strip_prefix('-') else {
+                continue;
+            };
+            let end_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let Ok(end) = end_digits.parse::<usize>() else {
+                continue;
+            };
+            let stem: String = line[..at + 3]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !stem.is_empty() && end > start {
+                out.push((stem, start, end));
+            }
+        }
+        out
+    }
+
+    /// The path of a source file named by a bare basename or a repo-relative path.
+    fn resolve_source_file(target: &str) -> Option<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let direct = root.join(target);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        find_by_name(&root, std::path::Path::new(target).file_name()?.to_str()?)
+    }
+    /// A RANGE CITATION INTO RUST MUST CONTAIN SOMETHING ITS OWN SENTENCE NAMES.
+    ///
+    /// THE BLIND SPOT `docs/testing.md` DOCUMENTS AND LEAVES OPEN. Its section on a citation guard
+    /// reading only the first number of a range records that the extractor returns the start and
+    /// never the end, so a range is validated at its opening line and at nothing else - and that a
+    /// range whose start lands on SOMETHING PLAUSIBLE is caught by nothing. MEASURED: shifting a
+    /// start by one line, `proxy.rs:571-576` to `:572-576`, both plausible and one correct, leaves
+    /// the suite green.
+    ///
+    /// SO THIS ASKS A QUESTION THE START LINE CANNOT ANSWER DISHONESTLY: does the SPAN contain a
+    /// snake_case identifier the citing sentence also uses? A sentence citing a range names the
+    /// construct it means, and a span containing none of those names is not the span it describes.
+    /// That is a property of the range as a whole, so it sees what a start-only parse cannot.
+    ///
+    /// IT FOUND ONE ON ITS FIRST RUN, and two more were repaired while measuring it:
+    ///
+    ///   * `db.rs` cited `expire_one_deposit` at a range near the top of that file; the function
+    ///     is at 547 and the span was a top-up ledger comment. It now names the symbol, with no
+    ///     number - which is also what stops THIS paragraph from being a citation itself.
+    ///   * `admin_auth_boundary.rs` cited two lines of `routes/mod.rs` for `/restore` and
+    ///     `/resume`; those lines were `/audit` and `/accounts/{id}`, and the real mount is two
+    ///     lines below them.
+    ///   * `money.rs` cited a range in `upstream/client.rs` twice for the input/cache split; those
+    ///     lines are the `Display` impl. Both now name `parse_usage_from_sse`.
+    ///
+    /// A RANGE WHOSE SENTENCE NAMES NOTHING IS SKIPPED. A citation that describes rather than names
+    /// has no token to require, and inventing one would fire on correct prose - which is how a guard
+    /// gets deleted. The same reason limits this to sentences naming a FEW identifiers.
+    #[test]
+    fn a_rust_range_citation_contains_a_name_its_sentence_uses() {
+        let mut checked = 0usize;
+        let mut problems: Vec<String> = Vec::new();
+
+        for path in source_files() {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let shown = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            for (i, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for (target, start, end) in rust_ranges_in(line) {
+                    let Some(target_path) = resolve_source_file(&target) else {
+                        continue;
+                    };
+                    let Ok(target_text) = std::fs::read_to_string(&target_path) else {
+                        continue;
+                    };
+                    let target_lines: Vec<&str> = target_text.lines().collect();
+                    if start < 1 || end > target_lines.len() {
+                        continue;
+                    }
+                    let span = target_lines[start - 1..end].join("\n");
+
+                    // BACKTICKED identifiers only. A first version counted every snake_case word,
+                    // and MEASURED it fired on ordinary prose - "start", "line", "documented",
+                    // "cost" - which is how a guard gets deleted rather than fixed. A backtick is
+                    // the markdown convention this repository already uses for a CODE name, so it
+                    // is the signal that a sentence is naming a construct rather than describing
+                    // one.
+                    // BACKTICKED identifiers only, from the helper this file already has for
+                    // exactly that purpose. A first version counted every snake_case word and
+                    // MEASURED it fired on ordinary prose - "start", "line", "documented", "cost" -
+                    // which is how a guard gets deleted rather than fixed. Requiring the markdown
+                    // convention this repository uses for code names is what makes the check mean
+                    // "the sentence is naming a construct".
+                    let names: Vec<String> = backticked_identifiers(line)
+                        .into_iter()
+                        .filter(|n| is_snake_identifier(n))
+                        .filter(|n| !target.contains(n))
+                        .map(str::to_string)
+                        .collect();
+                    if names.is_empty() || names.len() > 6 {
+                        continue;
+                    }
+                    checked += 1;
+                    if !names.iter().any(|n| span.contains(n.as_str())) {
+                        problems.push(format!(
+                            "{shown}:{} cites {target}:{start}-{end}, and the span contains none of the names that sentence uses ({names:?}) - the right file and the wrong lines, which a start-only parse cannot see",
+                            i + 1
+                        ));
+                    }
+                }
+            }
+        }
+
+        // TWO, against a measured three, and the number is small because the rule is STRICT by
+        // design: most Rust ranges cite a comment block or a block of code without naming it in
+        // backticks, and a citation that describes rather than names has nothing this can require.
+        // A floor of five was written first and failed on the real tree, which is the honest
+        // outcome - the alternative was to widen the rule until it counted prose words again, and
+        // that version fired on "start", "line" and "documented".
+        assert!(
+            checked >= 2,
+            "only {checked} Rust range citation(s) named something checkable, so this test is reading the wrong thing"
+        );
+        assert!(
+            problems.is_empty(),
+            "these Rust range citations do not reach what their sentence names:\n  {}",
+            problems.join("\n  ")
+        );
+    }
     /// THE ENV NAMES THE CONFIG NEEDS ARE THE ONES `.env.example` OFFERS, minus its
     /// DOCUMENTED EXCEPTIONS.
     ///
@@ -4493,9 +4643,31 @@ mod tests {
         /// `(basename -> best path)` for one root, in path-length order as `find_by_name` resolves.
         type Index = std::collections::HashMap<String, std::path::PathBuf>;
 
-        static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
+        // KEYED ON THE ROOT IT INDEXED, which is what the paragraph above already promised and
+        // what the code did NOT do. MEASURED: this was a single `OnceLock<Index>` built from
+        // whichever root called first, so the cache was correct only for that one. Two roots are
+        // reachable - the repo root from the citation walk, and `CARGO_MANIFEST_DIR/src` from the
+        // range check beside this - and tests run in PARALLEL, so the second caller silently got
+        // the first caller's index and every basename it looked up "did not exist". It surfaced as
+        // nine false failures in the full suite and zero when the test ran alone, which is the
+        // signature of shared state rather than of a wrong path.
+        //
+        // A MAP RATHER THAN ONE SLOT, because the two roots are both legitimate and a run may use
+        // either. The promise in the comment above is now the behaviour: the entry a caller gets is
+        // the one built from the root that caller passed.
+        static INDEX: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Index>>,
+        > = std::sync::OnceLock::new();
 
-        let index = INDEX.get_or_init(|| {
+        let cache = INDEX.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(root) {
+            return hit.get(base).cloned();
+        }
+
+        // A NAMED BINDING RATHER THAN AN IMMEDIATELY-INVOKED CLOSURE, which is what clippy asks
+        // for here: the build is a function of `root` alone, so naming it costs nothing and reads
+        // as the unit it is.
+        let build: fn(&std::path::Path) -> Index = |root| {
             fn walk(dir: &std::path::Path, hits: &mut Vec<std::path::PathBuf>) {
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     return;
@@ -4527,9 +4699,16 @@ mod tests {
                 }
             }
             index
-        });
+        };
 
-        index.get(base).cloned()
+        let index = build(root);
+
+        let found = index.get(base).cloned();
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(root.to_path_buf(), index);
+        found
     }
 
     /// No `Uuid` is ever bound to a statement WITHOUT `.hyphenated()`.
@@ -6014,6 +6193,19 @@ mod tests {
              contains sends a reader to a test that does not exist. Correct the row to say what is \
              actually true, or land the test"
         );
+    }
+
+    /// Is this backticked span shaped like a code identifier rather than a phrase or a path?
+    ///
+    /// The filter that makes the range check usable: `backticked_identifiers` returns EVERY
+    /// backticked span, including `` `docker stop` `` and a path. This keeps the ones shaped like
+    /// a name - lowercase-initial, underscores and digits allowed - which is what a sentence
+    /// citing a range uses to say which construct it means.
+    fn is_snake_identifier(s: &str) -> bool {
+        s.len() >= 4
+            && s.starts_with(|c: char| c.is_ascii_lowercase())
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
     }
 
     /// Every `` `identifier` `` on a line.

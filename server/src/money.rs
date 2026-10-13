@@ -426,7 +426,7 @@ mod tests {
     }
 
     /// `input_tokens` and `cache_read_tokens` are disjoint COUNTERS but they are
-    /// a partition of ONE prompt: upstream/client.rs:117-123 sets
+    /// a partition of ONE prompt: `parse_usage_from_sse` sets
     /// `input_tokens = prompt_tokens - cached_tokens`, so the cached count is a
     /// subset of the prompt. Folding it back into input double-counts it.
     #[test]
@@ -667,7 +667,7 @@ mod tests {
         // every cache split of the SAME prompt, and output anywhere up to the cap.
         //
         // `cache_read <= estimated_input` is the reachable domain, not a
-        // convenience: upstream/client.rs:117-123 defines
+        // convenience: `parse_usage_from_sse` defines
         // `input_tokens = prompt_tokens - cached_tokens`, so the cached count is
         // a subset of the prompt the estimate was taken from. A settlement with
         // more cached tokens than the whole prompt is not a state the upstream

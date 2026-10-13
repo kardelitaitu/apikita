@@ -16,7 +16,7 @@
 //! It deliberately does NOT test handler behaviour; those have direct-call tests. This closes the
 //! wiring gap and nothing else.
 //!
-//! VERIFIED REACHABLE: `/restore` and `/resume` both map to `resume_account` (`routes/mod.rs:377-378`).
+//! VERIFIED REACHABLE: `/restore` and `/resume` both map to `resume_account` (`routes/mod.rs:381-382`).
 //! That is the documented `/restore` == `/resume` equivalence, asserted separately; here all three are
 //! checked for authorization because all three are mounted and all three are callable.
 

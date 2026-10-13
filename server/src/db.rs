@@ -6659,7 +6659,7 @@ mod tests {
              instead, the candidate query is ordered by id rather than by expiry"
         );
         // The newer deposit is ALSO marked retired, with nothing taken - the documented
-        // `retired <= 0` path at `expire_one_deposit` (db.rs:424-430), which marks a
+        // `retired <= 0` path at `expire_one_deposit`, which marks a
         // deposit the sweep cannot pay out so it stops being revisited. That is not an
         // expiry EVENT and writes no ledger row, which is what `sweep.expired == 1`
         // above distinguishes. What matters for THIS test is that no MONEY moved for it.
