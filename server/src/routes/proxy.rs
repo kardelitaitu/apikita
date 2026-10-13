@@ -301,6 +301,27 @@ pub fn models_with_no_healthy_endpoint() -> Vec<String> {
         .collect()
 }
 
+/// Per-endpoint traffic counters for the metrics payload: which endpoints have served
+/// work and which have not.
+///
+/// THE SAME LAZY-INITIALISATION RULE AS `models_with_no_healthy_endpoint`: the upstream
+/// client is built on the first proxied request, so before then there is no pool and an
+/// EMPTY list is the honest answer. That is why the payload reports this as a list rather
+/// than an object keyed by endpoint — "no data yet" and "every endpoint at zero" are
+/// different observations, and an empty object would make them look alike.
+///
+/// `(endpoint, served, failed)` in config order, and the endpoint NAME is safe here
+/// because this route is operator-authenticated (`require_operator` runs first). The
+/// PUBLIC `/health` route must never carry it — see the reasoning on
+/// `ServerErrorCounter`, which keeps even the error count to two integers for exactly
+/// that reason.
+pub fn endpoint_traffic() -> Vec<(String, u64, u64)> {
+    let Some(upstream) = UPSTREAM.get() else {
+        return Vec::new();
+    };
+    upstream.endpoint_traffic()
+}
+
 /// Whether `model` is permitted for a key whose stored allowlist is
 /// `allowed_models`.
 ///

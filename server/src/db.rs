@@ -805,10 +805,10 @@ pub async fn debit_usage_transaction(
     //    mutation stays equivalent as tests are ADDED, but a stale count reads as "nobody has checked
     //    since", which is indistinguishable from an untested guard to the next reader.)
     //
-    //      - The production path cannot reach the else arm at all. `proxy.rs:1395` takes
-    //        `reserved_idr` from `ReservationResult::Held`, and `reserve_balance_transaction`
+    //      - The production path cannot reach the else arm at all. `chat_completions`
+    //        takes `reserved_idr` from `ReservationResult::Held`, and `reserve_balance_transaction`
     //        returns `Zero` for any `reserved_idr <= 0` (db.rs:1741) - so a `Held` value is strictly
-    //        positive. The only production caller of this function is `proxy.rs:1653`.
+    //        positive. The only production caller of this function is `release_quietly`.
     //      - Where a test DOES pass 0, both branches agree on every observable: `try_credit` with 0
     //        issues `balance_idr = balance_idr + 0`, returning the unchanged balance, so
     //        `released_idr` is 0 either way and no ledger row is written. `settlement_ledger_deltas`

@@ -47,6 +47,7 @@
 
 use std::fmt;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -235,6 +236,31 @@ struct EndpointEntry {
     pool: KeyPool,
     breaker: CircuitBreaker,
     supports_stream_options: bool,
+    /// How many requests this endpoint actually SERVED (the upstream answered 200).
+    ///
+    /// WHY THIS EXISTS. `endpoint_name` is already logged on every request, and
+    /// `docs/observability.md` already promises an `endpoint_circuit_state` metric — but
+    /// nothing counted BY ENDPOINT, so the one question failover raises most often had no
+    /// answer that did not mean grepping logs: **is traffic actually moving?** "Provider B
+    /// has served 0 requests since the last restart while provider A served 4,000" is a
+    /// silent failover that never happened, and with one real provider it is also the
+    /// first thing to check when a second one is added.
+    ///
+    /// Separate from the breaker on purpose, and the distinction is the whole value: the
+    /// breaker reports HEALTH (tripped or not), these report WORK. A healthy endpoint that
+    /// is never selected — because it is weight 0, because an earlier endpoint always
+    /// wins, because its keys are all parked — is invisible to a breaker and obvious here.
+    served: AtomicU64,
+    /// How many requests this endpoint was ATTEMPTED for and did not serve.
+    ///
+    /// Counts every outcome that is not a 200: a transport error, a 5xx, a 404, an
+    /// exhausted key pool, or an open breaker. Deliberately ONE counter rather than one
+    /// per status — the breakdown already exists in the breaker's state and in the log,
+    /// and a per-status map here would grow without bound in the payload.
+    ///
+    /// The pair is what makes the ratio meaningful, in the same way `ServerErrorCounter`
+    /// needed a denominator before an error RATE could be alerted on.
+    failed: AtomicU64,
 }
 
 /// One configured model with its endpoints.
@@ -357,6 +383,8 @@ impl UpstreamClient {
                         ),
                         breaker: CircuitBreaker::new(config.circuit_breaker.clone()),
                         supports_stream_options: endpoint.supports_stream_options,
+                        served: AtomicU64::new(0),
+                        failed: AtomicU64::new(0),
                     })
                     .collect(),
             })
@@ -379,6 +407,43 @@ impl UpstreamClient {
         self.models
             .iter()
             .map(|model| model.name.as_str())
+            .collect()
+    }
+
+    /// Per-endpoint traffic since the process started: which endpoints have SERVED work
+    /// and which have not, as `(endpoint, served, failed)` in config order.
+    ///
+    /// WHY THIS IS NOT A BREAKER QUESTION, and the reason it was worth adding: the
+    /// breaker reports HEALTH and these report WORK, and the two disagree in the case that
+    /// matters. An endpoint that is perfectly healthy and serving NOTHING — weight 0, or
+    /// losing every race to an earlier endpoint, or with all keys parked — reads
+    /// `Closed` on the breaker and `served: 0` here.
+    ///
+    /// The question it answers is the one failover raises most often and nothing could
+    /// answer without grepping logs: **is traffic actually moving?** With one permitted
+    /// provider the honest answer is "all of it through one endpoint", and the moment a
+    /// second provider is activated this column is how an operator checks that it took
+    /// effect. A silent failover that never happened is invisible in every other signal.
+    ///
+    /// EVERY endpoint is reported, including weight-0 and keyless ones, because "this
+    /// endpoint served 0" IS the observation — filtering to routed endpoints would hide
+    /// the placeholder an operator just raised the weight on and expects to see traffic.
+    ///
+    /// Counters are process-lifetime and reset on restart, like `ServerErrorCounter`.
+    /// They are deliberately not persisted: a database write per request to record a
+    /// diagnostic would put the metrics path on the money path.
+    pub fn endpoint_traffic(&self) -> Vec<(String, u64, u64)> {
+        self.models
+            .iter()
+            .flat_map(|model| {
+                model.endpoints.iter().map(|endpoint| {
+                    (
+                        endpoint.name.clone(),
+                        endpoint.served.load(Ordering::Relaxed),
+                        endpoint.failed.load(Ordering::Relaxed),
+                    )
+                })
+            })
             .collect()
     }
 
@@ -600,6 +665,12 @@ impl UpstreamClient {
                 endpoint.supports_stream_options,
             );
 
+            // Set by the 429 arm below and read once after the attempt loop, so a
+            // SINGLE throttled key that rotates onto a working one is not counted as an
+            // endpoint failure. The endpoint failed only if its attempts were exhausted
+            // without a 200 - and the 200 path RETURNs from the loop, so reaching the
+            // post-loop check with this flag set means exactly that.
+            let mut throttled_out = false;
             for _ in 0..endpoint.pool.max_attempts() {
                 let Some(lease) = endpoint.pool.acquire() else {
                     // Every key is cooling, or none is configured. Do not
@@ -612,6 +683,7 @@ impl UpstreamClient {
                     Err(err) => {
                         lease.report_status(0);
                         endpoint.breaker.record_failure();
+                        endpoint.failed.fetch_add(1, Ordering::Relaxed);
                         transport = Some(err.to_string());
                         break;
                     }
@@ -620,6 +692,13 @@ impl UpstreamClient {
 
                         if status == 200 {
                             endpoint.breaker.record_success();
+                            // THE ONLY EXIT THAT COUNTS AS SERVED. Everything else in this
+                            // loop is a request the endpoint did not answer, which is what
+                            // makes the served/failed pair meaningful: a ratio of one to the
+                            // other says whether the endpoint is carrying traffic, and
+                            // `served: 0` beside a healthy breaker is a silent failover that
+                            // never happened.
+                            endpoint.served.fetch_add(1, Ordering::Relaxed);
                             return Ok(UpstreamStream::new(response, endpoint.name.clone(), lease));
                         }
 
@@ -628,12 +707,14 @@ impl UpstreamClient {
                             // and rotate. This never trips the breaker.
                             lease.report_status(status);
                             rate_limited = true;
+                            throttled_out = true;
                             continue;
                         }
 
                         if status >= 500 {
                             lease.report_status(status);
                             endpoint.breaker.record_failure();
+                            endpoint.failed.fetch_add(1, Ordering::Relaxed);
                             unhealthy = true;
                             break;
                         }
@@ -650,6 +731,7 @@ impl UpstreamClient {
                         // So a 404 records the refusal and ROTATES to the next endpoint.
                         if status == 404 {
                             lease.report_status(status);
+                            endpoint.failed.fetch_add(1, Ordering::Relaxed);
                             model_refused
                                 .push(format!("{}={}", endpoint.name, endpoint.upstream_model));
                             break;
@@ -659,9 +741,18 @@ impl UpstreamClient {
                         // fault: do not trip the breaker, do not retry a
                         // different provider with the same bad body.
                         lease.report_status(status);
+                        endpoint.failed.fetch_add(1, Ordering::Relaxed);
                         return Err(UpstreamError::ServerError(status));
                     }
                 }
+            }
+
+            // THE ENDPOINT FAILED IF ITS ATTEMPTS RAN OUT WITHOUT A 200. The 200 path
+            // returns from inside the loop, so everything reaching here did not serve -
+            // and the flag distinguishes "every key was throttled" from "we stopped
+            // trying", because a 429 answers the key question, not the endpoint one.
+            if throttled_out {
+                endpoint.failed.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -2038,6 +2129,138 @@ mod tests {
             upstream.models[0].endpoints[0].breaker.allow_request(),
             "the caller own bad request must NOT trip the provider breaker"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // endpoint_traffic: which endpoints actually CARRY work
+    // -------------------------------------------------------------------
+
+    /// THE QUESTION THIS EXISTS FOR: a healthy endpoint that is serving nothing is
+    /// invisible to every other signal in the service. The breaker reports `Closed` for
+    /// an endpoint that has never been selected, so the only way to see a failover that
+    /// never happened is to count the work each endpoint did.
+    #[tokio::test]
+    async fn a_served_request_is_counted_against_the_endpoint_that_served_it() {
+        let url = upstream_answering("200 OK", "").await;
+        let upstream = client_pointed_at(&url);
+
+        // Every endpoint is reported from the start, at zero, INCLUDING ones that have
+        // seen no traffic — "served: 0" is the observation, not an absence.
+        let before = upstream.endpoint_traffic();
+        assert_eq!(before.len(), 1, "the fixture has one endpoint");
+        assert_eq!(before[0], ("solo".to_string(), 0, 0));
+
+        upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect("the upstream answers 200");
+
+        let after = upstream.endpoint_traffic();
+        assert_eq!(
+            after[0],
+            ("solo".to_string(), 1, 0),
+            "a 200 must be counted as SERVED and not as failed"
+        );
+    }
+
+    /// A FAILED ATTEMPT IS THE OTHER HALF OF THE RATIO, and the pair is what makes either
+    /// number mean something: "served 4,000" says nothing without knowing how many
+    /// attempts it took.
+    #[tokio::test]
+    async fn a_failed_attempt_is_counted_as_failed_not_served() {
+        let url = upstream_answering("500 Internal Server Error", "{}").await;
+        let upstream = client_pointed_at(&url);
+
+        let _ = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await;
+
+        let traffic = upstream.endpoint_traffic();
+        assert_eq!(
+            traffic[0],
+            ("solo".to_string(), 0, 1),
+            "a 5xx must be counted as FAILED; a served count of 1 would report an outage as work"
+        );
+    }
+
+    /// FAILOVER MUST BE VISIBLE IN THE COUNTS: the endpoint that answered is credited,
+    /// and the one that did not is charged a failure. This is the measurement that proves
+    /// a load-shift actually happened rather than being assumed from the breaker state.
+    #[tokio::test]
+    async fn failover_credits_the_endpoint_that_served_and_charges_the_one_that_did_not() {
+        let dead = upstream_answering("500 Internal Server Error", "{}").await;
+        let healthy = upstream_answering("200 OK", "").await;
+
+        let _lock = EnvLock::acquire();
+        let _a = EnvGuard::set("APK_TEST_FIRST_KEY_1", "first-key");
+        let _b = EnvGuard::set("APK_TEST_SECOND_KEY_1", "second-key");
+
+        let mut first = endpoint("first", 1.0);
+        first.url = dead;
+        let mut second = endpoint("second", 1.0);
+        second.url = healthy;
+
+        let upstream = client(vec![model("flash", vec![first, second])]);
+        upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect("the second endpoint serves");
+
+        let traffic = upstream.endpoint_traffic();
+        assert_eq!(traffic.len(), 2);
+        assert_eq!(
+            traffic[0],
+            ("first".to_string(), 0, 1),
+            "the endpoint that 500'd is charged a failure and credited nothing"
+        );
+        assert_eq!(
+            traffic[1],
+            ("second".to_string(), 1, 0),
+            "the endpoint that served is credited, which is how a failover is MEASURED"
+        );
+    }
+
+    /// A 429 IS A KEY FAILURE, NOT AN ENDPOINT FAILURE, and the counters must not
+    /// conflate them. When every attempt is throttled the endpoint genuinely did not
+    /// serve, so it IS charged — but the breaker must stay Closed, because the provider
+    /// is merely busy rather than broken. The two facts are separate and both are
+    /// asserted, which is the distinction this service is built around.
+    #[tokio::test]
+    async fn a_throttled_endpoint_is_charged_a_failure_without_tripping_its_breaker() {
+        let url = upstream_answering("429 Too Many Requests", r#"{"error":"slow down"}"#).await;
+        let upstream = client_pointed_at(&url);
+
+        let _ = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await;
+
+        let traffic = upstream.endpoint_traffic();
+        assert_eq!(traffic[0].1, 0, "nothing was served");
+        assert_eq!(
+            traffic[0].2, 1,
+            "every attempt was throttled, so the endpoint is charged ONE failure rather \
+             than one per 429 - the flag exists so a rotation is not over-counted"
+        );
+        assert!(
+            upstream.models[0].endpoints[0].breaker.allow_request(),
+            "a throttled key must NOT trip the endpoint breaker: saturated, not broken"
+        );
+    }
+
+    /// A 404 IS ENDPOINT-SCOPED, so it is charged as a failure of THAT endpoint — which
+    /// is what makes "provider B refuses this model every time" visible as a count.
+    #[tokio::test]
+    async fn a_404_is_charged_to_the_endpoint_that_refused() {
+        let url = upstream_answering("404 Not Found", r#"{"error":"no such model"}"#).await;
+        let upstream = client_pointed_at(&url);
+
+        let _ = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await;
+
+        let traffic = upstream.endpoint_traffic();
+        assert_eq!(traffic[0].1, 0, "nothing was served");
+        assert_eq!(traffic[0].2, 1, "the refusal is charged to the endpoint");
     }
 
     /// A 404 IS ENDPOINT-SCOPED, SO IT FAILS OVER — the fix this test exists for.

@@ -96,6 +96,7 @@ pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
 pub(crate) fn metrics_payload(
     counter: &crate::error::ServerErrorCounter,
     unhealthy_models: &[String],
+    endpoint_traffic: &[(String, u64, u64)],
     retention: &crate::db::RetentionLag,
     today: chrono::NaiveDate,
 ) -> serde_json::Value {
@@ -129,6 +130,33 @@ pub(crate) fn metrics_payload(
         // if alerts.tsv cites observability.md:N, for the same reason - and the same
         // rule now applies here.
         "unhealthy_models": unhealthy_models,
+        // WHICH ENDPOINTS ARE ACTUALLY CARRYING TRAFFIC, which is a genuinely different
+        // question from the line above. `unhealthy_models` reports a circuit that is
+        // OPEN; this reports an endpoint that is HEALTHY AND IDLE, which no other signal
+        // in the service can see. The two failure shapes an operator must tell apart:
+        //
+        //   * a provider is DOWN          -> unhealthy_models is non-empty
+        //   * a provider is never USED    -> every endpoint is healthy and one has
+        //                                    `served: 0` since boot
+        //
+        // The second is silent by construction. It is what a weight that was never
+        // raised looks like, what a mis-ordered endpoint list looks like, and what an
+        // endpoint whose keys are all parked looks like. With one permitted provider the
+        // correct reading is "one endpoint carries everything", so this column is also
+        // the measurement that proves a newly activated second provider took effect.
+        //
+        // An EMPTY LIST means the upstream client has not been built yet — it is created
+        // on the first proxied request — and is deliberately not the same as a list of
+        // zeros. The route is operator-authenticated, so endpoint names are safe here;
+        // the public /health route must never carry them.
+        "endpoint_traffic": endpoint_traffic
+            .iter()
+            .map(|(name, served, failed)| json!({
+                "endpoint": name,
+                "served": served,
+                "failed": failed,
+            }))
+            .collect::<Vec<_>>(),
         // The db_disk alert's REAL question (the "DB disk" row of the Alerts table in
         // docs/observability.md): its condition
         // column says "volume usage" but its ACTION says "check retention". This is the
@@ -215,6 +243,7 @@ pub async fn operator_metrics(
                 "responses": counter.responses(),
                 "error_rate": counter.error_rate(),
                 "unhealthy_models": crate::routes::proxy::models_with_no_healthy_endpoint(),
+                "endpoint_traffic": crate::routes::proxy::endpoint_traffic(),
                 "retention": { "behind": null, "error": "the retention read failed" },
             }))
             .into_response());
@@ -224,6 +253,7 @@ pub async fn operator_metrics(
     Ok(Json(metrics_payload(
         crate::error::server_error_counter(),
         &crate::routes::proxy::models_with_no_healthy_endpoint(),
+        &crate::routes::proxy::endpoint_traffic(),
         &retention,
         today,
     ))
@@ -803,6 +833,44 @@ mod tests {
         );
     }
 
+    /// THE PAYLOAD CARRIES PER-ENDPOINT TRAFFIC, and it is a LIST rather than an object
+    /// keyed by endpoint for a reason worth pinning: an EMPTY list means the upstream
+    /// client has not been built yet, which is a different observation from "every
+    /// endpoint is at zero". An object would collapse the two.
+    #[test]
+    fn the_payload_reports_endpoint_traffic_as_a_list() {
+        let counter = crate::error::ServerErrorCounter::default();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        // No traffic yet: an EMPTY LIST, present as a key, never missing.
+        let payload = metrics_payload(&counter, &[], &[], &Default::default(), today);
+        assert_eq!(
+            payload["endpoint_traffic"],
+            json!([]),
+            "an unbuilt upstream client reports an EMPTY list, not a missing key"
+        );
+
+        // With traffic: one object per endpoint, carrying both halves of the ratio.
+        let traffic = vec![
+            ("primary".to_string(), 4100u64, 12u64),
+            ("secondary".to_string(), 0u64, 0u64),
+        ];
+        let payload = metrics_payload(&counter, &[], &traffic, &Default::default(), today);
+        let entries = payload["endpoint_traffic"]
+            .as_array()
+            .expect("endpoint_traffic is an array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["endpoint"], json!("primary"));
+        assert_eq!(entries[0]["served"], json!(4100));
+        assert_eq!(entries[0]["failed"], json!(12));
+        assert_eq!(
+            entries[1]["served"],
+            json!(0),
+            "an endpoint that has served NOTHING since boot is the whole point of this \
+             column - it is the only signal that can show a failover never happened"
+        );
+    }
+
     /// The payload REPORTS the unhealthy models by NAME, and an empty list when all
     /// are healthy. This is the `all_providers_unhealthy` condition.
     ///
@@ -816,6 +884,7 @@ mod tests {
         // Healthy: an EMPTY list, not a missing key, so a consumer can always index it.
         let payload = metrics_payload(
             &counter,
+            &[],
             &[],
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
@@ -834,6 +903,7 @@ mod tests {
         let payload = metrics_payload(
             &counter,
             &down,
+            &[],
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -852,6 +922,7 @@ mod tests {
         // An EMPTY counter: the fresh-deploy case.
         let payload = metrics_payload(
             &crate::error::ServerErrorCounter::default(),
+            &[],
             &[],
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
@@ -876,6 +947,7 @@ mod tests {
         let payload = metrics_payload(
             &clean,
             &[],
+            &[],
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -898,6 +970,7 @@ mod tests {
         mixed.record_error();
         let payload = metrics_payload(
             &mixed,
+            &[],
             &[],
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),

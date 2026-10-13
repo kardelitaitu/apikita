@@ -72,9 +72,34 @@ did not agree to. Log token **counts**, never content.
 >
 > **What an operator has instead is `GET /api/admin/metrics`** (operator-only), and it does
 > NOT serve these names. Its payload is `server_errors`, `responses`, `error_rate`,
-> `unhealthy_models` and `retention` — a different shape, read from the in-process counter
-> and one database query, not from a time-series store. So a reader who greps for
-> `topups_settled_total` finds this table and nothing that produces it.
+> `unhealthy_models`, `endpoint_traffic` and `retention` — a different shape, read from
+> in-process counters and one database query, not from a time-series store. So a reader who
+> greps for `topups_settled_total` finds this table and nothing that produces it.
+>
+> **`endpoint_traffic` IS THE CLOSEST THING HERE TO A REAL ROUTING METRIC, and it is worth
+> the note because it answers a question none of the names below can.** It is a LIST of
+> `{endpoint, served, failed}` per configured endpoint, in config order, counted since the
+> process started:
+>
+>   * **`served` counts the endpoints that answered 200.** An endpoint with `served: 0` next
+>     to a READY circuit breaker is a failover that never happened — a weight that was never
+>     raised, an endpoint the routing order always skips, or a pool whose keys are all
+>     parked. Nothing else in the service can see that shape, because the breaker reports
+>     HEALTH and this reports WORK, and a healthy idle endpoint looks perfect to the breaker.
+>   * **`failed` counts every attempt that did not serve** — a transport error, a 5xx, a 404,
+>     and an endpoint whose attempts ran out throttled. A 429 that rotates onto a working key
+>     is NOT counted here: the key was saturated, the endpoint served the request, and
+>     conflating the two would report a healthy pool as degraded.
+>
+> The pair is what makes either number readable, exactly as `error_rate` needed a
+> denominator before it could be alerted on. With one permitted provider the correct reading
+> is "one endpoint carries everything"; the moment a second is activated, this is the
+> measurement that proves it took effect.
+>
+> An EMPTY list means the upstream client has not been built yet (it is created on the first
+> proxied request) — deliberately distinct from a list of zeros. The route is
+> operator-authenticated, so endpoint names are safe there; **the public `/health` route
+> must never carry them**, which is why this lives on the admin payload.
 >
 > Until a backend exists, treat this section as the argument for one — including the
 > rejection-reason breakdown below, which is a genuinely good idea that no code computes.
@@ -102,7 +127,7 @@ Keep it small. Three categories:
 | Metric | Why |
 | --- | --- |
 | `http_requests_total` by status | Baseline |
-| `proxy_requests_total` by model, by outcome | Product usage |
+| `proxy_requests_total` by model, by outcome | Product usage. **Partly real:** `endpoint_traffic` on `GET /api/admin/metrics` counts served/failed per endpoint, which is the routing half of this row. The per-model breakdown and the rejection-reason split below are still uncomputed |
 | `proxy_upstream_latency_ms` | Distinguish our latency from theirs |
 | `active_streams` | The memory driver |
 
