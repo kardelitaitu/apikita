@@ -4,11 +4,17 @@ Everything under `tools/` exists to **check** something. Most of it runs in CI; 
 document ([`docs/ci-cd.md`](../docs/ci-cd.md)) says which stage calls what.
 
 **Why this index exists.** These tools had no index at all: a search for every directory
-below in the root `README.md` and `AGENTS.md` returned **zero hits for all fourteen**. The
+below in the root `README.md` and `AGENTS.md` returned **zero hits for all of them**. The
 root README indexes the documentation and the tooling was invisible, so the only way to
 discover that a reconciliation gate or a restore drill existed was to list this directory
 or read the workflow. **The tools are where the verification actually lives**, so they are
 worth one page.
+
+The sentence above used to read **"zero hits for all fourteen"**, and MEASURED there are **29**
+directories here. It is a claim about a past search rather than a live count, which is why it
+went stale without anything noticing - and the fix is to stop stating a number that only grows.
+`ci-docs-check` enforces the part that matters: every directory must be LISTED on this page, so
+the index cannot fall behind even though this sentence no longer counts.
 
 This file is checked by [`tools/ci-docs-check/`](ci-docs-check/README.md): every directory
 here must appear, and every name listed must exist.
