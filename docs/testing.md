@@ -162,13 +162,68 @@ a finding:
 | the classifier keyed on `/^error/` | cargo's *trailing* `error: test failed` marked every **caught** mutation `did-not-compile` |
 | a restore used a text-mode file copy | every line "modified"; a restore that looks clean but is not |
 
-**The three checks that make a result usable**, and they are cheap:
+****The three checks that make a result usable**, and they are cheap:
 
 1. **Assert the mutation LANDED**, by reading the line back — not by `includes()`, which a comment can
    satisfy. Anchor on a full statement that cannot appear in prose.
 2. **Require a `test result:` line** before drawing any conclusion. No line means the crate did not build
    or the filter matched nothing; both mean *no evidence*, which is not *no finding*.
 3. **Restore with `git checkout`**, and confirm `git status` is clean, rather than copying a file back.
+
+**Two MORE modes, found later and subtler than the eight above, because neither looks like a harness fault:**
+
+| what the harness did | what it looked like |
+| --- | --- |
+| the mutation was **order-invisible** — an unscoped query read with `fetch_one`/`fetch_optional` still returned the right row, because the fixture created that account first and SQLite returns rowid order | **SURVIVED** — "this guard has a gap"; the mutation changed nothing |
+| the tests that failed were **collateral** — a wrong key fails *every* signature, so unrelated suites needing a successful webhook broke while the test actually about the key passed | **caught** — and would have been read as "the key is directly asserted" |
+| the failing test was a **different** test than the one the mutation names | caught, for the wrong reason |
+
+**The fourth and fifth checks**, which exist because of the table above:
+
+4. **For every SURVIVED result, first show the mutation could change behaviour.** Re-run it in a shape that
+   cannot be invisible — create the other row *first*, or bind the id explicitly — and include a **control**
+   that applies only the setup change with no code mutation. Round 42's "export scoping gap" was two such
+   zombies; the control is what proves it was the query and not the setup that failed.
+5. **Read the NAMES of the failing tests**, not just the count. If the tests that failed are about something
+   other than what the mutation changed, the coverage is collateral and the property is unasserted — say so
+   rather than reporting a catch.
+
+#### The checklist only existed in prose, so it was mechanized (round 43)
+
+Rounds 14–23 produced eight harness faults, rounds 41 and 42 produced three more, and this round found the
+reason they keep recurring: **the checks lived only as prose in this document.** Round 42 believed a mutation
+result that check 4 or 5 would have rejected.
+
+A checklist nobody runs is not a checklist. So `.agents/mutation-checklist.sh` now does the five checks
+mechanically and **exits non-zero when any of them fails**:
+
+```
+1. the anchor reaches CODE, not prose, and counts how many times it matches
+2. the suite RUNS - a `test result:` line exists, and it is green
+3. an identical from/to is possible and must be rejected by the caller
+4. a deliberate break FAILS the suite - so a later green is a real result
+5. the file restores with `git checkout` and `git status` ends clean
+```
+
+**Building it found four bugs in the checklist itself**, each of the class it guards against — which is the
+only reason to trust the finished thing:
+
+| bug in the checklist | what it would have reported |
+| --- | --- |
+| resolved `TARGET` absolutely but grepped the caller-**relative** name | every check `ok` for a file it never opened |
+| `cd`'d to the repo root before running `cargo test` | *"no `test result:` line — the crate did not build"* for a green crate |
+| `grep -c` emitting a multi-line count, fed to dash's `[` | `[: Illegal number` and a mis-scored anchor check |
+| the control's edit targeted a pattern that was not in the file | **"ok — a deliberate break fails to compile"** without breaking anything |
+
+That fourth is the important one: **a control that does not control** reports ok. It is the same defect as
+round 6's gates measuring nothing and round 21's `--nocapture` filter, and it is why the control is now a
+syntax error — which cannot be parsed by anything, so it fails regardless of the file's shape.
+
+**Then it earned its keep against a real round's work.** Given a second anchor —
+`resolve_account_from_cookie(&pool, &headers).await?` in `account.rs` — it reported
+**5 matches, and "the anchor is not unique"**. Round 42 mutated this exact function's
+handler by a *longer* anchor that contained this line, and got a clean result; a future round using the
+shorter anchor would have hit an unpredictable call site and read the outcome as a finding.
 
 #### The gate suite: five gates verified against a broken subject (round 24)
 
