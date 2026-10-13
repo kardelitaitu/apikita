@@ -3241,3 +3241,42 @@ anywhere else moved), the trail's truthfulness is pinned from two directions.
 **So this surface is sound, and it was sound for a reason that generalises: the tests assert the ABSENCE of
 a row as carefully as its presence.** That is the property a record-of-record needs and the one a coverage
 count cannot see — 32 passing tests say nothing about whether the failed case is checked.
+
+#### The fake that could sign one amount and send another (round 47)
+
+The last unexamined surface: the **fake services**, which are the fixtures the money path is exercised
+through. The gate over them was already strong — it reads the pinned vector out of `money.rs`, evaluates the
+fake's real `computeSignature` rather than a transcription, and drives every failure-injection row against a
+live `fake-upstream`. A transcription version of that signature check had already been mutation-tested and
+proven worthless, which is why the real one is written the way it is.
+
+**The fresh question was the inverse of the one the gate asks.** It proves the fake *can* compute the server's
+signature. It never sends anything, so **drift between what is signed and what is sent** is invisible to it.
+Two mutations, both real and both live:
+
+| mutation | result |
+| --- | --- |
+| the signature is over `grossAmount` while the body sends `finalGrossAmount` | **SURVIVED** |
+| the body's `order_id` renamed to `order_id_camel` | **SURVIVED** |
+
+`buildNotification` signs `finalGrossAmount` — the body amount — deliberately, because the `wrong-amount`
+scenario is a *valid* signature over a wrong number. Change which variable it signs and the gate stays green.
+
+**The consequence:** the server recomputes the signature over what it reads from the body, so a drifted
+payload is a webhook answered **401 with no explanation**. The tool's README promise — "exactly the way the
+server does" — was being asserted on the function and never on the body.
+
+Fixed by evaluating `buildNotification` from source too and **re-signing the notification over its own body
+fields**, the same pair `money.rs::verify_midtrans_signature` compares. `bad-signature` is asserted in the
+opposite direction: it must NOT verify, or the tool's forged case is not forged. Three mutations now caught,
+each naming the scenario.
+
+**Severity stated rather than inflated.** MEASURED: no test or drill consumes the fake — nothing posts it, and
+CI only runs the gate. So a drift here is a **tool an operator runs by hand getting a 401**, not a suite
+silently passing. Closed anyway, because the README's promise was being asserted on half of what it claims.
+
+**And the wiring is imperfect, which is worth knowing:** `fake-check` is invoked in CI as
+`node tools/fake-check/fake-check.js` rather than through a `check.sh`, so it is not one of the 15 audited
+gates and `mutation-check` does not cover it. Its exit-3 contract is therefore unenforced by the gate that
+enforces everyone else's.
+
