@@ -3322,4 +3322,44 @@ the checks mean anything.
 doc guards exist to catch and had no guard of its own. It now counts as it goes (`$fails of $total`), and
 verified it reports `1 of 16`.
 
+#### The fake lost its last chunk on every mid-stream cut (round 49)
+
+With `fake-check` inside the framework, the next question for `fake-upstream` was the one round 47 asked of
+`fake-midtrans`: **does the tool do what its README says, and is every row checked?** The README documents
+8 rows; the gate covered 6. Comparing the two found three unchecked promises, and asserting them found a
+defect in the fake.
+
+**The defect: every mid-stream cut arrived one chunk short.**
+
+```js
+for (let i = 0; i < total; i += 1) { res.write(sseChunk(...)); if (i < total - 1) await sleep(gap); }
+if (midstream) { res.socket.destroy(); }     // <- discards whatever is still buffered
+```
+
+`res.write()` is asynchronous, and destroying the socket immediately afterwards drops the final write.
+MEASURED over a raw socket: `?chunks=3` delivered **2**, `?chunks=8` delivered **4**, the default (4)
+delivered **3** — always `n-1`, against a README promising the count asked for. Fixed with `res.end()`,
+which drains first; the cut stays abrupt in every way the row describes (no `[DONE]`, no usage, a closed
+stream), so the proxy's mid-stream path is still exercised.
+
+**Two more unchecked rows:** the fixed `usage` numbers — which the README explicitly invites tests to
+hard-code (*"Billing assertions can hard-code these"*), and which `upstream/client.rs` **does** hard-code in
+three literals, agreeing today by coincidence with nothing comparing them — and `?chunks=`, the cut-length
+flag with its documented 3–5 clamp. Both now asserted, with the usage numbers **read out of the README**
+rather than restated, so a third copy cannot drift.
+
+**A one-sided assertion, found by mutation.** The mid-stream row read `midChunks < 3` — a floor, against a
+README promising 3–5. That is the same defect as a threshold no measurement can cross, and it is now both
+bounds. Four mutations verified: the clamp widened, a usage number changed, the last chunk dropped again,
+and the clamp ceiling changed — all caught.
+
+**And one mutation that SHOULD not be caught, which is the round's most useful result.** Changing the
+fake's default cut from 4 to 6 **survived**, and the instinct is to call that a gap. It is not: the default
+is `clamp(..., 3, 5)`, so 6 is clamped to 5 — MEASURED, the gate reported `sent 5 chunks`. The mutation
+**could not change behaviour**, and a change that cannot be observed is evidence of nothing. Changing the
+default 4→3 also survives, correctly, because 3 is inside the documented range. Only the clamp's own
+ceiling moved outside it fails. **Diagnosing the survivor is what turned a false gap into a confirmation
+that the assertion is right** — round 42's lesson, applied before recording rather than after.
+
+
 
