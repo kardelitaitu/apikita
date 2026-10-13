@@ -132,7 +132,25 @@ Keep it small. Three categories:
 | `http_requests_total` by status | Baseline |
 | `endpoint_traffic` on `GET /api/admin/metrics` | Per endpoint, in config order: `served`, `failed` and `mean_latency_ms`. This is `proxy_requests_total`'s routing half. **Still uncomputed: a per-MODEL breakdown** — the counts are per endpoint, and a model's total is the sum over its endpoints. The rejection-reason split is in the table below |
 | `proxy_upstream_latency_ms` | **Real, as `mean_latency_ms` inside each `endpoint_traffic` row.** Time-to-FIRST-BYTE, not total duration: the response is a stream whose length is the model's answer, so a total duration would mostly measure how many tokens the customer asked for. TTFB is the part of the wait the PROVIDER owns, and the only figure comparable across requests of different sizes |
-| `active_streams` | The memory driver. **Still uncomputed** — nothing counts in-flight streams |
+| `active_streams`, `peak_streams` | **Real.** The level now and the highest it has ever been. This is the instrument `docs/cost-and-sizing.md` was missing: that document's whole sizing argument rests on one sentence — *"The only thing that grows with load is in-flight streaming buffers"* — which was unmeasured |
+
+**`peak_streams` is the figure to size against, and the reason is that a level alone cannot
+answer the question.** A current count read at a random moment says what is happening *then*;
+capacity planning needs the worst moment. The peak is also the only figure that **survives the
+traffic stopping** — a current count of 0 after a burst is indistinguishable from one that was
+never busy.
+
+**`active_streams` is `0` on an idle service, not `null`.** That is the opposite convention
+from `rejection_rate`, and deliberately so: `null` means *unmeasured*, and a service with no
+streams in flight has **measured** zero. Conflating the two is how a metric surface becomes
+unreadable.
+
+**The release is tied to `Drop`, not to a method.** A stream ends three ways — it completes,
+the upstream dies, or the *client hangs up and the body is simply dropped* — and only the first
+two pass through a method. A gauge decremented in the stream's own finish path would leak one
+slot for every abandoned request, so a service under exactly the load that matters (clients
+giving up) would report a **rising** `active_streams` that never falls. That is the same
+reasoning that put the money release in `ReservationGuard`.
 
 **`mean_latency_ms` IS `null` FOR AN ENDPOINT THAT HAS SERVED NOTHING, never `0`.** An
 unmeasured endpoint would otherwise sort as the *fastest* in the pool, which is the exact

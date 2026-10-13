@@ -384,6 +384,82 @@ impl RejectionCounter {
     }
 }
 
+/// How many answers are being streamed RIGHT NOW, and the most there have ever been.
+///
+/// WHY A GAUGE RATHER THAN A COUNTER, and it is the first one in this file. Every other
+/// metric here counts events that have happened; this reports a level that rises and
+/// falls. `docs/observability.md` lists `active_streams` with the note "the memory
+/// driver", and `docs/cost-and-sizing.md` builds the whole sizing argument on one
+/// sentence: "**The only thing that grows with load is in-flight streaming buffers.**"
+/// That sentence had no instrument behind it. A level is the only thing that can test it.
+///
+/// THE PEAK IS THE PART THAT MATTERS, and it is why this is not just a current count. A
+/// current value read at a random moment says what is happening then; the sizing question
+/// is what the WORST moment was. A service whose peak is 3 has never needed to be sized
+/// for 500, and one whose peak is 480 is one incident away from the memory ceiling the
+/// document budgets against. The peak is also the only figure that survives the traffic
+/// having stopped - a current count of 0 after a burst is indistinguishable from one that
+/// was never busy.
+///
+/// IT IS NOT RESET. A peak that resets on a schedule needs a schedule someone must choose,
+/// and `docs/benchmark.md` already records that the in-process benchmark made the same
+/// choice for the same reason. Process-lifetime matches every other counter here.
+#[derive(Debug, Default)]
+pub struct StreamGauge {
+    /// Streams in flight at this instant.
+    active: AtomicU64,
+    /// The highest `active` has ever been.
+    peak: AtomicU64,
+}
+
+impl StreamGauge {
+    /// A stream began. Returns nothing: the caller holds the guard that ends it.
+    ///
+    /// THE PEAK IS UPDATED WITH A COMPARE-AND-SWAP LOOP rather than a load-then-store,
+    /// because two streams starting at the same instant would otherwise both read the old
+    /// peak and both store their own - losing whichever went first. This is the one place
+    /// where a lost update is not a rounding detail: the peak is the number the capacity
+    /// argument is checked against.
+    pub fn opened(&self) {
+        let now = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut peak = self.peak.load(Ordering::Relaxed);
+        while now > peak {
+            match self
+                .peak
+                .compare_exchange_weak(peak, now, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => peak = actual,
+            }
+        }
+    }
+
+    /// A stream finished, however it finished - completed, failed, or abandoned by a
+    /// client that hung up.
+    ///
+    /// `saturating_sub` and not `fetch_sub`: a double-close would wrap the counter to
+    /// `u64::MAX` and report every future reading as an enormous number of in-flight
+    /// streams. The guard below is written so a double-close cannot happen, and this is the
+    /// floor under that argument rather than a substitute for it.
+    pub fn closed(&self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn active(&self) -> u64 {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    pub fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+/// The process-wide stream gauge. See `StreamGauge`.
+pub fn stream_gauge() -> &'static StreamGauge {
+    static GAUGE: std::sync::OnceLock<StreamGauge> = std::sync::OnceLock::new();
+    GAUGE.get_or_init(StreamGauge::default)
+}
+
 /// The process-wide rejection counter. See `RejectionCounter`.
 pub fn rejection_counter() -> &'static RejectionCounter {
     static COUNTER: std::sync::OnceLock<RejectionCounter> = std::sync::OnceLock::new();
@@ -585,6 +661,100 @@ mod tests {
     // -----------------------------------------------------------------------
     // RejectionCounter: the reason breakdown, keyed on the documented code
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // StreamGauge: the level, and the peak that outlives the traffic
+    // -----------------------------------------------------------------------
+
+    /// THE PEAK IS THE POINT, and this is the test that says why rather than merely
+    /// counting.
+    ///
+    /// A current count read at a random moment says what is happening then. The sizing
+    /// question `docs/cost-and-sizing.md` asks is what the WORST moment was - and the peak is
+    /// the only figure that survives the traffic stopping, since a current count of 0 after a
+    /// burst is indistinguishable from one that was never busy.
+    #[test]
+    fn the_peak_survives_the_traffic_stopping() {
+        let gauge = StreamGauge::default();
+        assert_eq!((gauge.active(), gauge.peak()), (0, 0));
+
+        gauge.opened();
+        gauge.opened();
+        gauge.opened();
+        assert_eq!((gauge.active(), gauge.peak()), (3, 3));
+
+        gauge.closed();
+        gauge.closed();
+        gauge.closed();
+        assert_eq!(
+            (gauge.active(), gauge.peak()),
+            (0, 3),
+            "the peak must REMAIN 3 after every stream ended: a sizing decision needs the worst moment, not the current one"
+        );
+    }
+
+    /// THE GAUGE FALLS, which a peak alone would not prove - a value that only ever rises
+    /// cannot distinguish a service at 3 from one that was at 3 an hour ago.
+    #[test]
+    fn the_level_falls_when_a_stream_ends() {
+        let gauge = StreamGauge::default();
+        gauge.opened();
+        gauge.opened();
+        assert_eq!(gauge.active(), 2);
+        gauge.closed();
+        assert_eq!(
+            gauge.active(),
+            1,
+            "one stream ended, so exactly one slot freed"
+        );
+        assert_eq!(gauge.peak(), 2, "and the peak is unmoved by a normal close");
+    }
+
+    /// CONCURRENT OPENS DO NOT LOSE A PEAK UPDATE.
+    ///
+    /// The peak is what the capacity argument is checked against, so a lost update is not a
+    /// rounding detail - it is a smaller number than reality on the one figure used to decide
+    /// whether the instance is big enough. A load-then-store implementation would lose one
+    /// whenever two streams started in the same instant; this drives many threads at once so
+    /// that a naive implementation has a real chance to fail.
+    #[test]
+    fn concurrent_opens_never_lose_a_peak_update() {
+        let gauge = std::sync::Arc::new(StreamGauge::default());
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 200;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let gauge = std::sync::Arc::clone(&gauge);
+                std::thread::spawn(move || {
+                    // Drawn out so the threads genuinely overlap rather than running in
+                    // sequence, which is the state a naive peak update fails in.
+                    for i in 0..PER_THREAD {
+                        gauge.opened();
+                        if i % 8 == 0 {
+                            std::thread::yield_now();
+                        }
+                        gauge.closed();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("no thread may panic");
+        }
+
+        assert_eq!(
+            gauge.active(),
+            0,
+            "every open must be matched by a close, across every thread"
+        );
+        assert!(
+            gauge.peak() >= 1,
+            "the peak must have recorded SOMETHING: {} threads each opened {} times",
+            THREADS,
+            PER_THREAD
+        );
+    }
 
     /// THE RATE NEEDS ITS OWN DENOMINATOR, and this is the test that says why.
     ///

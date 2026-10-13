@@ -14,7 +14,7 @@
 //! THE CONTRACT THIS TEST MUST RESPECT, because violating it produces false findings rather than
 //! defects. `release_reservation_transaction` credits UNCONDITIONALLY - it never checks whether the ref
 //! was ever held, and `try_credit` has no idempotency guard. The repository knows this and says so at
-//! `routes/proxy.rs:4741`, where `ReservationGuard::defuse` is described as "the entire barrier": a
+//! `ReservationGuard::defuse` in `routes/proxy.rs`, described there as "the entire barrier": a
 //! guard that releases after a committed settlement would credit the hold a SECOND time.
 //!
 //! So the safety property is NOT "release is idempotent" - it is **"a caller releases only refs it

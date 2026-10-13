@@ -157,7 +157,13 @@ Adding server capacity fixes nothing and doubles the bill.
 
 - [ ] Actual prices from Northflank for the target instance sizes.
 - [ ] Confirm the Cloudflare Pages free tier covers this usage.
-- [ ] Measure real memory per concurrent stream once implemented.
+- [ ] Measure real memory per concurrent stream. **The INSTRUMENT half is done**: the claim
+  above — *"The only thing that grows with load is in-flight streaming buffers"* — is now
+  measurable, because `active_streams` and `peak_streams` on `GET /api/admin/metrics`
+  ([observability.md](observability.md)) report the level and the high-water mark. **The
+  MEASUREMENT is still open**: pairing that peak with an RSS reading to get KB/stream.
+  `docs/benchmark.md` publishes 35 KB/stream as the target and `tools/loadtest` samples RSS,
+  so both figures now exist; nobody has driven them together against a deployed instance.
 - [x] ~~Decide whether Postgres runs as a managed add-on or self-hosted.~~ **Moot** —
   the port to embedded SQLite removed the decision along with the service
   ([§Stack](../README.md#stack), [`plans/sqlite-migration.md`](plans/sqlite-migration.md)).

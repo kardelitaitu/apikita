@@ -93,6 +93,17 @@ pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
 /// a mutation that reported `0.0` for an empty window SURVIVED - the test was
 /// asserting its own copy of the logic, not the route. A function the handler calls
 /// closes that gap: the two cannot drift.
+/// In-flight streaming figures: the level now, and the highest it has ever been.
+///
+/// A STRUCT RATHER THAN TWO ARGUMENTS, for the reason this file already records for the
+/// rejection figures: two bare `u64`s in a row are swappable by a caller and the mistake
+/// compiles. `active` and `peak` are a pair whose meaning INVERTS if exchanged - a peak of 3
+/// with 480 active reads as an idle service that once had three.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct StreamSnapshot {
+    pub active: u64,
+    pub peak: u64,
+}
 /// The three rejection figures the payload needs, grouped so the signature does not grow
 /// one argument per metric.
 ///
@@ -152,11 +163,26 @@ pub(crate) struct EndpointSnapshot<'a> {
     pub latency_ms: &'a [(String, Option<u64>)],
 }
 
+/// The number of arguments is allowed to be 8, and the reason is that every one of them is a
+/// DIFFERENT SOURCE with a different type - the shape clippy's lint exists to catch (a row of
+/// interchangeable arguments) is not this one. Four are grouped structs already
+/// (`EndpointSnapshot`, `StreamSnapshot`, `RejectionSnapshot`), so a caller who swaps two of
+/// them gets a type error; the remaining four are a counter, a money counter, a name list and a
+/// date, none of which is assignable to another.
+///
+/// A previous round grouped the whole list into one `MetricsSources` struct to satisfy this
+/// lint, and the refactor itself introduced two bugs (a duplicated `.into_response()` and a
+/// text-scan that mangled the file) before being reverted - a real cost paid to silence a
+/// warning whose failure mode was already prevented by the types. Recorded rather than silently
+/// allowed, because "we grouped them once and it made things worse" is the part the next reader
+/// needs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn metrics_payload(
     counter: &crate::error::ServerErrorCounter,
     money: &crate::error::MoneyCounter,
     unhealthy_models: &[String],
     endpoints: EndpointSnapshot<'_>,
+    streams: StreamSnapshot,
     rejections: RejectionSnapshot<'_>,
     retention: &crate::db::RetentionLag,
     today: chrono::NaiveDate,
@@ -170,6 +196,8 @@ pub(crate) fn metrics_payload(
     let rejection_counts = rejections.counts;
     let rejection_rate = rejections.rate;
     let rejection_requests = rejections.requests;
+    let active_streams = streams.active;
+    let peak_streams = streams.peak;
 
     // `None` for an empty window, never 0.0. A zero would read as "perfectly
     // healthy" and suppress the alert on a service that has simply served nothing
@@ -263,6 +291,20 @@ pub(crate) fn metrics_payload(
         // Rounded to 4 decimals like error_rate, so the payload is stable to diff.
         "rejection_rate": rejection_rate.map(|rate| (rate * 10_000.0).round() / 10_000.0),
         "proxy_requests": rejection_requests,
+        // THE MEMORY DRIVER. `docs/cost-and-sizing.md` builds its sizing argument on one
+        // sentence - "The only thing that grows with load is in-flight streaming buffers" -
+        // and until now nothing measured it. A level is the only instrument that can test
+        // that claim, and the PEAK answers the sizing question: what the worst moment was.
+        //
+        // `active_streams` is 0 rather than null on an idle service, unlike `rejection_rate`:
+        // `null` means UNMEASURED, and a service with no streams in flight has measured
+        // zero. That is a fact about it, not an absence.
+        //
+        // `peak_streams` is what an operator sizes against, and it is the figure that
+        // survives the traffic stopping: a current count of 0 after a burst is
+        // indistinguishable from one that was never busy.
+        "active_streams": active_streams,
+        "peak_streams": peak_streams,
         "endpoint_traffic": endpoint_report(endpoint_traffic, endpoint_latency_ms),
         // The db_disk alert's REAL question (the "DB disk" row of the Alerts table in
         // docs/observability.md): its condition
@@ -366,6 +408,8 @@ pub async fn operator_metrics(
                     .rejection_rate()
                     .map(|rate| (rate * 10_000.0).round() / 10_000.0),
                 "proxy_requests": crate::error::rejection_counter().requests(),
+                "active_streams": crate::error::stream_gauge().active(),
+                "peak_streams": crate::error::stream_gauge().peak(),
                 "unhealthy_models": crate::routes::proxy::models_with_no_healthy_endpoint(),
                 "endpoint_traffic": endpoint_report(&crate::routes::proxy::endpoint_traffic(), &crate::routes::proxy::endpoint_latency_ms()),
                 "retention": { "behind": null, "error": "the retention read failed" },
@@ -381,6 +425,10 @@ pub async fn operator_metrics(
         EndpointSnapshot {
             traffic: &crate::routes::proxy::endpoint_traffic(),
             latency_ms: &crate::routes::proxy::endpoint_latency_ms(),
+        },
+        StreamSnapshot {
+            active: crate::error::stream_gauge().active(),
+            peak: crate::error::stream_gauge().peak(),
         },
         RejectionSnapshot {
             counts: &crate::error::rejection_counter().counts(),
@@ -988,6 +1036,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1013,6 +1062,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1026,6 +1076,44 @@ mod tests {
             payload["undercharged_idr"],
             json!(90_200),
             "the SUM is the actionable half and must be the figure an operator is paged on"
+        );
+    }
+
+    /// THE PAYLOAD CARRIES THE IN-FLIGHT LEVEL AND ITS PEAK, and `0` is a real reading.
+    ///
+    /// This is the one metric here where zero is a FACT rather than an absence: an idle
+    /// service HAS measured zero in-flight streams. That is the opposite of `rejection_rate`,
+    /// which is `null` on no traffic because a ratio needs a denominator. Conflating the two
+    /// conventions is how a metric surface becomes unreadable.
+    #[test]
+    fn the_payload_reports_in_flight_streams_and_their_peak() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let payload = metrics_payload(
+            &crate::error::ServerErrorCounter::default(),
+            &Default::default(),
+            &[],
+            EndpointSnapshot {
+                traffic: &[],
+                latency_ms: &[],
+            },
+            StreamSnapshot {
+                active: 7,
+                peak: 480,
+            },
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
+            &Default::default(),
+            today,
+        );
+
+        assert_eq!(payload["active_streams"], json!(7));
+        assert_eq!(
+            payload["peak_streams"],
+            json!(480),
+            "the peak is what the capacity argument is checked against, and it must survive the level falling"
         );
     }
 
@@ -1053,6 +1141,7 @@ mod tests {
                 traffic: &traffic,
                 latency_ms: &latency,
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1094,6 +1183,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1119,6 +1209,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[("rate_limited".to_string(), 1)],
                 rate: Some(0.25),
@@ -1149,6 +1240,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &rejections.counts(),
                 rate: rejections.rejection_rate(),
@@ -1177,6 +1269,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1206,6 +1299,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1233,6 +1327,7 @@ mod tests {
                 traffic: &traffic,
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1275,6 +1370,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1302,6 +1398,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1331,6 +1428,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1364,6 +1462,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1397,6 +1496,7 @@ mod tests {
                 traffic: &[],
                 latency_ms: &[],
             },
+            StreamSnapshot { active: 0, peak: 0 },
             RejectionSnapshot {
                 counts: &[],
                 rate: None,
@@ -1413,7 +1513,8 @@ mod tests {
     ///
     /// The handler deliberately does not fail the whole response when the retention
     /// query errors - "an operator asking for the counters during an incident should
-    /// still get them". What it returns instead is a SENTINEL (health.rs:187-195):
+    /// still get them". What it returns instead is a SENTINEL - the `"behind": null` arm of
+    /// `operator_metrics`:
     ///
     ///   "behind" is NULL rather than false, so a consumer can tell retention-is-fine
     ///   from we-could-not-tell."

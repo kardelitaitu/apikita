@@ -866,6 +866,41 @@ struct MeteredStream {
     /// Handed the outcome exactly once, when the stream ends.
     settle: Option<tokio::sync::oneshot::Sender<StreamEnd>>,
     done: bool,
+    /// Decrements the in-flight gauge WHEN THIS STRUCT DROPS, whichever way it goes.
+    ///
+    /// A FIELD RATHER THAN A DECREMENT IN `finish`, and that is the whole design. This
+    /// stream has three ways to end - the answer completes, the upstream dies, or the CLIENT
+    /// HANGS UP and the body is dropped - and only the first two pass through a method. A
+    /// gauge decremented in `finish` would leak one for every abandoned request, so a service
+    /// under exactly the load that matters (clients giving up) would report a rising
+    /// `active_streams` that never falls. Tying it to `Drop` makes the release structural
+    /// rather than something each exit path must remember - the same reasoning as the
+    /// `ReservationGuard` above it, which exists because a money release was forgotten on one
+    /// path and nobody could see it.
+    ///
+    /// It is a real field, not a `Drop` impl on `MeteredStream`, so the decrement is ordered
+    /// with the struct's own drops rather than racing them: the guard is dropped LAST because
+    /// it is declared last.
+    _in_flight: InFlightGuard,
+}
+
+/// One in-flight stream's claim on the `active_streams` gauge.
+///
+/// A separate type so the decrement cannot be forgotten at a construction site: `MeteredStream`
+/// cannot be built without one, because the field is not `Option`.
+struct InFlightGuard;
+
+impl InFlightGuard {
+    fn new() -> Self {
+        crate::error::stream_gauge().opened();
+        Self
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        crate::error::stream_gauge().closed();
+    }
 }
 
 impl MeteredStream {
@@ -875,6 +910,7 @@ impl MeteredStream {
             tail: Vec::new(),
             settle: Some(settle),
             done: false,
+            _in_flight: InFlightGuard::new(),
         }
     }
 
@@ -1992,6 +2028,60 @@ mod tests {
     // The usage tail: what decides whether a customer is billed at all.
     // ---------------------------------------------------------------------
 
+    /// A LEAKED SLOT IS DETECTABLE BECAUSE IT ACCUMULATES.
+    ///
+    /// THIS IS THE PATH A `Drop`-BASED RELEASE EXISTS FOR, and the reason it is not a
+    /// decrement inside `finish`. A client can hang up mid-answer, at which point the
+    /// `MeteredStream` is simply DROPPED - no method runs, no `finish` is called. A gauge
+    /// decremented in `finish` would leak one slot for every abandoned request, so a service
+    /// under exactly the load that matters (clients giving up) would report a RISING
+    /// `active_streams` that never falls - and `docs/cost-and-sizing.md` sizes the instance
+    /// from that number.
+    ///
+    /// WHY MANY GUARDS AND NOT ONE, which is the part that took two attempts. The gauge is
+    /// PROCESS-WIDE and sibling tests stream concurrently, so a single open/close is
+    /// unobservable against that noise: the first version of this test asserted `active`
+    /// returned to `before`, and a mutation that REMOVED the `Drop` release still passed -
+    /// MEASURED. The leak is not visible in one slot; it is visible in the ACCUMULATION.
+    /// Opening 64 and releasing all 64 leaves the level 64 higher forever if the release is
+    /// gone, which no amount of concurrent traffic from a handful of sibling tests can
+    /// account for.
+    #[test]
+    fn the_in_flight_guard_releases_every_slot_it_takes() {
+        let gauge = crate::error::stream_gauge();
+        const GUARDS: usize = 64;
+
+        let baseline = gauge.active();
+
+        {
+            // Held in a Vec so all 64 are alive at once, then dropped together.
+            // Held in a Vec so all 64 are alive at once, then dropped together. Named with a
+            // leading underscore because it is deliberately never READ: the assertion is about
+            // what the gauge reports while they exist, and the drop is what closes the scope.
+            let _guards: Vec<InFlightGuard> = (0..GUARDS).map(|_| InFlightGuard::new()).collect();
+            assert!(
+                gauge.active() >= baseline + GUARDS as u64,
+                "holding {GUARDS} guards must raise the level by at least that much: {} vs a baseline of {baseline}",
+                gauge.active()
+            );
+            assert!(
+                gauge.peak() >= baseline + GUARDS as u64,
+                "and the PEAK must record it - the peak is what the capacity argument is checked against"
+            );
+        }
+
+        // THE LEAK DETECTOR. A missing release leaves all 64 slots held for the life of the
+        // process, so the level stays at least 64 above where this test found it. A
+        // concurrent sibling stream can move the figure by a few, which is why the bound is
+        // the guard count and not an exact value - the signal is 64, the noise is single
+        // digits.
+        let after = gauge.active();
+        assert!(
+            after < baseline + GUARDS as u64,
+            "{GUARDS} released guards must not leave {GUARDS} slots held: the level is {after} against a baseline of {baseline}, which means the Drop release is missing"
+        );
+    }
+
     /// THE DENOMINATOR MUST BE RECORDED BEFORE ANY CHECK CAN REFUSE.
     ///
     /// This is a STRUCTURAL test rather than a behavioural one, and that is a deliberate
@@ -2142,6 +2232,7 @@ mod tests {
             tail: Vec::new(),
             settle: Some(settle),
             done: false,
+            _in_flight: InFlightGuard::new(),
         };
         for chunk in &chunks {
             metered.push(chunk);
@@ -2173,6 +2264,7 @@ mod tests {
             tail: Vec::new(),
             settle: Some(settle),
             done: false,
+            _in_flight: InFlightGuard::new(),
         };
         metered.push(usage_sse().as_bytes());
 
@@ -2197,6 +2289,7 @@ mod tests {
             tail: Vec::new(),
             settle: Some(settle),
             done: false,
+            _in_flight: InFlightGuard::new(),
         };
         metered.push(b"data: partial\n\n");
 
@@ -2221,6 +2314,7 @@ mod tests {
             tail: Vec::new(),
             settle: Some(settle),
             done: false,
+            _in_flight: InFlightGuard::new(),
         };
         metered.push(usage_sse().as_bytes());
 
@@ -2248,6 +2342,7 @@ mod tests {
             tail: Vec::new(),
             settle: Some(settle),
             done: false,
+            _in_flight: InFlightGuard::new(),
         };
 
         drop(metered);
@@ -2271,6 +2366,7 @@ mod tests {
             tail: Vec::new(),
             settle: Some(settle),
             done: false,
+            _in_flight: InFlightGuard::new(),
         };
         metered.push(usage_sse().as_bytes());
         assert!(metered.finish(true));
