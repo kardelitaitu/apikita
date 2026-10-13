@@ -3207,3 +3207,37 @@ catch**, which is why the controls are there:
 
 **So the round's result is that the check is sound, and the way that was established matters more than the
 result.** A grep was validated against behaviour rather than trusted because it was plausible.
+
+#### The audit trail, asked whether it can record a lie (round 46)
+
+The admin surface had never been given a fresh question. It is the one surface whose *purpose* is the record
+of privileged action, so the question worth asking is not "is an audit row written" but **"can the trail
+record something that did not happen?"** — an audit row nobody believes is worse than no audit row, because
+it is trusted.
+
+**Coverage of the action set first, measured rather than assumed:** `admin.rs` declares two privileged
+actions, `ACTION_SUSPEND` and `ACTION_RESUME`, and production code outside the test module performs exactly
+7 writes. They pair cleanly — suspend mutates `accounts` (status), `sessions` (revoke) and `api_keys`
+(revoke) and then inserts one audit row; resume mutates `accounts` and inserts one row. No third action
+exists, and a regex artefact (`UPDATE as`) turned out to be a comment, not a write.
+
+**Then two mutations, each producing a trail that lies:**
+
+| mutation | caught by |
+| --- | --- |
+| the account is **not** marked suspended, but sessions and keys are revoked and the row is written | `a_failed_suspend_writes_no_audit_row`, `suspend_revokes_every_live_session_and_every_live_key`, and the concurrency test — **7 failures** |
+| the audit row's `sessions_revoked` count is **wrong by one** — the action happened, the number is false | `suspend_revokes_every_live_session_and_every_live_key` |
+
+The first is the one that would matter, and the test's own comment states the principle:
+
+> *"an audit row for an action that did not happen is as bad as no audit row (the admin-surface document
+> makes the same point)."*
+
+`a_failed_suspend_writes_no_audit_row` drives a **refused** second suspend and asserts the row count stays
+at 1 — so the trail does not grow for an action that was declined, and it does not describe a partial
+suspend as a complete one. Combined with the `assert_no_drift` at the end of both suspend tests (no row
+anywhere else moved), the trail's truthfulness is pinned from two directions.
+
+**So this surface is sound, and it was sound for a reason that generalises: the tests assert the ABSENCE of
+a row as carefully as its presence.** That is the property a record-of-record needs and the one a coverage
+count cannot see — 32 passing tests say nothing about whether the failed case is checked.
