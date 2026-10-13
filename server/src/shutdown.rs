@@ -108,6 +108,72 @@ impl Drop for Guard {
 mod tests {
     use super::*;
 
+    /// Module names `lib.rs` declares `#[cfg(test)]`, so a whole file that is test-only is not
+    /// scanned for production spawns.
+    ///
+    /// READ FROM `lib.rs` RATHER THAN HARDCODED, and this was a real misclassification: the first
+    /// run of this guard reported `money_adversarial.rs:118` and `:207` as UNTRACKED PRODUCTION
+    /// spawns. They are neither - the file is `#[cfg(test)] pub mod money_adversarial` in
+    /// `lib.rs`, so nothing in it is compiled into the server at all. A hardcoded skip list would
+    /// have to be edited in step with that attribute; reading the attribute means the two cannot
+    /// disagree.
+    fn test_only_modules() -> Vec<String> {
+        let lib = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let text = std::fs::read_to_string(&lib)
+            .expect("src/lib.rs must be readable, or this guard checks nothing");
+        let mut out = Vec::new();
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(name) = line.trim().strip_prefix("pub mod ") else {
+                continue;
+            };
+            let name = name.trim_end_matches(';').trim();
+            let gated = i > 0 && lines[i - 1].trim() == "#[cfg(test)]";
+            if gated {
+                out.push(format!("{name}.rs"));
+            }
+        }
+        out
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Is `lines[i]` inside production code rather than the file's `mod tests`?
+    ///
+    /// BRACE DEPTH, not "the last `#[cfg(test)]` above it": a `#[cfg(test)]` also marks individual
+    /// test-only FUNCTIONS in this crate, and treating one of those as the module boundary would
+    /// report every production spawn after it as a test and make this guard vacuous for whole files.
+    fn in_production_code(lines: &[&str], i: usize) -> bool {
+        let mut depth: i32 = 0;
+        let mut tests_at: Option<i32> = None;
+        for (n, line) in lines.iter().enumerate().take(i + 1) {
+            if tests_at.is_none() && line.trim_start().starts_with("mod tests") {
+                tests_at = Some(depth);
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            if n == i {
+                break;
+            }
+        }
+        match tests_at {
+            Some(open) => i == 0 || depth <= open,
+            None => true,
+        }
+    }
+
     #[tokio::test]
     async fn an_empty_tracker_drains_immediately() {
         let t = TaskTracker::new();
@@ -156,5 +222,95 @@ mod tests {
         drop(guard);
         // The counter is already zero; drain must not wait for a wakeup.
         assert_eq!(t.drain(Duration::from_secs(5)).await, 0);
+    }
+    /// EVERY PRODUCTION `tokio::spawn` REGISTERS WITH THE TRACKER, AND THE COUNT IS THE ONE
+    /// THE MODULE DOC CLAIMS.
+    ///
+    /// THE DEFECT THIS PREVENTS: the module doc says "this server has four production spawn sites
+    /// on the money path" and names them. NOTHING CHECKED THAT. A fifth detached task that
+    /// forgot `tasks.begin()` would be invisible - the drain would return while it was still
+    /// running, which is the "reply sent, hold still open" shape the doc itself says this module
+    /// exists to close. The count would also go stale silently, which is the smaller problem.
+    ///
+    /// THE CHECK IS A SOURCE SCAN, and it is deliberately crude about what it will not catch: it
+    /// looks at each production spawn site and asks whether a `.begin()` appears within the few
+    /// lines BEFORE it. A registration made somewhere else entirely - passed in as a field and
+    /// begun by the callee, say - would read as missing. That is the same limitation the
+    /// config-unwired guard documents, and it is stated rather than hidden because a guard whose
+    /// blind spots are unknown is worse than none.
+    ///
+    /// `bin/` IS EXCLUDED for a reason rather than convenience: those are separate programs with
+    /// their own runtimes and no graceful-shutdown drain, so a spawn there is not a task this
+    /// module has ever promised to wait for.
+    #[test]
+    fn every_production_spawn_site_registers_with_the_tracker() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_rs_files(&src, &mut files);
+        assert!(
+            files.len() > 20,
+            "only {} source files were found, so this guard is scanning far less than the crate",
+            files.len()
+        );
+
+        let test_only = test_only_modules();
+        assert!(
+            !test_only.is_empty(),
+            "no `#[cfg(test)] pub mod` was found in lib.rs, so this scan is not reading what it thinks it is"
+        );
+
+        let mut untracked: Vec<String> = Vec::new();
+        let mut tracked = 0usize;
+
+        for path in &files {
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.starts_with("bin/") {
+                continue;
+            }
+            // A whole file gated behind `#[cfg(test)]` in lib.rs is not part of the server.
+            let file_name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+            if test_only.contains(&file_name) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if !line.contains("tokio::spawn(") {
+                    continue;
+                }
+                if !in_production_code(&lines, i) {
+                    continue;
+                }
+                let from = i.saturating_sub(6);
+                let registered = lines[from..i].iter().any(|l| l.contains(".begin()"));
+                if registered {
+                    tracked += 1;
+                } else {
+                    untracked.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+
+        assert!(
+            untracked.is_empty(),
+            "these production `tokio::spawn` sites do not register with the shutdown tracker, so a graceful shutdown can return before they finish - the 'reply sent, hold still open' shape this module exists to close. Take a guard with `tasks.begin()` immediately before the spawn and move it into the task. Sites: {untracked:?}"
+        );
+
+        // AND THE COUNT THE MODULE DOC CLAIMS IS STILL TRUE, pinned so a fifth site is a
+        // deliberate edit to the doc rather than a silent drift.
+        assert_eq!(
+            tracked, 4,
+            "shutdown.rs's module doc says 'four production spawn sites on the money path'. MEASURED: {tracked} register today. If that changed, update the doc in this commit - the count is what tells a reader how much this module carries."
+        );
     }
 }
