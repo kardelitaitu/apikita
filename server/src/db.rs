@@ -907,7 +907,7 @@ pub async fn debit_usage_transaction(
             // usage the upstream reported here is a money defect: the request is
             // delivered for free AND leaves no ledger row and no usage_daily row, so
             // the reconciliation check in docs/observability.md sees nothing. That
-            // is NOT the documented `washed` case (docs/failover.md:140-144), which
+            // is NOT the documented `washed` case (docs/failover.md:214-220 `Mid-stream failure and billing`), which
             // is an upstream that reported no usage at all.
             //
             // So record what actually happened, in this same transaction: the real

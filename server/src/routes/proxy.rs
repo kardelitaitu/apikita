@@ -1029,7 +1029,7 @@ impl Stream for MeteredStream {
                 // The status line is long gone, so a mid-stream failure can
                 // only be announced in-band (docs/error-model.md). Never
                 // retried: a retry would append a second answer and bill for
-                // both (docs/failover.md:133). The detail is logged, not sent:
+                // both (docs/failover.md:209-212). The detail is logged, not sent:
                 // a reqwest error carries the provider URL, and the client must
                 // never see provider names (docs/error-model.md, rule 1).
                 warn!(error = %err, "Upstream stream failed mid-answer");
@@ -1448,7 +1448,7 @@ pub async fn chat_completions(
         .ok_or_else(|| AppError::ModelNotAllowed(meta.model.clone()))?;
 
     // 3. The key's own requests-per-minute ceiling — step 3 of the documented
-    //    enforcement order (docs/failover.md:154, docs/server/api-spec.md:333):
+    //    enforcement order (docs/failover.md:222-231, docs/server/api-spec.md:762-774):
     //    authenticate, allowlist, RATE LIMIT, key spend/token limit, wallet.
     //    Throttling before the money checks is deliberate: a hammering key must
     //    be refused without touching the wallet at all.
