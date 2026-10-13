@@ -457,6 +457,27 @@ names what actually defends against slow-loris: **the edge** (nginx `client_head
 terminates TCP) and `max_concurrent_requests = 512`. A backend-side header timeout *could* be wired to
 hyper's HTTP/1 builder; it is not wired, and it is no longer claimed.
 
+**AND THE FORM WAS HUNTED SYSTEMATICALLY, not left as one lucky instance.** Round 37 produced a general
+rule — *two settings bounding the same thing, nothing comparing them* — so round 38 enumerated the
+config's 199 settings, grouped them by the interval each bounds, and checked whether each pair's implied
+ordering is asserted anywhere. Three candidate pairs had no comparison, and all three are safe:
+
+| pair | values | why it is safe |
+| --- | --- | --- |
+| `cooldown_seconds` vs `cooldown_max_seconds` | 30 vs 900 | `next_cooldown` **clamps** with `.min(cooldown_max_seconds)`, so a misordering degrades to the operator's intent being ignored — the cap is still honoured from the first doubling |
+| `login_per_hour_per_account` vs `login_per_hour_per_ip` | 10 vs 20 | **not comparable at all** — independent counters keyed on different subjects (account id vs salted IP hash), as `auth_attempts.rs`'s own header table says. A "fix" would have been inventing a rule |
+
+Two further pairs I expected to find missing were **already asserted**: `idle_days ≤ absolute_days`, and
+`password_min < password_max` in `validate()` with a message naming both fields. The broader form is
+closed too — `config.rs` requires **every field to be read by production code or on an explicit `UNWIRED`
+list with a reason**, plus the **reverse** check for entries that have quietly become read. A TOML-to-Rust
+sweep confirmed **199 of 199** settings have a field.
+
+**What this bought: the class is exhausted rather than lucky.** Round 37 was the one instance where the two
+numbers disagreed.
+
+hyper's HTTP/1 builder; it is not wired, and it is no longer claimed.
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period
