@@ -742,7 +742,7 @@ run_credit_expiry() {
 
 # Runs the HTTP alert checks (tools/alert/probe.sh) after the database ones.
 #
-# WHY THE IMAGE NOW CARRIES curl: probe.sh hard-requires it (probe.sh:164) and the
+# WHY THE IMAGE NOW CARRIES curl: probe.sh hard-requires it (probe.sh:191-192) and the
 # two checks worth having here are api_down and relay_down - both `covered`, and both
 # unreachable before because the binary was absent, not because of configuration.
 #
@@ -766,7 +766,7 @@ run_alert_probes() {
         return 0
     fi
     if ! command -v curl >/dev/null 2>&1; then
-        log "job alert-probes: SKIPPED - curl is not installed in this image, and probe.sh requires it (probe.sh:164). The database checks are unaffected."
+        log "job alert-probes: SKIPPED - curl is not installed in this image, and probe.sh requires it (probe.sh:191-192). The database checks are unaffected."
         return 0
     fi
 

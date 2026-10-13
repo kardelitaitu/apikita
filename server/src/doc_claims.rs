@@ -4135,6 +4135,29 @@ mod tests {
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         collect_markdown_excluding_docs(&root, &root, &mut files);
 
+        // AND THE SCRIPTS, WHICH CARRY CITATIONS AN OPERATOR FOLLOWS UNDER PRESSURE.
+        //
+        // MEASURED: `tools/wind-down/report.sh` carries 17 and `.docker/maintenance/entrypoint.sh`
+        // 13 - more than any single markdown file outside docs/ - and the walker above reads
+        // `.md` only, so neither was checked by anything. That is the same hole the config had,
+        // in the two files whose comments an operator reads while paying balances out or while a
+        // nightly job has failed.
+        //
+        // IT FOUND ONE IMMEDIATELY: `entrypoint.sh` cited `probe.sh:164` TWICE, and line 164 of
+        // probe.sh is BLANK. The requirement it meant is at `probe.sh:191-192` - the
+        // `command -v curl` guard - so a reader following the citation during an incident arrived
+        // at nothing. Fixed in the same commit.
+        //
+        // `.sh` only, and not `.py`/`.js`/`.ts`: those are covered where they live - the website
+        // suite reads its own sources and the probes are exercised by `sqlite-probes-check` - and
+        // widening this walk to every text file would make the floor below meaningless.
+        for rel in [
+            "tools/wind-down/report.sh",
+            ".docker/maintenance/entrypoint.sh",
+        ] {
+            files.push(root.join(rel));
+        }
+
         // AND THE SHIPPED CONFIG, WHICH IS NOT MARKDOWN AND WAS THEREFORE OUTSIDE EVERY
         // CITATION WALKER IN THIS FILE.
         //
@@ -4182,7 +4205,7 @@ mod tests {
                             .unwrap_or_default();
                         match find_by_name(&root, &base) {
                             Some(found) => {
-                                check_length(&found, number, &shown, &target, &mut problems);
+                                check_length(&found, number, &shown, &target, line, &mut problems);
                             }
                             None => problems.push(format!(
                                 "{shown} cites `{target}:{number}`, and no file by that name \
@@ -4191,7 +4214,7 @@ mod tests {
                         }
                         continue;
                     };
-                    check_length(&resolved, number, &shown, &target, &mut problems);
+                    check_length(&resolved, number, &shown, &target, line, &mut problems);
                 }
             }
         }
@@ -4215,18 +4238,77 @@ mod tests {
         number: usize,
         shown: &str,
         as_written: &str,
+        // THE LINE THE CITATION IS WRITTEN ON, not the line it points at. The range end is
+        // only in the citing text, and passing the cited line here was the bug in the first
+        // version of this check: it searched a blank target line for "185-".
+        citing: &str,
         problems: &mut Vec<String>,
     ) {
         let Ok(text) = std::fs::read_to_string(target) else {
             return;
         };
-        let lines = text.lines().count();
+        let all: Vec<&str> = text.lines().collect();
+        let lines = all.len();
         if number > lines {
             problems.push(format!(
                 "{shown} cites `{as_written}:{number}`, but that file has {lines} lines - \
                  the citation points past the end, so the reader finds nothing"
             ));
+            return;
         }
+
+        // AND THE LINE IT LANDS ON MUST HAVE SOMETHING ON IT, which existence alone did not
+        // check. MEASURED: `entrypoint.sh` cited `probe.sh:164` TWICE and line 164 of probe.sh
+        // is BLANK - the requirement they meant is at `probe.sh:191-192`. Every bound check
+        // passed, because a blank line inside the file is still inside the file. An operator
+        // following that citation during an alert-probe failure arrived at nothing.
+        //
+        // A RANGE IS ALLOWED TO START AT A SEPARATOR, which is why this is not simply "the
+        // cited line is non-blank": `reconcile.sh:185-191` and `provider1.md:71-88` both begin
+        // on the blank line that sets their section off, and those ranges ARE the content below
+        // them. So a range must contain a non-blank line anywhere in its span, while a single
+        // line must itself be non-blank.
+        let range_end = range_end_after(citing, number);
+        match range_end {
+            Some(end) => {
+                let from = number - 1;
+                let to = end.min(lines);
+                if all[from..to].iter().all(|l| l.trim().is_empty()) {
+                    problems.push(format!(
+                        "{shown} cites `{as_written}:{number}-{end}`, and every line in that range \
+                         is blank - the reader finds nothing"
+                    ));
+                }
+            }
+            None => {
+                if all[number - 1].trim().is_empty() {
+                    problems.push(format!(
+                        "{shown} cites `{as_written}:{number}`, and that line of {} is BLANK - the \
+                         citation reaches nothing",
+                        target
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The end of a range citation written on the SAME line as `number`, if there is one.
+    ///
+    /// The extractor records only the start, so the end is recovered from the citing text: a
+    /// hyphen immediately after the digits, then more digits. Anything else - a word, a
+    /// punctuation mark, the end of the line - is not a range.
+    fn range_end_after(citing: &str, number: usize) -> Option<usize> {
+        let needle = format!("{number}-");
+        let at = citing.find(&needle)?;
+        let digits: String = citing[at + needle.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let end = digits.parse::<usize>().ok()?;
+        (end > number).then_some(end)
     }
 
     /// All `file.ext:N` citations on one line, as (path, line number) pairs.
