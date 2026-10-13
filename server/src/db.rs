@@ -375,8 +375,43 @@ pub async fn credit_topup_transaction(
         });
     };
 
-    let topup_id: Uuid = settled.get::<Hyphenated, _>("id").into_uuid();
-    let account_id: Uuid = settled.get::<Hyphenated, _>("account_id").into_uuid();
+    // A MALFORMED ID IS AN ERROR, NOT A PANIC, and this pair used to do the opposite.
+    //
+    // MEASURED, and it was a live defect rather than a theoretical one: `topups.id` is
+    // `TEXT PRIMARY KEY` with NO foreign key and NO format constraint, so any writer - a
+    // migration, a repair script, an operator at the prompt - can store a value that is not a
+    // UUID. `Row::get::<Hyphenated, _>` PANICS on one, and the panic happens inside an axum
+    // handler task, so the observed behaviour is a request that NEVER ANSWERS AND NEVER LOGS:
+    // the connection is closed with no HTTP response and no log line naming the order. A
+    // payment provider retries into that forever, and nothing in the service says why.
+    //
+    // The crate already denies `clippy::unwrap_used` on the request path for exactly this
+    // reason (lib.rs), and it does not catch this: `get` is an infallible-looking accessor
+    // whose panic is a property of the Decode impl rather than an `unwrap` in this source.
+    // That is why four sites in this crate use `try_get` and seventeen used `get` - the
+    // difference was invisible, and only the paths a malformed fixture exercises ever showed it.
+    //
+    // `AppError::Database` rather than a new variant: this IS a database holding a value this
+    // code cannot use, which is what the variant means, and the webhook handler answers a 500
+    // - which Midtrans retries, and which the operator sees in the log with the order id.
+    let topup_id: Uuid = settled
+        .try_get::<Hyphenated, _>("id")
+        .map_err(|err| {
+            AppError::Database(sqlx::Error::ColumnDecode {
+                index: "topups.id".to_string(),
+                source: Box::new(err),
+            })
+        })?
+        .into_uuid();
+    let account_id: Uuid = settled
+        .try_get::<Hyphenated, _>("account_id")
+        .map_err(|err| {
+            AppError::Database(sqlx::Error::ColumnDecode {
+                index: "topups.account_id".to_string(),
+                source: Box::new(err),
+            })
+        })?
+        .into_uuid();
 
     // 3. Credit the wallet. `webhook_amount_idr` is the same value the guard
     //    proved equal to the stored amount, so it is what the ledger must carry.
@@ -5913,6 +5948,58 @@ mod tests {
             "an amount that cannot be added must be refused, never wrapped"
         );
         assert_eq!(test_support::balance(&db.pool, account_id).await, 1_000);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+    /// A MALFORMED `topups.id` IS AN ERROR, NOT A CONNECTION-KILLING PANIC.
+    ///
+    /// THE DEFECT THIS PINS, found by driving the settlement path with a seeded order whose id
+    /// was not a UUID: `Row::get::<Hyphenated, _>` panicked inside the handler task, so the
+    /// request was closed with NO response and NO log line. A payment provider retries into
+    /// that forever and nothing in the service says why - an availability incident with no
+    /// signal, which is the shape `docs/observability.md` and the crate's own lints exist to
+    /// prevent.
+    ///
+    /// The schema permits it: `topups.id` is `TEXT PRIMARY KEY` with no foreign key and no
+    /// format constraint, so any migration, repair script or operator at a prompt can write a
+    /// non-UUID. This test writes one the same way - through SQL, not through the API - because
+    /// that is the only way it can get there.
+    #[tokio::test]
+    async fn a_non_uuid_topup_id_is_an_error_rather_than_a_panic() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO topups (id, account_id, amount_idr, order_id, status, rail, created_at) \
+             VALUES ('not-a-uuid', ?, 50000, 'nonuuid-order', 'pending', 'midtrans', ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .expect("the schema accepts a non-UUID primary key, which is what makes this reachable");
+
+        // The call must RETURN. Before the fix it panicked, which is the failure this cannot
+        // observe directly - a panicking test IS the failure, so an `is_err()` assertion is the
+        // whole observation: reaching it at all proves no panic happened.
+        let outcome = credit_topup_transaction(&db.pool, "nonuuid-order", 50_000, 0).await;
+        assert!(
+            outcome.is_err(),
+            "a top-up id this code cannot decode must be an Err, got {outcome:?}"
+        );
+
+        // AND NOTHING MOVED. A malformed id is discovered AFTER the settle statement, so the
+        // transaction must have rolled back rather than leaving a settled row with no credit.
+        let status: String = sqlx::query_scalar("SELECT status FROM topups WHERE order_id = ?")
+            .bind("nonuuid-order")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the status");
+        assert_eq!(
+            status, "pending",
+            "the refused settlement must have rolled back, not left a settled row uncredited"
+        );
+        assert_eq!(test_support::balance(&db.pool, account_id).await, 0);
         assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }

@@ -5039,10 +5039,22 @@ mod tests {
             ("100-Key Pool", "bench_100_key_pool_routing"),
             ("SSE Streaming", "bench_concurrent_streaming_streams"),
         ];
-        // THE ONE THE HARNESS DOES NOT RUN, named so its absence is a decision rather than an
-        // oversight. MEASURED: its three criteria are `zero SQLITE_BUSY failures`, `zero balance
-        // discrepancies` (owned by tools/reconcile, the launch Gate 2 money check) and `> 100
-        // settlements/sec with pool size = 8` - the last two of which appear in NO other file.
+        // THE ONE THE BENCHMARK BINARY DOES NOT RUN, named so its absence is a decision rather
+        // than an oversight. MEASURED: its three criteria are `zero SQLITE_BUSY failures`,
+        // `zero balance discrepancies` and `> 100 settlements/sec with pool size = 8`.
+        //
+        // ALL THREE NOW HAVE AN OWNER, which was not true when this list was written:
+        //
+        //   * SQLITE_BUSY - `db::busy_timeout`, whose doc comment records the measurement
+        //     behind the 5s value and what happens when a second BEGIN IMMEDIATE waits it out.
+        //   * reconciliation - `tools/reconcile`, the launch Gate 2 money check.
+        //   * settlements/sec - `tools/settle-bench`, added because this test was the only
+        //     place that number appeared and a criterion owned by a comment is not owned.
+        //
+        // WHAT THIS TEST STILL DOES NOT DO, and must not start doing: RUN it. It asserts the
+        // document still carries the heading, so removing the scenario is deliberate. Driving
+        // the settlement path needs a live server and a database, which is the opposite of what
+        // a unit suite may depend on - so the ownership is recorded HERE and exercised THERE.
         const UNRUNNABLE: &[&str] = &["Database & Ledger Contention"];
 
         for needle in UNRUNNABLE {

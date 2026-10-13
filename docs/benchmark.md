@@ -64,6 +64,24 @@ We must answer five concrete questions through empirical testing:
   - Zero balance discrepancies: post-test reconciliation query returns 0 errors.
   - $> 100\text{ settlements/sec}$ with connection pool size = 8.
 
+> **WHO OWNS THESE NOW, because for a long time nothing did.** This scenario is the one the
+> benchmark binary does not run, and `doc_claims.rs` records that as a decision. But "the binary
+> does not run it" is not the same as "nobody measures it", and two of the three criteria were
+> stated in this document and in **no other file**:
+>
+> | Criterion | Owner |
+> | --- | --- |
+> | Zero `SQLITE_BUSY` failures | `db::busy_timeout` — its doc comment records the measurement behind the 5s value |
+> | Zero balance discrepancies | `tools/reconcile` — the launch Gate 2 money check |
+> | `> 100` settlements/sec | **`tools/settle-bench`** — added because this line was the only place that number appeared, and a criterion owned by a comment is not owned |
+>
+> `tools/settle-bench` seeds its own pending top-ups, drives signed settlement notifications, and
+> reads reconciliation through the shipped gate **before and after** — so "no drift" is a delta
+> rather than a coincidence. **MEASURED locally at 452.5 settlements/sec across 50 accounts at
+> concurrency 16**, which is what a development box produces and **not** the deployment's; see
+> [`tools/loadtest`](../tools/loadtest/README.md) for why local figures are not quoted as
+> production ones.
+
 > **These two figures said `10` until they were corrected, and nothing could have caught it.**
 > MEASURED: the code has never shipped `max_connections(10)` — `git log -S 'max_connections(10)'
 > -- server/src/db.rs` returns no commit — and the plan that specified the SQLite migration
