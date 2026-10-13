@@ -1291,6 +1291,22 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, AppError> {
+    // 0. COUNT THE ATTEMPT, BEFORE ANY CHECK CAN REFUSE IT.
+    //
+    // This is the denominator for the refusal rate, and its POSITION is the whole point:
+    // a request refused for a missing Authorization header never reaches step 1, so
+    // recording anywhere later would leave exactly the refusals this metric exists to
+    // measure out of its own denominator - the rate would be computed against a shrinking
+    // base and could exceed 1.0.
+    //
+    // It sits inside the handler rather than in middleware because the handler IS the /v1
+    // admission gate: chat_completions is the one route whose refusals are
+    // RejectionCounter subject, and a layer-wide counter would mix in the dashboard,
+    // sign-in and /health. Same reason ServerErrorCounter::responses is NOT usable here -
+    // it moves for every response the process returns, so a rate built on it would fall
+    // as unrelated traffic rose.
+    crate::error::rejection_counter().record_request();
+
     // 1. Authenticate via Bearer token
     let auth_header = headers
         .get(header::AUTHORIZATION)
@@ -1961,6 +1977,52 @@ mod tests {
     // ---------------------------------------------------------------------
     // The usage tail: what decides whether a customer is billed at all.
     // ---------------------------------------------------------------------
+
+    /// THE DENOMINATOR MUST BE RECORDED BEFORE ANY CHECK CAN REFUSE.
+    ///
+    /// This is a STRUCTURAL test rather than a behavioural one, and that is a deliberate
+    /// choice about what is checkable here. Driving `chat_completions` needs an `AppState`
+    /// (database, config, HTTP client, SSE hub) that the proxy test module has no builder
+    /// for, and building one to assert a single increment would be more scaffolding than
+    /// the property is worth.
+    ///
+    /// What the ORDER guarantees, and why it cannot be moved: a request refused for a
+    /// missing `Authorization` header never reaches step 1, so recording the attempt
+    /// anywhere later leaves exactly the refusals this metric measures OUT of its own
+    /// denominator. The rate is then a share of a shrinking base and can exceed 1.0 - a
+    /// percentage above 100, which is the kind of number that destroys trust in a metric.
+    ///
+    /// MEASURED against the source rather than asserted from memory: the call site and the
+    /// first refusal are located by their text, so a refactor that moves one past the other
+    /// fails here rather than silently changing what the rate means.
+    #[test]
+    fn the_attempt_is_counted_before_the_first_check_that_can_refuse_it() {
+        let src = include_str!("proxy.rs");
+        let entry = src
+            .find("pub async fn chat_completions(")
+            .expect("the handler this test describes must still exist by that name");
+        // BOTH SEARCHES START AT THE HANDLER, and that is not incidental: `find` reads the
+        // whole file, and `AppError::Unauthenticated` occurs in other handlers and tests
+        // above this one - MEASURED, the first file-wide occurrence is a DIFFERENT function,
+        // so an unscoped comparison failed against working code.
+        let body = &src[entry..];
+        let recorded = body
+            .find("rejection_counter().record_request()")
+            .expect("the attempt counter must still be recorded on the admission path");
+        let first_refusal = body
+            .find("AppError::Unauthenticated")
+            .expect("the first admission check must still refuse with Unauthenticated");
+
+        assert!(
+            body.len() > recorded,
+            "record_request must be INSIDE chat_completions, not somewhere else in the file"
+        );
+        assert!(
+            recorded < first_refusal,
+            "record_request must precede the first refusal, or a request refused for a missing \
+             credential becomes a numerator with no denominator and the rate can exceed 1.0"
+        );
+    }
 
     /// A usage block exactly as an upstream sends it, in the tail of an SSE
     /// stream: this is the ONLY evidence that an answer completed.

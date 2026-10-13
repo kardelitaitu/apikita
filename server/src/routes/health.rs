@@ -93,12 +93,29 @@ pub async fn health_check(State(pool): State<SqlitePool>) -> impl IntoResponse {
 /// a mutation that reported `0.0` for an empty window SURVIVED - the test was
 /// asserting its own copy of the logic, not the route. A function the handler calls
 /// closes that gap: the two cannot drift.
+/// The three rejection figures the payload needs, grouped so the signature does not grow
+/// one argument per metric.
+///
+/// This is not cosmetic. `metrics_payload` had reached nine positional arguments, and a
+/// caller that swapped two of them would have compiled and published wrong numbers - the
+/// same class of failure as the swapped `served`/`failed` pair `endpoint_traffic` avoids by
+/// carrying its values inside a tuple. Clippy flagged the count; the risk it names is real.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RejectionSnapshot<'a> {
+    /// Every reason that has fired at least once: `(code, count)`, in code order.
+    pub counts: &'a [(String, u64)],
+    /// The share of admission attempts refused, or `None` when none arrived.
+    pub rate: Option<f64>,
+    /// Attempts that reached the /v1 admission gate, refused or admitted.
+    pub requests: u64,
+}
+
 pub(crate) fn metrics_payload(
     counter: &crate::error::ServerErrorCounter,
     money: &crate::error::MoneyCounter,
     unhealthy_models: &[String],
     endpoint_traffic: &[(String, u64, u64)],
-    rejection_counts: &[(String, u64)],
+    rejections: RejectionSnapshot<'_>,
     retention: &crate::db::RetentionLag,
     today: chrono::NaiveDate,
 ) -> serde_json::Value {
@@ -106,6 +123,9 @@ pub(crate) fn metrics_payload(
     let responses = counter.responses();
     let undercharges = money.undercharges();
     let undercharged_idr = money.undercharged_idr();
+    let rejection_counts = rejections.counts;
+    let rejection_rate = rejections.rate;
+    let rejection_requests = rejections.requests;
 
     // `None` for an empty window, never 0.0. A zero would read as "perfectly
     // healthy" and suppress the alert on a service that has simply served nothing
@@ -188,6 +208,17 @@ pub(crate) fn metrics_payload(
             .iter()
             .map(|(code, count)| json!({ "reason": code, "count": count }))
             .collect::<Vec<_>>(),
+        // THE RATE, AND IT IS `null` RATHER THAN 0.0 ON NO TRAFFIC, the rule `error_rate`
+        // documents and for the identical reason: a gate that has seen nothing is UNMEASURED,
+        // and reporting 0% would look perfectly healthy and suppress anything built on it.
+        //
+        // The raw count above cannot be acted on alone - 40 refusals an hour is either growth
+        // or an attack depending entirely on how many requests produced them. A NON-ZERO rate
+        // is also the EXPECTED state on a public endpoint, since unauthenticated probing is
+        // continuous; it is the SHAPE that carries information, not the level.
+        // Rounded to 4 decimals like error_rate, so the payload is stable to diff.
+        "rejection_rate": rejection_rate.map(|rate| (rate * 10_000.0).round() / 10_000.0),
+        "proxy_requests": rejection_requests,
         "endpoint_traffic": endpoint_traffic
             .iter()
             .map(|(name, served, failed)| json!({
@@ -294,6 +325,10 @@ pub async fn operator_metrics(
                     .iter()
                     .map(|(code, count)| json!({ "reason": code, "count": count }))
                     .collect::<Vec<_>>(),
+                "rejection_rate": crate::error::rejection_counter()
+                    .rejection_rate()
+                    .map(|rate| (rate * 10_000.0).round() / 10_000.0),
+                "proxy_requests": crate::error::rejection_counter().requests(),
                 "unhealthy_models": crate::routes::proxy::models_with_no_healthy_endpoint(),
                 "endpoint_traffic": crate::routes::proxy::endpoint_traffic(),
                 "retention": { "behind": null, "error": "the retention read failed" },
@@ -307,7 +342,11 @@ pub async fn operator_metrics(
         crate::error::money_counter(),
         &crate::routes::proxy::models_with_no_healthy_endpoint(),
         &crate::routes::proxy::endpoint_traffic(),
-        &crate::error::rejection_counter().counts(),
+        RejectionSnapshot {
+            counts: &crate::error::rejection_counter().counts(),
+            rate: crate::error::rejection_counter().rejection_rate(),
+            requests: crate::error::rejection_counter().requests(),
+        },
         &retention,
         today,
     ))
@@ -901,7 +940,19 @@ mod tests {
         // ZERO IS A REAL AND GOOD READING, unlike error_rate's null for an empty window:
         // no undercharges is the normal state, and reporting it as null would make the
         // alert treat a healthy service as unmeasured.
-        let payload = metrics_payload(&counter, &money, &[], &[], &[], &Default::default(), today);
+        let payload = metrics_payload(
+            &counter,
+            &money,
+            &[],
+            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
+            &Default::default(),
+            today,
+        );
         assert_eq!(payload["undercharges"], json!(0));
         assert_eq!(payload["undercharged_idr"], json!(0));
         assert!(
@@ -911,13 +962,74 @@ mod tests {
 
         money.record_undercharge(200);
         money.record_undercharge(90_000);
-        let payload = metrics_payload(&counter, &money, &[], &[], &[], &Default::default(), today);
+        let payload = metrics_payload(
+            &counter,
+            &money,
+            &[],
+            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
+            &Default::default(),
+            today,
+        );
         assert_eq!(payload["undercharges"], json!(2));
         assert_eq!(
             payload["undercharged_idr"],
             json!(90_200),
             "the SUM is the actionable half and must be the figure an operator is paged on"
         );
+    }
+
+    /// THE RATE TRAVELS WITH THE COUNT, and `null` is not `0.0`.
+    ///
+    /// A gate that has taken no traffic is UNMEASURED. Reporting 0% would look perfectly
+    /// healthy and suppress anything built on it - the rule `error_rate` already documents,
+    /// applied to the same payload.
+    #[test]
+    fn the_payload_reports_the_rejection_rate_as_null_on_no_traffic() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        // No traffic: null, with the count still present as an array.
+        let payload = metrics_payload(
+            &crate::error::ServerErrorCounter::default(),
+            &Default::default(),
+            &[],
+            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
+            &Default::default(),
+            today,
+        );
+        assert!(
+            payload["rejection_rate"].is_null(),
+            "a gate that has seen nothing is unmeasured, not 0% healthy, got {}",
+            payload["rejection_rate"]
+        );
+        assert_eq!(payload["rejections"], json!([]));
+        assert_eq!(payload["proxy_requests"], json!(0));
+
+        // One refusal in four attempts, rounded to 4 decimals like error_rate.
+        let payload = metrics_payload(
+            &crate::error::ServerErrorCounter::default(),
+            &Default::default(),
+            &[],
+            &[],
+            RejectionSnapshot {
+                counts: &[("rate_limited".to_string(), 1)],
+                rate: Some(0.25),
+                requests: 4,
+            },
+            &Default::default(),
+            today,
+        );
+        assert_eq!(payload["rejection_rate"], json!(0.25));
+        assert_eq!(payload["proxy_requests"], json!(4));
     }
 
     /// THE PAYLOAD CARRIES THE REASON BREAKDOWN, and it is an OBJECT keyed by code rather than
@@ -935,7 +1047,11 @@ mod tests {
             &Default::default(),
             &[],
             &[],
-            &rejections.counts(),
+            RejectionSnapshot {
+                counts: &rejections.counts(),
+                rate: rejections.rejection_rate(),
+                requests: rejections.requests(),
+            },
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -956,7 +1072,11 @@ mod tests {
             &Default::default(),
             &[],
             &[],
-            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -978,7 +1098,11 @@ mod tests {
             &Default::default(),
             &[],
             &[],
-            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
             &Default::default(),
             today,
         );
@@ -998,7 +1122,11 @@ mod tests {
             &Default::default(),
             &[],
             &traffic,
-            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
             &Default::default(),
             today,
         );
@@ -1033,7 +1161,11 @@ mod tests {
             &Default::default(),
             &[],
             &[],
-            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -1053,7 +1185,11 @@ mod tests {
             &Default::default(),
             &down,
             &[],
-            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -1075,7 +1211,11 @@ mod tests {
             &Default::default(),
             &[],
             &[],
-            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -1101,7 +1241,11 @@ mod tests {
             &Default::default(),
             &[],
             &[],
-            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -1127,7 +1271,11 @@ mod tests {
             &Default::default(),
             &[],
             &[],
-            &[],
+            RejectionSnapshot {
+                counts: &[],
+                rate: None,
+                requests: 0,
+            },
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );

@@ -138,6 +138,7 @@ Keep it small. Three categories:
 | Metric | Meaning |
 | --- | --- |
 | `rejections` on `GET /api/admin/metrics` | `{reason, count}` per code that has fired: `insufficient_balance`, `rate_limited`, `key_limit_exceeded`, `model_not_allowed`, `key_revoked`, `key_expired`, `unauthenticated` |
+| `rejection_rate`, `proxy_requests` | The same figures as a RATE: refusals over attempts that reached the `/v1` gate. **`null` on no traffic, never `0.0`** — a gate that has seen nothing is unmeasured |
 
 **Break rejections down by reason.** A spike in `insufficient_balance` is a
 business signal (customers running dry). A spike in `rate_limited` is either growth
@@ -154,6 +155,21 @@ against, so the counter files each refusal under the code it was actually return
 entry per code in the table and a first firing is visible. **Rejections that cost money are
 not counted here**: a 402 raised *after* a hold left the wallet is a settlement (see
 `proxy_undercharge`), not an admission refusal.
+
+**THE RATE NEEDS ITS OWN DENOMINATOR, and reusing `responses` would have been wrong.**
+That counter moves for every response the process returns — sign-in, the dashboard,
+`/health` — so a rate built on it would *fall* as unrelated traffic rose, with no change in
+proxy traffic at all. A rate whose movement is caused by another surface is worse than no
+rate, because it looks like a measurement. `proxy_requests` is therefore incremented at the
+**same gate** the refusals are, and *before the first check that can refuse*: a request
+refused for a missing `Authorization` header never reaches a later step, so recording
+anywhere else would put refusals in the numerator that the denominator never saw — a
+percentage above 100.
+
+**A non-zero refusal rate is the EXPECTED state** on a public endpoint, because
+unauthenticated probing is continuous. It is the *shape* that carries information — a spike
+in `insufficient_balance` is customers running dry, a spike in `rate_limited` is growth or
+abuse — not the level, which is why this row has no alert threshold.
 
 ## Alerts
 

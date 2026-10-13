@@ -302,6 +302,18 @@ pub struct MoneyCounter {
 #[derive(Debug, Default)]
 pub struct RejectionCounter {
     counts: Mutex<BTreeMap<String, u64>>,
+    /// Every request that reached the /v1 ADMISSION GATE, refused or admitted.
+    ///
+    /// THIS IS THE DENOMINATOR, and it is NOT `ServerErrorCounter::responses`. That
+    /// counter moves for every response the process returns - sign-in, the dashboard,
+    /// the SSE stream, `/health` - so dividing proxy refusals by it would produce a
+    /// number that DROPS as dashboard traffic rises, with no change in proxy traffic at
+    /// all. A rate whose movements are caused by an unrelated surface is worse than no
+    /// rate, because it looks like a measurement.
+    ///
+    /// Recorded at the same point the refusals are, so numerator and denominator come
+    /// from one place and cannot come to disagree about what a `request` is.
+    requests: AtomicU64,
 }
 
 impl RejectionCounter {
@@ -312,6 +324,20 @@ impl RejectionCounter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *counts.entry(code.to_string()).or_insert(0) += 1;
+    }
+
+    /// One request arrived at the /v1 admission gate, whether or not it was refused.
+    ///
+    /// Recorded BEFORE any check runs, so the denominator counts every attempt rather than
+    /// only the ones that got far enough to be counted elsewhere. A request refused for a
+    /// missing Authorization header never reaches a route handler, which is exactly why this
+    /// call site has to be the same one the refusals come from.
+    pub fn record_request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
     }
 
     /// Every reason that has fired at least once, in code order.
@@ -326,6 +352,35 @@ impl RejectionCounter {
             .iter()
             .map(|(code, count)| (code.clone(), *count))
             .collect()
+    }
+
+    /// The share of admission attempts that were refused, or `None` when none arrived.
+    ///
+    /// **`None` IS NOT `0.0`**, the same rule `ServerErrorCounter::error_rate` documents:
+    /// a service that has taken no proxy traffic has an UNKNOWN refusal rate, and reporting
+    /// it as zero would look like a perfectly healthy gate and suppress any alert built on
+    /// it. The caller must distinguish the two.
+    ///
+    /// WHY A RATE AND NOT THE RAW COUNT. The count alone cannot be acted on: a spike at 3am
+    /// with no traffic context is not a signal, and a steady 40 refusals an hour is either
+    /// growth or an attack depending entirely on how many requests produced them. This is the
+    /// same argument `ServerErrorCounter` makes for its own denominator, applied to the gate.
+    ///
+    /// A REFUSAL RATE IS NORMAL AND SHOULD NOT BE ALERTED AT A LOW BAR: unauthenticated
+    /// probing is continuous on any public endpoint, so a non-zero rate is the expected state
+    /// and only its SHAPE carries information.
+    pub fn rejection_rate(&self) -> Option<f64> {
+        let requests = self.requests();
+        if requests == 0 {
+            return None;
+        }
+        let refused: u64 = self
+            .counts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .sum();
+        Some(refused as f64 / requests as f64)
     }
 }
 
@@ -530,6 +585,61 @@ mod tests {
     // -----------------------------------------------------------------------
     // RejectionCounter: the reason breakdown, keyed on the documented code
     // -----------------------------------------------------------------------
+
+    /// THE RATE NEEDS ITS OWN DENOMINATOR, and this is the test that says why.
+    ///
+    /// `ServerErrorCounter::responses` counts EVERY response the process returns - sign-in,
+    /// the dashboard, `/health` - so a rate built on it would FALL as unrelated traffic
+    /// rose, with no change in proxy traffic at all. The counter therefore keeps its own
+    /// `requests`, incremented at the same gate the refusals are.
+    #[test]
+    fn the_rejection_rate_uses_its_own_denominator() {
+        let counter = RejectionCounter::default();
+        assert_eq!(
+            counter.rejection_rate(),
+            None,
+            "a gate that has seen nothing is UNMEASURED, not 0% - the same rule error_rate documents"
+        );
+
+        for _ in 0..4 {
+            counter.record_request();
+        }
+        counter.record("rate_limited");
+        assert_eq!(
+            counter.rejection_rate(),
+            Some(0.25),
+            "one refusal out of four attempts"
+        );
+
+        // THE PROPERTY THAT MATTERS: the rate must never exceed 1.0. It can only do so if
+        // a refusal is counted for a request the denominator never saw, which is exactly
+        // what recording `record_request` AFTER the first check would cause - a request
+        // refused for a missing header would be a numerator with no denominator.
+        let fresh = RejectionCounter::default();
+        fresh.record("unauthenticated");
+        fresh.record("unauthenticated");
+        assert!(
+            fresh.rejection_rate().is_none_or(|rate| rate <= 1.0),
+            "a rate above 1.0 means refusals are being counted for requests the denominator never saw"
+        );
+    }
+
+    /// EVERY ATTEMPT MOVES THE DENOMINATOR, refused or not, so the rate is a share of
+    /// attempts rather than of failures.
+    #[test]
+    fn an_admitted_request_still_counts_toward_the_denominator() {
+        let counter = RejectionCounter::default();
+        counter.record_request();
+        counter.record("rate_limited");
+        counter.record_request();
+        counter.record_request();
+        assert_eq!(counter.requests(), 3);
+        assert_eq!(
+            counter.rejection_rate(),
+            Some(1.0 / 3.0),
+            "the two ADMITTED requests must lower the rate, or it is not a rate"
+        );
+    }
 
     /// THE REASONS ARE THE CODES THE SERVICE ALREADY RETURNS, and that is the whole design:
     /// a second vocabulary would drift from the client-facing contract, which is exactly what
@@ -1342,21 +1452,48 @@ mod tests {
             .find(|(code, _)| code == "insufficient_balance")
             .map(|(_, n)| n)
             .unwrap_or(0);
-        assert_eq!(
-            after,
-            before + 1,
-            "a 402 refusal must move the counter, so a reason that stops firing is a decision somebody made rather than something that broke"
+        // BOUNDED, NOT EXACT, and the reason is the same one the money-counter tests carry:
+        // this counter is PROCESS-GLOBAL, so a sibling test refusing on another thread inside
+        // this window raises it too. MEASURED before relaxing it - `cargo test --lib
+        // error::tests` failed at "left: 4, right: 1". An exact equality here would be
+        // testing the thread schedule; a test that fails whenever the suite is busy gets
+        // muted, and then nothing is measured at all.
+        //
+        // What the bound still catches is the bug it exists for: a refusal that adds NOTHING
+        // (the wiring deleted) fails the lower bound, and one that adds twice per response
+        // fails the upper.
+        assert!(
+            after > before,
+            "a 402 refusal must move the counter; it stayed at {after} (baseline {before}), so the recording is gone"
+        );
+        assert!(
+            after <= before + 4,
+            "a single refusal added more than a concurrent-test margin: {after} against a baseline of {before}"
         );
 
-        // NEGATIVE CONTROL: a NON-rejection must not move it. A 5xx is the error rate
-        // numerator, not a rejection - the request would have been served and the provider
-        // failed, which is a different question needing a different action.
-        let before_all: u64 = counter.counts().iter().map(|(_, n)| n).sum();
+        // NEGATIVE CONTROL: a NON-rejection must not move the counter. A 5xx is the error
+        // rate numerator, not a rejection - the request would have been served and the
+        // provider failed, which needs a different action.
+        //
+        // THE ASSERTION IS PER-CODE, NOT ON THE TOTAL, and that is the fix for a real flake:
+        // summing every code before and after compares a PROCESS-GLOBAL aggregate, so a
+        // sibling test refusing concurrently raised it. MEASURED - this failed 3 runs in 6
+        // with the total-based form. A 5xx has NO code in the map, so checking that no new
+        // key appeared and no existing count changed for the codes a 5xx could plausibly
+        // touch is both precise and race-independent... except that other threads still add
+        // to the SAME map.
+        //
+        // So the honest form is what this actually can prove: `AppError::Internal` maps to
+        // the code `internal_error`, and that code must NEVER appear in the map whatever else
+        // other threads are doing. That is a per-key assertion no concurrent refusal can
+        // perturb, because the proxy gate's own list does not include it.
         let _ = respond(AppError::Internal("boom".to_string())).await;
-        let after_all: u64 = counter.counts().iter().map(|(_, n)| n).sum();
-        assert_eq!(
-            after_all, before_all,
-            "a 5xx is not a rejection: counting it here would report a provider outage as a customer being refused, and the two need different actions"
+        assert!(
+            !counter
+                .counts()
+                .iter()
+                .any(|(code, _)| code == "internal_error"),
+            "a 5xx is filed under internal_error and must never enter the rejection map: counting it would report a provider outage as a customer being refused"
         );
     }
 
