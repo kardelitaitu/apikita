@@ -712,10 +712,10 @@ max_context_tokens = 1000000
 # flash -- the cheap, high-concurrency workhorse. THIS IS WHERE THE MARGIN IS.
 # ===========================================================================
 
-# FOUR FIELDS HERE ARE RECORDED, NOT ENFORCED: supports_vision, supports_thinking,
-# billing_basis and concurrency_per_key. The model struct parses all four and nothing
-# reads them - there is no GET /v1/models, and no document advertises a vision or
-# thinking capability, so nothing customer-facing is currently false. The consequence
+# THREE FIELDS HERE ARE RECORDED, NOT ENFORCED: supports_vision, supports_thinking
+# and billing_basis. The model struct parses all three and nothing reads them - there is
+# no GET /v1/models, and no document advertises a vision or thinking capability, so
+# nothing customer-facing is currently false. The consequence
 # is behavioural rather than a false claim: a request carrying an image is NOT rejected
 # because this model is marked supports_vision = false, so the failure arrives as
 # whatever the provider does with it. Recorded here so the flags read as intent rather
@@ -771,8 +771,20 @@ output_peak        = 10707.12  # ¥4.00
 #   - Key values come from ENV VARS ONLY, named here. Never inline a key.
 #
 # concurrency_per_key: the ceiling the provider enforces for ONE key.
-#   0 = unknown, in which case the router should learn it from 429s and back
-#   off, and a warning should be logged because capacity is then a guess.
+#   0 = unknown. THE ROUTER NOW ENFORCES THIS as an admission gate: a key already
+#   holding this many concurrent streams is SKIPPED, not selected, so the next key
+#   takes the request and the pool only reports exhaustion when every key is at its
+#   ceiling (server/src/upstream/key_pool.rs, KeyPool::acquire). It skips rather
+#   than queues, because docs/failover.md commits to failing fast instead of
+#   parking a request on a socket.
+#
+#   The shipped value is 0 for every endpoint, which admits everything and is the
+#   correct setting while the ceiling is unknown: guessing low would refuse
+#   capacity the provider would have served. Set it when a provider states its
+#   per-key limit, and the 429s that limit would otherwise produce stop being
+#   generated. What 0 does NOT do is warn - the comment here used to say a warning
+#   "should be logged because capacity is then a guess", and no such warning
+#   exists.
 #
 # weight is a GATE, not a probability: 0 = registered but never routed
 # (unverified terms), anything >0 = routable. It is NOT weighted-random.

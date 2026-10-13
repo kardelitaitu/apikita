@@ -326,6 +326,7 @@ impl UpstreamClient {
                             config.key_pool.key_cooldown_seconds,
                             config.key_pool.rate_limit_status.clone(),
                             config.key_pool.max_key_attempts,
+                            endpoint.concurrency_per_key,
                         ),
                         breaker: CircuitBreaker::new(config.circuit_breaker.clone()),
                         supports_stream_options: endpoint.supports_stream_options,

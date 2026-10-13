@@ -2658,10 +2658,6 @@ mod tests {
                 "every price is computed from the PEAK rates; the offpeak class is\n                 configured on the model and never selected. Selecting it would be a\n                 pricing change, which is why this is listed rather than fixed.",
             ),
             (
-                "concurrency_per_key",
-                "the key pool applies one global concurrency policy; the per-endpoint\n                 override is parsed and never consulted.",
-            ),
-            (
                 "min_monthly_tokens",
                 "no monthly token floor is applied to anything. The only place this \
                  name appeared outside the struct was a SENTENCE in abuse.rs citing it \

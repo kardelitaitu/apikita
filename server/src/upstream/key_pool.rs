@@ -56,6 +56,28 @@ struct Policy {
     cooldown: Duration,
     rate_limit_status: Vec<u16>,
     max_attempts: usize,
+    /// The provider's per-key concurrency ceiling, or 0 when unknown.
+    ///
+    /// THIS IS THE ONE FIELD THAT WAS PARSED, VALIDATED, DOCUMENTED — AND NEVER READ.
+    /// `ModelEndpoint::concurrency_per_key` reached `KeyPool` through exactly one path
+    /// and that path was `client.rs:695` setting it to 0 in a test fixture. So every
+    /// endpoint in the shipped config, including the comment at `apikita.toml:771`
+    /// describing the intended semantics as "the ceiling the provider enforces for ONE
+    /// key", governed nothing.
+    ///
+    /// The consequence was that a provider capping a key at N concurrent streams
+    /// answered a 429 on N+1, which parked the key, rotated to the next, and completed
+    /// the request. The failure was ABSORBED AND INVISIBLE, so what should have been one
+    /// router admission decision became repeated per-request upstream 429s, each costing
+    /// a retry and a parked key — under load, a per-child tax the router never charged.
+    ///
+    /// `acquire` enforces it as an ADMISSION gate, not a queue: `docs/failover.md`
+    /// ("all keys cooled down" fails immediately, it does not queue) is the model, and a
+    /// queued request would hold a connection and a socket — the very resource the
+    /// concurrency cap exists to bound. A saturated key is simply not selected, so the
+    /// next key takes the request, and only when the WHOLE pool is saturated does
+    /// `acquire` return None and the caller fail fast with a real `Retry-After`.
+    concurrency_per_key: usize,
     /// Test-only virtual clock offset, so a cooldown wait needs no real sleeping.
     ///
     /// Same device `CircuitBreaker` already uses: the alternative is a test that
@@ -150,11 +172,19 @@ impl KeyPool {
     /// cooldown_seconds comes from KeyPoolConfig.key_cooldown_seconds,
     /// rate_limit_status from KeyPoolConfig.rate_limit_status, and max_attempts
     /// from KeyPoolConfig.max_key_attempts.
+    ///
+    /// `concurrency_per_key` comes from the ENDPOINT (`ModelEndpoint`), not from
+    /// `KeyPoolConfig`, because the ceiling is a property of the provider being
+    /// called: one reseller caps a key at 4 concurrent streams and another caps it at
+    /// 64, and the same model can be bought from both. `0` means UNKNOWN, which is the
+    /// shipped value for every endpoint — see `acquire` for what that does and does
+    /// not change.
     pub fn new(
         keys: Vec<String>,
         cooldown_seconds: u64,
         rate_limit_status: Vec<u16>,
         max_attempts: usize,
+        concurrency_per_key: usize,
     ) -> Self {
         Self {
             keys: keys
@@ -165,6 +195,7 @@ impl KeyPool {
                 cooldown: Duration::from_secs(cooldown_seconds),
                 rate_limit_status,
                 max_attempts,
+                concurrency_per_key,
                 #[cfg(test)]
                 clock_offset: Mutex::new(Duration::ZERO),
             }),
@@ -177,14 +208,39 @@ impl KeyPool {
         self.policy.advance(elapsed);
     }
 
-    /// Take the least-loaded key that is not cooling, or None when every key is
-    /// parked. The returned lease holds one in-flight slot until it is reported.
+    /// Take the least-loaded key that is neither cooling nor at its concurrency
+    /// ceiling, or None when no such key exists.
+    ///
+    /// The returned lease holds one in-flight slot until it is reported.
+    ///
+    /// `acquire` previously filtered cooling keys only, so the in-flight counter was a
+    /// pure HINT and `concurrency_per_key` had no reader anywhere in the tree. That made
+    /// admission depend on the upstream saying 429 first, and a request that should have
+    /// been refused in-process instead paid for an upstream call, a key park and a
+    /// rotation — the failure was absorbed and invisible, which is why it survived.
+    ///
+    /// THE CEILING IS SKIPPED, NOT QUEUED, and that is deliberate: `docs/failover.md`
+    /// commits to "all keys cooled down fails immediately; it does not queue", on the
+    /// grounds that a queued request holds a connection and a socket — the exact resource
+    /// this cap bounds. A saturated key is simply not selected, so the next key takes the
+    /// request; `None` comes back only when the WHOLE pool is saturated, at which point
+    /// the caller fails fast and reports the earliest real cooldown rather than a guess.
+    ///
+    /// `concurrency_per_key == 0` means UNKNOWN and admits everything, which is the
+    /// shipped configuration for every endpoint today. The cap is therefore an opt-in
+    /// for operators who know their provider ceiling, not a behaviour change here.
     pub fn acquire(&self) -> Option<KeyLease> {
         let now = self.policy.now();
+        let cap = self.policy.concurrency_per_key;
         let slot = self
             .keys
             .iter()
             .filter(|slot| !slot.is_cooling(now))
+            // A saturated key is already at the provider ceiling, so another stream on it
+            // invites a 429 the router can already predict. `>=` rather than `>` because
+            // the capacity is a COUNT of concurrent streams, so the Nth admission needs
+            // in_flight to be below N.
+            .filter(|slot| cap == 0 || slot.in_flight.load(Ordering::Relaxed) < cap)
             .min_by_key(|slot| slot.in_flight.load(Ordering::Relaxed))?
             .clone();
 
@@ -275,7 +331,10 @@ mod tests {
 
     fn pool(keys: usize, cooldown: u64) -> KeyPool {
         let keys = (0..keys).map(|i| format!("key-{i}")).collect();
-        KeyPool::new(keys, cooldown, vec![429], 3)
+        // The fixture default is UNKNOWN ceiling (0), so these tests exercise the
+        // pool WITHOUT a cap — the cap has its own tests below, and mixing the two
+        // would make a cap regression look like a pool regression.
+        KeyPool::new(keys, cooldown, vec![429], 3, 0)
     }
 
     #[test]
@@ -489,6 +548,7 @@ mod tests {
             30,
             vec![429],
             3,
+            0,
         );
 
         let a = pool.acquire().expect("key-0");
@@ -528,6 +588,114 @@ mod tests {
             pool.acquire().is_some(),
             "and the control: the key really did come back"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // concurrency_per_key: the ceiling the router can now actually enforce
+    // -------------------------------------------------------------------
+
+    /// THE DEFECT THIS PINS: `concurrency_per_key` was parsed, validated and documented
+    /// as "the ceiling the provider enforces for ONE key" — and read by nothing. Selection
+    /// was least-in-flight with NO admission gate, so a provider that caps a key at N
+    /// answered a 429 on N+1, which parked the key, rotated and completed. The failure was
+    /// absorbed and invisible, which is why it survived: under load the router paid a
+    /// retry and a key park for every admission it could have decided in one comparison.
+    #[test]
+    fn a_saturated_key_is_skipped_not_rotated_after_a_429() {
+        // Cap 2 on a 1-key pool, so the second concurrent lease is refused by the
+        // ROUTER rather than by the provider.
+        let pool = KeyPool::new(vec!["key-0".to_string()], 30, vec![429], 3, 2);
+
+        let first = pool.acquire().expect("first lease fits the ceiling");
+        let second = pool.acquire().expect("second lease fits the ceiling");
+        assert_eq!(first.key(), second.key(), "one key, so both land on it");
+        assert!(
+            pool.acquire().is_none(),
+            "at the ceiling the key is not selected — and with a 1-key pool there is \
+             nothing else to try, so acquire reports None and the caller fails fast"
+        );
+
+        // Releasing one lease frees exactly one slot, not the whole pool.
+        first.report_success();
+        assert!(
+            pool.acquire().is_some(),
+            "a released lease must make room for exactly one more admission"
+        );
+    }
+
+    /// The cap must not silently become a queue, and it must not exceed the provider
+    /// ceiling. Two keys at cap 1 each hold one stream; a third request is refused
+    /// rather than stacked on a saturated key.
+    #[test]
+    fn the_cap_is_per_key_not_per_pool() {
+        let pool = KeyPool::new(
+            vec!["key-0".to_string(), "key-1".to_string()],
+            30,
+            vec![429],
+            3,
+            1,
+        );
+
+        let a = pool.acquire().expect("key-0");
+        assert_eq!(a.key(), "key-0");
+        let b = pool.acquire().expect("key-1");
+        assert_eq!(b.key(), "key-1", "the second stream goes to the OTHER key");
+        assert!(
+            pool.acquire().is_none(),
+            "every key is at its ceiling of 1, so nothing is admitted"
+        );
+
+        a.report_success();
+        assert_eq!(
+            pool.acquire().expect("key-0 freed one slot").key(),
+            "key-0",
+            "the freed key is selected again, which is what least-loaded means"
+        );
+    }
+
+    /// A ceiling of 0 is UNKNOWN and must admit everything, which is the shipped
+    /// configuration. If a cap of 0 were treated as "none allowed", every endpoint whose
+    /// provider ceiling is unknown would stop routing entirely.
+    #[test]
+    fn a_zero_ceiling_is_unknown_and_admits_everything() {
+        let pool = KeyPool::new(vec!["key-0".to_string()], 30, vec![429], 3, 0);
+
+        let leases: Vec<_> = (0..64)
+            .map(|_| {
+                pool.acquire()
+                    .expect("0 means unknown, so nothing is capped")
+            })
+            .collect();
+        assert_eq!(
+            leases.len(),
+            64,
+            "an unknown ceiling must not become an admission limit of its own"
+        );
+    }
+
+    /// A saturated-but-cold key must be preferred over a cooling-but-free one only when
+    /// the ceiling allows; and the ceiling must be checked BEFORE least-loaded ordering,
+    /// or a key at its ceiling with zero in-flight peers still wins on the tie.
+    #[test]
+    fn the_ceiling_is_applied_before_least_loaded_ordering() {
+        let pool = KeyPool::new(
+            vec!["key-0".to_string(), "key-1".to_string()],
+            30,
+            vec![429],
+            3,
+            1,
+        );
+
+        // key-0 holds a lease, so it is at its ceiling AND the most loaded.
+        let held = pool.acquire().expect("key-0");
+        let next = pool.acquire().expect("a lease is available");
+        assert_eq!(
+            next.key(),
+            "key-1",
+            "the at-ceiling key must not be selected even though it ties on load"
+        );
+        held.report_success();
+        next.report_success();
     }
 
     #[test]
