@@ -546,6 +546,39 @@ rather than aspirational.
 **The orderings and predicates are earned.** This is the shape the audit has been checking for since round
 16, and here the comments describe what the code does.
 
+#### The webhook signature path: the primitive and its caller, both guarded (round 41)
+
+The highest-stakes surface in the product — `POST /webhooks/midtrans` is what **credits a wallet**. The
+existing tests were strong, so this round tested the two places a strong test still cannot see: the
+**caller** of a well-tested function, and the **order** of the checks.
+
+`money.rs`'s own tests already cover the digest thoroughly — including `reordering_the_signed_fields_changes_the_digest`,
+which permutes all five field pairs to prove the concatenation is unambiguous. So the primitive was not the
+gap, and it was not re-tested.
+
+**Four mutations at the call site and one ordering mutation, all caught:**
+
+| mutation | caught by |
+| --- | --- |
+| the condition inverted (`!verify` → `verify`) | `live_webhook_rejects_a_settlement_for_an_unknown_order`, plus the settlement test |
+| **the check never refuses** (`if false`) | **`live_webhook_rejects_a_bad_signature_and_writes_nothing`**, the rejection-log test, the malformed-body test |
+| the configured key replaced by a literal | the key tests, plus collateral in unrelated suites |
+| **a forged webhook allowed to PROCEED** into the handler | the same three as above — so the ORDERING is tested, not just the verdict |
+
+**The assertions are the reason this holds.** `bad_signature_assertions` does not merely check the status
+code: it proves the money did not move by **four independent means** — balance `0`, the topup still
+`pending`, **no ledger row**, and `assert_reconciled`. A status-only test would pass on a handler that
+returned 401 *after* crediting; this one cannot. The forge is also the right shape, signed with
+*"SOMEBODY ELSE'S key ... exactly the shape a forger without the secret produces"*, and the key handling
+itself is covered by `live_webhook_refuses_an_empty_or_whitespace_server_key` and
+`live_webhook_refuses_a_missing_server_key` — the case money.rs flags as *"with an empty key anyone can
+compute a [valid signature]"*.
+
+**A note on what "caught" was worth.** The literal-key mutation was caught only by *collateral* — a wrong
+key fails every signature, so unrelated tests needed a successful webhook and broke. That is weaker evidence
+than the other three, which is why the key tests were checked **directly** rather than accepted from the
+mutation result.
+
 hyper's HTTP/1 builder; it is not wired, and it is no longer claimed.
 
 #### `doc_claims`: the retention check, measured in both directions (round 28)
