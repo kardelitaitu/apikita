@@ -406,7 +406,7 @@ mod tests {
         let ratio = R_IN / R_CACHE;
         assert!(
             ratio > 40.0 && ratio < 60.0,
-            "docs/local-development.md:115 - the classes differ ~50x, measured {ratio}"
+            "docs/local-development.md:222 - the classes differ ~50x, measured {ratio}"
         );
     }
 
@@ -976,7 +976,7 @@ mod tests {
     // Midtrans signature verification (docs/website/04-payments.md:36-48)
     //
     // This is the only control between a forged webhook and a credited wallet
-    // (server/src/routes/webhooks.rs:82 - a false return is the 401). The
+    // (`webhooks.rs`: `verify_midtrans_signature` - a false return is the 401). The
     // digests below are pinned as literals derived OUTSIDE Rust:
     // `printf '%s' 'order1' '200' '50000.00' 'SB-Mid-server-TEST' | sha512sum`,
     // cross-checked against Python's hashlib.sha512. Calling the function under

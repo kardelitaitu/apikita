@@ -2064,7 +2064,7 @@ mod tests {
         assert_eq!(
             rows.len(),
             3,
-            "docs/server/api-spec.md:97 - a bounded range must return ONLY the days \
+            "docs/server/api-spec.md:347-352 - a bounded range must return ONLY the days \
              inside it, so today ({}) is excluded by from={} to={}. body: {body}",
             days[0],
             days[3],

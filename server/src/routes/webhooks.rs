@@ -1115,7 +1115,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "docs/server/api-spec.md:276 - an amount that disagrees with the stored row is              rejected. body: {body}"
+            "docs/server/api-spec.md:684 - an amount that disagrees with the stored row is              rejected. body: {body}"
         );
         assert_eq!(body["error"], json!("amount mismatch"), "{body}");
 
@@ -1288,13 +1288,13 @@ mod tests {
         assert_reconciled(&pool, account_id, "after an unrecognised status").await;
 
         // ...and it must not report a money-moving outcome. The status code is
-        // 200 because docs/server/api-spec.md:293 requires a fast 2xx so
+        // 200 because docs/server/api-spec.md:699 requires a fast 2xx so
         // Midtrans does not retry; the BODY is therefore the only signal, and
         // it must not be any of the success words.
         assert_eq!(
             status,
             StatusCode::OK,
-            "docs/server/api-spec.md:293 - respond 200 quickly so Midtrans does not retry: {body}"
+            "docs/server/api-spec.md:699 - respond 200 quickly so Midtrans does not retry: {body}"
         );
         for success in [
             "settled",
