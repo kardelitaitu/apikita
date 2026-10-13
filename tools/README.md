@@ -55,6 +55,7 @@ here must appear, and every name listed must exist.
 | [`fake-check/`](fake-check/README.md) | Runs both fake services against their own READMEs: every row of `fake-upstream`'s failure-injection table, and `fake-midtrans`'s signature checked character-for-character against the server's **pinned vector**. | Yes |
 | [`sqlite-probes-check/`](sqlite-probes-check/README.md) | Keeps the probes behind the **shipped** SQLite port running, and holds them to the count and the `STRICT` rows the plan calls its most important line. | Yes |
 | [`ci-docs-check/`](ci-docs-check/README.md) | Asserts the CI document describes the pipeline that actually runs — including this file. | Yes |
+| [`mutation-check/`](mutation-check/README.md) | Every gate that needs an optional tool exits **3** when it is absent rather than 0. Found `sqlite-probes-check` returning 0 beside the message "nothing was verified" — the only gate in the tree in that position. | Yes |
 
 ## Local scaffolding — not checks
 

@@ -20,6 +20,10 @@
 #                                                 so a future edit cannot quietly remove it
 #
 # Requires python3 with the stdlib sqlite3 module. No packages, matching the probes' own claim.
+#
+# Usage: sh tools/sqlite-probes-check/check.sh
+# Exit: 0 = every probe ran and its cited result still holds, 1 = a probe failed or the plan drifted,
+#       3 = python3 is not on PATH, so NOTHING was verified (never 0 - see the skip below).
 set -u
 
 REPO=$(cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -32,8 +36,16 @@ fail() {
 }
 
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "sqlite-probes-check: SKIPPED - python3 is not on PATH, so nothing was verified"
-    exit 0
+    # Exit 3, NOT 0, and this was a real defect rather than a style point.
+    #
+    # MEASURED by a gate that enumerates every tool under `tools/`: this was the ONLY gate in the repo that
+    # requires an optional tool and could not skip. All 14 others exit 3. The old line said "SKIPPED -
+    # nothing was verified" and then returned 0, which every other gate here treats as PASS - so on a
+    # runner without python3, fourteen gates would report green while the SQLite probes never ran.
+    # The message named the exact failure mode this directory's arrangement exists to avoid ("a silent
+    # pass on a machine that ran nothing") and then did it.
+    echo "sqlite-probes-check: SKIPPED - python3 is not on PATH, so nothing was verified" >&2
+    exit 3
 fi
 
 for p in sqlite-port-probe.py sqlite-timestamp-probe.py validate-migration-schema.py; do

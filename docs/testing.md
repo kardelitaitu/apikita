@@ -3128,3 +3128,50 @@ not on the graph agreeing with itself.
 **The rule is the one this file applies to every other scanner.** A graph is a scan of the source made
 at a moment; its negative is a question, and its freshness is part of the answer. Cite the generation
 with any count taken from it, and read the source before reporting that something is absent.
+
+
+#### A gate that reported PASS on a machine that ran nothing (round 44)
+
+The audit's own tooling had the defect it had been hunting for twenty rounds. `sqlite-probes-check`:
+
+```sh
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "sqlite-probes-check: SKIPPED - python3 is not on PATH, so nothing was verified"
+    exit 0
+fi
+```
+
+The message names the failure mode this repository's whole tooling arrangement exists to avoid — **a green
+run that verified nothing** — and then returns `0`, which every other gate here treats as a pass. On a
+runner without `python3`, fourteen gates would report green while the SQLite probes never ran once.
+
+**MEASURED rather than assumed:** it was the *only* gate under `tools/` that requires an optional tool and
+cannot skip. The other thirteen exit 3. The fix was verified two ways — the skip branch's code in
+isolation, and the real script under a deliberately `python3`-free `PATH`, which now prints the same message
+and **exits 3**.
+
+Fixed, plus a new 15th gate — **`mutation-check`** — that audits the gates exactly this way: *enumerate which
+ones shell out to an optional tool, and require those to exit 3.* It also caught a CI step I added without
+documenting it, via `ci-docs-check`, before it could land.
+
+**Two false starts, recorded because they are why the gate is shaped this way:**
+
+- It began as a **mutation-harness checker** and named `relay-check/behaviour.sh`, which failed six of its
+  seven checks. Reading the subject showed it is a **behavioural probe** — it runs a real nginx container and
+  times stream arrival, never mutates a file, and has no reason to restore one. A check that no script under
+  `tools/` performs a mutate-and-restore confirmed it. **The check was sound and the subject was invented** —
+  a gate built on a guessed subject reports false violations, the same defect it was built to catch.
+- Its second version was too broad: `relay-check: never exits 3`. But `relay-check` is a **static** check
+  documenting `Exit: 0/1/2` that needs no external tool, so it has no reason to skip. The rule had measured
+  "exits 3" rather than "can skip when it cannot run".
+
+**One measurement of my own was wrong, which is the more useful half of the round.** The run first reported
+**2 website test failures** — the `retired-whitepaper` guards. Reproducing them properly showed why:
+`npm test` runs `npm run build` first, and **WSL's Node 18 is rejected by Astro (`requires >= 22.12.0`)**. The
+build fails, `node --test` still runs, and the glob output differs from a clean run. The authoritative run on
+Windows is **236 pass / 0 fail**, and both the guard's regex and the retired figures were checked for real
+matches — none outside the whitelisted correction notes.
+
+**The WSL environmental limit was already on record and I nearly re-derived it from scratch:** that distro
+cannot run Docker and cannot build the website. `compose-check` and the website suite are Windows-only
+operations. A suite run from WSL is not a measurement of this codebase.

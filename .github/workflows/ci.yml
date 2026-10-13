@@ -1078,6 +1078,20 @@ jobs:
       - name: Check the shell hazards that destroy a measurement
         run: sh tools/shell-hazards/check.sh
 
+      # EVERY GATE MUST BE ABLE TO SKIP LOUDLY.
+      #
+      # A gate that needs an optional tool and returns 0 when it is absent reports PASS on a machine that
+      # verified nothing - the failure mode this repository's whole tooling arrangement exists to avoid.
+      #
+      # MEASURED: `sqlite-probes-check` did exactly that. Its message said "SKIPPED - python3 is not on
+      # PATH, so nothing was verified" and then `exit 0`. On a runner without python3, fourteen gates would
+      # go green while the SQLite probes never ran. It was the ONLY gate in the repo in that position; the
+      # other thirteen exit 3. Fixed to exit 3, and this step is what keeps a new gate from repeating it.
+      #
+      # It also asserts every gate documents its exit codes and its usage, so a verdict can be acted on.
+      - name: Check that every gate can skip loudly
+        run: sh tools/mutation-check/check.sh
+
       # EVERY `[PASS]` THE BENCHMARK PRINTS MUST BE EARNED.
       #
       # MEASURED over two rounds: three of its four scenarios printed `[PASS]` from a fixed string
