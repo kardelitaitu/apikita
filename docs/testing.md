@@ -3317,4 +3317,9 @@ catch a gate that could not report "I could not run", and it did — while the s
 the tool that had just been extended. The fix was not more checks; it was **consistency**, which is what makes
 the checks mean anything.
 
+**And a small thing on the way, of the same family:** `.agents/gates-on-linux.sh` printed
+`failing on Linux: 1 of 14` while running **16** gates — a typed number in a script, which is the drift the
+doc guards exist to catch and had no guard of its own. It now counts as it goes (`$fails of $total`), and
+verified it reports `1 of 16`.
+
 
