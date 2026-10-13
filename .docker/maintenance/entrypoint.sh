@@ -42,8 +42,17 @@
 #               NOT this one, deliberately: its retention work is already done by
 #               `run_retention`, so shipping it would add an image and a job for no
 #               behaviour. The retention WINDOW is still enforced -
-#               `run_retention` applies the same two DELETEs through sqlite3 - so
-#               the promise is kept; it is the binary that does not run here.
+#               `run_retention` applies the same FIVE deletes `purge_expired` owns
+#               (key_ip_seen, key_ip_daily, link_redemption_attempts, auth_attempts,
+#               link_code_issues) through sqlite3 - so the promise is kept; it is the
+#               binary that does not run here, not the sweep.
+#
+#               "THE SAME TWO DELETES" STOOD HERE AND WAS WRONG BY THREE. MEASURED:
+#               ip-purge.rs calls `ip_tracking::purge_expired`, which reports five
+#               counters - seen, daily, link_attempts, auth_attempts and link_issues -
+#               and run_retention carries a delete for each of the five. The two the
+#               old sentence named are the two that existed when ip-purge was written;
+#               three tables joined the sweep and the sentence kept its first number.
 #
 #   usage-purge HALF ITS WORK IS HERE, HALF IS A JOB - AND THE MISSING HALF WAS
 #               THE ONE THAT MOVES MONEY. server/src/bin/usage-purge.rs makes TWO
@@ -52,11 +61,22 @@
 #               `db::purge_expired_usage` reports five deletes - usage_events
 #               (90d), usage_daily (730d), expired/revoked sessions (30d),
 #               expired identity links, and terminal Telegram link codes - and
-#               `run_retention` applies ALL FIVE through sqlite3, so
-#               docs/data-retention.md is enforced here. Running the binary as
+#               `run_retention` covers ALL TEN tables the two Rust sweeps reach
+#               (these five, plus the five `ip_tracking::purge_expired` owns),
+#               so docs/data-retention.md is enforced here. Running the binary as
 #               well would repeat them; the statements are idempotent, so it is
 #               waste rather than harm, and `run_credit_expiry` below reports
 #               both counts so an operator sees them agree.
+#
+#               THIS SAID "APPLIES ALL FIVE", AND FIVE WAS THE WRONG NUMBER IN A
+#               SENTENCE THAT HAD THE RIGHT LIST BESIDE IT. MEASURED: run_retention
+#               deletes from nine tables through `retention_delete`/`_instant`
+#               (key_ip_seen, key_ip_daily, usage_daily, usage_events, sessions,
+#               link_redemption_attempts, auth_attempts, link_code_issues,
+#               link_codes) plus `identity_tokens` inline - ten, which is what
+#               db.rs's own sweep doc says the fleet-wide total is. The error was
+#               reading "the five purge_expired_usage reports" as the whole of
+#               run_retention when it is the union of BOTH Rust sweeps.
 #
 #               `db::expire_credit` is the one that is NOT inline, and this
 #               comment used to say so while leaving it that way: "NO CREDIT
