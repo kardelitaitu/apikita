@@ -247,6 +247,32 @@ idle most of the time.
 | TLS handshakes at high rate | The real CPU cost — session resumption helps |
 | Volumetric flood | Cloudflare absorbs it first |
 
+**THE TABLE ABOVE REASONS ABOUT MEMORY, AND THE BINDING RESOURCE IS CONNECTION SLOTS.** Memory per idle
+connection really is small and SSE connections really are idle most of the time — that reasoning is sound
+and it is about the resource that is *not* scarce here.
+
+**`worker_connections` is not set**, so nginx applies its own default, and that default is a hard ceiling
+on simultaneous connections. It decides how many live dashboards this relay can hold, because an SSE stream
+holds a connection for its whole life. Nobody chose the number, measured it, or wrote it down.
+
+The arithmetic, so the gap has a size — `realtime.max_connections_per_account = 5` and
+`max_stream_seconds = 1800` let each customer hold five streams for thirty minutes:
+
+```
+200 customers x 5 streams  = 1000 simultaneous connections
+an SSE connection costs    = 2 slots (client side + upstream side)
+to carry the "comfortable" load you need at least 2000 slots
+```
+
+**It cannot be fixed in `relay.conf`.** That file is mounted at `/etc/nginx/conf.d/default.conf`, which
+nginx includes *inside* its `http {}` block — `events {}` is a `main`-context directive, so adding it there
+is a configuration error and the relay refuses to start. It has to go in the image's own `nginx.conf`
+(or `--worker-connections`), together with `worker_rlimit_nofile`, because a process can hit its
+file-descriptor limit first. nginx logs **"worker_connections are not enough"** when this binds.
+
+**Open item, not a mystery:** until the image sets it, the ceiling is whatever nginx defaults to, and the
+Sizing table's "comfortable" claim is unverified against the resource that actually binds.
+
 See [`docs/cost-and-sizing.md`](cost-and-sizing.md) for how this fits the budget.
 
 ## Observability

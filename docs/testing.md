@@ -476,6 +476,43 @@ sweep confirmed **199 of 199** settings have a field.
 **What this bought: the class is exhausted rather than lucky.** Round 37 was the one instance where the two
 numbers disagreed.
 
+#### The relay's connection ceiling, and the fix that would have broken it (round 39)
+
+Round 38's next step was to check the *cross-file* version of the pair form: the relay config and the server
+config are separate files written by different tools, and **nothing compares them**. That sweep was clean —
+`proxy_read_timeout` on the SSE locations, `client_max_body_size` vs `max_body_bytes`, and `limit_conn` vs
+`max_concurrent_requests` all bound different things in different scopes, and the two `1h` timeouts are
+present on **both** streaming locations.
+
+But it surfaced something the deployment path had not shown: **`worker_connections` is unset**, so nginx
+applies its own default, and that default is a hard ceiling on simultaneous connections. SSE streams hold a
+connection for their whole life, so it — not the rate limits, and not memory — decides how many live
+dashboards the relay can hold.
+
+The arithmetic, from two settings the server *does* state:
+
+```
+realtime.max_connections_per_account = 5  and  max_stream_seconds = 1800
+200 customers x 5 streams = 1000 simultaneous connections
+an SSE connection costs 2 slots (client + upstream) -> 2000 to carry "comfortable"
+```
+
+**And `docs/edge-relay.md`'s Sizing table calls ~200 customers "Comfortable" while reasoning only about
+memory** — *"per idle connection is small, and SSE connections are idle most of the time."* Sound, and about
+the resource that is not scarce. The same shape as the container-log and temp-file findings: a resource that
+looks bounded because a **different** one is.
+
+**I could not fix it in `relay.conf`, and trying would have broken the relay.** The obvious change is an
+`events { worker_connections 4096; }` block — but that file is mounted at
+`/etc/nginx/conf.d/default.conf`, which nginx includes **inside** its `http {}` block, and `events` is a
+`main`-context directive. Adding it is a configuration error and nginx refuses to start. Caught before
+committing, and recorded in the file itself so the next person does not retry it: the value has to go in
+the image's own `nginx.conf` or `--worker-connections`, alongside `worker_rlimit_nofile`, since a process
+can hit its file-descriptor limit first. nginx logs *"worker_connections are not enough"* when this binds.
+
+**So the ceiling is an acknowledged open item rather than a silent default**, in both the config — where a
+reader would look for it — and the Sizing section whose claim it qualifies.
+
 hyper's HTTP/1 builder; it is not wired, and it is no longer claimed.
 
 #### `doc_claims`: the retention check, measured in both directions (round 28)
