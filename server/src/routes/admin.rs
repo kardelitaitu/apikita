@@ -113,7 +113,8 @@ impl From<AppError> for AdminError {
 }
 
 /// A raw sqlx failure on the request path is an AppError::Database, exactly as
-/// it is everywhere else in the crate (error.rs:84). Without this, every
+/// it is everywhere else in the crate (the `AppError::Database` variant in
+/// `error.rs`). Without this, every
 /// question-mark on a query inside this module would have to be spelled
 /// map_err(AppError::from) by hand.
 impl From<sqlx::Error> for AdminError {

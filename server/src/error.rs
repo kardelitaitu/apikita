@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use axum::{
     http::StatusCode,
@@ -272,6 +274,67 @@ pub struct MoneyCounter {
     undercharged_idr: AtomicU64,
 }
 
+/// Per-reason counts for the requests the proxy REFUSED before costing anyone anything.
+///
+/// `docs/observability.md` has carried a `proxy_rejections_total{reason}` row in its
+/// "Rejection reasons" table since the document was written, with the note that it is
+/// "a genuinely good idea that no code computes". That note was accurate, and it is
+/// what this closes.
+///
+/// WHY THE KEY IS `AppError::code()` AND NOT A NEW VOCABULARY. The reasons an operator
+/// would act on are ALREADY the codes this service returns — `key_revoked`,
+/// `model_not_allowed`, `rate_limited`, `key_limit_exceeded`,
+/// `insufficient_balance` — and `code()` is the CLIENT-FACING contract
+/// (`docs/error-model.md`), so it is a closed set that already has a guard on it.
+/// Inventing a second list would have been the duplicate-rules-drift defect this
+/// repository keeps writing guards against. The doc's own draft list had already
+/// drifted from the codes in two places (`model_denied` for `model_not_allowed`,
+/// `limit_exceeded` for `key_limit_exceeded`).
+///
+/// WHAT IS DELIBERATELY NOT COUNTED: no per-account, no per-model, no path. This
+/// payload is served on an operator-authenticated route, but a cardinality-keyed map
+/// is how a metrics surface quietly becomes a surveillance surface — and
+/// `ServerErrorCounter`'s "two integers and nothing else" rule is the precedent.
+///
+/// WHAT IS ALSO DELIBERATELY NOT COUNTED: a refusal that COSTS money. A 402 after a
+/// reservation was taken is a settlement, not a rejection, and
+/// `insufficient_balance` here means the refusal fired before any hold moved.
+#[derive(Debug, Default)]
+pub struct RejectionCounter {
+    counts: Mutex<BTreeMap<String, u64>>,
+}
+
+impl RejectionCounter {
+    /// One refusal, filed under its documented code.
+    pub fn record(&self, code: &str) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counts.entry(code.to_string()).or_insert(0) += 1;
+    }
+
+    /// Every reason that has fired at least once, in code order.
+    ///
+    /// Reasons that have NEVER fired are absent rather than present-as-zero, so the
+    /// payload cannot grow to the size of the whole code table on a quiet service —
+    /// and a reason going non-zero for the first time is a visible event.
+    pub fn counts(&self) -> Vec<(String, u64)> {
+        self.counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(code, count)| (code.clone(), *count))
+            .collect()
+    }
+}
+
+/// The process-wide rejection counter. See `RejectionCounter`.
+pub fn rejection_counter() -> &'static RejectionCounter {
+    static COUNTER: std::sync::OnceLock<RejectionCounter> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(RejectionCounter::default)
+}
+
 impl MoneyCounter {
     /// One clamped settlement, carrying the shortfall that was not collected.
     ///
@@ -351,6 +414,31 @@ impl IntoResponse for AppError {
         counter.record_response();
         if status.is_server_error() {
             counter.record_error();
+        }
+        // COUNT THE REJECTION BY REASON, in this same single place so it cannot drift
+        // from what is actually returned. RejectionCounter is keyed on code(), which is
+        // the client-facing contract - so the breakdown docs/observability.md names is
+        // served without a second vocabulary that could disagree with it.
+        //
+        // ONLY THE 4xx THAT ARE THE PROXY OWN GATE FIRING, and the filter matters more
+        // than the increment. A 5xx is not a rejection: the request would have been served
+        // and the provider failed, which is ServerErrorCounter numerator. A 401 on /api/*
+        // is authentication, not a proxy decision. So the set is the admission refusals -
+        // bad or absent credential, model not sellable, key over a ceiling, rate limit, or
+        // the wallet short - and every one of them preceded any hold leaving the wallet.
+        if status.is_client_error() {
+            match code.as_str() {
+                "key_revoked"
+                | "key_expired"
+                | "model_not_allowed"
+                | "key_limit_exceeded"
+                | "insufficient_balance"
+                | "rate_limited"
+                | "unauthenticated" => {
+                    rejection_counter().record(&code);
+                }
+                _ => {}
+            }
         }
 
         // The detail moves to the log, not out of the system. `Display` keeps
@@ -436,6 +524,65 @@ mod tests {
             money.undercharged_idr(),
             90_200,
             "the SUM is the actionable half: 2 events of 200 is noise, and the total is what an operator pages on"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RejectionCounter: the reason breakdown, keyed on the documented code
+    // -----------------------------------------------------------------------
+
+    /// THE REASONS ARE THE CODES THE SERVICE ALREADY RETURNS, and that is the whole design:
+    /// a second vocabulary would drift from the client-facing contract, which is exactly what
+    /// docs/observability.md's own draft list had already done in two places.
+    #[test]
+    fn a_rejection_is_filed_under_the_code_it_was_returned_as() {
+        let counter = RejectionCounter::default();
+        counter.record("insufficient_balance");
+        counter.record("insufficient_balance");
+        counter.record("rate_limited");
+
+        assert_eq!(
+            counter.counts(),
+            vec![
+                ("insufficient_balance".to_string(), 2),
+                ("rate_limited".to_string(), 1),
+            ],
+            "counts must aggregate per code, and in code order so the payload is stable"
+        );
+    }
+
+    /// A REASON THAT HAS NEVER FIRED IS ABSENT, not zero.
+    ///
+    /// This is what keeps a quiet service from publishing an entry for every code in
+    /// error-model.md, and it is why a reason going non-zero for the FIRST time is a
+    /// visible event rather than one line changing among many.
+    #[test]
+    fn a_reason_that_has_never_fired_is_absent_not_zero() {
+        let counter = RejectionCounter::default();
+        counter.record("key_revoked");
+        let counts = counter.counts();
+        assert_eq!(counts.len(), 1, "only the code that fired is reported");
+        assert_eq!(counts[0].0, "key_revoked");
+    }
+
+    /// Poison must not take the metrics path down: one panicking recording thread must not
+    /// make every later rejection reading panic on the /api/admin/metrics route.
+    #[test]
+    fn a_poisoned_rejection_lock_recovers_instead_of_panicking() {
+        let counter = RejectionCounter::default();
+        {
+            let _held = counter.counts.lock().expect("fresh lock is unpoisoned");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                panic!("poison the rejection lock");
+            }))
+            .ok();
+        }
+
+        counter.record("rate_limited");
+        assert_eq!(
+            counter.counts(),
+            vec![("rate_limited".to_string(), 1)],
+            "recording and reading must both survive a poisoned lock"
         );
     }
 
@@ -1167,6 +1314,51 @@ mod tests {
     // ---------------------------------------------------------------------
     // Response shape
     // ---------------------------------------------------------------------
+
+    /// A REFUSAL DRIVEN THROUGH THE REAL RESPONSE PATH MOVES THE COUNTER, and the negative
+    /// control beside it is what makes that a measurement.
+    ///
+    /// A test that called rejection_counter().record() directly would pass with the wiring
+    /// deleted, because the counter and its call site are different things. This one builds
+    /// the whole response through respond(), exactly as the proxy does.
+    #[tokio::test]
+    async fn a_refusal_through_the_response_path_is_counted() {
+        let counter = rejection_counter();
+        // The process-global counter is shared with every other test in this binary, so the
+        // BEFORE value is read rather than assumed zero. A hard-coded 0 would be flaky for a
+        // reason that has nothing to do with what this asserts.
+        let before = counter
+            .counts()
+            .iter()
+            .find(|(code, _)| code == "insufficient_balance")
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+
+        let _ = respond(AppError::InsufficientBalance { details: None }).await;
+
+        let after = counter
+            .counts()
+            .into_iter()
+            .find(|(code, _)| code == "insufficient_balance")
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        assert_eq!(
+            after,
+            before + 1,
+            "a 402 refusal must move the counter, so a reason that stops firing is a decision somebody made rather than something that broke"
+        );
+
+        // NEGATIVE CONTROL: a NON-rejection must not move it. A 5xx is the error rate
+        // numerator, not a rejection - the request would have been served and the provider
+        // failed, which is a different question needing a different action.
+        let before_all: u64 = counter.counts().iter().map(|(_, n)| n).sum();
+        let _ = respond(AppError::Internal("boom".to_string())).await;
+        let after_all: u64 = counter.counts().iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            after_all, before_all,
+            "a 5xx is not a rejection: counting it here would report a provider outage as a customer being refused, and the two need different actions"
+        );
+    }
 
     #[tokio::test]
     async fn the_response_body_has_the_documented_shape() {

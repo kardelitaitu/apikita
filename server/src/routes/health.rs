@@ -98,6 +98,7 @@ pub(crate) fn metrics_payload(
     money: &crate::error::MoneyCounter,
     unhealthy_models: &[String],
     endpoint_traffic: &[(String, u64, u64)],
+    rejection_counts: &[(String, u64)],
     retention: &crate::db::RetentionLag,
     today: chrono::NaiveDate,
 ) -> serde_json::Value {
@@ -168,6 +169,25 @@ pub(crate) fn metrics_payload(
         // null would make the alert treat a healthy service as unmeasured.
         "undercharges": undercharges,
         "undercharged_idr": undercharged_idr,
+        // WHY THE PROXY REFUSED WHAT IT REFUSED, by the documented code. This is the row
+        // docs/observability.md has carried as "a genuinely good idea that no code computes"
+        // since the document was written.
+        //
+        // Keyed on `AppError::code()`, which is the client-facing contract and therefore a
+        // CLOSED set: a second vocabulary would have been the duplicate-rules-drift defect
+        // this repository writes guards against, and the doc own draft list had already
+        // drifted from the codes in two places.
+        //
+        // A reason that has never fired is ABSENT, not zero, so a quiet service does not grow
+        // an entry per code in the table and a first firing is visible.
+        //
+        // The monitoring value is the SHAPE, not the total: a spike in `insufficient_balance`
+        // is a business signal (customers running dry) while a spike in `rate_limited` is
+        // either growth or abuse. The same count in the other direction is a config error.
+        "rejections": rejection_counts
+            .iter()
+            .map(|(code, count)| json!({ "reason": code, "count": count }))
+            .collect::<Vec<_>>(),
         "endpoint_traffic": endpoint_traffic
             .iter()
             .map(|(name, served, failed)| json!({
@@ -267,6 +287,13 @@ pub async fn operator_metrics(
                 // matters most.
                 "undercharges": crate::error::money_counter().undercharges(),
                 "undercharged_idr": crate::error::money_counter().undercharged_idr(),
+                // Present in the DEGRADED payload too: an operator paged during an incident
+                // must still see why traffic is being refused.
+                "rejections": crate::error::rejection_counter()
+                    .counts()
+                    .iter()
+                    .map(|(code, count)| json!({ "reason": code, "count": count }))
+                    .collect::<Vec<_>>(),
                 "unhealthy_models": crate::routes::proxy::models_with_no_healthy_endpoint(),
                 "endpoint_traffic": crate::routes::proxy::endpoint_traffic(),
                 "retention": { "behind": null, "error": "the retention read failed" },
@@ -280,6 +307,7 @@ pub async fn operator_metrics(
         crate::error::money_counter(),
         &crate::routes::proxy::models_with_no_healthy_endpoint(),
         &crate::routes::proxy::endpoint_traffic(),
+        &crate::error::rejection_counter().counts(),
         &retention,
         today,
     ))
@@ -873,7 +901,7 @@ mod tests {
         // ZERO IS A REAL AND GOOD READING, unlike error_rate's null for an empty window:
         // no undercharges is the normal state, and reporting it as null would make the
         // alert treat a healthy service as unmeasured.
-        let payload = metrics_payload(&counter, &money, &[], &[], &Default::default(), today);
+        let payload = metrics_payload(&counter, &money, &[], &[], &[], &Default::default(), today);
         assert_eq!(payload["undercharges"], json!(0));
         assert_eq!(payload["undercharged_idr"], json!(0));
         assert!(
@@ -883,13 +911,56 @@ mod tests {
 
         money.record_undercharge(200);
         money.record_undercharge(90_000);
-        let payload = metrics_payload(&counter, &money, &[], &[], &Default::default(), today);
+        let payload = metrics_payload(&counter, &money, &[], &[], &[], &Default::default(), today);
         assert_eq!(payload["undercharges"], json!(2));
         assert_eq!(
             payload["undercharged_idr"],
             json!(90_200),
             "the SUM is the actionable half and must be the figure an operator is paged on"
         );
+    }
+
+    /// THE PAYLOAD CARRIES THE REASON BREAKDOWN, and it is an OBJECT keyed by code rather than
+    /// a list so a consumer can index a reason directly.
+    #[test]
+    fn the_payload_carries_rejections_by_reason() {
+        let counter = crate::error::ServerErrorCounter::default();
+        let rejections = crate::error::RejectionCounter::default();
+        rejections.record("insufficient_balance");
+        rejections.record("insufficient_balance");
+        rejections.record("rate_limited");
+
+        let payload = metrics_payload(
+            &counter,
+            &Default::default(),
+            &[],
+            &[],
+            &rejections.counts(),
+            &Default::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        );
+
+        let list = payload["rejections"]
+            .as_array()
+            .expect("rejections is an array");
+        assert_eq!(list.len(), 2, "only the reasons that fired are present");
+        assert_eq!(list[0]["reason"], json!("insufficient_balance"));
+        assert_eq!(list[0]["count"], json!(2));
+        assert_eq!(list[1]["reason"], json!("rate_limited"));
+        assert_eq!(list[1]["count"], json!(1));
+
+        // A QUIET service reports an empty array, not a missing key: a consumer must be able
+        // to index it and learn "nothing was refused" rather than guess.
+        let empty = metrics_payload(
+            &crate::error::ServerErrorCounter::default(),
+            &Default::default(),
+            &[],
+            &[],
+            &[],
+            &Default::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        );
+        assert_eq!(empty["rejections"], json!([]));
     }
 
     /// THE PAYLOAD CARRIES PER-ENDPOINT TRAFFIC, and it is a LIST rather than an object
@@ -905,6 +976,7 @@ mod tests {
         let payload = metrics_payload(
             &counter,
             &Default::default(),
+            &[],
             &[],
             &[],
             &Default::default(),
@@ -926,6 +998,7 @@ mod tests {
             &Default::default(),
             &[],
             &traffic,
+            &[],
             &Default::default(),
             today,
         );
@@ -960,6 +1033,7 @@ mod tests {
             &Default::default(),
             &[],
             &[],
+            &[],
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -978,6 +1052,7 @@ mod tests {
             &counter,
             &Default::default(),
             &down,
+            &[],
             &[],
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
@@ -998,6 +1073,7 @@ mod tests {
         let payload = metrics_payload(
             &crate::error::ServerErrorCounter::default(),
             &Default::default(),
+            &[],
             &[],
             &[],
             &Default::default(),
@@ -1025,6 +1101,7 @@ mod tests {
             &Default::default(),
             &[],
             &[],
+            &[],
             &Default::default(),
             chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         );
@@ -1048,6 +1125,7 @@ mod tests {
         let payload = metrics_payload(
             &mixed,
             &Default::default(),
+            &[],
             &[],
             &[],
             &Default::default(),

@@ -101,8 +101,10 @@ did not agree to. Log token **counts**, never content.
 > operator-authenticated, so endpoint names are safe there; **the public `/health` route
 > must never carry them**, which is why this lives on the admin payload.
 >
-> Until a backend exists, treat this section as the argument for one — including the
-> rejection-reason breakdown below, which is a genuinely good idea that no code computes.
+> Until a backend exists, treat this section as the argument for one. **The
+> rejection-reason breakdown below is now REAL** — `rejections` on the same
+> `GET /api/admin/metrics` payload — and it is the second row of this section to gain an
+> implementation rather than an argument, after `endpoint_traffic`.
 >
 > This is NOT the same statement as the one under **Alerts**, which says the alerts are
 > "implemented" and evaluated "without a metrics backend" by `check-alerts.sh` (SQL against
@@ -135,11 +137,23 @@ Keep it small. Three categories:
 
 | Metric | Meaning |
 | --- | --- |
-| `proxy_rejections_total{reason}` | `no_key`, `revoked`, `model_denied`, `rate_limited`, `limit_exceeded`, `insufficient_balance` |
+| `rejections` on `GET /api/admin/metrics` | `{reason, count}` per code that has fired: `insufficient_balance`, `rate_limited`, `key_limit_exceeded`, `model_not_allowed`, `key_revoked`, `key_expired`, `unauthenticated` |
 
 **Break rejections down by reason.** A spike in `insufficient_balance` is a
 business signal (customers running dry). A spike in `rate_limited` is either growth
 or abuse.
+
+**It is keyed on `AppError::code()`, which is why the row no longer publishes a list of
+its own.** The draft list above read `no_key`, `revoked`, `model_denied`,
+`limit_exceeded` — **none of which are codes this service returns**; the real ones are
+`key_revoked`, `key_expired`, `model_not_allowed`, `key_limit_exceeded`. A second
+vocabulary would have been the duplicate-rules-drift defect this repository writes guards
+against, so the counter files each refusal under the code it was actually returned as.
+
+**A reason that has never fired is ABSENT, not zero**, so a quiet service does not grow an
+entry per code in the table and a first firing is visible. **Rejections that cost money are
+not counted here**: a 402 raised *after* a hold left the wallet is a settlement (see
+`proxy_undercharge`), not an admission refusal.
 
 ## Alerts
 
