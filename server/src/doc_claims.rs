@@ -2597,6 +2597,64 @@ mod tests {
         );
     }
 
+    /// THE DRAIN ARITHMETIC `docs/deployment.md` PUBLISHES IS THE ONE `main.rs` IMPLEMENTS.
+    ///
+    /// THE DOCUMENT IS LOAD-BEARING HERE, and it says so: *"`--stop-timeout 30` on the `docker
+    /// run` above is load-bearing. Docker sends `SIGTERM`, waits for the grace period (default 10
+    /// seconds), then sends `SIGKILL`."* It then does the arithmetic - *the serve loop gets
+    /// `DRAIN_TIMEOUT` (5 s) and the task tracker gets `DRAIN_TIMEOUT` again, so the worst case is
+    /// 2 x 5 s = 10 s* - and draws the conclusion that without `--stop-timeout 30` the SIGKILL
+    /// lands exactly on the drain's worst case.
+    ///
+    /// EVERY NUMBER IN THAT ARGUMENT WAS A LITERAL WITH NO READER. Changing `DRAIN_TIMEOUT` to
+    /// `from_secs(8)` would have left the document telling an operator to size the stop window
+    /// against 10s while the process could take 16 - and the failure mode is a kill mid-drain,
+    /// which the document itself calls SILENT. Third instance of one shape: a value stated as
+    /// fact in a document and compared to nothing (see `rate_limit_status` and the cooldown
+    /// figures), and the first whose wrong value would surface in an incident rather than to a
+    /// reader.
+    ///
+    /// THE CONSTANT IS READ FROM `main.rs` RATHER THAN IMPORTED, because it is private to that
+    /// binary crate. That is a weaker coupling than a shared constant and it is stated rather than
+    /// hidden: what this checks is that the FIGURE is still `from_secs(5)`, which is the thing the
+    /// document copies. A refactor that moved the value elsewhere fails the parse below and says
+    /// so, rather than passing over nothing.
+    #[test]
+    fn the_deployment_document_publishes_the_drain_timeout_the_code_uses() {
+        let main_rs = read_repo_file("server/src/main.rs");
+        let deploy = read_repo_file("docs/deployment.md");
+
+        // The constant's value, as a number of seconds.
+        let secs: u64 = main_rs
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix("const DRAIN_TIMEOUT")?;
+                let rest = rest.split("from_secs(").nth(1)?;
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse().ok()
+            })
+            .expect("main.rs must still define `const DRAIN_TIMEOUT = Duration::from_secs(N)`, or this guard is parsing something other than the value it compares");
+        assert!(
+            secs > 0,
+            "a zero drain timeout would make both phases no-ops"
+        );
+
+        // BOTH FIGURES: the per-phase one and the doubled total the operator is told to size
+        // against. Asserting only one would let the other drift.
+        assert!(
+            deploy.contains(&format!("`DRAIN_TIMEOUT` ({secs} s)")),
+            "docs/deployment.md must state the per-phase budget as the shipped {secs} s; it currently states a literal that nothing compares to main.rs"
+        );
+        let total = secs * 2;
+        assert!(
+            // THE MULTIPLICATION SIGN, not the letter x: MEASURED, the document writes
+            // "2 × 5 s = 10 s" with U+00D7, and an ASCII-x matcher failed here on the first run.
+            // Worth the note because the failure read as a wrong NUMBER when it was a wrong
+            // CHARACTER - the assertion compared the figures and never reached them.
+            deploy.contains(&format!("2 × {secs} s = {total} s")),
+            "docs/deployment.md's worst-case arithmetic must be 2 x {secs} = {total} s, because the document uses that total to tell an operator how to size --stop-timeout, and a wrong total means a SIGKILL mid-drain - which the document itself calls silent"
+        );
+    }
     /// THE NUMBERS `docs/failover.md` STATES ARE THE ONES THE CONFIG SHIPS.
     ///
     /// THE DOC NAMES THREE NUMBERS AS FACTS - `After cooldown_seconds (default 30)`, `capped at
