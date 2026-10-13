@@ -394,6 +394,28 @@ mod tests {
             line.contains("401"),
             "rate_limit_status must park a 401: it is a KEY being rejected, not a caller being refused, and least-loaded selection makes a fast-failing key the one picked most. 403 stays out deliberately - it is a configuration decision, not a broken credential."
         );
+
+        // AND 403 IS ABSENT, which the sentence above CLAIMED while this test only checked the
+        // other half. That asymmetry is the defect this addition closes: a comment asserting a
+        // property is not the property, and the assertion it sat beside could not fail for the
+        // claim it made.
+        //
+        // WHY IT NEEDS ITS OWN ASSERTION RATHER THAN BEING IMPLIED. MEASURED: the client-level
+        // test `a_403_does_not_park_the_key` builds its pool from a FIXTURE literal, so adding
+        // 403 to this file would leave that test GREEN - it never reads the shipped config. The
+        // two tests cover different objects: that one pins what the ROUTER does with a 403, and
+        // this one pins what the CONFIG asks for. Only this one can see the file.
+        //
+        // The cost of the exclusion is real and documented in docs/failover.md - a revoked key
+        // answering 403 keeps being selected - so the assertion is not "403 is bad", it is "the
+        // reasoning in that document still matches the shipped value".
+        assert!(
+            !line.contains("403"),
+            "403 must NOT be in the shipped rate_limit_status: docs/failover.md excludes it so that \
+             one refused model does not withdraw a working key from rotation, and its cost (a \
+             revoked key answering 403 keeps being selected) is stated rather than hidden. Adding \
+             it here is a one-line change that document must be updated for: {line}"
+        );
     }
     #[test]
     fn a_401_frees_the_slot_without_parking_the_key() {
