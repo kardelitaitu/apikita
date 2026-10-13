@@ -72,10 +72,18 @@ did not agree to. Log token **counts**, never content.
 >
 > **What an operator has instead is `GET /api/admin/metrics`** (operator-only), and it does
 > NOT serve these names. Its payload is `server_errors`, `responses`, `error_rate`,
-> `unhealthy_models`, `endpoint_traffic`, `undercharges`, `rejections`, `rejection_rate`,
-> `proxy_requests` and `retention` — a different shape, read from
-> in-process counters and one database query, not from a time-series store. So a reader who
-> greps for `topups_settled_total` finds this table and nothing that produces it.
+> `unhealthy_models`, `undercharges`, `undercharged_idr`, `rejections`, `rejection_rate`,
+> `proxy_requests`, `active_streams`, `peak_streams`, `endpoint_traffic` and `retention` — a
+> different shape, read from in-process counters and one database query, not from a
+> time-series store. So a reader who greps for `topups_settled_total` finds this table and
+> nothing that produces it.
+>
+> **That list is checked in both directions** by
+> `the_metrics_payload_is_the_one_the_document_describes`: an emitted field missing here is one
+> an operator cannot look up, and a name here the route does not emit is a promise it does not
+> keep. It had gone stale — `undercharged_idr`, `active_streams` and `peak_streams` were all
+> emitted and none was named — which is why the guard exists rather than a corrected sentence
+> alone.
 >
 > **`endpoint_traffic` IS THE CLOSEST THING HERE TO A REAL ROUTING METRIC, and it is worth
 > the note because it answers a question none of the names below can.** It is a LIST of

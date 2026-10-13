@@ -2597,6 +2597,129 @@ mod tests {
         );
     }
 
+    /// THE PAYLOAD `docs/observability.md` DESCRIBES IS THE PAYLOAD THE ROUTE EMITS.
+    ///
+    /// THE DOC ALREADY DISCLOSES THE MOST IMPORTANT PART OF THIS - that the Prometheus-style
+    /// names in its Metrics table are a SPEC and are emitted nowhere - and it does so by NAME:
+    /// *"Five of the names below (http_requests_total, proxy_requests_total, topups_settled_total,
+    /// topups_rejected_total, wallet_balance_sum_idr) appear in this document and NOWHERE else in
+    /// the repository - measured, and the reason this note exists."* That is the right shape, and
+    /// it is why this guard is about the OTHER half.
+    ///
+    /// Because the note then says what an operator HAS instead: *"Its payload is server_errors,
+    /// responses, error_rate, unhealthy_models, endpoint_traffic, undercharges, rejections,
+    /// rejection_rate, proxy_requests and retention"* - and that list went STALE the moment the
+    /// sizing work landed. `undercharged_idr`, `active_streams` and `peak_streams` are all emitted
+    /// today and none is in that sentence, so a reader comparing the document to the route finds
+    /// three fields the document does not admit to. MEASURED before this was written.
+    ///
+    /// BOTH DIRECTIONS, because each is a different failure: an emitted key absent from the doc is
+    /// a field an operator cannot look up, and a documented key absent from the payload is a
+    /// promise the route does not keep. The doc is parsed from that one sentence so the coupling
+    /// is to the prose a reader actually sees, not to a list restated here.
+    #[test]
+    fn the_metrics_payload_is_the_one_the_document_describes() {
+        let route = read_repo_file("server/src/routes/health.rs");
+        let doc = read_repo_file("docs/observability.md");
+
+        // The top-level keys of the `json!({...})` the payload function returns, found by
+        // brace-matching from the macro so a nested object cannot be mistaken for a top-level
+        // field - a nested key would otherwise read as an undocumented addition.
+        let start = route
+            .find("fn metrics_payload")
+            .expect("metrics_payload must still exist, or this checks nothing");
+        let body = &route[start..];
+        let open = body
+            .find("json!({")
+            .expect("the payload must still be built by a json! macro");
+        let mut depth: i32 = 0;
+        let mut end = None;
+        for (k, ch) in body[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block = &body[open..end.expect("the json! object must close")];
+
+        // A top-level field is indented by eight spaces in that block; nested ones are deeper.
+        let emitted: Vec<String> = block
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("        \"")?;
+                let (key, _) = rest.split_once("\":")?;
+                Some(key.to_string())
+            })
+            .collect();
+        assert!(
+            emitted.len() > 8,
+            "only {} top-level payload keys were parsed, so this guard is reading the wrong block",
+            emitted.len()
+        );
+
+        // The sentence a reader sees, between its own markers.
+        let (_, after) = doc.split_once("Its payload is ").expect(
+            "observability.md must still name the payload; that sentence is what a reader uses",
+        );
+        let (listed, _) = after
+            // THE SENTENCE ENDS AT "— a", and BOTH halves of that marker cost a run. First the dash:
+            // the document writes U+2014 and the first attempt used an ASCII hyphen. Then the wrap:
+            // the document breaks the line between "— a" and "different shape", so a marker spanning
+            // that break never matches. Both failures READ AS WRONG NUMBERS when they were wrong
+            // BYTES, which is why they are written down rather than quietly fixed.
+            .split_once("— a")
+            .expect("the payload sentence must still end before the following paragraph");
+        let listed: Vec<String> = listed
+            // COMMA AND WHITESPACE, because the sentence is a comma list whose LAST TWO names are
+            // joined by "and": "... `endpoint_traffic` and `retention`". A comma-only split leaves
+            // those as one token and reports BOTH as undocumented - MEASURED, which is what the run
+            // before this one did.
+            .split([',', ' ', '\n', '\r', '>'])
+            // EACH NAME IS STRIPPED OF THE BLOCKQUOTE PREFIX, because the sentence wraps across
+            // lines: the raw text is "`...retention` — a\r\n> different shape", and without this a
+            // name landing after a wrap keeps its "> " and reads as undocumented. MEASURED: four
+            // names - unhealthy_models, proxy_requests, endpoint_traffic, retention - were reported
+            // missing for exactly that reason before this line existed.
+            .map(|s| {
+                s.trim()
+                    .trim_start_matches('>')
+                    .trim()
+                    .trim_matches('`')
+                    .trim()
+                    .to_string()
+            })
+            // "and" is lowercase-with-underscores only in the sense that it is lowercase letters, so
+            // it survives the identifier test below and would read as an undocumented KEY. Named
+            // explicitly rather than left to the character filter.
+            .filter(|s| {
+                !s.is_empty() && s != "and" && s.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            })
+            .collect();
+        assert!(
+            listed.len() > 8,
+            "only {} payload names were parsed from the document, so this guard is reading the wrong sentence: {listed:?}",
+            listed.len()
+        );
+
+        let undocumented: Vec<&String> = emitted.iter().filter(|k| !listed.contains(k)).collect();
+        let unemitted: Vec<&String> = listed.iter().filter(|k| !emitted.contains(k)).collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "the metrics payload emits {undocumented:?} and docs/observability.md's sentence does not name them, so an operator cannot look the field up. Update that sentence in the same commit that adds a field."
+        );
+        assert!(
+            unemitted.is_empty(),
+            "docs/observability.md promises {unemitted:?} in the payload and the route does not emit them, which is a promise the route does not keep."
+        );
+    }
     /// THE DRAIN ARITHMETIC `docs/deployment.md` PUBLISHES IS THE ONE `main.rs` IMPLEMENTS.
     ///
     /// THE DOCUMENT IS LOAD-BEARING HERE, and it says so: *"`--stop-timeout 30` on the `docker
