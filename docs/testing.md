@@ -3280,3 +3280,41 @@ silently passing. Closed anyway, because the README's promise was being asserted
 gates and `mutation-check` does not cover it. Its exit-3 contract is therefore unenforced by the gate that
 enforces everyone else's.
 
+#### The gate that sat outside the framework it existed to audit (round 48)
+
+The round-47 finding was a wiring inconsistency, and it belongs to `mutation-check` rather than to
+`fake-check`: the one gate auditing that *every other gate* can skip loudly was itself reachable only as a
+raw `node` call.
+
+**MEASURED rather than assumed:** 16 CI invocations, 15 through a `check.sh`, one raw:
+
+```
+node tools/fake-check/fake-check.js      <- the only one outside the framework
+```
+
+The other 13 directories without a `check.sh` are the **action** tools their `-check` counterpart drives
+(`backup/`, `drill/`, `reconcile/`, `rollback/`, `alert/`, `wind-down/`, …), which is the correct design, so
+this was a single outlier rather than a pattern.
+
+**Fixed:** a `tools/fake-check/check.sh` carrying the same contract every other gate documents — a `Usage:`
+line, an `Exit:` line naming `0/1/3`, and a loud `exit 3` when `node` is absent. The workings are untouched;
+the assertions, the runtime behaviour and the mutation record stay in `fake-check.js` and its README.
+
+**Verified rather than asserted**, with the same control technique round 44 used — does the run actually
+happen — because "the wrapper works" is exactly the kind of claim that survives a harness that ran nothing:
+
+| case | exit |
+| --- | --- |
+| `node` present | **0** |
+| `node` absent (stripped `PATH`, control proved the shell ran) | **3**, naming the missing tool |
+| the tool file itself missing | **3** |
+
+And `mutation-check` now reports **16 gates** where it reported 15, with `fake-check` among them — so the
+audit covers the tool whose gap round 47 found, which is the point of giving it a `check.sh` at all.
+
+**The general shape here is worth naming: an audit needs to be audited.** `mutation-check` was written to
+catch a gate that could not report "I could not run", and it did — while the same property went unchecked for
+the tool that had just been extended. The fix was not more checks; it was **consistency**, which is what makes
+the checks mean anything.
+
+

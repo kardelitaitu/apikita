@@ -1145,11 +1145,17 @@ jobs:
       # Midtrans signature "exactly the way the server does" - both are contracts that nothing executed.
       # The last three gate defects found in this repository were all in tooling CI never ran, so these
       # are run rather than read: the injection rows against a live instance, and the signature against
-      # the server's own pinned vector (server/src/money.rs:1005).
-      # MEASURED against three mutations - a fail branch returning 200, a midstream cut removed, and the
-      # signature's field order swapped - all caught.
+      # the server's own pinned vector (server/src/money.rs).
+      # MEASURED against six mutations - a fail branch returning 200, a midstream cut removed, the
+      # signature's field order swapped, and three payload/signed-field drift shapes - all caught.
+      #
+      # RUN LIKE EVERY OTHER GATE. This step used to call `node tools/fake-check/fake-check.js` directly,
+      # which made it the only one of 16 CI checks not reachable through a `check.sh` - and so the only one
+      # outside the contract every other gate documents (Usage, an Exit line, a loud exit 3 when a required
+      # tool is absent) and outside `mutation-check`'s audit of exactly that shape. MEASURED, not assumed:
+      # 16 invocations, 15 via check.sh, this one raw.
       - name: Check the fake upstream and payment tools
-        run: node tools/fake-check/fake-check.js
+        run: sh tools/fake-check/check.sh
 
       # The probes behind a SHIPPED plan still run and still measure what the plan cites.
       #
