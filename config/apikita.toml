@@ -424,15 +424,32 @@ trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128", "172.21.0.0/16"]
 # than one that was reached.
 max_concurrent_requests = 512
 
-# How long a client has to send its complete request HEADERS, in seconds.
+# A `header_read_timeout_seconds = 10` key WAS HERE, and it is DELETED rather than tuned.
 #
-# THE SLOWLORIS DEFENCE, and the one whose absence was measured: a client that
-# opens a socket and sends a partial request line was otherwise held
-# indefinitely. 10 seconds is far longer than any real client needs (a browser
-# sends headers in one packet) and far shorter than the damage a slow-loris can
-# do. nginx's client_header_timeout defaults to 60s; this is deliberately
-# tighter because it is the BACKEND's own defence, not the edge's.
-header_read_timeout_seconds = 10
+# WHAT IT CLAIMED: "How long a client has to send its complete request HEADERS... THE SLOWLORIS DEFENCE",
+# on the argument that a client opening a socket and sending a partial request line was otherwise held
+# indefinitely.
+#
+# WHAT IT DID: nothing of the sort. It was applied as
+# `TimeoutLayer::with_status_code(503, header_read_timeout_seconds)` over the whole router, and a
+# `TimeoutLayer` wraps the SERVICE - which only begins once the request has been parsed. So it never
+# bounded header arrival, and a slow-loris (which holds the connection BEFORE the handler runs) was
+# unaffected by it. MEASURED: a handler taking 6s under `header_read_timeout_seconds = 2` returned
+# `503 Service Unavailable` at 2007ms. The one thing the field actually did was abort long requests.
+#
+# AND THAT WAS A LIVE BUG, not a curiosity: with 10s here and
+# `[circuit_breaker] request_timeout_seconds = 120`, a chat completion that took longer than ten seconds -
+# the ordinary case this product exists for - was killed with a 503 while its upstream was still working.
+# The two budgets disagreed by 12x and the tighter one won.
+#
+# WHAT ACTUALLY DEFENDS AGAINST SLOWLORIS, since the field is gone and the reader should know what took
+# over:
+#   1. THE EDGE, which is the layer that can: nginx terminates the TCP connection and its
+#      `client_header_timeout` (60s default) is the real header-arrival bound. The deleted comment claimed
+#      the backend's defence was "deliberately tighter" than the edge's - but the backend never had one.
+#   2. `max_concurrent_requests = 512`, which bounds how many connections can be held open at all.
+# A backend-side header timeout COULD be wired (hyper exposes one on its HTTP/1 builder). It is not wired,
+# and it is not claimed: this key is removed rather than left looking like a defence that exists.
 
 # Maximum request body the server will read, in bytes.
 #

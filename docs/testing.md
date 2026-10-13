@@ -419,6 +419,44 @@ the **buffering**, not the **acceptance**: `client_max_body_size` stays 25m, a 3
 relay and is still refused by the server, and the deferred decision stays deferred. Verified rather than
 assumed, because accidentally resolving someone else's product decision is worse than leaving it open.
 
+#### The request budget was a twelfth of the upstream budget (round 37)
+
+The first real bug in shipped behaviour since this audit began, and it came from the same
+*"correct in isolation"* seam as the six deployment findings — but **server-side, on the product's core
+path**.
+
+Two numbers in the config disagreed, and nothing compared them:
+
+| source | value | claims to bound |
+| --- | --- | --- |
+| `[circuit_breaker] request_timeout_seconds` | **120 s** | *"Per-request upstream timeout"* |
+| `[server] header_read_timeout_seconds` | **10 s** | *"SLOWLORIS DEFENCE ... a browser sends headers in one packet"* |
+
+`hardening.rs` applied the second as `TimeoutLayer::with_status_code(503, header_read_timeout_seconds)` —
+over the **whole router**. A `TimeoutLayer` wraps the *service*, which only begins once the request is
+parsed, so:
+
+- **it never bounded header arrival**, so the slow-loris defence the comment describes was never implemented;
+- **it bounded the entire request**, so a chat completion taking longer than ten seconds was aborted with
+  a **503** while its upstream still had 110 seconds of its own budget left.
+
+**MEASURED, not reasoned:** a handler taking 6s under a 2s value returned `503 Service Unavailable` at
+**2007 ms**. And the shipped 10s/120s pair means the product's central case — a long answer from a slow
+provider — was a 503, at **one twelfth** of the allowance the same config grants the upstream.
+
+**Fixed**: `apply()` now takes the whole `AppConfig` rather than `&ServerConfig`, because the correct bound
+lives under `[circuit_breaker]` and a signature taking only the server section *could not express it* —
+which is how the two drifted apart. The bound is `request_timeout_seconds + 30` (headroom for the
+settlement write after the stream). Re-verified: the same 6s handler now returns **200 OK at 6006 ms**.
+
+**And `header_read_timeout_seconds` is DELETED rather than retuned**, because it was a misnomer rather than
+a defence that was lost: it never bounded header arrival, and its only real effect was the bug. Its removal
+tripped `every_config_field_is_read_by_production_code_or_explained` — *"a setting nobody reads is a setting
+an operator believes is working"* — which is the guard doing exactly its job, so the config comment now
+names what actually defends against slow-loris: **the edge** (nginx `client_header_timeout`, the layer that
+terminates TCP) and `max_concurrent_requests = 512`. A backend-side header timeout *could* be wired to
+hyper's HTTP/1 builder; it is not wired, and it is no longer claimed.
+
 #### `doc_claims`: the retention check, measured in both directions (round 28)
 
 `the_published_retention_periods_are_the_periods_the_sweeps_enforce` pins each documented retention period

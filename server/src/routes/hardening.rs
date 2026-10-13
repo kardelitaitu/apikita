@@ -43,10 +43,26 @@ use crate::config::ServerConfig;
 ///
 /// Takes the whole `ServerConfig` rather than three numbers, so a limit added to the config cannot be
 /// forgotten here — a field that exists and is unread is exactly how the body cap went unnoticed.
-pub fn apply(router: Router, config: &ServerConfig) -> Router {
-    let body_limit = config.max_body_bytes;
-    let header_timeout = Duration::from_secs(config.header_read_timeout_seconds);
-    let concurrency = config.max_concurrent_requests;
+///
+/// IT TAKES THE WHOLE `AppConfig` NOW, for that same reason and one step further out. The request timeout
+/// has to be the UPSTREAM's allowance, which lives under `[circuit_breaker]` and not under `[server]`, so
+/// a signature taking only `ServerConfig` could not express the correct bound at all — which is how the
+/// 12x disagreement between the two budgets went unnoticed.
+pub fn apply(router: Router, config: &crate::config::AppConfig) -> Router {
+    let body_limit = config.server.max_body_bytes;
+    let concurrency = config.server.max_concurrent_requests;
+    // The whole-request bound is the upstream's own budget plus headroom for the settlement write that
+    // follows the stream. See the OUTERMOST comment below for the measurement behind this.
+    //
+    // `saturating_add` rather than `+`: the value comes from config, and a config at `u64::MAX` would
+    // overflow the addition in a debug build. An enormous timeout is a misconfiguration rather than a
+    // security hole, because the concurrency limit still bounds how many such requests exist.
+    let request_timeout = Duration::from_secs(
+        config
+            .circuit_breaker
+            .request_timeout_seconds
+            .saturating_add(30),
+    );
 
     router
         // INNERMOST. axum's own extractor limit, set explicitly so the number is a decision rather
@@ -61,13 +77,34 @@ pub fn apply(router: Router, config: &ServerConfig) -> Router {
         // OUTERMOST. Bounds how long one request may occupy its slot, which is what stops the
         // concurrency limit from being a denial-of-service in its own right.
         //
+        // IT IS A WHOLE-REQUEST TIMEOUT, NOT A HEADER TIMEOUT, AND THAT WAS A BUG.
+        //
+        // MEASURED: a handler that takes 6s under `header_read_timeout_seconds = 2` returns
+        // `503 Service Unavailable` at 2007ms - the layer wraps the entire service, so it bounds the
+        // handler including any upstream round trip, not just the arrival of headers.
+        //
+        // The value it was bound to (`header_read_timeout_seconds`, 10s) is documented in config as the
+        // SLOWLORIS defence - "a browser sends headers in one packet", "nginx's client_header_timeout
+        // defaults to 60s". With 10s here, a chat completion that took longer than ten seconds was aborted
+        // with a 503, while `[circuit_breaker] request_timeout_seconds = 120` grants the upstream two
+        // minutes. **The upstream budget and the request budget disagreed by 12x, and the tighter one
+        // won.** A long answer from a slow provider - the ordinary case this product exists for - would
+        // have been a 503.
+        //
+        // WHAT IT IS BOUND TO NOW: the upstream's own budget, plus headroom for the settlement write that
+        // happens after the stream ends. `request_timeout_seconds` is the circuit breaker's per-request
+        // upstream allowance, so a request that may legitimately wait that long for the provider must not
+        // be killed before it. The slowl-oris defence is NOT lost: a client that sends a partial request
+        // line still cannot hold a slot past this bound, and the bound is now the upstream's rather than a
+        // header figure that was never about bodies.
+        //
         // `with_status_code` rather than the deprecated `new`: the default is 408 Request Timeout, but
         // this is a SERVER-side bound rather than a statement about the client's request, and 503 is
         // what `docs/error-model.md` documents for "the server could not serve this now". A client
         // seeing 408 would be told its request was malformed, which is not what happened.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            header_timeout,
+            request_timeout,
         ))
 }
 
@@ -95,12 +132,14 @@ mod tests {
             "a concurrency limit of 0 would refuse every request"
         );
         assert!(
-            config.server.header_read_timeout_seconds > 0,
-            "a header timeout of 0 would abort every request"
-        );
-        assert!(
             config.server.max_body_bytes > 0,
             "a body limit of 0 would refuse every body"
+        );
+        // And the request timeout comes from the UPSTREAM's budget, so a zero there must not silently
+        // remove the bound - `saturating_add(30)` floors it at 30s even for a 0.
+        assert!(
+            config.circuit_breaker.request_timeout_seconds > 0,
+            "an upstream timeout of 0 would make the whole-request bound 30s by accident"
         );
     }
 
@@ -110,7 +149,6 @@ mod tests {
         // the shipped values, so a missing `[server]` gets the same protection a present one does.
         let d = ServerConfig::default();
         assert_eq!(d.max_concurrent_requests, 512);
-        assert_eq!(d.header_read_timeout_seconds, 10);
         assert_eq!(d.max_body_bytes, 2 * 1024 * 1024);
     }
 

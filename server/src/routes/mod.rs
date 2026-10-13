@@ -533,7 +533,11 @@ pub fn create_router(state: AppState) -> Router {
     // The inbound hardening is applied OUTSIDE everything above, so a request that cannot get a
     // concurrency slot is refused before it is timed or buffered. See `hardening` for why all three
     // layers are needed and what each one bounds that the others do not.
-    hardening::apply(router, &state.config.server)
+    //
+    // The WHOLE config, not `&state.config.server`: the request timeout has to be the upstream's
+    // allowance, which lives under `[circuit_breaker]`. Passing only the server section is what let the
+    // 10s header figure become a whole-request bound that contradicted the 120s upstream budget.
+    hardening::apply(router, &state.config)
 }
 
 /// The path literals `create_router`'s `routes!` invocation actually expanded.

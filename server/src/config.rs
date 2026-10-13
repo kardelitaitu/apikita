@@ -89,15 +89,6 @@ pub struct ServerConfig {
     /// well inside it; the point is a number that was chosen rather than one that was reached.
     pub max_concurrent_requests: usize,
 
-    /// How long a client has to send its complete request HEADERS, in seconds.
-    ///
-    /// THE SLOWLORIS DEFENCE, and the one whose absence was measured: a client that opens a socket and
-    /// sends a partial request line was otherwise held indefinitely. 10 seconds is far longer than any
-    /// real client needs (a browser sends headers in one packet) and far shorter than the damage a
-    /// slow-loris can do. nginx's `client_header_timeout` defaults to 60s; this is deliberately tighter
-    /// because it is the backend's own defence, not the edge's.
-    pub header_read_timeout_seconds: u64,
-
     /// Maximum request body the server will read, in bytes.
     ///
     /// THIS WAS AXUM'S DEFAULT AND IS NOW A DECISION. MEASURED: the boundary was exactly 2,097,153
@@ -119,7 +110,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_concurrent_requests: 512,
-            header_read_timeout_seconds: 10,
             max_body_bytes: 2 * 1024 * 1024,
         }
     }
