@@ -608,8 +608,13 @@ else
         #   2. the word BEFORE "the one" is "and", not "is", so even unbolted the pattern missed it.
         # A planted restore of the exact defect SURVIVED both versions. The pattern now keys on
         # `the one that|which` with any preceding word, which is the phrase that actually makes the claim.
+        # CASE-INSENSITIVE, and that is a measured correction rather than a tidiness. The first versions of
+        # this pattern were `grep -nE`, which is case-SENSITIVE, so a sentence beginning "**The** one that
+        # remains ..." was INVISIBLE while the same words mid-sentence matched. MEASURED by planting both:
+        # the capitalised form SURVIVED at exit 0, the lower-case form was caught. The filter beside it
+        # already used `-i`, so the two halves of one pipeline disagreed about case.
         SINGULAR=$(sed 's/[*`]//g' "$README" \
-            | grep -nE 'the one (that|which) (is|are|needs|remains)|is a single (alert|definition)|gap is a single' \
+            | grep -niE 'the one (that|which) (is|are|needs|remains)|is a single (alert|definition)|gap is a single' \
             | grep -viE '(said|says|was|were|had|would|used to|no longer|used to read|wording here|paragraph said)' || true)
         if [ -n "$SINGULAR" ]; then
             # A HERE-DOCUMENT, NOT A PIPE, and this file already documents why at the count guard above:
