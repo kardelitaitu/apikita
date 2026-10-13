@@ -345,7 +345,6 @@ mod tests {
         assert!(pool(0, 30).acquire().is_none());
     }
 
-    #[test]
     /// The shipped config parks a key the upstream rejects as UNAUTHORISED.
     ///
     /// `report_status` parks a key only for a status in `rate_limit_status`. A wholesale key that has
@@ -378,6 +377,7 @@ mod tests {
     /// config was fixed. A test that does not read the thing that was changed is a test
     /// that would have stayed green through the whole defect, which is the whole point of
     /// reading before asserting.
+    #[test]
     fn the_shipped_config_parks_a_401() {
         let config = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

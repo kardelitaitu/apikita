@@ -2042,7 +2042,6 @@ mod tests {
     /// fail at the TRANSPORT level and record failures of a different kind, silently
     /// confounding whatever the test claims to measure. That is not hypothetical — it
     /// is what defeated a first attempt at the 429 test above.
-    #[allow(dead_code)]
     async fn repeating_upstream_answering(status_line: &str, body: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2235,6 +2234,9 @@ mod tests {
         let url = upstream_answering("500 Internal Server Error", "{}").await;
         let upstream = client_pointed_at(&url);
 
+        // THE REQUEST, without which the assertion below reads a counter that no attempt ever
+        // touched. Deleting this line as collateral damage from an unrelated edit is what made
+        // this test fail: it asserted `failed == 1` on a client that had sent nothing.
         let _ = upstream
             .stream_chat("flash", json!({ "model": "flash" }))
             .await;
@@ -2311,6 +2313,74 @@ mod tests {
         );
     }
 
+    /// A 403 DOES NOT PARK THE KEY — the behaviour `docs/failover.md` documents.
+    ///
+    /// THE DOC'S CLAIM IS PRECISE AND WORTH PINNING, because 403 is the one status the
+    /// edge-case table argues ABOUT: *"403 is deliberately NOT in that set, and it is a real
+    /// limitation rather than an oversight."* The stated reason is that our OWN surface uses
+    /// 403 for `model_not_allowed`, so parking on it would withdraw a working key from rotation
+    /// over one refused model. The consequence is stated just as plainly: *"a genuinely revoked
+    /// key that answers 403 instead of 401 keeps being selected."*
+    ///
+    /// SO THE ASSERTION IS THAT THE KEY STAYS USABLE. `report_status` parks only for a status
+    /// in `rate_limit_status` (shipped `[429, 401]`), and 403 is not in it - but that is a CONFIG
+    /// value, and the behaviour a reader relies on is the pair agreeing: the doc says 403 is
+    /// excluded, `apikita.toml` must still exclude it, and this proves it by driving a real 403
+    /// through the loop and checking the key was not withdrawn.
+    ///
+    /// WHY THIS WAS MISSING: searching this module for `403` returned NOTHING, so the status the
+    /// document spends two paragraphs on had no test at all - the exclusion was a property of a
+    /// config file that nothing read for 403.
+    ///
+    /// MUTATION-TESTED, AND THE FIRST ATTEMPT WAS AN INVALID MUTANT WORTH RECORDING. MEASURED:
+    /// making `is_rate_limit` answer true for 403 did NOT fail this test. The reason is a real
+    /// property of this code - `is_rate_limit` reads `self.config.key_pool.rate_limit_status`
+    /// while `report_status` reads `lease.policy.rate_limit_status`, a clone taken when the pool
+    /// was built. The two agree today, and a mutant that changes only ONE of them is not a
+    /// mutation of "403 parks the key" at all. The valid mutant is adding 403 to the CONFIG,
+    /// which feeds both: MEASURED, that fails here with `left: Some(4.9999754s)`.
+    ///
+    /// The distinction matters beyond this test: two readers of one setting mean a change to
+    /// either alone produces a state no test describes, so a mutation that passes looks like a
+    /// covered property when it is only an untouched copy.
+    #[tokio::test]
+    async fn a_403_does_not_park_the_key() {
+        // NO `EnvLock::acquire()` HERE, and this cost me two hung runs. `client_pointed_at` takes
+        // that lock itself, and it is deliberately NOT reentrant - the helper's own doc says so
+        // ("It is deliberately not Send: it belongs in the test body"). Taking it twice in one
+        // body deadlocks the test against itself, which shows up as a run that never finishes
+        // rather than one that fails: no timeout catches a lock held by the frame waiting on it.
+        // Every neighbouring test that reads the same way omits this line; I added it by pattern
+        // instead of by reading what the helper already does.
+        //
+        // `repeating_upstream_answering`, NOT `upstream_answering`, and getting this wrong cost a
+        // HUNG TEST rather than a failed one: the one-shot stub accepts a single connection and the
+        // listener is dropped, so the retry loop's later attempts connect to nothing and the run
+        // never finishes. The helper below is `#[allow(dead_code)]` with a note predicting exactly
+        // this ("a one-shot stub is wrong for a test that drives more than one attempt ... which
+        // defeated a first attempt at the 429 test above") - and the note was right.
+        let url = repeating_upstream_answering("403 Forbidden", r#"{"error":"forbidden"}"#).await;
+        let upstream = client_pointed_at(&url);
+
+        let _ = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await;
+
+        // THE KEY IS NOT PARKED, which is the whole claim. A parked key is reported by
+        // `shortest_key_cooldown` for the cooldown window; a released one is not.
+        assert_eq!(
+            upstream.models[0].endpoints[0].pool.shortest_key_cooldown(),
+            None,
+            "403 is NOT in rate_limit_status, so the key must be released rather than parked - docs/failover.md depends on this to avoid withdrawing a working key over one refused model"
+        );
+
+        // AND THE ENDPOINT IS NOT TRIPPED EITHER. A 403 is not a provider outage; the
+        // edge-case table says only 5xx (and a transport failure) marks it unhealthy.
+        assert!(
+            !upstream.all_endpoints_unhealthy("flash"),
+            "a 403 must not mark the endpoint unhealthy: it is a request-scoped refusal"
+        );
+    }
     /// A 404 IS ENDPOINT-SCOPED, so it is charged as a failure of THAT endpoint — which
     /// is what makes "provider B refuses this model every time" visible as a count.
     #[tokio::test]
