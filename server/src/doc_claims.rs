@@ -1556,15 +1556,62 @@ mod tests {
             swept.push((name.to_string(), days));
         }
 
-        // The vacuity guard: a parse that found nothing would agree with anything.
+        // THE VACUITY GUARD, AND IT WAS WEAK ENOUGH TO MISS THE THING IT IS FOR.
+        //
+        // This was `swept.len() >= 5`, reasoning that the entrypoint has "exactly seven"
+        // retention deletes and a floor of seven "cannot tell a full parse from a partial
+        // one". MEASURED, and both halves of that were stale or wrong:
+        //
+        //   * there are NINE deletes now, not seven - two windows were added since the
+        //     sentence was written, which is how a comment about a count goes wrong;
+        //   * a floor cannot substitute for the count, because the REVERSE loop below is
+        //     the only thing that notices a sweep DISAPPEARING, and the forward loop above
+        //     iterates SWEEP rather than the script. MEASURED: deleting the `usage_daily`
+        //     and `usage_events` calls from the entrypoint left 7 parsed, the floor passed,
+        //     and all 44 doc_claims tests stayed green - while both documents still promised
+        //     those windows. The rows would age past their window days later and the
+        //     `db_disk` alert would name retention generally, not the missing delete.
+        //
+        // THE COVERAGE ASSERTION, which is what a floor cannot give: every table SWEEP lists
+        // must be accounted for by a delete in the script, and the script must have no delete
+        // SWEEP does not list. The second half the reverse loop already does; this is the
+        // first, which the forward loop CANNOT do because it walks SWEEP and never asks the
+        // script whether that table is still there.
+        //
+        // ONE TABLE LEGITIMATELY HAS NO `retention_delete` CALL. `identity_tokens` is deleted
+        // by a different shape - `sqlite3 ... DELETE ... WHERE expires_at <= datetime('now')`
+        // - because its window is not a period: a link is stale when it EXPIRES, not N days
+        // after anything. SWEEP records that as 0 with the reasoning beside it. So the
+        // exception is named here rather than the assertion being loosened to accommodate it;
+        // a list of exempt tables is a rule, an inequality is a habit.
+        const NOT_DELETED_BY_THE_HELPER: &[&str] = &["identity_tokens"];
+        for (table, _, _) in SWEEP {
+            if NOT_DELETED_BY_THE_HELPER.contains(table) {
+                continue;
+            }
+            assert!(
+                swept.iter().any(|(t, _)| t == table),
+                "SWEEP promises `{table}` is swept after a window, and the entrypoint has no \
+                 retention_delete for it. That is the defect this guard exists for - a promise \
+                 kept in a document and dropped from the thing that enforces it - and the \
+                 forward loop below cannot see it, because it iterates SWEEP. Swept: {swept:?}"
+            );
+        }
+        for (table, _) in &swept {
+            assert!(
+                SWEEP.iter().any(|(t, _, _)| t == table)
+                    || NOT_DELETED_BY_THE_HELPER.contains(&table.as_str()),
+                "the entrypoint deletes `{table}` and no window in this test claims it. An \
+                 unlisted delete is work nothing promised."
+            );
+        }
+        // AND THE EXEMPTION IS NOT VACUOUS: the table must be a real SWEEP entry, or the
+        // name above would silently exempt nothing while reading as though it exempted one.
         assert!(
-            // SLACK, not the count. The entrypoint has exactly seven retention deletes, and
-            // a floor of seven is a tripwire: it fails the day one is removed and cannot
-            // tell a full parse from a partial one that still reaches seven. Five catches a
-            // parse that lost a third of them, which is the failure the floor is for.
-            swept.len() >= 5,
-            "only {} retention deletes were parsed from the entrypoint",
-            swept.len()
+            SWEEP
+                .iter()
+                .any(|(t, _, _)| NOT_DELETED_BY_THE_HELPER.contains(t)),
+            "NOT_DELETED_BY_THE_HELPER names no table in SWEEP, so it exempts nothing"
         );
 
         for (table, days) in &swept {
