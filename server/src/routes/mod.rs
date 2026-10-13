@@ -1489,8 +1489,8 @@ mod tests {
     const SOME_KEY_ID: &str = "00000000-0000-0000-0000-000000000000";
 
     /// Every route `create_router` mounts: (method, path, body). One row per route
-    /// CALL, so /api/topups and /api/keys - each a SINGLE `.route()` with two
-    /// methods chained - appear per method. **26 route calls, 28 rows.**
+    /// CALL, so /api/topups, /api/keys and /api/reviews - each a SINGLE `.route()` with two
+    /// methods chained - appear per method. **38 route calls, 41 rows.**
     ///
     /// THIS COUNT WAS WRONG FOR SIX ROUTES AND NOTHING SAID SO, which is the gap
     /// `the_route_inventory_matches_the_mounted_table` now closes. The header used to
@@ -1505,29 +1505,34 @@ mod tests {
     ///
     /// ROWS, not routes. The first attempt at this header said "30 rows" - a figure
     /// arrived at by assuming each dual-method path contributes an extra row. It does
-    /// not: `/api/topups` and `/api/keys` are ONE `.route(` call each carrying both
-    /// `get` and `post`, and this table lists a request per METHOD, so each
-    /// contributes two rows in total, not three. 40 is the number the test pins.
+    /// not: `/api/topups`, `/api/keys` and `/api/reviews` are ONE `.route(` call each carrying
+    /// both `get` and `post`, and this table lists a request per METHOD, so each
+    /// contributes two rows in total, not three. **41 is the number the test pins** -
+    /// `the_macro_body_lists_the_inventory_it_mounts`, and the pin is why this header can
+    /// be checked rather than trusted.
     ///
-    /// The reviews routes add three paths and FOUR rows: `/api/reviews` is the
-    /// third dual-method path in the table (GET for the public aggregate, POST to
-    /// write), so it contributes two, while `/api/reviews/mine` and
-    /// `/api/reviews/withdraw` contribute one each.
+    /// THE HEADER SAID "26 route calls, 28 rows" AND "40 is the number the test pins"
+    /// WHILE THE TEST PINNED 38 AND 41, and there was nothing checking the prose because
+    /// the pin checks the ARRAY. Three sentences stated numbers the guard beside them
+    /// contradicted, which is the more damaging direction: a reader believes the sentence
+    /// and concludes the test is wrong. MEASURED against the array and the pin together.
     ///
     /// The native identity routes each contribute ONE row: they are all
-    /// single-method (POST), so `/auth/logout` and `/auth/logout-all` are not the
-    /// dual-method paths the previous note named - only `/api/topups` and
-    /// `/api/keys` are. `/auth/password-change` (POST) and `/auth/providers` (GET)
-    /// are likewise one row each, and they are the two the settings panel needs:
-    /// the password change the retired SDK did with `users.update`, and the linked
-    /// provider list it did with `listExternalAuths`.
+    /// single-method (POST), so `/auth/logout` and `/auth/logout-all` are not
+    /// dual-method paths - the previous note named only two of the three, and
+    /// `/api/reviews` is the third. `/auth/password-change` (POST) and
+    /// `/auth/providers` (GET) are likewise one row each, and they are the two the
+    /// settings panel needs: the password change the retired SDK did with
+    /// `users.update`, and the linked provider list it did with `listExternalAuths`.
     ///
     /// THE COUNT MOVED FROM 32 TO 36 IN TWO DIRECTIONS AT ONCE, which is why the
     /// header names the intermediate number rather than only the endpoints. It was
     /// 34, then 32 when the identity port deleted `/auth/exchange`, then 33 when
     /// `/auth/google` was added to the inventory it had been missing from, and 36
-    /// now. A reader comparing two of those numbers without the sequence in
-    /// between would conclude a route was dropped that never existed.
+    /// then. **It is 38 now**, which is another five routes added after that
+    /// sequence was written down - the same drift this correction is repairing,
+    /// happening a third time. A reader comparing two of those numbers without the
+    /// sequence in between would conclude a route was dropped that never existed.
     const MOUNTED: &[(&str, &str, &str)] = &[
         ("GET", "/health", ""),
         ("GET", "/api/admin/metrics", ""),
@@ -2212,6 +2217,67 @@ mod tests {
              means a row was added or removed without updating this number."
         );
     }
+
+    /// THE DOC COMMENT ABOVE `MOUNTED` STATES TWO NUMBERS, AND THE PIN BESIDE IT STATED TWO
+    /// OTHERS. Nothing compared them, because the existing assertions check the ARRAY while the
+    /// prose is only a string.
+    ///
+    /// MEASURED, and it had drifted three times: the header read "26 route calls, 28 rows" and
+    /// then "40 is the number the test pins" while the assertion below it pinned 38 and 41. A
+    /// READER BELIEVES THE SENTENCE, so the failure direction is that someone concludes the TEST
+    /// is wrong and edits the pin - which is worse than the stale number itself.
+    ///
+    /// SO THIS READS THE PROSE, which is unlike the other guards in this file: they check code,
+    /// and this one checks the comment a reader actually reads. It is only possible because the
+    /// header states the numbers in a fixed shape, which the assertion below enforces.
+    #[test]
+    fn the_mounted_doc_comment_states_the_counts_the_pin_uses() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/mod.rs"),
+        )
+        .expect("mod.rs must be readable, or this checks nothing");
+
+        let header = source.find("Every route `create_router` mounts");
+        let header = header.expect(
+            "the MOUNTED doc comment moved or was deleted, so this guard is reading nothing",
+        );
+        // The paragraph that states the counts, taken as a window rather than by line number.
+        let window = &source[header..(header + 2600).min(source.len())];
+
+        let calls = MOUNTED_DOC_COUNTS.0;
+        let rows = MOUNTED_DOC_COUNTS.1;
+
+        assert!(
+            window.contains(&format!("**{calls} route calls, {rows} rows.**")),
+            "the MOUNTED doc comment no longer states `**{calls} route calls, {rows} rows.**` in that shape. Either the numbers drifted from the pin again, or the sentence was reworded and this guard can no longer find it - fix the sentence rather than deleting this test"
+        );
+        assert!(
+            window.contains(&format!("**{rows} is the number the test pins**")),
+            "the MOUNTED doc comment no longer states `**{rows} is the number the test pins**`, so the header and the assertion below it can disagree again"
+        );
+
+        // And the two constants must equal what the pin beside them uses, so this test and the
+        // assertion above cannot drift apart - which is the whole shape of the defect.
+        let declared = ROUTES
+            .lines()
+            .filter(|line| line.trim_start().starts_with(".route("))
+            .count();
+        assert_eq!(
+            declared,
+            calls,
+            "ROUTES carries {declared} route calls and the doc comment says {calls}; the pin in `the_macro_body_lists_the_inventory_it_mounts` is the third place this number lives"
+        );
+        assert_eq!(
+            MOUNTED.len(),
+            rows,
+            "MOUNTED carries {} rows and the doc comment says {rows}",
+            MOUNTED.len()
+        );
+    }
+
+    /// The two counts the doc comment above `MOUNTED` states, in one place so the guard that
+    /// checks the PROSE and the guard that checks the ARRAY cannot disagree.
+    const MOUNTED_DOC_COUNTS: (usize, usize) = (38, 41);
 
     /// THE MACRO BODY AND THE INVENTORY LIST THE SAME PATHS, AND NOTHING ELSE DID.
     ///
