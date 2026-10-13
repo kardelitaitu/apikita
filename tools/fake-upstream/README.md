@@ -27,7 +27,7 @@ instance covers every case.
 | Happy path | *(default)* | — | Streams one word per chunk at `tps` (default 30 tokens/sec) |
 | Rate limit | `?fail=429` | `x-fake-fail: 429` | Immediate `429` with an OpenAI-shaped JSON error body |
 | Server error | `?fail=500` | `x-fake-fail: 500` | Immediate `500` with an OpenAI-shaped JSON error body |
-| Mid-stream cut | `?fail=midstream` | `x-fake-fail: midstream` | 3–5 content chunks, then the socket is destroyed — **no `[DONE]`, no usage block** |
+| Mid-stream cut | `?fail=midstream` | `x-fake-fail: midstream` | 3–5 content chunks, then the stream ends — **no `[DONE]`, no usage block** |
 | Slow first token | `?fail=slow` | `x-fake-fail: slow` | Sleeps `delay` ms (default 5000) before the first chunk |
 | Token rate | `?tps=200` | `x-fake-tps: 200` | Chunks per second on the happy path |
 | First-token delay | `?delay=8000` | `x-fake-delay-ms: 8000` | Delay used by `fail=slow` |
@@ -47,6 +47,16 @@ words actually streamed. Billing assertions can hard-code these:
 ```json
 { "prompt_tokens": 11, "completion_tokens": 24, "total_tokens": 35 }
 ```
+
+**These are asserted against a live response** by `tools/fake-check/`, which reads the numbers out of this
+block rather than restating them — so if this table and the server change, the gate says so instead of
+letting the two drift. The server's own fixture in `upstream/client.rs` carries the same three numbers, and
+nothing compares THOSE two; this gate is what makes the published contract checked at all.
+
+**The mid-stream cut ends the stream rather than destroying the socket.** Both look identical to a client —
+no `[DONE]`, no usage, a closed connection — but `socket.destroy()` discards whatever is still buffered, so
+EVERY cut used to arrive one chunk short of the count this README promises. `res.end()` drains first, so the
+chunk counts above are now true.
 
 ## Examples
 

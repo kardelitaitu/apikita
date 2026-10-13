@@ -258,6 +258,44 @@ async function checkFakeUpstream(port) {
       ok(`happy path streams ${chunks} chunks, ends [DONE], carries usage`);
     }
 
+    // THE FIXED USAGE NUMBERS, read from the README and compared against a LIVE response.
+    //
+    // WHY THIS EXISTS. The README says "The final chunk always carries the same `usage` object,
+    // independent of how many words actually streamed. **Billing assertions can hard-code these**" and
+    // publishes { prompt_tokens: 11, completion_tokens: 24, total_tokens: 35 }.
+    //
+    // MEASURED before this was added: nothing asserted them. The gate checked that a usage block EXISTS
+    // and never what it contains, so the fake could have emitted any numbers and stayed green - while the
+    // server's own fixture in `upstream/client.rs` hard-codes 11/24/35 in three separate literals. Those
+    // two agree today by COINCIDENCE, which is the shape of a pair that drifts: two places describing the
+    // same numbers with nothing comparing them.
+    //
+    // The numbers are read OUT OF THE README rather than restated here, because a copy in this file would
+    // be a third place for them to drift - the failure the signature check in this same file documents.
+    const readmeUsage = (() => {
+      const readme = fs.readFileSync(path.join(REPO, 'tools', 'fake-upstream', 'README.md'), 'utf8').replace(/\r\n/g, '\n');
+      const m = readme.match(/"prompt_tokens":\s*(\d+),\s*"completion_tokens":\s*(\d+),\s*"total_tokens":\s*(\d+)/);
+      return m ? { prompt_tokens: Number(m[1]), completion_tokens: Number(m[2]), total_tokens: Number(m[3]) } : null;
+    })();
+
+    if (!readmeUsage) {
+      fail('could not read the published usage numbers out of tools/fake-upstream/README.md, so the billing contract is unchecked');
+    } else {
+      const m = happy.body.match(/"usage"\s*:\s*\{[^}]*\}/g);
+      const last = m ? m[m.length - 1] : null;
+      let got = null;
+      try { got = last ? JSON.parse('{' + last + '}').usage : null; } catch { /* unparseable */ }
+      const same = got
+        && got.prompt_tokens === readmeUsage.prompt_tokens
+        && got.completion_tokens === readmeUsage.completion_tokens
+        && got.total_tokens === readmeUsage.total_tokens;
+      if (!same) {
+        fail(`the usage block is ${JSON.stringify(got)} but the README publishes ${JSON.stringify(readmeUsage)} — a billing assertion that hard-codes the documented numbers would fail`);
+      } else {
+        ok(`the usage block matches the published numbers (${readmeUsage.prompt_tokens}/${readmeUsage.completion_tokens}/${readmeUsage.total_tokens})`);
+      }
+    }
+
     for (const code of [429, 500]) {
       const r = await post(`?fail=${code}`);
       let shaped = false;
@@ -291,10 +329,16 @@ async function checkFakeUpstream(port) {
       setTimeout(done, 10000);
     });
     const midChunks = (mid.match(/^data: /gm) || []).length;
-    if (midChunks < 3) fail(`?fail=midstream delivered ${midChunks} chunks over a raw socket, README says 3-5`);
+    // BOTH BOUNDS, not just the floor. This read `midChunks < 3` until the round that measured it:
+    // changing the fake's DEFAULT cut from 4 to 6 **SURVIVED** the gate, because 6 satisfies "at least 3"
+    // while the README's row says the default is 3-5. A one-sided assertion against a two-sided promise is
+    // the same defect as a threshold no measurement can cross.
+    if (midChunks < 3 || midChunks > 5) {
+      fail(`?fail=midstream delivered ${midChunks} chunks over a raw socket, but the README's row says the default cut is 3-5`);
+    }
     if (mid.includes('[DONE]')) fail('?fail=midstream included [DONE], but the README says the cut is before it');
     if (/usage/.test(mid)) fail('?fail=midstream included a usage block, but the README says there is none');
-    if (midChunks >= 3 && !mid.includes('[DONE]') && !/usage/.test(mid)) {
+    if (midChunks >= 3 && midChunks <= 5 && !mid.includes('[DONE]') && !/usage/.test(mid)) {
       ok(`?fail=midstream sent ${midChunks} chunks then cut, with no [DONE] and no usage`);
     }
 
@@ -303,6 +347,42 @@ async function checkFakeUpstream(port) {
     const slowMs = Date.now() - t0;
     if (slowMs < 800) fail(`?fail=slow returned in ${slowMs} ms, but was asked to delay 900 ms`);
     else ok(`?fail=slow delayed the first chunk (${slowMs} ms for a 900 ms delay)`);
+
+    // ?chunks=N - "Content chunks sent before a mid-stream cut (clamped to 3-5)". The midstream row above
+    // runs the DEFAULT cut; this asserts the flag moves it, and that the clamp holds, which is what a row
+    // documenting a bounded parameter means.
+    //
+    // Read over a raw socket for the same reason the midstream row is: fetch discards a chunked response
+    // whose socket ends, and a client library inverting a verdict is exactly why that row exists.
+    //
+    // AND ASSERTING THIS FOUND A DEFECT IN THE FAKE, which is the point of gating a mock's README:
+    // `res.write()` was followed by `res.socket.destroy()`, which discards the file-descriptor buffer, so
+    // EVERY cut came out one chunk short - `?chunks=3` delivered 2 and `?chunks=8` delivered 4, each
+    // against a README promising the number asked for. The fake now ends the response, draining first.
+    const rawPost = (query) => new Promise((resolve) => {
+      const body = JSON.stringify({ model: 'flash', messages: [{ role: 'user', content: 'hi' }], stream: true });
+      const s = net.connect(port, '127.0.0.1', () => {
+        s.write(`POST /v1/chat/completions${query} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
+      });
+      let data = '';
+      let settled = false;
+      const done = () => { if (!settled) { settled = true; try { s.destroy(); } catch { /* gone */ } resolve(data); } };
+      s.on('data', (d) => { data += d.toString(); });
+      s.on('end', done);
+      s.on('close', done);
+      s.on('error', done);
+      setTimeout(done, 10000);
+    });
+
+    for (const [asked, delivered] of [['1', 3], ['3', 3], ['8', 5], ['99', 5]]) {
+      const out = await rawPost(`?fail=midstream&chunks=${asked}`);
+      const n = (out.match(/^data: /gm) || []).length;
+      if (n === delivered) {
+        ok(`?chunks=${asked} delivers ${n} chunk(s), clamped into the documented 3-5`);
+      } else {
+        fail(`?chunks=${asked} delivered ${n} chunk(s), expected ${delivered} — the count the README promises is not what a client receives`);
+      }
+    }
 
     const slowTps = Date.now();
     await post('?tps=5');

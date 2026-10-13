@@ -123,8 +123,18 @@ const server = http.createServer(async (req, res) => {
 
   if (midstream) {
     // Abrupt: no [DONE], no usage block. The proxy must not silently retry.
-    res.socket.destroy();
-    log('socket destroyed mid-stream');
+    //
+    // THE LAST CHUNK WAS BEING LOST HERE, and every count came out one short of what was asked for.
+    // MEASURED over a raw socket, before this fix: `?chunks=3` delivered 2, `?chunks=8` delivered 4, and
+    // the default (4) delivered 3 - always n-1. `res.write()` is asynchronous, and destroying the socket
+    // immediately after the final write discards whatever is still buffered, so the chunk the README
+    // promises was never flushed.
+    //
+    // `end()` DRAINS before closing, which is what makes the documented count true. It still sends no
+    // `[DONE]` and no usage block, so the cut stays abrupt in every way the row describes: a client sees
+    // exactly the promised chunks and then a closed stream.
+    res.end();
+    log('stream ended mid-way with no [DONE]');
     return;
   }
 
