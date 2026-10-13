@@ -3430,5 +3430,45 @@ is what broke the checks, and the server's own comment is what named the stakes.
 that wasn't already in the repository — the question was what the three documents each assumed about the
 other two, and none of them had ever been compared.
 
+#### A README that called two things one, and a guard that took four attempts (round 53)
+
+The technique that produced rounds 50–52 — read a document against the code it describes — applied to
+`tools/alert/README.md`, which is 518 lines and states its own counts. **Its counts were all correct. Its
+quantifier was not.**
+
+`alerts.tsv` marks **two** rows `needs-metrics` (`relay_5xx`, `proxy_undercharge`). The README said
+`proxy_undercharge` was *"the one that is neither"*, then one sentence later that `relay_5xx` was in *"the
+same structural position"*. Three separate places made the same singular claim, and one of them — a block
+labelled **"quoted here verbatim"** — printed `probe.sh`'s real output with `2 of the 12` and then listed
+**one** of the two. MEASURED by running the command.
+
+**Every count was right, so `alert-check`'s number guard passed.** It pins the counts word by word and is
+thorough about it; it says nothing about a quantifier in a sentence.
+
+**Four faults while building the guard for it, every one a guard that could not fail** — which is the
+finding, not the guard:
+
+| fault | what it looked like |
+| --- | --- |
+| the pattern required `is` before `the one` | the sentence reads `...and **the one** that is`, so bold markers sat between "one" and "that" and the planted defect **SURVIVED** |
+| the pattern keyed on the wrong preceding word | the text says **`and`**, not `is`; found by testing the pipeline against the exact sentence rather than reasoning about it |
+| a piped `while` ran in a **SUBSHELL** | the message printed on every planted defect and the exit stayed **0** — the trap `check.sh` itself documents at line 661, *"knowing the rule did not stop me writing it"* |
+| `grep -nE` is **case-SENSITIVE** | `**The** one that remains` was invisible while the same words mid-sentence matched; the filter beside it already used `-i` |
+
+All four are now caught, verified by planting the defect in four forms and watching the gate exit 1.
+
+**And the harness that verified it failed three times before it worked**, each fault a different one:
+it restored with `git checkout` while the corrections were **uncommitted**, so it discarded the work it was
+verifying — three times, and the third time is when the cause was obvious; it captured `$?` after a
+**pipeline**, so it read the wrong process's status; and an **anchor miss printed nothing and did not
+count**, so four misses produced an "ok" line. The final harness refuses to run against a dirty file.
+
+**What the guard does NOT catch, recorded in the guard rather than only here:** a singular claim sitting on
+a line that also mentions history is exempt, because the same filter that skips this file's own corrections
+skips it. MEASURED by planting *"The one that remains is `relay_5xx`."* on the corrected sentence's line. The
+exemption is not optional — without it the guard fires on every correction, including the ones in the same
+paragraph — so the hole is the price of the guard existing, and it is narrowed rather than removed.
+
+
 
 
