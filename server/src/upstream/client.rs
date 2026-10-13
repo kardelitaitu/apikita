@@ -2313,6 +2313,52 @@ mod tests {
         );
     }
 
+    /// A CONNECTION REFUSAL TRIPS THE BREAKER IN ONE ATTEMPT — the claim
+    /// `docs/failover.md` makes in its trip-condition table.
+    ///
+    /// THE TABLE READS: `| Connection refused | 1 — an unreachable host is unambiguous |`,
+    /// and it is the only singleton among the three conditions (5xx and timeouts are both 3,
+    /// from `failure_threshold`). That asymmetry is the claim: an unreachable host does not
+    /// deserve the benefit of two more probes.
+    ///
+    /// MEASURED, and the table is WRONG: the transport arm calls `record_failure()` once and
+    /// `record_failure` knows nothing about the KIND of failure - it increments
+    /// `consecutive_failures` and compares to the same threshold a 5xx uses. So a refused
+    /// connection is worth 1 of 3, not 1 of 1, and an unreachable host is probed twice more
+    /// before it is taken out of rotation.
+    #[tokio::test]
+    async fn a_refused_connection_does_not_trip_the_breaker_in_one_attempt() {
+        // A port with nothing listening: binding then dropping the listener leaves the
+        // address closed, which is as close to "host unreachable" as a loopback test gets.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port to close");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        let url = format!("http://{addr}/v1");
+        let upstream = client_pointed_at(&url);
+
+        let err = upstream
+            .stream_chat("flash", json!({ "model": "flash" }))
+            .await
+            .expect_err("nothing is listening");
+        assert!(
+            matches!(err, UpstreamError::Transport(_)),
+            "a closed port is a TRANSPORT failure, not an HTTP status: {err:?}"
+        );
+
+        // THE ASSERTION IS THAT ONE ATTEMPT DID NOT TRIP IT. If the doc were right this
+        // would be false, and the test would be the evidence for the correction rather than
+        // a regression it fails on.
+        assert!(
+            upstream.models[0].endpoints[0].breaker.allow_request(),
+            "MEASURED: a refused connection leaves the breaker CLOSED, so docs/failover.md's \
+             'Connection refused | 1' row does not describe this router - a transport failure \
+             is one of the same three consecutive failures a 5xx needs"
+        );
+    }
+
     /// A 403 DOES NOT PARK THE KEY — the behaviour `docs/failover.md` documents.
     ///
     /// THE DOC'S CLAIM IS PRECISE AND WORTH PINNING, because 403 is the one status the

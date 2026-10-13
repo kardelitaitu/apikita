@@ -68,7 +68,21 @@ is — see Layer 3 below.
 | --- | --- |
 | Consecutive 5xx | 3 (config: `failure_threshold`) |
 | Consecutive timeouts | 3 |
-| Connection refused | 1 — an unreachable host is unambiguous |
+| Connection refused | **3, like the others** — see the correction below |
+
+> **The "connection refused trips in 1" row was WRONG, and the reason it survived is worth keeping.**
+> MEASURED before this was corrected: the transport arm of the routing loop calls
+> `CircuitBreaker::record_failure()` once, and `record_failure` takes no argument — it increments
+> `consecutive_failures` and compares to the same `failure_threshold` a 5xx uses. No per-KIND
+> weighting exists anywhere in the breaker, so a refused connection is worth **1 of 3**, not 1 of 1,
+> and an unreachable host is probed twice more before it is taken out of rotation.
+> `a_refused_connection_does_not_trip_the_breaker_in_one_attempt` drives a closed port and asserts
+> the breaker is still Closed, so the row cannot drift back.
+>
+> **It was plausible, which is why nobody checked it.** "An unreachable host is unambiguous" is a
+> real argument for a faster trip, and a reader who wanted that behaviour would have believed the
+> table rather than the code. If that behaviour IS wanted, it is not a doc edit — it is a change to
+> `record_failure` to weight transport failures, and this document updates in the same commit.
 
 **A 429 does NOT trip the circuit.** A throttled key is saturated, not broken; it
 goes on **key cooldown**, and the pool rotates. Conflating the two means one

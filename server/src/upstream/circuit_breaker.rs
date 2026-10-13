@@ -323,6 +323,38 @@ mod tests {
         assert_eq!(b.state(), BreakerState::Open);
     }
 
+    /// EVERY FAILURE IS WORTH THE SAME ONE, WHATEVER CAUSED IT.
+    ///
+    /// THE PROPERTY IS VISIBLE IN THE SIGNATURE: `record_failure(&self)` takes no argument, so a
+    /// caller cannot say WHAT failed. The routing loop's transport arm (a refused connection or a
+    /// dead socket) and its 5xx arm call the SAME method, so both increment the same
+    /// `consecutive_failures` and are compared to the same `failure_threshold`.
+    ///
+    /// THIS IS PINNED BECAUSE `docs/failover.md` SAID THE OPPOSITE. Its trip-condition table
+    /// carried `| Connection refused | 1 - an unreachable host is unambiguous |`, which is a
+    /// plausible rule this breaker has never implemented. The row is corrected, and this test is
+    /// what stops it drifting back: a change to weight transport failures must alter THIS, and
+    /// cannot arrive as an edit to a document.
+    #[test]
+    fn every_failure_counts_the_same_toward_the_threshold() {
+        let b = CircuitBreaker::new(cfg());
+
+        // TWO failures do not trip it, whichever kind they would have been.
+        b.record_failure();
+        b.record_failure();
+        assert!(
+            b.allow_request(),
+            "two failures must not trip a threshold of three - a refused connection is worth one of three, not three of three"
+        );
+
+        // The THIRD does, so the count is what decides and nothing else.
+        b.record_failure();
+        assert!(
+            !b.allow_request(),
+            "three consecutive failures must trip it, whatever caused them"
+        );
+    }
+
     #[test]
     fn opens_after_three_consecutive_failures() {
         let b = CircuitBreaker::new(cfg());
