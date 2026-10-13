@@ -2825,6 +2825,164 @@ mod tests {
             "docs/deployment.md's worst-case arithmetic must be 2 x {secs} = {total} s, because the document uses that total to tell an operator how to size --stop-timeout, and a wrong total means a SIGKILL mid-drain - which the document itself calls silent"
         );
     }
+    /// THE ENV NAMES THE CONFIG NEEDS ARE THE ONES `.env.example` OFFERS, minus its
+    /// DOCUMENTED EXCEPTIONS.
+    ///
+    /// `config/apikita.toml` states this as its own rule, in prose, at the top of the file:
+    /// *"The names here should match `.env.example`, and this line used to say they must, which
+    /// was false."* It names the one that broke it (`APK_V4PRO_PRIMARY_KEY_1`, a real endpoint
+    /// with no example entry, so an operator copying the file never sets it) and then states the
+    /// rule that replaced the false one: a name an operator is expected to set appears in BOTH,
+    /// while a placeholder or an unconfigured route appears only in the config.
+    ///
+    /// NOTHING CHECKED IT. MEASURED: the relation holds today - all eight `APK_*` names in
+    /// `.env.example` are named in the config, and the four config names absent from the example
+    /// are exactly the three `APK_DUMMY_*` placeholders and `APK_V4PRO_PRIMARY_KEY_1` - but it
+    /// held by inspection, and the config's comment is a reader's only warning.
+    ///
+    /// BOTH DIRECTIONS, because they fail differently: a config name an operator must set and
+    /// cannot find in the example is the `APK_V4PRO_*` defect repeating, and an example name the
+    /// config never uses is a variable someone fills in to no effect.
+    #[test]
+    fn the_env_names_the_config_needs_are_the_ones_the_example_offers() {
+        let config = read_repo_file("config/apikita.toml");
+        let example = read_repo_file(".env.example");
+
+        /// Every `SCREAMING_SNAKE` name the config refers to, from an `api_key_envs` list or a
+        /// single `*_env = "NAME"` assignment.
+        fn config_env_names(config: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut in_list = false;
+            for line in config.lines() {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    continue;
+                }
+                if in_list {
+                    for m in quoted_uppercase(line) {
+                        out.push(m);
+                    }
+                    if line.contains(']') {
+                        in_list = false;
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("api_key_envs") {
+                    if rest.trim_start().starts_with('=') {
+                        for m in quoted_uppercase(line) {
+                            out.push(m);
+                        }
+                        in_list = !line.contains(']');
+                    }
+                    continue;
+                }
+                // A single-valued env indirection, e.g. `smtp_password_env = "SMTP_PASSWORD"`.
+                if line.contains("_env ") || line.contains("_env=") || line.contains("_env = ") {
+                    for m in quoted_uppercase(line) {
+                        out.push(m);
+                    }
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
+
+        /// The uppercase names inside double quotes on one line.
+        fn quoted_uppercase(line: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut rest = line;
+            while let Some(start) = rest.find('"') {
+                let after = &rest[start + 1..];
+                let Some(end) = after.find('"') else {
+                    break;
+                };
+                let name = &after[..end];
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    out.push(name.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+            out
+        }
+
+        let needed = config_env_names(&config);
+        assert!(
+            needed.len() >= 8,
+            "only {} env name(s) were parsed out of config/apikita.toml, so this check is reading \
+             the wrong lines",
+            needed.len()
+        );
+
+        let offered: Vec<String> = example
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if l.starts_with('#') {
+                    return None;
+                }
+                let (name, _) = l.split_once('=')?;
+                let name = name.trim();
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    return None;
+                }
+                Some(name.to_string())
+            })
+            .collect();
+        assert!(
+            offered.len() >= 8,
+            ".env.example yielded only {} name(s), so this check is reading the wrong file",
+            offered.len()
+        );
+
+        // THE EXCEPTIONS ARE NAMED, from the config's own comment rather than invented here.
+        // Three dummy placeholders inside example endpoint blocks, and one route whose resale
+        // terms are unverified - the config explains both, and the reason a name is exempt must
+        // be one of those two rather than whatever made this test pass.
+        const PLACEHOLDER_OR_UNCONFIGURED: &[&str] = &[
+            "APK_DUMMY_GLM52_KEY_1",
+            "APK_DUMMY_GLM53FLASH_KEY_1",
+            "APK_DUMMY_QWEN4MAX_KEY_1",
+            "APK_V4PRO_PRIMARY_KEY_1",
+        ];
+        for name in PLACEHOLDER_OR_UNCONFIGURED {
+            assert!(
+                needed.iter().any(|n| n == name),
+                "{name} is exempted from the .env.example match and the config no longer names it, \
+                 so the exemption is stale rather than deliberate"
+            );
+        }
+
+        let missing: Vec<&String> = needed
+            .iter()
+            .filter(|n| !offered.contains(n) && !PLACEHOLDER_OR_UNCONFIGURED.contains(&n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "config/apikita.toml names {missing:?} and .env.example does not, so an operator copying \
+             that file never sets them - the APK_V4PRO_PRIMARY_KEY_1 defect repeating. Either add the \
+             name to .env.example or record it in the config's comment AND in \
+             PLACEHOLDER_OR_UNCONFIGURED above."
+        );
+
+        let unused: Vec<&String> = offered
+            .iter()
+            .filter(|n| n.starts_with("APK_") && !needed.contains(n))
+            .collect();
+        assert!(
+            unused.is_empty(),
+            ".env.example offers {unused:?} and config/apikita.toml never names them, so an operator \
+             fills in a variable nothing reads."
+        );
+    }
     /// THE NUMBERS `docs/failover.md` STATES ARE THE ONES THE CONFIG SHIPS.
     ///
     /// THE DOC NAMES THREE NUMBERS AS FACTS - `After cooldown_seconds (default 30)`, `capped at
