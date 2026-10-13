@@ -612,9 +612,19 @@ else
             | grep -nE 'the one (that|which) (is|are|needs|remains)|is a single (alert|definition)|gap is a single' \
             | grep -viE '(said|says|was|were|had|would|used to|no longer|used to read|wording here|paragraph said)' || true)
         if [ -n "$SINGULAR" ]; then
-            echo "$SINGULAR" | while IFS= read -r row; do
+            # A HERE-DOCUMENT, NOT A PIPE, and this file already documents why at the count guard above:
+            # `echo "$X" | while read ...; do fail ...; done` runs the loop in a SUBSHELL, so `fail`
+            # increments a COPY of FAILED and the script prints the violation then exits 0. MEASURED here:
+            # the first version of this block was written as a pipeline, the message appeared on every
+            # planted mutation, and every one of them still reported exit 0 - the exact trap the note
+            # above says "knowing the rule did not stop me writing it" about. The here-document keeps the
+            # loop in the current shell.
+            while IFS= read -r row; do
+                [ -n "$row" ] || continue
                 fail "$README calls the uncovered set singular, but alerts.tsv marks $UNCOVERED_N rows needs-metrics. A count that is right with a quantifier that is wrong still sends an operator to wire one surface when there are $UNCOVERED_N: $row"
-            done
+            done <<EOF
+$SINGULAR
+EOF
         fi
     fi
 
