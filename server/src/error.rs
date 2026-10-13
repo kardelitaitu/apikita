@@ -437,12 +437,36 @@ impl StreamGauge {
     /// A stream finished, however it finished - completed, failed, or abandoned by a
     /// client that hung up.
     ///
-    /// `saturating_sub` and not `fetch_sub`: a double-close would wrap the counter to
-    /// `u64::MAX` and report every future reading as an enormous number of in-flight
-    /// streams. The guard below is written so a double-close cannot happen, and this is the
-    /// floor under that argument rather than a substitute for it.
+    /// `saturating_sub` and not `fetch_sub`: a close with nothing open would wrap the counter to
+    /// `u64::MAX` and report every future reading as an enormous number of in-flight streams.
+    /// This is the floor under the argument that a caller cannot cause it, not a substitute for
+    /// that argument.
+    ///
+    /// MEASURED, AND THE COMMENT DESCRIBED A FUNCTION THAT DID NOT EXIST. This body used to be
+    /// `self.active.fetch_sub(1, Ordering::Relaxed)` - the exact call the sentence above says it
+    /// is not - and `git log -S` puts the prose and that line in the SAME commit, so it was never
+    /// true rather than having regressed. `a_close_on_an_empty_gauge_does_not_wrap_the_level`
+    /// reports the wrap as `18446744073709551615` and fails against the old body.
+    ///
+    /// THE CAS LOOP, NOT A LOAD-THEN-STORE, for the same reason `opened` uses one: two streams
+    /// ending at the same instant would otherwise both read the old level and both store their
+    /// own, losing one decrement and inflating the level for as long as the process runs. The
+    /// peak is NOT touched here - a close cannot raise a maximum, and writing to it would be the
+    /// one place a stray close could make the sizing figure worse.
     pub fn closed(&self) {
-        self.active.fetch_sub(1, Ordering::Relaxed);
+        let mut current = self.active.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.active.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     pub fn active(&self) -> u64 {
@@ -734,6 +758,62 @@ mod tests {
             (gauge.active(), gauge.peak()),
             (0, 3),
             "the peak must REMAIN 3 after every stream ended: a sizing decision needs the worst moment, not the current one"
+        );
+    }
+
+    /// A CLOSE ON AN EMPTY GAUGE DOES NOT WRAP, WHICH THE COMMENT ABOVE `closed` CLAIMED
+    /// WHILE THE CODE DID THE OPPOSITE.
+    ///
+    /// MEASURED, and this is the defect rather than hardening: `StreamGauge::closed`'s doc
+    /// comment reads *"`saturating_sub` and not `fetch_sub`: a double-close would wrap the
+    /// counter to `u64::MAX` and report every future reading as an enormous number of in-flight
+    /// streams."* The body was `self.active.fetch_sub(1, Ordering::Relaxed)` - the exact call
+    /// that sentence says it is not. `git log -S` puts the comment and that line in the SAME
+    /// commit, so the prose never described the code: not a regression, wrong on arrival.
+    ///
+    /// WHY IT MATTERS EVEN THOUGH `Drop` RUNS ONCE. The comment's own escape hatch is that "the
+    /// guard below is written so a double-close cannot happen" - true of `InFlightGuard`, whose
+    /// `Drop` runs exactly once per value. But that argument is about a CALLER, and `closed` is
+    /// `pub` on a `pub` struct, so the floor is supposed to hold regardless of who calls it. The
+    /// wrapped value is not a small error either: `u64::MAX` reads as 18 quintillion in-flight
+    /// streams on the figure `docs/cost-and-sizing.md` checks a capacity argument against, and
+    /// the peak CAS would latch it for the life of the process.
+    ///
+    /// THE ASSERTION IS ON THE OBSERVABLE, not on the implementation: a gauge at zero told that
+    /// one more stream ended must still read zero.
+    #[test]
+    fn a_close_on_an_empty_gauge_does_not_wrap_the_level() {
+        let gauge = StreamGauge::default();
+        assert_eq!(gauge.active(), 0);
+
+        gauge.closed();
+
+        assert_eq!(
+            gauge.active(),
+            0,
+            "a close with nothing open must leave the level at zero, not wrap it to u64::MAX - which is what the doc comment on `closed` promises and what `fetch_sub` does not do"
+        );
+    }
+
+    /// AND THE PEAK IS NOT LATCHED BY A WRAP EITHER, which is the lasting half of the damage:
+    /// `active` recovers as soon as a real close lands, but the peak CAS latches the maximum it
+    /// ever saw, so one wrapped reading makes the sizing figure unrecoverable until restart.
+    #[test]
+    fn a_wrapped_level_cannot_poison_the_peak() {
+        let gauge = StreamGauge::default();
+        gauge.opened();
+        gauge.closed();
+        let peak_before = gauge.peak();
+
+        // A stray close, which the doc says cannot wrap.
+        gauge.closed();
+        // And a real stream afterwards, which must not raise the peak to a nonsense number.
+        gauge.opened();
+        let peak_after = gauge.peak();
+
+        assert!(
+            peak_after <= peak_before + 1,
+            "the peak must be bounded by real concurrency, not by a wrapped counter: before {peak_before}, after {peak_after}"
         );
     }
 
