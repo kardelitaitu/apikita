@@ -1293,6 +1293,35 @@ mod tests {
     /// WHAT IT READS. The variant names are parsed from THIS FILE's enum declaration, so it needs no
     /// new dependency and no reflection. A variant named in the enum and absent from either list is a
     /// failure, with the name in the message.
+    /// The variant NAMES `every_variant()` exercises, read from its own source.
+    ///
+    /// PARSED FROM THE SAME `include_str!` THE ENUM IS, deliberately: the point of the reverse
+    /// check is that the hand-kept list and the enum have not drifted, so the list must be read
+    /// as TEXT rather than walked as values. Walking it would give the variant names back
+    /// perfectly while proving nothing about whether the enum still declares them.
+    fn every_variant_names() -> Vec<String> {
+        const SOURCE: &str = include_str!("error.rs");
+        let start = SOURCE
+            .find("fn every_variant() -> Vec<AppError> {")
+            .expect("every_variant() must still exist, or this reads nothing");
+        let body = &SOURCE[start..];
+        let end = body
+            .find("\n    }")
+            .expect("every_variant() must still close");
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("AppError::")?;
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn every_variant_is_listed_here() {
         const SOURCE: &str = include_str!("error.rs");
@@ -1323,11 +1352,45 @@ mod tests {
             .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
             .collect();
 
+        // THE VACUITY GUARD, AND IT USED TO SIT AT 10 AGAINST 16 REAL VARIANTS.
+        //
+        // MEASURED: re-indenting six variants so the parse above skipped them left `declared` at
+        // 10, this floor passed, and the assertion below still passed - because that assertion
+        // asks whether every PARSED variant is covered, so a parser that stops seeing variants
+        // makes the question SMALLER rather than failing it. The check ran vacuously over the part
+        // of the enum it could no longer read, while its own message promised the opposite.
+        //
+        // A count cannot be written here without being stale the day a variant is added, so the
+        // guard is not a count: it is the OTHER DIRECTION of the same comparison. Every variant
+        // named in `every_variant()` must be one the parser found, which fails on a lost variant
+        // and needs no number at all. `every_variant()` is the hand-kept list, so it is the one
+        // that must be `include_str!`-verified rather than trusted.
+        //
+        // The floor stays, BELOW the real count, purely so a total parse failure reports here
+        // rather than as a confusing one-directional mismatch.
         assert!(
             declared.len() >= 10,
             "only {} variants were parsed from the enum, so this check is looking at the wrong thing \
              and would pass vacuously: {declared:?}",
             declared.len()
+        );
+        let listed_names = every_variant_names();
+        assert!(
+            listed_names.len() >= 10,
+            "only {} variants could be read from `every_variant()`, so the reverse check below \
+             compares against nothing",
+            listed_names.len()
+        );
+        let not_in_enum: Vec<String> = listed_names
+            .into_iter()
+            .filter(|name| !declared.contains(&name.as_str()))
+            .collect();
+        assert!(
+            not_in_enum.is_empty(),
+            "`every_variant()` names {not_in_enum:?} and the parser did not find them in the enum \
+             body. Either the enum lost a variant that is still exercised here, or the parse above \
+             stopped recognising how it is written - and the coverage assertion below cannot tell \
+             those apart, because it only asks about variants the parse DID see."
         );
 
         // Every declared variant must produce a DISTINCT code among the ones every_variant() covers.
