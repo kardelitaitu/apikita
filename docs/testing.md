@@ -3469,6 +3469,40 @@ skips it. MEASURED by planting *"The one that remains is `relay_5xx`."* on the c
 exemption is not optional — without it the guard fires on every correction, including the ones in the same
 paragraph — so the hole is the price of the guard existing, and it is narrowed rather than removed.
 
+#### A lint for the harness itself, which took three attempts to be able to fail (round 54)
+
+Round 53's three harness faults were all the same shape, so they are now checked mechanically:
+**`.agents/harness-lint.js`** screens every `verify-*`/`mutate-*`/`test-*` script under `.agents/` for the
+three ways a harness lies about itself:
+
+1. it restores with `git checkout` **without first proving the tree is clean** — which is what discarded
+   round 53's work three times, because `git checkout` reverts *uncommitted* changes by definition;
+2. it captures a **pipeline** into a variable, so a later `$?` reads the last command's status — which read
+   `grep`'s answer instead of the gate's;
+3. it reports an **ANCHOR MISS without counting it**, so a run can end "ok" having tested nothing.
+
+It found one immediately: `.agents/test-barrier-keys.js` printed an anchor miss and returned — **it never
+exits non-zero at all**, so it reported success unconditionally. Fixed to set `process.exitCode = 1` on a
+miss and to refuse a measurement from a failed baseline.
+
+**Three faults in the linter itself, each found the same way — by planting a fault and watching it survive.**
+
+| fault | result |
+| --- | --- |
+| it flagged `verify-lint.js`, the file that **tests** it | a planted fault inside a JS template literal read as executable shell — round 27's defect: a scanner matching its own fixture |
+| it then stripped strings from **every** file | `echo "  ANCHOR MISS"` became `echo D`, so the ANCHOR-MISS screen could not fire on *any* shell script. **A lint that cannot fail, found by planting the fault it exists to catch.** |
+| its counter window was four lines | flagged the corrected file as still broken, because the fix set `process.exitCode` two lines below — a lint that cannot accept a fix is a lint that gets switched off |
+
+The rule the third taught, and the one the whole file now rests on: **strip JS quoting in JS files only.** A
+shell harness announces a miss by *printing* it, so the linter must read what it prints.
+
+**Verified in both directions, which is the only reason to trust either:** all four planted cases behave as
+expected — three faults caught with their line numbers, and a clean harness correctly not flagged.
+
+**One honest durability note.** `.agents/` is gitignored by `AGENTS.md`, so this linter is not committed and
+nothing runs it automatically. It is durable for the remaining rounds of this session and for whoever reads
+`docs/testing.md`, but it is not a 17th gate.
+
 
 
 
