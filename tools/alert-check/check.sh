@@ -598,6 +598,22 @@ else
     # singular is checked against it. The screening list is deliberately narrow - the two shapes that
     # ASSERT the quantity, not the ones that report it as history - because this file's own corrections
     # quote the old wording, and a guard that fires on its own explanation is the defect it is here to stop.
+    # WHAT THIS DOES NOT CATCH, stated because a guard that overclaims is worse than a narrow one:
+    # a singular claim sitting on a line that ALSO mentions history is exempt, because the same filter
+    # that skips this file's own corrections skips it. MEASURED by planting "The one that remains is
+    # `relay_5xx`." on the corrected sentence's line, which reads "...This paragraph used to name only..."
+    # - the gate reported exit 0. The exemption is not optional (without it the guard fires on every
+    # correction, including the ones above), so the hole is the price of the guard existing, and it is
+    # narrowed rather than removed: the filter matches specific past-tense markers, not the word
+    # "paragraph", and a fresh claim in a new sentence is caught.
+    #
+    # Four pattern faults were found and fixed while writing this, each by planting the defect and
+    # watching it survive: `is the one (that|...)` could not match "and **the one** that is";
+    # the pattern keyed on "is" where the text says "and"; a piped `while` ran in a SUBSHELL so the
+    # message printed and the exit stayed 0; and `grep -nE` is case-SENSITIVE, so "**The** one that
+    # remains" was invisible. Every one was a guard that could not fail, in a guard written to catch a
+    # claim that was wrong. They are recorded here rather than in a commit message because the next
+    # person to touch this pattern will make one of them again.
     UNCOVERED_N=$(printf '%s\n' "$NEEDS_METRICS_TSV" | grep -c . || true)
     if [ "$UNCOVERED_N" -gt 1 ]; then
         # STRIP THE MARKDOWN FIRST, and WIDEN THE PATTERN, because the first version of this guard did
