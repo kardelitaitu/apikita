@@ -460,6 +460,50 @@ pub fn stream_gauge() -> &'static StreamGauge {
     GAUGE.get_or_init(StreamGauge::default)
 }
 
+/// Decode a UUID column that SQLite stores as TEXT.
+///
+/// THE REPLACEMENT FOR `row.get::<Hyphenated, _>("col").into_uuid()`, WHICH PANICS ON A
+/// MALFORMED VALUE. Measured, twice, and both were silent outages:
+///
+///   * a settlement for a `topups.id` that was not a UUID panicked inside the handler task,
+///     so the connection closed with no response and no log line - a payment provider retries
+///     into that forever;
+///   * a request presenting an `api_keys` row whose `id` was not a UUID panicked on the
+///     AUTHENTICATION path, so that credential could never authenticate and nothing said why.
+///
+/// THE VALUES ARE REACHABLE, which is what makes this a defect rather than a curiosity. Every
+/// id column is `TEXT PRIMARY KEY` with no foreign key and no format constraint, so a migration,
+/// a repair script or an operator at a prompt can write one; the FK chain then propagates a
+/// malformed `accounts.id` to every child row. Verified against the shipped schema rather than
+/// assumed.
+///
+/// WHY `clippy::unwrap_used` DOES NOT CATCH IT, since that lint is denied crate-wide on the
+/// request path: `Row::get` looks like an infallible accessor, and the panic belongs to the
+/// `Decode` impl rather than to an `unwrap` in this source. That is exactly why nineteen sites
+/// used `get` while four used `try_get` - the difference was invisible, and only the paths a
+/// malformed fixture happened to exercise ever showed it.
+///
+/// `AppError::Database` rather than a new variant: this IS a database holding a value this code
+/// cannot use, which is what the variant means, and it answers a 500 that NAMES THE COLUMN in
+/// the log - so the operator learns which row is wrong instead of seeing a dropped connection.
+///
+/// CONCRETE FOR `SqliteRow` RATHER THAN GENERIC OVER `T: Row`, and the generic version was tried
+/// first: `Row::try_get` needs `Decode<'r, Self::Database>` on the OUTPUT type, and expressing that
+/// against an associated `Database` type needs a `where for<'r> ...` clause the compiler cannot
+/// resolve without naming the database. This crate is SQLite everywhere (`db.rs` is `SqlitePool`
+/// throughout), so the generality bought nothing and cost three trait errors.
+pub fn decode_uuid_column(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &'static str,
+) -> Result<uuid::Uuid, AppError> {
+    let raw: uuid::fmt::Hyphenated = sqlx::Row::try_get(row, column).map_err(|err| {
+        AppError::Database(sqlx::Error::ColumnDecode {
+            index: column.to_string(),
+            source: Box::new(err),
+        })
+    })?;
+    Ok(raw.into_uuid())
+}
 /// The process-wide rejection counter. See `RejectionCounter`.
 pub fn rejection_counter() -> &'static RejectionCounter {
     static COUNTER: std::sync::OnceLock<RejectionCounter> = std::sync::OnceLock::new();

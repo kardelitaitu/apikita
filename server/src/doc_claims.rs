@@ -4183,6 +4183,71 @@ mod tests {
         );
     }
 
+    /// A UUID DECODED WITH `Row::get` PANICS ON A MALFORMED VALUE, AND THIS FORBIDS IT.
+    ///
+    /// THE MEASURED DEFECT THIS CLOSES, twice, both silent outages: a settlement for a
+    /// `topups.id` that was not a UUID panicked inside the handler task, and a request
+    /// presenting an `api_keys` row whose `id` was not a UUID panicked ON THE AUTHENTICATION
+    /// PATH. In both cases the connection closed with NO response and NO log line, so a
+    /// payment provider retried forever and a credential could never authenticate, and nothing
+    /// in the service said why.
+    ///
+    /// THE VALUES ARE REACHABLE: every id column is `TEXT PRIMARY KEY` with no foreign key and
+    /// no format constraint, so a migration, a repair script or an operator at a prompt can
+    /// write one - and the FK chain then propagates a malformed `accounts.id` to every child.
+    /// Verified against the shipped schema rather than assumed.
+    ///
+    /// WHY A GUARD RATHER THAN NINETEEN FIXES, which is the part worth recording:
+    /// `clippy::unwrap_used` IS denied crate-wide on the request path (lib.rs) and does not
+    /// catch this, because `get` looks like an infallible accessor and the panic belongs to the
+    /// `Decode` impl rather than to an `unwrap` in this source. That is exactly how the code
+    /// reached nineteen `get` sites beside four `try_get` ones - the difference was invisible,
+    /// and only paths a malformed fixture happened to exercise ever showed it. Fixing the
+    /// nineteen without this guard leaves the twentieth to the next person, whose clippy run
+    /// will be green.
+    ///
+    /// MATCHED ON THE PATTERN rather than on a list of files, so a new module is covered by
+    /// being added. `get::<Hyphenated, _>` is the only shape that does this: a plain
+    /// `get::<String, _>` cannot panic on a well-formed row, and `decode_uuid_column` is the
+    /// one permitted spelling.
+    #[test]
+    fn no_uuid_column_is_decoded_with_a_panicking_get() {
+        let mut offenders: Vec<String> = Vec::new();
+        for path in source_files() {
+            let rel = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // This file QUOTES the pattern when explaining it, and a guard that cannot
+            // describe the thing it forbids is one nobody can read.
+            if rel == "doc_claims.rs" {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (i, line) in text.lines().enumerate() {
+                // A COMMENT mentioning the pattern is documentation, not a call. Only a line
+                // that would COMPILE as a call is reported, which is what makes this precise
+                // rather than noisy.
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if line.contains(".get::<Hyphenated, _>") {
+                    offenders.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these sites decode a UUID column with `Row::get`, which PANICS on a value that is 
+             not a UUID - and such a value is reachable, because every id column is TEXT PRIMARY 
+             KEY with no format constraint. The panic happens inside an axum handler task, so 
+             the request is closed with NO response and NO log line. Use 
+             `crate::error::decode_uuid_column(&row, \"col\")?` instead. Sites: {offenders:?}"
+        );
+    }
     #[test]
     fn every_rust_comment_citation_points_at_code() {
         /// Citations that are QUOTED EXAMPLES of staleness rather than claims about this tree.

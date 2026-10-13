@@ -567,7 +567,7 @@ async fn expire_one_deposit(
         return Ok(None);
     };
 
-    let account_id: Uuid = row.get::<Hyphenated, _>("account_id").into_uuid();
+    let account_id: Uuid = crate::error::decode_uuid_column(&row, "account_id")?;
     let balance: i64 = row.get("balance_idr");
 
     // Retire at most the deposit's own amount, and at most what is left in the
@@ -5949,6 +5949,52 @@ mod tests {
         );
         assert_eq!(test_support::balance(&db.pool, account_id).await, 1_000);
         assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+    /// A MALFORMED `api_keys.id` IS AN ERROR RATHER THAN A PANIC, ON THE AUTHENTICATION
+    /// PATH.
+    ///
+    /// THE SECOND SITE OF THE SAME DEFECT, found by asking which of the nineteen panicking
+    /// `get::<Hyphenated, _>` sites were reachable rather than assuming the one a benchmark
+    /// happened to trip. This one matters more than the settlement: it is the key lookup every
+    /// proxied request goes through, so a malformed row meant that credential could NEVER
+    /// authenticate, with no response and no log line.
+    ///
+    /// The assertion is on the DECODE, not on an HTTP status: driving a real request needs a
+    /// router this suite has no harness for, and what the fix changed is precisely which of
+    /// `Err` or a panic comes out of the row. Reaching the assertion at all is the observation.
+    #[tokio::test]
+    async fn a_non_uuid_api_key_id_is_an_error_rather_than_a_panic() {
+        let db = TestDb::new().await;
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO accounts (id, status, is_operator, created_at, updated_at) \
+             VALUES ('not-a-uuid', 'active', 0, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .expect("accounts.id accepts a non-UUID: TEXT PRIMARY KEY has no format constraint");
+        sqlx::query(
+            "INSERT INTO api_keys (id, account_id, key_hash, prefix, models, created_at) \
+             VALUES ('not-a-uuid-key', 'not-a-uuid', 'hash', 'apk_x', '[]', ?)",
+        )
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .expect("the FK permits the child once the parent exists");
+
+        let row = sqlx::query("SELECT id, account_id FROM api_keys WHERE key_hash = 'hash'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the malformed key row");
+
+        assert!(
+            crate::error::decode_uuid_column(&row, "id").is_err(),
+            "a malformed id must be an Err; a panic here would close the request silently"
+        );
+        assert!(crate::error::decode_uuid_column(&row, "account_id").is_err());
         db.close().await;
     }
     /// A MALFORMED `topups.id` IS AN ERROR, NOT A CONNECTION-KILLING PANIC.

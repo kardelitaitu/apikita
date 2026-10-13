@@ -82,7 +82,6 @@ use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{Row, SqlitePool};
-use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
 use crate::abuse;
@@ -546,7 +545,7 @@ pub async fn redeem_link_code(
         return Ok(invalid_code_response());
     };
 
-    let account_id: Uuid = row.get::<Hyphenated, _>("account_id").into_uuid();
+    let account_id: Uuid = crate::error::decode_uuid_column(&row, "account_id")?;
 
     // 4. Bind the chat. `telegram_links` is keyed by telegram_id, so re-linking the
     //    same chat REPLACES its account rather than violating the primary key. That
@@ -835,7 +834,10 @@ mod tests {
             .fetch_optional(pool)
             .await
             .expect("read telegram_links");
-        row.map(|r| r.get::<Hyphenated, _>("account_id").into_uuid())
+        row.map(|r| {
+            crate::error::decode_uuid_column(&r, "account_id")
+                .expect("the fixture must store a decodable telegram_links.account_id")
+        })
     }
 
     /// Attempts recorded across ALL hash keys.

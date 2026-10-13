@@ -12,7 +12,6 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use tracing::{error, warn};
-use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
 use crate::auth_attempts;
@@ -49,6 +48,11 @@ async fn resolve_account_from_cookie(
     pool: &SqlitePool,
     headers: &HeaderMap,
 ) -> Result<Uuid, AppError> {
+    // Test-only, which is why the import lives HERE and not at the module top: the production
+    // decode sites moved to `decode_uuid_column`, and this test fixture is the only thing left
+    // naming the type. A module-level import for one `cfg(test)` user is an unused warning in
+    // every non-test build, which is how a real unused import would hide.
+    use uuid::fmt::Hyphenated;
     let cookie_hdr = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -1246,7 +1250,12 @@ pub async fn logout_all(
         // rather than 500, matching how it already treats a cookie that resolves
         // to nothing.
         let caller = session.and_then(|s| {
-            let account_id: Uuid = s.get::<Hyphenated, _>("account_id").into_uuid();
+            // `.ok()?` rather than `?`: this closure yields `Option`, and the two decodes
+            // BESIDE it already do this. A session row whose account_id cannot be decoded is
+            // not a reason to fail the request - it is a caller that does not resolve, which
+            // is what the surrounding code already means by `None`. The difference from the
+            // old `get` is that this no longer PANICS on the way to that answer.
+            let account_id: Uuid = crate::error::decode_uuid_column(&s, "account_id").ok()?;
             let last_seen_at: chrono::DateTime<chrono::Utc> = s.try_get("last_seen_at").ok()?;
             let expires_at: chrono::DateTime<chrono::Utc> = s.try_get("expires_at").ok()?;
             Some((account_id, last_seen_at, expires_at))

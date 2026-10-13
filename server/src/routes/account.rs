@@ -3382,11 +3382,13 @@ mod tests {
         // through `Hyphenated` rather than a bare `Uuid` (the failure is
         // `ParseByteLength { len: 36 }`).
         assert_eq!(
-            row.get::<Hyphenated, _>("id").into_uuid(),
+            crate::error::decode_uuid_column(&row, "id")
+                .expect("the fixture must store a decodable topups.id"),
             Uuid::parse_str(topup_id).unwrap()
         );
         assert_eq!(
-            row.get::<Hyphenated, _>("account_id").into_uuid(),
+            crate::error::decode_uuid_column(&row, "account_id")
+                .expect("the fixture must store a decodable topups.account_id"),
             account_id
         );
         assert_eq!(row.get::<i64, _>("amount_idr"), amount);

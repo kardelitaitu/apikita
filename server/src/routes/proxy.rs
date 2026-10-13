@@ -33,7 +33,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
 use crate::config::AppConfig;
@@ -745,9 +744,14 @@ async fn load_key_metadata(
         return Err(AppError::Unauthenticated);
     };
 
+    // THESE TWO DECODES ARE ON THE AUTHENTICATION PATH, which is what makes them the most
+    // consequential of the nineteen panicking sites this helper replaced. MEASURED before the
+    // fix: a key row whose `id` was not a UUID panicked here, so every request presenting that
+    // credential was closed with NO response and NO log line - a permanent, silent outage for one
+    // key, and nothing in the service said why. Now it is a 500 with the column named in the log.
     let meta = KeyMetadata {
-        key_id: row.get::<Hyphenated, _>("id").into_uuid(),
-        account_id: row.get::<Hyphenated, _>("account_id").into_uuid(),
+        key_id: crate::error::decode_uuid_column(&row, "id")?,
+        account_id: crate::error::decode_uuid_column(&row, "account_id")?,
         models: row.get("models"),
         spend_limit_idr: row.get("spend_limit_idr"),
         token_limit: row.get("token_limit"),

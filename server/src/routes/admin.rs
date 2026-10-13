@@ -13,7 +13,8 @@
 //!   the one session-cookie parser and resolver - never a query parameter, never
 //!   a header, never a separate admin credential (docs/server/api-spec.md:421);
 //! - revocation reuses the same predicate logout_all uses for sessions
-//!   (auth.rs:309) - `revoked_at IS NULL` - and stamps the keys the way
+//!   (the session-revocation statement in `auth::logout_all`) - `revoked_at IS NULL` - and
+//!   stamps the keys the way
 //!   revoke_key does;
 //! - a revoked key is evicted from the proxy's process-wide metadata cache with
 //!   proxy::invalidate_key_cache, exactly as revoke_key does - without it a
@@ -801,7 +802,8 @@ pub async fn get_account_audit(
 /// Only an 'active' account can be suspended. Anything else (already suspended,
 /// or closed) is a 409 and writes NO audit row: there is nothing to do, and a
 /// non-active account cannot acquire new credentials in the meantime - the login
-/// path refuses a non-active account outright (auth.rs:204), so it cannot mint a
+/// path refuses a non-active account outright (`auth::login`'s `status != "active"`
+/// check), so it cannot mint a
 /// session, and the only way to mint a key is with one.
 ///
 /// The cache eviction is deliberately AFTER the commit: evicting before it would
@@ -2365,7 +2367,7 @@ mod tests {
         db.close().await;
     }
     /// (h) The login path still refuses a suspended account - the behaviour
-    /// auth.rs:204 already had, now asserted next to the suspension that makes it
+    /// `auth::login` already had, now asserted next to the suspension that makes it
     /// matter.
     ///
     /// Driven through the REAL login handler. There is no external identity

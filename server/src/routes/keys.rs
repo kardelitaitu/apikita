@@ -27,7 +27,6 @@ use serde_json::{json, Value};
 
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
-use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -359,22 +358,43 @@ pub async fn list_keys(
     .fetch_all(&pool)
     .await?;
 
+    // `filter_map`, NOT `map` + `?`, and the choice is about which failure is worse. A usage row
+    // whose `api_key_id` cannot be decoded is ONE unusable row; failing the whole listing would
+    // take the customer's dashboard down over it, and panicking - which is what this did before -
+    // would take the request down with no response and no log. Skipping it drops one day's spend
+    // from the report, which is visible and recoverable; it is LOGGED rather than swallowed, so
+    // the operator learns the row is wrong instead of seeing a number that is quietly low.
     let usage: Vec<(Uuid, NaiveDate, i64)> = usage_rows
         .into_iter()
-        .map(|r| {
-            let key_id: Uuid = r.get::<Hyphenated, _>("api_key_id").into_uuid();
+        .filter_map(|r| {
+            let key_id = match crate::error::decode_uuid_column(&r, "api_key_id") {
+                Ok(key_id) => key_id,
+                Err(err) => {
+                    tracing::error!(error = %err, "skipping a usage row with an undecodable api_key_id");
+                    return None;
+                }
+            };
             let day: NaiveDate = r.get("day");
             let cost_idr: i64 = r.get("cost_idr");
-            (key_id, day, cost_idr)
+            Some((key_id, day, cost_idr))
         })
         .collect();
     let spend_by_key = fold_spend_in_window(&usage, today);
 
+    // Same reasoning as the usage rows above: one undecodable key row must not take the listing
+    // down, and it must not panic on the way. It is SKIPPED AND LOGGED, so the customer sees the
+    // keys that are readable and the operator sees that one was not.
     let response: Vec<ApiKeyDto> = keys
         .into_iter()
-        .map(|k| {
-            let id: Uuid = k.get::<Hyphenated, _>("id").into_uuid();
-            ApiKeyDto {
+        .filter_map(|k| {
+            let id = match crate::error::decode_uuid_column(&k, "id") {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::error!(error = %err, "skipping a key row whose id cannot be decoded");
+                    return None;
+                }
+            };
+            Some(ApiKeyDto {
                 id,
                 prefix: k.get("prefix"),
                 label: k.get("label"),
@@ -386,7 +406,7 @@ pub async fn list_keys(
                 expires_at: k.get("expires_at"),
                 last_used_at: k.get("last_used_at"),
                 revoked_at: k.get("revoked_at"),
-            }
+            })
         })
         .collect();
 
@@ -509,7 +529,7 @@ pub async fn create_key(
     .fetch_one(&mut *tx)
     .await?;
 
-    let id: Uuid = key_record.get::<Hyphenated, _>("id").into_uuid();
+    let id: Uuid = crate::error::decode_uuid_column(&key_record, "id")?;
 
     // Commit BEFORE the response is built, so a caller that sees a 201 knows the
     // key is durable. The write lock is held for the whole of the above: the
