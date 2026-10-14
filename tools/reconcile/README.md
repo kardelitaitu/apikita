@@ -149,6 +149,27 @@ sqlite3 run is exit 4, not a warning.
 | `5`  | **Stranded hold** - at least one reservation hold unpaired for more than `HOLD_MAX_AGE_SECONDS` (default 900s): money left a wallet and came back nowhere. Run `hold-sweep`. |
 | `6`  | The database file `DATABASE_URL` names does not exist. |
 
+### Every code exercised, and how
+
+AN EXIT-CODE TABLE IS A CONTRACT WITH WHATEVER SCHEDULES THIS, and a code no run produces is a promise
+nobody has kept. MEASURED, one round ran the codes it could stage:
+
+| code | how it was produced | what it printed |
+| --- | --- | --- |
+| `0` | a freshly migrated database | `OK - wallet balances reconcile with the ledger (0 drifting accounts); 0 holds over the 900s bound` |
+| `1` | an account whose `wallets.balance_idr` disagrees with `SUM(ledger.delta_idr)` | `DRIFT DETECTED - 1 account(s) where the wallet cache disagrees with the authoritative ledger`, then the offending row |
+| `2` | `DATABASE_URL` unset, and separately set to `postgres://x/y` | `DATABASE_URL is not set` / `DATABASE_URL is not a SQLite URL` |
+| `6` | a `sqlite://` URL naming a file that is not there | `no such database file: does/not/exist.db`, plus the `cargo run --bin migrate` hint |
+
+`3` and `4` need `sqlite3` removed from `PATH` and a corrupt file respectively, and `5` needs a hold
+older than the bound - none of which this round staged. THEY ARE RECORDED AS UNTESTED RATHER THAN
+IMPLIED TO WORK, because the point of the table above is that a reader can tell which codes have been
+seen running and which have only been read.
+
+**The `1` case is worth noting for its message.** It does not stop at the count: it names the columns
+(`account_id|balance_idr|ledger_sum`) and flags `NO WALLET ROW` separately, because that is the shape a
+`LEFT JOIN` driven from `wallets` cannot see - the same weaker-rule case `reconcile.sql` documents.
+
 Codes `0`-`4` and `5` keep their original meanings. `6` is the single addition the
 SQLite port forced: the port had wanted `5` for a missing database file, but `5`
 was already the stranded hold in this line, and one code meaning two things is
