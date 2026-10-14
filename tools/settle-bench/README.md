@@ -50,6 +50,36 @@ idempotency key the credit is keyed on. A replay of one body would settle once a
 5. **Deletes every row it seeded**, in a `finally`, so a repeated run does not accumulate
    accounts in the operator's listing. A cleanup that fails says so rather than passing.
 
+## The measured run
+
+Ran against a local server with the shipped pool size, 20 accounts at 3 pending top-ups each,
+60 distinct settlements at concurrency 8:
+
+```
+    Settlements        : 60 of 60 offered
+    Wall time          : 0.29 s at concurrency 8
+    Settlements/sec    : 209.1
+    Published bar      : > 100 settlements/sec, pool size = 8
+```
+
+ALL FOUR CRITERIA PASS, and three of them are the tool's verdicts rather than a reading: the count
+against the published bar, every offered order settling exactly once, no `SQLITE_BUSY`/locked/5xx in
+any response, and a post-run reconciliation delta of 0. A second run reported **reconciliation
+before: clean**, which is what the `finally` cleanup is for - a repeatable tool that accumulates
+accounts is a tool whose second measurement is not the same measurement.
+
+### What this figure does and does not establish
+
+It establishes the criterion has an owner that RUNS, which is the whole point of the tool: before it
+landed the figure existed in exactly one place, a document line, and `doc_claims.rs` pinned the
+scenario by name as the one the harness cannot run. It does NOT establish a capacity number for a
+deployment - this is a dev-profile binary on a developer machine with no `--cpus` pin, which is the
+condition `docs/load-test.md` describes.
+
+Two figures from two runs on the same machine (209.1 then 178.6 at a smaller account count) are
+**a tool that reports a measurement, not a constant**. Anyone quoting this README's number as a
+capacity should quote the run conditions with it.
+
 ## What it deliberately does not do
 
 - **No latency distribution.** That is `tools/loadtest`'s job, and its four-process calibration
