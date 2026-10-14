@@ -4,6 +4,7 @@
 // docs/website/06-api-keys-and-limits.md, docs/website/03-functional-spec.md.
 // This is a script-island (plain <script>), not a UI-framework component:
 // astro.config and package.json are owned by another worker and must not change.
+import Skeleton from '../../components/Skeleton.astro';
 const MODELS = ['flash', 'deepseek-v4-flash'];
 ---
 
@@ -16,6 +17,10 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   </div>
 
   <div id="key-error" hidden class="mt-4 rounded-lg border border-danger-edge bg-danger-surface p-4 text-sm text-danger-ink"></div>
+
+  <div id="key-list-loading" class="mt-4 rounded-lg border border-edge bg-surface-raised p-4">
+    <Skeleton width="w-full" lines={3} />
+  </div>
 
   <ul id="key-list" class="mt-4 divide-y divide-edge rounded-lg border border-edge"></ul>
 
@@ -120,13 +125,88 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       </div>
     </div>
   </div>
+
+  <!-- Edit modal ------------------------------------------------------------- -->
+  <div id="key-edit-modal" hidden class="fixed inset-0 z-20 flex items-center justify-center bg-surface-sunken/80 p-4 backdrop-blur-sm"
+    role="dialog" aria-modal="true" aria-labelledby="key-edit-title">
+    <div class="w-full max-w-lg rounded-xl border border-edge-strong bg-surface-raised p-6 shadow-2xl shadow-black/60">
+      <h2 id="key-edit-title" class="text-lg font-semibold tracking-tight">Edit API key</h2>
+      <p class="mt-2 text-sm text-ink-muted">
+        Change the label, model access, limits or expiry. The key itself never
+        changes — its value stays the same.
+      </p>
+
+      <form id="key-edit-form" class="mt-4 space-y-4">
+        <div>
+          <label for="e-label" class="block text-sm font-medium">Label</label>
+          <input id="e-label" name="label" type="text" required autocomplete="off"
+            class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+        </div>
+
+        <fieldset>
+          <legend class="text-sm font-medium">Models</legend>
+          <p class="text-xs text-ink-muted">An empty selection permits nothing — the allowlist is deny by default.</p>
+          <div class="mt-2 flex flex-wrap gap-3">
+            <label class="inline-flex items-center gap-2 text-sm">
+              <input type="checkbox" name="models" value="flash" /> <span class="font-mono">flash</span>
+            </label>
+            <label class="inline-flex items-center gap-2 text-sm">
+              <input type="checkbox" name="models" value="deepseek-v4-flash" /> <span class="font-mono">deepseek-v4-flash</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="grid gap-4 sm:grid-cols-3">
+          <div>
+            <label for="e-spend" class="block text-sm font-medium">Spend limit (IDR)</label>
+            <input id="e-spend" name="spend_limit_idr" type="number" min="0"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label for="e-token" class="block text-sm font-medium">Token limit</label>
+            <input id="e-token" name="token_limit" type="number" min="0"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label for="e-rate" class="block text-sm font-medium">Rate (req/min)</label>
+            <input id="e-rate" name="rate_limit_rpm" type="number" min="0"
+              class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          </div>
+        </div>
+
+        <div>
+          <label for="e-expires" class="block text-sm font-medium">Expires on</label>
+          <input id="e-expires" name="expires_on" type="date"
+            class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm" />
+          <p class="mt-1 text-xs text-ink-muted">Blank = never expires.</p>
+        </div>
+
+        <div id="key-edit-warning" hidden class="rounded-md border border-warn-edge bg-warn-surface p-3 text-sm text-warn-ink"></div>
+        <div id="key-edit-error" hidden class="rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+
+        <div class="flex justify-end gap-3 pt-2">
+          <button id="key-edit-cancel" type="button"
+            class="rounded-md border border-edge-strong px-4 py-2 text-sm font-medium hover:border-brand">Cancel</button>
+          <button id="key-edit-submit" type="submit"
+            class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">Save changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
 </div>
 
 <script>
   import { apiFetch, ApiError } from '../../lib/api';
   import { describeError, inlineNotice, renderFieldError } from '../../lib/errors';
   import { formatIdr } from '../../lib/format';
-  import { buildCreateKeyRequest, plaintextKeyOf } from '../../lib/dashboard-form';
+  import { getLiveStore } from '../../lib/live';
+  import {
+    buildCreateKeyRequest,
+    buildUpdateKeyRequest,
+    limitReductionWarning,
+    plaintextKeyOf,
+    type ExistingKeyLimits,
+  } from '../../lib/dashboard-form';
 
   const MODELS_ALL = ['flash', 'deepseek-v4-flash'];
 
@@ -136,6 +216,10 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     label: string;
     models: string[];
     spend_limit_idr: number;
+    /** The token ceiling, 0 meaning unlimited. Mirrors ApiKeyDto in
+     *  server/src/routes/keys.rs. It was absent from both, which is why the edit
+     *  form could not populate the field and every save sent 0. */
+    token_limit: number;
     spend_used_idr: number;
     rate_limit_rpm: number;
     expires_at: string | null;
@@ -188,13 +272,14 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     return isNaN(d.getTime()) ? '—' : d.toLocaleString();
   }
 
-  function escapeHtml(s: string): string {
-    return s.replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    }[c] as string));
-  }
+  // The list as last rendered, so the live subscription can patch it without a refetch. Kept in one
+  // place because `render` replaces the DOM wholesale - a patched row that is not in this array would
+  // be lost on the next render.
+  let renderedKeys: ApiKey[] = [];
 
   function render(keys: ApiKey[]): void {
+    renderedKeys = keys;
+    ($('key-list-loading') as HTMLElement).hidden = true;
     const hasAny = keys.length > 0;
     emptyEl.toggleAttribute('hidden', hasAny);
     listEl.toggleAttribute('hidden', !hasAny);
@@ -204,16 +289,52 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     for (const k of keys) {
       const li = document.createElement('li');
       li.className = 'flex flex-wrap items-center justify-between gap-4 p-4';
+
+      // Built with createElement + textContent, never innerHTML. The label is
+      // user-supplied and the prefix is server data: textContent has no escaping
+      // to forget, so a label containing "<script>" renders as text rather than
+      // being one missed case away from injection. Same rule as the usage and
+      // admin islands.
       const left = document.createElement('div');
-      left.innerHTML =
-        '<div class="flex items-center gap-2">' +
-          '<span class="font-medium">' + escapeHtml(k.label || '(unlabeled)') + '</span>' +
-          '<span class="rounded-full border border-edge-strong px-2 py-0.5 text-xs text-ink-muted ' + (k.revoked_at ? "border-danger-edge text-danger" : "border-ok-edge text-ok") + '">' + statusLabel(k) + '</span>' +
-        '</div>' +
-        '<div class="mt-1 font-mono text-sm text-ink-muted">' + escapeHtml(k.prefix) + '…</div>' +
-        '<div class="mt-1 text-xs text-ink-muted">Models: ' + modelsText(k) + ' · Spend: ' + spendText(k) + ' · Last used: ' + lastUsedText(k) + '</div>';
+
+      const head = document.createElement('div');
+      head.className = 'flex items-center gap-2';
+
+      const label = document.createElement('span');
+      label.className = 'font-medium';
+      label.textContent = k.label || '(unlabeled)';
+      head.append(label);
+
+      const badge = document.createElement('span');
+      badge.className =
+        'rounded-full border px-2 py-0.5 text-xs ' +
+        (k.revoked_at ? 'border-danger-edge text-danger' : 'border-ok-edge text-ok');
+      badge.textContent = statusLabel(k);
+      head.append(badge);
+
+      const prefix = document.createElement('div');
+      prefix.className = 'mt-1 font-mono text-sm text-ink-muted';
+      prefix.textContent = k.prefix + '…';
+
+      const summary = document.createElement('div');
+      summary.className = 'mt-1 text-xs text-ink-muted';
+      summary.textContent =
+        'Models: ' + modelsText(k) +
+        ' · Spend: ' + spendText(k) +
+        ' · Last used: ' + lastUsedText(k);
+
+      left.append(head, prefix, summary);
       const right = document.createElement('div');
+      right.className = 'flex items-center gap-2';
       if (!k.revoked_at) {
+        // Edit first: changing limits is the common action, revoking is not.
+        const edit = document.createElement('button');
+        edit.type = 'button';
+        edit.className = 'rounded-md border border-edge-strong px-3 py-1.5 text-sm font-medium hover:border-brand';
+        edit.textContent = 'Edit';
+        edit.addEventListener('click', () => openEdit(k));
+        right.appendChild(edit);
+
         const revoke = document.createElement('button');
         revoke.type = 'button';
         revoke.className = 'rounded-md border border-danger-edge px-3 py-1.5 text-sm font-medium text-danger hover:bg-danger-surface';
@@ -229,6 +350,7 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   async function loadKeys(): Promise<void> {
     clearError();
     statusEl.textContent = 'Loading keys…';
+    ($('key-list-loading') as HTMLElement).hidden = false;
     try {
       const keys = await apiFetch<ApiKey[]>('/api/keys');
       render(keys);
@@ -238,6 +360,58 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
       showError(inlineNotice(view));
       render([]);
     }
+  }
+
+  // CROSS-TAB REVOCATION, which was the whole point of the `key` event and had no consumer.
+  //
+  // `live.ts` listens for `key` and records revoked ids in `revokedKeyIds`. That field was read by
+  // ZERO files outside live.ts — MEASURED against every sibling field, which are read by 2 to 15 —
+  // so this page kept rendering a Revoke button for a key another tab had already revoked, and
+  // clicking it answered 404. The comment on the field says "for cross-tab consistency"; this is the
+  // subscriber that makes that sentence true.
+  //
+  // IT PATCHES THE LIST RATHER THAN REFETCHING. The event carries `key_id` and `revoked_at`, which is
+  // exactly what `statusLabel` and the button gate read, so there is nothing a round trip would add —
+  // and a refetch on every event would race a concurrent create.
+  //
+  // AND IT DOES NOT FETCH ON LOAD. `loadKeys` is the only path that populates the list; the
+  // subscription only ever marks a key that is already rendered, so an event for a key this page has
+  // never seen is ignored rather than inserting a half-known row.
+  function applyRevocations(): void {
+    const revoked = new Set(getLiveStore().getState().revokedKeyIds);
+    if (revoked.size === 0) return;
+    let changed = false;
+    for (const key of renderedKeys) {
+      if (key.revoked_at === null && revoked.has(key.id)) {
+        // The stream's `revoked_at` is not carried into the row: the list's own fetch is the source
+        // of the timestamp, and inventing one here would put a client-side clock into a field the
+        // server owns. The row only needs to stop being "live".
+        key.revoked_at = 'revoked';
+        changed = true;
+      }
+    }
+    if (changed) render(renderedKeys);
+  }
+
+  // CREATE AND EDIT, which cannot be patched and therefore have to REFETCH.
+  //
+  // A create is the case that makes this necessary rather than nice: the new key is not on screen at
+  // all, and the event carries only `key_id` and `revoked_at` while the row needs a label, models,
+  // limits and a prefix. An edit is the same problem in reverse - the row exists but every field in it
+  // may have moved. So `changedKeyIds` is a signal, and this is the only thing that can turn it into
+  // correct markup.
+  //
+  // DEBOUNCED, because a burst is normal: creating a key fires one event, and the create result and
+  // the refetch are both list-shaped. Without the timer, N events in a tick would issue N requests and
+  // the last response to land would win rather than the last one REQUESTED.
+  let refetchTimer: number | null = null;
+  function applyKeyChanges(): void {
+    if (getLiveStore().getState().changedKeyIds.length === 0) return;
+    if (refetchTimer !== null) return;
+    refetchTimer = window.setTimeout(() => {
+      refetchTimer = null;
+      void loadKeys();
+    }, 150);
   }
 
   // The plaintext key is held nowhere but the #key-secret node. Dismissing the
@@ -265,6 +439,112 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
     ($('key-form') as HTMLFormElement).reset();
     void loadKeys();
   }
+
+  // --- Edit (PATCH /api/keys/:id) ------------------------------------------
+  // The create form and the edit form share ONE request builder
+  // (buildUpdateKeyRequest delegates to buildCreateKeyRequest), so the two cannot
+  // disagree about which values are acceptable.
+  const editModal = $('key-edit-modal');
+  const editForm = $('key-edit-form') as HTMLFormElement;
+  const editWarning = $('key-edit-warning');
+  const editError = $('key-edit-error');
+  /** The key being edited, and its stored limits (for the TTL warning). */
+  let editing: { id: string; before: ExistingKeyLimits } | null = null;
+
+  function openEdit(k: ApiKey): void {
+    editing = {
+      id: k.id,
+      before: {
+        spend_limit_idr: k.spend_limit_idr ?? 0,
+        token_limit: k.token_limit ?? 0,
+        rate_limit_rpm: k.rate_limit_rpm ?? 0,
+      },
+    };
+    ($('e-label') as HTMLInputElement).value = k.label ?? '';
+    ($('e-spend') as HTMLInputElement).value = String(k.spend_limit_idr ?? 0);
+    // Read the token ceiling back, for the same reason the model boxes below are
+    // read back: the submit path sends the whole field set, so anything this form
+    // fails to populate is submitted as its blank default, and the blank default
+    // for a limit is 0 - unlimited. This line is the difference between an edit
+    // that keeps a key's ceiling and one that quietly removes it.
+    ($('e-token') as HTMLInputElement).value = String(k.token_limit ?? 0);
+    ($('e-rate') as HTMLInputElement).value = String(k.rate_limit_rpm ?? 0);
+    ($('e-expires') as HTMLInputElement).value = k.expires_at ? k.expires_at.slice(0, 10) : '';
+    // Preselect the key's existing allowlist. Reading it back is what keeps an
+    // edit from silently widening access: an unchecked box means "not granted".
+    const granted = new Set(k.models ?? []);
+    for (const box of Array.from(editForm.querySelectorAll<HTMLInputElement>('input[name="models"]'))) {
+      box.checked = granted.has(box.value);
+    }
+    editWarning.hidden = true;
+    editError.hidden = true;
+    editModal.hidden = false;
+    ($('e-label') as HTMLInputElement).focus();
+  }
+
+  function closeEdit(): void {
+    editModal.hidden = true;
+    editing = null;
+    editForm.reset();
+  }
+
+  $('key-edit-cancel').addEventListener('click', closeEdit);
+
+  editForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!editing) return;
+    editError.hidden = true;
+
+    const data = new FormData(editForm);
+    const built = buildUpdateKeyRequest({
+      label: String(data.get('label') ?? ''),
+      models: data.getAll('models').map(String),
+      spend_limit_idr: String(data.get('spend_limit_idr') ?? ''),
+      token_limit: String(data.get('token_limit') ?? ''),
+      rate_limit_rpm: String(data.get('rate_limit_rpm') ?? ''),
+      expires_on: String(data.get('expires_on') ?? ''),
+    });
+    if (!built.ok) {
+      editError.textContent = built.error;
+      editError.hidden = false;
+      return;
+    }
+
+    const submit = $('key-edit-submit') as HTMLButtonElement;
+    submit.disabled = true;
+    submit.textContent = 'Saving…';
+    const targetId = editing.id;
+    const before = editing.before;
+    void apiFetch<ApiKey>('/api/keys/' + encodeURIComponent(targetId), {
+      method: 'PATCH',
+      body: JSON.stringify(built.body),
+    })
+      .then(() => {
+        const warning = limitReductionWarning(before, {
+          spend_limit_idr: built.body.spend_limit_idr,
+          token_limit: built.body.token_limit,
+          rate_limit_rpm: built.body.rate_limit_rpm,
+        });
+        if (warning) {
+          // Keep the modal open and SHOW the warning rather than closing
+          // silently: docs/server/api-spec.md:187 requires the honest note that a
+          // reduction is not instant.
+          editWarning.textContent = warning + ' Your change has been saved.';
+          editWarning.hidden = false;
+          return;
+        }
+        closeEdit();
+        void loadKeys();
+      })
+      .catch((err: unknown) => {
+        editError.textContent = describeError(err).message;
+        editError.hidden = false;
+      })
+      .finally(() => {
+        submit.disabled = false;
+        submit.textContent = 'Save changes';
+      });
+  });
 
   function openSecretStep(key: string | undefined): void {
     ($('key-form-step') as HTMLElement).hidden = true;
@@ -388,4 +668,14 @@ const MODELS = ['flash', 'deepseek-v4-flash'];
   });
 
   void loadKeys();
+
+  // The cross-tab subscription. Started here rather than at module scope so the DOM the listener
+  // writes to is in place, and because the store de-duplicates subscribers - a second call to
+  // `getLiveStore()` returns the same one `DashboardLayout` already started.
+  //
+  // TWO listeners for one event, because the two outcomes need different remedies: a revocation is
+  // PATCHED into the rows already on screen, a create or edit REFETCHES. See `changedKeyIds`.
+  const store = getLiveStore();
+  store.subscribe(applyRevocations);
+  store.subscribe(applyKeyChanges);
 </script>

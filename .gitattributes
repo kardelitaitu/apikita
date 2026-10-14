@@ -27,6 +27,25 @@ Dockerfile.*    text eol=lf
 *.yaml          text eol=lf
 *.conf          text eol=lf
 
+# TOML: baked into the server image by `COPY config` (server/Dockerfile:147), so it is a
+# CONTAINER INPUT even though the server reads it with a TOML parser rather than a shell.
+# It was missing from this list while shipping CRLF - measured inside a built image,
+# /srv/apikita/config/apikita.toml had 637 CRLF lines.
+#
+# NOTHING BREAKS TODAY, and that is exactly why it belongs here. The failure this file
+# exists to prevent is SILENT: the config inside the image is byte-different from what the
+# repository stores, and the next consumer need not be a tolerant parser. A checksum, a
+# byte-comparing test or a build-cache key would all see a difference nobody intended, on
+# the machine that built it. The repository side is already correct - git stores LF and
+# `core.autocrlf` adds the CR to the WORKING TREE - so this pins the checkout, not history.
+*.toml          text eol=lf
+
+# NOT added, and the omission is deliberate rather than an oversight: `*.ts` and `*.astro`.
+# They are Linux-built in CI but were MEASURED to tolerate CRLF - 222 CRLF lines in a
+# .astro page while all 163 website tests pass and the build succeeds - so adding them
+# would be a guess, and this file should carry claims that were tested. Add them with
+# evidence if a tool ever objects.
+
 # Never text-normalise binaries or lock files: git would corrupt them.
 *.png           binary
 *.jpg           binary

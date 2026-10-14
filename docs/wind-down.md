@@ -78,6 +78,15 @@ Give at least 30 days. Tell customers to **confirm their payout destination**.
 
 ## Step 3 — The eligibility query
 
+**Run the tool rather than typing this by hand.** [`tools/wind-down/report.sh`](../tools/wind-down/report.sh)
+runs exactly the query below against a read-only connection, splits the threshold, classifies
+each rail and computes the stablecoin units. It pays nobody. It requires the frozen rate in
+`$CLOSURE_USD_IDR_RATE` and refuses rather than defaulting — see
+[`tools/wind-down/README.md`](../tools/wind-down/README.md).
+
+The SQL is kept here because it is the definition of the step: the tool implements this
+query, and a disagreement between them is a bug in the tool.
+
 The refundable figure is `wallets.balance_idr`, **whole**. Expiry is waived, and in any
 case the schema holds one un-aged integer — expired and live credit are not
 distinguishable at all today.
@@ -98,10 +107,28 @@ SELECT w.account_id,
  ORDER BY w.balance_idr DESC;
 ```
 
-> **`topups.rail` does not exist yet.** Until it is added, **every customer is
-> Indonesian** — Midtrans QRIS is the only implemented rail — and the classification
-> query degenerates to `'bank_transfer'` for everyone. That is the correct answer today,
-> not a stub: there has never been a crypto top-up to classify.
+> **Every customer is Indonesian today**, so this query returns `'bank_transfer'` for
+> everyone. That is the correct answer, not a stub: there has never been a crypto top-up
+> to classify.
+>
+> **The reason is that no crypto rail is implemented, not that the column is missing.**
+> `topups.rail` exists and is load-bearing — it is `NOT NULL` with no `DEFAULT` and
+> `CHECK (rail IN ('midtrans','crypto'))`, in
+> `server/migrations/20260925000000_initial_schema.sql`, where the column comment also
+> records why it has no default: a `'midtrans'` default would silently mislabel a row
+> written by a path that forgot to name its rail. Every top-up writes it
+> (`server/src/routes/account.rs`, and the `INSERT` binds the literal `'midtrans'`), the
+> top-up list reads it back (same file, `get_topups`), and the test
+> `a_topup_must_name_its_rail_and_the_value_set_is_frozen`
+> (`server/src/test_support.rs`) asserts the column, the absence of a default, and that a
+> third value is refused. The `NOT NULL`-with-no-default shape exists precisely so that a
+> future second rail **cannot** inherit `'midtrans'` by omission.
+>
+> This runbook previously said the column did not exist. That was false when it was
+> written — and it mattered, because the paragraph it appeared in was the explanation an
+> operator would read while deciding whether the classification step was safe to run.
+> They would have been told a working query was a stub. The degenerate answer was always
+> right; only the stated cause was wrong.
 
 ## Step 4 — The sub-threshold list
 
@@ -155,15 +182,45 @@ UPDATE accounts SET status = 'closed', updated_at = :now WHERE id = :account_id;
 that a non-zero wallet is never closed is already recorded in
 [`data-retention.md`](data-retention.md).
 
+**The ordering is the operator's responsibility, because NO GUARD CHECKS IT, and that is
+measured rather than assumed.** Step 6 renumbered above is deliberately ordered 1-2-3, and
+the numbers are load-bearing: nothing enforces that they are run in that order. Run step 3
+early, or run step 2 without step 1, and reconcile in Step 7 still returns zero rows —
+because it compares `wallets.balance_idr` against `SUM(ledger.delta_idr)` and those two can
+agree perfectly on an account that was never paid out. Verified against a scratch database:
+
+    accounts.status = 'closed', wallets.balance_idr = 50000, SUM(ledger) = 50000
+    -> reconcile drift rows = 0
+
+The wallet and the ledger agree with each other, so no drift is reported, and the reconcile
+query never reads `accounts.status` at all. **So "zero rows" proves the payout was
+ARITHMETICALLY CONSISTENT; it does not prove every closed account was emptied.** An operator
+who wants the second fact has to query for it:
+
+```sql
+SELECT a.id, w.balance_idr FROM accounts a
+  JOIN wallets w ON w.account_id = a.id
+ WHERE a.status = 'closed' AND w.balance_idr <> 0;
+```
+
+**Zero rows from THAT query** is the proof that no closed account still holds money, and it
+is the one to run beside reconcile. It is written here because the runbook previously called
+Step 7's zero rows "the only proof the payout was complete and correct", which overstates
+what that query can see.
+
 ## Step 7 — Verify
 
 ```
 tools/reconcile/reconcile.sh
 ```
 
-**Zero rows.** This is the only proof the payout was complete and correct, and it must
-be run against a scratch copy before any live payout — an untested recovery path is a
-belief, and this is the same standard the backup drill is held to.
+**Zero rows from reconcile, AND zero rows from the closed-but-funded query above.** Reconcile
+is the money invariant; the second query is the closure rule. They answer different questions
+and a runbook that checks only the first can sign off a wind-down with unpaid balances on
+closed accounts.
+
+Both must be run against a scratch copy before any live payout — an untested recovery path is
+a belief, and this is the same standard the backup drill is held to.
 
 ## Step 8 — Destroy the banking details
 

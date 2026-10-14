@@ -87,7 +87,7 @@ The `api_keys` table lives in SQLite (see [02-data-model.md](02-data-model.md)):
 | `token_limit` | bigint | 0 = unlimited |
 | `rate_limit_rpm` | integer | 0 = unlimited |
 | `expires_at` | timestamptz | null = never |
-| `last_used_at` | timestamptz | Updated lazily by proxy |
+| `last_used_at` | timestamptz | Updated lazily by proxy — on the key-metadata cache miss, so at most once per `limits.key_metadata_cache_seconds` per key |
 | `revoked_at` | timestamptz | null = active |
 | `created_at` | timestamptz | Audit timestamp |
 
@@ -196,13 +196,25 @@ click. Do not force a limit on a user who does not want one.
 | Prefix | `apk_live_a1b2…` |
 | Models | "All" or a count |
 | Spend | "12,340 / 50,000 IDR (30d)" or "Unlimited" |
-| Last used | |
+| Last used | `2026-01-01 14:32` or "Never" — written on the key-metadata cache miss, so it can lag by up to `limits.key_metadata_cache_seconds` |
 | Status | Active / Revoked / Expired |
 
 ### Detail / edit
 
 Show current-window usage against each limit. Allow raising limits immediately;
 **lowering** should warn that it may cut off in-flight usage within the TTL.
+
+**The edit form must be populated from the stored key, and it submits every
+limit, not just the changed ones.** Clearing a limit has to be expressible, so a
+diff is not enough — but that makes every unpopulated field a silent write of its
+blank default, and for a limit the blank default is `0`, which means unlimited.
+The token ceiling was the field this went wrong for: `GET /api/keys` did not
+return `token_limit`, the edit form therefore opened with its input blank, and
+saving an unrelated change raised that key's ceiling to no ceiling. Both halves
+are pinned by tests now — the server publishes the field
+(`list_keys_publishes_the_token_ceiling_that_a_save_would_otherwise_clear`) and
+the edit request cannot clear a limit it was handed
+(`editing a key sends back every limit it was given, clearing none`).
 
 ### Revoke
 
@@ -235,5 +247,5 @@ relationship visible, not present them as unrelated numbers.
 - [x] Exclude `key_hash` from list responses — enforced server-side by Rust `GET /api/keys`.
 - [x] Cache TTL **60s** — see [`docs/decisions.md`](../decisions.md).
 - [x] Spend limit returns **402** — see [`docs/decisions.md`](../decisions.md).
-- [x] Rolling window **30 days** — `config/apikita.toml` `[limits]`.
+- [x] Rolling window **30 days** — `routes::keys::SPEND_WINDOW_DAYS`, a code constant. It is **not** a config key, and this line used to say it was: `config/apikita.toml` `[limits]` has no window setting, and an operator told to change one would find nothing to change. The constant is deliberate — the proxy and the dashboard must fold the same window, and a configurable length would need a single reader anyway. The "e.g. the trailing 30 days" above is the DESIGN discussion; this is the value, and they agree because the example was taken as the specification.
 - [x] Key creation: **10/day per account** (`decisions.md`).

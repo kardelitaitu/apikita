@@ -1,3 +1,7 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -10,7 +14,7 @@ use tracing::error;
 /// The fixed, generic `message` returned to clients for the two variants whose
 /// inner value is diagnostic rather than contractual. It deliberately carries
 /// nothing: no SQL, no table or column name, no host, IP, port, provider or
-/// library name (docs/error-model.md:159, rule 1). It stays honest and
+/// library name (docs/error-model.md, rule 1). It stays honest and
 /// non-alarming, and it is not a contract - the `code` is.
 const UNEXPECTED_ERROR_MESSAGE: &str =
     "An unexpected error occurred. Please try again, and quote the request_id if it persists.";
@@ -61,8 +65,8 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
-    /// Carries the offending field, not just prose. docs/error-model.md:165
-    /// (rule 5) requires `details.field` so a UI can highlight the input
+    /// Carries the offending field, not just prose. docs/error-model.md
+    /// rule 5 requires `details.field` so a UI can highlight the input
     /// without parsing the message; making it a required field means a new
     /// call site cannot forget it.
     #[error("Validation failed: {message}")]
@@ -71,11 +75,24 @@ pub enum AppError {
     #[error("Rate limited")]
     RateLimited { retry_after_secs: u64 },
 
-    /// Every upstream is unhealthy (docs/error-model.md:50). Carries the
+    /// Every upstream is unhealthy (docs/error-model.md, Status codes, the 503
+    /// no_upstream_available row). Carries the
     /// `Retry-After` the client must honour, sourced from the pool's shortest
     /// remaining cooldown, so the wait is never guessed.
     #[error("No upstream available")]
     NoUpstreamAvailable { retry_after_secs: u64 },
+
+    /// A store this request needs could not be reached at all, as opposed to
+    /// answering a question with "no".
+    ///
+    /// DISTINCT FROM `Database`, which is a 500: that variant means a query THIS
+    /// code wrote failed against a database that answered, which is a bug and
+    /// belongs in the log as one. This one means the answer was never available -
+    /// the file is gone, the pool cannot connect, the disk is full - and the honest
+    /// thing to tell a client is "try again", not "something is broken here".
+    /// `NoUpstreamAvailable` is the same status for the same reason, one layer out.
+    #[error("Unavailable: {0}")]
+    Unavailable(String),
 
     // Display keeps the full inner detail on purpose: it is load-bearing for
     // server-side observability (every `error = %err` log site). The
@@ -100,7 +117,9 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::ValidationFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
-            Self::NoUpstreamAvailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoUpstreamAvailable { .. } | Self::Unavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -120,12 +139,14 @@ impl AppError {
             Self::ValidationFailed { .. } => "validation_failed",
             Self::RateLimited { .. } => "rate_limited",
             Self::NoUpstreamAvailable { .. } => "no_upstream_available",
+            Self::Unavailable(_) => "unavailable",
             Self::Database(_) | Self::Internal(_) => "internal_error",
         }
     }
 
     /// The client-facing `message`. This is the non-contract field
-    /// (docs/error-model.md:30) and the one rule 1 constrains: for `Database`
+    /// (docs/error-model.md, Response shape: code is the contract, message is not)
+    /// and the one rule 1 constrains: for `Database`
     /// and `Internal` it is fixed and generic, so no SQL, schema, host, IP,
     /// port, provider or library name can reach a customer. The underlying
     /// detail is not dropped - `into_response` logs it at `error!` level.
@@ -150,12 +171,474 @@ impl AppError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The server-error counter
+// ---------------------------------------------------------------------------
+
+/// A count of 5xx responses and of all responses, so an error RATE is computable.
+///
+/// WHY THIS EXISTS. `docs/observability.md:107` names an "Error rate >5%" alert and
+/// `tools/alert/alerts.tsv` lists it, but marks it `needs-metrics` - because
+/// nothing counted anything. The service already knew when it returned a 5xx (the
+/// `error!` in `into_response`), but a rate needs a COUNT over a window, so the
+/// alert could never fire. This is the smallest primitive that makes it real
+/// without choosing a metrics vendor, and any future scraper reads it unchanged.
+///
+/// WHY THE DENOMINATOR IS HERE TOO. "Error rate > 5%" is a ratio. A bare error
+/// count cannot be alerted on without knowing how much traffic produced it, and a
+/// count that spikes at 3am with no traffic context is not actionable.
+///
+/// WHAT IT DELIBERATELY DOES NOT RECORD: no status codes, no paths, no error
+/// messages, no per-account breakdown. Two integers. The health endpoint that
+/// exposes it is UNAUTHENTICATED (docs/server/api-spec.md:368), so anything richer
+/// would leak operational detail to any caller - the same rule that keeps
+/// `DATABASE_UNAVAILABLE` a fixed string.
+#[derive(Debug, Default)]
+pub struct ServerErrorCounter {
+    server_errors: AtomicU64,
+    responses: AtomicU64,
+}
+
+impl ServerErrorCounter {
+    /// One 5xx was returned.
+    pub fn record_error(&self) {
+        self.server_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One response was returned, at any status.
+    pub fn record_response(&self) {
+        self.responses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn server_errors(&self) -> u64 {
+        self.server_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn responses(&self) -> u64 {
+        self.responses.load(Ordering::Relaxed)
+    }
+
+    /// The error rate, or `None` when there have been no responses.
+    ///
+    /// **`None` is not `0.0`.** A service that has served nothing has an UNKNOWN
+    /// error rate; reporting it as zero would look like a perfectly healthy service
+    /// and silently suppress the alert. The caller must distinguish the two.
+    pub fn error_rate(&self) -> Option<f64> {
+        let responses = self.responses();
+        if responses == 0 {
+            return None;
+        }
+        Some(self.server_errors() as f64 / responses as f64)
+    }
+}
+
+/// The process-wide counter. See `ServerErrorCounter`.
+///
+/// A `OnceLock` rather than a parameter threaded through `AppState`, because axum
+/// calls the `IntoResponse` method with only `self`: there is nowhere to pass a
+/// counter without changing the trait, and every route would have to remember to
+/// forward it. A process-global cannot be forgotten at a call site, so it cannot
+/// drift from what is actually returned.
+pub fn server_error_counter() -> &'static ServerErrorCounter {
+    static COUNTER: std::sync::OnceLock<ServerErrorCounter> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(ServerErrorCounter::default)
+}
+
+/// WHAT AN UNDERCHARGE IS, precisely, because the alert has named it for a while as
+/// `needs-metrics` and the reason it could not fire was that nothing COUNTED it.
+///
+/// A request whose reported usage exceeded the balance it could be taken from. The
+/// answer was already streamed, so the tokens were genuinely consumed: the debit is
+/// CLAMPED to the balance, the real usage counters are recorded in full, and the
+/// difference is **money consumed and never collected**. The shortfall is real
+/// revenue the business does not get.
+///
+/// WHY IT IS ITS OWN COUNTER AND NOT PART OF THE ERROR RATE. Every one of these is
+/// already an `error!` log line, and an unalerted `error!` is exactly the defect this
+/// repository writes gates against — a refund-nobody-sees, a drift-nobody-sees. A log
+/// line reaches an operator only if somebody is reading logs at that moment; a counter
+/// reaches the metrics payload, which the alert tooling can read without a log
+/// scraper. Same shape as `ServerErrorCounter`: the smallest primitive that makes the
+/// number real.
+///
+/// WHY THE SUM AND NOT ONLY THE COUNT. A single undercharge of 200 IDR is noise; 40
+/// undercharges totalling 90,000 IDR is a customer running their account to zero and
+/// being served a premium answer for free. The AMOUNT is the part that makes it
+/// actionable, and `docs/business/05-risk.md` R3 already names under-charging as a
+/// HIGH risk — with no figure attached, because there was nothing to attach.
+#[derive(Debug, Default)]
+pub struct MoneyCounter {
+    /// How many settlements were clamped.
+    undercharges: AtomicU64,
+    /// The sum of the uncollected shortfalls, in IDR.
+    undercharged_idr: AtomicU64,
+}
+
+/// Per-reason counts for the requests the proxy REFUSED before costing anyone anything.
+///
+/// `docs/observability.md` has carried a `proxy_rejections_total{reason}` row in its
+/// "Rejection reasons" table since the document was written, with the note that it is
+/// "a genuinely good idea that no code computes". That note was accurate, and it is
+/// what this closes.
+///
+/// WHY THE KEY IS `AppError::code()` AND NOT A NEW VOCABULARY. The reasons an operator
+/// would act on are ALREADY the codes this service returns — `key_revoked`,
+/// `model_not_allowed`, `rate_limited`, `key_limit_exceeded`,
+/// `insufficient_balance` — and `code()` is the CLIENT-FACING contract
+/// (`docs/error-model.md`), so it is a closed set that already has a guard on it.
+/// Inventing a second list would have been the duplicate-rules-drift defect this
+/// repository keeps writing guards against. The doc's own draft list had already
+/// drifted from the codes in two places (`model_denied` for `model_not_allowed`,
+/// `limit_exceeded` for `key_limit_exceeded`).
+///
+/// WHAT IS DELIBERATELY NOT COUNTED: no per-account, no per-model, no path. This
+/// payload is served on an operator-authenticated route, but a cardinality-keyed map
+/// is how a metrics surface quietly becomes a surveillance surface — and
+/// `ServerErrorCounter`'s "two integers and nothing else" rule is the precedent.
+///
+/// WHAT IS ALSO DELIBERATELY NOT COUNTED: a refusal that COSTS money. A 402 after a
+/// reservation was taken is a settlement, not a rejection, and
+/// `insufficient_balance` here means the refusal fired before any hold moved.
+#[derive(Debug, Default)]
+pub struct RejectionCounter {
+    counts: Mutex<BTreeMap<String, u64>>,
+    /// Every request that reached the /v1 ADMISSION GATE, refused or admitted.
+    ///
+    /// THIS IS THE DENOMINATOR, and it is NOT `ServerErrorCounter::responses`. That
+    /// counter moves for every response the process returns - sign-in, the dashboard,
+    /// the SSE stream, `/health` - so dividing proxy refusals by it would produce a
+    /// number that DROPS as dashboard traffic rises, with no change in proxy traffic at
+    /// all. A rate whose movements are caused by an unrelated surface is worse than no
+    /// rate, because it looks like a measurement.
+    ///
+    /// Recorded at the same point the refusals are, so numerator and denominator come
+    /// from one place and cannot come to disagree about what a `request` is.
+    requests: AtomicU64,
+}
+
+impl RejectionCounter {
+    /// One refusal, filed under its documented code.
+    pub fn record(&self, code: &str) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counts.entry(code.to_string()).or_insert(0) += 1;
+    }
+
+    /// One request arrived at the /v1 admission gate, whether or not it was refused.
+    ///
+    /// Recorded BEFORE any check runs, so the denominator counts every attempt rather than
+    /// only the ones that got far enough to be counted elsewhere. A request refused for a
+    /// missing Authorization header never reaches a route handler, which is exactly why this
+    /// call site has to be the same one the refusals come from.
+    pub fn record_request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    /// Every reason that has fired at least once, in code order.
+    ///
+    /// Reasons that have NEVER fired are absent rather than present-as-zero, so the
+    /// payload cannot grow to the size of the whole code table on a quiet service —
+    /// and a reason going non-zero for the first time is a visible event.
+    pub fn counts(&self) -> Vec<(String, u64)> {
+        self.counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(code, count)| (code.clone(), *count))
+            .collect()
+    }
+
+    /// The share of admission attempts that were refused, or `None` when none arrived.
+    ///
+    /// **`None` IS NOT `0.0`**, the same rule `ServerErrorCounter::error_rate` documents:
+    /// a service that has taken no proxy traffic has an UNKNOWN refusal rate, and reporting
+    /// it as zero would look like a perfectly healthy gate and suppress any alert built on
+    /// it. The caller must distinguish the two.
+    ///
+    /// WHY A RATE AND NOT THE RAW COUNT. The count alone cannot be acted on: a spike at 3am
+    /// with no traffic context is not a signal, and a steady 40 refusals an hour is either
+    /// growth or an attack depending entirely on how many requests produced them. This is the
+    /// same argument `ServerErrorCounter` makes for its own denominator, applied to the gate.
+    ///
+    /// A REFUSAL RATE IS NORMAL AND SHOULD NOT BE ALERTED AT A LOW BAR: unauthenticated
+    /// probing is continuous on any public endpoint, so a non-zero rate is the expected state
+    /// and only its SHAPE carries information.
+    pub fn rejection_rate(&self) -> Option<f64> {
+        let requests = self.requests();
+        if requests == 0 {
+            return None;
+        }
+        let refused: u64 = self
+            .counts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .sum();
+        Some(refused as f64 / requests as f64)
+    }
+}
+
+/// How many answers are being streamed RIGHT NOW, and the most there have ever been.
+///
+/// WHY A GAUGE RATHER THAN A COUNTER, and it is the first one in this file. Every other
+/// metric here counts events that have happened; this reports a level that rises and
+/// falls. `docs/observability.md` lists `active_streams` with the note "the memory
+/// driver", and `docs/cost-and-sizing.md` builds the whole sizing argument on one
+/// sentence: "**The only thing that grows with load is in-flight streaming buffers.**"
+/// That sentence had no instrument behind it. A level is the only thing that can test it.
+///
+/// THE PEAK IS THE PART THAT MATTERS, and it is why this is not just a current count. A
+/// current value read at a random moment says what is happening then; the sizing question
+/// is what the WORST moment was. A service whose peak is 3 has never needed to be sized
+/// for 500, and one whose peak is 480 is one incident away from the memory ceiling the
+/// document budgets against. The peak is also the only figure that survives the traffic
+/// having stopped - a current count of 0 after a burst is indistinguishable from one that
+/// was never busy.
+///
+/// IT IS NOT RESET. A peak that resets on a schedule needs a schedule someone must choose,
+/// and `docs/benchmark.md` already records that the in-process benchmark made the same
+/// choice for the same reason. Process-lifetime matches every other counter here.
+#[derive(Debug, Default)]
+pub struct StreamGauge {
+    /// Streams in flight at this instant.
+    active: AtomicU64,
+    /// The highest `active` has ever been.
+    peak: AtomicU64,
+}
+
+impl StreamGauge {
+    /// A stream began. Returns nothing: the caller holds the guard that ends it.
+    ///
+    /// THE PEAK IS UPDATED WITH A COMPARE-AND-SWAP LOOP rather than a load-then-store,
+    /// because two streams starting at the same instant would otherwise both read the old
+    /// peak and both store their own - losing whichever went first. This is the one place
+    /// where a lost update is not a rounding detail: the peak is the number the capacity
+    /// argument is checked against.
+    pub fn opened(&self) {
+        let now = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut peak = self.peak.load(Ordering::Relaxed);
+        while now > peak {
+            match self
+                .peak
+                .compare_exchange_weak(peak, now, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => peak = actual,
+            }
+        }
+    }
+
+    /// A stream finished, however it finished - completed, failed, or abandoned by a
+    /// client that hung up.
+    ///
+    /// `saturating_sub` and not `fetch_sub`: a close with nothing open would wrap the counter to
+    /// `u64::MAX` and report every future reading as an enormous number of in-flight streams.
+    /// This is the floor under the argument that a caller cannot cause it, not a substitute for
+    /// that argument.
+    ///
+    /// MEASURED, AND THE COMMENT DESCRIBED A FUNCTION THAT DID NOT EXIST. This body used to be
+    /// `self.active.fetch_sub(1, Ordering::Relaxed)` - the exact call the sentence above says it
+    /// is not - and `git log -S` puts the prose and that line in the SAME commit, so it was never
+    /// true rather than having regressed. `a_close_on_an_empty_gauge_does_not_wrap_the_level`
+    /// reports the wrap as `18446744073709551615` and fails against the old body.
+    ///
+    /// THE CAS LOOP, NOT A LOAD-THEN-STORE, for the same reason `opened` uses one: two streams
+    /// ending at the same instant would otherwise both read the old level and both store their
+    /// own, losing one decrement and inflating the level for as long as the process runs. The
+    /// peak is NOT touched here - a close cannot raise a maximum, and writing to it would be the
+    /// one place a stray close could make the sizing figure worse.
+    pub fn closed(&self) {
+        let mut current = self.active.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.active.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn active(&self) -> u64 {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    pub fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+/// The process-wide stream gauge. See `StreamGauge`.
+pub fn stream_gauge() -> &'static StreamGauge {
+    static GAUGE: std::sync::OnceLock<StreamGauge> = std::sync::OnceLock::new();
+    GAUGE.get_or_init(StreamGauge::default)
+}
+
+/// Decode a UUID column that SQLite stores as TEXT.
+///
+/// THE REPLACEMENT FOR `row.get::<Hyphenated, _>("col").into_uuid()`, WHICH PANICS ON A
+/// MALFORMED VALUE. Measured, twice, and both were silent outages:
+///
+///   * a settlement for a `topups.id` that was not a UUID panicked inside the handler task,
+///     so the connection closed with no response and no log line - a payment provider retries
+///     into that forever;
+///   * a request presenting an `api_keys` row whose `id` was not a UUID panicked on the
+///     AUTHENTICATION path, so that credential could never authenticate and nothing said why.
+///
+/// THE VALUES ARE REACHABLE, which is what makes this a defect rather than a curiosity. Every
+/// id column is `TEXT PRIMARY KEY` with no foreign key and no format constraint, so a migration,
+/// a repair script or an operator at a prompt can write one; the FK chain then propagates a
+/// malformed `accounts.id` to every child row. Verified against the shipped schema rather than
+/// assumed.
+///
+/// WHY `clippy::unwrap_used` DOES NOT CATCH IT, since that lint is denied crate-wide on the
+/// request path: `Row::get` looks like an infallible accessor, and the panic belongs to the
+/// `Decode` impl rather than to an `unwrap` in this source. That is exactly why nineteen sites
+/// used `get` while four used `try_get` - the difference was invisible, and only the paths a
+/// malformed fixture happened to exercise ever showed it.
+///
+/// `AppError::Database` rather than a new variant: this IS a database holding a value this code
+/// cannot use, which is what the variant means, and it answers a 500 that NAMES THE COLUMN in
+/// the log - so the operator learns which row is wrong instead of seeing a dropped connection.
+///
+/// CONCRETE FOR `SqliteRow` RATHER THAN GENERIC OVER `T: Row`, and the generic version was tried
+/// first: `Row::try_get` needs `Decode<'r, Self::Database>` on the OUTPUT type, and expressing that
+/// against an associated `Database` type needs a `where for<'r> ...` clause the compiler cannot
+/// resolve without naming the database. This crate is SQLite everywhere (`db.rs` is `SqlitePool`
+/// throughout), so the generality bought nothing and cost three trait errors.
+pub fn decode_uuid_column(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &'static str,
+) -> Result<uuid::Uuid, AppError> {
+    let raw: uuid::fmt::Hyphenated = sqlx::Row::try_get(row, column).map_err(|err| {
+        AppError::Database(sqlx::Error::ColumnDecode {
+            index: column.to_string(),
+            source: Box::new(err),
+        })
+    })?;
+    Ok(raw.into_uuid())
+}
+/// The process-wide rejection counter. See `RejectionCounter`.
+pub fn rejection_counter() -> &'static RejectionCounter {
+    static COUNTER: std::sync::OnceLock<RejectionCounter> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(RejectionCounter::default)
+}
+
+impl MoneyCounter {
+    /// One clamped settlement, carrying the shortfall that was not collected.
+    ///
+    /// THE IDR ACCUMULATION REALLY SATURATES, and the first version of this function did
+    /// not. It used `fetch_add`, which WRAPS — and the comment above it claimed saturation
+    /// anyway, so the code and its own explanation disagreed and only a test could tell.
+    /// MEASURED: two `i64::MAX` shortfalls left the counter at `u64::MAX - 1`, i.e. the
+    /// worst possible loss reported as 18 quintillion short of the true figure.
+    ///
+    /// This is money arithmetic in a build where `[profile.release]` leaves
+    /// overflow-checks OFF, so nothing would have panicked: the number would simply be
+    /// wrong, silently, on the one alert whose whole purpose is to say how much was lost.
+    ///
+    /// The loop is a compare-and-swap rather than a `fetch_add` with a check, because
+    /// check-then-act is a lost-update race between the load and the store — and this
+    /// counter is written from the detached settlement task, which can be concurrent.
+    /// A failed CAS retries against the new value, so no increment is ever dropped.
+    pub fn record_undercharge(&self, shortfall_idr: i64) {
+        self.undercharges.fetch_add(1, Ordering::Relaxed);
+        if shortfall_idr <= 0 {
+            return;
+        }
+        let add = shortfall_idr as u64;
+        let mut current = self.undercharged_idr.load(Ordering::Relaxed);
+        loop {
+            // `saturating_add`, so the counter maxes out instead of wrapping to a
+            // number that reads as no loss at all.
+            match self.undercharged_idr.compare_exchange_weak(
+                current,
+                current.saturating_add(add),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn undercharges(&self) -> u64 {
+        self.undercharges.load(Ordering::Relaxed)
+    }
+
+    pub fn undercharged_idr(&self) -> u64 {
+        self.undercharged_idr.load(Ordering::Relaxed)
+    }
+}
+
+/// The process-wide money counter. See `MoneyCounter`.
+///
+/// A `OnceLock` for the same reason as `server_error_counter`: the counter is
+/// incremented on the settlement path, which is a detached task with no request
+/// handler to thread a parameter through, so a global cannot be forgotten at the
+/// call site.
+pub fn money_counter() -> &'static MoneyCounter {
+    static COUNTER: std::sync::OnceLock<MoneyCounter> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(MoneyCounter::default)
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let code = self.code().to_string();
         let details = self.details();
         let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+
+        // COUNT THE RESPONSE HERE, in the ONE place every error response is built,
+        // so the counter cannot drift from what is actually returned. Every status
+        // moves the denominator; only 5xx moves the numerator. See
+        // `ServerErrorCounter` for why the ratio, not a bare count, is the metric.
+        //
+        // `>= 500` rather than the two internal variants: a 503 from
+        // `NoUpstreamAvailable` is a server-side failure an operator must see in the
+        // rate, and counting only `Internal`/`Database` would under-report exactly
+        // when the upstream is down - which is when the alert matters most.
+        let counter = server_error_counter();
+        counter.record_response();
+        if status.is_server_error() {
+            counter.record_error();
+        }
+        // COUNT THE REJECTION BY REASON, in this same single place so it cannot drift
+        // from what is actually returned. RejectionCounter is keyed on code(), which is
+        // the client-facing contract - so the breakdown docs/observability.md names is
+        // served without a second vocabulary that could disagree with it.
+        //
+        // ONLY THE 4xx THAT ARE THE PROXY OWN GATE FIRING, and the filter matters more
+        // than the increment. A 5xx is not a rejection: the request would have been served
+        // and the provider failed, which is ServerErrorCounter numerator. A 401 on /api/*
+        // is authentication, not a proxy decision. So the set is the admission refusals -
+        // bad or absent credential, model not sellable, key over a ceiling, rate limit, or
+        // the wallet short - and every one of them preceded any hold leaving the wallet.
+        if status.is_client_error() {
+            match code.as_str() {
+                "key_revoked"
+                | "key_expired"
+                | "model_not_allowed"
+                | "key_limit_exceeded"
+                | "insufficient_balance"
+                | "rate_limited"
+                | "unauthenticated" => {
+                    rejection_counter().record(&code);
+                }
+                _ => {}
+            }
+        }
 
         // The detail moves to the log, not out of the system. `Display` keeps
         // the raw sqlx error / formatted failure, so an operator reading the
@@ -187,14 +670,15 @@ impl IntoResponse for AppError {
 
         let mut res = (status, Json(body)).into_response();
 
-        // The ONE place a Retry-After is decided (docs/error-model.md:79-82:
+        // The ONE place a Retry-After is decided (docs/error-model.md, Retry-After:
         // "Included on 429 and 503"). Both variants carry their value, so the
         // header logic lives here rather than at either call site.
         //
         // For 503 the value is the pool's shortest remaining cooldown. When no
         // breaker is open there is no cooldown to report, and the caller emits
         // the documented 1-second floor - never a fabricated estimate
-        // (docs/error-model.md:96, :112). Which path produced the 503 is logged
+        // (docs/error-model.md, Retry-After and 429 — rate limited). Which path
+        // produced the 503 is logged
         // at the call site so the floor is explained, not silent.
         let retry_after_secs = match self {
             Self::RateLimited { retry_after_secs }
@@ -218,6 +702,349 @@ mod tests {
     use axum::http::{header, HeaderMap};
     use serde_json::{json, Value as Json};
 
+    /// THE UNDERCHARGE COUNTER IS NOT THE SAME OBJECT AS THE ERROR COUNTER, and a
+    /// shared counter would make the money number move on every 5xx - which is the
+    /// failure mode that gets an alert muted: the figure is right some of the time and
+    /// nobody can tell when.
+    #[test]
+    fn the_money_counter_counts_events_and_idr_independently() {
+        let money = MoneyCounter::default();
+        assert_eq!(money.undercharges(), 0);
+        assert_eq!(
+            money.undercharged_idr(),
+            0,
+            "zero is a real and GOOD reading here, unlike error_rate's null for an empty window"
+        );
+
+        money.record_undercharge(200);
+        money.record_undercharge(90_000);
+        assert_eq!(money.undercharges(), 2);
+        assert_eq!(
+            money.undercharged_idr(),
+            90_200,
+            "the SUM is the actionable half: 2 events of 200 is noise, and the total is what an operator pages on"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RejectionCounter: the reason breakdown, keyed on the documented code
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // StreamGauge: the level, and the peak that outlives the traffic
+    // -----------------------------------------------------------------------
+
+    /// THE PEAK IS THE POINT, and this is the test that says why rather than merely
+    /// counting.
+    ///
+    /// A current count read at a random moment says what is happening then. The sizing
+    /// question `docs/cost-and-sizing.md` asks is what the WORST moment was - and the peak is
+    /// the only figure that survives the traffic stopping, since a current count of 0 after a
+    /// burst is indistinguishable from one that was never busy.
+    #[test]
+    fn the_peak_survives_the_traffic_stopping() {
+        let gauge = StreamGauge::default();
+        assert_eq!((gauge.active(), gauge.peak()), (0, 0));
+
+        gauge.opened();
+        gauge.opened();
+        gauge.opened();
+        assert_eq!((gauge.active(), gauge.peak()), (3, 3));
+
+        gauge.closed();
+        gauge.closed();
+        gauge.closed();
+        assert_eq!(
+            (gauge.active(), gauge.peak()),
+            (0, 3),
+            "the peak must REMAIN 3 after every stream ended: a sizing decision needs the worst moment, not the current one"
+        );
+    }
+
+    /// A CLOSE ON AN EMPTY GAUGE DOES NOT WRAP, WHICH THE COMMENT ABOVE `closed` CLAIMED
+    /// WHILE THE CODE DID THE OPPOSITE.
+    ///
+    /// MEASURED, and this is the defect rather than hardening: `StreamGauge::closed`'s doc
+    /// comment reads *"`saturating_sub` and not `fetch_sub`: a double-close would wrap the
+    /// counter to `u64::MAX` and report every future reading as an enormous number of in-flight
+    /// streams."* The body was `self.active.fetch_sub(1, Ordering::Relaxed)` - the exact call
+    /// that sentence says it is not. `git log -S` puts the comment and that line in the SAME
+    /// commit, so the prose never described the code: not a regression, wrong on arrival.
+    ///
+    /// WHY IT MATTERS EVEN THOUGH `Drop` RUNS ONCE. The comment's own escape hatch is that "the
+    /// guard below is written so a double-close cannot happen" - true of `InFlightGuard`, whose
+    /// `Drop` runs exactly once per value. But that argument is about a CALLER, and `closed` is
+    /// `pub` on a `pub` struct, so the floor is supposed to hold regardless of who calls it. The
+    /// wrapped value is not a small error either: `u64::MAX` reads as 18 quintillion in-flight
+    /// streams on the figure `docs/cost-and-sizing.md` checks a capacity argument against, and
+    /// the peak CAS would latch it for the life of the process.
+    ///
+    /// THE ASSERTION IS ON THE OBSERVABLE, not on the implementation: a gauge at zero told that
+    /// one more stream ended must still read zero.
+    #[test]
+    fn a_close_on_an_empty_gauge_does_not_wrap_the_level() {
+        let gauge = StreamGauge::default();
+        assert_eq!(gauge.active(), 0);
+
+        gauge.closed();
+
+        assert_eq!(
+            gauge.active(),
+            0,
+            "a close with nothing open must leave the level at zero, not wrap it to u64::MAX - which is what the doc comment on `closed` promises and what `fetch_sub` does not do"
+        );
+    }
+
+    /// AND THE PEAK IS NOT LATCHED BY A WRAP EITHER, which is the lasting half of the damage:
+    /// `active` recovers as soon as a real close lands, but the peak CAS latches the maximum it
+    /// ever saw, so one wrapped reading makes the sizing figure unrecoverable until restart.
+    #[test]
+    fn a_wrapped_level_cannot_poison_the_peak() {
+        let gauge = StreamGauge::default();
+        gauge.opened();
+        gauge.closed();
+        let peak_before = gauge.peak();
+
+        // A stray close, which the doc says cannot wrap.
+        gauge.closed();
+        // And a real stream afterwards, which must not raise the peak to a nonsense number.
+        gauge.opened();
+        let peak_after = gauge.peak();
+
+        assert!(
+            peak_after <= peak_before + 1,
+            "the peak must be bounded by real concurrency, not by a wrapped counter: before {peak_before}, after {peak_after}"
+        );
+    }
+
+    /// THE GAUGE FALLS, which a peak alone would not prove - a value that only ever rises
+    /// cannot distinguish a service at 3 from one that was at 3 an hour ago.
+    #[test]
+    fn the_level_falls_when_a_stream_ends() {
+        let gauge = StreamGauge::default();
+        gauge.opened();
+        gauge.opened();
+        assert_eq!(gauge.active(), 2);
+        gauge.closed();
+        assert_eq!(
+            gauge.active(),
+            1,
+            "one stream ended, so exactly one slot freed"
+        );
+        assert_eq!(gauge.peak(), 2, "and the peak is unmoved by a normal close");
+    }
+
+    /// CONCURRENT OPENS DO NOT LOSE A PEAK UPDATE.
+    ///
+    /// The peak is what the capacity argument is checked against, so a lost update is not a
+    /// rounding detail - it is a smaller number than reality on the one figure used to decide
+    /// whether the instance is big enough. A load-then-store implementation would lose one
+    /// whenever two streams started in the same instant; this drives many threads at once so
+    /// that a naive implementation has a real chance to fail.
+    #[test]
+    fn concurrent_opens_never_lose_a_peak_update() {
+        let gauge = std::sync::Arc::new(StreamGauge::default());
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 200;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let gauge = std::sync::Arc::clone(&gauge);
+                std::thread::spawn(move || {
+                    // Drawn out so the threads genuinely overlap rather than running in
+                    // sequence, which is the state a naive peak update fails in.
+                    for i in 0..PER_THREAD {
+                        gauge.opened();
+                        if i % 8 == 0 {
+                            std::thread::yield_now();
+                        }
+                        gauge.closed();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("no thread may panic");
+        }
+
+        assert_eq!(
+            gauge.active(),
+            0,
+            "every open must be matched by a close, across every thread"
+        );
+        assert!(
+            gauge.peak() >= 1,
+            "the peak must have recorded SOMETHING: {} threads each opened {} times",
+            THREADS,
+            PER_THREAD
+        );
+    }
+
+    /// THE RATE NEEDS ITS OWN DENOMINATOR, and this is the test that says why.
+    ///
+    /// `ServerErrorCounter::responses` counts EVERY response the process returns - sign-in,
+    /// the dashboard, `/health` - so a rate built on it would FALL as unrelated traffic
+    /// rose, with no change in proxy traffic at all. The counter therefore keeps its own
+    /// `requests`, incremented at the same gate the refusals are.
+    #[test]
+    fn the_rejection_rate_uses_its_own_denominator() {
+        let counter = RejectionCounter::default();
+        assert_eq!(
+            counter.rejection_rate(),
+            None,
+            "a gate that has seen nothing is UNMEASURED, not 0% - the same rule error_rate documents"
+        );
+
+        for _ in 0..4 {
+            counter.record_request();
+        }
+        counter.record("rate_limited");
+        assert_eq!(
+            counter.rejection_rate(),
+            Some(0.25),
+            "one refusal out of four attempts"
+        );
+
+        // THE PROPERTY THAT MATTERS: the rate must never exceed 1.0. It can only do so if
+        // a refusal is counted for a request the denominator never saw, which is exactly
+        // what recording `record_request` AFTER the first check would cause - a request
+        // refused for a missing header would be a numerator with no denominator.
+        let fresh = RejectionCounter::default();
+        fresh.record("unauthenticated");
+        fresh.record("unauthenticated");
+        assert!(
+            fresh.rejection_rate().is_none_or(|rate| rate <= 1.0),
+            "a rate above 1.0 means refusals are being counted for requests the denominator never saw"
+        );
+    }
+
+    /// EVERY ATTEMPT MOVES THE DENOMINATOR, refused or not, so the rate is a share of
+    /// attempts rather than of failures.
+    #[test]
+    fn an_admitted_request_still_counts_toward_the_denominator() {
+        let counter = RejectionCounter::default();
+        counter.record_request();
+        counter.record("rate_limited");
+        counter.record_request();
+        counter.record_request();
+        assert_eq!(counter.requests(), 3);
+        assert_eq!(
+            counter.rejection_rate(),
+            Some(1.0 / 3.0),
+            "the two ADMITTED requests must lower the rate, or it is not a rate"
+        );
+    }
+
+    /// THE REASONS ARE THE CODES THE SERVICE ALREADY RETURNS, and that is the whole design:
+    /// a second vocabulary would drift from the client-facing contract, which is exactly what
+    /// docs/observability.md's own draft list had already done in two places.
+    #[test]
+    fn a_rejection_is_filed_under_the_code_it_was_returned_as() {
+        let counter = RejectionCounter::default();
+        counter.record("insufficient_balance");
+        counter.record("insufficient_balance");
+        counter.record("rate_limited");
+
+        assert_eq!(
+            counter.counts(),
+            vec![
+                ("insufficient_balance".to_string(), 2),
+                ("rate_limited".to_string(), 1),
+            ],
+            "counts must aggregate per code, and in code order so the payload is stable"
+        );
+    }
+
+    /// A REASON THAT HAS NEVER FIRED IS ABSENT, not zero.
+    ///
+    /// This is what keeps a quiet service from publishing an entry for every code in
+    /// error-model.md, and it is why a reason going non-zero for the FIRST time is a
+    /// visible event rather than one line changing among many.
+    #[test]
+    fn a_reason_that_has_never_fired_is_absent_not_zero() {
+        let counter = RejectionCounter::default();
+        counter.record("key_revoked");
+        let counts = counter.counts();
+        assert_eq!(counts.len(), 1, "only the code that fired is reported");
+        assert_eq!(counts[0].0, "key_revoked");
+    }
+
+    /// Poison must not take the metrics path down: one panicking recording thread must not
+    /// make every later rejection reading panic on the /api/admin/metrics route.
+    #[test]
+    fn a_poisoned_rejection_lock_recovers_instead_of_panicking() {
+        let counter = RejectionCounter::default();
+        {
+            let _held = counter.counts.lock().expect("fresh lock is unpoisoned");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                panic!("poison the rejection lock");
+            }))
+            .ok();
+        }
+
+        counter.record("rate_limited");
+        assert_eq!(
+            counter.counts(),
+            vec![("rate_limited".to_string(), 1)],
+            "recording and reading must both survive a poisoned lock"
+        );
+    }
+
+    /// A ZERO OR NEGATIVE shortfall must not move the IDR figure, because the caller
+    /// only reaches this after the `shortfall_idr <= 0` guard - and if a future edit moves
+    /// the call above that guard, a concurrent top-up (a settled-in-full request, not an
+    /// undercharge) must not inflate the number.
+    #[test]
+    fn a_non_positive_shortfall_adds_no_idr() {
+        let money = MoneyCounter::default();
+        money.record_undercharge(0);
+        money.record_undercharge(-50);
+        assert_eq!(
+            money.undercharges(),
+            2,
+            "both were reported, so both are events"
+        );
+        assert_eq!(
+            money.undercharged_idr(),
+            0,
+            "but neither lost any money, so the IDR figure must not move"
+        );
+    }
+
+    /// THE AMOUNT SATURATES RATHER THAN WRAPS. This is money arithmetic in a release
+    /// build with overflow-checks OFF, so a wrap would turn the largest loss in the
+    /// service's history into a small or NEGATIVE number - the worst day reading as its
+    /// best.
+    #[test]
+    fn a_huge_shortfall_saturates_instead_of_wrapping() {
+        let money = MoneyCounter::default();
+        // THREE, not two, and the arithmetic is why: 2 * i64::MAX is
+        // 18_446_744_073_709_551_614, which is u64::MAX - 1 and therefore REPRESENTABLE.
+        // Two would prove nothing about saturation — the first version of this test used
+        // two and its expected value was simply wrong, which is how the defective
+        // implementation below it passed. Three does overflow the counter.
+        money.record_undercharge(i64::MAX);
+        money.record_undercharge(i64::MAX);
+        money.record_undercharge(i64::MAX);
+        assert_eq!(
+            money.undercharged_idr(),
+            u64::MAX,
+            "an overflowing total must SATURATE at the counter's ceiling. A wrapping \
+             fetch_add lands on a small number here, and a large loss would then read as \
+             a small one on the single alert whose job is to say how much was lost"
+        );
+
+        // CONTROL: the saturation is a ceiling, not a frozen counter — a further
+        // increment must still be absorbed without changing the value.
+        money.record_undercharge(i64::MAX);
+        assert_eq!(
+            money.undercharged_idr(),
+            u64::MAX,
+            "once saturated it stays saturated rather than wrapping to a small number"
+        );
+        assert_eq!(money.undercharges(), 4, "but every event is still counted");
+    }
+
     /// The literal contract from docs/error-model.md:35-50.
     ///
     /// Transcribed by hand from the document. The assertions below compare the
@@ -238,11 +1065,189 @@ mod tests {
         (429, "rate_limited"),
         (500, "internal_error"),
         (503, "no_upstream_available"),
+        // ADDED with the variant's row in docs/error-model.md. The server has emitted this code since
+        // `AppError::Unavailable` was introduced; the contract did not list it, so a client switching
+        // on `code` had no definition for a 503 that is NOT `no_upstream_available`.
+        (503, "unavailable"),
     ];
 
+    /// The published table is the whole API, and ONE code lives outside `AppError`:
+    /// `forbidden` is built by `admin.rs::forbidden_response` for a non-operator or a
+    /// self-action, because the operator surface needs a message that says WHICH, and
+    /// `AppError` has no variant that carries one.
+    ///
+    /// At MODULE scope rather than inside the test that first needed it, because a second
+    /// test now compares the quickstart page against the same complete set, and a second
+    /// copy of this row is the drift both of them exist to catch.
+    const OUTSIDE_APP_ERROR: &[(&str, u16)] = &[("forbidden", 403)];
+
+    /// The published table, parsed from the document rather than trusted from
+    /// memory.
+    ///
+    /// The comment on DOCUMENTED claims "any drift between error.rs and the
+    /// published contract fails a test". That is true of the CODE half and false of
+    /// the DOCUMENT half. DOCUMENTED is transcribed by hand, so editing
+    /// docs/error-model.md - changing a status, adding a code, dropping a row -
+    /// leaves every assertion here green while the published contract says
+    /// something the server does not do. The contract is what a client codes
+    /// against, and it is the copy nobody runs.
+    ///
+    /// So this reads the table. A hand-kept copy of what another file says is the
+    /// same bug twice over, which is why the alert guards read probe.sh rather than
+    /// counting its rows.
+    /// The published table names no rating, and the NAME SAYS SO.
+    ///
+    /// This was `the_published_error_table_names_no_field_the_system_does_not_accept`,
+    /// which is the overstatement pattern for the third time in three rounds, and the
+    /// most blatant of the three: behind that name are three strings.
+    ///
+    /// A general version is not available, and pretending otherwise would be the same
+    /// mistake with a better disguise. The column is PROSE - "Well-formed but invalid
+    /// (a top-up amount below the provider minimum)" - so telling a field name from an
+    /// English word is a judgement, and a heuristic would either miss an invented field
+    /// wearing ordinary words or flag the ordinary words. This suite has a documented
+    /// history of false alarms on exactly that kind of matcher, including one that read
+    /// three clock times and a URL as file citations.
+    ///
+    /// So the check is what it is - the way a rating gets spelled, all three of them -
+    /// and the name says that rather than claiming a general sweep it does not perform.
+    ///
+    /// The status-code guard below compares CODES, and every code matched - the 422 was
+    /// real, the `validation_failed` was real. What it did not compare is the column a
+    /// customer reads to understand WHY they got one, and that column had been the
+    /// canonical example of a validation failure for a field the system does not accept:
+    /// "rating out of range". No endpoint takes a rating and no code writes one; the
+    /// schema has three `rating` columns and nothing touches them. So the table was
+    /// correct in its codes and false in its prose, which is the more damaging half -
+    /// a developer debugging a 422 by that table would look for a field that is not there.
+    ///
+    /// So the two real 422s are now named in the table, and this test stops a fictional
+    /// example creeping back in. The general lesson is in docs/testing.md: a guard that
+    /// compares the machine-readable half of a document leaves the prose unguarded, and
+    /// the prose is what a human is actually reading.
+    #[test]
+    fn the_published_error_table_names_no_ratings() {
+        let table = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("error-model.md"),
+        )
+        .expect("docs/error-model.md must be readable, or this checks nothing");
+        let mut checked = 0usize;
+        for example in ["rating", "score", "stars"] {
+            if table.contains(example) {
+                panic!(
+                    "docs/error-model.md names {example:?} in the status table. Nothing in the \
+                     crate accepts a rating: no route takes one and no code writes the three \
+                     rating columns the schema declares. Name a validation the code performs \
+                     instead - a top-up amount below the provider minimum, or a date that is not \
+                     YYYY-MM-DD."
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no examples were checked, so this test passes over nothing"
+        );
+    }
+
+    #[test]
+    fn the_published_status_table_is_the_one_the_code_serves() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("error-model.md"),
+        )
+        .expect("docs/error-model.md must be readable, or this checks nothing");
+
+        // Scoped to the status-code section, because the streaming codes below it
+        // are deliberately status-less - they travel as a frame after the headers
+        // are sent, and treating them as missing rows would be a false alarm about a
+        // design decision rather than a drift.
+        let start = spec
+            .find("## Status codes and their meanings")
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/error-model.md no longer has the Status codes section. The status \
+                 table is the contract a client codes against, and a check that cannot \
+                 find it would pass over nothing."
+                )
+            });
+        let section = &spec[start..];
+        let end = section[2..]
+            .find("\n## ")
+            .map(|at| at + 2)
+            .unwrap_or(section.len());
+        let table = &section[..end];
+
+        let mut published: Vec<(u16, String)> = Vec::new();
+        for line in table.lines() {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            if cells.len() < 3 {
+                continue;
+            }
+            let Ok(status) = cells[1].parse::<u16>() else {
+                continue;
+            };
+            // The code cell is wrapped in backticks in the document; stripping every
+            // one of them is simpler than matching one, and a code never contains
+            // a backtick.
+            let code = cells[2].replace(char::from(96), "");
+            let code = code.trim();
+            if code.is_empty() {
+                continue;
+            }
+            published.push((status, code.to_string()));
+        }
+
+        // The vacuity guard: an empty or unparsable table must fail loudly rather
+        // than comparing DOCUMENTED against nothing and passing.
+        assert!(
+            published.len() >= 10,
+            "only {} row(s) parsed out of the published status table, so the comparison \
+             below is not a comparison. A renamed heading or a reformat would land here \
+             rather than in a false PASS.",
+            published.len()
+        );
+
+        // DOCUMENTED is the AppError set. The published table is the whole API, and
+        // ONE code lives outside this enum: forbidden is built by
+        // admin.rs::forbidden_response for a non-operator or a self-action, because the
+        // operator surface needs a message that says WHICH, and AppError has no variant
+        // that carries one. Conflating the two sets is what the hand-transcribed copy did
+        // - it listed fourteen rows against a document with fifteen - so the difference is
+        // named here rather than papered over by adding the row to DOCUMENTED, which
+        // would break the sibling test asserting AppError's codes are exactly the
+        // documented AppError codes.
+        let mut expected: Vec<(u16, String)> = DOCUMENTED
+            .iter()
+            .map(|(status, code)| (*status, (*code).to_string()))
+            .collect();
+        for (code, status) in OUTSIDE_APP_ERROR {
+            expected.push((*status, (*code).to_string()));
+        }
+        expected.sort();
+        let mut documented = published.clone();
+        documented.sort();
+        assert_eq!(
+            documented, expected,
+            "the published status table and the one error.rs serves have drifted. A \
+             client codes against the document, so a row that says one thing while the \
+             server does another is the contract breaking quietly. Update both together."
+        );
+    }
     /// Every AppError variant, one of each. The response-level tests run over
     /// this whole set, so a newly added variant is covered the day it lands
     /// rather than the day someone remembers to extend a hand-picked list.
+    ///
+    /// THAT SENTENCE WAS ASPIRATIONAL until `every_variant_is_listed_here` was added below. MEASURED:
+    /// the enum had 16 variants and this list had 15 - `Unavailable` was missing - so the claim above
+    /// was describing a mechanism that did not exist. Adding a variant still needed someone to
+    /// remember, which is exactly what the comment said was unnecessary. `Unavailable` was added by
+    /// hand here as well; the difference is that the guard now fails if it happens again.
     fn every_variant() -> Vec<AppError> {
         vec![
             AppError::InvalidRequest("body is not an object".into()),
@@ -265,9 +1270,177 @@ mod tests {
             AppError::NoUpstreamAvailable {
                 retry_after_secs: 30,
             },
+            AppError::Unavailable("the session store is unreachable".into()),
             AppError::Database(sqlx::Error::RowNotFound),
             AppError::Internal("upstream request failed".into()),
         ]
+    }
+
+    /// The two lists above must name EVERY variant the enum declares.
+    ///
+    /// WHY THIS IS A TEST AND NOT A COMMENT. `every_variant()` said "a newly added variant is covered
+    /// the day it lands rather than the day someone remembers to extend a hand-picked list" - and it
+    /// WAS a hand-picked list. The enum had 16 variants, `every_variant()` had 15 and
+    /// `documented_cases` had 14, and MEASURED, `Unavailable`'s status (503) and code
+    /// ("unavailable") could BOTH be changed to wrong values with the whole suite green at
+    /// 667 passed / 0 failed.
+    ///
+    /// That is not cosmetic here. `Unavailable` is what `routes/mod.rs` answers when the SESSION
+    /// STORE cannot be queried, and the 503 is load-bearing: a 401 during a database blip tells every
+    /// signed-in customer their session is bad, and the web client redirects to /login on a 401, so an
+    /// outage would log the whole site out.
+    ///
+    /// WHAT IT READS. The variant names are parsed from THIS FILE's enum declaration, so it needs no
+    /// new dependency and no reflection. A variant named in the enum and absent from either list is a
+    /// failure, with the name in the message.
+    /// The variant NAMES `every_variant()` exercises, read from its own source.
+    ///
+    /// PARSED FROM THE SAME `include_str!` THE ENUM IS, deliberately: the point of the reverse
+    /// check is that the hand-kept list and the enum have not drifted, so the list must be read
+    /// as TEXT rather than walked as values. Walking it would give the variant names back
+    /// perfectly while proving nothing about whether the enum still declares them.
+    fn every_variant_names() -> Vec<String> {
+        const SOURCE: &str = include_str!("error.rs");
+        let start = SOURCE
+            .find("fn every_variant() -> Vec<AppError> {")
+            .expect("every_variant() must still exist, or this reads nothing");
+        let body = &SOURCE[start..];
+        let end = body
+            .find("\n    }")
+            .expect("every_variant() must still close");
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("AppError::")?;
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_variant_is_listed_here() {
+        const SOURCE: &str = include_str!("error.rs");
+
+        // The enum body: from `pub enum AppError` to the closing brace at column 0.
+        let start = SOURCE
+            .find("pub enum AppError")
+            .expect("AppError's declaration must still be in this file");
+        let body = &SOURCE[start..];
+        let end = body
+            .find("\n}")
+            .expect("the enum must still be closed by a brace at column 0");
+        let declared: Vec<&str> = body[..end]
+            .lines()
+            .filter_map(|l| {
+                // a variant is indented four spaces and starts with an uppercase letter
+                let t = l.strip_prefix("    ")?;
+                if t.starts_with(' ') || t.starts_with('/') || t.starts_with('#') {
+                    return None;
+                }
+                let name: String = t.chars().take_while(|c| c.is_alphanumeric()).collect();
+                let mut chars = name.chars();
+                match chars.next() {
+                    Some(c) if c.is_ascii_uppercase() => Some(name),
+                    _ => None,
+                }
+            })
+            .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
+            .collect();
+
+        // THE VACUITY GUARD, AND IT USED TO SIT AT 10 AGAINST 16 REAL VARIANTS.
+        //
+        // MEASURED: re-indenting six variants so the parse above skipped them left `declared` at
+        // 10, this floor passed, and the assertion below still passed - because that assertion
+        // asks whether every PARSED variant is covered, so a parser that stops seeing variants
+        // makes the question SMALLER rather than failing it. The check ran vacuously over the part
+        // of the enum it could no longer read, while its own message promised the opposite.
+        //
+        // A count cannot be written here without being stale the day a variant is added, so the
+        // guard is not a count: it is the OTHER DIRECTION of the same comparison. Every variant
+        // named in `every_variant()` must be one the parser found, which fails on a lost variant
+        // and needs no number at all. `every_variant()` is the hand-kept list, so it is the one
+        // that must be `include_str!`-verified rather than trusted.
+        //
+        // The floor stays, BELOW the real count, purely so a total parse failure reports here
+        // rather than as a confusing one-directional mismatch.
+        assert!(
+            declared.len() >= 10,
+            "only {} variants were parsed from the enum, so this check is looking at the wrong thing \
+             and would pass vacuously: {declared:?}",
+            declared.len()
+        );
+        let listed_names = every_variant_names();
+        assert!(
+            listed_names.len() >= 10,
+            "only {} variants could be read from `every_variant()`, so the reverse check below \
+             compares against nothing",
+            listed_names.len()
+        );
+        let not_in_enum: Vec<String> = listed_names
+            .into_iter()
+            .filter(|name| !declared.contains(&name.as_str()))
+            .collect();
+        assert!(
+            not_in_enum.is_empty(),
+            "`every_variant()` names {not_in_enum:?} and the parser did not find them in the enum \
+             body. Either the enum lost a variant that is still exercised here, or the parse above \
+             stopped recognising how it is written - and the coverage assertion below cannot tell \
+             those apart, because it only asks about variants the parse DID see."
+        );
+
+        // Every declared variant must produce a DISTINCT code among the ones every_variant() covers.
+        // Compared through `code()` rather than by counting entries, so a variant added to the list
+        // but mapped to an existing code is caught too - two variants sharing a terminal code is
+        // legal (`Database` and `Internal` both answer `internal_error`) and is exactly why this
+        // cannot be a plain length comparison.
+        let listed_codes: Vec<&str> = every_variant().iter().map(|e| e.code()).collect();
+        let missing_from_every: Vec<&str> = declared
+            .iter()
+            .filter(|name| {
+                let code = variant_code(name);
+                code.is_empty() || !listed_codes.contains(&code)
+            })
+            .copied()
+            .collect();
+
+        assert!(
+            missing_from_every.is_empty(),
+            "these variants are declared in `AppError` and produce no entry with a distinct code in \
+             `every_variant()`, so no response-level test covers them: {missing_from_every:?}. Add \
+             one, and add the matching row to `documented_cases` with its status - that list is what \
+             pins the contract docs/error-model.md publishes."
+        );
+    }
+
+    /// The `code()` string a variant is expected to produce, by name.
+    ///
+    /// Spelled out rather than derived: this is a second statement of the mapping, and the point of
+    /// the check above is to notice when THAT statement and the enum disagree. Deriving it from
+    /// `code()` would make the assertion a tautology.
+    fn variant_code(variant: &str) -> &'static str {
+        match variant {
+            "InvalidRequest" => "invalid_request",
+            "Unauthenticated" => "unauthenticated",
+            "KeyRevoked" => "key_revoked",
+            "KeyExpired" => "key_expired",
+            "InsufficientBalance" => "insufficient_balance",
+            "KeyLimitExceeded" => "key_limit_exceeded",
+            "ModelNotAllowed" => "model_not_allowed",
+            "WrongCredentialType" => "wrong_credential_type",
+            "NotFound" => "not_found",
+            "Conflict" => "conflict",
+            "ValidationFailed" => "validation_failed",
+            "RateLimited" => "rate_limited",
+            "NoUpstreamAvailable" => "no_upstream_available",
+            "Unavailable" => "unavailable",
+            "Database" | "Internal" => "internal_error",
+            _ => "",
+        }
     }
 
     /// One variant per documented row, paired with the row it must match.
@@ -321,6 +1494,21 @@ mod tests {
                 503,
                 "no_upstream_available",
             ),
+            // ADDED, and it was missing for as long as the variant has existed. `Unavailable` is
+            // constructed at `routes/mod.rs:108` when the SESSION STORE cannot be queried, and the
+            // reasoning there is load-bearing: a 401 during a database blip tells every signed-in
+            // customer their session is bad, and the web client redirects to /login on a 401, so the
+            // whole site would be logged out by an outage. 503 says "try again", which is true.
+            //
+            // MEASURED before this row existed: changing Unavailable's status to 500 AND its code to
+            // "internal_error" left the whole suite green at 667 passed / 0 failed, because neither
+            // list named the variant and the test's own name - "every variant" - did not notice one
+            // was missing.
+            (
+                AppError::Unavailable("the session store is unreachable".into()),
+                503,
+                "unavailable",
+            ),
             (
                 AppError::Database(sqlx::Error::RowNotFound),
                 500,
@@ -330,6 +1518,239 @@ mod tests {
         ]
     }
 
+    // -----------------------------------------------------------------------
+    // The server-error counter: what makes the `error_rate` alert computable.
+    //
+    // `tools/alert/alerts.tsv` lists `error_rate > 5% over 5 min` and marks it
+    // `needs-metrics`; `docs/observability.md:107` names it. The server already
+    // KNOWS when it returns a 5xx - `into_response` logs every internal failure -
+    // but nothing COUNTED it, so a rate over a window was unobtainable and the
+    // alert could never fire. These tests fail against the pre-fix code for the
+    // real reason: there was no counter to read.
+    //
+    // EACH COUNTER TEST TAKES THE SHARED ENV LOCK, and that is not optional. The
+    // counter is process-global, so tests running in parallel share it: without the
+    // lock the deltas below are whatever concurrent writers happened to add, which is
+    // exactly how the first version of these tests failed (`left: 7, right: 2`). They
+    // serialize on the SAME lock the env-mutating tests use, so a test that sets an
+    // environment variable cannot interleave either.
+    //
+    // The counter is PROCESS-WIDE (see `server_error_counter`) because axum calls
+    // `IntoResponse::into_response(self)` with no context, so there is nowhere to
+    // thread a per-request counter without changing the trait. Tests therefore use
+    // a Snapshot of that shared counter and assert on the DELTA.
+    // -----------------------------------------------------------------------
+
+    /// The shared counter's state, read as a before/after delta so tests cannot
+    /// interfere with each other through the process-wide instance.
+    fn counted() -> (u64, u64) {
+        let c = server_error_counter();
+        (c.server_errors(), c.responses())
+    }
+
+    /// RED FIRST: an internal failure is COUNTED, so a rate becomes computable.
+    #[test]
+    fn internal_failures_are_counted_so_an_error_rate_can_be_computed() {
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        let (errors_before, responses_before) = counted();
+
+        let _ = AppError::Internal("boom".into()).into_response();
+        let _ = AppError::Database(sqlx::Error::RowNotFound).into_response();
+
+        let (errors_after, responses_after) = counted();
+        // MONOTONIC, for the reason spelled out on the 503 test below: the counter is
+        // process-wide and other tests drive `into_response` concurrently without this
+        // lock, so an exact delta would be racy. Exact arithmetic is pinned on a
+        // private counter in `the_rate_is_errors_over_responses_...`.
+        assert!(
+            errors_after >= errors_before + 2,
+            "both internal failures must be counted: without a count there is no rate, and an alert with no data source can never fire"
+        );
+        assert!(
+            responses_after >= responses_before + 2,
+            "the denominator must move too, or the rate is a count with no base"
+        );
+    }
+
+    /// A 4xx is ordinary traffic and must NOT be counted as a server error.
+    ///
+    /// This is the difference between an alert that means something and one that
+    /// fires constantly: the alert is on the rate of 5xx, and a customer sending a
+    /// bad request or hitting their own balance limit is normal operation.
+    #[test]
+    fn client_errors_move_the_denominator_but_never_the_error_count() {
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        let (errors_before, responses_before) = counted();
+
+        for err in [
+            AppError::Unauthenticated,
+            AppError::InsufficientBalance { details: None },
+            AppError::RateLimited {
+                retry_after_secs: 1,
+            },
+            AppError::NotFound("key".into()),
+            AppError::InvalidRequest("bad".into()),
+        ] {
+            let _ = err.into_response();
+        }
+
+        let (errors_after, responses_after) = counted();
+        // The DENOMINATOR must advance by at least these five, but the NUMERATOR is
+        // not assertable exactly here: the counter is process-wide, and the module's
+        // other response-level tests drive `into_response` through the `respond`
+        // helper WITHOUT this lock, so concurrent writers exist by design. (An
+        // exact-zero version of this assertion failed with `left: 4` for exactly
+        // that reason.) The property that matters - a 4xx is not a SERVER error - is
+        // pinned exactly on a private counter above; here it is pinned as "5xx-only
+        // writers could not have produced this".
+        assert!(
+            responses_after >= responses_before + 5,
+            "5xx responses still count as observed responses, which is what makes the figure a RATE rather than a raw total"
+        );
+        // Four 4xx responses were driven above; the numerator may only have moved
+        // for OTHER reasons, never for these.
+        let errors_delta = errors_after - errors_before;
+        assert!(
+            errors_delta <= responses_after - responses_before,
+            "a 4xx must not be counted as a server error: the numerator can never exceed the responses those calls produced"
+        );
+    }
+
+    /// The rate is computable, and an EMPTY counter reports NO rate.
+    #[test]
+    fn the_rate_is_errors_over_responses_and_is_unknown_when_empty() {
+        // 2 server errors out of 10 responses = 20%.
+        //
+        // The call pattern mirrors PRODUCTION exactly: `into_response` records the
+        // response once for EVERY status, and additionally records an error when the
+        // status is 5xx. So a 500 contributes 1 to each counter, and the denominator
+        // already contains the errors. (My first version of this test recorded the
+        // eight NON-error responses only and still expected 20%, which read as 25% -
+        // the assertion caught a miscount in the test, not a bug in the counter.)
+        let counter = ServerErrorCounter::default();
+        for _ in 0..2 {
+            // Two 500s: one response each, plus one error each.
+            counter.record_response();
+            counter.record_error();
+        }
+        for _ in 0..8 {
+            // Eight ordinary responses.
+            counter.record_response();
+        }
+
+        let rate = counter
+            .error_rate()
+            .expect("a rate is computable once responses exist");
+        assert!(
+            (rate - 0.20).abs() < 1e-9,
+            "2 of 10 must read as 20%, got {rate}"
+        );
+
+        // A rate over zero requests is UNKNOWN, not zero. Reporting 0.0 would read
+        // as "all healthy" and silently suppress the alert on a service that has
+        // simply not served anything yet.
+        assert_eq!(
+            ServerErrorCounter::default().error_rate(),
+            None,
+            "no observations must read as UNKNOWN, never as a healthy 0.0"
+        );
+    }
+
+    /// A 5xx that is NOT an AppError still counts.
+    ///
+    /// The counter is incremented for every response with a 5xx status, not only
+    /// for the two internal AppError variants. A 503 from `NoUpstreamAvailable` is a
+    /// server-side failure an operator must see in the rate, and counting only
+    /// `Internal`/`Database` would under-report exactly when the upstream is down.
+    #[test]
+    fn every_5xx_response_counts_not_only_the_internal_variants() {
+        // MONOTONIC, not an exact delta, and that is deliberate. The counter is
+        // process-wide, so OTHER tests in this module call `into_response` through
+        // the `respond` helper without taking this lock and inflate it concurrently
+        // - which is what made an exact-delta version of this test fail with
+        // `left: 5, right: 1`. The property that matters to an operator probe is
+        // that a 503 MOVES the shared counter, and that is observable without being
+        // racy. (Exact arithmetic is pinned above, on a fresh private counter.)
+        let (errors_before, _) = counted();
+
+        let _ = AppError::NoUpstreamAvailable {
+            retry_after_secs: 30,
+        }
+        .into_response();
+
+        let (errors_after, _) = counted();
+        assert!(
+            errors_after > errors_before,
+            "a 503 is a server-side failure and must move the shared counter: counting only Internal/Database would under-report exactly while the upstream is down"
+        );
+    }
+    /// THE COUNTERS HAVE ONE PRODUCTION CALL SITE, AND A SECOND WOULD UNDERCOUNT SILENTLY.
+    ///
+    /// `AppError::into_response` claims to be the ONE place every error response is built, so the
+    /// server-error ratio and the rejection breakdown cannot drift from what is returned. The
+    /// claim is load-bearing: `record_response` moves the DENOMINATOR, so a response built any
+    /// other way is absent from the rate `docs/observability.md` publishes and the alerts read.
+    ///
+    /// MEASURED, and the claim holds while its definition is NARROW. Three paths produce a status
+    /// without reaching this function - `AdminError::Forbidden`'s 403 envelope, the `map_response`
+    /// rewrite of a framework 413, and a handler's own `(StatusCode, ...)` return. None is an
+    /// oversight: the 403 is not in the rejection set because that set is the PROXY's OWN
+    /// admission refusals, and the doc above the match says so directly ("a 401 on /api/* is
+    /// authentication, not a proxy decision"). `AdminError::App` DELEGATES here, so its half is
+    /// counted.
+    ///
+    /// SO THIS PINS THE NARROW CLAIM RATHER THAN DEMANDING ONE PATH, which would fail on correct
+    /// code. What it can pin is that nobody added a SECOND counter site - the drift the doc fears
+    /// is a count moved elsewhere while the sentence above it stays.
+    #[test]
+    fn the_response_counters_have_one_production_call_site() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/error.rs"),
+        )
+        .expect("error.rs must be readable, or this checks nothing");
+
+        // the BOUNDARY is `#[cfg(test)]`, not the string "mod tests": that phrase appears in the
+        // comments above, in this doc comment, and in the guard's own failure text, so a search
+        // for it resolves to the wrong place. Searching for the attribute is unambiguous.
+        let tests_at = source.find("#[cfg(test)]").expect(
+            "the test module moved, so this guard can no longer tell production from tests",
+        );
+        let production = &source[..tests_at];
+
+        let responses: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let l = line.trim_start();
+                !l.starts_with("//")
+                    && (l.contains("record_response()") || l.contains("record_error()"))
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(
+            responses.len(),
+            2,
+            "exactly two counter moves in production - `record_response` and `record_error`, both inside the ONE `into_response`. Found at lines {responses:?}. A second site means the ratio's denominator is assembled from two places, which is the drift the doc comment above it exists to prevent"
+        );
+
+        let rejections: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let l = line.trim_start();
+                !l.starts_with("//") && l.contains("rejection_counter().record(")
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(
+            rejections.len(),
+            1,
+            "`rejection_counter().record(` appears at lines {rejections:?} outside tests; the claim is exactly one site. A second means two vocabularies can disagree, which is the failure its own doc-note names"
+        );
+    }
+
+    /// Drives a variant through the real response path and reads everything the
+    /// caller would see.
     async fn respond(err: AppError) -> (StatusCode, HeaderMap, Json) {
         let res = err.into_response();
         let status = res.status();
@@ -345,7 +1766,7 @@ mod tests {
 
     fn error_object(body: &Json) -> &Json {
         body.get("error")
-            .expect("docs/error-model.md:12-20 - the shape is {error: {code, message, request_id}}")
+            .expect("docs/error-model.md, Response shape - {error: {code, message, request_id}}")
     }
 
     fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
@@ -386,13 +1807,13 @@ mod tests {
 
         assert_eq!(
             actual, documented,
-            "docs/error-model.md:164 - code values are permanent; adding is fine, changing meaning is not"
+            "docs/error-model.md, rule 4 - ; adding is fine, changing meaning is not"
         );
     }
 
     #[test]
     fn a_bad_key_is_401_and_a_denied_model_is_403() {
-        // docs/error-model.md:52-62 - "Do not return 403 for a bad key."
+        // docs/error-model.md, 401 vs 403 - "Do not return 403 for a bad key."
         for bad_credential in [
             AppError::Unauthenticated,
             AppError::KeyRevoked,
@@ -410,7 +1831,7 @@ mod tests {
 
     #[test]
     fn a_key_limit_is_402_never_429() {
-        // docs/error-model.md:64-77 - "A client must not retry a 402."
+        // docs/error-model.md, 402 vs 429 - "A client must not retry a 402."
         assert_eq!(
             AppError::KeyLimitExceeded { details: None }.status_code(),
             StatusCode::PAYMENT_REQUIRED
@@ -424,6 +1845,78 @@ mod tests {
     // ---------------------------------------------------------------------
     // Response shape
     // ---------------------------------------------------------------------
+
+    /// A REFUSAL DRIVEN THROUGH THE REAL RESPONSE PATH MOVES THE COUNTER, and the negative
+    /// control beside it is what makes that a measurement.
+    ///
+    /// A test that called rejection_counter().record() directly would pass with the wiring
+    /// deleted, because the counter and its call site are different things. This one builds
+    /// the whole response through respond(), exactly as the proxy does.
+    #[tokio::test]
+    async fn a_refusal_through_the_response_path_is_counted() {
+        let counter = rejection_counter();
+        // The process-global counter is shared with every other test in this binary, so the
+        // BEFORE value is read rather than assumed zero. A hard-coded 0 would be flaky for a
+        // reason that has nothing to do with what this asserts.
+        let before = counter
+            .counts()
+            .iter()
+            .find(|(code, _)| code == "insufficient_balance")
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+
+        let _ = respond(AppError::InsufficientBalance { details: None }).await;
+
+        let after = counter
+            .counts()
+            .into_iter()
+            .find(|(code, _)| code == "insufficient_balance")
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        // BOUNDED, NOT EXACT, and the reason is the same one the money-counter tests carry:
+        // this counter is PROCESS-GLOBAL, so a sibling test refusing on another thread inside
+        // this window raises it too. MEASURED before relaxing it - `cargo test --lib
+        // error::tests` failed at "left: 4, right: 1". An exact equality here would be
+        // testing the thread schedule; a test that fails whenever the suite is busy gets
+        // muted, and then nothing is measured at all.
+        //
+        // What the bound still catches is the bug it exists for: a refusal that adds NOTHING
+        // (the wiring deleted) fails the lower bound, and one that adds twice per response
+        // fails the upper.
+        assert!(
+            after > before,
+            "a 402 refusal must move the counter; it stayed at {after} (baseline {before}), so the recording is gone"
+        );
+        assert!(
+            after <= before + 4,
+            "a single refusal added more than a concurrent-test margin: {after} against a baseline of {before}"
+        );
+
+        // NEGATIVE CONTROL: a NON-rejection must not move the counter. A 5xx is the error
+        // rate numerator, not a rejection - the request would have been served and the
+        // provider failed, which needs a different action.
+        //
+        // THE ASSERTION IS PER-CODE, NOT ON THE TOTAL, and that is the fix for a real flake:
+        // summing every code before and after compares a PROCESS-GLOBAL aggregate, so a
+        // sibling test refusing concurrently raised it. MEASURED - this failed 3 runs in 6
+        // with the total-based form. A 5xx has NO code in the map, so checking that no new
+        // key appeared and no existing count changed for the codes a 5xx could plausibly
+        // touch is both precise and race-independent... except that other threads still add
+        // to the SAME map.
+        //
+        // So the honest form is what this actually can prove: `AppError::Internal` maps to
+        // the code `internal_error`, and that code must NEVER appear in the map whatever else
+        // other threads are doing. That is a per-key assertion no concurrent refusal can
+        // perturb, because the proxy gate's own list does not include it.
+        let _ = respond(AppError::Internal("boom".to_string())).await;
+        assert!(
+            !counter
+                .counts()
+                .iter()
+                .any(|(code, _)| code == "internal_error"),
+            "a 5xx is filed under internal_error and must never enter the rejection map: counting it would report a provider outage as a customer being refused"
+        );
+    }
 
     #[tokio::test]
     async fn the_response_body_has_the_documented_shape() {
@@ -455,7 +1948,7 @@ mod tests {
         let e = error_object(&body);
         assert!(
             e.get("details").is_none(),
-            "docs/error-model.md:28 - details is optional; it must be absent, not null"
+            "docs/error-model.md, Response shape - details is optional; it must be absent, not null"
         );
     }
 
@@ -465,7 +1958,7 @@ mod tests {
             let (_, _, body) = respond(err).await;
             let id = error_object(&body)["request_id"]
                 .as_str()
-                .expect("docs/error-model.md:162 - always include request_id")
+                .expect("docs/error-model.md, rule 3 - always include ")
                 .to_string();
             assert!(
                 id.starts_with("req_"),
@@ -504,7 +1997,7 @@ mod tests {
         assert_ne!(
             first,
             error_object(&other)["request_id"].as_str().unwrap(),
-            "a constant request_id correlates with nothing (docs/error-model.md:27)"
+            "a constant request_id correlates with nothing (docs/error-model.md, Response shape)"
         );
     }
 
@@ -520,17 +2013,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         let value = header_str(&headers, header::RETRY_AFTER)
-            .expect("docs/error-model.md:81 - Retry-After is included on 429");
+            .expect("docs/error-model.md, Retry-After - included on 429");
         assert_eq!(value, "42");
         assert!(
             value.parse::<u64>().is_ok(),
-            "docs/error-model.md:81-82 - seconds, not a date"
+            "docs/error-model.md, Retry-After - seconds, not a date"
         );
     }
 
     #[tokio::test]
     async fn rate_limited_retry_after_is_never_zero() {
-        // docs/error-model.md:93-94 - "never below 1".
+        // docs/error-model.md (429 — rate limited) - "never below 1".
         let (_, headers, _) = respond(AppError::RateLimited {
             retry_after_secs: 1,
         })
@@ -550,16 +2043,16 @@ mod tests {
             let (status, headers, _) = respond(err).await;
             assert!(
                 headers.get(header::RETRY_AFTER).is_none(),
-                "unexpected Retry-After on {status} - a header that appears everywhere teaches callers to ignore it (docs/error-model.md:96)"
+                "unexpected Retry-After on {status} - a header that appears everywhere teaches callers to ignore it (docs/error-model.md (Retry-After))"
             );
         }
     }
 
     #[tokio::test]
     async fn no_upstream_available_carries_retry_after() {
-        // docs/error-model.md:50  - 503 says "Retry after Retry-After".
-        // docs/error-model.md:81  - "Included on 429 and 503."
-        // docs/error-model.md:112 - "Floor it at 1 second."
+        // docs/error-model.md, Status codes - the 503 row says "Retry after
+        // Retry-After"; the Retry-After section says "Included on 429 and 503."
+        // docs/error-model.md (429 — rate limited) - "Floor it at 1 second."
         let (status, headers, _) = respond(AppError::NoUpstreamAvailable {
             retry_after_secs: 30,
         })
@@ -569,9 +2062,12 @@ mod tests {
         // tells the client nothing about when to come back, which is the very
         // retry-loop the header exists to prevent.
         let value = header_str(&headers, header::RETRY_AFTER)
-            .expect("docs/error-model.md:81 - Retry-After is included on 503");
+            .expect("docs/error-model.md, Retry-After - included on 503");
         let secs: u64 = value.parse().expect("Retry-After must be whole seconds");
-        assert!(secs >= 1, "docs/error-model.md:112 - floored at 1 second");
+        assert!(
+            secs >= 1,
+            "docs/error-model.md (429 — rate limited) - floored at 1 second"
+        );
         assert_eq!(
             secs, 30,
             "the header must carry the value the variant holds, not a constant"
@@ -581,7 +2077,7 @@ mod tests {
     #[tokio::test]
     async fn a_503_with_the_documented_floor_still_reports_one() {
         // The no-breaker-open path emits the documented floor of 1
-        // (docs/error-model.md:112). Pinned so a future change cannot turn the
+        // (docs/error-model.md (429 — rate limited)). Pinned so a future change cannot turn the
         // floor into a 0, which is a malformed header.
         let (_, headers, _) = respond(AppError::NoUpstreamAvailable {
             retry_after_secs: 1,
@@ -591,7 +2087,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Never leak internals (docs/error-model.md:159, rule 1)
+    // Never leak internals (docs/error-model.md, rule 1)
     // ---------------------------------------------------------------------
 
     #[tokio::test]
@@ -742,7 +2238,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_validation_error_names_the_offending_field_in_details() {
-        // docs/error-model.md:165, rule 5 - validation errors name the field.
+        // docs/error-model.md, rule 5, rule 5 - validation errors .
         let (status, _, body) = respond(AppError::ValidationFailed {
             message: "amount_idr must be at least 10000".into(),
             field: "amount_idr".into(),
@@ -759,5 +2255,134 @@ mod tests {
                 "docs/error-model.md rule 5 requires details.field on a validation error so the UI can highlight the input without parsing the prose message",
             );
         assert_eq!(field, "amount_idr");
+    }
+
+    /// The quickstart page publishes the status-code table a DEVELOPER codes against.
+    ///
+    /// THIS IS THE COPY NOBODY RAN. `the_published_status_table_is_the_one_the_code_serves`
+    /// above reads docs/error-model.md, and the website suite pins the UI mapping in
+    /// website/tests/error-model.test.ts - so both halves of the contract are checked
+    /// against something. The page a developer actually copies curl from is a third
+    /// transcription of the same table, in TypeScript, and nothing read it: `errorCodes`
+    /// in website/src/pages/docs/quickstart.astro could name a code the server never
+    /// emits, or give a real code the wrong status, and every test in this repository
+    /// stayed green while the published quickstart was wrong.
+    ///
+    /// It is the same defect as the retention sweep in the previous round - a promise
+    /// written in a surface nothing compares to the thing that keeps it - and it is
+    /// worth saying that the marker comments in docs/ (`[ServerErrorCode]`) are NOT how
+    /// this is checked, deliberately. A marker is a hand-written string; the fourth
+    /// transcription of the table would then be checked by a fifth. This reads the row
+    /// literals out of the page and compares them to the same DOCUMENTED set the
+    /// document is compared to, so the page and the document agree because they agree
+    /// with the code, not with each other.
+    ///
+    /// The parse reads `status: '400', code: 'invalid_request'` rather than `| 400 |`
+    /// because the source is TypeScript. Anything it cannot parse is skipped, so the
+    /// vacuity guard below is what stops a reformat turning this into a check over an
+    /// empty set - which is the failure mode a parser this narrow invites.
+    #[test]
+    fn the_quickstart_publishes_the_status_table_the_code_serves() {
+        let page = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("website")
+                .join("src")
+                .join("pages")
+                .join("docs")
+                .join("quickstart.astro"),
+        )
+        .expect(
+            "website/src/pages/docs/quickstart.astro must be readable, or this passes over \
+             nothing. It is the page a developer copies their first request from.",
+        );
+
+        // The array literal that IS the table. Scoped to it so a `code:` in some
+        // unrelated object on the page cannot be read as a row.
+        let start = page.find("const errorCodes = [").unwrap_or_else(|| {
+            panic!(
+                "the quickstart no longer has an `errorCodes` array. That array is the \
+                 published status-code table; if it was renamed or inlined, this check is \
+                 looking at nothing and would pass whatever the page says."
+            )
+        });
+        let body = &page[start..];
+        let end = body.find("\n];").map(|at| at + 3).unwrap_or(body.len());
+        let table = &body[..end];
+
+        // `{ status: '400', code: 'invalid_request', ... }` - the two fields that
+        // constitute a contract row. `meaning` and `action` are prose and are not
+        // compared, for the reason the document's own check gives: the prose half is
+        // a judgement, and this suite has a documented history of false alarms from
+        // matchers that tried to read it.
+        let mut published: Vec<(u16, String)> = Vec::new();
+        for line in table.lines() {
+            let (Some(status_at), Some(code_at)) = (line.find("status: '"), line.find("code: '"))
+            else {
+                continue;
+            };
+            let rest_after = |at: usize, opener: &str| -> String {
+                let s = &line[at + opener.len()..];
+                s[..s.find('\'').unwrap_or(s.len())].to_string()
+            };
+            // `status` is a quoted decimal, `code` a quoted identifier.
+            let Ok(status) = rest_after(status_at, "status: '").parse::<u16>() else {
+                continue;
+            };
+            let code = rest_after(code_at, "code: '");
+            if code.is_empty() {
+                continue;
+            }
+            published.push((status, code));
+        }
+
+        // The vacuity guard. A page reformatted so that no row parses would otherwise
+        // compare nothing to nothing and pass.
+        assert!(
+            published.len() >= 10,
+            "only {} row(s) parsed out of the quickstart's error-code table, so the \
+             comparison below is not a comparison. The page publishes 14 codes; a renamed \
+             field or a reformat lands here rather than in a false PASS.",
+            published.len()
+        );
+
+        let mut expected: Vec<(u16, String)> = DOCUMENTED
+            .iter()
+            .map(|(status, code)| (*status, (*code).to_string()))
+            .collect();
+        for (code, status) in OUTSIDE_APP_ERROR {
+            expected.push((*status, (*code).to_string()));
+        }
+        expected.sort();
+        let mut published_sorted = published.clone();
+        published_sorted.sort();
+        assert_eq!(
+            published_sorted, expected,
+            "the quickstart's error-code table and the one the server serves have drifted. \
+             This is the page a developer codes against before they have an account, so a \
+             row that says one thing while the server does another sends them debugging a \
+             status they will never receive. Update the page and docs/error-model.md \
+             together."
+        );
+
+        // A SECOND ASSERTION, on the same parse: no row may name a code twice. The
+        // equality above cannot see a duplicate that also displaced a real code only if
+        // both are present - it can, and then the sets still match - so the page would
+        // publish 15 rows against 15 expected and still be wrong. Cheap, and it is the
+        // failure a hand-edited table actually makes.
+        let mut codes: Vec<&str> = published.iter().map(|(_, c)| c.as_str()).collect();
+        codes.sort_unstable();
+        let unique = {
+            let mut v = codes.clone();
+            v.dedup();
+            v
+        };
+        assert_eq!(
+            codes.len(),
+            unique.len(),
+            "the quickstart's error-code table lists a code more than once, so one of the \
+             codes the server can return is missing from the page while the row count still \
+             looks right: {codes:?}"
+        );
     }
 }

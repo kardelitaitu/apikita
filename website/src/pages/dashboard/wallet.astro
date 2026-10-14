@@ -1,14 +1,53 @@
 ---
 import DashboardLayout from '../../layouts/DashboardLayout.astro';
 import TopUpForm from '../../islands/wallet/TopUpForm.astro';
+// The three figures in this paragraph are config values, read through the same module
+// the landing page uses. They were HARDCODED here, which made this the third and fourth
+// place the two minimums were written out: consolidating the landing page's two copies
+// into one constant did not touch this file, and no guard could see it, because
+// tests/prices.test.ts checks the CONSTANT against config/apikita.toml and the constant
+// was right. The two copies here were invisible to it by construction.
+//
+// That is the failure this file is now evidence of: a fix that consolidates SOME copies
+// of a value, and a check that pins the consolidated one.
+import { minFirstDepositIdr, minTopupIdr, topupPerHour, idr } from '../../lib/models.ts';
+
+//
+// THE PARAGRAPH BELOW IS ONE LINE ON PURPOSE. A line break on either side of an
+// {expression} is collapsed by Astro, so the space lands on whichever side is NOT the
+// break: the page first rendered "at least10,000 IDR", and after moving the break it
+// rendered "10,000IDR". Neither was visible in the source and both were on the page a
+// customer reads before their first payment. Read the BUILT page, not the template.
+//
+// REMOVED: `const topupPerHour = 5;` sat on this line and SHADOWED the import above.
+// The page published the local literal, and tests/prices.test.ts - which compares the
+// imported constant against config/apikita.toml - stayed green while checking a value
+// this page never rendered. Changing that line to 7 changed the built HTML to
+// "rate-limited to 7 per hour" with every test still passing.
+//
+// It is the failure the comment above describes, committed by the very edit that
+// describes it: the two minimums were consolidated into one constant and the rate cap
+// was left behind as a second copy. The declaration is DELETED rather than corrected -
+// a second copy that happens to agree today is still a second copy, and no test can
+// keep two copies agreeing. What renders now is the imported constant.
 ---
 
 <DashboardLayout title="Wallet">
   <h1 class="text-2xl font-semibold tracking-tight">Wallet</h1>
   <p class="mt-3 max-w-2xl text-sm text-ink-muted">
-    Prepaid balance, topped up by QRIS through Midtrans. Minimums differ: your first
-    deposit is at least 50,000 IDR, later top-ups at least 10,000 IDR. Top-up
-    creation is rate-limited to 5 per hour.
+    Prepaid balance, topped up by QRIS through Midtrans. Minimums differ: your first deposit is at least {idr(minFirstDepositIdr)} IDR, and later top-ups at least {idr(minTopupIdr)} IDR. Top-up creation is rate-limited to {topupPerHour} per hour.
+</p>
+
+
+  <!-- THE non-refundable POLICY IS ABOVE THE FORM ON PURPOSE. It used to sit in the
+       "How crediting works" section BELOW <TopUpForm />, so a customer met the payment
+       form and only then read that the balance cannot be refunded. The launch gate
+       this page carries is about ORDER ("states the fee and the non-refundable policy
+       BEFORE PAYMENT"), and the test cited by that gate checked only that the phrases
+       EXISTED - so the ordering was wrong while the gate was ticked. The test now
+       asserts the order; see website/tests/landing-claims.test.ts. -->
+  <p class="mt-6 max-w-2xl text-sm text-ink-muted">
+    Balances are prepaid and <strong>non-refundable</strong>. Credit expires 2 years after each deposit.
   </p>
 
   <div class="mt-8">
@@ -25,9 +64,8 @@ import TopUpForm from '../../islands/wallet/TopUpForm.astro';
       <strong>pending</strong> here until the confirmation lands.
     </p>
     <p class="mt-2">
-      Balances are prepaid and non-refundable. Credit expires 2 years after each deposit. If a payment is
-      confirmed and the service cannot be delivered, contact support with the order
-      id above.
+      If a payment is confirmed and the service cannot be delivered, contact support with
+      the order id above.
     </p>
   </section>
 </DashboardLayout>

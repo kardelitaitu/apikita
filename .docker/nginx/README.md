@@ -98,6 +98,18 @@ repeat the **whole** set there.
 
 ## Verifying it still works
 
+**The SSE contract is now checked automatically** — `tools/relay-check/` (its
+[README](../../tools/relay-check/README.md) explains both halves), run as a CI step.
+That matters because the failure is SILENT: a buffering relay answers 200 and looks
+connected while the dashboard stops updating.
+
+```sh
+sh tools/relay-check/check.sh       # the directives are present (no dependencies)
+sh tools/relay-check/behaviour.sh   # they actually stream (needs Docker)
+```
+
+The rest is still a manual sanity pass against a running relay:
+
 ```sh
 docker compose config >/dev/null && echo 'compose ok'
 docker compose up -d nginx
@@ -106,5 +118,4 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/login/      # 200
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/nope        # 404, not 200
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/me      # 401 (proxied)
 curl -s http://127.0.0.1:8000/health                                        # backend health
-docker exec apikita-nginx nginx -T | grep -A9 'location /events'            # buffering still off
 ```

@@ -8,7 +8,7 @@ const pages = [
   {
     href: '/docs/quickstart',
     title: 'Quickstart',
-    body: 'The integration guide: exchange a login for a session cookie, create an API key, make a streaming chat completion, and every error code you can get back.',
+    body: 'The integration guide: sign in for a session cookie, create an API key, make a streaming chat completion, and every error code you can get back.',
   },
 ];
 ---
@@ -48,9 +48,9 @@ const pages = [
       <h2 class="text-xl font-semibold tracking-tight">What the quickstart covers</h2>
       <ul class="mt-4 max-w-2xl list-disc space-y-2 pl-5 text-ink-muted">
         <li>
-          <strong>Authentication</strong> — exchange a login for an
+          <strong>Authentication</strong> — sign in for an
           <code class="font-mono text-sm">HttpOnly</code> session cookie with
-          <code class="font-mono text-sm">POST /auth/exchange</code>. The session
+          <code class="font-mono text-sm">POST /auth/login</code>. The session
           cookie is for the dashboard only; it is never accepted on
           <code class="font-mono text-sm">/v1/*</code>.
         </li>

@@ -25,6 +25,28 @@
 //! would hide the abuse this exists to find. Over-counting is a human
 //! investigating; under-counting is nobody investigating.
 //!
+//! THE RULE THAT FALLS OUT OF THE ROTATION, learned the hard way from a sibling
+//! table. An ip_hash is a stable identifier for ONE UTC day, so anything that COUNTS
+//! on it must have a window that is itself one day, or must aggregate per day and
+//! keep the aggregate. `key_ip_daily` does exactly that - `(api_key_id, day)` with a
+//! 90-day trend over counts that are already daily - and the window and the salt line
+//! up, so the two can never split across rows.
+//!
+//! `link_redemption_attempts` is the case that got it wrong, and it is wrong QUIETLY.
+//! Its counter is keyed on ip_hash over a sliding multi-hour `link_code_window`, so at
+//! midnight the key changes, the counter starts empty, and the pre-midnight attempts
+//! stop counting. The limiter reads as an hours-shaped cap and is a daily allowance
+//! that resets on the hour. Nothing errors; the limit simply stops applying to the
+//! attacker it was written for, and the test suite passes because a within-window
+//! attempt stream is still refused.
+//!
+//! So the shape to recognise is: a sliding window over a daily-rotating identifier. It
+//! will not fail loudly, it will fail as a limit that quietly stops limiting, and the
+//! cause is a privacy decision that is correct on its own terms - which is exactly why
+//! it survives review. The fix is to document the real ceiling, or to count on something
+//! stable, and never to lengthen the salt's life without saying what that costs
+//! unlinkability.
+//!
 //! SUSPICION, NOT ENFORCEMENT. The doc draws a hard line between the two:
 //! a suspicion threshold is "flagged for a human to look at", a hard cap
 //! (`config/apikita.toml [limits]`) "refuses the request". Nothing here refuses
@@ -57,6 +79,30 @@
 //! assumption is recorded so it is a known constraint rather than a latent
 //! surprise.
 
+#![cfg_attr(
+    not(test),
+    // THIS MODULE IS FENCED FOR A DIFFERENT REASON than the money ones, and the
+    // reason is worth being precise about rather than folding into the same list.
+    //
+    // Nothing here computes a figure a customer is charged. What it computes is the
+    // TRUST BOUNDARY: the CIDR mask decides whose X-Forwarded-For is believed, and a
+    // peer that is believed chooses the address it is recorded as - which is the
+    // exact signal docs/ip-tracking.md exists to raise.
+    //
+    // Two of the four sites are SHIFTS (`32 - prefix`, `128 - prefix`), and a shift
+    // whose amount is computed rather than literal is where a mask silently becomes
+    // the wrong mask. A mask that is too wide trusts more hosts than the operator
+    // wrote; a mask that is too narrow trusts fewer. Both are security outcomes, and
+    // neither raises anything.
+    //
+    // Like account, admin and money, this one cost nothing to install: four sites,
+    // all bounded by construction, each argued below. Unlike those, the argument
+    // for the two shifts is CROSS-FUNCTION - it depends on IpCidr::parse rejecting a
+    // prefix past the family width - which is exactly the kind of thing that rots
+    // when the check and the use live far apart, so both are written down here.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use chrono::{NaiveDate, Utc};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
@@ -75,6 +121,35 @@ pub const SEEN_RETENTION_DAYS: i64 = 7;
 /// `key_ip_daily` counts are kept this long: trend without history.
 pub const DAILY_RETENTION_DAYS: i64 = 90;
 
+/// `auth_attempts` rows are kept this long — the same seven days as
+/// [`SEEN_RETENTION_DAYS`], because they are the same privacy class.
+///
+/// A NAMED CONSTANT rather than a reuse of `seen_cutoff`, which is what the two
+/// link-code sweeps below do, and the difference is deliberate: those two have no
+/// separate measurement, while this window is read by `db::retention_lag` and by
+/// the metrics endpoint's `windows_days` map. A bare reuse would leave both of
+/// them with no name to read and a literal `7` to type, which is the drift the
+/// link window's constant was created to remove. One number, three readers.
+pub const AUTH_ATTEMPT_RETENTION_DAYS: i64 = 7;
+
+/// `link_code_issues` rows are kept this long: the same seven days as
+/// [`SEEN_RETENTION_DAYS`], for the same reason plus one of its own.
+///
+/// The shared reason: the cap counts issues over a window measured in HOURS, so a
+/// seven-day-old row can no longer refuse anything. The one of its own: the row is
+/// a per-account record of who asked for a Telegram link code and when, which is a
+/// weaker record than the hashes but still one nobody needs after the cap's window
+/// has closed.
+///
+/// NAMED RATHER THAN REUSING `seen_cutoff`, which is what the DELETE below did. The
+/// property that made it worth naming is not that it differs from the other windows,
+/// because it does not, but that THREE other places need to read it: the maintenance
+/// entrypoint passes it as a literal, `doc_claims`'s SWEEP list transcribes it, and
+/// docs/data-retention.md states it to a customer. A window with three transcriptions
+/// and no name is the drift this constant exists to remove, and the fact that two
+/// tables happen to share the number is not a reason for either to be anonymous.
+pub const LINK_CODE_ISSUE_RETENTION_DAYS: i64 = 7;
+
 /// Distinct IPs on one key in one day above which the runbook says to look.
 ///
 /// A starting value from [`docs/ip-tracking.md`](../../docs/ip-tracking.md)
@@ -83,6 +158,26 @@ pub const DAILY_RETENTION_DAYS: i64 = 90;
 /// so crossing it logs and nothing else — a mobile user can legitimately sit
 /// above it (the doc puts a mobile user at 10-50 IPs/day).
 pub const SHARING_SUSPICION_IPS: i32 = 20;
+
+/// Whether a day's distinct-IP count has just crossed the sharing threshold.
+///
+/// EXACTLY EQUAL, not `>=`, and that is a deliberate choice with a precondition: the
+/// crossing warning is logged once at the transition rather than on every subsequent
+/// request, so 20 requests from 20 addresses must stay quiet or the log becomes noise an
+/// operator learns to skip. For that to be safe the count must climb by exactly one per
+/// new address, which the upsert guarantees and a test pins.
+///
+/// The risk is a future change that lets a single call move the count by more than one -
+/// a batched insert, a backfill, a corrected counter - and the warning then fires for
+/// NOTHING, silently, because the count skipped 21. `>=` would remove that risk at the
+/// cost of one log line per request after the crossing, which is the wrong trade for a
+/// control whose whole purpose is to be noticed once.
+///
+/// A pure function so the boundary is testable at all: the warning goes to a log
+/// subscriber, and a predicate nobody can call is a predicate nobody can check.
+pub fn crossed_sharing_threshold(distinct_ips: i32) -> bool {
+    distinct_ips == SHARING_SUSPICION_IPS + 1
+}
 
 /// The counters for one key on one day, as they stand after a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +266,19 @@ impl std::fmt::Debug for DailySalt {
 
 /// The current UTC day. One definition, because the salt boundary and the
 /// `key_ip_daily.day` column must agree or the counts split across two rows.
+///
+/// **AND NOW IT REALLY IS ONE, which it was not for most of this crate's life.**
+/// The comment above made a promise that eighteen call sites did not keep: they
+/// wrote `Utc::now().date_naive()` themselves. The value was identical - this
+/// function is that exact expression - so nothing was wrong TODAY, and that is
+/// precisely what made it dangerous. A skew correction, a timezone, or a
+/// documented-but-unapplied offset added here would have moved the salt boundary
+/// and left every one of those sites on the old definition, which is the split the
+/// comment warns about, arriving by the most boring route available.
+///
+/// The same day also decides the usage and spend rollups, so a split here does not
+/// just split IP counts: a customer's 30-day spend would be windowed differently
+/// from the spend shown to them. Every one of those sites now calls this.
 pub fn today_utc() -> NaiveDate {
     Utc::now().date_naive()
 }
@@ -275,7 +383,7 @@ pub async fn record_key_ip(
         request_count: row.get("request_count"),
     };
 
-    if counts.distinct_ips == SHARING_SUSPICION_IPS + 1 {
+    if crossed_sharing_threshold(counts.distinct_ips) {
         // Logged once, at the crossing. A suspicion threshold is a flag for a
         // human, not a refusal — see the module note.
         warn!(
@@ -308,6 +416,21 @@ pub struct PurgedRows {
     /// know the link-code table is actually being swept. A count that cannot be
     /// printed cannot be noticed when it silently stops moving.
     pub link_attempts: u64,
+    /// `link_code_issues` rows deleted.
+    ///
+    /// A third field for the same reason as the second: this table was added because
+    /// the issuance cap could not count anything, and the counter it counts has to
+    /// be swept on a policy someone can see. A count that cannot be printed cannot
+    /// be noticed when it silently stops moving.
+    pub link_issues: u64,
+    /// `auth_attempts` rows deleted.
+    ///
+    /// A fourth field for the same reason as the second and third: this is the
+    /// credential-guessing counter behind the five `_per_hour` caps, it is keyed on
+    /// a salted IP hash, and an operator reading the sweep log has to be able to
+    /// see it moving. A count that cannot be printed cannot be noticed when it
+    /// silently stops moving.
+    pub auth_attempts: u64,
 }
 
 /// Deletes rows past their retention window.
@@ -338,8 +461,26 @@ pub struct PurgedRows {
 /// happen once a day.
 pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<PurgedRows, AppError> {
     // Inclusive cutoffs: the boundary day is deleted, `today - N + 1` is kept.
+    //
+    // SAFE, and it is the same argument as every other date subtraction in this
+    // repository: chrono's date arithmetic PANICS on an out-of-range result rather
+    // than wrapping, so a nonsense window fails loudly instead of quietly dating
+    // every row to the wrong side of the cutoff. The operands are retention
+    // constants (7 and 90 days) against the current date, so the range is never in
+    // question anyway.
+    #[allow(clippy::arithmetic_side_effects)]
     let seen_cutoff = today - chrono::Duration::days(SEEN_RETENTION_DAYS);
+    #[allow(clippy::arithmetic_side_effects)]
     let daily_cutoff = today - chrono::Duration::days(DAILY_RETENTION_DAYS);
+    // Its own constant rather than a reuse of `seen_cutoff`: see the doc on
+    // `AUTH_ATTEMPT_RETENTION_DAYS`. The two are both 7 today and are free to
+    // diverge, which is exactly why they are two names.
+    #[allow(clippy::arithmetic_side_effects)]
+    let auth_cutoff = today - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS);
+    // Its own cutoff, for the reason on the constant: three other places transcribe
+    // this window, so it needs a name to transcribe.
+    #[allow(clippy::arithmetic_side_effects)]
+    let link_issue_cutoff = today - chrono::Duration::days(LINK_CODE_ISSUE_RETENTION_DAYS);
 
     let seen = sqlx::query("DELETE FROM key_ip_seen WHERE day <= ?")
         .bind(seen_cutoff)
@@ -379,10 +520,80 @@ pub async fn purge_expired(pool: &SqlitePool, today: NaiveDate) -> Result<Purged
         .await?
         .rows_affected();
 
+    // The link-code ISSUANCE counter is the same class again: an account_id and a
+    // timestamp, feeding an abuse guard and holding nothing a person is identified
+    // by. Same 7-day bound, same sweep, same reason - a second retention policy is a
+    // second place the policy can be forgotten, and the first version of that table
+    // shipped with none at all.
+    //
+    // The cutoff is its OWN constant now, not `seen_cutoff`. The two are both 7 and
+    // are free to diverge - a private counter and a salted hash answering different
+    // questions - and while the number was shared, nothing could tell a deliberate
+    // reuse from a copy that was never revisited when one of the two moved.
+    //
+    // The instant form is what `created_at` requires: it is a TIMESTAMP in a TEXT
+    // column, so binding a bare date would compare 2026-09-27 as a string against
+    // 2026-09-27T03:04:05+00:00 - the shorter sorts first, the DELETE matches
+    // nothing, and the rows survive forever. A silent retention failure in the
+    // direction that keeps data.
+    let link_issues = sqlx::query("DELETE FROM link_code_issues WHERE created_at <= ?")
+        .bind(
+            link_issue_cutoff
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid")
+                .and_utc(),
+        )
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    // The credential-guessing counter behind the five `_per_hour` caps. The same
+    // 7-day bound as `key_ip_seen`, for the same two reasons and one more of its
+    // own.
+    //
+    // The two shared reasons first. The IP-KEYED rows are the same privacy class
+    // (a salted hash answering "who was this"), and the whole point of the counter
+    // is a window measured in MINUTES - `auth_attempts::window()` is one hour - so
+    // a seven-day-old row can no longer move any cap and deleting it costs the
+    // limiter nothing. The second reason is the one this module keeps relearning:
+    // the table shipped with no retention policy at all, and a second job or a
+    // second period is a second place the policy can be forgotten.
+    //
+    // THE ACCOUNT-KEYED ROWS ARE THE NEW QUESTION, and the answer is that they take
+    // the SAME window rather than a longer one. They hold no IP-derived data -
+    // `auth_attempts::record` stores the empty-string sentinel in `ip_hash`, which
+    // the migration's NOT NULL requires and which no address produced - so they are
+    // not a privacy burden of the hashed-identifier kind. They are still a
+    // per-account LOG OF WHO TRIED TO SIGN IN AND WHEN, which is a linkable
+    // behavioural record about an identifiable person, and `docs/data-retention.md`
+    // puts that class at 7 days for the salted hashes beside it. Keeping them
+    // longer would buy nothing an operator can act on (the caps read one hour) and
+    // would grow a table keyed on an account id that never rotates.
+    //
+    // The cutoff is the SAME inclusive `<=` and the SAME midnight-UTC instant as
+    // the two sweeps above, for the reason documented there: `created_at` is a
+    // TIMESTAMP in a TEXT column, so binding a bare `NaiveDate` would compare
+    // `2026-09-27` as a STRING against `2026-09-27T03:04:05+00:00`, where the
+    // shorter string sorts FIRST - the DELETE would match nothing and the rows
+    // would survive forever. A silent retention failure in the direction that keeps
+    // data, and the one this file's tests pin in both directions.
+    let auth_attempts = sqlx::query("DELETE FROM auth_attempts WHERE created_at <= ?")
+        .bind(
+            auth_cutoff
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid")
+                .and_utc(),
+        )
+        .execute(pool)
+        .await?
+        .rows_affected();
+
     Ok(PurgedRows {
         seen,
         daily,
         link_attempts,
+        link_issues,
+        auth_attempts,
     })
 }
 
@@ -466,8 +677,25 @@ impl IpCidr {
     }
 }
 
-/// `prefix == 0` is handled separately: shifting a 32-bit value by 32 is
-/// undefined, and it would panic in a debug build — on the request path.
+/// `prefix == 0` is handled separately, and the comment this replaces called the
+/// consequence "undefined". It is not undefined - Rust defines a shift past the
+/// width as an overflow, which panics in a debug build and masks in a release one.
+/// Both are wrong here: this runs on the REQUEST PATH, so the failure would be a
+/// panic under a debug build and a silently wrong mask in the one that ships.
+// SAFE, and the bound is CROSS-FUNCTION, which is why it is written down rather
+// than left to the reader: `32 - prefix` underflows for any prefix above 32, and
+// the result feeds a shift whose amount must stay under 32. IpCidr::parse rejects a
+// prefix past the family width, so the only way to reach this above 32 is to build
+// the struct without it - the fields are private, so that is this module's own tests
+// and nothing else.
+//
+// If that ever changes, the failure in production is not a crash but a mask that
+// trusts a different set of hosts than the operator wrote, which is the outcome this
+// whole module exists to make hard.
+//
+// The allow is on the FUNCTION: an attribute in tail-expression position is still
+// unstable, and the version that put it on the `else` arm did not compile.
+#[allow(clippy::arithmetic_side_effects)]
 fn v4_mask(prefix: u8) -> u32 {
     if prefix == 0 {
         0
@@ -476,6 +704,13 @@ fn v4_mask(prefix: u8) -> u32 {
     }
 }
 
+/// The v6 form, with the same cross-function bound against 128. The widest legal
+/// v6 prefix is /128, which makes this the largest shift either mask function
+/// performs, and it was the one end of the range nothing tested.
+///
+/// SAFE for the same reason as `v4_mask`: parse bounds prefix to 128, so
+/// `128 - prefix` is 0..=127 and the shift stays inside the type.
+#[allow(clippy::arithmetic_side_effects)]
 fn v6_mask(prefix: u8) -> u128 {
     if prefix == 0 {
         0
@@ -560,6 +795,50 @@ mod tests {
     }
 
     #[test]
+    fn one_visitor_is_not_linkable_across_days_which_is_what_the_page_promises() {
+        // The published claim, in the words of the privacy page: the hash is
+        // HMAC-SHA256 of the address under a salt replaced at each UTC midnight, so
+        // THE SAME VISITOR IS NOT LINKABLE ACROSS DAYS. Nothing tested that end to
+        // end. The tests above prove the FUNCTION is sound - same inputs, same
+        // output, different inputs, different output - which is a different claim
+        // entirely. A perfectly correct HMAC under a salt that never rotated would
+        // pass every one of them.
+        let rot = DailySalt::new();
+        let day = today_utc();
+        let next = day.succ_opt().expect("a next day exists");
+
+        // The salt actually rotates between the two days...
+        assert_ne!(
+            rot.salt_for_day(day),
+            rot.salt_for_day(next),
+            "the salt must differ across days, or nothing below means anything"
+        );
+
+        // ...so the same address does not produce the same hash.
+        let visitor = ip("203.0.113.9");
+        assert_ne!(
+            ip_hash(&rot.salt_for_day(day), &visitor),
+            ip_hash(&rot.salt_for_day(next), &visitor),
+            "the same address on two days must not produce the same hash - that is the whole privacy claim, and a stable salt would break a promise on a public page while leaving every other test here green"
+        );
+
+        // THE DIRECTION THAT MATTERS. A hash stored yesterday is a 64-character
+        // string; what someone holding it must not be able to do is look up which
+        // address produced it under TODAYS salt. Since the two differ, a dictionary
+        // attack over the IPv4 space needs yesterdays salt, which is gone - and that
+        // is the reason the salt is process memory only.
+        let stored_yesterday = ip_hash(&rot.salt_for_day(day), &visitor);
+        let linkable = (1..=64u32)
+            .filter_map(|last| format!("203.0.113.{last}").parse().ok())
+            .any(|candidate: std::net::IpAddr| {
+                ip_hash(&rot.salt_for_day(next), &candidate) == stored_yesterday
+            });
+        assert!(
+            !linkable,
+            "a hash stored yesterday matched some address under TODAYS salt, so the two days are linkable and the unlinkability claim on the privacy page is false"
+        );
+    }
+    #[test]
     fn different_ips_and_different_salts_hash_differently() {
         let salt = [7u8; 32];
         let other_salt = [8u8; 32];
@@ -635,6 +914,75 @@ mod tests {
             salt.salt_for_day(yesterday),
             [1u8; 32],
             "an older day must not recover the salt that made its hashes"
+        );
+    }
+
+    /// Concurrent callers asking for the SAME new day must all get the SAME salt.
+    ///
+    /// The write-lock RE-CHECK in `salt_for_day` exists for this and nothing held it: MEASURED,
+    /// deleting it left the whole suite green at 643. Every other test here is single-threaded, so
+    /// it takes the read-lock fast path or rotates once - the double-rotation needs two threads to
+    /// reach the write lock together.
+    ///
+    /// WHY IT MATTERS, and it is not a cosmetic race. `state.bytes` is REPLACED on rotation, so
+    /// without the re-check the second thread mints a SECOND salt for the same day and discards the
+    /// one the first thread already returned. A caller that hashed an IP with the first salt can no
+    /// longer match it against a later lookup for that same day, because the lookup hashes with the
+    /// second - the abuse counters silently stop counting the thing they were counting. The
+    /// invariant the comment states ("rotating twice would drop the salt those in-flight requests
+    /// are about to use") is exactly this, and it is observable from outside via `ip_hash`.
+    #[test]
+    fn concurrent_callers_on_a_new_day_all_get_the_same_salt() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        let day = NaiveDate::from_ymd_opt(2026, 9, 25).expect("date");
+        let next = NaiveDate::from_ymd_opt(2026, 9, 26).expect("date");
+        // Seeded with a DIFFERENT day, so every thread must take the rotation path rather than the
+        // read-lock fast path - which is the branch under test.
+        let salt = Arc::new(DailySalt::seeded(day, [1u8; 32]));
+
+        // A barrier so all the threads pile onto the write lock at once rather than trickling.
+        let gate = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let salt = Arc::clone(&salt);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    salt.salt_for_day(next)
+                })
+            })
+            .collect();
+
+        let salts: Vec<[u8; 32]> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
+
+        // Every thread must agree, because a caller cannot know which of its peers won the race.
+        let first = salts[0];
+        assert_ne!(
+            first, [1u8; 32],
+            "the fixture must have rotated off the seeded salt"
+        );
+        for (i, s) in salts.iter().enumerate() {
+            assert_eq!(
+                s, &first,
+                "thread {i} got a different salt for the SAME day. Removing the write-lock \
+                 re-check in salt_for_day rotates twice, so the second rotation discards the salt \
+                 the first caller is already hashing with - and an IP hash made with the discarded \
+                 salt stops matching a later lookup for that day"
+            );
+        }
+
+        // And the same fact through the public hashing path, which is how a caller would notice.
+        let visitor = ip("203.0.113.9");
+        let stored = ip_hash(&first, &visitor);
+        assert_eq!(
+            ip_hash(&salt.salt_for_day(next), &visitor),
+            stored,
+            "an IP hashed with the salt returned to one caller must still match a later lookup"
         );
     }
 
@@ -807,10 +1155,50 @@ mod tests {
         );
     }
 
+    /// The two IP-hash windows, checked against the PAGE a customer reads.
+    ///
+    /// This test used to be called `the_retention_windows_match_the_privacy_statement`
+    /// and read no privacy statement at all. Its whole body was
+    /// `assert_eq!(SEEN_RETENTION_DAYS, 7)` and `assert_eq!(DAILY_RETENTION_DAYS, 90)` - a
+    /// hand-kept copy of two numbers compared to two constants, proving that the copy
+    /// agreed with the constants and nothing whatever about the page. Renaming it was the
+    /// honest minimum; reading the page is the actual fix, and it is the sixth time in
+    /// this work that a guard was found comparing a restatement of a thing rather than
+    /// the thing.
+    ///
+    /// It reads the CUSTOMER page rather than docs/ip-tracking.md, because ip-tracking.md
+    /// is where the constants are documented and this is the copy a reader never sees.
+    /// Both are real documents; only one of them is the promise.
     #[test]
-    fn the_retention_windows_match_the_privacy_statement() {
-        assert_eq!(SEEN_RETENTION_DAYS, 7);
-        assert_eq!(DAILY_RETENTION_DAYS, 90);
+    fn the_ip_hash_windows_are_the_ones_the_privacy_page_states() {
+        let page = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("website")
+                .join("src")
+                .join("lib")
+                .join("privacy.ts"),
+        )
+        .expect("website/src/lib/privacy.ts must be readable, or this passes over nothing");
+
+        // A row that does not exist at all is a silent pass, so each is FOUND first.
+        let seen_row = page
+            .lines()
+            .find(|l| l.contains("per address seen"))
+            .expect("the privacy page must disclose the per-address IP hash");
+        assert!(
+            seen_row.contains(&format!("keep: '{SEEN_RETENTION_DAYS} days'")),
+            "the privacy page says {seen_row:?}, but SEEN_RETENTION_DAYS is {SEEN_RETENTION_DAYS}. The page is what a customer is held to."
+        );
+
+        let daily_row = page
+            .lines()
+            .find(|l| l.contains("caller IP, per day"))
+            .expect("the privacy page must disclose the per-day IP count");
+        assert!(
+            daily_row.contains(&format!("keep: '{DAILY_RETENTION_DAYS} days'")),
+            "the privacy page says {daily_row:?}, but DAILY_RETENTION_DAYS is {DAILY_RETENTION_DAYS}."
+        );
     }
 
     #[test]
@@ -1044,6 +1432,99 @@ mod tests {
         db.close().await;
     }
 
+    /// The TWO TIMESTAMP-column sweeps, at their own boundaries.
+    ///
+    /// WHY THESE NEED THEIR OWN TEST while the date-column sweeps above are covered. The test above
+    /// seeds `key_ip_seen` and `key_ip_daily`; `link_code_issues` is not named in it at all and
+    /// `link_redemption_attempts` only appears as a table name. MEASURED, in the module they live in:
+    ///
+    ///   `link_code_issues`'s comparison flipped to `<`               30 passed / 0 failed SURVIVED
+    ///   `link_code_issues`'s sweep made a complete NO-OP, `AND 0`   30 passed / 0 failed SURVIVED
+    ///
+    /// The second is the one that matters: a retention policy that silently stops sweeping retains
+    /// every IP-hash row forever, and nothing in the suite noticed. The table IS measured by a health
+    /// report test in db.rs, but that seeds a row 200 DAYS old - it proves the report fires, not that
+    /// the sweep deletes at 7. Two properties, and only one of them was pinned.
+    ///
+    /// The unit differs from the date sweeps and that is the reason both are seeded as INSTANTS:
+    /// `attempted_at` and `created_at` are timestamps in TEXT columns, so the bound has to be
+    /// midnight-UTC-of-the-cutoff-day. A bare `NaiveDate` would be the shorter string, sort FIRST, and
+    /// match nothing - a silent retention failure in the direction that KEEPS data.
+    #[tokio::test]
+    async fn the_timestamp_sweeps_delete_their_cutoff_instant_and_keep_the_one_inside() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let today = today_utc();
+
+        // Midnight UTC of each cutoff DAY - the instant each sweep binds.
+        let attempts_cutoff = (today - chrono::Duration::days(SEEN_RETENTION_DAYS))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc();
+        let issues_cutoff = (today - chrono::Duration::days(LINK_CODE_ISSUE_RETENTION_DAYS))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc();
+        // One second INSIDE each window: must survive. A whole day inside would be caught by a
+        // comparison that is off by a day; one second is the tightest provable neighbour.
+        let attempts_kept = attempts_cutoff + chrono::Duration::seconds(1);
+        let issues_kept = issues_cutoff + chrono::Duration::seconds(1);
+
+        for (at, address) in [
+            (attempts_cutoff, "198.51.100.21"),
+            (attempts_kept, "198.51.100.22"),
+        ] {
+            sqlx::query(
+                "INSERT INTO link_redemption_attempts (ip_hash, attempted_at) VALUES (?, ?)",
+            )
+            .bind(ip_hash(&[3u8; 32], &ip(address)))
+            .bind(at.to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("seed a link redemption attempt");
+        }
+        for at in [issues_cutoff, issues_kept] {
+            sqlx::query("INSERT INTO link_code_issues (account_id, created_at) VALUES (?, ?)")
+                .bind(account_id.hyphenated())
+                .bind(at.to_rfc3339())
+                .execute(&db.pool)
+                .await
+                .expect("seed a link code issue");
+        }
+
+        let purged = purge_expired(&db.pool, today).await.expect("purge");
+        assert_eq!(
+            purged.link_attempts, 1,
+            "exactly the attempt ON its cutoff instant is deleted. 0 means the sweep stopped \
+             matching - the NaiveDate-against-a-timestamp shape - and 2 means the comparison is \
+             `<=` to the wrong cutoff"
+        );
+        assert_eq!(
+            purged.link_issues, 1,
+            "exactly the ISSUE on its cutoff instant is deleted. A 0 here is the retention policy \
+             silently not running, which was MEASURED as a surviving mutation before this test"
+        );
+
+        let kept_attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM link_redemption_attempts WHERE attempted_at >= ?",
+        )
+        .bind(attempts_kept.to_rfc3339())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read surviving attempts");
+        assert_eq!(kept_attempts, 1, "the attempt one second inside survives");
+
+        let kept_issues: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM link_code_issues WHERE created_at >= ?")
+                .bind(issues_kept.to_rfc3339())
+                .fetch_one(&db.pool)
+                .await
+                .expect("read surviving issues");
+        assert_eq!(kept_issues, 1, "the issue one second inside survives");
+
+        db.close().await;
+    }
+
     // -----------------------------------------------------------------------
     // The link_redemption_attempts sweep.
     //
@@ -1141,6 +1622,190 @@ mod tests {
         db.close().await;
     }
 
+    // -----------------------------------------------------------------------
+    // The auth_attempts sweep.
+    //
+    // This table is the credential-guessing counter behind the five `_per_hour`
+    // caps. Its IP-keyed half is the same privacy class as key_ip_seen (a salted
+    // hash answering "who was this"), so it takes the same 7-day bound and the
+    // same sweep; its account-keyed half holds no IP-derived data but is a
+    // per-account log of who tried to sign in and when, which is the same
+    // retention question asked of a different key.
+    //
+    // BOTH KEYINGS ARE SEEDED AND BOTH ARE ASSERTED, rather than copying the
+    // link_redemption_attempts test: that table has one keying, so a copy would
+    // assert nothing about the half of this table that is new. A DELETE with an
+    // `account_id IS NOT NULL` predicate bolted on would pass a copy and fail
+    // here.
+    // -----------------------------------------------------------------------
+
+    /// Seeds one `auth_attempts` row at an explicit instant, IP-keyed or
+    /// account-keyed. The kind is `login` because that is the one kind written
+    /// under both keyings, so one helper can build either half.
+    async fn seed_auth_attempt(pool: &SqlitePool, at: DateTime<Utc>, account_id: Option<Uuid>) {
+        match account_id {
+            Some(id) => {
+                sqlx::query(
+                    "INSERT INTO auth_attempts (id, ip_hash, account_id, kind, created_at) \
+                     VALUES (?, '', ?, 'login', ?)",
+                )
+                .bind(Uuid::new_v4().hyphenated())
+                .bind(id.hyphenated())
+                .bind(at)
+                .execute(pool)
+                .await
+                .expect("seed an account-keyed attempt row");
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO auth_attempts (id, ip_hash, account_id, kind, created_at) \
+                     VALUES (?, ?, NULL, 'login', ?)",
+                )
+                .bind(Uuid::new_v4().hyphenated())
+                .bind(ip_hash(&[5u8; 32], &ip("203.0.113.77")))
+                .bind(at)
+                .execute(pool)
+                .await
+                .expect("seed an IP-keyed attempt row");
+            }
+        }
+    }
+
+    async fn auth_attempt_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_attempts")
+            .fetch_one(pool)
+            .await
+            .expect("count auth attempt rows")
+    }
+
+    /// RED FIRST: stale credential-guessing rows are DELETED by the sweep, under
+    /// BOTH keyings.
+    ///
+    /// Against the pre-fix code this fails for the real reason: nothing deletes
+    /// them, so a per-attempt history of who tried to sign in - from where, and
+    /// against which account - sits in the database forever, while the counters
+    /// that read it only ever look back one hour.
+    #[tokio::test]
+    async fn the_sweep_deletes_auth_attempt_rows_past_the_bound_and_keeps_recent_ones() {
+        let db = TestDb::new().await;
+        let now = Utc::now();
+        let account = test_support::account(&db.pool).await;
+
+        // Far outside the window, both keyings.
+        seed_auth_attempt(
+            &db.pool,
+            now - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS + 30),
+            None,
+        )
+        .await;
+        seed_auth_attempt(
+            &db.pool,
+            now - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS + 30),
+            Some(account),
+        )
+        .await;
+        // Just inside it, both keyings - a live attack must still be investigable.
+        seed_auth_attempt(&db.pool, now - chrono::Duration::days(1), None).await;
+        seed_auth_attempt(&db.pool, now - chrono::Duration::days(1), Some(account)).await;
+
+        assert_eq!(auth_attempt_rows(&db.pool).await, 4, "all four rows seeded");
+
+        let purged = purge_expired(&db.pool, today_utc()).await.expect("purge");
+
+        assert_eq!(
+            purged.auth_attempts, 2,
+            "the sweep must report the two stale rows it deleted, and the count must be its \
+             own field - a count folded into `seen` is a table that stops being swept without \
+             anyone noticing"
+        );
+        assert_eq!(
+            auth_attempt_rows(&db.pool).await,
+            2,
+            "the IP-keyed AND the account-keyed rows past the retention bound must both be \
+             DELETED; before this fix they survived forever"
+        );
+
+        // The survivors are the RECENT ones, not merely two of the four: a sweep
+        // that deleted the wrong half would still leave two rows.
+        let oldest_surviving: DateTime<Utc> =
+            sqlx::query_scalar("SELECT MIN(created_at) FROM auth_attempts")
+                .fetch_one(&db.pool)
+                .await
+                .expect("read the oldest survivor");
+        assert!(
+            oldest_surviving > now - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS),
+            "the rows that survived must be the in-window ones, got oldest {oldest_surviving}"
+        );
+
+        db.close().await;
+    }
+
+    /// THE BOUNDARY, PINNED EXACTLY - both directions, and on BOTH keyings.
+    ///
+    /// "Old rows go" passes with BOTH `<` and `<=`, which is how the window quietly
+    /// becomes N+1 days. `created_at` is also a TIMESTAMP, not a DATE, so the cutoff
+    /// must compare instants: binding a NaiveDate would store `2026-09-27` and compare
+    /// it as a STRING against `2026-09-27T03:04:05+00:00`, where the shorter string
+    /// sorts FIRST and the DELETE would remove nothing at all. Both halves of the
+    /// boundary are asserted on both keyings, so neither the off-by-one nor the type
+    /// confusion can return on either one.
+    #[tokio::test]
+    async fn the_auth_attempt_cutoff_is_inclusive_of_the_boundary_instant_and_keeps_the_rest() {
+        let db = TestDb::new().await;
+        let today = today_utc();
+        let account = test_support::account(&db.pool).await;
+        let cutoff = today - chrono::Duration::days(AUTH_ATTEMPT_RETENTION_DAYS);
+
+        // AT the cutoff instant: must go (inclusive), on both keyings.
+        seed_auth_attempt(
+            &db.pool,
+            cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+            None,
+        )
+        .await;
+        seed_auth_attempt(
+            &db.pool,
+            cutoff.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+            Some(account),
+        )
+        .await;
+        // One second INSIDE the window: must stay. This assertion fails if the
+        // cutoff becomes exclusive.
+        seed_auth_attempt(
+            &db.pool,
+            cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),
+            None,
+        )
+        .await;
+        seed_auth_attempt(
+            &db.pool,
+            cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),
+            Some(account),
+        )
+        .await;
+
+        purge_expired(&db.pool, today).await.expect("purge");
+
+        let surviving: Vec<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT created_at FROM auth_attempts ORDER BY created_at")
+                .fetch_all(&db.pool)
+                .await
+                .expect("read surviving attempts");
+
+        assert_eq!(
+            surviving,
+            vec![
+                cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),
+                cutoff.and_hms_opt(0, 0, 1).unwrap().and_utc(),
+            ],
+            "the instant AT the cutoff must be deleted on BOTH keyings and one second later \
+             must survive on both - and if this deletes NOTHING, the cutoff is being compared \
+             as a DATE against a TIMESTAMP column"
+        );
+
+        db.close().await;
+    }
+
     #[test]
     fn daily_salt_default_builds_a_fresh_salt() {
         // The `Default` impl backs `#[derive(Default)]` callers and the app's
@@ -1154,17 +1819,98 @@ mod tests {
         );
     }
 
+    /// The mask must trust EXACTLY the hosts the operator wrote, at every prefix.
+    ///
+    /// The previous test checked one value - `v4_mask(0)` and `v6_mask(0)` - and
+    /// nothing else. Zero is the easy end: it is the special case the function
+    /// handles in its own arm, so it cannot be reached by a mistake in the shift.
+    /// The ends that CAN be reached by a mistake are the other two: the widest legal
+    /// prefix, where the shift amount is largest, and anything near it.
+    ///
+    /// The property is swept rather than spot-checked, and it is stated as a count
+    /// rather than as figures: a mask for prefix `n` must have exactly `n` leading
+    /// ones. Too few and the relay stops being trusted; too many and hosts the
+    /// operator deliberately excluded are trusted, which is the outcome
+    /// docs/ip-tracking.md exists to make hard. A single wrong number cannot hide in
+    /// a set bit count, and every legal prefix is covered rather than a sample.
+    ///
+    /// 0 and the family width are named explicitly as well, because they are the two
+    /// the implementation branches on and the two a sweep could otherwise treat as
+    /// merely interior points.
     #[test]
-    fn the_zero_prefix_mask_is_explicitly_zero() {
-        // `prefix == 0` is the documented special case: shifting a 32- or
-        // 128-bit value by its full width is undefined and would panic on the
-        // request path, so both masks return 0 explicitly.
-        assert_eq!(v4_mask(0), 0);
-        assert_eq!(v6_mask(0), 0);
+    fn a_mask_trusts_exactly_the_hosts_the_operator_wrote_at_every_prefix() {
+        for prefix in 0u8..=32 {
+            assert_eq!(
+                v4_mask(prefix).count_ones(),
+                u32::from(prefix),
+                "an IPv4 /{prefix} mask must have exactly {prefix} leading ones"
+            );
+        }
+        for prefix in 0u8..=128 {
+            assert_eq!(
+                v6_mask(prefix).count_ones(),
+                // count_ones() is u32 for BOTH widths, including u128 - which is
+                // itself a small trap in a test that is otherwise about 128-bit
+                // values, and caught here by the compiler rather than by a sweep
+                // that silently compared nothing.
+                u32::from(prefix),
+                "an IPv6 /{prefix} mask must have exactly {prefix} leading ones"
+            );
+        }
+
+        // The branch points, named rather than left to the sweep above to imply.
+        // `prefix == 0` is a special arm because `u32::MAX << 32` is an overflow -
+        // Rust defines a shift past the width rather than leaving it undefined, and
+        // an overflow panics in a debug build and masks in a release one. Both are
+        // wrong on the request path, which is why the arm exists.
+        assert_eq!(v4_mask(0), 0, "a /0 trusts nobody");
+        assert_eq!(v6_mask(0), 0, "a /0 trusts nobody");
+        assert_eq!(v4_mask(32), u32::MAX, "a /32 trusts exactly one address");
+        assert_eq!(v6_mask(128), u128::MAX, "a /128 trusts exactly one address");
+        assert_eq!(v4_mask(24), 0xFFFF_FF00, "a /24 masks on the last octet");
+        assert_eq!(v6_mask(64), u128::MAX << 64, "a /64 masks on the low half");
+    }
+
+    /// The crossing PREDICATE fires at the threshold and not before, not after, not
+    /// again - and the name says predicate because this does not observe a log line.
+    ///
+    /// It is named carefully on purpose. webhooks.rs has a `capture_logs` helper and two
+    /// tests that genuinely use it, so log observation IS available in this crate; a test
+    /// called `..._warns_once` that does not use it claims something it did not do, which
+    /// is exactly how the old test for this ended up pinning a count and calling it a
+    /// warning. This one is honest about being one step short: the predicate is checked
+    /// from both sides, and the `warn!` consuming it is a single call whose argument is
+    /// this boolean.
+    ///
+    /// The step it does not take is stated rather than hidden. Capturing THIS log would
+    /// mean moving `capture_logs` out of webhooks.rs into test_support, which is worth
+    /// doing when a second caller needs it rather than for one test.
+    #[test]
+    fn the_sharing_crossing_predicate_fires_at_the_threshold_and_nowhere_else() {
+        // One below, and the threshold itself: quiet. A control that fires early is a
+        // control an operator learns to ignore.
+        assert!(
+            !crossed_sharing_threshold(SHARING_SUSPICION_IPS - 1),
+            "below the threshold must be silent"
+        );
+        assert!(
+            !crossed_sharing_threshold(SHARING_SUSPICION_IPS),
+            "AT the threshold must still be silent - the promise is MORE than 20"
+        );
+
+        // The crossing, and exactly it.
+        assert!(
+            crossed_sharing_threshold(SHARING_SUSPICION_IPS + 1),
+            "one past the threshold is the crossing and must fire"
+        );
+        assert!(
+            !crossed_sharing_threshold(SHARING_SUSPICION_IPS + 2),
+            "firing again on every later request would make it noise, and the precondition is that the count climbs by exactly one"
+        );
     }
 
     #[tokio::test]
-    async fn recording_past_the_sharing_threshold_warns_once() {
+    async fn the_distinct_ip_count_climbs_by_exactly_one_per_new_address() {
         // docs/ip-tracking.md: a key seen from >20 distinct domestic IPs in a
         // day is a sharing-suspicion flag for a human, not a refusal. The
         // warning is logged at the crossing (distinct_ips == SHARING_SUSPICION_IPS + 1),

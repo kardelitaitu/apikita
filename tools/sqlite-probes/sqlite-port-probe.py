@@ -27,7 +27,16 @@ def fresh():
 
 
 print(f"sqlite3 library version : {sqlite3.sqlite_version}")
-print(f"python sqlite3 module   : {sqlite3.version}")
+# `sqlite3.version` WAS REMOVED IN PYTHON 3.14, and this line ran before a single probe did, so the
+# script died on its own banner - `AttributeError: module 'sqlite3' has no attribute 'version'`,
+# exit 1. MEASURED on Python 3.14.5. docs/plans/sqlite-migration.md says to "run the probes first,
+# before writing any Rust", and this is the FIRST of the three, so that instruction led straight
+# into a crash rather than a measurement.
+#
+# `sys.version` has no deprecation and says the thing the line was for: WHICH interpreter is running
+# the module. The sqlite library version above is the one the port's behaviour depends on, and it
+# stays from `sqlite3.sqlite_version`, which is not affected.
+print(f"python                  : {sys.version.split()[0]}")
 print()
 
 # ---------------------------------------------------------------------------
@@ -341,6 +350,24 @@ def t_vacuum_into():
     con = fresh()
     con.execute("CREATE TABLE t (k TEXT)")
     con.execute("INSERT INTO t VALUES ('a')")
+    # THE COMMIT IS THE POINT OF THIS PROBE, NOT A DETAIL OF IT.
+    #
+    # Python's sqlite3 opens an IMPLICIT transaction before a DML statement (isolation_level=''),
+    # so the INSERT above left the connection "within a transaction" and SQLite refused:
+    #
+    #   OperationalError: cannot VACUUM from within a transaction
+    #
+    # That was reported as `[ERROR] VACUUM INTO (the backup primitive)` for as long as nobody ran
+    # this script, so the probe appeared to say the BACKUP PRIMITIVE does not work, when what it
+    # actually said was that the probe forgot to commit. MEASURED, three ways:
+    #   (a) uncommitted INSERT            -> ERROR: cannot VACUUM from within a transaction
+    #   (b) after con.commit()            -> ok, 8192 bytes
+    #   (c) sqlite3.connect(...).isolation_level == '' (the implicit-transaction default)
+    #
+    # Worth keeping as a comment because it is a REAL hazard for the Rust code too: the backup path
+    # must not hold an open write transaction when it runs the vacuum. The probe now commits and so
+    # measures the primitive rather than its own harness.
+    con.commit()
     import tempfile, os
     p = os.path.join(tempfile.mkdtemp(), "backup.db")
     con.execute(f"VACUUM INTO '{p}'")
@@ -373,6 +400,91 @@ def t_begin_immediate_visible():
 
 
 check("BEGIN IMMEDIATE accepted", t_begin_immediate_visible)
+
+
+# ---------------------------------------------------------------------------
+# STRICT tables — the invariant the PLAN calls "the single most important line"
+# ---------------------------------------------------------------------------
+#
+# WHY THIS SECTION EXISTS, and it was missing. docs/plans/sqlite-migration.md:1441 says every table is
+# `STRICT`, calls it "the single most important line in this appendix", and gives the reason: without it
+# `INTEGER` is only *affinity*, so a `REAL` lands in a money column silently. The plan also states the
+# requirement this creates - "Requires SQLite >= 3.37" (:694, :714, :1441).
+#
+# MEASURED: the suite had NO STRICT probe and nothing asserted the version. The single most important
+# invariant of the whole port was the one thing the probes did not measure, and the version requirement
+# was printed on the banner rather than checked - so a host with an older SQLite would run all 24 probes
+# green and then fail to create the first table.
+#
+# `sqlite_version_info` so the comparison is numeric: "3.9.0" > "3.37.0" as STRINGS, which would pass a
+# host that cannot run the schema at all.
+
+STRICT_MIN_VERSION = (3, 37, 0)
+
+
+def t_sqlite_version_supports_strict():
+    v = sqlite3.sqlite_version_info
+    if v < STRICT_MIN_VERSION:
+        raise AssertionError(
+            f"SQLite {sqlite3.sqlite_version} is older than "
+            f"{'.'.join(map(str, STRICT_MIN_VERSION))}, which every table's STRICT clause requires "
+            f"(docs/plans/sqlite-migration.md:1441). The schema cannot be created on this host."
+        )
+    return f"{sqlite3.sqlite_version} >= {'.'.join(map(str, STRICT_MIN_VERSION))}"
+
+
+check("SQLite version supports STRICT (>= 3.37)", t_sqlite_version_supports_strict)
+
+
+def t_strict_rejects_a_wrong_type():
+    """The money-column protection, measured: a TEXT value must not land in an INTEGER column."""
+    con = fresh()
+    con.execute("CREATE TABLE s (amount_idr INTEGER NOT NULL) STRICT")
+    con.execute("INSERT INTO s (amount_idr) VALUES (5000)")
+    try:
+        con.execute("INSERT INTO s (amount_idr) VALUES ('not a number')")
+    except sqlite3.IntegrityError as exc:
+        return f"rejected: {exc}"
+    raise AssertionError(
+        "a STRICT table ACCEPTED text in an INTEGER column, so the money rule is not structural"
+    )
+
+
+check("STRICT rejects a wrong type (the money-column rule)", t_strict_rejects_a_wrong_type)
+
+
+def t_non_strict_accepts_the_same_value():
+    """The control: without STRICT the same insert succeeds, so STRICT is what does the work.
+
+    Without this, the probe above would pass on a build where SQLite rejected the value for an
+    unrelated reason, and the result would not be evidence about STRICT at all.
+    """
+    con = fresh()
+    con.execute("CREATE TABLE loose (amount_idr INTEGER NOT NULL)")
+    con.execute("INSERT INTO loose (amount_idr) VALUES ('not a number')")
+    got = con.execute("SELECT amount_idr, typeof(amount_idr) FROM loose").fetchone()
+    return f"accepted as {got[0]!r} typeof={got[1]!r} - which is the silent corruption STRICT prevents"
+
+
+check("control: a NON-STRICT table accepts it", t_non_strict_accepts_the_same_value)
+
+
+def t_strict_rejects_a_real_in_a_money_column():
+    """The exact failure the plan names: a REAL in a money column.
+
+    This is the case `sqlite-migration.md:4.9` is about - a float reaching the wallet - and it is worth
+    probing separately from text because REAL is what an arithmetic slip actually produces.
+    """
+    con = fresh()
+    con.execute("CREATE TABLE s (amount_idr INTEGER NOT NULL) STRICT")
+    try:
+        con.execute("INSERT INTO s (amount_idr) VALUES (5000.5)")
+    except sqlite3.IntegrityError as exc:
+        return f"rejected a REAL in an INTEGER money column: {exc}"
+    raise AssertionError("a REAL was accepted into a STRICT INTEGER money column")
+
+
+check("STRICT rejects a REAL in a money column", t_strict_rejects_a_real_in_a_money_column)
 
 
 # ---------------------------------------------------------------------------

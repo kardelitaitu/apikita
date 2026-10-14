@@ -16,7 +16,7 @@ Pages, flows, and states. Written as behaviour, not markup.
 | `/dashboard/keys` | API key list, create, limits, revoke | Required |
 | `/dashboard/keys/new` | Create key: models + limits | Required |
 | `/dashboard/wallet` | Balance, top-up, history | Required |
-| `/dashboard/usage` | Token usage over time | Required |
+| `/dashboard/usage` | Token usage over time — flat table **and** a one-metric trend chart | Required |
 | `/dashboard/settings` | Profile, password, linked accounts | Required |
 | `/docs` | Integration guide | Public |
 
@@ -51,23 +51,23 @@ avoids both account duplication and enumeration.
 
 ## Logout
 
-Simple, because there are no server-side sessions: "logout" is discarding the
-PocketBase auth token and clearing the cookie the BFF set.
+Sessions are server-side rows, so "logout" is real revocation rather than a
+local discard: the server revokes the session row and clears the cookie.
 
 - One control in the dashboard header. No confirmation dialog — logging out is
   not destructive.
-- Clears the token cookie server-side (BFF) **and** the client auth store, so a
-  back-button cannot restore an authenticated view.
-- **Token caveat:** the token itself remains cryptographically valid until it
-  expires; discarding it does not revoke it. A token copied off the device still
-  works. This is inherent to stateless tokens, not a bug.
+- Revokes the session server-side (BFF) **and** clears the client auth state, so
+  a back-button cannot restore an authenticated view.
+- **No token caveat.** A revoked session stops resolving immediately; a copy of
+  the credential taken off the device is dead the moment the row is revoked.
+  This is why the design moved off stateless tokens.
 
 ### Sign out of all devices
 
-A separate, deliberate action — this is real revocation.
+A separate, deliberate action — this is the broader revocation.
 
-- Calls the BFF, which rotates the record's `tokenKey` and saves.
-- **Invalidates every token for that user instantly**, on all devices.
+- Calls the BFF, which revokes **every** session row for that account.
+- **Invalidates every session for that user instantly**, on all devices.
 - Use after: password change (automatic), suspected compromise, or a "sign out
   everywhere" request.
 
@@ -103,8 +103,16 @@ Live-updating by default (see [01-architecture.md](01-architecture.md)).
 | Balance | `wallets.balance_idr` | Realtime; polling fallback |
 | Today's usage | `usage_daily` | Realtime |
 | Token breakdown | input / cache-read / output | Same |
-| Recent requests | last N metered calls | Poll or realtime |
-| Status | upstream health | Poll |
+| Recent requests | last N metered calls (`GET /api/usage/recent`, source `usage_events`) | On load |
+| Status | `GET /health` — the API and its database only | Poll (60s) |
+
+> **Status limited by design.** The "Uptime monitoring" section of
+> `docs/observability.md` forbids `/health` from
+> probing upstream providers ("an upstream outage would then look like a dead
+> server and trigger a restart loop"). So this indicator reports whether the
+> platform is **reachable**, not whether a model provider is healthy, and its copy
+> must never claim otherwise. A true upstream-health view needs the operator
+> surface (see `docs/admin-surface.md` open items), not the customer dashboard.
 
 ### Required states
 
@@ -214,4 +222,4 @@ Not optional, and cheap if done from the start:
 
 - LLM request proxying → `server/`
 - Telegram bot UI → `telegram/`
-- Admin operations → PocketBase dashboard initially
+- Admin operations → the shipped `/admin` operator console over the Rust admin routes (account lookup, suspend/resume, audit trail, service metrics) — see [`../admin-surface.md`](../admin-surface.md). (This was previously "the PocketBase dashboard", which no longer exists.)

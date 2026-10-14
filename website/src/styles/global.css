@@ -163,6 +163,20 @@
   .ticker__copy[aria-hidden="true"] {
     display: none;
   }
+
+  /* Every OTHER animation stops too. The loading skeletons pulse
+     (`animate-pulse`), and a user who asked for less motion must not be shown a
+     perpetual fade — WCAG 2.3.3. The skeleton still renders (its shape is the
+     point); only the movement goes, and a static block of the right size reads
+     identically as "content is coming". `*` rather than a class list so a future
+     animated element is covered by default instead of shipping un-motion-reduced. */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }
 
 /* One shared focus guard instead of a per-element class. Deliberately NOT in

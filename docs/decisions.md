@@ -20,7 +20,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Backend | **Rust on Northflank** | I/O-bound proxy; one service does API + proxy |
 | Money store | **SQLite (embedded, WAL)** | Transactions, constraints, the ledger — on the same host as the API, so a ledger write is a local file write rather than a network round trip |
 | SQL driver | **`sqlx` with the `sqlite` feature** | Not `rusqlite`. The port is a 106-site dialect change, not an API rewrite; `sqlx migrate` is already settled below; and the bottleneck is the single writer, not the binding. Reasoning: [`plans/proxy-hot-path-audit.md`](plans/proxy-hot-path-audit.md) §3 |
-| Identity store | **Rust-owned** — the `accounts` + `identities` tables | Auth only — never money. No external auth service remains |
+| Identity store | **Rust-owned** — the `accounts` + `identities` tables | Auth only — never money. **Phase 6 LANDED:** this crate verifies every credential — Argon2id password hashes, Google ID tokens, verification and reset tokens — and mints its own sessions. There is no PocketBase service, no `POCKETBASE_URL`, and no `/auth/exchange`; the `identities` table is populated and is the only identity record. The operative description is [`architecture/identity.md`](architecture/identity.md) |
 | Payments | **Midtrans, QRIS only** | Card excluded: a flat fee is ~20% of a small top-up |
 | Relay | **nginx on a VPS, L7** | TLS + filtering; absorbs load before the backend |
 | CDN / edge | **Cloudflare** | Free tier; also where Pages lives |
@@ -35,7 +35,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Second relay | **No** | The backend is already the fallback; a second relay is cost without benefit |
 | Session storage | **Server-side rows in the local SQLite database** | Makes logout revoke immediately |
 | SSE auth | **Session cookie, same-site subdomain** | A token in a query string lands in logs and history |
-| Account key | **`accounts.id` is the only key; the PocketBase id column is dropped** | Auth is the component most likely to change, so it must not own the identity |
+| Account key | **`accounts.id` is the only key** | Auth is the component most likely to change, so it must not own the identity. **Phase 6 LANDED:** `accounts.pb_user_id` is GONE — migration `20260930000000_identity_port.sql` dropped it. An account is addressed by its own `id` from the moment it is minted; there is no external id to link through and no column that could disagree with it |
 | Proxy/API split | **One service for now** | They share the database, key lookup, and usage accounting |
 
 ### Money
@@ -53,13 +53,14 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Ledger | **Append-only; balance derivable** | Corrections are new rows, never edits |
 | Balance floor | **`CHECK (balance_idr >= 0)`** | The database refuses a negative balance |
 | Overdraft | **Not permitted — no flag** | The balance is non-negative by decision. The `CHECK (balance_idr >= 0)` on `wallets` in `server/migrations/20260925000000_initial_schema.sql` is the authoritative backstop; the pre-flight in `server/src/routes/proxy.rs` always rejects when the reservation exceeds the balance. Gate 2 of [`launch-checklist.md`](launch-checklist.md) requires the constraint present and exercised |
+| Overdraft: what it does to reporting | **Usage and revenue diverge for a clamped request, by design** | A request whose hold could not be fully covered is billed at the balance — the debit is clamped — while `usage_daily` still records the **full** cost, because the service was genuinely consumed and the usage is a fact. The ledger records only what was taken, so reconciliation still holds. The consequence for anyone reading a margin report is the part that needs saying out loud: **revenue from a clamped request is lower than the usage it recorded**, so a margin computed from `usage_daily.cost_idr` alone will show less profit than was actually collected, and one computed from usage multiplied by the price card will show revenue that was never billed. Neither is a bug and neither is a rounding artefact — it is the difference between what a customer consumed and what they could pay |
 | Refund policy | **Non-refundable; inbound refunds are refused, never applied** | The platform does not move money back. A Midtrans `refund`/`partial_refund` notification is answered **200** `{"status":"refund_not_supported"}`, logged at `error!`, and changes nothing — no wallet debit, no ledger row, `topups.status` stays `settled` |
 | Refund: why 200, not 4xx | **A 4xx would make Midtrans retry an event that can never succeed** | The refusal reports a fact already true at the rail; a distinct body is the observable signal, and a 4xx would be indistinguishable from a transient 5xx in Midtrans' dashboard and in our alerting |
 | Refund classification | **Named `PaymentAction::RefundRefused`, never `Unrecognised`** | Refusing a refund is a policy answer, not a status we failed to parse. Collapsing it into `Unrecognised` would mislabel settled policy as a classification gap |
 | Refund code path | **Deleted, not quarantined** | `DebitRefund`, `refund_topup_transaction`, `RefundResult` and `refund_decision` are removed. A money-moving `pub fn` with no caller is one wiring away from misuse. `topup_ledger_ref` and `TopupCreditResult::NotSettleable` are kept — the credit path still needs both |
 | `status='refunded'` / ledger `reason='refund'` | **Unreachable from the webhook; reachable from the wind-down runbook** | No *automatic* writer remains — an inbound Midtrans refund is refused. The closure payout is the one deliberate writer, and it is operator-run ([`wind-down.md`](wind-down.md)). The CHECK values stay because migrations are forward-only and additive-only — removing one is a table rebuild. A test fixture also writes them, simulating an out-of-band bank action |
 | Refund: scope of the policy | **Non-refundable during operation, with no non-delivery exception** — settled by the owner | There is no code path that returns money **in response to a customer request**, and no self-serve refund. The register previously carried a non-delivery carve-out; that carve-out is withdrawn, and [`terms-of-service.md`](terms-of-service.md) now states the same. **This row does not govern wind-down**: a closure payout is platform-initiated and sits in the row above. Read the two together — a customer cannot ask for their money back, but we will hand it back when we stop serving. The terms remain a **draft outline requiring legal review (Gate 0)** — the text records the decision, it does not certify it is enforceable |
-| Refund: enforceability caveat (**not resolved here**) | **Recorded, deliberately not fixed** | `terms-of-service.md:61-72` and `business/05-risk.md:31-46` warn that a non-refundable clause which overreaches is likelier to be struck down *in its entirety* than a narrow one, and that on non-delivery the payer generally prevails at the dispute stage **regardless of the stated policy**. Withdrawing the carve-out therefore may reduce, not increase, the clause's protective value. This is a lawyer's call; it is written down so it is not discovered later |
+| Refund: enforceability caveat (**not resolved here**) | **Recorded, deliberately not fixed** | The "Open legal risk — flagged, not resolved" callout in the Refunds section of `terms-of-service.md`, and risk item 2 in `business/05-risk.md`, warn that a non-refundable clause which overreaches is likelier to be struck down *in its entirety* than a narrow one, and that on non-delivery the payer generally prevails at the dispute stage **regardless of the stated policy**. Withdrawing the carve-out therefore may reduce, not increase, the clause's protective value. This is a lawyer's call; it is written down so it is not discovered later |
 | **Wind-down payout** | **On closure, every balance above USD 2.00 is paid out** — settled by the owner | The one thing that overrides non-refundable. Trigger is platform-initiated (we decide to stop), never a customer request, which is why it does not contradict the row above: same money, opposite initiator. See [`wind-down.md`](wind-down.md) |
 | Wind-down: classification | **The rail a customer paid on decides it — "anyone who used Midtrans is considered Indonesian"** | Settled by the owner. Per account, monotone: **ever settled a Midtrans top-up ⇒ Indonesian ⇒ bank transfer; otherwise ⇒ USD stablecoin.** Monotone so it can never be applied retroactively, and it errs toward the domestic rail with a real entity behind it — never paying crypto to an Indonesian. **Today it degenerates to "everyone is Indonesian"**, because Midtrans QRIS is the only implemented rail — stated here rather than pretending the split is exercised |
 | Wind-down: threshold | **`balance_idr > 2 × closure_usd_idr_rate`, strictly greater, rate frozen once** | The owner said "more than \$2". The rate is captured **once at wind-down start** (Bank Indonesia JISDOR) and reused for every payout: balances are frozen at the same instant, so there is no fairness argument for varying it, and one auditable number beats a moving target. A live FX API is exactly what is unavailable when you are shutting down. The threshold is **ceiled**, so a sub-\$2 balance is never paid automatically |
@@ -73,7 +74,7 @@ open. Do not re-open a settled decision in a document — change it here instead
 | Legal review | **Deferred with the entity.** Triggered by the same 4.8b IDR line | The wind-down clause is a promise to customers that has not been reviewed by a lawyer. It is written to *reduce* exposure, and is the one clause that should not be weakened. Re-open the moment the trigger is in sight |
 | Crypto rail | **Not built, not promised.** Launch on Midtrans QRIS alone | The stablecoin payout path and the USD route exist only because of an orphaned rough plan (`billing-system.md`). Building a crypto rail would add Bappebti/OJK registration, PMK 50/2025 PPh 22, KYC/AML on an email-only payee, and cross-border reporting — the largest compliance surface in the plan, for a rail with zero code today. **Practical effect: everyone is Indonesian and gets a bank transfer**, which is what the classification already degenerates to |
 | Credit expiry | **2 years (24 months) from each deposit's own date** | Settled by the owner. Per deposit, not per account or from last activity — a wallet holds credit of several ages, and expiry-from-last-activity would silently extend old credit. |
-| Credit expiry: implementation | **Not built — the terms promise something the code does not do yet** | There is no per-deposit expiry column, no sweep job, and no refusal of a spend against aged credit. Policy is settled; the code is a build task in [`launch-checklist.md`](launch-checklist.md). Flagged because a policy the code does not keep is worse than no policy |
+| Credit expiry: implementation | **Built** - shipped in the server image and RUN nightly | `topups.credit_expires_at` is stamped at settlement *in the same statement* that records the settlement, so the deposit's date and its expiry instant cannot be made to disagree by a crash. `db::expire_credit` retires each aged deposit separately, oldest first, capped by its own amount and by what the wallet holds. It is CALLED from the `usage-purge` binary rather than a fourth one - this file's argument against multiplying retention jobs does not care whether a job deletes a row or appends one. **That binary is now built into the server image (`server/Dockerfile`) and run nightly by `.docker/maintenance/entrypoint.sh` as the `credit-expiry` job, which fails loudly and exits non-zero if the runner is missing.** It is the only maintenance job that is NOT inline SQL, for the reason the file used to use as an excuse: the sweep is an `UPDATE` plus an `INSERT`, i.e. a guarded debit and a ledger row carrying `balance_after` - the ledger invariant - and a second copy of that in shell would be two implementations of the one thing the money model rests on. The retirement is a negative `usage`-reasoned row plus a wallet decrement in one transaction; the reason cannot be a new value because the CHECK is frozen and widening it on SQLite is a table rebuild, so the `ref` carries the distinction as `expiry:<topup id>`. `credit_expiry_months = 0` is the disabled setting and it writes NULL, which the sweep reads as **nothing to retire** rather than as long overdue. **The window is honoured to the sweep's cadence, not to the instant**: `try_debit` checks only `balance_idr >= amount`, so credit that aged out after the last run stays spendable until the next one. A spend-time predicate would be a second definition of expiry, and the terms say so rather than implying otherwise. **This row previously read "called from a binary that does NOT run" and "NO CREDIT EXPIRES", and the correction is the part worth keeping**: the sweep had seventeen tests, a stamped window and no runner in production, so a customer-facing term that extinguishes value was disclosed and not enforced. The disclosure had a gate; the enforcement did not. |
 | Credit expiry: legal caveat | **Recorded, not resolved** | An expiring balance that is never refunded is a consumer-protection concern in Indonesia. 2 years is defensible, but the interaction with the non-refundable clause is not settled — part of the Gate 0 legal review |
 | Refund: accepted risk | **Negative float, visible only via the refusal alert** | A chargeback returns the customer's money at the rail while the wallet keeps the credit. Because the ledger does not move, no drift check fires; the `error!` line is the only fast signal, and the monthly Midtrans-vs-`topups` reconciliation surfaces it up to a month later. Mitigation: alert on the refusal and hold a reserve. **Unalerted, this is a silent loss.** See [`website/04-payments.md`](website/04-payments.md) |
 
@@ -93,9 +94,9 @@ open. Do not re-open a settled decision in a document — change it here instead
 
 | Decision | Value | Rationale |
 | --- | --- | --- |
-| Session lifetime | **30 days absolute, 7 days idle** | Rare re-login; bounded exposure on a stolen token |
-| Password hashing | **Argon2id, owned by the Rust API** | The qualifier is resolved: PocketBase is going, so nothing else can own it. Parameters and the rehash-on-login policy become ours to set |
-| Login methods | **Google + email/password, with reset** | Unchanged as a product decision; what changes is that the Rust API implements all of it, including the pre-hijacking defences in [`architecture/identity.md`](architecture/identity.md) |
+| Session lifetime | **30 days absolute, 7 days idle** | Rare re-login; bounded exposure on a stolen token. **Enforced at three points, and the split is not obvious from the numbers.** The ABSOLUTE bound is stamped, not checked at resolution: `expires_at` is seeded `now + absolute_days` at both login paths (`routes/auth.rs`), and `routes::session_is_live_at` deliberately DISCARDS its `absolute_days` parameter — `let _ = absolute_days;`, whose comment says the parameter is kept only so no reader thinks the bound is enforced elsewhere. The IDLE bound is the one computed in Rust at resolution, `last_seen_at + idle_days > now`. The values themselves are tied to this table by `doc_claims`, which loads `config/apikita.toml` and asserts `absolute_days == 30` and `idle_days == 7` against the wording of this row, so a policy change that edits the config without this table fails the build. `routes::both_session_bounds_are_inclusive_unusable_at_the_exact_instant` pins each boundary from both sides, isolating one bound by satisfying the other |
+| Password hashing | **Argon2id, owned by the Rust API** | **Phase 6 LANDED:** Rust owns Argon2id outright — `identity/password.rs` hashes and verifies, and the parameters come from the `[auth]` section rather than from a service's config. Nothing else can hash a password for this crate, which is what makes the rehash-on-login policy ours to set |
+| Login methods | **Google + email/password, with reset** | Unchanged as a product decision, and now implemented entirely by this crate: `/auth/google`, `/auth/signup`, `/auth/login`, the verification and reset routes, and `/auth/password-change`. The pre-hijacking defences are in [`architecture/identity.md`](architecture/identity.md) |
 | Telegram | **A linked surface, not an identity provider** | One wallet, two surfaces |
 | Review writes | **Telegram only** | A second writer makes "who reviewed" ambiguous |
 | Review identity | **Keyed on the account, re-attributed on link** | Otherwise linking creates a second review slot |
@@ -177,24 +178,33 @@ open. Do not re-open a settled decision in a document — change it here instead
 | RPO | **15 minutes** | The ledger is the business |
 | RTO | **4 hours** | Achievable by restoring to a new host |
 
-### Migration in flight — the direction is chosen, and the tree has partly moved
+### Migration landed — the tree matches the register
 
-The entries this changes — Money store, SQL driver, Identity store, Account key,
-Money type, Backup tooling, and the Operations additions — are **decided**.
+The entries this changed — Money store, SQL driver, Identity store, Account key,
+Money type, Backup tooling, and the Operations additions — are **decided AND shipped**.
 
-As of Phases 0–5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
+As of Phase 6 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
 
 - **`server/` no longer builds against Postgres.** The dependency, the config, the
   compose file, the schema, the migration binary and every SQL statement in `src/`
   are SQLite. `cargo check --all-targets` is clean.
-- **`server/` still calls PocketBase** for `auth-refresh`, and `accounts.pb_user_id`
-  is still present and `NOT NULL`. Identity is Phase 6, and the column survives
-  deliberately: `auth.rs` creates accounts through it, so dropping it earlier would
-  break login while claiming the intermediate phases shipped intact.
+- **`server/` no longer calls any identity service, and the column that linked to one
+  is gone.** `accounts.pb_user_id` was dropped by migration
+  `20260930000000_identity_port.sql`, and the PocketBase HTTP client was deleted from
+  the crate — the breaking change is `19e04a3 refactor(auth)!: delete the PocketBase
+  client path`. Identity is verified here: Argon2id in `identity/password.rs`, Google
+  ID tokens in `identity/google.rs`, and sessions minted by `routes/auth.rs`. Phase 6
+  is why the earlier version of this entry said the column "survives deliberately";
+  that reason expired with the phase, and a register that kept it would be describing
+  a login path that no longer exists.
 - **The test suite runs, and it runs by default.** Phase 5 gave every database test
   its own migrated SQLite file in a temp directory, so no test needs
-  `DATABASE_URL` and not one `#[ignore]` remains: measured
-  **134 passed / 0 failed / 0 ignored**. The money tests — including the real
+  `DATABASE_URL` and not one `#[ignore]` remains. It measured **134 passed / 0 failed /
+  0 ignored** when Phase 5 landed and **556 / 0 / 0** when Phase 6 first landed, after
+  identity moved in and the tests that drove the retired service were deleted with it.
+  It reads **565 / 0 / 0** now, the difference being the tests added for the
+  password-change and provider-list routes. The money
+  tests — including the real
   concurrency proof of the overdraw fix,
   `concurrent_requests_cannot_overdraw_a_one_request_balance` — had been
   `#[ignore = "requires live Postgres"]` and were therefore never executed
@@ -231,11 +241,12 @@ As of Phases 0–5 of [`plans/sqlite-migration.md`](plans/sqlite-migration.md):
   session's `expires_at` is seeded `login + absolute_days`; only a value BELOW the
   absolute lifetime (the shipped 7 against 30) changes any outcome.
 
-This marker exists so the register does not lie in either direction. Here,
-**settled means the direction is chosen, not that the tree matches it** — the register
-is read by agents working in parallel with the port, and a value flipped ahead of the
-code is the same failure as a value left behind it. The list above is the current
-boundary between the two.
+This marker exists so the register does not lie in either direction. The list above is
+the boundary, and at Phase 6 the boundary and the tree agree — every "target" in this
+register is now the description of shipped code. The register is read by agents working
+in parallel, and a value flipped ahead of the code is the same failure as a value left
+behind it; the failure mode that remains is a NEW decision made in code and not
+recorded here.
 
 ## Genuinely open
 
@@ -271,14 +282,14 @@ Decided *values* that the running system reads are in `config/apikita.toml`:
 | Config section | Holds |
 | --- | --- |
 | `[pricing]` | Currency (margin is per model) |
-| `[wallet]` | Deposit minimums, low-balance threshold |
+| `[wallet]` | Deposit minimums. **Not enforced:** `low_balance_threshold_idr`, `low_balance_max_per_day`, `dormancy_days` (no low-balance alert is emitted and no sweep ages a wallet out), `min_monthly_tokens` (no monthly token floor is applied to anything), `reserve_settlement_cycles` (the reservation *is* sized for one cycle, by construction in `worst_case_reservation_idr` — this setting restates a hardcoded behaviour while reading as a control, and setting it to 5 would change nothing) |
 | `[sessions]` | Absolute and idle lifetimes |
-| `[limits]` | Per-account rate caps, key metadata cache TTL, limit window, admin threshold |
+| `[limits]` | Per-account rate caps (top-up, key creation, link codes, **reviews**), key metadata cache TTL, limit window, admin threshold. **Not enforced:** `wallet_mutations_per_minute` — a rate limit for a limiter that was never written. It also **could not bind** if it were wired: `topup_per_hour` is 5 and is enforced on the only caller-controlled wallet mutation, and 5 per hour is under 10 per minute. It becomes the binding cap only if `topup_per_hour` rises above 600, which is a single config edit away with nothing enforcing the other side — see the arithmetic in `config/apikita.toml`. **`review_per_hour` was on this list and is NOT any more**: this row used to say "for a review endpoint that does not exist", and that stopped being true when `routes/reviews.rs` landed, which reads the cap (`let limit = state.config.limits.review_per_hour;`) inside the write transaction so the COUNT and the write are serialised. It is named here rather than silently deleted because the STALE ENTRY is the instructive part: the module's own doc-comment records that the unwired entry was removed in the same change that added the module, and this row was not — so for that interval the register told an operator a live cap was inert. The `UNWIRED` guard in `config.rs` could not catch it, by its own stated design: it asserts a field is NAMED in this table, never that the sentence about it is still true |
 | `[realtime]` | SSE replay buffer, connection cap, stream lifetime |
-| `[key_pool]` | Rotation, cooldowns, attempts |
-| `[circuit_breaker]` | Trip threshold, cooldown + backoff cap, upstream timeout, health checks |
-| `[streaming]` | Mid-stream cutoff, max output tokens, context cap. `allow_negative_balance_overdraft` was **removed** — overdraft is not permitted |
-| `[[models]]` | Per-model margin, rates, endpoints, key env names |
+| `[key_pool]` | Rotation, cooldowns, attempts. **Not enforced:** `on_pool_exhausted` — only `reject_503` is implemented, and the config comment says the alternative "needs a queue", so a one-valued enum is presented as a setting |
+| `[circuit_breaker]` | Trip threshold, cooldown + backoff cap, upstream timeout. **Not enforced:** `health_check_interval_seconds`, `health_check_failures` — there is no background health check; recovery is a trial request on real traffic, and `upstream/circuit_breaker.rs` says "no I/O" |
+| `[streaming]` | Max output tokens. **Not enforced:** `mid_stream_cutoff` (the cut-off is always off and the flag is never consulted), `max_context_tokens` (**not a cap** — nothing refuses a request whose prompt exceeds it; the hold is sized from the actual body, so the ceiling bounds nothing. Its only production reader was a second `worst_case_reservation_idr` on `UpstreamClient` that no request ever called). `allow_negative_balance_overdraft` was **removed** — overdraft is not permitted |
+| `[[models]]` | Per-model margin, peak rates, endpoints, key env names. **Enforced:** `concurrency_per_key` — an endpoint's per-key ceiling now gates admission in `KeyPool::acquire`, which skips a key already at its ceiling rather than selecting it and waiting for the provider to answer 429. **Not enforced:** `billing_basis` (every price is computed from the peak rates, so the offpeak class `input_offpeak` / `output_offpeak` / `cache_read_offpeak` is configured, checked, and never charged), `supports_vision`, `supports_thinking`, `description` |
 
 **A decision here without a corresponding config value cannot be enforced.** If you
 add one, give it a home in the config or it will be implemented as a hardcoded

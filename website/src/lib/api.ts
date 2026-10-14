@@ -64,8 +64,10 @@ export function redirectToLogin(): void {
 
 export interface ApiFetchInit extends RequestInit {
   /**
-   * 401 -> redirect to /login. Off for /auth/exchange, which is called *from*
-   * the login page and legitimately returns 401 for a bad PocketBase token.
+   * 401 -> redirect to /login. Off for the calls made *from* an auth page — the
+   * signed-in probe on /login and the POSTs on /login, /signup, /reset and
+   * /verify — which legitimately answer 401 and must own that answer themselves
+   * rather than bounce the visitor back to the page they are already on.
    */
   redirectOn401?: boolean;
 }
@@ -117,4 +119,19 @@ export interface Me {
   usage_today: UsageToday;
   telegram_linked: boolean;
   status: string;
+  /**
+   * The address this account signs in with, and whether it has been verified.
+   *
+   * `null` when the account holds no identity row at all, which is a real case: the
+   * row is created by the sign-in that mints the account, so an account the API has
+   * never seen sign in has none. The settings panel renders a dash for a missing
+   * address rather than an empty string — "" and "we do not have one" are different
+   * answers, and only one of them is true here.
+   *
+   * BOTH COME FROM THE SAME IDENTITY ROW, which is why they are one shape and not
+   * two lookups: a panel that read the address from one row and the flag from
+   * another could show a verified marker beside an address that is not verified.
+   */
+  email: string | null;
+  email_verified: boolean;
 }

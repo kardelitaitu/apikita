@@ -1,3 +1,19 @@
+#![cfg_attr(
+    not(test),
+    // THE CUSTOMER WALLET SURFACE, fenced like the money modules for the same
+    // structural reason. This is where a deposit limit is compared and where the
+    // wallet figures a customer is shown are assembled, so an overflow here would be
+    // a limit that silently stops biting or a balance that reads wrong in the
+    // dashboard.
+    //
+    // It costs nothing, which is the finding rather than the assumption: measured
+    // before adding it, this module has ZERO arithmetic_side_effects sites outside
+    // its tests. Every money computation happens in db.rs and this module routes to
+    // it rather than repeating it. That is worth locking in - a fence is only
+    // useful if it is cheap, and this one was.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use std::borrow::Cow;
 use std::env;
 use std::sync::OnceLock;
@@ -5,13 +21,13 @@ use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
+
 use sqlx::{Row, SqlitePool};
 use tracing::info;
 use uuid::fmt::Hyphenated;
@@ -28,6 +44,30 @@ pub struct MeResponse {
     pub usage_today: UsageTodayDto,
     pub telegram_linked: bool,
     pub status: String,
+    /// Whether this account may use the operator surface. Sent so the browser
+    /// can decide whether to render the admin entry points at all, rather than
+    /// showing links that answer 403. It is a rendering hint, NOT the
+    /// authorization: every admin route re-checks `accounts.is_operator` server
+    /// side (admin.rs::require_operator), so a forged value here buys nothing.
+    pub is_operator: bool,
+    /// The address this account signs in with, and whether it has been verified.
+    ///
+    /// Both are on THIS response rather than a second endpoint because the
+    /// settings page renders them beside the balance, and two round trips for one
+    /// panel is two chances to show a half-filled card.
+    ///
+    /// `None` when the account holds no identity row at all — which is possible:
+    /// the row is created by the sign-in that mints the account, so an account
+    /// this API has never seen sign in has none. The page shows a dash for a
+    /// missing address rather than an empty string, because "" and "we do not
+    /// have one" are different answers.
+    ///
+    /// This REPLACED a read of the PocketBase record's `email`/`verified` fields
+    /// after the identity port. The port is why the page had to ask twice: the
+    /// address used to arrive with the exchanged token, and it now lives in
+    /// `identities` like everything else.
+    pub email: Option<String>,
+    pub email_verified: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,7 +105,7 @@ pub struct LimitQuery {
     pub limit: Option<i64>,
 }
 
-/// The window parameters docs/server/api-spec.md:97 advertises on
+/// The window parameters docs/server/api-spec.md (Account, GET /api/usage) advertises on
 /// `GET /api/usage`. Held as raw strings, not `NaiveDate`, so a malformed
 /// value produces OUR JSON 422 naming the field instead of axum's plain-text
 /// extractor rejection - docs/error-model.md:10 requires every response to be
@@ -76,50 +116,24 @@ pub struct UsageQuery {
     pub to: Option<String>,
 }
 
-/// SHA-256 hex of a session token.
+/// The account a request's session cookie resolves to.
 ///
-/// Carried over from the Postgres branch, where the shared
-/// `crate::routes::resolve_account_from_cookie` in mod.rs took a `PgPool`. That
-/// resolver is now a `SqlitePool` too, so this local copy is equivalent to it:
-/// this module keeps its own so the handler and its tests exercise the same
-/// resolver. Two copies of the hash-then-compare rule, so a divergence fails a
-/// test rather than passing silently
-/// into mod.rs. Same rule either way: the token is hashed, never stored raw.
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-async fn resolve_account_from_cookie(
-    pool: &SqlitePool,
-    headers: &HeaderMap,
-) -> Result<Uuid, AppError> {
-    let cookie_hdr = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthenticated)?;
-
-    for piece in cookie_hdr.split(';') {
-        let piece = piece.trim();
-        if let Some(token) = piece.strip_prefix("session=") {
-            let token_hash = hash_string(token);
-            let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
-            )
-            .bind(token_hash)
-            .bind(Utc::now())
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some(s) = session {
-                return Ok(s.try_get::<Hyphenated, _>("account_id")?.into_uuid());
-            }
-        }
-    }
-
-    Err(AppError::Unauthenticated)
-}
+/// THIS IS NOT A LOCAL COPY ANY MORE, and its comment used to say that it was.
+/// It claimed the local resolver was "equivalent to" `crate::routes`'s, on the
+/// grounds that both are `SqlitePool` - which was true of the hash and false of
+/// the RULE. The local copy filtered revocation and absolute expiry in SQL and
+/// stopped there. It never applied the idle bound (`last_seen_at + idle_days >
+/// now`) and never moved `last_seen_at`, so with the shipped
+/// `idle_days = 7` against `absolute_days = 30` a session idle for eight days
+/// was REFUSED by the cookie paths in mod.rs and ACCEPTED by every customer route
+/// in this file - and could still read the account, spend the balance and mint
+/// keys.
+///
+/// That divergence is exactly what the comment promised a test would catch, and
+/// no test did: nothing asserted that the copies agreed, and the copies are what
+/// the handlers called. The one resolver is now the only one, so the claim and
+/// the code are the same statement.
+use crate::routes::resolve_account_from_cookie;
 
 pub async fn get_me(
     State(pool): State<SqlitePool>,
@@ -127,12 +141,13 @@ pub async fn get_me(
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&pool, &headers).await?;
 
-    let account = sqlx::query("SELECT status FROM accounts WHERE id = ?")
+    let account = sqlx::query("SELECT status, is_operator FROM accounts WHERE id = ?")
         .bind(account_id.hyphenated())
         .fetch_one(&pool)
         .await?;
 
     let status: String = account.try_get("status")?;
+    let is_operator: bool = account.try_get("is_operator")?;
 
     let wallet = sqlx::query("SELECT balance_idr FROM wallets WHERE account_id = ?")
         .bind(account_id.hyphenated())
@@ -144,7 +159,7 @@ pub async fn get_me(
         .transpose()?
         .unwrap_or(0);
 
-    let today = Utc::now().date_naive();
+    let today = crate::ip_tracking::today_utc();
     let usage_today = sqlx::query(
         r#"
         SELECT
@@ -166,6 +181,38 @@ pub async fn get_me(
         .fetch_optional(&pool)
         .await?;
 
+    // The address and its verified flag, from the SAME row, so the pair cannot
+    // describe two different identities. `ORDER BY email_verified DESC, created_at
+    // ASC` and `LIMIT 1` are the preference the receipt path already uses (see
+    // `account_email`): a verified identity outranks an unverified one, and among
+    // equals the oldest wins, so the answer does not move when a second identity is
+    // linked. Without the ordering a customer with both a password and a Google
+    // identity would see the panel flip depending on which row SQLite happened to
+    // return first.
+    let identity = sqlx::query(
+        "SELECT email, email_verified FROM identities \
+         WHERE account_id = ? ORDER BY email_verified DESC, created_at ASC LIMIT 1",
+    )
+    .bind(account_id.hyphenated())
+    .fetch_optional(&pool)
+    .await?;
+
+    let (email, email_verified) = match identity {
+        Some(row) => {
+            let raw: String = row.try_get("email")?;
+            let trimmed = raw.trim();
+            // An empty address is "we have none", not an address that is the empty
+            // string - the same reading `account_email` applies before a receipt.
+            let email = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            (email, row.try_get::<i64, _>("email_verified")? != 0)
+        }
+        None => (None, false),
+    };
+
     Ok(Json(MeResponse {
         account_id,
         balance_idr,
@@ -177,6 +224,9 @@ pub async fn get_me(
         },
         telegram_linked: tg_link.is_some(),
         status,
+        is_operator,
+        email,
+        email_verified,
     }))
 }
 
@@ -328,6 +378,265 @@ pub async fn get_topups(
     Ok(Json(result))
 }
 
+/// Rows returned when the caller asks for no explicit limit. Matches the
+/// dashboard's "last N metered calls" and keeps the response small enough to
+/// render without paging.
+const RECENT_USAGE_DEFAULT_LIMIT: i64 = 20;
+
+/// `GET /api/usage/recent?limit=` — the last N metered requests for this account.
+///
+/// docs/website/03-functional-spec.md, Dashboard table: "Recent requests — last N
+/// metered calls". `usage_daily` is an aggregate with no per-request rows and no
+/// model, so it cannot answer this; the source is `usage_events`, which the
+/// settlement transaction writes one row to per billed request.
+///
+/// Only THIS account's rows are ever returned: the cookie is resolved first and
+/// every query is bound to that account id, so a second account's requests are
+/// unreachable even with a guessed id. Nothing here exposes a prompt, a
+/// completion, or a key's plaintext — `usage_events` stores none of them.
+pub async fn get_recent_usage(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+    Query(query): Query<LimitQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+    let limit = query
+        .limit
+        .unwrap_or(RECENT_USAGE_DEFAULT_LIMIT)
+        .clamp(1, 100);
+
+    // Newest first. The index `usage_events_account_idx (account_id, created_at
+    // DESC)` serves exactly this ordering, so the sort is not a table scan.
+    let rows = sqlx::query(
+        r#"
+        SELECT id, api_key_id, model,
+               input_tokens, cache_read_tokens, output_tokens, cost_idr, created_at
+        FROM usage_events
+        WHERE account_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(account_id.hyphenated())
+    .bind(limit)
+    .fetch_all(&pool)
+    .await?;
+
+    let events: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| -> Result<serde_json::Value, AppError> {
+            let id: Uuid = r.try_get::<Hyphenated, _>("id")?.into_uuid();
+            // A key deleted later nulls the column (ON DELETE SET NULL), so this
+            // is genuinely optional; the UI shows the request without a key name.
+            let api_key_id: Option<Uuid> = r
+                .try_get::<Option<Hyphenated>, _>("api_key_id")?
+                .map(Hyphenated::into_uuid);
+            Ok(json!({
+                "id": id,
+                "api_key_id": api_key_id,
+                "model": r.try_get::<String, _>("model")?,
+                "input_tokens": r.try_get::<i64, _>("input_tokens")?,
+                "cache_read_tokens": r.try_get::<i64, _>("cache_read_tokens")?,
+                "output_tokens": r.try_get::<i64, _>("output_tokens")?,
+                "cost_idr": r.try_get::<i64, _>("cost_idr")?,
+                "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(events))
+}
+
+/// `GET /api/export` - the customer's own data, as one JSON document.
+///
+/// docs/data-retention.md "Access and deletion requests": a customer can ask to
+/// export their data. This is that export. The scope is fixed by that document's
+/// "The export — what is IN and what is OUT" table, and the rule is **metadata,
+/// not secrets**:
+///
+/// - IN: the account, wallet, ledger, top-ups, usage (daily and per-request) and
+///   API-key METADATA - exactly what the customer can already see or act on.
+/// - OUT: `key_hash`, `token_hash`, `snap_token`, session rows,
+///   IP hashes and the Telegram chat id. Hashes and internal ids are not the
+///   customer's to hold, and handing them out is an attack surface for no benefit.
+/// - OUT: `admin_audit`. Whether operator actions reach the customer is a
+///   SEPARATE open decision (docs/admin-surface.md Open items); this does not
+///   pre-empt it.
+///
+/// Every query is bound to the cookie-resolved account id, so a customer can only
+/// export their OWN rows.
+pub async fn export_account_data(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let account_id = resolve_account_from_cookie(&pool, &headers).await?;
+    let id = account_id.hyphenated().to_string();
+
+    // Account: no pb_user_id (an internal link), no password (elsewhere).
+    let account =
+        sqlx::query("SELECT id, status, is_operator, created_at FROM accounts WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await?;
+
+    let wallet = sqlx::query("SELECT balance_idr, updated_at FROM wallets WHERE account_id = ?")
+        .bind(&id)
+        .fetch_optional(&pool)
+        .await?;
+
+    let ledger = sqlx::query(
+        "SELECT delta_idr, reason, ref, balance_after, created_at
+         FROM ledger WHERE account_id = ? ORDER BY id",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    // snap_token is deliberately NOT selected: it is a Midtrans credential.
+    let topups = sqlx::query(
+        "SELECT id, amount_idr, order_id, status, rail, created_at, settled_at
+         FROM topups WHERE account_id = ? ORDER BY created_at",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    let usage_daily = sqlx::query(
+        "SELECT day, input_tokens, cache_read_tokens, output_tokens, cost_idr
+         FROM usage_daily WHERE account_id = ? ORDER BY day",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    let usage_events = sqlx::query(
+        "SELECT id, model, input_tokens, cache_read_tokens, output_tokens, cost_idr, created_at
+         FROM usage_events WHERE account_id = ? ORDER BY created_at",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    // Key METADATA only. key_hash is not selected.
+    let keys = sqlx::query(
+        "SELECT prefix, label, models, spend_limit_idr, token_limit, rate_limit_rpm,
+                expires_at, last_used_at, revoked_at, created_at
+         FROM api_keys WHERE account_id = ? ORDER BY created_at",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+
+    // Link STATE only - never the chat id, which is the other party's identifier.
+    let telegram_linked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM telegram_links WHERE account_id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await?;
+
+    // Each table is mapped explicitly rather than generically: a generic row ->
+    // JSON pass would have to guess a column's type, and getting that wrong on a
+    // money field is worse than a few extra lines. Every field here is named in
+    // the doc's IN table and nowhere else.
+    let account_json = json!({
+        "id": account.try_get::<String, _>("id")?,
+        "status": account.try_get::<String, _>("status")?,
+        "is_operator": account.try_get::<bool, _>("is_operator")?,
+        "created_at": account.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+    });
+
+    let wallet_json = match wallet {
+        Some(w) => json!({
+            "balance_idr": w.try_get::<i64, _>("balance_idr")?,
+            "updated_at": w.try_get::<chrono::DateTime<Utc>, _>("updated_at")?,
+        }),
+        None => serde_json::Value::Null,
+    };
+
+    let mut ledger_json = Vec::with_capacity(ledger.len());
+    for r in ledger {
+        ledger_json.push(json!({
+            "delta_idr": r.try_get::<i64, _>("delta_idr")?,
+            "reason": r.try_get::<String, _>("reason")?,
+            "ref": r.try_get::<Option<String>, _>("ref")?,
+            "balance_after": r.try_get::<i64, _>("balance_after")?,
+            "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+        }));
+    }
+
+    let mut topups_json = Vec::with_capacity(topups.len());
+    for r in topups {
+        topups_json.push(json!({
+            "id": r.try_get::<String, _>("id")?,
+            "amount_idr": r.try_get::<i64, _>("amount_idr")?,
+            "order_id": r.try_get::<String, _>("order_id")?,
+            "status": r.try_get::<String, _>("status")?,
+            "rail": r.try_get::<String, _>("rail")?,
+            "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+            "settled_at": r.try_get::<Option<chrono::DateTime<Utc>>, _>("settled_at")?,
+        }));
+    }
+
+    let mut daily_json = Vec::with_capacity(usage_daily.len());
+    for r in usage_daily {
+        daily_json.push(json!({
+            "day": r.try_get::<String, _>("day")?,
+            "input_tokens": r.try_get::<i64, _>("input_tokens")?,
+            "cache_read_tokens": r.try_get::<i64, _>("cache_read_tokens")?,
+            "output_tokens": r.try_get::<i64, _>("output_tokens")?,
+            "cost_idr": r.try_get::<i64, _>("cost_idr")?,
+        }));
+    }
+
+    let mut events_json = Vec::with_capacity(usage_events.len());
+    for r in usage_events {
+        events_json.push(json!({
+            "id": r.try_get::<String, _>("id")?,
+            "model": r.try_get::<String, _>("model")?,
+            "input_tokens": r.try_get::<i64, _>("input_tokens")?,
+            "cache_read_tokens": r.try_get::<i64, _>("cache_read_tokens")?,
+            "output_tokens": r.try_get::<i64, _>("output_tokens")?,
+            "cost_idr": r.try_get::<i64, _>("cost_idr")?,
+            "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+        }));
+    }
+
+    let mut keys_json = Vec::with_capacity(keys.len());
+    for r in keys {
+        // models is stored as JSON text. Parse it to a real array so the export is
+        // machine-readable; a value that does not parse is passed through as text
+        // rather than dropped — losing a key's allowlist would misstate the account.
+        let models_raw: String = r.try_get("models")?;
+        let models_value: serde_json::Value =
+            serde_json::from_str(&models_raw).unwrap_or(serde_json::Value::String(models_raw));
+        keys_json.push(json!({
+            "prefix": r.try_get::<String, _>("prefix")?,
+            "label": r.try_get::<Option<String>, _>("label")?,
+            "models": models_value,
+            "spend_limit_idr": r.try_get::<i64, _>("spend_limit_idr")?,
+            "token_limit": r.try_get::<i64, _>("token_limit")?,
+            "rate_limit_rpm": r.try_get::<i64, _>("rate_limit_rpm")?,
+            "expires_at": r.try_get::<Option<chrono::DateTime<Utc>>, _>("expires_at")?,
+            "last_used_at": r.try_get::<Option<chrono::DateTime<Utc>>, _>("last_used_at")?,
+            "revoked_at": r.try_get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")?,
+            "created_at": r.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+        }));
+    }
+
+    Ok(Json(json!({
+        "exported_at": Utc::now(),
+        "note": "Metadata, not secrets. Credential hashes, session/IP records, the Telegram chat id and internal ids are deliberately excluded - see docs/data-retention.md.",
+        "account": account_json,
+        "wallet": wallet_json,
+        "ledger": ledger_json,
+        "topups": topups_json,
+        "usage_daily": daily_json,
+        "usage_events": events_json,
+        "api_keys": keys_json,
+        "telegram_linked": telegram_linked > 0,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Midtrans Snap client
 // ---------------------------------------------------------------------------
@@ -471,25 +780,35 @@ fn build_snap_payload(order_id: &str, amount_idr: i64, customer_email: Option<&s
     Value::Object(payload)
 }
 
-/// The email Snap should attach to the transaction. The accounts table holds
-/// only the PocketBase record id, so the address is read from PocketBase itself
-/// (POCKETBASE_URL, the same address auth.rs uses). It is best-effort: a failure
-/// there degrades the receipt and must never block a top-up.
-async fn account_email(http: &reqwest::Client, pb_user_id: &str) -> Option<String> {
-    let base = env::var("POCKETBASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let url = format!(
-        "{}/api/collections/users/records/{}",
-        base.trim_end_matches('/'),
-        pb_user_id
-    );
+/// The email Snap should attach to the transaction.
+///
+/// This used to be a best-effort HTTP read of PocketBase, because the accounts
+/// table held only that service's record id and the address lived over there.
+/// After the identity port the address is a local row in `identities`, so the
+/// lookup is a single indexed query and the network dependency is gone: a
+/// PocketBase outage can no longer degrade a receipt.
+///
+/// Still best-effort in the sense that matters: this returns `None` rather than an
+/// error, and a caller without an address must send the transaction without one.
+/// A missing email degrades a receipt; failing here would block a top-up.
+async fn account_email(pool: &SqlitePool, account_id: Uuid) -> Option<String> {
+    // Order matters only for determinism: an account may hold several identities
+    // (a password one and a Google one), and any address on the account is the
+    // same person. `email_verified DESC` prefers a proven address, then the
+    // oldest row, so the answer is stable across runs rather than whatever the
+    // planner happened to return first.
+    let email: Option<String> = sqlx::query_scalar(
+        "SELECT email FROM identities WHERE account_id = ? \
+         ORDER BY email_verified DESC, created_at ASC LIMIT 1",
+    )
+    .bind(account_id.hyphenated())
+    .fetch_optional(pool)
+    .await
+    .ok()?;
 
-    let response = http.get(url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let body: Value = response.json().await.ok()?;
-    body.get("email")?.as_str().map(|e| e.trim().to_string())
+    email
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
 }
 
 /// Creates the Snap transaction and returns (token, redirect_url).
@@ -620,12 +939,9 @@ pub async fn create_topup(
     let topup_id = Uuid::new_v4();
     let order_id = format!("topup_{}", topup_id);
 
-    // accounts stores only the PocketBase record id; the email lives in PocketBase.
-    let pb_user_id: String = sqlx::query("SELECT pb_user_id FROM accounts WHERE id = ?")
-        .bind(account_id.hyphenated())
-        .fetch_one(&state.pool)
-        .await?
-        .try_get("pb_user_id")?;
+    // The email now comes from the account's own identity rows, so this lookup is
+    // local and cannot be defeated by an upstream service being down.
+    let email = account_email(&state.pool, account_id).await;
 
     // Built per request: this path is one call per customer action, far too cold
     // to justify a process-wide pool, and SNAP_REQUEST_TIMEOUT is this call's
@@ -634,8 +950,6 @@ pub async fn create_topup(
         .timeout(SNAP_REQUEST_TIMEOUT)
         .build()
         .map_err(|e| AppError::Internal(format!("failed to build Snap HTTP client: {e}")))?;
-
-    let email = account_email(&snap_http, &pb_user_id).await;
     let snap_payload = build_snap_payload(&order_id, payload.amount_idr, email.as_deref());
 
     // Midtrans first. Any failure here returns before a row exists, so a rejected
@@ -650,6 +964,53 @@ pub async fn create_topup(
     // `rail` is named explicitly and is `'midtrans'` because Midtrans QRIS is the
     // only rail implemented. The column is NOT NULL with no default precisely so
     // that a future second rail cannot inherit this literal by omission.
+    //
+    // THE CAP IS RE-CHECKED HERE, INSIDE THIS TRANSACTION, and that is the fix.
+    //
+    // The check at the top of this handler is a COUNT on the pool, and this INSERT
+    // is the row it governs - with a Midtrans Snap call and a PocketBase lookup in
+    // between. So concurrent callers all read the same count, all saw room, and all
+    // created a top-up; abuse.rs measures that at fourteen rows against a cap of
+    // five.
+    //
+    // The obvious fix - one transaction from the first check to the INSERT - is NOT
+    // available, and deliberately not attempted: it would hold a SQLite WRITE LOCK
+    // across a network round trip to a payment provider, and every other top-up in
+    // the process would serialise behind it.
+    //
+    // So the cap is checked TWICE, and the two checks have different jobs. The early
+    // one is a cheap gate that refuses an over-cap account BEFORE a Snap session is
+    // created - which is the whole reason it is first. This one is authoritative
+    // and atomic, because there is nothing between it and the INSERT but this
+    // comment: SQLite serialises writers, so a second caller either sees the first
+    // caller's row or is still waiting for the lock.
+    //
+    // WHAT THAT COSTS, stated rather than glossed: a caller that passes the early
+    // check and then loses this one has already created a Snap transaction with no
+    // matching row, so its payment would be orphaned. That is the same state a Snap
+    // call that succeeded and whose INSERT then failed already produces, and the
+    // window for it is a burst by an account already at its cap - the case the
+    // early gate exists to stop in the first place. Trading an unbounded abuse
+    // window for that is the right way round, but it is a trade and not a free win.
+    //
+    // ONE instant for both the cap boundary and the row's created_at, read inside
+    // the transaction rather than beside it. They must agree: a row stamped slightly
+    // after the check that admitted it could in principle fall on the far side of a
+    // window edge, and then the count that refused the next caller and the row that
+    // was admitted would disagree about what "in the window" means.
+    let now = Utc::now();
+    let mut tx = crate::db::begin_immediate(&state.pool).await?;
+
+    crate::abuse::enforce_creation_cap_in(
+        &mut tx,
+        "topups",
+        crate::abuse::topup_window(),
+        state.config.limits.topup_per_hour,
+        account_id,
+        now,
+    )
+    .await?;
+
     sqlx::query(
         "INSERT INTO topups (id, account_id, amount_idr, order_id, status, snap_token, rail, created_at) VALUES (?, ?, ?, ?, 'pending', ?, 'midtrans', ?)",
     )
@@ -658,9 +1019,11 @@ pub async fn create_topup(
     .bind(payload.amount_idr)
     .bind(&order_id)
     .bind(&snap_token)
-    .bind(Utc::now())
-    .execute(&state.pool)
+    .bind(now)
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     info!(
         topup_id = %topup_id,
@@ -684,6 +1047,7 @@ pub async fn create_topup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ledger_drift_rows;
 
     fn wallet(min_topup: u64, min_first_deposit: u64) -> WalletConfig {
         WalletConfig {
@@ -694,6 +1058,7 @@ mod tests {
             reserve_settlement_cycles: 1,
             low_balance_threshold_idr: 10_000,
             low_balance_max_per_day: 1,
+            credit_expiry_months: 24,
         }
     }
 
@@ -936,7 +1301,9 @@ mod tests {
     //     cargo test --lib -- --ignored
     // -----------------------------------------------------------------------
 
-    use crate::db::credit_topup_transaction;
+    use crate::db::{
+        credit_topup_transaction, debit_usage_transaction, SHIPPED_CREDIT_EXPIRY_MONTHS,
+    };
     use crate::routes::events::RealtimeHub;
     use crate::routes::test_env::{EnvGuard, EnvLock};
     use crate::test_support::{self, TestDb};
@@ -949,23 +1316,65 @@ mod tests {
 
     /// The reconciliation check from docs/observability.md, scoped to one
     /// account: wallets.balance_idr must equal SUM(ledger.delta_idr).
-    async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT w.account_id
-                FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
+    ///
+    /// FULL OUTER JOIN, matching `tools/reconcile/reconcile.sh` and the copy in
+    /// `db.rs`. This used to be a `LEFT JOIN` driven from `wallets`, which is a
+    /// DIFFERENT and weaker question: it can only see accounts that have a wallet row.
+    /// `ledger.account_id` references `accounts(id)`, NOT `wallets`, so a ledger row
+    /// with no wallet is permitted by the schema - and against exactly that case the
+    /// old query reported 0 drift. Measured: an account with a 5000 IDR ledger row and
+    /// no wallet row gives drift=1 under this query and drift=0 under the old one, so
+    /// every assertion in this module would have passed on an account the real Gate 2
+    /// reconcile fails. The shipped gate has always used the FULL OUTER JOIN (its own
+    /// header says so - "so it also catches a ledger account with NO wallets row");
+    /// A test OF THE HELPER ABOVE, which is the thing that let this module drift from the
+    /// shipped gate for several rounds. `ledger_drift_rows` is a transcription of
+    /// `tools/reconcile/reconcile.sh`, and a transcription that has quietly become weaker
+    /// turns every assertion built on it into a weaker check - while still being green.
+    ///
+    /// The case it must not lose is the one the schema permits and the old LEFT JOIN could
+    /// not see: a `ledger` row whose account has NO `wallets` row. `ledger.account_id`
+    /// references `accounts(id)`, not `wallets`, so nothing forbids it, and it is real
+    /// money with no cache holding it.
+    ///
+    /// Written as a direct assertion on the helper rather than through a handler, because
+    /// no handler can create this state - which is exactly why it went unnoticed.
+    #[tokio::test]
+    async fn the_reconciliation_helper_sees_ledger_money_with_no_wallet_row() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        // A ledger row with no wallets row. The account exists (the FK needs it); the
+        // wallet deliberately does not.
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) \
+             VALUES (?, 5000, 'adjustment', 5000, '2026-01-01T00:00:00+00:00')",
         )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
+        .bind(account.hyphenated())
+        .execute(&db.pool)
         .await
-        .expect("reconciliation query")
+        .expect("insert the orphan ledger row");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count wallets"),
+            0,
+            "the fixture must have NO wallet row, or this test is not testing the case"
+        );
+
+        assert_eq!(
+            ledger_drift_rows(&db.pool, account).await,
+            1,
+            "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate \
+             reports it (reconcile.sql is a FULL OUTER JOIN for this case). A helper that \
+             returns 0 here has silently become a weaker rule than the one that ships, and \
+             every assertion using it inherits the weakness."
+        );
+
+        db.close().await;
     }
 
     /// An account with a live session cookie, built the way the login path
@@ -1004,15 +1413,6 @@ mod tests {
         LiveAccount { account_id, token }
     }
 
-    fn cookie_header(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            format!("a=1; session={token}; b=2").parse().unwrap(),
-        );
-        headers
-    }
-
     /// Money enters a wallet only through the REAL path: a topups row, then
     /// credit_topup_transaction, which settles it and appends the matching +
     /// ledger row in the same transaction. Writing wallets.balance_idr directly
@@ -1038,9 +1438,10 @@ mod tests {
         .await
         .expect("create topup");
 
-        let credited = credit_topup_transaction(pool, &order_id, amount_idr)
-            .await
-            .expect("credit the top-up through the real money path");
+        let credited =
+            credit_topup_transaction(pool, &order_id, amount_idr, SHIPPED_CREDIT_EXPIRY_MONTHS)
+                .await
+                .expect("credit the top-up through the real money path");
         assert!(
             matches!(credited, crate::db::TopupCreditResult::Settled { .. }),
             "the fixture must settle the top-up, got {credited:?}"
@@ -1087,6 +1488,7 @@ mod tests {
             config: Arc::new(config),
             ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies: Arc::from(trusted.into_boxed_slice()),
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 
@@ -1125,6 +1527,88 @@ mod tests {
         outcome.expect("the get_me assertions panicked");
     }
 
+    /// A session past its IDLE bound is refused by the CUSTOMER ROUTE, not only by
+    /// the shared resolver.
+    ///
+    /// WHY THIS EXISTS AND WHY IT IS NOT THE TEST BESIDE IT. routes/mod.rs already
+    /// pins that resolve_account_from_cookie refuses a session idle for eight days.
+    /// That test calls the function DIRECTLY, so it passes whatever the handlers do -
+    /// and for most of this file's life they did not call it. account.rs, events.rs
+    /// and keys.rs each carried a private resolver that filtered revocation and
+    /// absolute expiry in SQL and stopped there, so a customer could read the account,
+    /// spend the balance and mint keys with a session the idle rule had already ended.
+    /// Every test in those files stayed green, because none of them asked whether an
+    /// IDLE session was refused at all - only whether a REVOKED or EXPIRED one was.
+    ///
+    /// So this drives the HANDLER. That is the whole point: it passes only if the
+    /// route resolves the session through the rule that has the idle bound, so a
+    /// local resolver reintroduced tomorrow fails here rather than in production.
+    ///
+    /// The shape is the one that was exploitable - 30-day absolute expiry, 8 days idle
+    /// - so ONLY the idle bound can refuse it, and the row looks perfectly healthy to
+    /// any query that checks revocation and expiry.
+    #[tokio::test]
+    async fn an_idle_expired_session_is_refused_by_the_customer_routes() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let live = live_account(&pool).await;
+
+        // POSITIVE CONTROL: the same session, used now, must work. Without this the
+        // refusal below would also be satisfied by a handler that refuses everything.
+        let (ok, _) = respond(get_me(
+            State(pool.clone()),
+            test_support::session_request_headers(&live.token),
+        ))
+        .await;
+        assert_eq!(
+            ok,
+            StatusCode::OK,
+            "a session used now must resolve, or the refusal below proves nothing"
+        );
+
+        // 8 days idle against a 30-day absolute expiry: far from expiring, so the
+        // only rule that can refuse it is the idle bound.
+        age_session(&pool, &live.token, 8).await;
+        let (status, body) = respond(get_me(
+            State(pool.clone()),
+            test_support::session_request_headers(&live.token),
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a session idle for 8 days must be refused by /api/me, not only by the shared resolver: docs/decisions.md settles the lifetime as 30 days absolute AND 7 days idle, and a customer route that skips the idle half is a credential that outlives it. Got {body}"
+        );
+
+        // The bound, not "any old session": 6 days is inside a 7-day bound and must
+        // still be admitted. A single-sided assertion would pass against a handler
+        // that refused everything older than a minute.
+        age_session(&pool, &live.token, 6).await;
+        let (status, _) = respond(get_me(
+            State(pool.clone()),
+            test_support::session_request_headers(&live.token),
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a session idle for 6 days is inside the 7-day bound and must be admitted"
+        );
+
+        db.close().await;
+    }
+
+    /// Moves a session's stored activity back in time, which is the only way to
+    /// drive the idle rule: it is evaluated against the STORED value, never against
+    /// `now`.
+    async fn age_session(pool: &SqlitePool, token: &str, days: i64) {
+        sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?")
+            .bind(Utc::now() - chrono::Duration::days(days))
+            .bind(crate::routes::hash_token(token))
+            .execute(pool)
+            .await
+            .expect("age the session");
+    }
     async fn get_me_assertions(
         pool: SqlitePool,
         account_id: Uuid,
@@ -1134,12 +1618,40 @@ mod tests {
         let opening = 73_500;
         settle_topup(&pool, account_id, opening).await;
 
+        // The address is an identity row, and it is written through the SAME
+        // production helper the signup path uses: `identities` carries
+        // `CHECK ((provider = 'password') = (password_hash IS NOT NULL))`, so a
+        // hand-written INSERT would either fail that check or store a flag the real
+        // writer cannot produce.
+        let address = "primary@example.com";
+        let hash = crate::identity::password::hash_password(
+            crate::routes::auth::auth_config_for_tests()
+                .expect("the shipped [auth] section parses"),
+            "not-a-real-password".to_string(),
+        )
+        .await
+        .expect("hash the fixture password");
+        crate::identity::accounts::upsert_password_identity(
+            &pool,
+            account_id,
+            address,
+            &hash,
+            true,
+            Utc::now(),
+        )
+        .await
+        .expect("create the password identity");
+
         // The second account carries a DIFFERENT balance, so a handler reading
         // the wrong row - or returning a constant - cannot satisfy both.
         let other_opening = 11_000;
         settle_topup(&pool, other_account_id, other_opening).await;
 
-        let (status, body) = respond(get_me(State(pool.clone()), cookie_header(&token))).await;
+        let (status, body) = respond(get_me(
+            State(pool.clone()),
+            test_support::session_request_headers(&token),
+        ))
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         // Cross-checked against a direct SELECT, so the test cannot pass on a
@@ -1173,6 +1685,9 @@ mod tests {
             [
                 "account_id",
                 "balance_idr",
+                "email",
+                "email_verified",
+                "is_operator",
                 "status",
                 "telegram_linked",
                 "usage_today"
@@ -1182,6 +1697,23 @@ mod tests {
         assert_eq!(body["account_id"], json!(account_id));
         assert_eq!(body["status"], json!("active"));
         assert_eq!(body["telegram_linked"], json!(false));
+        // The address and its flag come from the identity row, cross-checked
+        // against the table so a handler that returned a constant cannot pass.
+        assert_eq!(body["email"], json!(address));
+        assert_eq!(
+            body["email_verified"],
+            json!(true),
+            "the fixture verified the identity, so the panel must say so: {body}"
+        );
+        // The fixture accounts are ordinary customers, so the operator flag the
+        // admin UI gates on must read false. Cross-checked against the row.
+        let stored_operator: bool =
+            sqlx::query_scalar("SELECT is_operator FROM accounts WHERE id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("read the account row");
+        assert_eq!(body["is_operator"], json!(stored_operator));
 
         let usage = body["usage_today"]
             .as_object()
@@ -1289,7 +1821,7 @@ mod tests {
         token: String,
         other_account_id: Uuid,
     ) {
-        let today = Utc::now().date_naive();
+        let today = crate::ip_tracking::today_utc();
         let yesterday = today - chrono::Duration::days(1);
 
         // usage_daily.api_key_id is part of the primary key, so a real key row
@@ -1333,7 +1865,7 @@ mod tests {
 
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(None, None),
         ))
         .await;
@@ -1476,7 +2008,7 @@ mod tests {
         token: String,
         other_account_id: Uuid,
     ) {
-        let today = Utc::now().date_naive();
+        let today = crate::ip_tracking::today_utc();
         let key = create_api_key(&pool, account_id).await;
         let other_key = create_api_key(&pool, other_account_id).await;
 
@@ -1509,7 +2041,7 @@ mod tests {
         // must not appear, which is precisely what the old handler got wrong.
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(Some(&days[3].to_string()), Some(&days[1].to_string())),
         ))
         .await;
@@ -1519,7 +2051,7 @@ mod tests {
         assert_eq!(
             rows.len(),
             3,
-            "docs/server/api-spec.md:97 - a bounded range must return ONLY the days \
+            "docs/server/api-spec.md:347-352 - a bounded range must return ONLY the days \
              inside it, so today ({}) is excluded by from={} to={}. body: {body}",
             days[0],
             days[3],
@@ -1564,7 +2096,7 @@ mod tests {
         // --- BOTH BOUNDS ARE INCLUSIVE. ---
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(Some(&days[1].to_string()), Some(&days[1].to_string())),
         ))
         .await;
@@ -1581,7 +2113,7 @@ mod tests {
         // --- A range with no rows is EMPTY, never a fallback. ---
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(Some("2001-01-01"), Some("2001-01-31")),
         ))
         .await;
@@ -1600,7 +2132,7 @@ mod tests {
         // --- A range that starts after today is still empty, not a fallback. ---
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(
                 Some(&(today + chrono::Duration::days(10)).to_string()),
                 Some(&(today + chrono::Duration::days(20)).to_string()),
@@ -1613,7 +2145,7 @@ mod tests {
         // --- No params: the documented default window still holds. ---
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(None, None),
         ))
         .await;
@@ -1651,7 +2183,7 @@ mod tests {
             &pool,
             account_id,
             key,
-            Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
             (7, 8, 9, 10),
         )
         .await;
@@ -1663,7 +2195,7 @@ mod tests {
         ] {
             let (status, body) = respond(get_usage(
                 State(pool.clone()),
-                cookie_header(&token),
+                test_support::session_request_headers(&token),
                 usage_query(from, to),
             ))
             .await;
@@ -1685,7 +2217,7 @@ mod tests {
         // The valid path is untouched by the refusals above.
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(None, None),
         ))
         .await;
@@ -1761,7 +2293,7 @@ mod tests {
 
         let (status, body) = respond(get_topups(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Query(LimitQuery { limit: None }),
         ))
         .await;
@@ -1838,7 +2370,7 @@ mod tests {
         // limit is honoured, newest first.
         let (status, limited) = respond(get_topups(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Query(LimitQuery { limit: Some(1) }),
         ))
         .await;
@@ -1850,6 +2382,136 @@ mod tests {
             json!(settled_id),
             "created_at DESC: the newest top-up comes first"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3b. get_recent_usage - the per-request history (usage_events)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_get_recent_usage_returns_only_this_accounts_requests() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let primary = live_account(&pool).await;
+        let other = live_account(&pool).await;
+
+        let primary_key = test_support::api_key(&pool, primary.account_id).await;
+        let other_key = test_support::api_key(&pool, other.account_id).await;
+
+        let outcome = tokio::spawn(get_recent_usage_assertions(
+            pool.clone(),
+            primary.account_id,
+            primary.token.clone(),
+            primary_key,
+            other.account_id,
+            other_key,
+        ));
+
+        let outcome = outcome.await;
+        db.close().await;
+        outcome.expect("the get_recent_usage assertions panicked");
+    }
+
+    async fn get_recent_usage_assertions(
+        pool: SqlitePool,
+        account_id: Uuid,
+        token: String,
+        key_id: Uuid,
+        other_account_id: Uuid,
+        other_key_id: Uuid,
+    ) {
+        // The requests are written through the REAL settlement path, so
+        // `usage_events` is populated the way production populates it.
+        test_support::fund(&pool, account_id, 1_000_000).await;
+        debit_usage_transaction(
+            &pool,
+            account_id,
+            Some(key_id),
+            "flash",
+            100,
+            10,
+            50,
+            111,
+            Some("r1"),
+            0,
+        )
+        .await
+        .expect("first settlement");
+
+        // A second request by the OTHER account must never appear in this list.
+        test_support::fund(&pool, other_account_id, 1_000_000).await;
+        debit_usage_transaction(
+            &pool,
+            other_account_id,
+            Some(other_key_id),
+            "flash",
+            999,
+            0,
+            999,
+            222,
+            Some("r2"),
+            0,
+        )
+        .await
+        .expect("other account settlement");
+
+        let (status, body) = respond(get_recent_usage(
+            State(pool.clone()),
+            test_support::session_request_headers(&token),
+            Query(LimitQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let rows = body.as_array().expect("a recent-usage list is an array");
+        assert_eq!(rows.len(), 1, "only this account's requests: {body}");
+        let row = &rows[0];
+
+        // The documented shape, exactly - no prompt, no completion, no key hash.
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "api_key_id",
+                "cache_read_tokens",
+                "cost_idr",
+                "created_at",
+                "id",
+                "input_tokens",
+                "model",
+                "output_tokens",
+            ],
+            "docs/server/api-spec.md GET /api/usage/recent: {body}"
+        );
+        assert_eq!(row["model"], json!("flash"));
+        assert_eq!(row["input_tokens"], json!(100));
+        assert_eq!(row["cache_read_tokens"], json!(10));
+        assert_eq!(row["output_tokens"], json!(50));
+        assert_eq!(row["cost_idr"], json!(111));
+        assert_eq!(row["api_key_id"], json!(key_id));
+        // The event is tied to the reservation the ledger rows carry.
+        let text = body.to_string();
+        for forbidden in ["token_hash", "key_hash", "apk_live", "prompt", "completion"] {
+            assert!(
+                !text.contains(forbidden),
+                "the history leaked {forbidden}: {text}"
+            );
+        }
+
+        // An unauthenticated call is refused before any row is read.
+        let (status, _) = respond(get_recent_usage(
+            State(pool.clone()),
+            HeaderMap::new(),
+            Query(LimitQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     // -----------------------------------------------------------------------
@@ -1884,6 +2546,54 @@ mod tests {
         outcome.expect("the create_topup assertions panicked");
     }
 
+    #[tokio::test]
+    async fn live_create_topup_without_a_server_key_is_an_internal_failure_persisting_nothing() {
+        // Held for the WHOLE test body: the spawned task REMOVES
+        // MIDTRANS_SERVER_KEY, and this lock keeps that write from interleaving
+        // with another test's - in this module or in routes::webhooks, which
+        // installs its own key.
+        let _env = EnvLock::acquire();
+
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let primary = live_account(&pool).await;
+
+        // The same contract as an unreachable Snap, reached a different way:
+        // the configuration itself is MISSING, which in production is a deploy
+        // defect. The handler must still answer 500 internal_error, persist
+        // nothing, and never leak the missing variable's name to the client.
+        let outcome = tokio::spawn(async move {
+            let _guard = EnvGuard::remove("MIDTRANS_SERVER_KEY");
+            let state = live_app_state(pool.clone());
+            let (status, body) = respond(create_topup(
+                State(state),
+                test_support::session_request_headers(&primary.token),
+                Json(CreateTopupRequest {
+                    amount_idr: configured_wallet().min_first_deposit as i64,
+                }),
+            ))
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a top-up that cannot even find its server key is an internal \
+                 failure, not a created top-up. body: {body}"
+            );
+            assert_eq!(body["error"]["code"], json!("internal_error"), "{body}");
+            assert!(
+                !serde_json::to_string(&body)
+                    .expect("the body is json")
+                    .contains("MIDTRANS_SERVER_KEY"),
+                "the missing-variable name must not reach the client: {body}"
+            );
+        });
+
+        let outcome = outcome.await;
+        db.close().await;
+        outcome.expect("the missing-server-key assertions panicked");
+    }
+
     async fn create_topup_failure_assertions(pool: SqlitePool, account_id: Uuid, token: String) {
         let wallet = configured_wallet();
         let amount = wallet.min_first_deposit as i64;
@@ -1899,7 +2609,7 @@ mod tests {
         let state = live_app_state(pool.clone());
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest { amount_idr: amount }),
         ))
         .await;
@@ -2008,7 +2718,7 @@ mod tests {
         let state = live_app_state(pool.clone());
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest {
                 amount_idr: wallet.min_topup as i64,
             }),
@@ -2063,7 +2773,7 @@ mod tests {
         let state = live_app_state(pool.clone());
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest {
                 amount_idr: wallet.min_topup as i64,
             }),
@@ -2204,6 +2914,208 @@ mod tests {
         );
     }
 
+    /// A rejection whose body carries `status_message` (and no `error_messages`)
+    /// must surface that detail, and a 2xx whose body is not JSON must be its
+    /// own error rather than a parse panic. Covers both arms of the Snap response
+    /// handling - the two the 401 test above never reaches.
+    #[tokio::test]
+    async fn snap_client_surfaces_status_message_and_refuses_a_non_json_success() {
+        let payload = build_snap_payload("topup_x", 50_000, None);
+
+        // status_message is the documented fallback when error_messages is absent.
+        let endpoint = snap_stub(http_response(
+            "402 Payment Required",
+            r#"{"status_message": "declined by the fraud engine"}"#,
+        ))
+        .await;
+        let err = create_snap_transaction(&snap_client(), "key", &endpoint, &payload)
+            .await
+            .expect_err("a 402 is not a token");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declined by the fraud engine"),
+            "the status_message detail must surface in the error: {msg}"
+        );
+
+        // A 2xx whose body is not JSON is refused with its own message, never
+        // turned into a token and never a panic.
+        let endpoint = snap_stub(http_response("200 OK", "<html>not json</html>")).await;
+        let err = create_snap_transaction(&snap_client(), "key", &endpoint, &payload)
+            .await
+            .expect_err("a non-JSON 2xx is not a token");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not valid JSON"),
+            "a non-JSON 2xx must be its own error: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // account_email: best-effort BY CONTRACT, so absence must degrade to None and
+    // a real address must come back trimmed. The source is a local `identities`
+    // row now, so there is no HTTP stub to stand up and no remote failure mode to
+    // simulate - the absence case is an account with no identity at all.
+    // -----------------------------------------------------------------------
+
+    /// The address is trimmed before it is used, so an identity row whose email
+    /// carries padding cannot put a padded address on a receipt. Formerly read
+    /// this from PocketBase; the source is local now.
+    #[tokio::test]
+    async fn account_email_reads_the_address_from_the_identity_and_trims_it() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = crate::test_support::account(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO identities (id, account_id, provider, subject, email, email_verified, \
+             password_hash, created_at, updated_at) VALUES (?, ?, 'password', ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().hyphenated())
+        .bind(account.hyphenated())
+        .bind("ada")
+        .bind("  ada@example.com  ")
+        .bind("$argon2id$fake")
+        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("seed an identity");
+
+        let email = account_email(&pool, account).await;
+        assert_eq!(
+            email.as_deref(),
+            Some("ada@example.com"),
+            "the address must be the trimmed value the identity row holds"
+        );
+    }
+
+    /// An account with no `identities` row has no address, and the lookup says so
+    /// rather than failing. After the identity port the address is a LOCAL row, so
+    /// "there is none" is the only absence mode left and the one a receipt has to
+    /// survive. Replaces the PocketBase-failure-mode test, whose subject is gone.
+    #[tokio::test]
+    async fn account_email_is_none_when_the_account_has_no_identity_row() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = crate::test_support::account(&pool).await;
+
+        assert_eq!(
+            account_email(&pool, account).await,
+            None,
+            "no identities row carries no address"
+        );
+
+        // Positive control: an address that IS on the account comes back, so the
+        // `None` above is the absence of a row and not a query that never matches.
+        sqlx::query(
+            "INSERT INTO identities (id, account_id, provider, subject, email, email_verified, \
+             password_hash, created_at, updated_at) VALUES (?, ?, 'password', ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().hyphenated())
+        .bind(account.hyphenated())
+        .bind("ada@example.com")
+        .bind("ada@example.com")
+        .bind("$argon2id$fake")
+        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("seed an identity");
+
+        assert_eq!(
+            account_email(&pool, account).await,
+            Some("ada@example.com".to_string())
+        );
+    }
+
+    /// An account with no wallets row yet exports its wallet as JSON null rather
+    /// than failing: the export describes what EXISTS. Covers the wallet read in
+    /// the export handler, which uses `fetch_optional` rather than `fetch_one`.
+    #[tokio::test]
+    async fn the_export_of_an_account_with_no_wallet_is_null_not_an_error() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        // The accounts row + a live session, WITHOUT the wallets row that
+        // `live_account` adds - the whole point of this test.
+        let account_id = test_support::account(&pool).await;
+        let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().hyphenated())
+        .bind(account_id.hyphenated())
+        .bind(crate::routes::hash_token(&token))
+        .bind(now + chrono::Duration::days(30))
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("create session");
+
+        let (status, body) = respond(export_account_data(
+            State(pool.clone()),
+            test_support::session_request_headers(&token),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            body["wallet"].is_null(),
+            "a missing wallets row must export as null, not an error: {body}"
+        );
+        db.close().await;
+    }
+
+    /// The success path when Snap answers a token but NO redirect_url: the row
+    /// is still created and the 201 still carries the token. A subscriber is
+    /// installed so the `info!` field expressions beside the Snap client call are
+    /// actually evaluated - tracing skips them when no subscriber is active, which
+    /// left that line uncovered even though the success path itself ran.
+    #[tokio::test]
+    async fn live_create_topup_success_without_a_redirect_url_still_creates_the_row() {
+        let _env = EnvLock::acquire();
+        let _capture =
+            tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false).finish());
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account = live_account(&pool).await;
+
+        let endpoint = snap_stub(http_response(
+            "200 OK",
+            r#"{"token":"snap-token-no-redirect"}"#,
+        ))
+        .await;
+
+        let mut env_vars = EnvGuard::set("MIDTRANS_ENV", "sandbox");
+        env_vars.also("MIDTRANS_SNAP_URL", &endpoint);
+        env_vars.also("MIDTRANS_SERVER_KEY", "SB-Mid-server-LIVE-TEST-SUCCESS");
+
+        let state = live_app_state(pool.clone());
+        let amount = configured_wallet().min_first_deposit as i64;
+
+        let (status, body) = respond(create_topup(
+            State(state),
+            test_support::session_request_headers(&account.token),
+            Json(CreateTopupRequest { amount_idr: amount }),
+        ))
+        .await;
+
+        drop(env_vars);
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a token without a redirect_url is still a created top-up: {body}"
+        );
+        assert_eq!(
+            body["snap_token"],
+            json!("snap-token-no-redirect"),
+            "{body}"
+        );
+        db.close().await;
+    }
+
     // -----------------------------------------------------------------------
     // 7. create_topup: the in-handler 429, and the SUCCESS path
     //
@@ -2283,7 +3195,7 @@ mod tests {
         // the documented order, not an incidental detail.
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest { amount_idr: 1 }),
         ))
         .await;
@@ -2404,7 +3316,7 @@ mod tests {
 
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest { amount_idr: amount }),
         ))
         .await;
@@ -2457,11 +3369,13 @@ mod tests {
         // through `Hyphenated` rather than a bare `Uuid` (the failure is
         // `ParseByteLength { len: 36 }`).
         assert_eq!(
-            row.get::<Hyphenated, _>("id").into_uuid(),
+            crate::error::decode_uuid_column(&row, "id")
+                .expect("the fixture must store a decodable topups.id"),
             Uuid::parse_str(topup_id).unwrap()
         );
         assert_eq!(
-            row.get::<Hyphenated, _>("account_id").into_uuid(),
+            crate::error::decode_uuid_column(&row, "account_id")
+                .expect("the fixture must store a decodable topups.account_id"),
             account_id
         );
         assert_eq!(row.get::<i64, _>("amount_idr"), amount);
@@ -2485,7 +3399,7 @@ mod tests {
         // The customer sees it through the read path, as pending.
         let (status, history) = respond(get_topups(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Query(LimitQuery { limit: None }),
         ))
         .await;
@@ -2509,9 +3423,10 @@ mod tests {
 
         // The persisted row is real money: settle it through the documented
         // path (the webhook's own function) and check the ledger follows.
-        let credited = credit_topup_transaction(&pool, order_id, amount)
-            .await
-            .expect("the pending row must be settleable");
+        let credited =
+            credit_topup_transaction(&pool, order_id, amount, SHIPPED_CREDIT_EXPIRY_MONTHS)
+                .await
+                .expect("the pending row must be settleable");
         assert_eq!(
             credited,
             crate::db::TopupCreditResult::Settled {
@@ -2553,7 +3468,7 @@ mod tests {
 
         // A replayed webhook must not pay twice.
         assert_eq!(
-            credit_topup_transaction(&pool, order_id, amount)
+            credit_topup_transaction(&pool, order_id, amount, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("replay the settlement"),
             crate::db::TopupCreditResult::AlreadySettled,
@@ -2672,5 +3587,132 @@ mod tests {
             .await
             .expect("count the refused row");
         assert_eq!(rows, 0, "a refused status must leave no row");
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/export - the customer's own data.
+    //
+    // The two things that matter: it returns ONLY this account's rows (a scoping
+    // bug leaks another customer's financial history), and it never contains a
+    // credential or internal id (docs/data-retention.md "metadata, not secrets").
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn export_returns_only_this_account_and_no_secrets() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let mine = live_account(&pool).await;
+        let other = live_account(&pool).await;
+
+        let key_id = test_support::api_key(&pool, mine.account_id).await;
+        test_support::fund(&pool, mine.account_id, 42_000).await;
+        debit_usage_transaction(
+            &pool,
+            mine.account_id,
+            Some(key_id),
+            "flash",
+            100,
+            10,
+            50,
+            111,
+            Some("exp_ref"),
+            0,
+        )
+        .await
+        .expect("a settlement");
+
+        // The OTHER account carries a distinct balance, so a scoping bug is
+        // visible rather than coincidentally equal.
+        test_support::fund(&pool, other.account_id, 999_999).await;
+
+        let (status, body) = respond(export_account_data(
+            State(pool.clone()),
+            test_support::session_request_headers(&mine.token),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        for field in [
+            "account",
+            "wallet",
+            "ledger",
+            "topups",
+            "usage_daily",
+            "usage_events",
+            "api_keys",
+            "telegram_linked",
+            "exported_at",
+            "note",
+        ] {
+            assert!(
+                body.get(field).is_some(),
+                "export is missing {field}: {body}"
+            );
+        }
+
+        assert_eq!(
+            body["account"]["id"],
+            json!(mine.account_id.hyphenated().to_string())
+        );
+        // The balance AFTER the settlement: 42,000 funded minus the 111 IDR the
+        // request cost. Asserting the net (not the funding) is what proves the
+        // export reads the wallet rather than echoing a fixture constant.
+        assert_eq!(body["wallet"]["balance_idr"], json!(42_000 - 111));
+        // The ledger carries the matching rows, so the export can reconcile.
+        assert!(
+            !body["ledger"].as_array().unwrap().is_empty(),
+            "the ledger must be exported"
+        );
+        assert_eq!(
+            body["usage_events"].as_array().unwrap().len(),
+            1,
+            "the request must be exported"
+        );
+
+        // A key's `models` is emitted as a real JSON array, not a string that
+        // contains JSON — the export must be machine-readable.
+        assert!(
+            body["api_keys"][0]["models"].is_array(),
+            "models must be an array, not a string: {}",
+            body["api_keys"][0]["models"]
+        );
+
+        // No secret or internal identifier anywhere in the document, by name.
+        let text = body.to_string();
+        for forbidden in [
+            "key_hash",
+            "token_hash",
+            "pb_user_id",
+            "snap_token",
+            "apk_live_",
+            "password",
+            "ip_hash",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "the export leaked {forbidden}: {text}"
+            );
+        }
+
+        // The other account's money never appears.
+        assert!(
+            !text.contains("999999"),
+            "the export leaked another account's balance: {text}"
+        );
+
+        db.close().await;
+    }
+
+    /// An unauthenticated request is refused before any row is read.
+    #[tokio::test]
+    async fn export_requires_a_session() {
+        let db = TestDb::new().await;
+        let (status, _) = respond(export_account_data(
+            State(db.pool.clone()),
+            HeaderMap::new(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        db.close().await;
     }
 }

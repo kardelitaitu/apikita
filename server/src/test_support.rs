@@ -31,6 +31,7 @@
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -38,7 +39,10 @@ use sqlx::SqlitePool;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use crate::db::{credit_topup_transaction, init_pool, TopupCreditResult};
+use crate::config::AppConfig;
+use crate::db::{
+    credit_topup_transaction, init_pool, TopupCreditResult, SHIPPED_CREDIT_EXPIRY_MONTHS,
+};
 
 /// Resolved at compile time from `CARGO_MANIFEST_DIR`, exactly as `bin/migrate.rs`
 /// does. The tests therefore apply the real migration rather than a transcription
@@ -76,6 +80,33 @@ const SIDECARS: [&str; 2] = ["-wal", "-shm"];
 /// leak one database per test. Deferring gets both: by the time the next test
 /// database is built the handle is gone, so the file does go away — just not on
 /// the schedule Windows chose.
+///
+/// THE TWO ENDS OF THIS ARE CONNECTED, and checking that is worth the minute it
+/// takes: `close` retries the delete, and whatever is left lands in ORPHANS, and
+/// `reap_orphans` — called at the top of `TestDb::new` — tries those again on the next
+/// run. A list that is written and never read would be a leak that looks handled, and
+/// this one was nearly reported as exactly that before the caller was checked.
+///
+/// NOR is there a fragile sleep hiding here, which is what a 66-second suite run once
+/// suggested. The whole crate has two real sleeps outside a paused clock: this bounded
+/// retry, and the one-second stream deadline in the events tests. The circuit breaker
+/// and key pool use `tokio::time::advance`, so they are deterministic under load.
+///
+/// THE STREAM DEADLINE IS NOT THE ANSWER, and arithmetic is what says so. I wrote it
+/// down last round as the one remaining candidate; it is not. A one-second wait accounts
+/// for at most one second of a run that took fifty-two longer than usual, so chasing it
+/// would have been chasing a number that cannot fit.
+///
+/// The run in question also had `npm test` and a cargo invocation in the same command,
+/// so compilation contending with the suite is the better explanation — and a test
+/// failing while the crate is being rebuilt says something about the machine, not about
+/// the test. That is a hypothesis, not a finding, and is labelled as one.
+///
+/// The deadline stays at a second regardless, and that is a decision rather than an
+/// accident: it is generous enough that the live arm reliably delivers, and it costs one
+/// second of a fourteen-second suite. Shortening it would trade a rare flake for a
+/// common one, which is the wrong way round for the test that guards the cross-account
+/// boundary.
 static ORPHANS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 async fn template_path() -> &'static PathBuf {
@@ -271,22 +302,22 @@ impl TestDb {
 /// `id`, `created_at` and `updated_at` are all bound from Rust because the SQLite
 /// schema has no `DEFAULT` for them (plan section 4.1, correction 1). This is the
 /// defect the compiler cannot see: removing a column default breaks INSERTs at
-/// runtime only, so the old fixture
-/// `INSERT INTO accounts (pb_user_id) VALUES (?)` still type-checked and failed at
-/// `NOT NULL constraint failed: accounts.id`.
+/// runtime only, so the old fixture `INSERT INTO accounts (pb_user_id) VALUES (?)`
+/// still type-checked and failed at `NOT NULL constraint failed: accounts.id`.
+///
+/// The `pb_user_id` fixture value went the same way in Phase 6, when the column
+/// itself was dropped: this INSERT named it explicitly, so the rebuild left the
+/// fixture rejected with `no such column: pb_user_id` rather than quietly wrong.
 pub async fn account(pool: &SqlitePool) -> Uuid {
     let id = Uuid::new_v4();
     let now = chrono::Utc::now();
-    sqlx::query(
-        "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind(id.hyphenated())
-    .bind(format!("pb_test_{}", id.simple()))
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("create the test account");
+    sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)")
+        .bind(id.hyphenated())
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("create the test account");
     id
 }
 
@@ -348,7 +379,8 @@ pub async fn pending_topup(pool: &SqlitePool, account_id: Uuid, amount_idr: i64)
 /// consistent. Never write `balance_idr` directly: see the module comment.
 pub async fn fund(pool: &SqlitePool, account_id: Uuid, amount_idr: i64) {
     let order_id = pending_topup(pool, account_id, amount_idr).await;
-    match credit_topup_transaction(pool, &order_id, amount_idr).await {
+    match credit_topup_transaction(pool, &order_id, amount_idr, SHIPPED_CREDIT_EXPIRY_MONTHS).await
+    {
         Ok(TopupCreditResult::Settled { .. }) => {}
         other => panic!("the fixture must fund through the real top-up path: {other:?}"),
     }
@@ -363,6 +395,141 @@ pub async fn balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
         .expect("read the wallet balance")
 }
 
+/// The reconciliation the shipped gate runs: how many ways this account's wallet row DISAGREES
+/// with its ledger.
+///
+/// WELCOME TO THE ONE COPY. This SQL was transcribed SEVEN TIMES — in `db.rs`, `routes/auth.rs`,
+/// `routes/account.rs`, `routes/admin.rs`, `routes/keys.rs`, `routes/proxy.rs` and
+/// `routes/webhooks.rs` — each carrying the same query and its own hand-written note. Every one of
+/// those notes ended by asking for the copies to be lifted into a single helper, because a helper
+/// duplicated seven ways is seven chances to weaken one, and at least one note described a detector
+/// gap that had already closed. The duplication survived three rounds of being written down before
+/// this landed.
+///
+/// IT IS THE STRONG FORM, AND THAT IS THE WHOLE POINT. A `LEFT JOIN` driven from `wallets` asks a
+/// weaker question: it sees only accounts that HAVE a wallet row, while `ledger.account_id`
+/// references `accounts(id)` and not `wallets`, so a ledger row with no wallet row is permitted by
+/// the schema and invisible to the old shape. Measured: 5000 IDR of ledger money with no wallet row
+/// reports drift=1 here and reported drift=0 before, so an assertion built on the weak form could
+/// pass on an account the shipped gate fails.
+///
+/// THE DETECTORS ARE PER-MODULE (`the_drift_helper_sees_ledger_money_with_no_wallet_row`, under
+/// five different names — which is part of the same problem) and `db.rs` holds the JOIN form via
+/// `every_copy_of_the_reconciliation_helper_has_a_detector`. That guard never checked the copies
+/// were ONE; this function is that, and it now points at itself.
+pub async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM (
+            SELECT COALESCE(w.account_id, l.account_id) AS account_id
+            FROM wallets w
+            FULL OUTER JOIN ledger l ON l.account_id = w.account_id
+            WHERE COALESCE(w.account_id, l.account_id) = ?
+            GROUP BY w.account_id, l.account_id, w.balance_idr
+            HAVING w.account_id IS NULL
+                OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+        ) AS drift
+        "#,
+    )
+    .bind(account_id.hyphenated())
+    .fetch_one(pool)
+    .await
+    .expect("reconciliation query")
+}
+
+/// The shipped `apikita.toml`, loaded once per test — the REAL file, not a fixture.
+///
+/// ONE COPY, from FIVE identical ones: this same eight-line function existed in
+/// `routes/admin_auth_boundary.rs`, `routes/admin.rs`, `routes/keys.rs`, `routes/proxy.rs` and
+/// `routes/webhooks.rs`. Each loaded the file two ways because the test's working directory
+/// differs between `cargo test --package apikita-server` and a run from the crate root, and each
+/// panicked with the same message. A sixth copy in `abuse.rs` returns the `limits` sub-struct
+/// instead of the whole config, so it reads through this and takes `.limits`.
+///
+/// IT IS THE SHIPPED FILE ON PURPOSE. A fixture would be a second place a config change has to
+/// land, and the tests that read a limit are testing the limit the deployment opens with.
+///
+/// The two paths are tried rather than one because `CARGO_MANIFEST_DIR`-relative is not what
+/// `std::fs` resolves against: `cargo test` runs with the CRATE directory as the working
+/// directory, and some invocations run from the repository root instead.
+pub fn shipped_config() -> Arc<AppConfig> {
+    for path in ["../config/apikita.toml", "config/apikita.toml"] {
+        if std::path::Path::new(path).exists() {
+            return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
+        }
+    }
+    panic!("could not find apikita.toml for testing");
+}
+/// A REQUEST's cookie header carrying `token` as the session, with decoys on both sides.
+///
+/// NAMED FOR THE DIRECTION. `routes/auth.rs` has a PRODUCTION `session_cookie` that BUILDS a
+/// `Set-Cookie` response header, so a fixture with the same name would read as the same thing in a
+/// grep. This one is the request side: what a browser sends, not what the server sets.
+///
+/// ONE COPY, from FIVE: `routes/account.rs` and `routes/auth.rs` called it `cookie_header`,
+/// `routes/telegram.rs` and `routes/admin.rs` called it `cookie_headers`, and `routes/health.rs`
+/// called it `session_cookie` - the same seven lines with the same `"a=1; session={token}; b=2"`
+/// literal under five names.
+///
+/// THE DECOYS ARE THE POINT, NOT DECORATION. `session_token_from_cookie_header` documents three
+/// load-bearing rules, and this fixture is what exercises two of them: the name must match EXACTLY
+/// (so the `a=1` before it and the `b=2` after it must not be mistaken for the session), and the
+/// value is everything after the first `=`. A fixture that sent a bare `session={token}` would let a
+/// parser that splits on `;` and takes index 0 pass while failing on a real browser's header.
+///
+/// Built through `HeaderMap` rather than a raw string so a caller can hand it to `Request::builder`
+/// without re-parsing, and so an invalid token panics HERE rather than in the caller's setup.
+pub fn session_request_headers(token: &str) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        format!("a=1; session={token}; b=2").parse().unwrap(),
+    );
+    headers
+}
+/// The stored status of a topup, by `order_id`.
+///
+/// ONE COPY, from `db.rs` and `routes/webhooks.rs`, where it was named `topup_status` and
+/// `topup_status_of`. Both are test helpers reading the same column of the same table, so the two
+/// names were the only difference.
+pub async fn topup_status(pool: &SqlitePool, order_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM topups WHERE order_id = ?")
+        .bind(order_id)
+        .fetch_one(pool)
+        .await
+        .expect("read topup status")
+}
+
+/// Every ledger row for one account and reason, oldest first: `(delta_idr, ref)`.
+///
+/// ONE COPY, from `db.rs` and `routes/webhooks.rs` (`ledger_rows` and `ledger_rows_of`). The
+/// `ORDER BY id` is load-bearing for callers that assert the SEQUENCE of -hold/+hold/-charge,
+/// which an unordered read would make flaky rather than wrong.
+pub async fn ledger_rows(
+    pool: &SqlitePool,
+    account_id: Uuid,
+    reason: &str,
+) -> Vec<(i64, Option<String>)> {
+    sqlx::query_as(
+        "SELECT delta_idr, ref FROM ledger WHERE account_id = ? AND reason = ? ORDER BY id",
+    )
+    .bind(account_id.hyphenated())
+    .bind(reason)
+    .fetch_all(pool)
+    .await
+    .expect("read ledger rows")
+}
+
+/// How many ledger rows the account has, whatever their reason.
+///
+/// ONE COPY, from `db.rs` and `routes/webhooks.rs` (`ledger_row_count` and `ledger_count`).
+pub async fn ledger_row_count(pool: &SqlitePool, account_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
+        .bind(account_id.hyphenated())
+        .fetch_one(pool)
+        .await
+        .expect("count ledger rows")
+}
 /// The sum of the account's ledger rows — the other side of the invariant.
 pub async fn ledger_sum(pool: &SqlitePool, account_id: Uuid) -> i64 {
     sqlx::query_scalar("SELECT COALESCE(SUM(delta_idr), 0) FROM ledger WHERE account_id = ?")
@@ -375,6 +542,49 @@ pub async fn ledger_sum(pool: &SqlitePool, account_id: Uuid) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CHECK (balance_idr >= 0)` actually refuses a negative write.
+    ///
+    /// The launch checklist's Gate 2 requires the constraint "present and exercised",
+    /// and only the first half was true: no test drove a balance below zero and watched
+    /// SQLite refuse it. That matters more than it looks, because the constraint is
+    /// explicitly a BACKSTOP - `db.rs` puts it that way - the layer that catches you when
+    /// the layer above fails. The clamp above it is proven in isolation (a pure function
+    /// with the case analysis written out), so the CHECK is the only thing standing between
+    /// a bug in that proof and a wallet that owes money.
+    ///
+    /// A backstop that has never been exercised is a backstop whose behaviour has never
+    /// been demonstrated, and the failure it exists to catch is the one nobody would notice
+    /// in a test: a migration that dropped the constraint, or a code path that bypassed the
+    /// clamp. Both look fine right up until a balance is negative.
+    ///
+    /// Written here rather than in `db.rs` because the harness owns the migrated database
+    /// and both sides of the invariant, and a test that reached for its own pool would be
+    /// testing the setup rather than the constraint.
+    #[tokio::test]
+    async fn the_balance_check_refuses_a_negative_write() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = account(&pool).await;
+        wallet(&pool, account_id).await;
+
+        let result = sqlx::query("UPDATE wallets SET balance_idr = -1 WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .execute(&pool)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the schema accepted a negative balance. The clamp above is what should refuse it, so if the CHECK is gone a bug in the clamp now silently owes money."
+        );
+        // And the row is untouched, so the refusal is a refusal and not a silent clamp.
+        assert_eq!(
+            balance(&pool, account_id).await,
+            0,
+            "the negative write was refused but the balance changed"
+        );
+        db.close().await;
+    }
 
     /// The URL the helper builds must name the file it was given.
     ///
@@ -450,15 +660,13 @@ mod tests {
     async fn the_schema_refuses_a_timestamp_sqlite_would_have_written() {
         let db = TestDb::new().await;
 
-        let space_format = sqlx::query(
-            "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(Uuid::new_v4().hyphenated())
-        .bind("pb_space_format")
-        .bind("2026-09-25 07:00:00")
-        .bind("2026-09-25 07:00:00")
-        .execute(&db.pool)
-        .await;
+        let space_format =
+            sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES (?, ?, ?)")
+                .bind(Uuid::new_v4().hyphenated())
+                .bind("2026-09-25 07:00:00")
+                .bind("2026-09-25 07:00:00")
+                .execute(&db.pool)
+                .await;
 
         assert!(
             space_format.is_err(),
@@ -586,5 +794,74 @@ mod tests {
         );
 
         second.close().await;
+    }
+    /// A NEGATIVE CONTROL FOR THE SHARED DRIFT HELPER, and the reason three copies of it were deleted.
+    ///
+    /// This test existed VERBATIM in `routes/keys.rs`, `routes/proxy.rs` and `routes/webhooks.rs` -
+    /// 55 lines each, 165 in total - while the helper they tested was duplicated seven ways beside them.
+    /// Round 54 lifted the helper into one definition, and the ARGUMENT FOR KEEPING THREE DETECTORS
+    /// DIED WITH IT: the three copies were the articles of faith in a duplicated helper's honesty, and
+    /// once the helper is one definition they are three tests of the same statement.
+    ///
+    /// What survives here is the case they were each pinning, stated once: a ledger row with NO wallet
+    /// row is DRIFT, and the helper reports 0 once a wallet row agrees the ledger. The shipped gate
+    /// (`tools/reconcile/reconcile.sql`) is a FULL OUTER JOIN for exactly this case, so a helper that
+    /// regressed to a LEFT JOIN would be a WEAKER rule than the one on the reconciliation path - and
+    /// every caller asserts == 0 as a fixture check, which a weakened helper satisfies perfectly.
+    ///
+    /// WHY IT LIVES HERE RATHER THAN IN A ROUTE MODULE. It tests a `test_support` helper, so its natural
+    /// home is beside that helper. A route module also works, but a reader of the route module would
+    /// reasonably assume the case was about that route's behaviour rather than about the harness.
+    #[tokio::test]
+    async fn the_drift_helper_sees_ledger_money_with_no_wallet_row() {
+        let db = crate::test_support::TestDb::new().await;
+        let account = crate::test_support::account(&db.pool).await;
+
+        // A ledger row with no wallets row. The account exists (the FK needs it); the wallet
+        // deliberately does not.
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) \
+         VALUES (?, 5000, 'adjustment', 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the orphan ledger row");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count wallets"),
+            0,
+            "the fixture must have NO wallet row, or this test is not testing the case"
+        );
+
+        assert_eq!(
+        ledger_drift_rows(&db.pool, account).await,
+        1,
+        "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate reports it \
+         (reconcile.sql is a FULL OUTER JOIN for this case). This helper returning 0 here means it \
+         has silently become a weaker rule than the one that ships"
+    );
+
+        // And it stops reporting drift once a wallet row agrees, so this is a detector rather than a
+        // constant.
+        sqlx::query(
+            "INSERT INTO wallets (account_id, balance_idr, updated_at) \
+         VALUES (?, 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the wallet row");
+
+        assert_eq!(
+        ledger_drift_rows(&db.pool, account).await,
+        0,
+        "once the wallet holds the ledger's 5000 IDR there is no drift, so the helper must report \
+         0 - otherwise this test would pass on a helper that always says 1"
+    );
     }
 }

@@ -1,27 +1,32 @@
 // The pure half of the public auth pages: /signup, /verify, /reset, /reset/confirm.
 //
-// Identity lives in PocketBase (docs/architecture/identity.md lines 35-38), so
-// these pages are SDK calls from the browser — not new server routes. The Rust
-// API has exactly /auth/exchange, /auth/logout and /auth/logout-all.
+// Identity is served natively by the Rust API (lib/auth-api.ts), so these pages
+// call our own routes with a session cookie. There is no PocketBase SDK in this
+// path and no token exchange: the handlers set the cookie themselves.
 //
 // Everything here is deliberately argument-free where the spec demands
-// neutrality. docs/website/03-functional-spec.md line 90: "Always respond with
-// the same neutral message", and "### Duplicate email": "do not reveal that it
-// exists". A function that is never told whether the account exists is a
-// function that cannot leak it — that is why these take no such argument.
+// neutrality. docs/website/03-functional-spec.md: "Always respond with the same
+// neutral message", and "### Duplicate email": "do not reveal that it exists". A
+// function that is never told whether the account exists is a function that cannot
+// leak it — that is why these take no such argument.
 //
 // Node loads this module directly (the test suite), which is why the import
 // carries an explicit .ts extension.
 
+import { ApiError } from './api.ts';
 import { describeError } from './errors.ts';
 
-/** PocketBase's default minimum. Shown up front, per spec line 30. */
+/** Shown up front, per spec. Mirrors `[auth] password_min_length` in config. */
 export const MIN_PASSWORD_LENGTH = 8;
 
 /**
- * docs/website/03-functional-spec.md line 41, verbatim: "Show: 'If this email is
+ * docs/website/03-functional-spec.md, verbatim: "Show: 'If this email is
  * registered, we've sent sign-in instructions.'" Used for the signup reply, not
  * only for the duplicate case — see `signupReply`.
+ *
+ * The server sends its own neutral wording in the 202 body and it is deliberately
+ * not used here: this string is the page's copy, fixed before any request is made,
+ * so no response can vary it.
  */
 export const DUPLICATE_SIGNUP_MESSAGE =
   'If this email is registered, we\'ve sent sign-in instructions.';
@@ -41,8 +46,8 @@ export const UNREACHABLE_MESSAGE =
   'Could not reach the identity service. Check your connection and try again.';
 
 /**
- * Covers all three landing states the spec asks for at /verify. PocketBase
- * clears a verification token when it is used, so an already-verified address
+ * Covers all three landing states the spec asks for at /verify. A verification
+ * token is single-use and consumed by redemption, so an already-verified address
  * arrives here as an unusable token rather than as a distinct code.
  */
 export const VERIFICATION_FAILED_MESSAGE =
@@ -52,25 +57,21 @@ export const VERIFICATION_FAILED_MESSAGE =
 export const PASSWORD_RESET_DONE_MESSAGE =
   'Password updated. Every session on this account has been signed out \u2014 sign in again with the new password.';
 
-/** PocketBase errors carry a numeric `status`; 0 means the request never left. */
-interface PocketBaseError {
-  status?: unknown;
-  data?: { data?: Record<string, { message?: unknown }> } | null;
-}
-
-function statusOf(err: unknown): number | null {
-  if (err === null || typeof err !== 'object') return null;
-  const status = (err as PocketBaseError).status;
-  return typeof status === 'number' ? status : null;
-}
-
 /**
- * A request that never reached the server. Every other answer is a server answer,
- * and on a neutral page the two must be told apart: a transport failure is the
- * only thing a page may admit to.
+ * A request that never reached the server.
+ *
+ * There is no numeric status to read here. `ApiError` is constructed only from a
+ * RESPONSE, so its absence is the signal: a transport failure throws the
+ * platform's own `TypeError` from `fetch` and never becomes an `ApiError`. The
+ * retired PocketBase SDK instead reported status 0 for the same case, which is
+ * what the old shape checked for; checking for `0` against `ApiError` would have
+ * matched nothing and quietly turned every network failure into a server answer.
+ *
+ * Every other answer IS a server answer, and on a neutral page the two must be
+ * told apart: a transport failure is the only thing a page may admit to.
  */
 export function isUnreachable(err: unknown): boolean {
-  return statusOf(err) === 0;
+  return !(err instanceof ApiError);
 }
 
 /**
@@ -106,12 +107,25 @@ export function confirmationError(password: string, confirmation: string): strin
 }
 
 /**
- * The token PocketBase put in the link. Read from the query string only — there
- * is one place a token is read, so there is one place to audit.
+ * The token the link carried. Read from the query string only — there is one place
+ * a token is read, so there is one place to audit.
  */
 export function readAuthToken(search: string): string | null {
   const token = new URLSearchParams(search).get('token');
   return token !== null && token.length > 0 ? token : null;
+}
+
+/**
+ * The address the link was sent to, when the mail template carries it.
+ *
+ * The reset-confirm endpoint requires the address alongside the token, so the page
+ * needs one from somewhere. `?email=` is a convenience, not a credential: the token
+ * is what authorises the reset, and the server refuses a mismatched pair. A link
+ * without it means the page has to ask (`reset/confirm.astro` does).
+ */
+export function readAuthEmail(search: string): string | null {
+  const email = new URLSearchParams(search).get('email');
+  return email !== null && email.length > 0 ? email : null;
 }
 
 /**
@@ -133,37 +147,35 @@ export function withoutAuthToken(href: string): string {
   return beforeHash.slice(0, queryAt) + (rest ? `?${rest}` : '') + hash;
 }
 
-/** Field names PocketBase reports a 400 against. */
-const EMAIL_FIELD = 'email';
-const PASSWORD_FIELDS = ['password', 'passwordConfirm'];
-
 /**
- * What a PocketBase failure shows the user.
+ * What an auth failure shows the user.
  *
  * Spec "### Error codes -> UI" rule 5: "Never render a raw error body. Server
- * messages are for support, not users." PocketBase's own messages are raw error
- * bodies, so none of them pass through here — every branch returns our copy.
+ * messages are for support, not users." The server's own messages never pass
+ * through here — every branch returns our copy, and the fallback goes through
+ * `describeError`, which maps by stable error CODE rather than by prose.
  *
- * `emailConflictMessage` is passed in because the neutral wording differs per
- * page (signup vs reset); it is never chosen by inspecting the error.
+ * `emailConflictMessage` is passed in because the neutral wording differs per page
+ * (signup vs reset); it is never chosen by inspecting the error.
  */
 export function describeAuthError(err: unknown, emailConflictMessage: string): string {
-  const status = statusOf(err);
-  if (status === null) return describeError(err).message;
-  if (status === 0) return UNREACHABLE_MESSAGE;
+  if (isUnreachable(err)) return UNREACHABLE_MESSAGE;
+
+  const status = (err as ApiError).status;
   if (status === 401) return 'Email or password is incorrect.';
-  if (status === 404) return 'That link is no longer valid. Request a new one.';
   if (status === 429) return 'Too many attempts. Try again later.';
 
-  const fields = (err as PocketBaseError).data?.data;
-  if (status === 400 && fields !== null && typeof fields === 'object') {
-    if (EMAIL_FIELD in fields) return emailConflictMessage;
-    if (PASSWORD_FIELDS.some((field) => field in fields)) {
+  // A rejected field is named structurally, `details.field`, not as a map of
+  // per-field prose: the old PocketBase SDK reported `data.data.<field>.message`
+  // and this branch read that shape, which no longer exists.
+  const field = (err as ApiError).details?.field;
+  if (typeof field === 'string') {
+    if (field === 'email') return emailConflictMessage;
+    if (field === 'password' || field === 'passwordConfirm') {
       return `Password must be at least ${MIN_PASSWORD_LENGTH} characters, and both entries must match.`;
     }
   }
 
-  return status >= 500
-    ? 'Something went wrong on our side.'
-    : 'That did not work. Check the details and try again.';
+  if (status >= 500) return 'Something went wrong on our side.';
+  return describeError(err).message;
 }

@@ -122,7 +122,15 @@ test('the store keeps the last value and reacts to every stream event', async ()
       'key',
       JSON.stringify({ key_id: 'k1', revoked_at: '2020-01-01T00:00:00Z' }),
     );
-    // revoke frame with no revoked_at must not change the list.
+    // A frame with NO revoked_at is a CREATE or an EDIT, and it is recorded in its OWN field. This
+    // assertion used to read "revoke frame with no revoked_at must not change the list", which was
+    // true of the code and false of the contract: docs/realtime.md:73 promises the event on
+    // "created, edited, or revoked", and dropping the first two left every other tab stale. The two
+    // fields are separate because the remedies are separate - a revocation is PATCHED into the rows
+    // on screen, while a create or edit carries no field values and has to trigger a REFETCH.
+    es.dispatch('key', JSON.stringify({ key_id: 'k2', revoked_at: null }));
+    // A repeat of the same edit must not grow the list: the store is a set, and a burst of events for
+    // one key would otherwise make a debounced refetch fire on every tick.
     es.dispatch('key', JSON.stringify({ key_id: 'k2', revoked_at: null }));
 
     // Error frame with parseable data marks the store stale and records id.
@@ -154,6 +162,14 @@ test('the store keeps the last value and reacts to every stream event', async ()
     assert.equal(finalState.balanceIdr, 777);
     assert.equal(finalState.usage?.cost_idr, 20);
     assert.deepEqual(finalState.revokedKeyIds, ['k1']);
+    assert.deepEqual(
+      finalState.changedKeyIds,
+      ['k2'],
+      'a `key` frame with no `revoked_at` is a CREATE or EDIT and must be recorded as a change. Zero ' +
+        'entries here means the store still handles only the revoked case, so a key created in another ' +
+        'tab never appears and an edit never lands - two thirds of what docs/realtime.md:73 promises. ' +
+        'The duplicate dispatch above must NOT have added a second entry.',
+    );
 
     assert.ok(states.length > 0, 'subscribers were notified');
     unsub();
@@ -165,6 +181,102 @@ test('the store keeps the last value and reacts to every stream event', async ()
   }
 });
 
+// ---------------------------------------------------------------------------
+// THE STALE PROMISE: a dropped stream KEEPS the last balance and marks it old.
+//
+// docs/launch-checklist.md Gate 5 states this as a customer-facing claim: "a
+// dropped stream surfaces as a stale indicator, not a silently frozen balance."
+// The existing store test asserts the STATUS becomes stale, but not the half that
+// makes the claim true: the last KNOWN value must still be there, and the poll
+// fallback must refresh it WITHOUT claiming it is live.
+//
+// The distinction is the whole point. A blanked balance looks like a bug; a live-
+// looking frozen balance is worse, because the customer trusts a number that
+// stopped updating and may act on it.
+// ---------------------------------------------------------------------------
+test('a dropped stream keeps the last balance, marks it stale, and polls without calling it live', async () => {
+  FakeEventSource.instances = [];
+  const originalFetch = globalThis.fetch;
+  // The poll fallback fetches /api/me. Serve a NEWER balance than the stream sent, so
+  // a refreshed value is distinguishable from the last streamed one.
+  // A FIXED polled balance, deliberately. It must differ from the streamed 777 so a
+  // refresh is observable, but it must NOT vary per call: `start()` calls loadMe()
+  // BEFORE connect(), so a value that changed on every fetch would already have
+  // overwritten the balance before the streamed frame arrived, and the assertion
+  // below would be measuring the wrong writer. (The first version of this test did
+  // exactly that and failed with 777 vs 901.)
+  let polls = 0;
+  globalThis.fetch = async () => {
+    polls += 1;
+    return new Response(JSON.stringify({ ...ME, balance_idr: 4242 }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    FakeEventSource.instances = [];
+    const store = createLiveStore();
+    store.start();
+    // Drain a few ticks: `start()` awaits loadMe() before it calls connect().
+    for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r));
+
+    assert.ok(
+      FakeEventSource.instances.length > 0,
+      'connect() must have created an EventSource by now',
+    );
+    // THE FIRST instance of THIS test, not the last: a previous test's store may still
+    // be settling its retry chain under the shared shim, and a later socket would then
+    // belong to a DIFFERENT store - dispatching on it would silently do nothing to the
+    // state under assertion.
+    const es = FakeEventSource.instances[0];
+    // DIAGNOSTIC: the listener map must be populated, or the dispatch below is a no-op
+    // and the test would be asserting on nothing.
+    assert.ok(
+      Object.keys(es.listeners).length > 0,
+      `connect() must have attached listeners; got ${JSON.stringify(Object.keys(es.listeners))}`,
+    );
+    es.dispatch('open');
+    es.dispatch('balance', JSON.stringify({ balance_idr: 777 }));
+    assert.equal(store.getState().status, 'live');
+    assert.equal(store.getState().balanceIdr, 777);
+
+    // The stream dies with real error data, as a mid-answer failure would.
+    es.dispatch(
+      'error',
+      JSON.stringify({ error: { message: 'upstream died', request_id: 'req-x' } }),
+    );
+
+    const afterError = store.getState();
+    assert.equal(afterError.status, 'stale', 'a dropped stream must be marked stale');
+    assert.equal(
+      afterError.balanceIdr,
+      777,
+      'the last KNOWN balance must be KEPT, not blanked: a vanished number reads as a bug, and the customer loses their place',
+    );
+    assert.equal(afterError.error, 'upstream died');
+    assert.equal(afterError.requestId, 'req-x');
+
+    // The poll fallback must bring a FRESH value while the badge stays stale: the
+    // data is last-known, so it must never be presented as live.
+    await new Promise((r) => setImmediate(r));
+
+    assert.ok(polls > 0, 'the error path must start the poll fallback');
+    assert.equal(
+      store.getState().status,
+      'stale',
+      'polled data is LAST KNOWN, not live: showing it as live would be the silently frozen balance this claim rules out',
+    );
+    assert.equal(
+      store.getState().balanceIdr,
+      4242,
+      'the fallback must actually refresh the balance, or the stale badge shows an indefinitely old number',
+    );
+
+    store.stop();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 test('loadMe returns null on 401 without setting an error', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>
@@ -214,6 +326,83 @@ test('loadMe records an ApiError failure with its request id', async () => {
     await new Promise((r) => setImmediate(r));
     assert.equal(store.getState().error, 'boom');
     assert.equal(store.getState().requestId, 'rid-42');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a dead session opens no stream, and a failing-but-alive one does', async () => {
+  // THE EARLY RETURN IN `start()`, which nothing covered.
+  //
+  // `start()` loads `/api/me` first and returns before `connect()` when the session is gone:
+  //
+  //     const me = await loadMe();
+  //     if (me === null && state.balanceIdr === null && state.error === null) return;
+  //     if (me) applyMe(me);
+  //     connect();
+  //
+  // MEASURED: deleting that line, dropping its `balanceIdr` term, and dropping its `error` term all
+  // left the whole website suite at 230 pass / 0 fail. The guard is the difference between a page on
+  // a dead session and a page that opens an EventSource against it.
+  //
+  // WHY THE `error` TERM IS LOAD-BEARING, and it is the half that looks redundant. `loadMe` returns
+  // `null` for a 401 AND for a 500, but only the 500 sets `state.error`. So `error === null` is what
+  // distinguishes "the session is gone, apiFetch has already redirected to /login" from "the server
+  // is unwell but the session is fine". Without it the second case would also skip `connect()`, and
+  // a customer hitting a transient 500 on /api/me would get a page that never goes live.
+  //
+  // The two cases are asserted together on purpose: a test for the 401 alone would pass against a
+  // guard that skipped `connect()` on ANY failure, which is the mutation that matters.
+  const originalFetch = globalThis.fetch;
+
+  // (1) A 401: the session is gone.
+  FakeEventSource.instances = [];
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'no' } }), {
+      status: 401,
+      headers: { 'content-type': 'application/json' },
+    });
+  try {
+    const store = createLiveStore();
+    store.start();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(
+      FakeEventSource.instances.length,
+      0,
+      'a 401 must not open an event stream: `/api/me` returning 401 means the session is gone and ' +
+        'apiFetch has already redirected to /login, so the stream would be opened against a session ' +
+        'that is being torn down. This is the guard at the top of `start()`.',
+    );
+    assert.equal(store.getState().status, 'connecting');
+    assert.equal(store.getState().error, null, 'a 401 is a redirect, not an error to display');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // (2) A 500: the session is fine, the server is not.
+  FakeEventSource.instances = [];
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { code: 'server_error', message: 'boom' } }), {
+      status: 500,
+      headers: { 'content-type': 'application/json' },
+    });
+  try {
+    const store = createLiveStore();
+    store.start();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(
+      FakeEventSource.instances.length,
+      1,
+      'a 500 from /api/me must still open the stream. The session is not what failed, so the store ' +
+        'has to keep trying - otherwise a transient server error leaves the dashboard permanently ' +
+        'non-live. The guard distinguishes this from the 401 by `state.error`, which `loadMe` sets ' +
+        'only for a non-401 failure.',
+    );
+    assert.equal(store.getState().error, 'boom', 'and the failure is still surfaced');
   } finally {
     globalThis.fetch = originalFetch;
   }

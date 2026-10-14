@@ -5,7 +5,8 @@ purpose is not dashboards — it is **noticing a billing or balance problem befo
 customer does**.
 
 > Stack: Cloudflare -> edge relay (nginx) -> Rust on Northflank with embedded
-> SQLite, plus PocketBase. See [`docs/architecture.md`](architecture.md) and
+> SQLite (money and identity in the same file — no second store). See
+> [`docs/architecture.md`](architecture.md) and
 > [`docs/edge-relay.md`](edge-relay.md).
 
 ## The principle
@@ -32,7 +33,7 @@ has a defined action; anything without an action is a dashboard, not an alert.
 | Event | Level | Why |
 | --- | --- | --- |
 | `auth.login` | info | Audit trail |
-| `auth.login_failed` | warn | Brute force detection |
+| `auth.login_failed` | warn | **Detection data, not detection.** It records a failed exchange; nothing counts it, alerts on it, or blocks anything. `alerts.tsv` has no brute-force row, so the only automated response to a credential attack is `api_down`, which fires on the *service* being unhealthy and not on anyone guessing passwords. The runbook's step 2 - block at the edge relay - is a human action |
 | `key.created` / `key.revoked` | info | Audit trail |
 | `topup.created` | info | Money in flight |
 | `topup.settled` | info | Money landed |
@@ -60,6 +61,67 @@ did not agree to. Log token **counts**, never content.
 
 ## Metrics
 
+> **NONE OF THESE ARE EMITTED YET, and the tables below are a SPEC rather than a
+> description.** Every name here is a Prometheus-style counter, and this repository
+> contains no metrics exporter and no `/metrics` endpoint: `grep` for `_total{`,
+> `prometheus`, `opentelemetry` or a scrape port returns nothing, and the checklist at the
+> bottom of this file still carries "Metrics backend" UNCHECKED. Five of the names below
+> (`http_requests_total`, `proxy_requests_total`, `topups_settled_total`,
+> `topups_rejected_total`, `wallet_balance_sum_idr`) appear in this document and NOWHERE
+> else in the repository — measured, and the reason this note exists.
+>
+> **What an operator has instead is `GET /api/admin/metrics`** (operator-only), and it does
+> NOT serve these names. Its payload is `server_errors`, `responses`, `error_rate`,
+> `unhealthy_models`, `undercharges`, `undercharged_idr`, `rejections`, `rejection_rate`,
+> `proxy_requests`, `active_streams`, `peak_streams`, `endpoint_traffic` and `retention` — a
+> different shape, read from in-process counters and one database query, not from a
+> time-series store. So a reader who greps for `topups_settled_total` finds this table and
+> nothing that produces it.
+>
+> **That list is checked in both directions** by
+> `the_metrics_payload_is_the_one_the_document_describes`: an emitted field missing here is one
+> an operator cannot look up, and a name here the route does not emit is a promise it does not
+> keep. It had gone stale — `undercharged_idr`, `active_streams` and `peak_streams` were all
+> emitted and none was named — which is why the guard exists rather than a corrected sentence
+> alone.
+>
+> **`endpoint_traffic` IS THE CLOSEST THING HERE TO A REAL ROUTING METRIC, and it is worth
+> the note because it answers a question none of the names below can.** It is a LIST of
+> `{endpoint, served, failed}` per configured endpoint, in config order, counted since the
+> process started:
+>
+>   * **`served` counts the endpoints that answered 200.** An endpoint with `served: 0` next
+>     to a READY circuit breaker is a failover that never happened — a weight that was never
+>     raised, an endpoint the routing order always skips, or a pool whose keys are all
+>     parked. Nothing else in the service can see that shape, because the breaker reports
+>     HEALTH and this reports WORK, and a healthy idle endpoint looks perfect to the breaker.
+>   * **`failed` counts every attempt that did not serve** — a transport error, a 5xx, a 404,
+>     and an endpoint whose attempts ran out throttled. A 429 that rotates onto a working key
+>     is NOT counted here: the key was saturated, the endpoint served the request, and
+>     conflating the two would report a healthy pool as degraded.
+>
+> The pair is what makes either number readable, exactly as `error_rate` needed a
+> denominator before it could be alerted on. With one permitted provider the correct reading
+> is "one endpoint carries everything"; the moment a second is activated, this is the
+> measurement that proves it took effect.
+>
+> An EMPTY list means the upstream client has not been built yet (it is created on the first
+> proxied request) — deliberately distinct from a list of zeros. The route is
+> operator-authenticated, so endpoint names are safe there; **the public `/health` route
+> must never carry them**, which is why this lives on the admin payload.
+>
+> Until a backend exists, treat this section as the argument for one. **The
+> rejection-reason breakdown below is now REAL** — `rejections` on the same
+> `GET /api/admin/metrics` payload — and it is the second row of this section to gain an
+> implementation rather than an argument, after `endpoint_traffic`.
+>
+> This is NOT the same statement as the one under **Alerts**, which says the alerts are
+> "implemented" and evaluated "without a metrics backend" by `check-alerts.sh` (SQL against
+> the database file) and `probe.sh` (HTTP against `/health` and the relay). Both are true at
+> once: the ALERTS are real because they read the database and the health endpoint directly,
+> and the METRICS in this section are not, because nothing exports a counter. The two
+> sections used to read as though the same machinery served both.
+
 Keep it small. Three categories:
 
 ### Money (the ones that matter)
@@ -76,19 +138,78 @@ Keep it small. Three categories:
 | Metric | Why |
 | --- | --- |
 | `http_requests_total` by status | Baseline |
-| `proxy_requests_total` by model, by outcome | Product usage |
-| `proxy_upstream_latency_ms` | Distinguish our latency from theirs |
-| `active_streams` | The memory driver |
+| `endpoint_traffic` on `GET /api/admin/metrics` | Per endpoint, in config order: `served`, `failed` and `mean_latency_ms`. This is `proxy_requests_total`'s routing half. **Still uncomputed: a per-MODEL breakdown** — the counts are per endpoint, and a model's total is the sum over its endpoints. The rejection-reason split is in the table below |
+| `proxy_upstream_latency_ms` | **Real, as `mean_latency_ms` inside each `endpoint_traffic` row.** Time-to-FIRST-BYTE, not total duration: the response is a stream whose length is the model's answer, so a total duration would mostly measure how many tokens the customer asked for. TTFB is the part of the wait the PROVIDER owns, and the only figure comparable across requests of different sizes |
+| `active_streams`, `peak_streams` | **Real.** The level now and the highest it has ever been. This is the instrument `docs/cost-and-sizing.md` was missing: that document's whole sizing argument rests on one sentence — *"The only thing that grows with load is in-flight streaming buffers"* — which was unmeasured |
+
+**`peak_streams` is the figure to size against, and the reason is that a level alone cannot
+answer the question.** A current count read at a random moment says what is happening *then*;
+capacity planning needs the worst moment. The peak is also the only figure that **survives the
+traffic stopping** — a current count of 0 after a burst is indistinguishable from one that was
+never busy.
+
+**`active_streams` is `0` on an idle service, not `null`.** That is the opposite convention
+from `rejection_rate`, and deliberately so: `null` means *unmeasured*, and a service with no
+streams in flight has **measured** zero. Conflating the two is how a metric surface becomes
+unreadable.
+
+**The release is tied to `Drop`, not to a method.** A stream ends three ways — it completes,
+the upstream dies, or the *client hangs up and the body is simply dropped* — and only the first
+two pass through a method. A gauge decremented in the stream's own finish path would leak one
+slot for every abandoned request, so a service under exactly the load that matters (clients
+giving up) would report a **rising** `active_streams` that never falls. That is the same
+reasoning that put the money release in `ReservationGuard`.
+
+**`mean_latency_ms` IS `null` FOR AN ENDPOINT THAT HAS SERVED NOTHING, never `0`.** An
+unmeasured endpoint would otherwise sort as the *fastest* in the pool, which is the exact
+inversion of the truth on the one metric whose stated purpose is comparing providers.
+
+**It is a MEAN and not a percentile**, and that is a limit rather than a rounding detail: a
+p99 needs a ring buffer whose memory is a function of traffic — the same reason this document
+already records for why `error_rate` has no real time window. A mean says "this endpoint is
+slower", which is the question the row asks; it will not show a tail.
+
+**A failed attempt contributes no latency.** The figure is TTFB for a request that was
+SERVED; folding a refusal into it would drag the mean toward the speed of the error path,
+which is fast precisely because nothing was generated.
 
 ### Rejection reasons
 
 | Metric | Meaning |
 | --- | --- |
-| `proxy_rejections_total{reason}` | `no_key`, `revoked`, `model_denied`, `rate_limited`, `limit_exceeded`, `insufficient_balance` |
+| `rejections` on `GET /api/admin/metrics` | `{reason, count}` per code that has fired: `insufficient_balance`, `rate_limited`, `key_limit_exceeded`, `model_not_allowed`, `key_revoked`, `key_expired`, `unauthenticated` |
+| `rejection_rate`, `proxy_requests` | The same figures as a RATE: refusals over attempts that reached the `/v1` gate. **`null` on no traffic, never `0.0`** — a gate that has seen nothing is unmeasured |
 
 **Break rejections down by reason.** A spike in `insufficient_balance` is a
 business signal (customers running dry). A spike in `rate_limited` is either growth
 or abuse.
+
+**It is keyed on `AppError::code()`, which is why the row no longer publishes a list of
+its own.** The draft list above read `no_key`, `revoked`, `model_denied`,
+`limit_exceeded` — **none of which are codes this service returns**; the real ones are
+`key_revoked`, `key_expired`, `model_not_allowed`, `key_limit_exceeded`. A second
+vocabulary would have been the duplicate-rules-drift defect this repository writes guards
+against, so the counter files each refusal under the code it was actually returned as.
+
+**A reason that has never fired is ABSENT, not zero**, so a quiet service does not grow an
+entry per code in the table and a first firing is visible. **Rejections that cost money are
+not counted here**: a 402 raised *after* a hold left the wallet is a settlement (see
+`proxy_undercharge`), not an admission refusal.
+
+**THE RATE NEEDS ITS OWN DENOMINATOR, and reusing `responses` would have been wrong.**
+That counter moves for every response the process returns — sign-in, the dashboard,
+`/health` — so a rate built on it would *fall* as unrelated traffic rose, with no change in
+proxy traffic at all. A rate whose movement is caused by another surface is worse than no
+rate, because it looks like a measurement. `proxy_requests` is therefore incremented at the
+**same gate** the refusals are, and *before the first check that can refuse*: a request
+refused for a missing `Authorization` header never reaches a later step, so recording
+anywhere else would put refusals in the numerator that the denominator never saw — a
+percentage above 100.
+
+**A non-zero refusal rate is the EXPECTED state** on a public endpoint, because
+unauthenticated probing is continuous. It is the *shape* that carries information — a spike
+in `insufficient_balance` is customers running dry, a spike in `rate_limited` is growth or
+abuse — not the level, which is why this row has no alert threshold.
 
 ## Alerts
 
@@ -97,14 +218,110 @@ Each has a threshold and an action. If you would not act, do not alert.
 | Alert | Condition | Action |
 | --- | --- | --- |
 | **Webhook rejection** | any `topup.rejected` | **Investigate immediately** — either an attack or a config error breaking payments |
+| **Refund refused by policy** | any `refund.refused` | Correct behaviour, but nothing else moves on this path — a spike means a status-mapping regression or a dispute |
 | **Ledger drift** | `ledger_balance_drift_idr != 0` | Money is wrong. Freeze changes, investigate |
 | **API down** | `/health` failing 2 min | Restart/investigate; auth is down |
 | **Relay 5xx** | relay returns 502/504 | The relay is up but the backend is not |
 | **Relay down** | external check fails | Total outage — single point of failure |
 | **All providers unhealthy** | circuit open on every endpoint | Requests failing; check upstream |
 | **Balance negative** | `balance_idr < 0` | Should be impossible (CHECK constraint). A bug |
-| **DB disk >80%** | volume usage | Usage rows growing; check retention |
-| **Error rate >5%** | 5 min window | Investigate |
+| **DB disk** | any age-based table holding a row past its retention window — all seven, and it could not measure one of the original three until a decode fix | Usage rows growing; check retention |
+| **Error rate >5%** | **Process-lifetime ratio, not a 5-minute window** | Investigate |
+| **Stranded reservation hold** | `reserve_*` negative ledger row with no positive row under the same ref | **Investigate the release path, then credit the account if the hold is lost.** Invisible to the drift query by construction — the hold left the wallet and no offsetting credit was written, so `balance` still equals `SUM(delta)` |
+| **Proxy undercharge** | the `undercharges` counter on `GET /api/admin/metrics` (and the `Proxy request UNDERCHARGED` log line it counts): the balance could not cover the reported usage | **Investigate whether the reservation size is wrong for the model.** The answer was delivered and the REAL token counts were recorded, so the books stay consistent — but some of the money consumed was not collected. Invisible to every other alert by construction: the request returned 200, so it moves neither the error-rate numerator nor any drift query, and the debit was clamped rather than refused. The counter was added because **the log line alone was not a signal anything read** — this row named the alert for months while no script could see it |
+
+**These are implemented, and the definition is machine-readable.** Every row above has
+an entry in [`tools/alert/alerts.tsv`](../tools/alert/alerts.tsv) — id, condition, threshold,
+action and a coverage verdict — and [`tools/alert/README.md`](../tools/alert/README.md) is the
+operator's view of it. Two scripts evaluate them without a metrics backend:
+`check-alerts.sh` runs the SQL-answerable checks against the database file, and `probe.sh`
+runs the external ones against `/health` and the relay. `alert.sh` is the transport, with
+Telegram, webhook, file and stdout channels and a per-key cooldown so one incident pages once.
+
+**WHAT IS AND IS NOT CHECKED BETWEEN THESE TWO LISTS.** `alert-check` fails when an alert
+exists in one and not the other, in both directions — so MEMBERSHIP cannot drift. Wording is
+not compared, and should not be: this table states a condition in prose and the TSV quotes
+one in code, so a literal comparison would fail on formatting rather than on substance.
+That leaves condition and threshold free to drift apart, and two of them have in this
+work — `db_disk` said "any age-based table" while the struct measured three of six, and
+`error_rate` said "5 min window" while the counters were cumulative since process start.
+Both were fixed by hand, in the same commit as the code or the claim that made them true.
+The threshold and the coverage verdict exist ONLY in the TSV; this table has no column for
+either, which is why it is the TSV a reader should treat as the definition.
+
+**One more thing IS now checked, and it is the same shape one level down.** Every `alerts.tsv`
+row cites a row of THIS table by its **title**, and nothing verified that the title exists here —
+so renaming a row would leave its citations pointing at nothing while still reading as plausible
+references, which is the failure the no-line-numbers rule prevents for line citations. MEASURED,
+and it had already happened: `error_rate` cited `the "Error rate" row` while the row here reads
+**Error rate >5%**, and the TSV's own `title` column for that alert agrees with this table — so the
+row disagreed with ITSELF and `alert-check` was green. The gate now resolves every quoted title
+against this file and requires **all** of them, not a floor: a floor of 8 was written first and
+MEASURED to pass while a single citation had silently stopped being read.
+rather than once per run.
+
+**And they run on a schedule.** `.docker/maintenance/` invokes both nightly, so a breach
+reaches an operator rather than only existing as a definition — see its README for which
+jobs are wired and which are not.
+
+**What is still a decision, not a gap:** WHICH channel to use and WHEN to run are an
+operator's choices, and a breach with no channel configured is reported as unmonitored
+rather than as a pass. `probe.sh` also states, in its own output, the alerts it cannot check
+and why, so a skipped check is never mistaken for a clean one.
+
+**The `db_disk` alert now measures RETENTION, not disk.** Its old name and condition
+("DB disk >80% / volume usage") described a signal the backend cannot see, while its
+own ACTION column asked for something it can: "check retention". Those were two
+different questions and only the second is answerable here. `GET /api/admin/metrics`
+reports the age of the oldest row per age-based table, present only when that row has
+exceeded the table's window, so the alert fires when a retention **promise** is being
+broken — which is an incident at any disk size, whereas 80% full is normal for a
+working database. The row above is restated accordingly rather than silently redefined.
+
+**The refund-refusal alert is a DISTINCT event, not folded into `topup.rejected`.**
+They look similar and mean opposite things: a rejection is a payment that failed to
+land and may owe someone money, while a refusal is a refund **declined by policy**,
+which is the system working. Sharing the name would page on routine enforcement and
+would let a refusal spike hide inside a rejection count.
+
+It is alerted on even though the behaviour is correct, because a refusal is the one
+webhook outcome where **nothing moves** — the topup stays `settled`, no ledger row is
+appended, the balance is untouched. That is also exactly what a status-mapping
+regression routing real events into this arm would look like, so without a distinct
+marker the two are indistinguishable. `tools/alert/probe.sh` scans for it with its OWN
+line-offset marker, so it and `topup.rejected` cannot consume each other's events.
+
+**The all-providers-unhealthy alert is SERVED too.** `GET /api/admin/metrics` also
+reports `unhealthy_models`: the models whose EVERY routed endpoint has an open
+circuit. Note what this deliberately is NOT — one open endpoint means failover is
+WORKING, so the server does not reuse its cooldown accessor for this. It counts only
+ROUTED endpoints (weight > 0), so an unrouted placeholder can neither cause a false
+alarm nor mask a real outage on the endpoint that is actually serving.
+
+**The error-rate alert is SERVED, and it is a LIFETIME ratio.** `error.rs` counts 5xx
+responses and total responses in process with cumulative `fetch_add`s, and
+`GET /api/admin/metrics` (operator-only) reports them, so
+`tools/alert/probe.sh --check error_rate` measures a real number instead of declaring
+the alert unchecked.
+
+**Three caveats, and the first is the one that matters.** The ratio is over everything
+the process has served since it started, NOT over a 5-minute window — the counters have
+no window, no reset and no ring buffer. A burst of errors during an incident moves it
+very little on a service that has been up a week, so **this alert under-fires by design
+of its implementation** and an operator should treat a silent `error_rate` as "below 5%
+for the whole life of the process", not "below 5% for the last five minutes". Both tables in
+this repository said 5 min until now; the prose here always said "in process", which is
+the shape of the error worth watching for — the careful sentence is written and the table
+beside it is not updated.
+
+The other two: the ceiling is over **handled** requests (a 404 for an unmatched path never
+reaches `AppError`, so it is not counted), and a process that has served nothing reports
+**`null`, not `0.0`** — the probe treats null as no-data rather than a healthy service.
+
+A real window is a small change and a deliberate one: two `VecDeque`s of (instant, was_5xx)
+behind the same atomics, trimmed on read. It is not done because a lifetime ratio answers a
+real question — "is this service returning 5xx at all" — and a windowed one would need its
+own tuning for minimum traffic before it was worth alerting on.
 
 **What is deliberately NOT alerted:** individual 401s, individual 500s, high CPU
 with normal latency, slow upstream (their problem, and you cannot fix it).
@@ -129,11 +346,15 @@ The `ledger` is authoritative; `wallets` is a cache of it. A mismatch means a bu
 in the credit/debit transaction, and it is the specific failure the append-only
 ledger exists to detect.
 
-### Plus the two cross-system checks
+### And the check that crosses the payment boundary
+
+Identity and money share one SQLite database, so there is no auth-side orphan to
+look for: a deleted identity cannot leave a funded wallet behind, because the
+wallet hangs off the account and accounts are never hard-deleted. The one check
+that still crosses a system boundary is the payment provider's.
 
 | Check | Why |
 | --- | --- |
-| `accounts.pb_user_id` exists in PocketBase | Orphans mean a deleted auth user with a funded wallet |
 | Midtrans settlements vs `topups` where `settled` | Catches a missed webhook |
 
 See [`docs/website/04-payments.md`](website/04-payments.md) for webhook details.
@@ -150,17 +371,47 @@ the hold is gone from the wallet and no offsetting credit was written, so
 `balance_idr = SUM(ledger.delta_idr)` still holds and the query returns **no row**.
 Money is debited against a request that was never billed, and no alert fires.
 
-**Detection is a separate query with its own invariant.**
-`unpaired_hold_rows` (`server/src/db.rs`) counts `reserve_*` refs that have a negative
-row and **no positive row under the same ref**. **Zero rows is the invariant.** A
-non-zero count means a release failed to land — most often the fire-and-forget
-`ReservationGuard::drop` (`server/src/routes/proxy.rs`) never reached the database, or
-the process died between the response and the settlement commit.
+**Detection is a separate query with its own invariant.** It counts `reserve_*`
+refs that have a negative row and **no positive row under the same ref**. **Zero rows
+is the invariant.** A non-zero count means a release failed to land — most often the
+fire-and-forget `ReservationGuard::drop` (`server/src/routes/proxy.rs`) never reached
+the database, or the process died between the response and the settlement commit.
 
-**Run the sweep on a schedule, alongside `ip-purge`.** Both are maintenance jobs that
-enforce a money or retention promise, and neither has a scheduler behind it yet
-([`docs/ip-tracking.md`](ip-tracking.md)); schedule them together, on the same cadence
-as the reconciliation query.
+**WHICH IMPLEMENTATION RUNS, because this paragraph used to name the wrong one.**
+It said `unpaired_hold_rows` (`server/src/db.rs`), and that function is **called by
+nothing except its own tests**. Three copies of this detector exist:
+
+| Implementation | Runs |
+| --- | --- |
+| `db::unpaired_hold_rows` (`server/src/db.rs`) | **never in production** — tests only |
+| `bin/hold-sweep.rs` | **never in production** — not shipped in the server image, the scheduler logs it as NOT WIRED |
+| `.docker/maintenance/entrypoint.sh` (`run_hold_sweep`) | nightly, and it is **the one** the scheduler runs |
+| `tools/alert/check-alerts.sh` (`HOLDS_OVER`) | nightly, fires the `stranded_hold` alert |
+
+**There are FOUR copies, and this table previously named the wrong one.** It listed
+`bin/hold-sweep.rs` as "nightly, via the maintenance scheduler". The binary is not
+shipped in the server image and the scheduler says so on every run: `NOT WIRED
+hold-sweep` is not what it prints — it prints `WIRED hold-sweep - REPORT-ONLY, SQL
+inline in this entrypoint, using the SAME predicate as
+server/src/bin/hold-sweep.rs`. What runs is the **inline SQL**, not the binary. This is
+the same error this paragraph already documents for retention, where
+`data-retention.md` said the sweeps were enforced by `usage-purge.rs` and the binary
+that enforces them does not run either.
+
+All three that run carry their own SQL rather than calling the Rust ones, which is the
+same duplication that hid a second reservation rule until it was measured. The
+`db.rs` copy is left in place because it states the invariant in the place a reader
+looks for it — but it is not the detector, and an operator told to run it would find
+nothing scheduled.
+
+**The sweep now RUNS on a schedule.** The maintenance scheduler
+(`.docker/maintenance/`) runs `run_hold_sweep` every night, alongside the retention
+sweeps — and its CI smoke seeds a stranded hold and a HEALTHY paired reservation, then
+asserts the detector fires on the first and stays silent on the second. It is
+**report-only**, matching the binary's default: the scheduler detects, names the
+accounts and refs, and exits non-zero, while crediting a hold back stays a deliberate
+operator action (`hold-sweep --release`). Silently correcting a stranded hold is the
+same invisible-money anti-pattern this whole section describes.
 
 **The bound.** A hold may legitimately be unpaired at the moment of a sweep — the
 request is still streaming, and the upstream timeout is deliberately **per read rather
@@ -197,7 +448,22 @@ database only.
 ## Open items
 
 - [ ] Metrics backend (self-hosted Prometheus vs a hosted service — cost matters).
+- [x] Confirm the other five never-log classes are absent — **audited**, not assumed.
+      A sweep of every `info!`/`warn!`/`error!`/`debug!`/`trace!` call site in
+      `server/src` for `token`, `key` and `cookie` finds only `key_id` (a uuid),
+      `token_hash` and `api_key_id` — never a raw API key, a session token, or a
+      cookie value. The one place a raw key exists (`auth.rs` exchanges it) hashes
+      before any write. This is a point-in-time audit, so the TEST above is what
+      holds the line going forward.
 - [ ] Log retention period.
 - [ ] Alert delivery channel (Telegram is already in the stack).
 - [ ] Whether to expose a public status page.
-- [ ] Confirm prompts/completions are never logged, in code review.
+- [x] Confirm prompts/completions are never logged — **now enforced by a test, not a
+      review.** `a_customer_prompt_never_reaches_the_log` (`server/src/routes/proxy.rs`)
+      drives a real request carrying a sentinel prompt through the handler with a
+      capturing `tracing` subscriber installed, and asserts the sentinel NEVER
+      appears. It captures at **TRACE**, not info, because the promise breaks in
+      practice when someone adds a `debug!` while investigating a bug — which is
+      exactly what a one-off review cannot prevent. It carries a positive control
+      (the request must still be observable by model/account) so it cannot pass on a
+      server that logs nothing at all.

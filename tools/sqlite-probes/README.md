@@ -36,6 +36,26 @@ The SQLite behaviours the port depends on, measured rather than recalled.
 | `SUM()` over `INTEGER` vs `REAL` | `integer` vs `real` | §4.6 |
 | `journal_mode = WAL` persists | yes | §4.3 |
 | `VACUUM INTO` inside a transaction | **refused** | §4.3 trap 4 |
+| Library version supports `STRICT` | **asserted, not printed** | §4.9 |
+| `STRICT` rejects TEXT in an `INTEGER` column | **rejected** | §4.9 |
+| `STRICT` rejects a **REAL** in a money column | **rejected** | §4.9 |
+| Control: a **non**-`STRICT` table accepts both | accepted | §4.9 |
+
+**The four `STRICT` rows are new, and their absence was a real hole.** §4.9 of the plan calls
+`STRICT` *"the single most important line in this appendix"* — without it `INTEGER` is only *affinity*,
+so a `REAL` lands in a money column silently — and the plan states the requirement it creates
+(**SQLite ≥ 3.37**). MEASURED before these were added: the suite had **no `STRICT` probe at all**, and
+the version was **printed on the banner rather than checked**. So a host with an older SQLite would run
+every probe green and then fail to create the first table.
+
+The version comparison is numeric (`sqlite_version_info`), because `"3.9.0" > "3.37.0"` as strings —
+which would pass exactly the host that cannot run the schema.
+
+The **control** row matters as much as the two rejection rows: without it, a probe that saw a value
+rejected would not know whether `STRICT` did it or something unrelated did.
+
+All four were mutation-tested — the version raised beyond the host, `STRICT` removed from the table, and
+the control table made `STRICT` too — and **each provocation was caught**.
 
 ## `sqlite-timestamp-probe.py`
 
@@ -54,6 +74,24 @@ outranks the space-format value. Up to ~24 hours of extra session life, silently
 Also confirms that with a *uniform* RFC3339-offset format, ordering is correct even when
 the fractional part varies in length. Plan reference: §4.6.
 
+**It asserts its expectations as of this round; it used to only print them.** The script wrote
+`(want N)` beside every measurement and compared none of them — MEASURED: patching it so a value
+contradicted its own printed `want` still exited **0**. It now has **8 assertions and a real exit code**,
+so a change in SQLite's comparison behaviour fails the probe instead of printing a number for a human to
+notice.
+
+**Two corrections were made to it while adding those assertions**, both the same shape — a stated
+expectation the code never enforced:
+
+| line | was | is | why |
+| --- | --- | --- | --- |
+| §2 `expires_at > now` | `(want 0)` | **`(want 1)`** | `want 0` describes *correct* behaviour; the observed `1` **is the hazard this probe exists to demonstrate**, so the assertion records the hazard and fails if it ever *disappears* |
+| §3 same instant, two formats | `(want 1)` | **`(want 0)`** | it sat under the heading *"is NOT equal"* and could never be satisfied — the strings differ at position 10, where `'T'` sorts above `' '` |
+
+The distinction in §2 is worth reading before changing it: the probe demonstrates a comparison that gets
+the answer *wrong*, so a "healthier" reading there would mean the hazard had stopped reproducing and the
+schema's format enforcement no longer load-bearing.
+
 ## `validate-migration-schema.py`
 
 The schema gate, and the only script here that inspects the shipped artefact rather
@@ -66,11 +104,21 @@ If the plan and the schema disagree, the run fails. A plan that lies about the
 database is worse than no plan, and this is the only mechanism that stops the two
 drifting apart after the port lands.
 
-**2. Invariants**, asserted against the *shipped* migration — 32 checks:
+**2. Invariants**, asserted against the *shipped* migration — the script prints its own count, and the
+run reports **38 checks** with 0 failed. Read the number off a run rather than from here; two of the
+three figures on this list had gone stale, which is the reason the prose below names the *shape* of
+each assertion instead of the count it produced on the day this was written:
 
-- the schema has exactly 17 tables, and every one is `STRICT`;
+- the schema has **at least 17** tables, and every one is `STRICT`. NOT "exactly 17", which is what
+  this line used to say: the script pins a FLOOR on purpose, because the exact count was 17 in the
+  first migration alone and extending the probe to apply every migration made an exact assertion fail
+  on a correct schema. The run reports **21 tables** today, and a migration that adds a table should
+  not have to edit a check whose job is to catch a migration skipping the CONVENTIONS rather than to
+  ratify a number;
 - no `REAL`/`FLOAT`/`NUMERIC`/`DECIMAL` column exists anywhere;
-- all 30 date and time columns carry a `GLOB` format check;
+- **every** date and time column carries a `GLOB` format check — the run reports **39** such columns.
+  This said "all 30" and the figure moves with the schema, which makes it the same trap as the table
+  count: a reader who checks it finds a number that was true once;
 - no table has a `DEFAULT CURRENT_TIMESTAMP` — a default that fires writes the wrong
   format (plan §4.6);
 - `REAL` and `TEXT` are refused in `INTEGER` money and flag columns;

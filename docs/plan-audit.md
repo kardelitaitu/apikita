@@ -1,5 +1,15 @@
 # Plan Audit
 
+**Status:** HISTORICAL - this is a record of an audit performed against the plan as it stood at the
+time, not a description of the system now. `doc_claims.rs` excludes it from the citation check on
+exactly that basis ("a historical record of a past audit"), and the two other historical documents
+carry a Status line saying so for the same reason. The line was missing here, which mattered: the
+audit's own present-tense sections — "What is genuinely solid" — read as current findings, and at
+least one figure no longer holds. MEASURED, the schema section says **15 tables** while
+`tools/sqlite-probes/validate-migration-schema.py` applies the shipped migrations and reports **21**,
+because **five more migrations** have landed since - and those added FOUR tables net. The findings below are what was true when they were
+written; read them as a dated audit, not as the current state.
+
 A deliberate review of the whole plan, asking whether it holds together rather than
 whether it is internally consistent. **The consistency checks pass** (332 links, no
 dead anchors, arithmetic reproduces). This document records the problems that
@@ -59,13 +69,17 @@ with the first ten customers, before any spend on growth.
 3,000,000 IDR/month (~$165) is assumed across Northflank, a VPS relay, Cloudflare,
 and CI. **No quotes have been obtained.** At $300 actual, break-even roughly doubles.
 
-### 5. Seven moving parts, one operator
+### 5. Six moving parts, one operator
+
+> **Since this audit:** the identity port landed. PocketBase is gone — identity is
+> served by the Rust API itself in the embedded SQLite database, so there is no
+> separate auth system to run. The count below is updated; the finding is not.
+> See [`architecture/identity.md`](architecture/identity.md).
 
 | Component | Why it exists |
 | --- | --- |
-| Rust API + proxy | The product |
-| SQLite (embedded) | Money |
-| PocketBase | Identity |
+| Rust API + proxy | The product, and now identity too |
+| SQLite (embedded) | Money and identity |
 | VPS relay | Flood absorption, cost |
 | Cloudflare Pages | Frontend |
 | Cloudflare edge | DDoS, DNS, TLS |
@@ -77,8 +91,9 @@ customer. The objective is *low cost server*; complexity is a cost even when eac
 component is cheap.
 
 **Candidates to defer at launch:** the edge relay (Cloudflare already absorbs
-volumetric attacks), and the PocketBase hybrid (it saves auth work but adds a second
-system to back up and reconcile).
+volumetric attacks). The PocketBase hybrid was once the other candidate — a second
+system to back up and reconcile — and it is no longer a choice: the identity port
+folded it into the API, which is why the surface above is six and not seven.
 
 ### 6. The whitepaper remains misleading
 

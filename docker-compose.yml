@@ -9,16 +9,15 @@
 # There is no database container. The API uses embedded SQLite at the path in
 # DATABASE_URL (default sqlite://data/server.db) — a file on this host, not a
 # service. The Postgres container was removed when the schema moved to embedded
-# SQLite (docs/plans/sqlite-migration.md); that migration only changed the
-# database engine, not identity.
+# SQLite (docs/plans/sqlite-migration.md); the identity port (Phase 6) has since
+# landed too, so that migration changed the database engine AND moved identity
+# into the same SQLite file.
 #
-# PocketBase is a SEPARATE concern and is NOT part of the SQLite migration. It is
-# still the identity provider until Phase 6 replaces it with a Rust
-# implementation (todo.md:133); the server still calls it at POCKETBASE_URL for
-# every login (server/src/routes/auth.rs), so removing this file's PocketBase
-# service did not remove the dependency. It is run here as a standalone binary in
-# local dev (docs/local-development.md) rather than a container, and Phase 6's
-# Rust replacement will also be process-local — never a container.
+# Identity is served by the Rust API ITSELF, in the embedded SQLite database
+# (`accounts` + `identities`). There is no PocketBase service, no PocketBase
+# binary to run in local dev, and no `POCKETBASE_URL` for the server to call —
+# the provider was deleted from the crate. See docs/architecture/identity.md.
+# Nothing here proxies to, starts, or backs up an auth service.
 #
 # Resetting the local database is a file operation, not a volume one, and the
 # instructions live with the rest of the dev loop in docs/local-development.md —
@@ -63,6 +62,24 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    # BOUNDED LOGS, and the reason is the DISK rather than the volume.
+    #
+    # Docker's default `json-file` driver has NO size limit, so a container's log grows until the disk
+    # fills - and a full disk on this host takes down the SQLite database, not just the logging. The
+    # volume is small: `docs/cost-and-sizing.md` puts the edge relay on a "~2 vCPU / 4 GB" VPS and says
+    # "start smaller than you think", so a few unbounded GB is material here.
+    #
+    # WHAT THIS SERVICE ACTUALLY WRITES, measured so the bound is not superstition: nginx sets
+    # `access_log off` (relay.conf:72), so it does NOT log per request - only errors, startup and the
+    # occasional upstream failure. At 10 MB x 3 it would take an extraordinary error rate to rotate, and
+    # the bound is there for the case where something DOES go wrong repeatedly: a crash loop or a
+    # connection storm is exactly when a log grows fastest and when losing the oldest lines is least
+    # acceptable.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ---------------------------------------------------------------------------
   # Maintenance scheduler. The jobs below were written and then never run by
@@ -71,25 +88,30 @@ services:
   # green run; it states exactly what is wired and what is not.
   #
   #   retention  RUNS HERE, for real. The sqlite3 CLI plus the exact SQL of
-  #              server/src/bin/ip-purge.rs (server/src/ip_tracking.rs:298-316):
-  #              key_ip_seen > 7d, key_ip_daily > 90d. This is the
-  #              docs/ip-tracking.md retention promise actually being kept.
+  #              server/src/bin/ip-purge.rs: key_ip_seen > 7d, key_ip_daily > 90d,
+  #              link_redemption_attempts > 7d, auth_attempts > 7d. This is the
+  #              docs/ip-tracking.md and docs/data-retention.md retention promise
+  #              actually being kept.
   #   reconcile  RUNS HERE, for real. tools/reconcile/reconcile.sh, exit code
   #              preserved verbatim (1=drift 2=no DATABASE_URL 3=no sqlite3
   #              4=sqlite3 failed 5=stranded hold 6=no such database file).
   #              No `|| true` anywhere near it.
-  #   ip-purge, hold-sweep
-  #              NOT WIRED HERE. Both are Rust binaries, and this service's image
-  #              (.docker/maintenance) deliberately contains only the sqlite3 CLI
-  #              — it is not the server image and must not become one. A server
-  #              image DOES now exist (server/Dockerfile, W17) and it ships
-  #              apikita-server and migrate; ip-purge and hold-sweep are still not
-  #              copied into it, because neither has been scheduled. This service
-  #              logs that on startup and never pretends to have run them — a
-  #              scheduler that looks like it works and does nothing is the same
-  #              failure class as a money check that returns 0 while the money is
-  #              wrong. Run them on the host, on the same cadence, until they are
-  #              wired into a scheduled container.
+  #   hold-sweep RUNS HERE, for real, REPORT-ONLY. Not the binary — this image
+  #              contains only the sqlite3 CLI and must never become the server
+  #              image — but the same DETECTOR, applied inline by
+  #              run_hold_sweep with the predicate server/src/bin/hold-sweep.rs
+  #              itself demands (a different one "would make the binary and the
+  #              library disagree about what stranded means, which is how a
+  #              detector stops being trusted") and its 900s bound. A stranded
+  #              reservation hold is INVISIBLE MONEY: the ledger still balances
+  #              and reconcile.sh is structurally blind to it. It counts, names
+  #              the accounts and refs, and exits non-zero. It NEVER moves money —
+  #              crediting a hold back is the deliberate `--release` action, so
+  #              that stays a host command.
+  #   ip-purge   NOT WIRED HERE, and its WORK IS: run_retention applies its two
+  #              DELETEs inline (see retention above), so the retention promise is
+  #              kept even though the binary does not run. The binary is a Rust
+  #              program and this image deliberately has no Rust toolchain.
   #
   # PORTED TO SQLITE. The image is built from .docker/maintenance/Dockerfile,
   # which exists only to put the sqlite3 CLI on PATH; both DSNs are sqlite://
@@ -118,7 +140,8 @@ services:
     # never runs against the real database. This is the directory server/ is
     # mounted at, and the one the API runs in.
     working_dir: /srv/apikita/server
-    # schedule = nightly loop. one-shot verbs for operators/CI: once, retention, reconcile.
+    # schedule = nightly loop. one-shot verbs for operators/CI:
+    # once, retention, reconcile, hold-sweep.
     command: ["schedule"]
     environment:
       # The retention job's database. A FILE, not a service: there is no
@@ -136,12 +159,49 @@ services:
       # default: the resolution of both DSNs depends on it, and a silent default
       # is not something a database path should rest on.
       APP_DIR: /srv/apikita
+      # Where tools/alert is mounted, so the entrypoint finds the checks.
+      ALERT_DIR: /srv/apikita/tools/alert
+      # The cooldown state. On the DATA volume, not /tmp, precisely because it
+      # must survive a container restart - a cooldown that resets pages repeatedly
+      # for one incident, which is the failure it exists to prevent.
+      ALERT_STATE_DIR: /srv/apikita/server/data/alert-state
+      ALERT_HOST: apikita-scheduler
+      # The relay, addressed by SERVICE NAME. probe.sh defaults to 127.0.0.1, which
+      # inside this container is its own loopback - nothing is listening, so an
+      # unconfigured run would call the relay down every night. A false alarm on a
+      # schedule is worse than no check: it is believed, and it teaches an operator
+      # to ignore the alert.
+      RELAY_HOST: nginx
+      # The BACKEND, which is a separate deployment - this compose holds only nginx
+      # and the scheduler, so there is no service name to default to and no safe
+      # guess. Unset leaves api_down SKIPPED with its reason printed, which is
+      # probe.sh's own semantic. Set it to wherever the API actually answers.
+      PROBE_API_URL: ${PROBE_API_URL:-}
+      # THE DELIVERY CHANNEL, passed through from the host. UNSET is a supported
+      # state, not an error: the checks still run and a CLEAN night still exits 0,
+      # but a breach with no channel exits non-zero rather than reporting a pass.
+      # That is a deployment decision (docs/launch-checklist.md keeps its box
+      # unticked for the same reason), so it is deliberately NOT defaulted here.
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       # Nightly run time, UTC hour 0-23. 03:00 UTC is a quiet hour for the stack.
       SCHEDULE_HOUR_UTC: ${SCHEDULE_HOUR_UTC:-3}
     volumes:
       - ./.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro
       # Read-only: reconcile.sh + reconcile.sql, unmodified and unowned by this job.
       - ./tools/reconcile:/usr/local/share/reconcile:ro
+      # Read-only: the alert checks, run nightly by `run_alert_checks`. They
+      # delegate to tools/reconcile (check 1 IS reconcile.sh), which is why this
+      # is read-only too - nothing in tools/alert writes to the repo. What it DOES
+      # write is its cooldown state, and that needs a PERSISTENT directory or the
+      # throttle resets every run and one incident pages once per run (see
+      # tools/alert/README.md:121-122). It lives on the data volume below.
+      # The whole tools/ tree, at the path its own scripts expect: check-alerts.sh
+      # derives the reconcile runner from its OWN location (`$SCRIPT_DIR/../..`),
+      # so mounting tools/alert alone would leave it looking for a sibling that is
+      # not there and reporting exit 6 forever. Mounting the tree mirrors the repo.
+      - ./tools:/srv/apikita/tools:ro
       # The API's data directory — the file the API writes, the same file these
       # jobs must open. Without this mount the container cannot see the database
       # at all, which is what made this service permanently unable to succeed.
@@ -165,3 +225,18 @@ services:
     # Nightly cadence needs it back after a reboot, and `unless-stopped` matches
     # every other service here.
     restart: unless-stopped
+    # BOUNDED LOGS. THIS is the container that writes on a schedule: the entrypoint
+    # runs its wired jobs nightly, logs a summary for each, and repeats - 97 output
+    # statements over a run, so KB per night rather than MB.
+    #
+    # That is small enough that the bound looks unnecessary, and it is kept for the
+    # reason the bound exists at all: the failure mode is not the steady state. A job
+    # that starts failing retries every night and logs every time, and a scheduler
+    # stuck in a restart loop writes as fast as the runtime will let it. Both are
+    # exactly when the log matters most, and both are when an unbounded file fills a
+    # small disk and takes the database with it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

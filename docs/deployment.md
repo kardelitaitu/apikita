@@ -124,13 +124,21 @@ migration that undoes it. Down-migrations on live data are how you lose rows.
 
 ## The server image
 
-Step [3] ships **one image** containing **two binaries**, both built from
+Step [3] ships **one image** containing **three binaries**, all built from
 `server/Dockerfile`:
 
 | Binary | In the image as | Used by |
 | --- | --- | --- |
 | `apikita-server` | `/usr/local/bin/apikita-server` (the entrypoint) | Step [3] — the service itself |
 | `migrate` | `/usr/local/bin/apikita-migrate` | Step [2] — `sqlite migrate`, **never on server boot** |
+| `usage-purge` | `/usr/local/bin/apikita-usage-purge` | The **maintenance scheduler**, not this service — its `credit-expiry` job runs `db::expire_credit` nightly. It ships HERE because the server image is the only one with a Rust toolchain to build it, and `.docker/maintenance/` has no compiler |
+
+**The third binary is not used by this service at all**, and that is the part worth
+reading twice. It is in this image because this is where a Rust binary can be *built* —
+the maintenance container is Alpine with `sqlite3` and `curl` and has no toolchain — and
+the scheduler mounts it from here. So "the server image contains a money-moving binary"
+is true and does **not** mean the API runs a sweep: `entrypoint.sh` on this image starts
+`apikita-server` and nothing else.
 
 **Build it from the REPOSITORY ROOT**, not from `server/`:
 
@@ -152,20 +160,57 @@ still overrides it.
 docker run --rm -v apikita-data:/srv/apikita/server/data \
   --entrypoint /usr/local/bin/apikita-migrate apikita-server:latest
 
-# [3] then the new server
-docker run -d --name apikita-api -p 8080:8080 \
+# [3] then the new server.
+#     --stop-timeout IS REQUIRED, not tidiness. See "The stop window" below: the drain's own worst case
+#     is 10s, which is exactly Docker's default grace period, so without this the SIGKILL lands on the
+#     deadline and the drain loses.
+docker run -d --name apikita-api -p 8080:8080 --stop-timeout 30 \
   -v apikita-data:/srv/apikita/server/data apikita-server:latest
 ```
+
+### The stop window
+
+**`--stop-timeout 30` on the `docker run` above is load-bearing.** Docker sends `SIGTERM`, waits for the
+grace period (default **10 seconds**), then sends `SIGKILL`. `tini` forwards the signal but cannot extend
+that window.
+
+MEASURED, from `server/src/main.rs`'s own comment: **the drain budget is PER PHASE, not shared** — the
+serve loop gets `DRAIN_TIMEOUT` (5 s) and the task tracker gets `DRAIN_TIMEOUT` again, so the worst case is
+**2 × 5 s = 10 s**. The comment says this in as many words: *"the orchestrator's TERM-to-KILL deadline is
+what actually bounds the whole thing. Do not read DRAIN_TIMEOUT as the total."*
+
+**10 s of worst-case drain inside a 10 s window is no margin at all.** A half-open upload that uses its
+full first phase leaves the second phase with nothing before the kill — and the failure mode is the one the
+drain exists to prevent: connections cut with no log line, which is precisely the 35-minute hang that was
+fixed before it.
+
+30 s gives the two-phase worst case 3× headroom. **A kill mid-drain is silent**, so this is the kind of
+setting that is only noticed by its absence, in production, on the one deploy where a client was slow.
 
 **What the image guarantees, and how each is verified in CI:**
 
 | Property | Why | Verified by |
 | --- | --- | --- |
-| Runs as **uid 10001, non-root** | It holds a writable database and provider credentials in its environment | `docker run … --entrypoint id` |
-| **No toolchain or package manager** | A compiler in the runtime image is attack surface with no operational use | the runtime stage copies only the two binaries |
-| `/srv/apikita/server/data` exists and is **writable by the runtime user** | A fresh volume with a root-owned directory fails on first start with "unable to open database file" | the probe in the smoke step |
-| A **working `HEALTHCHECK`** | An always-red probe turns a healthy deploy into a restart loop | the smoke step requires the container to *report healthy* |
-| The container's shutdown is **graceful** | `tini` reaps and forwards signals to the whole process group | `ENTRYPOINT` exec form |
+| Runs as **uid 10001, non-root** | It holds a writable database and provider credentials in its environment | `tools/backup-check` reads the runtime stage: a `USER` line must be present, must not be root, and must name an account that stage actually creates |
+| **No toolchain or package manager** | A compiler in the runtime image is attack surface with no operational use | the smoke step greps for `apt`, `apt-get` and `dpkg`, which regressed once already |
+| `/srv/apikita/server/data` exists and is **writable by the runtime user** | A fresh volume with a root-owned directory fails on first start with "unable to open database file" | the probe in the smoke step: it migrates and starts on a fresh volume |
+| A **working `HEALTHCHECK`** | An always-red probe turns a healthy deploy into a restart loop | the smoke step requires the container to *report healthy*, then re-reads the documented body |
+| The container's shutdown is **graceful** | `tini` reaps and forwards signals to the whole process group | `ENTRYPOINT` exec form — **read from the Dockerfile, not asserted by a check** |
+| **The stop window is longer than the drain** | `tini` forwards the signal but cannot extend Docker's grace period, so the window has to exceed the drain's 2 × `DRAIN_TIMEOUT` worst case | **The operator's `--stop-timeout` flag** — see "The stop window". Nothing in the image can enforce it, and CI does not test the stop path at all (it cleans up with `docker rm -f`, which SIGKILLs) |
+
+> **This table used to overstate three of its rows, and the cells were the reason nobody looked.**
+> The non-root row named `docker run … --entrypoint id`; the package-manager row named a property of
+> the build rather than a check; the shutdown row named the `ENTRYPOINT` form. **No workflow step and
+> no tool check ran any of them.** MEASURED: deleting `USER apikita` from `server/Dockerfile` — so
+> the container runs as **root**, holding the money database and the provider credentials — left
+> `backup-check`, `compose-check` and `ci-docs-check` all at exit 0, and the smoke step would not
+> have caught it either: it polls the health status, checks the health body, and greps for
+> `apt`/`dpkg`, all of which a root container satisfies.
+>
+> The non-root row is now genuinely checked. The package-manager row names the grep that runs. The
+> shutdown row says plainly that it is **read, not asserted** — `tini` is in the `ENTRYPOINT` line
+> and a check could pin it, but a cell claiming a verification that does not exist is worse than a
+> cell admitting there is none, because the first is why nobody checks.
 
 **One entrypoint, two verbs.** The image's `ENTRYPOINT` is `tini -- apikita-server`;
 running the migration means overriding it with `--entrypoint`. There is no
@@ -227,7 +272,7 @@ a *given* value means. It cannot detect that the two values disagree.
 
 A mismatch is never diagnosed as a mismatch, and the two directions are not equally
 bad. The server calls Snap *before* it writes anything, and only inserts the top-up row
-once that call succeeds ([`server/src/routes/account.rs:558-572`](../server/src/routes/account.rs)):
+once that call succeeds (the Snap call and the INSERT are in `create_topup` in [`server/src/routes/account.rs`](../server/src/routes/account.rs), with the top-up row written last):
 
 - **Server sandbox, browser production.** The server's Snap call is rejected, so no
   top-up row is ever written. Nothing is charged and nothing is left pending — the
@@ -268,7 +313,9 @@ The wallet ledger is the business.
 - **PITR, or at minimum daily snapshots**, retained off-host.
 - **Test a restore before launch.** An untested backup is a belief.
 - Back up **before every migration** — the cheapest rollback is a restore.
-- PocketBase needs backing up too: losing it loses logins, though not money.
+- There is no second store to back up: identity lives in the same SQLite file
+  (`accounts` + `identities`), so one tested restore covers money and logins
+  together — see [`backup-and-restore.md`](backup-and-restore.md).
 
 ## What can go wrong, and the response
 
@@ -286,12 +333,71 @@ The wallet ledger is the business.
 
 ## Open items
 
-- [ ] CI provider — GitHub Actions assumed. Stages specified in
-      [`ci-cd.md`](ci-cd.md).
+- [x] CI provider — **GitHub Actions**, settled. The stages are this repository's
+      `.github/workflows/ci.yml` (28 steps); see [`ci-cd.md`](ci-cd.md).
+      > **This box said `[ ]` "GitHub Actions assumed" and was stale.** Two other
+      > documents already recorded it as decided — `ci-cd.md`'s own open items list it
+      > `[x]`, and `decisions.md` carries the row "CI provider | **GitHub Actions** |
+      > Assumed; only changes if the repo moves". The workflow has been the CI in
+      > practice for the whole life of this file. A settled decision left as open in the
+      > one document a deployer reads first is how a working pipeline gets treated as
+      > unproven.
 - [x] Migration tool: **sqlx migrate** — [`ci-cd.md`](ci-cd.md).
 - [x] Migrations run in CI, after a snapshot and before the server deploy —
       see [`ci-cd.md`](ci-cd.md).
 - [ ] Rollback drill: rehearse a bad deploy and a restore before launch — procedure
       in [`backup-and-restore.md`](backup-and-restore.md).
+      **The rehearsal is now executable**: [`tools/rollback/drill.sh`](../tools/rollback/README.md)
+      snapshots a migrated database, applies a deliberately destructive migration, proves
+      `tools/reconcile/reconcile.sh` **detects** the damage, restores, and asserts the
+      restored file carries the **pre-migration** `_sqlx_migrations` version — the
+      assertion that distinguishes a rollback from a restore. It is CI-checked, and its
+      check states which of its assertions are *not* mutation-covered. **What remains is
+      running it against the real schema**, the same prerequisite the restore drill has.
 - [ ] Staging environment, or deploy straight to production? (Currently no staging
       is specified anywhere.)
+- [ ] **The maintenance scheduler is not deployed.** Every recurring job the system relies on
+      runs from **one container**: the `scheduler` service (`.docker/maintenance/`,
+      `maintenance-entrypoint.sh`), whose `run_wired_jobs` calls `run_retention`,
+      `run_reconcile`, `run_hold_sweep`, `run_credit_expiry`, `run_alert_checks` and
+      `run_alert_probes`. It is
+      **not** a step in the pipeline above, and **no other section of this document names
+      it** — this item is the only place it appears.
+      > **The list above is the reason this item is worth re-reading rather than trusting.**
+      > It said five calls and omitted `run_credit_expiry`, which was added to
+      > `run_wired_jobs` when the credit-expiry sweep was finally wired to run. A job list
+      > that a reader takes as complete is exactly how the scheduler's coverage drifts out of
+      > step with the schedule, so the six names above are the ones `run_wired_jobs` actually
+      > calls.
+      > **This item is also the correction of its own measurement, and the wording matters.**
+      > Before this was written, the word `scheduler` and the word `maintenance` appeared in
+      > this file **zero times** while `server` appeared 52 — which is what made the omission
+      > a deployment-step gap rather than a docs nit, and that count is what the sentence
+      > used to report. Left as written it became false the moment it was committed: a
+      > sentence asserting "the word `scheduler` does not appear in this file at all" IS the
+      > word appearing in the file, so a reader arriving after the fix finds the claim
+      > contradicted by the paragraph carrying it. The measurement is therefore stated in the
+      > past tense, as what was true of the file BEFORE, which is the only form a correction
+      > can take without refuting itself. Same shape as every other note in this repository
+      > that records a defect it also fixes.
+      > **And 52 is case-insensitive, which the number does not say.** Re-running it
+      > case-sensitively gives **48**, because 4 of the occurrences are capitalised `Server`.
+      > Both are correct counts of a different thing, and a figure that a reader can
+      > reproduce only by guessing the method is the same defect as one that is wrong. The
+      > past-tense claim is `scheduler` and `maintenance` **0**, `server` **52** counting
+      > case-insensitively (48 lower-case + 4 capitalised), and 0 is insensitive to the
+      > method, which is the part that carries the argument.
+      > **Why it is easy to miss.** The jobs are written, tested and CI-smoked, and several
+      > documents describe the scheduler as *what enforces retention* — so every retention
+      > and expiry claim reads as satisfied. But a job that is built and smoked is still a
+      > **deployment decision** away from running. What is actually at stake, in order:
+      > `data-retention.md`'s deletion windows (data kept longer than the page promises),
+      > credit expiry (which therefore never fires — see the checklist), the nightly
+      > reconcile (drift goes unnoticed), the hold sweep (stranded reservations accumulate),
+      > and both alert jobs (nobody is told).
+      > **What a fix looks like, as a deployment step rather than a code change:** build
+      > `.docker/maintenance/Dockerfile`, deploy it as a long-running service with the same
+      > mounts `docker-compose.yml` gives the local one, and give it the database plus the
+      > alert channel. This is deliberately not done here — it needs the provider and the
+      > channel, which are the same operator inputs the alert gate is blocked on.
+      > **Tracked** in the launch checklist as its own gate.

@@ -1,0 +1,30 @@
+---
+// The operator surface — the UI docs/server/api-spec.md has always described as
+// absent ("There is no admin UI — routes only").
+//
+// Auth = session cookie. The page is a static shell: the island reads
+// GET /api/me, reveals the console only for an operator, and every request it
+// makes is re-authorised server-side. Nothing here decides access.
+//
+// Contract: docs/admin-surface.md, docs/server/api-spec.md (Admin routes).
+import AdminLayout from '../../layouts/AdminLayout.astro';
+import AccountAdmin from '../../islands/admin/AccountAdmin.astro';
+---
+
+<AdminLayout title="Admin">
+  <header class="max-w-3xl">
+    <h1 class="text-2xl font-semibold tracking-tight">Operator console</h1>
+    <p class="mt-3 text-sm text-ink-muted">
+      Look up an account by id and suspend or resume it. Suspending revokes every
+      live session and API key for that account in one transaction; the action and
+      its audit row are written together, so a rolled-back action leaves no trail.
+    </p>
+    <p class="mt-3 text-sm text-ink-muted">
+      This surface is deliberately narrow. It is read-only plus suspend/restore:
+      there are <strong>no money actions</strong>, no key reveal, and no way to read a
+      customer's credentials. An operator cannot act on their own account.
+    </p>
+  </header>
+
+  <AccountAdmin />
+</AdminLayout>

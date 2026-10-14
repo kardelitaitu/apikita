@@ -15,6 +15,19 @@ const lead = 'Choose a new password. Saving it signs out every session on this a
   lead={lead}
 >
   <form id="reset-confirm" class="mt-6 space-y-4">
+    <div id="email-field" hidden>
+      <label for="email" class="block text-sm font-medium">Email</label>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        autocomplete="email"
+        class="mt-1 w-full rounded-md border border-edge-strong bg-surface-sunken px-3 py-2 text-sm focus:border-brand focus:outline-none"
+      />
+      <p class="mt-1 text-xs text-ink-muted">
+        The address this reset was requested for. Usually filled in from the link.
+      </p>
+    </div>
     <div>
       <label for="password" class="block text-sm font-medium">New password</label>
       <input
@@ -54,8 +67,8 @@ const lead = 'Choose a new password. Saving it signs out every session on this a
 </AuthLayout>
 
 <script>
-  import { pb } from '../../lib/pocketbase';
-  import { confirmationError, describeAuthError, passwordRuleError, PASSWORD_RESET_DONE_MESSAGE, readAuthToken, withoutAuthToken } from '../../lib/auth-flow';
+  import { confirmPasswordReset } from '../../lib/auth-api';
+  import { confirmationError, describeAuthError, passwordRuleError, PASSWORD_RESET_DONE_MESSAGE, readAuthEmail, readAuthToken, withoutAuthToken } from '../../lib/auth-flow';
 
   const errorBox = document.getElementById('auth-error') as HTMLDivElement;
   const done = document.getElementById('auth-done') as HTMLDivElement;
@@ -64,12 +77,30 @@ const lead = 'Choose a new password. Saving it signs out every session on this a
   const submit = document.getElementById('reset-confirm-submit') as HTMLButtonElement;
 
   const token = readAuthToken(window.location.search);
+  const emailField = document.getElementById('email-field') as HTMLDivElement;
+  const emailInput = document.getElementById('email') as HTMLInputElement;
+
+  // The link carries the address, because the API's confirm endpoint requires the
+  // token and the address to AGREE and will refuse a pair that does not. Reading it
+  // from the query beats asking the user to retype what they typed a minute ago;
+  // the field below is the fallback for a link that arrived without one.
+  const address = readAuthEmail(window.location.search);
+  if (address !== null) {
+    emailInput.value = address;
+  } else {
+    emailField.hidden = false;
+    emailInput.required = true;
+  }
 
   // Spec line 95: the token must not be echoed back in a URL that gets logged.
   // Removed from the address bar before the request, so it is not in the history
   // entry, in a copied link, or in the referrer of the next navigation. The token
   // is never written to the title, to storage, or to any other place — it lives
-  // in this closure and in PocketBase's own auth store.
+  // only in this closure.
+  //
+  // The ADDRESS is not stripped with it: it is not a credential, it is the value
+  // the user is about to submit, and leaving it visible would be the more honest
+  // state. Only the token is a secret.
   if (token !== null) {
     window.history.replaceState(null, '', withoutAuthToken(window.location.href));
   }
@@ -96,19 +127,31 @@ const lead = 'Choose a new password. Saving it signs out every session on this a
       const data = new FormData(form);
       const password = String(data.get('password') ?? '');
       const confirmation = String(data.get('passwordConfirm') ?? '');
+      const addressTyped = String(data.get('email') ?? emailInput.value).trim();
 
       const local = passwordRuleError(password) ?? confirmationError(password, confirmation);
       if (local !== null) {
         showError(local);
         return;
       }
+      // The API refuses a token/address pair that disagrees, so an empty address
+      // is worth catching here: the 401 it would earn says nothing about which of
+      // the two was wrong.
+      if (addressTyped === '') {
+        showError('Enter the email address this reset was requested for.');
+        return;
+      }
 
       setBusy(true);
-      // PocketBase invalidates the token on use and rotates the record's tokenKey
-      // with the new password, so every session on the account is signed out.
-      void pb.collection('users').confirmPasswordReset(token, password, confirmation)
+      // ONE request BY DESIGN, and the order of the three things the handler does
+      // is the security property: it consumes the token, sets the hash, and THEN
+      // revokes every live session on the account. A reset is what someone does
+      // when they believe their credential leaked, so a session opened with the
+      // old password surviving it would defeat the whole gesture. Nothing needs
+      // clearing here — every one of those sessions was server-side, and the
+      // browser's cookie is already dead.
+      void confirmPasswordReset(token, addressTyped, password)
         .then(() => {
-          pb.authStore.clear();
           form.hidden = true;
           doneMessage.textContent = PASSWORD_RESET_DONE_MESSAGE;
           done.hidden = false;

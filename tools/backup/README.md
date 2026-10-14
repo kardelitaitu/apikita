@@ -22,9 +22,22 @@ Both are exit-code gates here, never warnings.
 ```sh
 export DATABASE_URL='sqlite://data/server.db'                    # local dev only
 export BACKUP_ENCRYPTION_KEY='<key from your secret manager>'    # REQUIRED
-export OFFSITE_CMD='rclone copy "$1" remote:apikita-backups'
+
+# Either shape works. Both are tested by tools/backup-check/.
+export OFFSITE_CMD='rclone copy "$1" remote:apikita-backups'                 # inline
+export OFFSITE_CMD='sh /usr/local/bin/upload-offsite.sh'                     # a script
+
 sh tools/backup/backup.sh
 ```
+
+**Both hook shapes are supported, and that is now enforced.** The artifact is appended
+to `OFFSITE_CMD` before it runs, so an INLINE command sees it as `$1` and a SCRIPT
+receives it as its own first argument. This was **broken for the script shape**: the
+hook was invoked as `sh -c "$OFFSITE_CMD" apikita-offsite "$ARTIFACT"`, where the
+`name` argument becomes `$0` *inside* the command - so a script got **nothing**,
+while the backup printed *"offsite hook succeeded"* and exited 0. The one outcome this
+tool exists to prevent, a backup that never left the machine, was reachable through
+the ordinary hook. `tools/backup-check/check.sh` now runs both shapes in CI.
 
 ### Environment
 
@@ -203,7 +216,6 @@ for whoever wires the cron job, not a default to invent here.
 | **Scheduling** | Nothing runs this yet: no cron, no compose service, no CI job. `tools/reconcile/` has the same gap. |
 | **PITR (RPO 15 minutes)** | **This tool does not meet the doc's RPO.** A daily snapshot loses up to 24 hours; the 15-minute RPO comes from continuous WAL archiving / managed PITR, which the doc's open item assigns to `wal-g` or a managed offering. Nothing here implements it. SQLite makes this *easier* than Postgres did - the `-wal` file can be archived - but nothing here does it. |
 | **The restore drill** | The doc's quarterly rehearsal, with the ledger-reconciliation gate, is `tools/drill/drill.sh`. This tool proves an artifact is *readable and intact*, not that it *restores*; the drill is what proves that. |
-| **PocketBase** | The doc ranks it below the money database but it is not backed up here at all. |
 
 ## Verified status
 

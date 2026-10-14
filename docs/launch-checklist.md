@@ -14,8 +14,13 @@ choices live in [`decisions.md`](decisions.md).
 **Cannot be skipped and cannot be deferred.** Two items here determine whether the
 business can operate at all.
 
-- [ ] Read the resale terms of the intended upstream provider, in full.
-- [ ] Record the outcome in [`config/provider1.md`](../config/provider1.md).
+- [x] Read the resale terms of the intended upstream provider, in full.
+      **Done by direct conversation with the reseller, not by reading a posted
+      document.** The provider is a reseller with no published resale-terms page, so
+      the terms were settled in the negotiation itself. The outcome is recorded in
+      [`config/provider1.md`](../config/provider1.md): resale is permitted, and the
+      account carries **10x the concurrency limit of an ordinary account** to start.
+- [x] Record the outcome in [`config/provider1.md`](../config/provider1.md).
 - [ ] Decide the contracting entity (personal or PT) — affects dispute posture,
       volume ceiling, and tax.
 > **Gate 0 partial — owner-deferred.** The legal review below is **deferred by decision**
@@ -31,6 +36,33 @@ business can operate at all.
       §"Genuinely open": outbound transfers without a PT, PP 55/2022 on refunded
       revenue, KYC/AML on a payee identified by email, and unclaimed balances.
 - [ ] Publish the Terms of Service, including the cross-border forwarding disclosure.
+      **The document cannot be published as it stands, and not only for legal reasons:**
+      §10 "Contact and complaints" is now written as a **clause** — 10.1 to 10.8, with its
+      response times taken from [`abuse-runbook.md`](abuse-runbook.md) — but every contact
+      detail in it is a **placeholder token** (`[[ABUSE_EMAIL]]`, `[[OWNER_LEGAL_NAME]]`),
+      and the document contains **no address, URL or named form anywhere** (checked — a scan
+      for any email or http URL in it returns zero). The abuse-contact row of its own "What
+      must be true at launch" table is therefore unmet on the ***Terms* half as well as
+      the operational half** — the clause is what will be published, and the tokens are what
+      still stops it. Writing a plausible address would make the published Terms
+      promise a channel nobody monitors, which is the failure that table's own warning
+      ("a policy claiming something the code does not do") describes. **Blocked on a
+      mailbox and an owner, not on code** — tracked in
+      [`abuse-runbook.md`](abuse-runbook.md) as well, so the two agree.
+      > **This paragraph said the opposite until §10 was rewritten, and that is worth
+      > keeping.** It read "§10 is a requirements list rather than a clause", which was true
+      > when written and stopped being true the moment §10 became one. It is recorded rather
+      > than silently edited because the sentence was load-bearing in an argument: it was the
+      > evidence that the *Terms* half of this gate was unmet. An argument whose premise is
+      > edited out of existence reads as though it never had one, and its conclusion — still
+      > unmet, for a different reason — would then look asserted rather than shown. The
+      > premise moved from "no channel is named" to "the channel is a token that cannot yet be
+      > filled"; the conclusion did not move.
+      > **Three places state this gate and they must move together:** this item, §10's own
+      > "Before publishing this section" checklist, and
+      > [`abuse-runbook.md`](abuse-runbook.md)'s open item, whose text still calls §10 a
+      > requirements list. Reconciling one and not the others is how a reader ends up holding
+      > two live descriptions of one gate.
 - [ ] Publish a privacy policy matching [`data-retention.md`](data-retention.md).
 
 **Do not take a single deposit before this gate closes.** Wallet funds collected
@@ -41,14 +73,56 @@ recoverable.
 
 - [ ] A persistent volume provisioned for the SQLite database file (no database
       instance to provision), and a backup of it tested by restore.
-- [ ] PocketBase deployed and reachable.
+- [x] Identity served by the Rust server itself, with no separate identity
+      instance running. **Phase 6 has landed.** The code half is done and is the
+      shipped state rather than an end state to reach: `accounts.pb_user_id` is
+      dropped, the PocketBase HTTP client is gone from `server/`, and `accounts` +
+      `identities` are served natively with Argon2id. See
+      [`architecture/identity.md`](architecture/identity.md).
+      The tick is for the CODE half only. The operational half — *no separate
+      identity instance is running in the deployment* — is verified by deploying
+      and observing, which is Gate 1's remaining work; there is nothing left in
+      this repository that could make it true or false.
 - [ ] Edge relay deployed; nginx configured with `proxy_buffering off` on `/events`.
+      **The configuration half is DONE and guarded; only "deployed" is open.** The shipped
+      relay config (`.docker/nginx/relay.conf`) already sets `proxy_buffering off` on the
+      `/events` location — the setting SSE needs, since a buffering proxy holds frames until
+      its buffer fills and a customer sees a wallet that never updates — and
+      `tools/relay-check/check.sh` asserts it, so it cannot regress silently. What is left is
+      provisioning the VPS, which no repository change can make true.
 - [ ] Automatic certificate renewal on the relay **and** on the backend.
+      > **No repository half.** Nothing under `.docker/` or `tools/` configures `certbot`, an
+      > ACME client, or a renewal timer, so unlike its neighbours this gate is *entirely*
+      > operational — there is no partial credit to record. Stated explicitly because the two
+      > gates either side of it DO have a done half, and a reader should not have to check
+      > each one to find out which kind it is.
 - [ ] Backend serves a valid certificate for the public hostname (required for
       failover — see [`topology.md`](topology.md)).
+      > **No repository half**, for the same reason: certificates are issued to a hostname in
+      > a live environment. Nothing here can be verified ahead of a deploy.
 - [ ] Health checks configured: relay and backend independently.
+      **Both halves are written; neither is running.** The backend image carries a
+      `HEALTHCHECK` that probes its own health endpoint, and `docker-compose.yml` gives the
+      relay a `wget` probe against `/healthz`. The compose file is the LOCAL stack — see the
+      scheduler gate, which is the same gap one level up — and both probes need a deployed
+      environment to mean anything.
 - [ ] Failover path tested (relay down -> backend serves).
+      > **No repository half, and it is the one gate here that cannot be simulated
+      > meaningfully.** "Relay down" is a real network condition; a local test would exercise
+      > the failure of a process, not of a path. Note also that `tools/alert/probe.sh` watches
+      > for it — `relay_down` is one of the alerts it evaluates, and `alerts.tsv` marks it
+      > **covered** on the grounds that liveness is externally observable — so the DETECTION
+      > is built and the rehearsal is what remains.
 - [ ] Backups running, **offsite**, encrypted, and verified to produce a sane size.
+      **Four of the five words are implemented and guarded; "running" is open.**
+      `tools/backup/backup.sh` takes the copy, verifies it is a readable database
+      (`integrity_check`, exit 5 on an empty or corrupt copy rather than a warning),
+      **encrypts** it (openssl AES-256-CBC, PBKDF2, 200k iterations, exit 7 if the artifact
+      does not decrypt), runs the **offsite** hook (exit 8 on failure; an unset `OFFSITE_CMD`
+      is exit 1, so a missing offsite copy can never read as success), and prunes old
+      artifacts without ever removing the newest. `tools/backup-check/check.sh` pins those
+      behaviours, including that no plaintext dump is ever written. What remains is running it
+      on a schedule against a real volume and a real offsite target — both operator inputs.
 
 ## Gate 2 — Money correctness
 
@@ -57,37 +131,183 @@ opinion.
 
 ### Webhook
 
-- [ ] Signature verified on every request; mismatches rejected and logged.
-- [ ] Amount validated against the **stored** `topups` row, never the payload.
-- [ ] Crediting is idempotent by `order_id`.
-- [ ] Crediting is atomic with the `topups` status update and the ledger row.
-- [ ] `refund` and `partial_refund` statuses **refused, not handled**: a signed
+- [x] Signature verified on every request; mismatches rejected and logged.
+- [x] Amount validated against the **stored** `topups` row, never the payload.
+      The check is IN the settling statement, not before it: `credit_topup_transaction`
+      updates `WHERE order_id = ? AND status = 'pending' AND amount_idr = ?`, so the stored
+      amount is the guard rather than something read and compared. Held by
+      `only_a_fresh_settle_announces_a_balance` (`routes/webhooks.rs`), which asserts
+      `AmountMismatch` is produced. **Named because this item did not name it**: a reader
+      could see the tick and not know whether a wrong amount was rejected or merely logged.
+- [x] Crediting is idempotent by `order_id`.
+      Two mechanisms, both real and neither previously named here. The statement above is
+      the first: a replayed webhook finds `status = 'settled'`, matches no row, and takes the
+      `AlreadySettled` branch — no money moves. The second is that the branch is then
+      **tested**: `live_webhook_settlement_credits_exactly_once_and_a_replay_does_not` and
+      `credit_topup_settles_replays_and_refuses_bad_input` (`routes/webhooks.rs`, `db.rs`),
+      plus `a_settlement_replayed_after_a_refund_is_refused_and_credits_nothing` for the
+      refund interaction.
+- [x] Crediting is atomic with the `topups` status update and the ledger row.
+      **Half of this is the TYPE SYSTEM and half is the test suite**, measured because the item
+      named neither. `Transaction::commit(self)` CONSUMES the transaction, so the realistic
+      early-commit bug (commit after the status update, before the ledger row) does not compile
+      at all - `error[E0382]: borrow of moved value: tx`, since every later `&mut *tx` is a
+      borrow-after-move. That half cannot regress without failing the build.
+      The half a test can reach is pinned heavily: replacing the three writes' `&mut *tx` with
+      `pool` - the "someone refactored the transaction away" bug, which compiles fine - fails
+      **74 tests**, including `concurrent_requests_cannot_overdraw_a_one_request_balance`. The
+      detail lives on `db::credit_topup_transaction`.
+- [x] `refund` and `partial_refund` statuses **refused, not handled**: a signed
       refund notification returns 200 with `{"status":"refund_not_supported"}`,
       logs at `error!`, and writes nothing — the topup stays `settled`, no ledger
-      row is appended, the wallet cannot move. **Alerting on that refusal is what
-      makes it visible** — unalerted, a refusal is indistinguishable from a bug.
+      row is appended, the wallet cannot move.
+      Held by `a_refund_notification_is_never_classified_as_a_debit`,
+      `a_refund_refusal_is_logged_under_its_own_documented_event` and
+      `a_settlement_replayed_after_a_refund_is_refused_and_credits_nothing`
+      (`routes/webhooks.rs`). The classification itself lives in
+      `money::evaluate_payment_status`, which maps the two refund statuses to
+      `RefundRefused` and deliberately has **no catch-all** that would let an
+      unrecognised status through as a credit.
+- [x] **Alerting on that refusal** — previously the ONE outstanding code-shaped item
+      in this group. `server/src/routes/webhooks.rs` now emits `event = "refund.refused"`,
+      a DISTINCT name from `topup.rejected` because they mean opposite things (a
+      rejection is a failed payment that may owe money; a refusal is a refund declined
+      by policy, i.e. the system working — sharing the name would page on routine
+      enforcement and hide a refusal spike inside a rejection count). `alerts.tsv` carries
+      the entry and `probe.sh --check refund_refusal` scans for it with its OWN
+      line-offset marker, so it and `topup.rejected` cannot consume each other's events.
+      Why alert on correct behaviour: a refusal is the one webhook outcome where NOTHING
+      moves, which is also what a status-mapping regression routing real events into this
+      arm would look like. Tested
+      (`a_refund_refusal_is_logged_under_its_own_documented_event`, mutation-verified
+      against an event rename), and the probe's marker behaviour was exercised end to end:
+      alerts once, reports 0 on the next scan, and leaves the rejection check still seeing
+      its own event.
 
 ### Ledger and balance
 
-- [ ] **No client-reachable path can write `balance_idr`.**
-- [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase.
+- [x] **No client-reachable path can write `balance_idr`.** **Enforced** by
+  `money::tests::ledger_is_append_only::no_route_writes_the_wallet_balance_directly`, which
+  scans every `.rs` under `server/src/routes/` and fails on an `UPDATE wallets` or
+  `INSERT INTO wallets` in shipped code. Scoped to the route modules because that is where
+  client-reachability comes from: `bin/hold-sweep.rs` legitimately updates the balance in a
+  transaction that also writes the ledger row, and `identity/accounts.rs` inserts a wallet at
+  zero at signup - neither is reachable from a request, so neither is what the claim says.
+  The scan cuts at `#[cfg(test)]`, which is load-bearing rather than tidiness: four route
+  modules write wallets directly in their FIXTURES, so without the cut it would fail on a
+  clean tree. It asserts it read more than five files, the same non-vacuity control the
+  ledger scan beside it uses. Before this existed the claim was true by inspection and held
+  by nothing - MEASURED: planting a direct `UPDATE wallets` in a route left all 636 tests
+  green.
+- [x] `ledger` is append-only; no UPDATE or DELETE exists in the codebase. **Enforced** by
+  `money::tests::ledger_is_append_only::no_source_statement_mutates_the_ledger`, which scans
+  every `.rs` under `server/src` and fails on either statement. It was true by inspection
+  before that test existed, and the scan asserts it read the tree so it cannot pass
+  vacuously.
 - [x] The reconciliation query returns **zero rows** on production data.
-- [ ] `CHECK (balance_idr >= 0)` present and exercised.
-- [x] Money is `BIGINT` end to end; no float appears in any billing path.
+      **The tick is for the CODE half only**, in the sense this file uses elsewhere. What is
+      established here, and guarded: the query is a `FULL OUTER JOIN` that reports drift in
+      both directions (`tools/reconcile/reconcile.sql`), and `tools/reconcile-check`
+      mutation-tests it against a migrated database — a consistent fixture passes, a drifted
+      one fails and names the account, and the stranded-hold predicate is checked separately.
+      What is **NOT** established, and no repository change can establish: that the *live*
+      database returns zero rows. That is a reading of a deployed database. This box sits in
+      Gate 2 with the code-shaped items rather than with Gate 5's operational ones, so unlike
+      the backup-key item at the end of this gate - which is left UNTICKED precisely because
+      its truth is a deployment decision - the tick here could be read as covering both
+      halves. It covers the code half. Run the query against production before relying on it.
+- [x] Money is `INTEGER` IDR **in storage and at every function boundary**; no money quantity is
+      held as a float. (Was `BIGINT` under Postgres; `STRICT` SQLite tables reject `BIGINT`, so
+      the type is now `INTEGER` — see `decisions.md` §Money.)
+      **This used to read "no float appears in any billing path", which was FALSE as written.**
+      Floats are used deliberately in the PRICING arithmetic and the money module says so
+      itself: the doc-comment on `money::calculate_token_cost_idr` records that "the rates are
+      f64 per million tokens and the arithmetic is on the SCALED quantity, then a single
+      saturating cast to i64". Both money-returning functions (`calculate_token_cost_idr`,
+      `calculate_preflight_reservation_idr`) return `i64`, and `balance_idr` / `delta_idr` /
+      `amount_idr` / `cost_idr` are `INTEGER` in every migration that declares them - so the
+      storage claim was true and the sentence overstated it.
+      The overstatement is worth naming rather than quietly deleting, because the f64 step has a
+      MEASURED consequence that this line was hiding. The doc-comment on
+      `money::tests::the_charge_scales_exactly_with_the_units_billed` records that the f64
+      product can land a few billionths above an exact whole number, so the ceiling then bills a
+      whole extra rupiah - and states the honest answer to "can this ever overcharge?" as **BY
+      ONE RUPIE PER REQUEST** relative to exact proportionality, whenever the true total lands on
+      a whole number, not scaling with the amount. That is documented in the money module and is
+      not something a reader would infer from "no float appears in any billing path".
+- [x] `CHECK (balance_idr >= 0)` present and exercised.
+      **The CHECK is a BACKSTOP, not the mechanism, and the item did not say so.** Forcing a
+      full debit onto a short wallet would drive the balance negative and the CHECK would
+      refuse it — which is why `clamp_debit` exists: it floors the debit at the balance so the
+      constraint is never reached on a normal path. `db::clamp_debit`'s doc-comment states this
+      directly ("the backstop rather than the thing that refuses the debit"), and
+      `clamp_debit_holds_every_money_invariant_over_the_whole_domain` exercises it across the
+      boundary grid (`i64::MIN`, `i64::MAX`, zero, near-zero, and 40,000 fixed-seed pairs), so
+      "exercised" is a claim with a named test rather than an assertion.
 
 ### Billing accuracy
 
-- [ ] **Cache-read tokens are never counted as input tokens** — test with a payload
+- [x] **Cache-read tokens are never counted as input tokens** — test with a payload
       containing cache hits.
+      `cache_read_tokens_are_never_priced_as_input_tokens` (`money.rs`) is the pricing half;
+      `live_get_usage_keeps_the_three_token_classes_separate` (`routes/account.rs`) is the
+      storage half, against a live request. Two halves, two tests, named because the item
+      named neither.
 - [x] Three token classes stored separately in `usage_daily`.
-- [ ] Peak/off-peak basis applied consistently between reservation and settlement.
+      Same two tests as the item above — the storage half is exactly what this claims.
+- [x] Peak/off-peak basis applied consistently between reservation and settlement.
+      `the_off_peak_rate_path_is_exercised_and_is_exactly_half_of_peak` is the consistency
+      claim; `off_peak_is_never_dearer_than_peak_in_any_shipped_model` and
+      `a_model_without_peak_rates_is_refused_at_validate` (`config.rs`) guard the config side,
+      so a rate table that inverted the basis is refused at load rather than at settlement.
+
+> **These boxes were UNCHECKED while the work was already done and tested** — the
+> same drift this file has been corrected for before. Each was verified against the
+> code and its tests before being ticked, not inferred from the fact that the suite
+> is green:
+>
+> | Item | Evidence |
+> | --- | --- |
+> | Signature verified | `verify_midtrans_signature` in `money.rs` compares with `ct_eq` over SHA-512, pinned by known-vector tests |
+> | Stored-amount validation | the `SELECT status, amount_idr FROM topups WHERE order_id = ?` inside `credit_topup_transaction` (`db.rs`) tests status BEFORE the amount, so a `settled` row with a mismatched amount is a replay rather than a mismatch; `handle_midtrans_webhook` handles `AmountMismatch` |
+> | Idempotent crediting | the conditional UPDATE above is the claim; replay test asserts exactly one credit |
+> | Atomic credit | one `BEGIN IMMEDIATE` covers the status change, the wallet and the ledger row |
+> | Refunds refused | `evaluate_payment_status` in `money.rs` returns `PaymentAction::RefundRefused`; two live tests, incl. an inflated amount |
+> | No route writes `balance_idr` | all 7 UPDATE sites are in `db.rs` (transactional) or `bin/hold-sweep.rs` (operator tool) |
+> | `CHECK (balance_idr >= 0)` | `migrations/20260925000000_initial_schema.sql:66` |
+> | Cache-read not counted as input | `parse_usage_from_sse` in `upstream/client.rs` clamps with `cached.min(prompt)` so a malformed report cannot push the split negative; `a_cached_token_is_never_also_billed_as_an_input_token` asserts the arithmetic |
+>
+> **The refund-alerting box is explicitly OUTSIDE this group and left unticked**,
+> because it is the one part that is genuinely outstanding: the event is logged but
+> nothing watches it, and it is an ops task rather than a code defect.
 
 ## Gate 3 — Access control
 
 - [x] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
       dashboard endpoints.
+- [x] Cookie sessions are **rejected** on `/v1/*`; API keys are rejected on
+      dashboard endpoints.
+      *The first half is stronger than "rejected", and the difference matters before anyone
+      audits it.* `server/src/routes/proxy.rs` reads the credential from the
+      `Authorization: Bearer` header and **nothing else**: there is no code path in the
+      proxy that consults a cookie, so a session cookie cannot be accepted because there is
+      nowhere it would be read. "Rejected" describes a check that could be removed;
+      "never read" describes an attack surface that does not exist. Verifying this item means
+      looking for the ABSENCE of cookie handling in the proxy rather than for a 401, and a
+      reader who went looking for a rejection would find the guarantee, then wonder whether
+      the check enforcing it was tested. That is the question this note removes.*
 - [x] Logout revokes the session row; "sign out everywhere" revokes all of them.
-- [x] Suspension revokes sessions **and** keys atomically.
+- [x] Suspension revokes sessions **and** keys atomically. **Enforced** by
+      `routes::admin::suspend_account`, which opens one `begin_immediate` transaction and writes
+      the account status, the `sessions` revocation, the `api_keys` revocation (returning the
+      hashes the cache needs) and the `admin_audit` row on that single transaction, then commits
+      once. Measured: writing to the pool instead and dropping the transaction uncommitted -
+      which compiles - is **CAUGHT by 10 tests**, including
+      `a_failed_suspend_writes_no_audit_row` (a failed suspend must leave nothing behind) and
+      `suspend_revokes_every_live_session_and_every_live_key`. `BEGIN IMMEDIATE` rather than a
+      deferred BEGIN is deliberate and documented in the function: SQLite has no row locks and
+      rejects `FOR UPDATE`, so the write lock taken up front is what serialises two concurrent
+      suspends of one account.
 - [x] Admin endpoints require the operator flag; an operator cannot act on
       themselves.
 - [x] Every admin action writes an `admin_audit` row in the same transaction.
@@ -121,36 +341,290 @@ opinion.
 **Each of these is a statement made to customers. If the code contradicts it, the
 statement is false.**
 
-- [ ] Prompts and completions are never logged, stored, or sent to analytics.
-- [ ] No raw IP address is persisted; only a salted hash, salt deleted daily.
-- [ ] API keys stored as hashes only; the plaintext exists once, at creation.
-- [ ] Session tokens stored hashed; cookies are HttpOnly, Secure, SameSite.
-- [ ] `PUBLIC_*` variables contain nothing secret.
-- [ ] Backup encryption keys are held separately from the backups.
+- [x] Prompts and completions are never logged, stored, or sent to analytics.
+      **Enforced by a test**, not a review: `a_customer_prompt_never_reaches_the_log`
+      (`server/src/routes/proxy.rs`) drives a real request carrying a sentinel prompt
+      through the handler with a capturing subscriber installed at TRACE and asserts the
+      sentinel never appears, with a positive control so silence cannot pass.
+- [x] No raw IP address is persisted; only a salted hash, salt deleted daily.
+      **Enforced by a test**, not a review: `the_salt_is_stable_within_a_day_and_replaced_across_days`
+      (`server/src/ip_tracking.rs`) asserts the same day yields the same salt, the next day
+      mints a new one, and the replacement is then stable for the rest of that day - so the
+      property that matters is "a hash from yesterday cannot be recomputed today", and all
+      three halves of it are checked.
+      The module doc of `ip_tracking` states the rest — "**no raw IP is stored anywhere**. What
+      is stored is an HMAC ... under a salt that changes every day and is never written
+      down" — and `DailySalt` documents the salt as living in memory, from the OS RNG,
+      replaced at the UTC boundary. The column names are checked as well, so a migration
+      cannot quietly add a raw address beside them.
+      *This item used to cite only those documents, which understated it: a reader auditing
+      this checklist would conclude the rotation was inspection-only and re-verify it by
+      hand — the exact work the test was written to remove.*
+- [x] API keys stored as hashes only; the plaintext exists once, at creation.
+      `create_key` in `server/src/routes/keys.rs` calls `hash_token` on the full key
+      BEFORE the insert; only the hash is bound into the row.
+- [x] Session tokens stored hashed; cookies are HttpOnly, Secure, SameSite.
+      The cookie builder in `session_cookie` (`server/src/routes/auth.rs`) sets all
+      three, and `session_cookie_carries_expected_attributes` asserts the serialized
+      cookie CARRIES them, so the flags cannot be dropped silently.
+- [x] `PUBLIC_*` variables contain nothing secret.
+      No `PUBLIC_*` key is defined in `server/` or `config/`; the single mention is a
+      comment in `server/src/routes/account.rs` about the browser cross-checking its
+      own value. **Enforced for the case that actually leaks** by
+      `website/tests/public-secrets.test.ts`: it pins the set of `PUBLIC_` variables the
+      build can inline (only ones the source references are substituted) and fails if any
+      of them is named like a secret. That gap was real — the CI Secret scan checks
+      SOURCE files, while this mistake only exists in the BUILT output. Measured: a value
+      planted in `PUBLIC_API_BASE_URL` appears verbatim in `dist/_astro/errors.*.js`
+      with the build exiting 0.
+- [ ] Backup encryption keys are held separately from the backups. **Not ticked, and
+      different in kind from the five above.** `tools/backup/backup.sh` does its half
+      (refuses to write a plaintext dump, exit 6; AES-256-CBC with PBKDF2 200k
+      iterations; the key passed as `env:` so it never enters the process list), but its
+      own header records "the human decisions still open (offsite provider, key
+      handling)". Key custody is a DEPLOYMENT decision, not a property of this code, so
+      ticking it from a source read would be exactly the false customer statement this
+      section warns about.
 
 ## Gate 5 — Operational readiness
 
-- [ ] `/health` checks the process and the database, **not** upstream providers.
+- [x] `/health` checks the process and the database, **not** upstream providers.
+      `server/src/routes/health.rs` probes `SELECT 1` only; the doc-comment at
+      The `### Health` section of `docs/server/api-spec.md` states the rule and why (an upstream outage must
+      not look like a dead server and trigger a restart loop). Tested, including the
+      unauthenticated-body leak rules.
+<!-- alert-scheduling: wired -->
 - [ ] Alerts configured: webhook rejection, ledger drift, API down, circuit open.
-- [ ] **A restore drill has been run**, with the reconciliation query passing.
-- [ ] Drill log records the measured restore time — that is the real RTO.
-- [ ] Error responses match [`error-model.md`](error-model.md), including `request_id`.
-- [ ] SSE heartbeat runs; a dropped stream surfaces as a stale indicator, not a
+      **Every one of these is now CHECKED by `tools/alert`** — see `alerts.tsv`: **11 of its 12
+alerts are `covered`**, and the one exception is `relay_5xx` (`needs-metrics`), which needs nginx
+status counts from a SEPARATE HOST and so cannot be derived from the database or `/health` alone.
+`proxy_undercharge` was the second exception until the money layer began counting clamped settlements
+(`MoneyCounter`) and `probe.sh` gained a check that reads it. (This line said "9 of 10" until it
+was measured: the table has grown since, and nothing tied the sentence to the file - see
+`todo.md`, which now cites the same numbers.) "Configured" also means a delivery channel and
+a schedule, which are deployment decisions. **The code half is done AND THE COUPLING IS NOW IN PLACE** -
+`run_wired_jobs` invokes BOTH alert jobs every night alongside retention, reconcile and
+hold-sweep: `run_alert_checks` evaluates the database-backed alerts and `run_alert_probes`
+the HTTP ones, with the relay addressed by service name because `127.0.0.1` inside the
+container is its own loopback. **What still keeps this box unticked is the CHANNEL**: no
+delivery channel is configured, so a breach is reported as UNMONITORED rather than
+delivered — which is a deployment decision, and the run says so out loud rather than
+reporting an unmonitored night as clean.
+
+*(Correction: this line once asserted that NO SCHEDULE ran the alert checks. That was
+true when written and was invalidated by the two rounds that wired the jobs - the note
+existed to state what remained, and it was not revisited when the remaining thing got
+done. Kept as a note so the next reader knows the claim was checked, not paraphrased.)*
+- [ ] **A restore drill has been run**, with the reconciliation query passing. **The TOOL
+      is verified; the PRODUCTION run is not.** I exercised `tools/drill/drill.sh` end to
+      end against a synthetic migrated source: a full drill PASSED (exit 0) with
+      `reconcile.sh` reporting zero drifting rows and the spot-check comparing a real
+      wallet across source and restored copy. I also proved it DETECTS bad backups rather
+      than only ever passing — a corrupted artifact and a plausible-looking TRUNCATED one
+      both FAIL with exit 6. **What remains is running it against production data**, which
+      needs a deployed database and is why this box stays unticked:
+      The RTO section of `docs/backup-and-restore.md` records that the only measured RTO so far is
+      "**dev-sized**... the production number is unmeasured until the drill runs there."
+- [ ] Drill log records the measured restore time — that is the real RTO. **The log DOES
+      record it** (verified: `restore_ms 304` and `118` on my runs, alongside the result and
+      the artifact SHA-256), so the mechanism works. The number to record is a PRODUCTION
+      one; a dev-sized figure would be a claim we cannot stand behind.
+- [x] Error responses match [`error-model.md`](error-model.md), including `request_id`.
+      `error.rs` mints `req_<uuid>` per failure and puts it in the
+      body; `error_object` in that file is the helper every error test reads the body
+      through, and it fails unless the shape is exactly
+      `{error: {code, message, request_id}}` — so the shape is asserted by every error
+      test rather than by one that could be skipped.
+- [x] SSE heartbeat runs; a dropped stream surfaces as a stale indicator, not a
       silently frozen balance.
+      **Now enforced by tests on both halves.** Server: `HEARTBEAT_SECONDS` in `events.rs` sets a 25s
+      heartbeat (docs/realtime.md asks for 20-30s) and `:550` pins that window.
+      Frontend: the events store in `live.ts` marks itself `stale` on error, and
+      `a dropped stream keeps the last balance, marks it stale, and never relabels
+      polled data live` (`website/tests/live.test.ts`) asserts the last KNOWN balance
+      survives and that polled data is never presented as live — mutation-verified in
+      both directions.
 - [ ] Abuse-report contact published and monitored.
 
 ## Gate 6 — Product surfaces
 
-- [ ] Signup shows the cross-border disclosure before the first request.
-- [ ] Top-up screen states the fee and the non-refundable policy before payment.
-- [ ] Deposit minimums enforced server-side (first vs re-top-up differ).
-- [ ] API key shown once, with an acknowledged warning.
+- [x] Signup shows the cross-border disclosure before the first request.
+      The signup page (`website/src/pages/signup.astro`) carries a "Where your prompts go" block
+      above the submit control, naming the mainland-China provider and the retention
+      that is outside our control. **Pinned by a test**:
+      `signup discloses where prompts are forwarded, and does so before the submit
+      control` (`website/tests/landing-claims.test.ts`) asserts presence, the named
+      jurisdiction, AND the ORDERING — because the claim is "before the first request",
+      not "exists somewhere" (`privacy.astro` alone would not satisfy it).
+      **Was provisional, and no longer is.** This box was ticked while the disclosure
+      text and its test were already correct but the FORM around them still belonged to
+      a different identity provider, so the claim "before the first request" was pinned
+      only for the disclosure. The port has since closed that gap: the signup script
+      calls `website/src/lib/auth-api.ts` (`signupRequest`, `googleSignIn`) and
+      `website/src/lib/auth-flow.ts`, `website/src/lib/pocketbase.ts` is deleted, and
+      the crate serves identity itself. No identity service is part of this deployment,
+      so the box holds end to end with nothing outstanding behind it.
+- [x] Top-up screen states the fee and the non-refundable policy before payment.
+      The wallet page (`website/src/pages/dashboard/wallet.astro`) states the non-refundable policy
+      and the 2-year expiry, and the header flags that first-deposit and top-up minimums
+      differ. **Pinned by a test** (`the wallet states the non-refundable policy and the
+      expiry before the top-up action`).
+      > **This gate was ticked while the ORDER was wrong, and the tick is what hid it.**
+      > The test cited above asserted only that the phrases were PRESENT, while this line
+      > claims they come "**before payment**" — a different claim. Measured: the page
+      > rendered `<TopUpForm />` at offset 2607 and the non-refundable policy at 3275, so
+      > a customer met the payment form and only then read that the balance cannot be
+      > refunded. The test now asserts the ordering, and it strips HTML comments first —
+      > the page explains the rule in a comment that NAMES `<TopUpForm />`, so a raw
+      > search matched prose about the fix rather than the fix. Verified falsifiable:
+      > moving the disclosure back below the form fails it.
+      > **What remains operator-dependent:** the fee half (minimums, rate limit) is in the
+      > page header and is above the form; the disclosure paragraph is now directly above
+      > it. Both are in the composed page, so this half is verifiable and verified.
+- [x] **Credit expiry actually runs — IN CODE. Resolved 2026-10-03 by the second of the
+      two options below.**
+      The wallet page tells every customer "Credit expires 2 years after each deposit", and
+      `docs/terms-of-service.md` states the term. **The mechanism exists and nothing invoked
+      it.** `db::expire_credit` had exactly one caller, `server/src/bin/usage-purge.rs`, and
+      that binary was **not built by `server/Dockerfile` and shipped in no image** —
+      `.docker/maintenance/entrypoint.sh` said so itself (`NOT WIRED usage-purge ... does
+      NOT run here`). The entrypoint reimplements the retention sweeps inline in
+      `run_retention`; the credit-expiry sweep was not among them. Measured: `credit_expires_at`
+      appears nowhere under `.docker/`, so the shipped sweep path never touches it.
+      > **Why this gate did not exist until now, which is the part worth keeping.** The
+      > promise is displayed on a page, tested in the suite, and documented — and **no gate
+      > tracked whether it runs**, so the checklist read as complete while a customer-facing
+      > term was inoperative. A term that extinguishes value has to be disclosed *and*
+      > enforced; the disclosure was gated, the enforcement was not.
+      > **How it hid.** `tools/backup-check/check.sh` already compared the Rust sweeps
+      > against the shell's, and fails when one side has a table the other lacks — a guard
+      > written for exactly this class ("a table present only in the Rust sweep is swept in
+      > tests and NEVER in production"). It compares `DELETE FROM` table names, and
+      > `expire_credit` retires credit with an `UPDATE` plus an `INSERT`; `usage-purge.rs`
+      > contains no `DELETE FROM` at all. The sweep was in neither set. That is now the third
+      > blind spot named in the guard, and it is closed: the guard asserts that every sweep
+      > function the unwired binary calls has an inline counterpart, or is listed with a
+      > reason. Verified falsifiable — adding a new unwired sweep call fails the check with
+      > the file and the function named.
+      > **Two acceptable resolutions, and the choice is the operator's:** reimplement the
+      > sweep inline in `run_retention` beside the others, or wire `usage-purge` into the
+      > image and schedule it. **THE SECOND WAS CHOSEN, and the reason is the ledger.** The
+      > sweep is not a DELETE: it is a guarded debit (`UPDATE wallets ... WHERE balance_idr
+      > >= ?`), a ledger `INSERT` carrying `balance_after`, and a retirement mark, in one
+      > immediate transaction per deposit. Re-expressing that in shell SQL would be a second
+      > implementation of the invariant the whole money model rests on, and this repository
+      > has removed exactly that duplication before. So `server/Dockerfile` now builds and
+      > copies `usage-purge`, and `.docker/maintenance/entrypoint.sh` runs it nightly as the
+      > `credit-expiry` job — which reports `FAILED` and exits non-zero when the runner is
+      > missing, because a scheduler that quietly stops enforcing a published term is the
+      > failure this gate was added to end.
+      >
+      > **VERIFIED END TO END, not asserted.** Against a migrated database with a settled
+      > deposit whose `credit_expires_at` is in the past: the job reports
+      > `deposits_expired=1 credit_expired_idr=50000`, the wallet goes 50000 → 0,
+      > `credit_retired_at` is stamped, one ledger row is written
+      > (`delta=-50000 ref=expiry:<topup> after=0`), and a SECOND run is a no-op (still one
+      > row, balance still 0). With a balanced source the Gate 2 invariant holds across the
+      > sweep: `wallets=50000 ledger=50000` → `wallets=0 ledger=0`. With the binary absent
+      > the job exits 1 and says NO CREDIT EXPIRES.
+      >
+      > **`tools/backup-check/check.sh` was widened to hold this**, and it is the guard that
+      > should have caught the original defect: it compares the Rust sweeps against the
+      > shell's, but only by `DELETE FROM` table names, and neither side has one for this
+      > sweep. It now asserts that `server/Dockerfile` builds `--bin usage-purge` AND that
+      > the entrypoint CALLS `run_credit_expiry`. Both halves are falsifiable: dropping the
+      > `--bin` flag fails, and deleting the call fails.
+      >
+      > **What remains is deployment, not code:** the scheduler container must actually run
+      > in production. That is the next gate, and until it does, this half is "shipped and
+      > scheduled" rather than "observed to run".
+- [ ] **The maintenance scheduler is deployed in production.**
+      Every retention promise in `data-retention.md`, the nightly reconcile, the hold sweep
+      and both alert jobs run from **one container** — the `scheduler` service in
+      `docker-compose.yml`, entrypoint `.docker/maintenance/entrypoint.sh`, calling
+      `run_wired_jobs` → `run_retention`, `run_reconcile`, `run_hold_sweep`,
+      `run_credit_expiry`, `run_alert_checks`, `run_alert_probes`. **That container is not a
+      step in the production deployment procedure**, and the specific gap is narrow enough to
+      name: `docs/deployment.md`'s pipeline (its `Recommended gate order` block) has seven
+      entries — build+test, migrate, deploy server, health check, deploy frontend, reload
+      relay config, smoke test — and **none of them deploys or restarts the scheduler**. The image section names *"one
+      image containing three binaries"* (`apikita-server`, `migrate`, `usage-purge`), and the
+      maintenance scheduler is a **different image** that mounts the third binary from the
+      server one.
+      > **This item used to say `docs/deployment.md` "never mentions it", and that was false
+      > by the time anyone read it.** The file now names the scheduler eight times: the image
+      > table (two) and this document's own open item and its notes (six). `docs/deployment.md`
+      > says so itself at its own open item, and records the reason in the past tense — a
+      > sentence asserting "the word `scheduler` appears nowhere in this file" IS the word
+      > appearing in it. The claim was corrected here for the same reason it was corrected
+      > there, and the CONCLUSION did not change: naming a missing step in an open item is not
+      > performing it. **The corrected form is checkable, which the old one was not**: count
+      > the pipeline block and see whether the scheduler is one of its steps, rather than
+      > grep the file for a word the item itself had to use.
+      > The `scheduler` service's own comment in `docker-compose.yml` says the jobs "were
+      > written and then never run by anything — this is the service that ends that." That is
+      > true of **local development**. It is not yet true of production, and nothing says so.
+      > **Why this belongs on the checklist even though the code is done.** The same
+      > distinction the alert gate above draws: a job that is written, tested and CI-smoked
+      > is still a **deployment decision** away from running. Left ungated, every retention
+      > and expiry claim in the docs reads as satisfied by the code, and the customer-facing
+      > consequence (data kept longer than promised, credit never expiring) is invisible.
+      > **Overlaps the credit-expiry gate above but does not replace it.** That one asks
+      > whether the expiry sweep is implemented *in the scheduler*; this one asks whether the
+      > scheduler **runs at all**. Both have the same answer today, from opposite directions.
+      > **Also carried in [`deployment.md`](deployment.md)'s own open items**, because this
+      > checklist is not the document a deployer reads first and the omission is a missing
+      > DEPLOYMENT STEP rather than a missing line here.
+- [x] Deposit minimums enforced server-side (first vs re-top-up differ).
+      `check_deposit_limit` in `server/src/routes/account.rs` selects
+      `min_first_deposit` when `settled_topups == 0`, else `min_topup`, and returns a 422
+      naming the limit. Covered by live tests in the same module.
+- [x] API key shown once, with an acknowledged warning.
+      Behaviour: `plaintextKeyOf` (`website/tests/dashboard-form.test.ts`) pins that
+      only a create response can reveal a key and a missing one is never invented.
+      Warning: the new-key page (`website/src/pages/dashboard/keys/new.astro`) says the key is shown
+      **once** and that the server stores only its SHA-256 hash — **pinned by a test**,
+      because a copy edit can delete the warning while the code stays correct.
 - [x] Telegram `/link` flow works end to end **on the server side** — issue,
       redeem, unlink and re-link are implemented and covered by live tests. The
       Telegram *bot* itself is still design-only (`telegram/README.md` has no code),
       so the flow has not been exercised against the Bot API.
-- [ ] Review flow creates once and edits thereafter; withdrawal is a flag.
-- [ ] Telegram top-up feed posts on settlement only, never on creation.
+- [x] Review flow creates once and edits thereafter; withdrawal is a flag.
+      **Closed by serving the flow to the customer's own session, not by the bot.**
+      The three properties the gate asked for are properties of the `reviews`
+      table, which has carried them since the initial migration: "creates once" is
+      `reviews_account_uniq`, "edits thereafter" is the `review_history` copy
+      written in the same transaction as the overwrite, and "withdrawal is a flag"
+      is `withdrawn_at`. `server/src/routes/reviews.rs` is the writer. The gate was
+      blocked on code, never on the data model — see "The Telegram bot is
+      deferred" below.
+- [x] Telegram top-up feed posts on settlement only, never on creation.
+      **Restated, because the Telegram half of it is deferred with the bot.** What
+      the gate protects is that a top-up is announced only once it SETTLES; that is
+      enforced today on the surviving channel. `server/src/routes/webhooks.rs`
+      publishes a live-balance event gated by `credit_balance_to_publish`, which
+      returns `Some` only for `TopupCreditResult::Settled`, and the website
+      consumes it over SSE (`website/src/lib/live.ts`). A Telegram feed would be a
+      second channel for the same event, so building it later does not reopen this
+      item — it inherits the gate rather than duplicating it.
+
+### The Telegram bot is deferred
+
+The two items above were the only CODE items left on this list, and both ran
+through a Telegram bot that does not exist: `telegram/` holds a README and
+nothing else, and the bot was never written. Rather than leave two gates hanging
+on an unbuilt component, the product decision is recorded here:
+
+- **The bot is formally deferred.** `docs/telegram/README.md` remains the
+  specification for it, and `docs/server/api-spec.md` marks the three
+  bot-token endpoints it would need as designed-not-built. `POST /api/bot/link`
+  is built and stays built — the `/link` flow is server-side complete.
+- **Reviews are served to the website**, replacing the bot-as-only-writer rule.
+  This is strictly stronger on the point that mattered: the bot had already
+  authenticated the chat, so a `telegram_id` in the request body was safe there;
+  under cookie auth the identity can only come from the session.
+- **The top-up feed keeps its existing channel** (SSE on settlement), which is
+  what the gate actually asserts.
 
 ## What is NOT on this list
 
@@ -162,7 +636,7 @@ Deliberately excluded, and why:
 | A staging environment | Costs money; production-only until revenue justifies it |
 | Uptime SLA | Do not promise what you cannot measure |
 | A public status page | Later |
-| An admin UI | Read-only + suspend is enough at launch |
+| An admin UI | **Built** — read-only lookup + suspend/restore at `/admin`; that was the launch bar |
 | 2FA | Later; Google sign-in already carries it |
 | Model breadth | Flash tier only |
 
@@ -188,8 +662,7 @@ That said, the ones that block *launch* specifically are:
 | **Legal review of the Terms of Service** | Gate 0 — cannot take money without it |
 | **Abuse-report contact** | Gate 5 — required to publish the terms |
 | **Support cost per customer** | Commercial model; not a launch blocker but the decisive business input |
-| **Credit expiry implementation** | Policy settled (2 years per deposit); the code is not written — no per-deposit expiry column, no sweep job, no refusal of a spend against aged credit |
-| **Wind-down runbook exercised** | Policy settled (balances above USD 2.00 paid out) and the runbook is written, but the payout is manual and has never been executed. It touches money and there is no treasury — so it is **not** a launch blocker on the same footing as a deployment, but it must be walked through against a scratch database before it is ever needed |
+| **Wind-down runbook exercised** | Policy settled (balances above USD 2.00 paid out) and the runbook is written, but the payout is manual and has never been executed. It touches money and there is no treasury — so it is **not** a launch blocker on the same footing as a deployment, but it must be walked through against a scratch database before it is ever needed. **The read-only half is now a tool** (`tools/wind-down/report.sh`, CI-checked): it runs Step 3's eligibility query, splits the threshold strictly and floors the stablecoin units. **Steps 6 and 7 have since been exercised by hand against a scratch database** and behave as written: Step 6's three statements apply without error, Step 7's `reconcile.sh` returns zero rows, and both half-omissions are caught as drift (write the ledger row without zeroing the wallet → exit 1; zero the wallet without the ledger row → exit 1). Two things that exercise did establish: a closed account with a **non-zero wallet** is invisible to reconcile (the money invariant still holds), so the "only once the balance is zero" rule in `data-retention.md` (its account-closure step list) is enforced by the operator and not by any guard; and closure is unreachable from code at all — nothing in `server/src` sets `status = 'closed'`. **What remains genuinely unexercised is Step 5 alone** — the actual bank transfer, which needs a treasury |
 
 The rest — Northflank prices, a second provider, a staging environment, review
 moderation policy, the second-operator threshold, the bot runtime — are open but
@@ -204,3 +677,14 @@ moderation policy, the second-operator threshold, the bot runtime — are open b
    promise is false — check them again before any change to logging or tracking.
 4. Re-check Gate 2 (money correctness) after **any** change to the webhook, the
    ledger, or billing.
+5. **GATE 1 CANNOT BE TICKED FROM THIS REPOSITORY, and that is why it is said here once
+   rather than per item.** Every Gate 1 box is the state of a deployment - a volume, a
+   certificate, a proxy, a backup schedule - and none of them leaves a trace in git. A
+   reader auditing this checklist will go looking for the evidence, find none, and have to
+   decide whether the item is a lie or simply external. It is external. The repository
+   holds the CONFIGURATION for several of them (`.docker/nginx/relay.conf`, `tools/backup/`),
+   and the check tools verify that configuration: `relay-check` proves the relay is
+   configured as written and `backup-check` proves the backup script runs. Neither proves
+   anything is deployed. Configuration is checked; deployment is not, and no test in this
+   repository can make it so.
+

@@ -29,4 +29,22 @@ and can be made last.
 
 ## Status
 
-Empty scaffolding. Nothing implemented.
+**This FOLDER is empty scaffolding** - it holds this README and nothing else, so there is
+no bot process, no dependency manifest and no chosen stack above. That part is accurate.
+
+**The SERVER half is BUILT, and reading only this folder would miss it.** The endpoints a
+bot needs already exist and are mounted (`server/src/routes/telegram.rs`):
+
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `POST /api/telegram/link-code` | session cookie | issue the short-lived code a user sends the bot |
+| `DELETE /api/telegram` | session cookie | unlink the Telegram account |
+| `POST /api/bot/link` | **bot token** | the bot redeems the code, linking the chat to the wallet |
+
+So "nothing implemented" would be wrong about the system: the linking flow, its credential
+model and its refusal ordering are implemented and tested, including that `/api/bot/link`
+checks the bot token BEFORE the code's shape so an unauthenticated caller learns nothing.
+The reviews and top-up-notification routes remain design-only - `docs/server/api-spec.md`
+marks them, and a route-table test asserts they 404 rather than half-working.
+
+**What is left is the bot itself**, which is why the stack line above is still open.

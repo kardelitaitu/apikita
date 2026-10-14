@@ -1,10 +1,34 @@
+#![cfg_attr(
+    not(test),
+    // EVERY HTTP SURFACE, fenced at the MODULE ROOT rather than per file.
+    //
+    // An inner attribute here covers every submodule beneath it, so this is one
+    // line of intent rather than nine - and it is also the placement that cannot
+    // rot: a new handler file under routes/ is covered the moment it is added, with
+    // nothing to remember. Fencing each file separately meant a file added later
+    // would be unfenced until somebody noticed, which is how auth.rs and events.rs
+    // still carry per-function allows while their neighbours carry a module deny.
+    //
+    // Non-test scoping, as everywhere else: a test that adds 1 to a counter has
+    // failed loudly and cost nothing, and the test corpus trips this lint dozens of
+    // times.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 pub mod account;
 pub mod admin;
+#[cfg(test)]
+pub mod admin_auth_boundary;
 pub mod auth;
 pub mod events;
+pub mod hardening;
 pub mod health;
 pub mod keys;
+#[cfg(test)]
+pub mod limits_lock_invariant;
+pub mod oversize;
 pub mod proxy;
+pub mod reviews;
 pub mod telegram;
 pub mod webhooks;
 
@@ -25,8 +49,25 @@ use proxy::AppState;
 pub const SESSION_COOKIE: &str = "session";
 
 /// SHA-256 of a credential, hex. Only the hash is ever stored or compared
-/// (docs/website/02-data-model.md, sessions), so the plaintext never reaches
-/// Postgres.
+/// (docs/server/api-spec.md, sessions), so the plaintext never reaches the DATABASE.
+///
+/// THIS SAID "never reaches Postgres" AND CITED A SUPERSEDED DOCUMENT, which is worth recording
+/// because both halves were wrong in the same direction - a reader sent to the wrong engine and the
+/// wrong page.
+///
+///   * There is no Postgres. The port is complete: `db.rs` is `SqlitePool` throughout and
+///     `main.rs` says outright that this deployment has no Postgres. `doc_claims.rs` already marks
+///     the schema document this comment used to cite as "SUPERSEDED - it documents the PostgreSQL
+///     schema the port replaced", so the guard knew the citation was dead and this line did not.
+///   * Naming the engine in a claim about a CREDENTIAL matters more than it looks. "Never reaches
+///     Postgres" invites the reader to reason about a network boundary; the truth is a file, and the
+///     relevant fact for a credential is narrower and stronger - it is not in the DATABASE at all,
+///     whichever engine. The hash is, and a hash is what a lookup can use.
+///
+/// The historical notes elsewhere in this crate that begin "the Postgres original" are DELIBERATE
+/// and are NOT this: they explain why a dialect choice was made, and `docs/plans/sqlite-migration.md`
+/// is their cited home. The distinction is tense and subject - a past-tense note about the old code
+/// is history; a present-tense claim about where data goes is a claim about THIS system.
 pub fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -55,6 +96,24 @@ pub fn session_token_from_cookie_header(cookie_header: &str) -> Option<&str> {
     })
 }
 
+/// A session row that cannot be read is a store that is not there, not a credential
+/// that is wrong.
+///
+/// `resolve_account_from_cookie` answers `Unauthenticated` for every way a session can
+/// be unusable, and that is deliberate: a caller must not be able to tell "no session"
+/// from "dead session". A store that cannot be queried is a third case and does NOT
+/// belong in that bucket - answering 401 during an outage tells every signed-in
+/// customer their session is bad, and the web client acts on a 401 by redirecting to
+/// /login, so a database blip would log the whole site out. 503 says "try again",
+/// which is what is true.
+///
+/// The message is fixed rather than the sqlx text: a store error string can name the
+/// path or the schema, and this is returned on a route any authenticated caller
+/// reaches.
+fn unusable_session_store(_: sqlx::Error) -> AppError {
+    AppError::Unavailable("the session store is unreachable".into())
+}
+
 /// Whether a session is usable at `now`, given when it was last seen and when it
 /// absolutely expires.
 ///
@@ -79,6 +138,7 @@ pub fn session_token_from_cookie_header(cookie_header: &str) -> Option<&str> {
 /// idle half LESS binding, never cut a session short - which is why the shipped
 /// `idle_days = 7` against `absolute_days = 30` is the only combination that
 /// changes behaviour.
+#[allow(clippy::arithmetic_side_effects)]
 pub fn session_is_live_at(
     now: chrono::DateTime<chrono::Utc>,
     last_seen_at: chrono::DateTime<chrono::Utc>,
@@ -95,6 +155,18 @@ pub fn session_is_live_at(
         return false;
     }
 
+    // SAFE because config.rs refuses a lifetime the clock cannot represent, at load.
+    // A bare `DateTime + Duration` PANICS on an out-of-range result, and this is on
+    // EVERY session resolution, so an unrepresentable idle bound would panic on the
+    // first request and every request after it - which is why the config check names
+    // `idle_days` rather than only the absolute bound.
+    //
+    // `idle_days` is an i64 here rather than the config's u32, so a caller could in
+    // principle pass a negative; `checked_add_signed` accepts that happily, and it is
+    // harmless - the sum moves into the past and the session reads as idle.
+    //
+    // The allow is on the FUNCTION: this addition is the function's tail expression,
+    // and an attribute there needs the unstable `stmt_expr_attributes` feature.
     last_seen_at + chrono::Duration::days(idle_days) > now
 }
 
@@ -152,11 +224,27 @@ pub async fn resolve_account_from_cookie(
         return Err(AppError::Unauthenticated);
     };
 
+    // A row that cannot be read at all is a store that is not there, not a credential
+    // that is wrong. Returning Unauthenticated would say "your session is bad" about
+    // every session during an outage, and the two callers that act on a 401 - the web
+    // client's redirectToLogin() and a customer deciding whether to sign in again -
+    // would both do the wrong thing. 503 says "try again", which is what is true.
+    //
+    // THIS WAS FOUND BY A TEST, not by reading: `table_state()` builds a pool pointing
+    // at a file that does not exist, so a route resolving a cookie reached this
+    // `?` and answered 500, which is not a status the mounted-route table test accepts
+    // as "the router matched". The routing question and the error mapping were the same
+    // question and only the table asked it.
     let account_id: Uuid = session
-        .try_get::<uuid::fmt::Hyphenated, _>("account_id")?
+        .try_get::<uuid::fmt::Hyphenated, _>("account_id")
+        .map_err(unusable_session_store)?
         .into_uuid();
-    let last_seen_at: chrono::DateTime<chrono::Utc> = session.try_get("last_seen_at")?;
-    let expires_at: chrono::DateTime<chrono::Utc> = session.try_get("expires_at")?;
+    let last_seen_at: chrono::DateTime<chrono::Utc> = session
+        .try_get("last_seen_at")
+        .map_err(unusable_session_store)?;
+    let expires_at: chrono::DateTime<chrono::Utc> = session
+        .try_get("expires_at")
+        .map_err(unusable_session_store)?;
 
     if !session_is_live_at(now, last_seen_at, expires_at, idle_days, absolute_days) {
         return Err(AppError::Unauthenticated);
@@ -176,54 +264,379 @@ pub async fn resolve_account_from_cookie(
     Ok(account_id)
 }
 
+/// The ROUTES constant, expanded into `create_router`'s method-router expressions.
+///
+/// WHY THIS IS A MACRO AND NOT A LOOP. axum's `MethodRouter` is CHAINED per route -
+/// `get(a).post(b)` - and axum guarantees `/api/topups` and `/api/keys` carry exactly
+/// two methods each. A `for` loop would have to `.merge()` two single-method routers
+/// per path, which would restate each method list in a second place. That is the
+/// duplicate-that-drifts-toward-the-weaker-reading defect this codebase already
+/// fights, traded for the one this macro closes, so the macro is the smaller evil.
+///
+/// The cost is real and belongs in writing rather than in an absence: ONE rustfmt
+/// invocation would re-wrap these `route(` lines and swallow the trailing `;` markers
+/// that `the_route_inventory_matches_the_mounted_table` reads, and the only other
+/// arm - a `cargo fmt` check in CI - is deliberately not taken, because this crate
+/// holds several deliberate mis-formattings that rustfmt undoes.
+macro_rules! routes {
+    ($($(#[$meta:meta])* .route($path:literal, $($m:ident($h:path)).+ $(,)?));+ $(;)?) => {
+        Router::new()
+        $(
+            $(#[$meta])*
+            .route($path, $($m($h)).+)
+        )+
+    };
+    // THE PATH LIST, CAPTURED FROM THE SAME INVOCATION. This arm is the second
+    // half of the guard: `stringify!` of a `$path:literal` is the LITERAL'S OWN
+    // TEXT, produced by the compiler from the tokens it actually expanded, so it
+    // reports what the router was built from rather than what a test hoped was
+    // there. Comments are stripped by the lexer and the `;` markers are not part
+    // of a single route's capture, so the result is a bare list of quoted paths -
+    // which is exactly what `the_macro_body_lists_the_inventory_it_mounts` needs
+    // to compare against `ROUTES`.
+    //
+    // A SEPARATE ARM rather than a second field on the first, because the first
+    // one is what `create_router` returns and every caller wants a `Router`, not
+    // a `(Router, &str)`. Two arms of one macro is the guarantee that the list
+    // cannot describe a different invocation than the router: both are expanded
+    // from the SAME tokens by the SAME macro.
+    (@paths $($(#[$meta:meta])* .route($path:literal, $($m:ident($h:path)).+ $(,)?));+ $(;)?) => {
+        &[$(stringify!($path)),+]
+    };
+}
+
+/// THE ROUTE INVENTORY. The single source for what this server serves.
+///
+/// **BOTH ENDS OF THIS LIST ARE CHECKED, and neither check can see the other's
+/// subject.** `the_route_inventory_matches_the_mounted_table` reads THIS literal in
+/// the source and compares it to `MOUNTED`, so a route dropped from the list is a
+/// failure rather than the silent 404 it used to be. The method-router expressions
+/// themselves are read by no test: axum does not expose its route table
+/// (docs/testing.md:145), and the table test drives the ROUTER, which is built from
+/// the list. So a method removed here is caught by no automated check, and saying so
+/// is the point - it is the one link these checks cannot close.
+///
+/// WHAT THE TRAILING `;` MARKS ARE FOR. Each `.route(` line ends in `;`, which is a
+/// token rustfmt never emits. A `.route(` line deleted by hand takes its `;` with it,
+/// so the source literal and the built router fall out of step **detectably**. The
+/// markers do not make this tamper-proof and do not claim to: a deletion can still be
+/// made to read as consistent by removing the `;` too. They make the accidental
+/// version - the one that actually happens - loud.
+///
+/// THE PATH LITERALS ARE load-bearing strings, not comments. `$path:literal` expands
+/// into the method-router expression that axum receives, so the path a request is
+/// matched against IS the string this test reads. Before this list existed the paths
+/// were written here and mounted there, and the two could disagree with nothing to
+/// say so.
+///
+/// `{id}` is axum 0.8's parameter syntax. `MOUNTED` carries a concrete uuid for the
+/// same route, because it drives requests rather than parsing them.
+pub const ROUTES: &str = r#"
+.route("/health", get(health::health_check));
+// Operator-only operational counts. NOT on /health: that body is pinned
+// because the deploy gate parses it, and a leak test forbids ANY digit in an
+// unauthenticated health body. See health::operator_metrics.
+.route("/api/admin/metrics", get(health::operator_metrics));
+// Auth. These are what the website calls, and none of them needs a PocketBase
+// instance: the identity provider is this crate's own `identity` module, over
+// the `identities` table.
+.route("/auth/signup", post(auth::signup));
+.route("/auth/login", post(auth::login));
+.route("/auth/google", post(auth::google_sign_in));
+.route("/auth/verify-email", post(auth::verify_email));
+.route("/auth/password-reset/request", post(auth::request_password_reset));
+.route("/auth/password-reset/confirm", post(auth::confirm_password_reset));
+.route("/auth/verification/resend", post(auth::resend_verification));
+.route("/auth/logout", post(auth::logout));
+.route("/auth/logout-all", post(auth::logout_all));
+.route("/auth/password-change", post(auth::change_password));
+.route("/auth/providers", get(auth::list_providers));
+.route("/api/me", get(account::get_me));
+.route("/api/usage", get(account::get_usage));
+.route("/api/usage/recent", get(account::get_recent_usage));
+.route("/api/export", get(account::export_account_data));
+.route("/api/topups", get(account::get_topups).post(account::create_topup));
+.route("/api/keys", get(keys::list_keys).post(keys::create_key));
+.route("/api/keys/{id}", patch(keys::update_key));
+.route("/api/keys/{id}/revoke", post(keys::revoke_key));
+.route("/api/telegram/link-code", post(telegram::issue_link_code));
+.route("/api/telegram", delete(telegram::unlink_telegram));
+// Reviews. Written by a COOKIE, not by a bot: the Telegram bot this was
+// originally specified for is not being built, and the three properties the
+// launch gate asked for (one per account, editable, withdrawal as a flag) are
+// properties of the table rather than of the client that writes it. The
+// aggregate is public; the write paths are the caller's own row and nothing
+// else.
+.route("/api/reviews", get(reviews::get_reviews).post(reviews::upsert_review));
+.route("/api/reviews/mine", get(reviews::get_my_review));
+.route("/api/reviews/withdraw", post(reviews::withdraw_review));
+// The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN.
+.route("/api/bot/link", post(telegram::redeem_link_code));
+.route("/events", get(events::sse_events_handler));
+.route("/api/admin/accounts", get(admin::list_accounts));
+.route("/api/admin/audit", get(admin::list_recent_audit));
+.route("/api/admin/accounts/{id}", get(admin::get_account));
+.route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit));
+.route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
+.route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
+.route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
+.route("/api/admin/accounts/{id}/adjust", post(admin::adjust_account));
+// Webhooks
+.route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
+// Proxy
+.route("/v1/chat/completions", post(proxy::chat_completions));
+"#;
+
+/// **DEAD BY DESIGN.** The route table as a `const` array, which is the one thing
+/// that would make the inventory checkable WITHOUT reading source text.
+///
+/// `ROUTES` above is a source literal because Rust has no stable reflection over
+/// names, so `get(health::health_check)` cannot be assembled from an array of
+/// strings - `concat_idents!` is unstable and a `macro_rules` pass cannot build an
+/// identifier fragment-wise either. An array of paths can drive NOTHING in axum, so
+/// adding one would be a second hand-maintained list, which is the defect.
+///
+/// It is kept as a MEASURED, REFUTED PROPOSAL rather than deleted, because it looks
+/// obviously better to a first reader and "why not just use an array" is the first
+/// question this file's approach invites. It is `#[allow(dead_code)]` so this
+/// paragraph is tested against the compiler rather than trusted.
+#[allow(dead_code)]
+pub const ROUTE_ARRAY_SHAPE_IS_IMPOSSIBLE: &[&str] = &[
+    "/health",
+    "/api/admin/metrics",
+    "/auth/signup",
+    "/auth/login",
+    "/auth/google",
+    "/auth/verify-email",
+    "/auth/password-reset/request",
+    "/auth/password-reset/confirm",
+    "/auth/verification/resend",
+    "/auth/logout",
+    "/auth/logout-all",
+    "/auth/password-change",
+    "/auth/providers",
+    "/api/me",
+    "/api/usage",
+    "/api/usage/recent",
+    "/api/export",
+    "/api/topups",
+    "/api/keys",
+    "/api/keys/{id}",
+    "/api/keys/{id}/revoke",
+    "/api/telegram/link-code",
+    "/api/telegram",
+    "/api/reviews",
+    "/api/reviews/mine",
+    "/api/reviews/withdraw",
+    "/api/bot/link",
+    "/events",
+    "/api/admin/accounts",
+    "/api/admin/audit",
+    "/api/admin/accounts/{id}",
+    "/api/admin/accounts/{id}/audit",
+    "/api/admin/accounts/{id}/suspend",
+    "/api/admin/accounts/{id}/restore",
+    "/api/admin/accounts/{id}/resume",
+    "/webhooks/midtrans",
+    "/v1/chat/completions",
+];
+
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        // Ops
-        .route("/health", get(health::health_check))
-        // Auth
-        .route("/auth/exchange", post(auth::exchange_token))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/logout-all", post(auth::logout_all))
+    // The macro expands to a `Router::new()....with_state(..)` EXPRESSION, so it is bound here rather
+    // than returned directly: the hardening layers have to wrap it from outside, and they need the
+    // config, which is only reachable through `state`.
+    let router = routes!(
+        .route("/health", get(health::health_check));
+        // Operator-only operational counts. NOT on /health: that body is pinned
+        // because the deploy gate parses it, and a leak test forbids ANY digit in an
+        // unauthenticated health body. See health::operator_metrics.
+        .route("/api/admin/metrics", get(health::operator_metrics));
+        // Auth. These are what the website calls, and none of them needs a
+        // PocketBase instance: the identity provider is this crate's own
+        // `identity` module, over the `identities` table.
+        .route("/auth/signup", post(auth::signup));
+        .route("/auth/login", post(auth::login));
+        .route("/auth/google", post(auth::google_sign_in));
+        .route("/auth/verify-email", post(auth::verify_email));
+        .route("/auth/password-reset/request", post(auth::request_password_reset));
+        .route("/auth/password-reset/confirm", post(auth::confirm_password_reset));
+        .route("/auth/verification/resend", post(auth::resend_verification));
+        .route("/auth/logout", post(auth::logout));
+        .route("/auth/logout-all", post(auth::logout_all));
+        // The two the settings panel needs, and the reason each exists rather than a
+        // PocketBase SDK call: `change_password` replaces `users.update` with a verb
+        // that verifies the CURRENT password and kills every session, and
+        // `list_providers` replaces `listExternalAuths` by reporting the account's own
+        // identity rows and taking no address or id.
+        .route("/auth/password-change", post(auth::change_password));
+        .route("/auth/providers", get(auth::list_providers));
         // Account & Wallet
-        .route("/api/me", get(account::get_me))
-        .route("/api/usage", get(account::get_usage))
-        .route(
-            "/api/topups",
-            get(account::get_topups).post(account::create_topup),
-        )
+        .route("/api/me", get(account::get_me));
+        .route("/api/usage", get(account::get_usage));
+        .route("/api/usage/recent", get(account::get_recent_usage));
+        .route("/api/export", get(account::export_account_data));
+        .route("/api/topups", get(account::get_topups).post(account::create_topup));
         // API Keys
-        .route("/api/keys", get(keys::list_keys).post(keys::create_key))
-        .route("/api/keys/{id}", patch(keys::update_key))
-        .route("/api/keys/{id}/revoke", post(keys::revoke_key))
+        .route("/api/keys", get(keys::list_keys).post(keys::create_key));
+        .route("/api/keys/{id}", patch(keys::update_key));
+        .route("/api/keys/{id}/revoke", post(keys::revoke_key));
         // Telegram
-        .route("/api/telegram/link-code", post(telegram::issue_link_code))
-        .route("/api/telegram", delete(telegram::unlink_telegram))
+        .route("/api/telegram/link-code", post(telegram::issue_link_code));
+        .route("/api/telegram", delete(telegram::unlink_telegram));
+        // Reviews. Cookie-authenticated: the bot these were specified for is not
+        // being built, and the gate's three properties live in the table.
+        .route("/api/reviews", get(reviews::get_reviews).post(reviews::upsert_review));
+        .route("/api/reviews/mine", get(reviews::get_my_review));
+        .route("/api/reviews/withdraw", post(reviews::withdraw_review));
         // The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN
-        .route("/api/bot/link", post(telegram::redeem_link_code))
+        .route("/api/bot/link", post(telegram::redeem_link_code));
         // Live updates (SSE)
-        .route("/events", get(events::sse_events_handler))
+        .route("/events", get(events::sse_events_handler));
         // Admin (cookie + operator flag)
-        .route("/api/admin/accounts/{id}", get(admin::get_account))
-        .route(
-            "/api/admin/accounts/{id}/suspend",
-            post(admin::suspend_account),
-        )
-        .route(
-            "/api/admin/accounts/{id}/restore",
-            post(admin::resume_account),
-        )
-        .route(
-            "/api/admin/accounts/{id}/resume",
-            post(admin::resume_account),
-        )
+        .route("/api/admin/accounts", get(admin::list_accounts));
+        .route("/api/admin/audit", get(admin::list_recent_audit));
+        .route("/api/admin/accounts/{id}", get(admin::get_account));
+        .route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit));
+        .route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
+        .route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
+        .route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
+        .route("/api/admin/accounts/{id}/adjust", post(admin::adjust_account));
         // Webhooks
-        .route(
-            "/webhooks/midtrans",
-            post(webhooks::handle_midtrans_webhook),
-        )
+        .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
         // Proxy
         .route("/v1/chat/completions", post(proxy::chat_completions))
-        .with_state(state)
+    )
+    // The router-level fallback, so the 404 for an UNROUTED path is the documented JSON
+    // rather than axum's empty-bodied default.
+    //
+    // docs/error-model.md:10 promises "Every error returns the same JSON. No bare HTML
+    // error pages, no empty bodies." Measured against the running binary, everything the
+    // HANDLERS answer already met that - eleven of fourteen error paths carried
+    // code/message/request_id - but a request that matches no route never reaches a
+    // handler, so axum's own 404 (empty body) was what a client actually got. That is the
+    // commonest client mistake there is, and the api-spec ADVERTISES two 404s of exactly
+    // this kind (the DESIGNED-NOT-BUILT routes), so the contract was broken on paths the
+    // documentation deliberately points at.
+    //
+    // NOT the same as METHOD_NOT_ALLOWED, which axum raises for a mounted path with the
+    // wrong verb; that keeps its own status and is asserted separately in the route table.
+    .fallback(unrouted)
+    // The body limit's 413 is produced during EXTRACTION, before any handler exists to give it the
+    // documented envelope - so the shape has to be fixed on the way out. Everything that is not a
+    // 413 passes through untouched; see `oversize` for why this could not be an `AppError` variant.
+    //
+    // THIS IS APPLIED BEFORE `hardening`, so it sits INSIDE the concurrency and timeout layers and
+    // still sees the body-limit rejection. Reversing the order would put the 413 outside the layers
+    // that produce it and the envelope would be lost.
+    .layer(axum::middleware::map_response(
+        oversize::documented_oversize_response,
+    ))
+    .with_state(state.clone());
+    // The inbound hardening is applied OUTSIDE everything above, so the timeout bounds the whole
+    // request INCLUDING a wait for a concurrency slot. The comment here used to say a request
+    // "is refused before it is timed or buffered", which was wrong twice: `tower`'s concurrency
+    // limiter WAITS rather than refusing, and the timeout is outside it, so a queued request is
+    // bounded by the timeout rather than refused ahead of it. See `hardening` for the correction
+    // and for why all three layers are needed and what each bounds that the others do not.
+    //
+    // The WHOLE config, not `&state.config.server`: the request timeout has to be the upstream's
+    // allowance, which lives under `[circuit_breaker]`. Passing only the server section is what let the
+    // 10s header figure become a whole-request bound that contradicted the 120s upstream budget.
+    hardening::apply(router, &state.config)
+}
+
+/// The path literals `create_router`'s `routes!` invocation actually expanded.
+///
+/// THE SECOND HALF OF THE INVENTORY GUARD, and it exists because the first half
+/// cannot see the macro body. `the_route_inventory_matches_the_mounted_table`
+/// compares `ROUTES` to `MOUNTED`, and BOTH of those are hand-written text: a
+/// route added to the macro and forgotten in `ROUTES` left every check green
+/// while the router served a path the inventory denied. The `;` markers catch a
+/// HAND-DELETED line; nothing caught an ADDED one.
+///
+/// This array is not written by hand. It is the same invocation `create_router`
+/// passes to `routes!`, run through the `@paths` arm, whose `stringify!($path)`
+/// is the compiler's rendering of the literal the router was built from - so the
+/// two cannot describe different invocations, because they are the same tokens.
+/// `the_macro_body_lists_the_inventory_it_mounts` compares this to `ROUTES`.
+///
+/// WHAT THIS STILL DOES NOT COVER: the METHOD. `@paths` captures `$path` only,
+/// so a `.route("/api/keys/{id}", get(...))` changed to `post(...)` moves in
+/// neither list. That gap is stated on `ROUTES` already ("the method-router
+/// expressions themselves are read by no test") and closing it is not possible
+/// from a `macro_rules` arm without capturing `$m` too - which would make this
+/// array carry method names no caller can check against anything.
+#[allow(dead_code)]
+pub const MOUNTED_BY_THE_MACRO: &[&str] = routes!(@paths
+    .route("/health", get(health::health_check));
+    // Operator-only operational counts. NOT on /health: that body is pinned
+    // because the deploy gate parses it, and a leak test forbids ANY digit in an
+    // unauthenticated health body. See health::operator_metrics.
+    .route("/api/admin/metrics", get(health::operator_metrics));
+    // Auth. These are what the website calls, and none of them needs a PocketBase
+    // instance: the identity provider is this crate's own `identity` module, over
+    // the `identities` table.
+    .route("/auth/signup", post(auth::signup));
+    .route("/auth/login", post(auth::login));
+    .route("/auth/google", post(auth::google_sign_in));
+    .route("/auth/verify-email", post(auth::verify_email));
+    .route("/auth/password-reset/request", post(auth::request_password_reset));
+    .route("/auth/password-reset/confirm", post(auth::confirm_password_reset));
+    .route("/auth/verification/resend", post(auth::resend_verification));
+    .route("/auth/logout", post(auth::logout));
+    .route("/auth/logout-all", post(auth::logout_all));
+    // The two the settings panel needs, and the reason each exists rather than a
+    // PocketBase SDK call: `change_password` replaces `users.update` with a verb
+    // that verifies the CURRENT password and kills every session, and
+    // `list_providers` replaces `listExternalAuths` by reporting the account's own
+    // identity rows and taking no address or id.
+    .route("/auth/password-change", post(auth::change_password));
+    .route("/auth/providers", get(auth::list_providers));
+    // Account & Wallet
+    .route("/api/me", get(account::get_me));
+    .route("/api/usage", get(account::get_usage));
+    .route("/api/usage/recent", get(account::get_recent_usage));
+    .route("/api/export", get(account::export_account_data));
+    .route("/api/topups", get(account::get_topups).post(account::create_topup));
+    // API Keys
+    .route("/api/keys", get(keys::list_keys).post(keys::create_key));
+    .route("/api/keys/{id}", patch(keys::update_key));
+    .route("/api/keys/{id}/revoke", post(keys::revoke_key));
+    // Telegram
+    .route("/api/telegram/link-code", post(telegram::issue_link_code));
+    .route("/api/telegram", delete(telegram::unlink_telegram));
+    // Reviews. This mirror is compared against ROUTES by
+    // `the_macro_body_lists_the_inventory_it_mounts`, so a route added to one and
+    // not the other fails there rather than silently drifting.
+    .route("/api/reviews", get(reviews::get_reviews).post(reviews::upsert_review));
+    .route("/api/reviews/mine", get(reviews::get_my_review));
+    .route("/api/reviews/withdraw", post(reviews::withdraw_review));
+    // The bot's redemption endpoint, authenticated by TELEGRAM_BOT_TOKEN
+    .route("/api/bot/link", post(telegram::redeem_link_code));
+    // Live updates (SSE)
+    .route("/events", get(events::sse_events_handler));
+    // Admin (cookie + operator flag)
+    .route("/api/admin/accounts", get(admin::list_accounts));
+    .route("/api/admin/audit", get(admin::list_recent_audit));
+    .route("/api/admin/accounts/{id}", get(admin::get_account));
+    .route("/api/admin/accounts/{id}/audit", get(admin::get_account_audit));
+    .route("/api/admin/accounts/{id}/suspend", post(admin::suspend_account));
+    .route("/api/admin/accounts/{id}/restore", post(admin::resume_account));
+    .route("/api/admin/accounts/{id}/resume", post(admin::resume_account));
+.route("/api/admin/accounts/{id}/adjust", post(admin::adjust_account));
+    // Webhooks
+    .route("/webhooks/midtrans", post(webhooks::handle_midtrans_webhook));
+    // Proxy
+    .route("/v1/chat/completions", post(proxy::chat_completions))
+);
+
+/// The documented JSON for a path that matches no route.
+///
+/// Reuses `AppError::NotFound` rather than building a body here, so the shape, the `code`
+/// vocabulary and the `request_id` all come from the ONE place that defines them - which is
+/// what keeps this from drifting away from the handlers.
+async fn unrouted() -> AppError {
+    AppError::NotFound("no route matches this path".into())
 }
 
 /// Process-wide serialisation of environment-variable mutation in tests.
@@ -302,6 +715,24 @@ pub mod test_env {
             self.previous.push((key, std::env::var_os(key)));
             std::env::set_var(key, value);
         }
+
+        /// Removes a variable for the duration of the guard, putting the
+        /// PREVIOUS value - or its absence - back on Drop. This is how a test
+        /// exercises the "required configuration is MISSING" path rather than
+        /// merely an invalid value.
+        pub fn remove(key: &'static str) -> Self {
+            let mut guard = Self {
+                previous: Vec::new(),
+            };
+            guard.also_remove(key);
+            guard
+        }
+
+        /// Removes another variable under the same guard.
+        pub fn also_remove(&mut self, key: &'static str) {
+            self.previous.push((key, std::env::var_os(key)));
+            std::env::remove_var(key);
+        }
     }
 
     impl Drop for EnvGuard {
@@ -326,6 +757,7 @@ pub mod test_env {
         const RESTORED: &str = "APK_TEST_ENV_GUARD_PROBE_RESTORED";
         const REMOVED: &str = "APK_TEST_ENV_GUARD_PROBE_REMOVED";
         const PANICKED: &str = "APK_TEST_ENV_GUARD_PROBE_PANICKED";
+        const SET_FOR_REMOVAL: &str = "APK_TEST_ENV_GUARD_PROBE_REMOVAL";
         const SERIALISED: &str = "APK_TEST_ENV_GUARD_PROBE_SERIALISED";
 
         #[test]
@@ -362,9 +794,24 @@ pub mod test_env {
 
             assert!(
                 std::env::var_os(REMOVED).is_none(),
-                "a variable that was UNSET before the guard must be unset again, not left holding the test value: {:?}",
-                std::env::var_os(REMOVED)
+                "a variable that was UNSET before the guard must be unset again, not left holding the test value"
             );
+        }
+
+        #[test]
+        fn remove_hides_a_variable_and_restores_its_previous_state_on_drop() {
+            let _lock = EnvLock::acquire();
+            std::env::set_var(SET_FOR_REMOVAL, "the-original-value");
+            {
+                let _guard = EnvGuard::remove(SET_FOR_REMOVAL);
+                assert!(std::env::var_os(SET_FOR_REMOVAL).is_none());
+            }
+            assert_eq!(
+                std::env::var(SET_FOR_REMOVAL).as_deref(),
+                Ok("the-original-value"),
+                "a removed variable must come back with its previous value"
+            );
+            std::env::remove_var(SET_FOR_REMOVAL);
         }
 
         /// The classic bug this type exists to prevent: a guard that restores on
@@ -512,7 +959,8 @@ mod tests {
 
     #[test]
     fn session_token_hash_is_sha256_hex_and_never_the_token() {
-        // Only the hash reaches Postgres; the cookie value never does.
+        // Only the hash reaches the DATABASE; the cookie value never does. (This comment said
+        // "Postgres" - there is no Postgres, the port to SQLite is complete. See `hash_token`.)
         assert_eq!(
             hash_token("apk_sess_abc"),
             "c943c9214781fe698239bd2827dda2ed0fd7c0c746cd3ab44785da20083a1a9e"
@@ -524,6 +972,124 @@ mod tests {
         assert_ne!(hash_token("apk_sess_abc"), hash_token("apk_sess_abd"));
     }
 
+    /// THERE IS ONE CREDENTIAL HASH, AND NOTHING USED TO SAY SO.
+    ///
+    /// `routes/proxy.rs` claimed the guarantee was structural - "there is only one function" -
+    /// while `routes/auth.rs` carried a BYTE-IDENTICAL PRIVATE COPY of this one, with 20 call sites
+    /// on the copy. The two wrote and read the same `sessions.token_hash` column: `auth.rs` wrote
+    /// with its copy, `routes/mod.rs` and `routes/account.rs` read with this one, and
+    /// `proxy.rs` authenticated the API key with this one. Nothing failed because the bodies were
+    /// identical - which is precisely what makes the defect invisible until someone edits one of
+    /// them, at which point every key or session stops authenticating with no compile error.
+    ///
+    /// THE PATTERN WAS ALREADY FIXED ONCE IN THIS FILE: the cookie PARSER the note above describes
+    /// was "folded into this module, so there is no second implementation to compare against". The
+    /// hash got the same treatment now, and this is the guard that keeps it.
+    ///
+    /// A test that the two AGREE would have passed on the duplicates, which is why the assertion is
+    /// on the count of DEFINITIONS rather than on behaviour: two identical copies agree perfectly
+    /// and are still two copies.
+    #[test]
+    fn there_is_one_credential_hash() {
+        use std::path::PathBuf;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut definitions: Vec<String> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let shown = path
+                    .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+                    .unwrap_or(&path);
+                for (i, line) in text.lines().enumerate() {
+                    // The definition, not a call: a `pub fn` or a module-private `fn` named exactly
+                    // hash_token. A call is `hash_token(`, which this excludes because a definition
+                    // is followed by a parameter list too - so the discriminator is `fn hash_token`.
+                    let l = line.trim_start();
+                    if (l.starts_with("pub fn hash_token") || l.starts_with("fn hash_token"))
+                        && !defined_in_a_test_module(&text, i)
+                    {
+                        // Forward slashes and only the last two components: a Windows checkout
+                        // renders backslashes, and the depth of the checkout root differs between
+                        // contributors, so the path is normalised rather than compared as text.
+                        let rel = shown.display().to_string().replace('\\', "/");
+                        let tail = rel
+                            .rsplit('/')
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        definitions.push(format!("{tail}:{}", i + 1));
+                    }
+                }
+            }
+        }
+
+        // The FILE each definition lives in, not the line: the line is what the message needs to
+        // print, and comparing it would fail the day the file grows.
+        let files: Vec<String> = definitions
+            .iter()
+            .map(|d| d.split(':').next().unwrap_or("").to_string())
+            .collect();
+        assert!(
+            !definitions.is_empty(),
+            "the guard found nothing, which is the vacuous answer - it would pass on a file with no credential hash at all"
+        );
+        assert_eq!(
+            files,
+            vec!["routes/mod.rs".to_string()],
+            "EXACTLY ONE production definition of `hash_token` may exist, in `routes/mod.rs`. Found: {definitions:?}. A second copy - even byte-identical - splits the credential hash into two, and the one that drifts stops every key or session authenticating with no compile error. Forward the callers through `crate::routes::hash_token`."
+        );
+    }
+
+    /// Whether line `i` of `text` is inside a `#[cfg(test)] mod tests` block.
+    ///
+    /// A test may define its own helper named `hash_token` without splitting the production hash,
+    /// so the count above has to exclude them. The boundary is the attribute rather than the string
+    /// "mod tests", which appears in prose and resolves to the wrong place.
+    fn defined_in_a_test_module(text: &str, i: usize) -> bool {
+        // The line AFTER an attribute must declare `mod tests`, not `mod <anything_else>`.
+        let mut attr = false;
+        for (n, line) in text.lines().enumerate() {
+            if line.contains("#[cfg(test)]") {
+                attr = true;
+                continue;
+            }
+            if !attr {
+                continue;
+            }
+            attr = false;
+            let trimmed = line.trim();
+            if !(trimmed.starts_with("mod tests") || trimmed.starts_with("pub mod tests")) {
+                continue;
+            }
+            // INSIDE means the definition comes AFTER the module's opening line, so the
+            // comparison is `i > n` and not the reverse. MEASURED the reverse direction first: it
+            // returned true for every definition in the file, the guard found ZERO production
+            // definitions, and it failed as a vacuous answer inverted - passing on a file with no
+            // credential hash at all.
+            if i > n {
+                return true;
+            }
+        }
+        false
+    }
     /// auth.rs's parser was FOLDED INTO this module, so there is no second
     /// implementation to compare against - the login path now resolves the
     /// cookie through the function tested above. What can still drift is the
@@ -802,6 +1368,66 @@ mod tests {
         stale.close().await;
     }
 
+    /// Both bounds are INCLUSIVE-UNUSABLE, pinned at the exact instant.
+    ///
+    /// The function's own doc states the rule - "Both bounds are inclusive-unusable,
+    /// matching the expires_at > ? predicate the lookup has always used" - and the
+    /// test above cannot catch a change to it. It compares two CALLS to the same
+    /// function, so a boundary that moved on both sides at once still passes. What a
+    /// customer meets at the boundary is the difference between a session that is
+    /// gone and one that is not, and it is a single instant wide.
+    ///
+    /// Each bound is isolated by making the other comfortably satisfied, so a failure
+    /// names which of the two moved rather than that "something did".
+    #[test]
+    fn both_session_bounds_are_inclusive_unusable_at_the_exact_instant() {
+        let now = chrono::Utc::now();
+        const IDLE_DAYS: i64 = 7;
+        const ABSOLUTE_DAYS: i64 = 30;
+        let live = |last_seen_at, expires_at| {
+            session_is_live_at(now, last_seen_at, expires_at, IDLE_DAYS, ABSOLUTE_DAYS)
+        };
+
+        // (1) ABSOLUTE. last_seen_at is now, so the idle rule is satisfied by a
+        // fortnight and cannot be what refuses these.
+        assert!(
+            !live(now, now),
+            "expires_at EXACTLY now must already be unusable: the rule is a session is
+             live while its expiry is still in the future, and a boundary flipped to
+             `<` would keep it alive for one more instant"
+        );
+        assert!(
+            live(now, now + chrono::Duration::microseconds(1)),
+            "one microsecond of headroom must be enough: a session whose expiry has
+             not yet passed is live, and pinning only the dead side would let a
+             boundary move in the direction that refuses a valid session"
+        );
+
+        // (2) IDLE. expires_at is a year out, so the absolute rule cannot be what
+        // refuses these.
+        let far = now + chrono::Duration::days(365);
+        let at_bound = now - chrono::Duration::days(IDLE_DAYS);
+        assert!(
+            !live(at_bound, far),
+            "last_seen_at EXACTLY idle_days ago must already be unusable: the rule is
+             last_seen_at + idle_days > now, so the instant itself is out"
+        );
+        assert!(
+            live(at_bound + chrono::Duration::microseconds(1), far),
+            "one microsecond of activity inside the bound must be enough, and pinning
+             only the dead side would let a boundary move in the direction that cuts a
+             session short while it is still in use"
+        );
+
+        // (3) BOTH AT ONCE, which is the shape a real expiry produces: the bounds
+        // are independent refusals and either is enough, so the two dead rungs above
+        // must not depend on the other rule being slack.
+        assert!(
+            !live(at_bound, now),
+            "a session at both bounds at once is refused, and it would be refused by
+             either rule alone - neither is leaning on the other"
+        );
+    }
     /// The idle bound must be INERT unless it is STRICTER than the absolute
     /// lifetime, and that is a property of the code rather than of a particular
     /// config value.
@@ -913,6 +1539,7 @@ mod tests {
             events,
             ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies,
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 
@@ -931,9 +1558,28 @@ mod tests {
 
     /// Sends one credential-free request through the real router and returns the
     /// status. The body is supplied where a handler parses one BEFORE checking a
-    /// credential (auth::exchange_token validates pb_token first): a 400 there
-    /// still proves the route matched, which is all this asserts.
+    /// credential (auth::login validates its payload first): a 400 there still
+    /// proves the route matched, which is all this asserts.
     async fn route_status(app: &Router, method: &str, uri: &str, body: &str) -> StatusCode {
+        route_status_with_body(app, method, uri, body).await.0
+    }
+
+    /// The status AND the response body, for the callers that have to tell two
+    /// 404s apart.
+    ///
+    /// A 404 alone does not mean "not mounted". axum answers 404 for an unmatched
+    /// path AND for a request whose extractor rejected the body ("Failed to
+    /// deserialize the JSON body into the target type" carries `NOT_FOUND` in axum's
+    /// `JsonRejection`), so the status by itself cannot separate "this route is gone"
+    /// from "this row sends a body the handler refuses". The body text is what
+    /// separates them, and `POST /auth/password-change` sat on that ambiguity until
+    /// the response was read rather than the code.
+    async fn route_status_with_body(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
         use axum::http::Request;
         use tower::ServiceExt;
 
@@ -945,26 +1591,119 @@ mod tests {
             .body(axum::body::Body::from(body.to_string()))
             .expect("build the request");
 
-        app.clone()
+        let res = app
+            .clone()
             .oneshot(req)
             .await
-            .expect("the router must respond")
-            .status()
+            .expect("the router must respond");
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("the response body must be readable");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// A concrete path parameter, used to prove {id} is a PARAMETER.
     const SOME_KEY_ID: &str = "00000000-0000-0000-0000-000000000000";
 
-    /// Every route `create_router` mounts: (method, path, body). One row per
-    /// route CALL, so /api/topups and /api/keys - each a SINGLE `.route()` with
-    /// two methods chained - appear per method. 13 route calls, 15 rows.
+    /// Every route `create_router` mounts: (method, path, body). One row per route
+    /// CALL, so /api/topups, /api/keys and /api/reviews - each a SINGLE `.route()` with two
+    /// methods chained - appear per method. **38 route calls, 41 rows.**
+    ///
+    /// THIS COUNT WAS WRONG FOR SIX ROUTES AND NOTHING SAID SO, which is the gap
+    /// `the_route_inventory_matches_the_mounted_table` now closes. The header used to
+    /// read "13 route calls, 15 rows" against a router mounting 26 calls, and
+    /// `GET /api/admin/metrics`, `GET /api/usage/recent`, `GET /api/export`,
+    /// `GET /api/admin/accounts`, `GET /api/admin/audit` and
+    /// `GET /api/admin/accounts/{id}/audit` were mounted, documented in the api-spec,
+    /// and ABSENT here. Nothing failed: every check below starts from this table, so a
+    /// route missing from it was invisible. The direction is now checked in both
+    /// places - this table against the spec below, and this table against the route
+    /// inventory above.
+    ///
+    /// ROWS, not routes. The first attempt at this header said "30 rows" - a figure
+    /// arrived at by assuming each dual-method path contributes an extra row. It does
+    /// not: `/api/topups`, `/api/keys` and `/api/reviews` are ONE `.route(` call each carrying
+    /// both `get` and `post`, and this table lists a request per METHOD, so each
+    /// contributes two rows in total, not three. **41 is the number the test pins** -
+    /// `the_macro_body_lists_the_inventory_it_mounts`, and the pin is why this header can
+    /// be checked rather than trusted.
+    ///
+    /// THE HEADER SAID "26 route calls, 28 rows" AND "40 is the number the test pins"
+    /// WHILE THE TEST PINNED 38 AND 41, and there was nothing checking the prose because
+    /// the pin checks the ARRAY. Three sentences stated numbers the guard beside them
+    /// contradicted, which is the more damaging direction: a reader believes the sentence
+    /// and concludes the test is wrong. MEASURED against the array and the pin together.
+    ///
+    /// The native identity routes each contribute ONE row: they are all
+    /// single-method (POST), so `/auth/logout` and `/auth/logout-all` are not
+    /// dual-method paths - the previous note named only two of the three, and
+    /// `/api/reviews` is the third. `/auth/password-change` (POST) and
+    /// `/auth/providers` (GET) are likewise one row each, and they are the two the
+    /// settings panel needs: the password change the retired SDK did with
+    /// `users.update`, and the linked provider list it did with `listExternalAuths`.
+    ///
+    /// THE COUNT MOVED FROM 32 TO 36 IN TWO DIRECTIONS AT ONCE, which is why the
+    /// header names the intermediate number rather than only the endpoints. It was
+    /// 34, then 32 when the identity port deleted `/auth/exchange`, then 33 when
+    /// `/auth/google` was added to the inventory it had been missing from, and 36
+    /// then. **It is 38 now**, which is another five routes added after that
+    /// sequence was written down - the same drift this correction is repairing,
+    /// happening a third time. A reader comparing two of those numbers without the
+    /// sequence in between would conclude a route was dropped that never existed.
     const MOUNTED: &[(&str, &str, &str)] = &[
         ("GET", "/health", ""),
-        ("POST", "/auth/exchange", r#"{"pb_token":"probe"}"#),
+        ("GET", "/api/admin/metrics", ""),
+        // The bodies are the smallest shape each handler accepts, so a
+        // credential-free request reaches the handler and stops at its own
+        // validation rather than at axum's extractor - which is all this table
+        // asserts (the router matched).
+        (
+            "POST",
+            "/auth/signup",
+            r#"{"email":"a@b.example","password":"correct-horse-battery"}"#,
+        ),
+        (
+            "POST",
+            "/auth/login",
+            r#"{"email":"a@b.example","password":"correct-horse-battery"}"#,
+        ),
+        ("POST", "/auth/google", r#"{"id_token":"probe"}"#),
+        ("POST", "/auth/verify-email", r#"{"token":"probe"}"#),
+        (
+            "POST",
+            "/auth/password-reset/request",
+            r#"{"email":"a@b.example"}"#,
+        ),
+        (
+            "POST",
+            "/auth/password-reset/confirm",
+            r#"{"token":"probe","email":"a@b.example","password":"correct-horse-battery"}"#,
+        ),
+        (
+            "POST",
+            "/auth/verification/resend",
+            r#"{"email":"a@b.example"}"#,
+        ),
         ("POST", "/auth/logout", ""),
         ("POST", "/auth/logout-all", ""),
+        (
+            // HANDLED BEFORE THE GATE, which is why no extractor can turn it into a
+            // 404. `POST /auth/password-change` does this and NOTHING ELSE in the table
+            // does: every other handler takes `Json<T>` directly and therefore lets
+            // axum decide the status when a body does not parse, which axum reports as
+            // 404 - indistinguishable, from a status alone, from a route that is not
+            // mounted at all. Take a `Result<Json<T>, JsonRejection>` and map the
+            // rejection yourself; the table can then assert what it means to assert.
+            "POST",
+            "/auth/password-change",
+            r#"{"current_password":"probe","new_password":"probe"}"#,
+        ),
+        ("GET", "/auth/providers", ""),
         ("GET", "/api/me", ""),
         ("GET", "/api/usage", ""),
+        ("GET", "/api/usage/recent", ""),
+        ("GET", "/api/export", ""),
         ("GET", "/api/topups", ""),
         ("POST", "/api/topups", "{}"),
         ("GET", "/api/keys", ""),
@@ -985,6 +1724,13 @@ mod tests {
         // so the router matched, which is all this table asserts.
         ("POST", "/api/telegram/link-code", ""),
         ("DELETE", "/api/telegram", ""),
+        // Reviews. GET is public, so a bodyless request must reach the handler
+        // and answer 200. The write paths are session-scoped and stop at the
+        // guard (401) - not 404/405, which is what says the router matched.
+        ("GET", "/api/reviews", ""),
+        ("POST", "/api/reviews", r#"{"rating":5}"#),
+        ("GET", "/api/reviews/mine", ""),
+        ("POST", "/api/reviews/withdraw", ""),
         (
             "POST",
             "/api/bot/link",
@@ -993,9 +1739,16 @@ mod tests {
         // Admin: cookie + operator flag. A credential-free request stops at the
         // guard (401), which is not 404/405 - so the router matched, which is all
         // this table asserts.
+        ("GET", "/api/admin/accounts", ""),
+        ("GET", "/api/admin/audit", ""),
         (
             "GET",
             "/api/admin/accounts/00000000-0000-0000-0000-000000000000",
+            "",
+        ),
+        (
+            "GET",
+            "/api/admin/accounts/00000000-0000-0000-0000-000000000000/audit",
             "",
         ),
         (
@@ -1013,13 +1766,17 @@ mod tests {
             "/api/admin/accounts/00000000-0000-0000-0000-000000000000/resume",
             "",
         ),
+        (
+            "POST",
+            "/api/admin/accounts/00000000-0000-0000-0000-000000000000/adjust",
+            "{}",
+        ),
         ("POST", "/webhooks/midtrans", "{}"),
         ("POST", "/v1/chat/completions", ""),
     ];
 
     /// Near misses that MUST be 405: the PATH is mounted, the method is not.
     const WRONG_METHOD: &[(&str, &str)] = &[
-        ("GET", "/auth/exchange"),
         ("POST", "/health"),
         ("GET", "/auth/logout"),
         ("GET", "/auth/logout-all"),
@@ -1050,7 +1807,12 @@ mod tests {
     const ABSENT_PATH: &[(&str, &str)] = &[
         ("GET", "/api/nope"),
         ("GET", "/api/mex"),
+        // A NEAR MISS FOR THE PATH THAT REPLACED IT. `/auth/exchange` is gone from
+        // the crate entirely, so a plural `s` tests nothing about it; the useful
+        // sibling now is `/auth/password-change`, whose path is long enough to be
+        // mistyped and mounted only as POST.
         ("POST", "/auth/exchanges"),
+        ("POST", "/auth/password-changes"),
         ("GET", "/healt"),
         ("GET", "/api/me/"),
         ("GET", "/api/ME"),
@@ -1068,23 +1830,332 @@ mod tests {
     /// wrong method, 404 for a path that is not mounted. Delete a route, rename a
     /// path, or move a handler to another method and this fails naming the exact
     /// pair.
+    // -----------------------------------------------------------------------
+    // THE SPEC MUST NOT PROMISE A ROUTE THE SERVER DOES NOT SERVE.
+    // -----------------------------------------------------------------------
+    //
+    // `docs/server/api-spec.md:14-25` is presented as the CURRENT surface. W30 found
+    // FOUR rows in it with no handler and no mount at all - GET/POST /api/reviews,
+    // GET /api/bot/account, GET /api/bot/reviews/mine, POST /api/bot/notify-topup -
+    // while the tables they need have existed since the initial migration.
+    //
+    // They are not bugs to fix (the whole reviews/feed flow is Telegram-BOT driven,
+    // and the launch checklist records that the bot is still design-only),
+    // but an integrator reading that table would call /api/reviews, get a 404, and
+    // conclude the SERVER was broken. So the spec now marks them DESIGNED-NOT-BUILT,
+    // and this test keeps the two documents from drifting apart again.
+    //
+    // It cannot parse free-form prose, so it pins the CONTRACT instead: every route
+    // the spec calls implemented must appear in MOUNTED. When a new endpoint is
+    // documented, either it is mounted (and added to MOUNTED) or it is marked
+    // designed-only - and the list below is the mechanical record of which is which.
+    #[test]
+    fn the_spec_marks_exactly_the_designed_but_unbuilt_routes_as_designed() {
+        // Routes the api-spec table mentions that are NOT mounted, each of which must
+        // therefore carry a designed-not-built marker in the spec. If one of these is
+        // ever mounted, this test fails and forces the spec to be updated with it -
+        // which is the point.
+        const SPEC_ONLY: &[&str] = &[
+            "/api/bot/account",
+            "/api/bot/reviews/mine",
+            "/api/bot/notify-topup",
+        ];
+
+        let mounted_paths: Vec<&str> = MOUNTED.iter().map(|(_, path, _)| *path).collect();
+
+        for path in SPEC_ONLY {
+            assert!(
+                !mounted_paths.contains(path),
+                "{path} is mounted now, so it is no longer designed-only: remove it from SPEC_ONLY AND from the designed-not-built marker in docs/server/api-spec.md",
+            );
+        }
+
+        // POSITIVE CONTROL: the list above is only meaningful if MOUNTED is the real
+        // set. A path that IS mounted must be found, or `contains` is answering the
+        // wrong question.
+        assert!(
+            mounted_paths.contains(&"/api/bot/link"),
+            "the mounted table must contain a route that really exists, or the check above is vacuous"
+        );
+    }
+
+    /// The SPEC must actually say so, which the test above never checked.
+    ///
+    /// `the_spec_marks_exactly_the_designed_but_unbuilt_routes_as_designed` asserts that
+    /// the four designed-only paths are NOT MOUNTED. It never opened the spec. So the
+    /// claim in its own comment - that each "must therefore carry a designed-not-built
+    /// marker in the spec" - was a comment, and the W30 defect it exists to prevent
+    /// could return by editing the spec alone: delete the markers, leave the routes
+    /// unmounted, and the suite stays green while the table promises four endpoints
+    /// that 404.
+    ///
+    /// That is the API CONTRACT, which is the one document a client codes against, and
+    /// a promise the server does not keep is worse here than silence: an integrator
+    /// calls /api/reviews, gets a 404, and concludes the SERVER is broken.
+    ///
+    /// Read from the spec rather than a list kept here, for the same reason the alert
+    /// guards read probe.sh: a hand-maintained copy of what another file says is the
+    /// same bug twice over.
+    #[test]
+    fn the_spec_names_every_route_it_does_not_serve() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("server")
+                .join("api-spec.md"),
+        )
+        .expect("docs/server/api-spec.md must be readable, or this checks nothing");
+
+        // The paragraph that carries the promise, located by its own heading rather
+        // than by line: a line citation here would be the very defect this test
+        // exists to catch, and the paragraph moves whenever a route is added.
+        let start = spec
+            .find("MARKED ROUTES ARE DESIGNED, NOT BUILT")
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/server/api-spec.md no longer carries the MARKED ROUTES ARE \
+                     DESIGNED, NOT BUILT paragraph. Without it a reader has no way to \
+                     tell a documented route from a served one."
+                )
+            });
+        // A generous window: the paragraph names all three and may grow a sentence.
+        let end = (start + 700).min(spec.len());
+        let promise = &spec[start..end];
+
+        const SPEC_ONLY: &[&str] = &[
+            "/api/bot/account",
+            "/api/bot/reviews/mine",
+            "/api/bot/notify-topup",
+        ];
+        for path in SPEC_ONLY {
+            assert!(
+                promise.contains(path),
+                "docs/server/api-spec.md does not say that {path} is designed and not \
+                 built, while the route table presents it. An integrator who calls it \
+                 gets a 404 and concludes the server is broken - which is exactly the \
+                 defect this paragraph was added to prevent."
+            );
+        }
+
+        // The table carries the marker too, and that is the half a scanner sees: the
+        // paragraph is four paragraphs below the table, so a reader skimming the table
+        // meets the row before the warning.
+        //
+        // The marker MOVED to the Bot row when the reviews routes were mounted. It
+        // used to sit on Reviews, which was correct while the review endpoints were
+        // designed-only; now they are served, so the same marker on that row would be
+        // the opposite defect - a served route advertised as unbuilt. The three
+        // /api/bot/* routes are still designed-only, so the marker still has a row to
+        // live on and the test still asserts something true.
+        //
+        // The expected substring is the whole cell, `| **Bot** ⚠ |`, not a fragment of
+        // it: the row's label is bold because the bot row groups several routes and the
+        // others name one each. Asserting a loosely-matched fragment would pass on a
+        // row that merely CONTAINS those characters - including a future row where the
+        // marker no longer means what this test says it means.
+        assert!(
+            spec.contains("| **Bot** ⚠ |"),
+            "the api-spec route table no longer marks ANY row as designed-not-built, while the \
+             MARKED ROUTES ARE DESIGNED, NOT BUILT paragraph still names three routes. The \
+             warning paragraph is further down; the marker is what someone reading the table \
+             actually sees."
+        );
+    }
+
+    /// THE OTHER MARKER, and the half nothing read: a route marked ⚠ must NOT be mounted.
+    ///
+    /// WHAT WAS MISSING, measured. The test above reads the PARAGRAPH and the ROW LABEL - the literal
+    /// `| **Bot** ⚠ |`. It never reads a per-route marker. Two edits proved it:
+    ///
+    ///   - flipping `GET /api/bot/account` from ⚠ to ✅ INSIDE the Bot row left the suite green,
+    ///     because the row label that test asserts is still there, and the paragraph still names the
+    ///     path. Nothing compared either to the router.
+    ///   - adding ✅ to `POST /api/admin/topups/:id/refund` - a route the table itself strikes
+    ///     through as **not planned** - also left it green, because no row other than Bot's is read
+    ///     at all.
+    ///
+    /// THE TABLE'S VOCABULARY, read off the file rather than assumed: a route with NO marker is
+    /// SERVED, and ⚠ means designed-not-built. Measured - `✅` appears in exactly one row, the Bot
+    /// row, and everywhere else service is the default. A first draft of this test asserted the
+    /// opposite convention (that ✅ marks the served majority) and its own positive control caught
+    /// the mistake at 1 matched marker out of 57 parsed.
+    ///
+    /// SO THE RULE IS THE ⚠ DIRECTION, which is also the one that misleads: a route marked ⚠ and
+    /// actually MOUNTED tells an integrator not to build against an endpoint that works, which is a
+    /// smaller harm than the reverse - but the reverse, a route with NO marker that is not mounted,
+    /// is the 404-in-production case, and that is what `SPEC_ONLY` and
+    /// `the_spec_names_every_route_it_does_not_serve` cover for the three known paths. What no check
+    /// covered is that the ⚠ SET ITSELF is honest against the router, and that is this test.
+    #[test]
+    fn every_route_the_spec_marks_designed_is_not_mounted() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("server")
+                .join("api-spec.md"),
+        )
+        .expect("docs/server/api-spec.md must be readable, or this checks nothing");
+
+        const PLACEHOLDER: &str = "00000000-0000-0000-0000-000000000000";
+        // `GET /api/keys/:id` as the spec writes it.
+        let mounted: Vec<String> = MOUNTED
+            .iter()
+            .map(|(method, path, _)| format!("{method} {}", path.replace(PLACEHOLDER, ":id")))
+            .collect();
+
+        // Every `METHOD /path` inside backticks in a table row, with whatever marker trails it.
+        let mut parsed = 0usize;
+        let mut designed_seen = 0usize;
+        let mut served_seen = 0usize;
+        for line in spec.lines() {
+            if !line.starts_with('|') {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(open) = rest.find('`') {
+                let Some(close) = rest[open + 1..].find('`') else {
+                    break;
+                };
+                let inside = rest[open + 1..open + 1 + close].to_string();
+                let tail = rest[open + 1 + close + 1..].to_string();
+                rest = &rest[open + 1 + close + 1..];
+                let after = tail.trim_start();
+
+                // `GET /api/me`, or `GET/POST /api/keys` for a dual-method row.
+                let mut methods: Vec<&str> = Vec::new();
+                let mut path = "";
+                for (i, tok) in inside.split(' ').enumerate() {
+                    if i == 0 {
+                        methods = tok.split('/').collect();
+                    } else if tok.starts_with('/') {
+                        path = tok;
+                    }
+                }
+                if path.is_empty() {
+                    continue;
+                }
+
+                let designed = after.starts_with('⚠');
+                if designed {
+                    designed_seen += 1;
+                } else if after.starts_with('✅') {
+                    served_seen += 1;
+                }
+
+                for method in methods {
+                    parsed += 1;
+                    let want = format!("{method} {path}");
+                    if designed {
+                        assert!(
+                            !mounted.contains(&want),
+                            "docs/server/api-spec.md marks `{method} {path}` as ⚠ DESIGNED, and \
+                             create_router MOUNTS it. The table tells an integrator not to build \
+                             against a route that works - or, reading it the other way, the ⚠ set \
+                             and the router have drifted apart and one of them is wrong. Move the \
+                             marker to ✅, or remove the route. (normalised: {want})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // THE POSITIVE CONTROLS, both of them. The loop reports "no mismatches" for a correct table
+        // AND for a parser that read nothing, so both the marker set and the route parse are pinned.
+        assert!(
+            designed_seen >= 3,
+            "only {designed_seen} route(s) in the spec table carry a ⚠ marker. The MARKED ROUTES \
+             paragraph names three, so this parser has stopped reading them and the comparison \
+             above proved nothing."
+        );
+        assert!(
+            parsed >= 30,
+            "only {parsed} `METHOD /path` token(s) were parsed out of the spec table, far fewer \
+             than it lists, so the comparison above examined almost nothing. ({served_seen} carried \
+             an explicit ✅.)"
+        );
+    }
+
+    /// And the OTHER direction: every route the server MOUNTS is in the spec.
+    ///
+    /// The companion to the test above, and the half nobody checks. That one asks
+    /// whether the spec is honest about what it does not serve; this asks whether it
+    /// describes what it does. An endpoint that is mounted and undocumented is a
+    /// route an integrator cannot find and a maintainer cannot account for - and the
+    /// spec is a CONTRACT, so a silent addition is a contract that grew without
+    /// anyone agreeing to it.
+    ///
+    /// The spec writes a parameterised path with :id while the router needs a
+    /// concrete one, so the mounted path is normalised before the comparison. That
+    /// normalisation is asserted to be EXERCISED below: a test that quietly compared
+    /// nothing because every path failed to match would pass.
+    #[test]
+    fn every_mounted_route_is_documented_in_the_api_spec() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs")
+                .join("server")
+                .join("api-spec.md"),
+        )
+        .expect("docs/server/api-spec.md must be readable, or this checks nothing");
+
+        const PLACEHOLDER: &str = "00000000-0000-0000-0000-000000000000";
+        let mut parameterised = 0usize;
+        for (_, path, _) in MOUNTED {
+            let documented = path.replace(PLACEHOLDER, ":id");
+            if documented.contains(":id") {
+                parameterised += 1;
+            }
+            assert!(
+                spec.contains(&documented),
+                "{path} is mounted by create_router but docs/server/api-spec.md does not \
+                 document it. An endpoint the contract does not mention is a route an \
+                 integrator cannot find, and a contract that grew without anyone \
+                 agreeing to it."
+            );
+        }
+
+        // The vacuity guards. A MOUNTED list that lost its entries, or a table that
+        // stopped using the placeholder, would make the loop above answer nothing.
+        assert!(
+            MOUNTED.len() >= 30,
+            "MOUNTED has {} entries, far fewer than the router mounts, so the comparison \
+             above is checking a list that no longer describes the surface",
+            MOUNTED.len()
+        );
+        assert!(
+            parameterised >= 4,
+            "only {parameterised} mounted paths contain the id placeholder, so the \
+             normalisation above is barely exercised and a mismatch in it would go \
+             unnoticed"
+        );
+    }
     #[tokio::test]
     async fn every_mounted_route_dispatches_and_every_near_miss_is_refused() {
         let app = table_app();
 
         for (method, path, body) in MOUNTED {
-            let status = route_status(&app, method, path, body).await;
-            assert_ne!(
-                status,
-                StatusCode::NOT_FOUND,
-                "{method} {path} is mounted by create_router but the router did not match it \
-                 (404): the route was deleted or the path renamed"
-            );
+            let (status, response) = route_status_with_body(&app, method, path, body).await;
             assert_ne!(
                 status,
                 StatusCode::METHOD_NOT_ALLOWED,
                 "{method} {path} is mounted by create_router but the router refused the method \
                  (405): the handler was moved to a different method"
+            );
+            // A 404 IS NOT PROOF THAT THE PATH IS MISSING. axum answers 404 for an
+            // unmatched path AND for a rejected extractor, so a row whose body the
+            // handler will not accept is indistinguishable, from the status alone, from
+            // a route that was deleted. The RESPONSE TEXT is what separates the two, so
+            // it travels in the message: without it the next reader gets a 404 and no
+            // way to tell which of two very different repairs is the right one.
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} {path} answered 404 against a router built from create_router. Either \
+                 the route was deleted or renamed, or the request was rejected before it reached \
+                 the handler - axum reports both as 404. Body sent: {body}. Response: {response}"
             );
         }
 
@@ -1105,6 +2176,319 @@ mod tests {
                  table does not declare is being matched (prefix matching, or an extra route)"
             );
         }
+    }
+
+    /// The number of DISTINCT paths in a MOUNTED-shaped list, for the count
+    /// cross-check in `the_route_inventory_matches_the_mounted_table`.
+    ///
+    /// `MOUNTED` is a table of REQUESTS, so a dual-method path appears twice. `ROUTES`
+    /// is a list of MOUNTS, so it appears once. Comparing `MOUNTED.len()` to the
+    /// inventory count was wrong by exactly the number of extra rows the dual-method
+    /// routes contribute - which is how this helper came to exist.
+    fn mounted_paths_distinct(mounted_set: &[&str]) -> usize {
+        let mut seen: Vec<&str> = Vec::new();
+        for path in mounted_set {
+            if !seen.contains(path) {
+                seen.push(path);
+            }
+        }
+        seen.len()
+    }
+
+    ///
+    /// Every other test in this module starts from `MOUNTED`. That is the direction
+    /// that happens to be safe against a route being *deleted* - the dispatch test
+    /// would fail - but it is blind in the direction a route is *added*: mount a new
+    /// route, forget the table, and all seven checks stay green while nothing
+    /// exercises the new endpoint. This test was written because that had ALREADY
+    /// happened four times (`GET /api/admin/metrics`, `GET /api/usage/recent`,
+    /// `GET /api/export`, `GET /api/admin/accounts/{id}/audit` were mounted,
+    /// documented, and absent from the table), which is why the fix is a check
+    /// rather than a correction.
+    ///
+    /// HOW IT CAN WORK AT ALL, given that axum exposes no route table and the naive
+    /// source scan is wrong (docs/testing.md:129-150). `create_router` no longer
+    /// writes its paths inline: it expands the `routes!` macro over an inventory
+    /// whose PATH LITERALS ARE THE STRINGS THE MSVC/AXUM ROUTER IS BUILT FROM.
+    /// So this test reads the same bytes the router consumed, and the two cannot
+    /// disagree by accident.
+    ///
+    /// THE TRAP IT MUST NOT FALL INTO is the one docs/testing.md documents: a
+    /// regex over `create_router` matches twenty of twenty-six `.route(` calls and
+    /// falsely reports `/webhooks/midtrans` as unmounted, because some calls put the
+    /// path on the following line. The parse below is line-oriented and requires the
+    /// path on the SAME line as `.route(`, and `ROUTES` is written so that is always
+    /// true - the assertion on the parsed count is what stops a future multi-line
+    /// entry from silently dropping out.
+    #[test]
+    fn the_route_inventory_matches_the_mounted_table() {
+        // The rendered inventory, as Rust sees it. `include_str!` would be a second
+        // copy of the bytes; `ROUTES` IS the bytes create_router expanded.
+        let inventory = ROUTES;
+
+        // A route line in ROUTES is exactly:  .route("<path>", <expr>);
+        // Anchored at both ends so a COMMENT that mentions `.route("...")` cannot be
+        // mistaken for a route - the comment above `/api/admin/metrics` mentions
+        // `/health`, and a looser match would collect it.
+        let mut declared: Vec<&str> = Vec::new();
+        for line in inventory.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix(".route(\"") else {
+                continue;
+            };
+            let Some(close) = rest.find('"') else {
+                continue;
+            };
+            let path = &rest[..close];
+            // The trailing `;` is the marker described on ROUTES: rustfmt never emits
+            // it, so its presence is evidence a human wrote this line and its absence
+            // is evidence something rewrote it.
+            assert!(
+                line.ends_with(");"),
+                "the route line for {path} does not end in `);`. That trailing `;` is what \
+                 makes a deleted route detectable: without it this test can no longer tell a \
+                 mounted route from a removed one. Restore the `;` (an editor or a formatter \
+                 removed it)."
+            );
+            declared.push(path);
+        }
+
+        // The count cross-check, placed before the set comparison because its failure
+        // message explains the mismatch the set loops would otherwise report as a
+        // mystery: a route added to `routes!` and not to MOUNTED is a COUNT difference
+        // before it is a set difference.
+        //
+        // NOT `MOUNTED.len()`: MOUNTED is a table of REQUESTS, so a dual-method path
+        // (/api/topups, /api/keys) appears twice while `ROUTES` lists it once. The
+        // first version of this test compared the two lengths and failed purely
+        // because 28 rows != 26 route calls - a false positive, which is the failure
+        // mode docs/testing.md:152-171 says costs more than a miss.
+        let mounted_set: Vec<&str> = MOUNTED.iter().map(|(_, path, _)| *path).collect();
+
+        // The parser must find the routes, not a fraction of them. If a route is
+        // ever written multi-line, or a line's shape changes, this count drops and
+        // the message names the cause rather than reporting a mystery mismatch
+        // below. The number itself is pinned separately at the end of this test;
+        // this assertion is the cross-check against the table.
+        assert_eq!(
+            declared.len(),
+            mounted_paths_distinct(&mounted_set),
+            "the inventory parse found {} route lines but MOUNTED declares {} distinct paths. \
+             Either a route was added to `routes!` and not to MOUNTED (which is the defect this \
+             test exists for), or the ROUTES line was rewritten into a shape this parser does \
+             not recognise (it requires the path on the same line as `.route(`). Check both: \
+             MOUNTED is the by-request table, `routes!` is what the router mounts.",
+            declared.len(),
+            mounted_paths_distinct(&mounted_set)
+        );
+
+        // The real comparison. MOUNTED uses a concrete uuid where the router uses {id},
+        // so the inventory path is normalised the same way
+        // `every_mounted_route_is_documented_in_the_api_spec` normalises MOUNTED.
+        let declared_set: Vec<String> = declared
+            .iter()
+            .map(|p| p.replace("{id}", SOME_KEY_ID))
+            .collect();
+
+        for path in &declared_set {
+            assert!(
+                mounted_set.contains(&path.as_str()),
+                "{path} is mounted by create_router and does NOT appear in MOUNTED, so no test \
+                 exercises it. Add a (method, path, body) row to MOUNTED - this is exactly the \
+                 hole the four admin/account routes sat in."
+            );
+        }
+        for path in &mounted_set {
+            assert!(
+                declared_set.iter().any(|d| d == path),
+                "{path} is in MOUNTED but create_router does NOT mount it. Either mount it or \
+                 delete the row: a row for a route that does not exist makes the dispatch test \
+                 assert something about a 404."
+            );
+        }
+
+        // POSITIVE CONTROL, because both loops above pass trivially against two empty
+        // lists and a parse that collected nothing would report a clean bill of health.
+        assert!(
+            declared.contains(&"/api/bot/link"),
+            "the inventory parse did not find /api/bot/link, so it is not reading the route \
+             list it thinks it is and every assertion above is vacuous"
+        );
+        // And the count the router actually expands, pinned: a hand-edit that drops a
+        // route is caught above; this catches a rewrite that drops one from BOTH and
+        // looks self-consistent.
+        assert_eq!(
+            declared.len(),
+            38,
+            "create_router mounts a different number of routes than the 38 this test was \
+             last reconciled against. If that is deliberate, update this number AND the \
+             MOUNTED doc comment that states the row count - both, or the next reader \
+             trusts a stale one."
+        );
+        assert_eq!(
+            mounted_set.len(),
+            41,
+            "MOUNTED declares a different number of ROWS than the 41 this test was last \
+             reconciled against. Rows, not routes: /api/topups, /api/keys and /api/reviews each \
+             carry GET+POST, so each contributes two rows from one `.route(` call, while the rest \
+             including /auth/logout and /auth/logout-all are single-method. A mismatch here \
+             means a row was added or removed without updating this number."
+        );
+    }
+
+    /// THE DOC COMMENT ABOVE `MOUNTED` STATES TWO NUMBERS, AND THE PIN BESIDE IT STATED TWO
+    /// OTHERS. Nothing compared them, because the existing assertions check the ARRAY while the
+    /// prose is only a string.
+    ///
+    /// MEASURED, and it had drifted three times: the header read "26 route calls, 28 rows" and
+    /// then "40 is the number the test pins" while the assertion below it pinned 38 and 41. A
+    /// READER BELIEVES THE SENTENCE, so the failure direction is that someone concludes the TEST
+    /// is wrong and edits the pin - which is worse than the stale number itself.
+    ///
+    /// SO THIS READS THE PROSE, which is unlike the other guards in this file: they check code,
+    /// and this one checks the comment a reader actually reads. It is only possible because the
+    /// header states the numbers in a fixed shape, which the assertion below enforces.
+    #[test]
+    fn the_mounted_doc_comment_states_the_counts_the_pin_uses() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/mod.rs"),
+        )
+        .expect("mod.rs must be readable, or this checks nothing");
+
+        let header = source.find("Every route `create_router` mounts");
+        let header = header.expect(
+            "the MOUNTED doc comment moved or was deleted, so this guard is reading nothing",
+        );
+        // The paragraph that states the counts, taken as a window rather than by line number.
+        let window = &source[header..(header + 2600).min(source.len())];
+
+        let calls = MOUNTED_DOC_COUNTS.0;
+        let rows = MOUNTED_DOC_COUNTS.1;
+
+        assert!(
+            window.contains(&format!("**{calls} route calls, {rows} rows.**")),
+            "the MOUNTED doc comment no longer states `**{calls} route calls, {rows} rows.**` in that shape. Either the numbers drifted from the pin again, or the sentence was reworded and this guard can no longer find it - fix the sentence rather than deleting this test"
+        );
+        assert!(
+            window.contains(&format!("**{rows} is the number the test pins**")),
+            "the MOUNTED doc comment no longer states `**{rows} is the number the test pins**`, so the header and the assertion below it can disagree again"
+        );
+
+        // And the two constants must equal what the pin beside them uses, so this test and the
+        // assertion above cannot drift apart - which is the whole shape of the defect.
+        let declared = ROUTES
+            .lines()
+            .filter(|line| line.trim_start().starts_with(".route("))
+            .count();
+        assert_eq!(
+            declared,
+            calls,
+            "ROUTES carries {declared} route calls and the doc comment says {calls}; the pin in `the_macro_body_lists_the_inventory_it_mounts` is the third place this number lives"
+        );
+        assert_eq!(
+            MOUNTED.len(),
+            rows,
+            "MOUNTED carries {} rows and the doc comment says {rows}",
+            MOUNTED.len()
+        );
+    }
+
+    /// The two counts the doc comment above `MOUNTED` states, in one place so the guard that
+    /// checks the PROSE and the guard that checks the ARRAY cannot disagree.
+    const MOUNTED_DOC_COUNTS: (usize, usize) = (38, 41);
+
+    /// THE MACRO BODY AND THE INVENTORY LIST THE SAME PATHS, AND NOTHING ELSE DID.
+    ///
+    /// THE HOLE THIS CLOSES. `ROUTES` and the `routes!(...)` invocation inside
+    /// `create_router` are two hand-written copies of the same list, and every
+    /// existing check reads ONE of them against `MOUNTED`:
+    ///
+    /// - `the_route_inventory_matches_the_mounted_table` reads `ROUTES` and compares
+    ///   it to `MOUNTED`. Both are text. A route present in the macro body and in
+    ///   `MOUNTED` but MISSING from `ROUTES` fails that test - correctly - but a
+    ///   route added to the MACRO and to `MOUNTED` while `ROUTES` was left alone
+    ///   fails nothing, and the inventory then denies a path the router serves.
+    /// - The `;` markers catch a line DELETED by hand. Nothing caught a line ADDED
+    ///   to one copy and not the other.
+    ///
+    /// The test's own history is the evidence this mattered: when the password-change
+    /// and provider routes were mounted, `ROUTES` was edited FIRST and the inventory
+    /// test passed while every request to those paths answered 404, because
+    /// `create_router` had not been touched. Four iterations were spent before the
+    /// response body, not the status, revealed it.
+    ///
+    /// `MOUNTED_BY_THE_MACRO` is not a third hand-written list - it is this same
+    /// invocation run through the macro's `@paths` arm, so its entries are the
+    /// compiler's rendering of the literals the router expanded. Comparing it to
+    /// `ROUTES` is therefore a real cross-check rather than two copies of one
+    /// mistake.
+    #[test]
+    fn the_macro_body_lists_the_inventory_it_mounts() {
+        // `stringify!` renders a STRING LITERAL as its source text INCLUDING the
+        // quotes, so this array holds `"\"/health\""` rather than `/health`. The
+        // quotes are stripped on the READING side because the macro arm cannot do
+        // it: `macro_rules` has no way to take `$path` and emit its value without
+        // the literal syntax, and `concat!`/`stringify!` combinations keep the
+        // quotes too. Stripping here still compares the COMPILER'S rendering of the
+        // literal rather than a re-typed copy of it, which is the property that
+        // makes this cross-check worth having.
+        let from_the_macro: Vec<&str> = MOUNTED_BY_THE_MACRO
+            .iter()
+            .map(|quoted| quoted.trim_matches('"'))
+            .collect();
+        let from_the_inventory: Vec<&str> = ROUTES
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix(".route(\"")?;
+                let close = rest.find('"')?;
+                Some(&rest[..close])
+            })
+            .collect();
+
+        // POSITIVE CONTROL. `stringify!` returning an empty-ish array, or the parse
+        // finding nothing, would make the comparison below pass against nothing at
+        // all - the same vacuity the sibling test guards against.
+        assert!(
+            from_the_macro.contains(&"/v1/chat/completions"),
+            "the macro capture did not find the last route, so it is not reading the \
+             invocation it thinks it is and every assertion here is vacuous"
+        );
+
+        // Every route the ROUTER expands must be in the inventory the test above
+        // trusts. This is the direction the missing-check bug took.
+        for path in &from_the_macro {
+            assert!(
+                from_the_inventory.contains(path),
+                "{path} is mounted by create_router's `routes!` invocation but is NOT in \
+                 the `ROUTES` inventory. The inventory is what `the_route_inventory_matches_\
+                 the_mounted_table` and `every_mounted_route_is_documented_in_the_api_spec` \
+                 both read, so this path is mounted, undocumented and unlisted - add it to \
+                 `ROUTES` (with its trailing `;`), and to MOUNTED, and to the api-spec."
+            );
+        }
+
+        // And the other direction, so the inventory cannot advertise a route the
+        // router does not serve - which is how a 404 gets documented as a 200.
+        for path in &from_the_inventory {
+            assert!(
+                from_the_macro.contains(path),
+                "{path} is in the `ROUTES` inventory but create_router does NOT mount it. \
+                 Every check downstream reads `ROUTES`, so the inventory claims a path a \
+                 client would get a 404 from - add the `.route(` line to the `routes!` \
+                 invocation in create_router, or remove this one from `ROUTES`."
+            );
+        }
+
+        assert_eq!(
+            from_the_macro.len(),
+            from_the_inventory.len(),
+            "the macro expands {} paths and `ROUTES` lists {}. The two loops above should \
+             already have named the offender; this count is the cross-check that they were \
+             not both empty or both truncated.",
+            from_the_macro.len(),
+            from_the_inventory.len()
+        );
     }
 
     /// The dual-method routes: /api/topups and /api/keys are ONE `.route()` call

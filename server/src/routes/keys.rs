@@ -1,22 +1,38 @@
+#![cfg_attr(
+    not(test),
+    // THE API-KEY SURFACE, fenced with the other money-adjacent modules.
+    //
+    // This is where a per-key spend limit and a token ceiling are COMPARED, so an
+    // overflow here does not corrupt a total so much as stop a limit from biting.
+    // That is the permissive direction, which is why the fold in this module now
+    // saturates rather than wrapping, and why this fence exists at all: the
+    // arithmetic that decides whether a key keeps being served is arithmetic.
+    //
+    // It is NOT free here, and the difference from the last three modules is worth
+    // recording: this one has two real sites, and both carry a written argument.
+    // The third was the fold, and that one was not an argument at all - it was a
+    // wrong direction, so it became saturating_add instead of an allow.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
-use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::routes::events::publish_key_update;
 use crate::routes::hash_token;
 use crate::routes::proxy::{invalidate_key_cache, AppState};
-
 #[derive(Debug, Serialize)]
 pub struct ApiKeyDto {
     pub id: Uuid,
@@ -24,6 +40,20 @@ pub struct ApiKeyDto {
     pub label: Option<String>,
     pub models: Value,
     pub spend_limit_idr: i64,
+    /// The token ceiling this key was created with, 0 meaning unlimited.
+    ///
+    /// THIS FIELD WAS MISSING, and its absence silently destroyed the value it
+    /// describes. `CreateKeyRequest` and `UpdateKeyRequest` both accept
+    /// `token_limit`, and the dashboard's edit form sends the WHOLE field set on
+    /// every save rather than a diff (`website/src/lib/dashboard-form.ts`, whose
+    /// own doc argues that sending only changed fields would preserve a value the
+    /// user deliberately cleared). That argument holds only if the form is
+    /// populated from the stored value - and this field is what would have
+    /// populated it. Without it the edit form opened with the token input blank,
+    /// a blank limit reads as 0, and 0 means unlimited: renaming a key or
+    /// toggling a model on it raised that key's token ceiling to no ceiling at
+    /// all, with nothing on screen or in the response to show it had happened.
+    pub token_limit: i64,
     pub spend_used_idr: i64,
     pub rate_limit_rpm: i32,
     pub expires_at: Option<DateTime<Utc>>,
@@ -75,6 +105,18 @@ pub const SPEND_WINDOW_DAYS: i64 = 30;
 
 /// First day (inclusive) of the rolling spend window ending on `today`.
 /// The window holds exactly 30 day-values, so it starts 29 days back.
+///
+/// SAFE, twice over. `SPEND_WINDOW_DAYS - 1` is `30 - 1` on a const, folded at
+/// compile time with no runtime operand that could overflow. And `NaiveDate -
+/// Duration` PANICS on an out-of-range result rather than wrapping, so even a
+/// nonsense window length would fail loudly instead of silently dating rows to the
+/// wrong side of the boundary. 29 days back from any real date is in range.
+///
+/// The allow is on the FUNCTION, not on the expression. An attribute in
+/// tail-expression position is still unstable - "attributes on expressions are
+/// experimental" - so the version that put it on the line below did not compile,
+/// and the compiler said so rather than accepting it.
+#[allow(clippy::arithmetic_side_effects)]
 pub(crate) fn spend_window_start(today: NaiveDate) -> NaiveDate {
     today - chrono::Duration::days(SPEND_WINDOW_DAYS - 1)
 }
@@ -89,13 +131,47 @@ fn in_spend_window(day: NaiveDate, today: NaiveDate) -> bool {
 ///
 /// The summed value is `usage_daily.cost_idr`, which the settlement path already
 /// stores as the money.rs `calculate_token_cost_idr` result — no second formula.
+///
+/// **THIS IS USAGE, NOT WHAT THE CUSTOMER WAS BILLED**, and for a clamped request
+/// those differ. When a hold cannot be fully covered the debit is clamped to the
+/// balance, so the wallet takes less than the service cost, while `usage_daily` records
+/// the full cost because the service was genuinely consumed. This function sums the full
+/// cost, so a customer whose balance ran out has their key SPEND limit advanced by money
+/// they were never charged.
+///
+/// That is defensible — a limit expressed in IDR is most safely read as a ceiling on
+/// consumption, and using revenue would let a customer with a tiny balance and a large
+/// limit consume without ever reaching it. But the column is `spend_limit_idr`, the
+/// documentation calls it a spend limit, and a customer who finds their key blocked for
+/// spend that was never collected deserves to know why. The behaviour is right; the NAME
+/// reads the other way, and that is what this note is for. The same divergence is
+/// recorded under Overdraft in `docs/decisions.md`.
 fn fold_spend_in_window(rows: &[(Uuid, NaiveDate, i64)], today: NaiveDate) -> HashMap<Uuid, i64> {
     let mut spend: HashMap<Uuid, i64> = HashMap::new();
     for &(key_id, day, cost_idr) in rows {
         if !in_spend_window(day, today) {
             continue;
         }
-        *spend.entry(key_id).or_insert(0) += cost_idr;
+        // SATURATING, not wrapping, and the direction is the whole point.
+        //
+        // This total decides whether the per-key spend limit bites. A wrapped sum
+        // that crosses i64::MAX comes back NEGATIVE, and a negative spend is
+        // "nowhere near the limit" - so the one condition that stops a key being
+        // served would be the one arithmetic that turned the limit off. That is
+        // the exact failure shape this repository treats as worst: silent, and
+        // pointed in the permissive direction.
+        //
+        // Saturating puts the failure on the other side: the total reads as
+        // i64::MAX, which is above every spend_limit_idr the config can express, so
+        // the limit keeps biting. Being wrong about how MUCH a key has spent is
+        // recoverable; not enforcing a limit is not.
+        //
+        // Unreachable with real figures - 30 days of IDR would have to exceed
+        // 9.2e18 - but the same sum IS implemented a second time in SQL by
+        // `key_spend_used`, which is the read the PROXY enforces from, and the two
+        // must not fail in opposite directions. This one now saturates.
+        let total = spend.entry(key_id).or_insert(0);
+        *total = total.saturating_add(cost_idr);
     }
     spend
 }
@@ -169,6 +245,21 @@ pub(crate) async fn key_tokens_used(
 /// 0 means "no limit" (docs/website/06-api-keys-and-limits.md). A negative limit
 /// has no meaning and would fail every request, so it is refused here rather than
 /// stored and silently obeyed.
+///
+/// **`spend_used_idr` DOES NOT DECIDE ANYTHING, and the signature invites the opposite reading.**
+/// It is the key's real trailing-window spend, and it appears exactly once in this function - as a
+/// field in the error body of the negative case. So a request to LOWER the limit below what the key
+/// has already spent is ACCEPTED, and this parameter cannot make it otherwise.
+///
+/// That is deliberate: see the note on the `spend_limit_idr` arm in `update_key` for why refusing a
+/// lowering would be the wrong rule. It is called out here because the parameter's presence reads as
+/// "the real spend is compared against the request", and a reader who assumes that would conclude a
+/// guard exists where none does. MEASURED: replacing the caller's lookup with the constant `0` leaves
+/// all 22 `routes::keys` tests green.
+///
+/// The value is still worth fetching. docs/website/06-api-keys-and-limits.md requires the UI to show
+/// current-window usage against each limit, and an operator who asks for an impossible ceiling is told
+/// the figure they are up against - provided by the caller, carried by the error.
 fn check_spend_limit(requested_idr: i64, spend_used_idr: i64) -> Result<(), AppError> {
     if requested_idr < 0 {
         return Err(AppError::KeyLimitExceeded {
@@ -204,54 +295,15 @@ fn check_token_limit(requested: i64) -> Result<(), AppError> {
     Ok(())
 }
 
-/// SHA-256 hex of a session token.
+/// The account a request's session cookie resolves to.
 ///
-/// Carried over from the Postgres branch, where the shared resolver in
-/// `crate::routes` took a `PgPool`. It is now a `SqlitePool` too, so this local
-/// copy is equivalent to it and is kept so the handler and its tests run the same
-/// resolver. The token is hashed, never stored raw.
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// The account a request's session cookie resolves to, against SQLite.
-///
-/// The Postgres branch shared one resolver in `crate::routes`, but that one takes
-/// a `PgPool` and this crate's sqlx is sqlite-only, so the port gave each route
-/// module its own. Kept here rather than centralised for the same reason: the
-/// resolution rule - hash the token, never store it raw, treat every failure as
-/// Unauthenticated - stays next to the handlers that use it.
-async fn resolve_account_from_cookie(
-    pool: &SqlitePool,
-    headers: &HeaderMap,
-) -> Result<Uuid, AppError> {
-    let cookie_hdr = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthenticated)?;
-
-    for piece in cookie_hdr.split(';') {
-        let piece = piece.trim();
-        if let Some(token) = piece.strip_prefix("session=") {
-            let token_hash = hash_string(token);
-            let session = sqlx::query(
-                "SELECT account_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
-            )
-            .bind(token_hash)
-            .bind(Utc::now())
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some(s) = session {
-                return Ok(s.get::<Hyphenated, _>("account_id").into_uuid());
-            }
-        }
-    }
-
-    Err(AppError::Unauthenticated)
-}
+/// The local resolver that used to sit here is DELETED, and its comment claimed it
+/// was "equivalent to" `crate::routes`'s because both take a `SqlitePool`. That
+/// was true of the hash and false of the RULE: the copy filtered revocation and
+/// absolute expiry in SQL and stopped, so it never applied the idle bound and
+/// never recorded activity. The one place the session rule lives is the only one
+/// now.
+use crate::routes::resolve_account_from_cookie;
 
 /// The same refusal for `rate_limit_rpm`.
 ///
@@ -280,7 +332,7 @@ pub async fn list_keys(
     let keys = sqlx::query(
         r#"
         SELECT
-            id, prefix, label, models, spend_limit_idr, rate_limit_rpm,
+            id, prefix, label, models, spend_limit_idr, token_limit, rate_limit_rpm,
             expires_at, last_used_at, revoked_at
         FROM api_keys
         WHERE account_id = ?
@@ -293,7 +345,7 @@ pub async fn list_keys(
 
     // Real 30-day spend per key. usage_daily.cost_idr is the settled cost of the
     // key's usage; a key with no rows in the window reads as 0.
-    let today = Utc::now().date_naive();
+    let today = crate::ip_tracking::today_utc();
     let usage_rows = sqlx::query(
         r#"
         SELECT api_key_id, day, cost_idr
@@ -306,33 +358,55 @@ pub async fn list_keys(
     .fetch_all(&pool)
     .await?;
 
+    // `filter_map`, NOT `map` + `?`, and the choice is about which failure is worse. A usage row
+    // whose `api_key_id` cannot be decoded is ONE unusable row; failing the whole listing would
+    // take the customer's dashboard down over it, and panicking - which is what this did before -
+    // would take the request down with no response and no log. Skipping it drops one day's spend
+    // from the report, which is visible and recoverable; it is LOGGED rather than swallowed, so
+    // the operator learns the row is wrong instead of seeing a number that is quietly low.
     let usage: Vec<(Uuid, NaiveDate, i64)> = usage_rows
         .into_iter()
-        .map(|r| {
-            let key_id: Uuid = r.get::<Hyphenated, _>("api_key_id").into_uuid();
+        .filter_map(|r| {
+            let key_id = match crate::error::decode_uuid_column(&r, "api_key_id") {
+                Ok(key_id) => key_id,
+                Err(err) => {
+                    tracing::error!(error = %err, "skipping a usage row with an undecodable api_key_id");
+                    return None;
+                }
+            };
             let day: NaiveDate = r.get("day");
             let cost_idr: i64 = r.get("cost_idr");
-            (key_id, day, cost_idr)
+            Some((key_id, day, cost_idr))
         })
         .collect();
     let spend_by_key = fold_spend_in_window(&usage, today);
 
+    // Same reasoning as the usage rows above: one undecodable key row must not take the listing
+    // down, and it must not panic on the way. It is SKIPPED AND LOGGED, so the customer sees the
+    // keys that are readable and the operator sees that one was not.
     let response: Vec<ApiKeyDto> = keys
         .into_iter()
-        .map(|k| {
-            let id: Uuid = k.get::<Hyphenated, _>("id").into_uuid();
-            ApiKeyDto {
+        .filter_map(|k| {
+            let id = match crate::error::decode_uuid_column(&k, "id") {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::error!(error = %err, "skipping a key row whose id cannot be decoded");
+                    return None;
+                }
+            };
+            Some(ApiKeyDto {
                 id,
                 prefix: k.get("prefix"),
                 label: k.get("label"),
                 models: k.get("models"),
                 spend_limit_idr: k.get("spend_limit_idr"),
+                token_limit: k.get("token_limit"),
                 spend_used_idr: spend_by_key.get(&id).copied().unwrap_or(0),
                 rate_limit_rpm: k.get("rate_limit_rpm"),
                 expires_at: k.get("expires_at"),
                 last_used_at: k.get("last_used_at"),
                 revoked_at: k.get("revoked_at"),
-            }
+            })
         })
         .collect();
 
@@ -351,8 +425,24 @@ pub async fn create_key(
     // so a revoked key still counts - revoking one to mint another is exactly
     // the circumvention the cap is for. The cap comes from the config the app
     // already owns.
-    crate::abuse::enforce_creation_cap(
-        &state.pool,
+    //
+    // HELD OPEN ACROSS THE INSERT, and that is the fix. The cap is a COUNT, and a
+    // count taken before the insert it guards is a count of the past: concurrent
+    // callers all read the same number and all insert, so the cap held against a
+    // sequential script and not at all against a parallel one. SQLite serialises
+    // writers, so one transaction spanning the COUNT and the INSERT makes the two
+    // atomic - a second caller either sees the first caller's row or is still
+    // waiting for the lock.
+    //
+    // This path can afford that because everything between them is LOCAL: key
+    // generation, hashing and three validations, all microseconds of CPU. The
+    // top-up path cannot - its insert comes after a Midtrans Snap call, and a
+    // transaction spanning a network round trip to a payment provider would
+    // serialise every other top-up in the process behind it. That path keeps the
+    // non-transactional variant and its race is characterised in abuse.rs.
+    let mut tx = crate::db::begin_immediate(&state.pool).await?;
+    crate::abuse::enforce_creation_cap_in(
+        &mut tx,
         "api_keys",
         crate::abuse::key_creation_window(),
         state.config.limits.key_creation_per_day,
@@ -370,6 +460,19 @@ pub async fn create_key(
     const KEY_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let random_bytes: String = (0..43)
         .map(|_| {
+            // SAFE: a remainder is strictly less than its divisor, and the divisor
+            // is a non-zero constant, so the modulo cannot overflow or divide by
+            // zero. The narrowing casts are also bounded - the value is already
+            // < 62 and the target types are wider than that.
+            //
+            // What the modulo DOES cost is a slight bias, and it is left in place
+            // deliberately: 2^32 is not a multiple of 62, so the first
+            // (2^32 mod 62) alphabet characters are very slightly more likely than
+            // the rest. The alphabet is 62 characters over a 43-character key, so
+            // the bias is ~1 in 10^7 per position and 43 positions do not make it
+            // attackable. Correcting it would mean rejection sampling, which is
+            // real code for a defect this key length cannot express.
+            #[allow(clippy::arithmetic_side_effects)]
             let idx = (rand_core::OsRng.next_u32() % KEY_ALPHABET.len() as u32) as usize;
             KEY_ALPHABET.get(idx).copied().unwrap_or(b'0') as char
         })
@@ -423,10 +526,29 @@ pub async fn create_key(
     .bind(payload.rate_limit_rpm)
     .bind(payload.expires_at)
     .bind(Utc::now())
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
 
-    let id: Uuid = key_record.get::<Hyphenated, _>("id").into_uuid();
+    let id: Uuid = crate::error::decode_uuid_column(&key_record, "id")?;
+
+    // Commit BEFORE the response is built, so a caller that sees a 201 knows the
+    // key is durable. The write lock is held for the whole of the above: the
+    // generate/hash/validate sequence is local, but it is still a write lock, and
+    // that is the price of a cap that actually caps. See the note at the
+    // transaction's opening.
+    tx.commit().await?;
+
+    // AND THE LIVE STREAM IS TOLD, after the commit and only after it.
+    //
+    // `docs/realtime.md:73` promises the `key` event is "Emitted when a key is created, edited, or
+    // revoked — so a second browser tab stays consistent". The revoke half was wired last round and
+    // the other two were not, so a second tab never learned about a key created elsewhere: the list is
+    // fetched ONCE when the island starts, and nothing else refetches it.
+    //
+    // `None` for `revoked_at` is the documented encoding of a LIVE key, which is what a key is the
+    // moment it is created. The event is published AFTER `tx.commit()`, so a subscriber can never be
+    // told about a key that then rolls back.
+    publish_key_update(&state.events, account_id, id, None);
 
     Ok((
         StatusCode::CREATED,
@@ -448,12 +570,29 @@ pub async fn update_key(
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = resolve_account_from_cookie(&state.pool, &headers).await?;
 
-    // Lowering a limit below what the key has already spent in the window leaves
-    // it immediately over limit. Validate against the real spend so the operator
-    // sees the number rather than a silently ineffective limit.
+    // LOWERING BELOW THE WINDOW'S SPEND IS ALLOWED, and that is a decision rather than an oversight -
+    // worth stating because the previous comment here claimed the opposite.
+    //
+    // It used to read: "Validate against the real spend so the operator sees the number rather than a
+    // silently ineffective limit." That is not what the code does. `check_spend_limit` refuses only a
+    // NEGATIVE request; `spend_used_idr` is read here and used for nothing but a field in that
+    // negative-case error body, so it cannot change whether the request is refused. MEASURED: replacing
+    // this lookup with the constant `0` leaves all 22 `routes::keys` tests green, which is the proof
+    // that the value has no effect on the outcome.
+    //
+    // The lookup is still worth its query: `docs/website/06-api-keys-and-limits.md` requires the UI to
+    // "show current-window usage against each limit", and an operator who asks for an impossible
+    // limit is told the figure they are up against rather than a bare "negative".
+    //
+    // AND LOWERING IS NOT REFUSED, because refusing it would be the wrong rule. The document says
+    // "Allow raising limits immediately; **lowering** should warn that it may cut off in-flight usage"
+    // - a warn, not a refusal - and a key sitting over a newly lowered limit is not a broken state:
+    // `proxy.rs` refuses the NEXT request and the customer can raise the limit again. Blocking the
+    // edit instead would leave an operator unable to close a runaway key, which is the case the
+    // control exists for.
     if let Some(requested) = payload.spend_limit_idr {
         let spend_used_idr =
-            key_spend_used(&state.pool, account_id, id, Utc::now().date_naive()).await?;
+            key_spend_used(&state.pool, account_id, id, crate::ip_tracking::today_utc()).await?;
         check_spend_limit(requested, spend_used_idr)?;
     }
     // A patch that is absent leaves the column alone (COALESCE below), so only a
@@ -510,6 +649,16 @@ pub async fn update_key(
     };
     invalidate_key_cache(&state.config, &key_hash);
 
+    // AND THE LIVE STREAM IS TOLD, on the same condition as the cache eviction and for the same
+    // reason: the statement above matches only a key that exists AND is not revoked, so reaching here
+    // means an edit landed. Publishing on the `None` path would announce a change that the UPDATE
+    // refused - and it would announce it for a key the caller does not own, since the same statement
+    // is scoped by `account_id`.
+    //
+    // `None` for `revoked_at` because an edited key is still live; the event reports "this key
+    // changed", and the revoked/live distinction is what the field encodes.
+    publish_key_update(&state.events, account_id, id, None);
+
     Ok(StatusCode::OK)
 }
 
@@ -528,6 +677,10 @@ pub async fn revoke_key(
     // plaintext key exists nowhere in the database (it was shown once, at
     // creation). The hash is also all `invalidate_key_cache` will ever take, so
     // the plaintext never has to be reconstructed to evict an entry.
+    // The instant is bound to a NAME rather than written inline, because the realtime event below has
+    // to carry the SAME value the row now holds. A second `Utc::now()` would put a slightly later
+    // timestamp on the wire than in the database, and the two are compared by the client.
+    let revoked_at = Utc::now();
     let revoked_hash: Option<String> = sqlx::query_scalar(
         r#"
         UPDATE api_keys SET revoked_at = ?
@@ -535,7 +688,7 @@ pub async fn revoke_key(
         RETURNING key_hash
         "#,
     )
-    .bind(Utc::now())
+    .bind(revoked_at)
     .bind(id.hyphenated())
     .bind(account_id.hyphenated())
     .fetch_optional(&state.pool)
@@ -553,6 +706,21 @@ pub async fn revoke_key(
     // documented cost of the cache and is not closed by this call.
     if let Some(key_hash) = revoked_hash {
         invalidate_key_cache(&state.config, &key_hash);
+
+        // AND THE LIVE STREAM IS TOLD, which it had never been.
+        //
+        // `docs/realtime.md:73` promises the `key` event is "Emitted when a key is created, edited, or
+        // revoked — so a second browser tab stays consistent", `RealtimeEvent::key` and
+        // `publish_key_update` both existed for it, `website/src/lib/live.ts:167` LISTENS for it and
+        // records the id in `revokedKeyIds` so the key greys out — and NOTHING CALLED THE PUBLISHER.
+        // MEASURED: its only caller in the whole repository was a test in events.rs, so every link of
+        // that chain was present except the first one, and a second tab showed a revoked key as live
+        // until it was reloaded.
+        //
+        // Published INSIDE the `Some` arm, on the same condition as the cache eviction and for the
+        // same reason: a second revoke matches no row, so there is no state change to announce. Sending
+        // on the `None` path would report a revocation that did not happen.
+        publish_key_update(&state.events, account_id, id, Some(revoked_at));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -561,7 +729,8 @@ pub async fn revoke_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{self, TestDb};
+    use crate::test_support::ledger_drift_rows;
+    use crate::test_support::{self, shipped_config, TestDb};
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -578,6 +747,63 @@ mod tests {
         assert!(!in_spend_window(start - chrono::Duration::days(1), today));
         assert!(!in_spend_window(day(2026, 4, 20), today));
         assert_eq!(spend_window_start(day(2026, 3, 1)), day(2026, 1, 31));
+    }
+
+    /// THE DIRECTION OF THE OVERFLOW, which is the whole reason the fold saturates.
+    ///
+    /// The window total decides whether the per-key spend limit bites, so the two
+    /// ways to be wrong are not equally bad. A wrapping sum that crosses i64::MAX
+    /// comes back NEGATIVE, and a negative spend is "nowhere near the limit" - the
+    /// limit stops enforcing, silently, and only for a key that has somehow run up an
+    /// absurd total. A saturating sum reads as i64::MAX, which is above every
+    /// spend_limit_idr the schema can hold, so the limit keeps biting.
+    ///
+    /// This is asserted on the FUNCTION rather than in prose, with figures no
+    /// database would ever produce, because the property is exactly that it holds
+    /// for figures no database would ever produce. A debug build panics on the
+    /// wrapping version, so the two implementations are distinguishable by this
+    /// test alone.
+    ///
+    /// The two rows are the minimum that crosses the boundary: i64::MAX alone sums
+    /// to itself, and only the second row pushes the running total past the edge.
+    #[test]
+    fn a_window_total_that_overflows_reads_as_over_the_limit_and_never_below_it() {
+        let today = day(2026, 5, 20);
+        let start = spend_window_start(today);
+        let key = Uuid::new_v4();
+
+        let rows = vec![(key, start, i64::MAX), (key, today, 1)];
+        let spend = fold_spend_in_window(&rows, today);
+
+        let total = spend
+            .get(&key)
+            .copied()
+            .expect("a key with rows in the window must appear in the fold");
+        assert_eq!(
+            total,
+            i64::MAX,
+            "an over-large window total must SATURATE, not wrap to a negative that \
+             reads as 'under the limit'"
+        );
+
+        // The property that actually matters, stated without reference to i64: the
+        // total is above every limit, so a limit comparison refuses. A spend limit
+        // is an i64 column, so i64::MAX is the largest one that can exist.
+        assert!(
+            total > 0,
+            "a saturated spend must never read as zero or negative: that is the \
+             direction in which a limit silently stops biting"
+        );
+
+        // The control, or the assertion above could pass because nothing was summed
+        // at all. A single row must still be reported exactly.
+        let one = vec![(key, today, 4_242)];
+        assert_eq!(
+            fold_spend_in_window(&one, today).get(&key).copied(),
+            Some(4_242),
+            "an ordinary total must be reported unchanged - saturation must not \
+             perturb the normal case"
+        );
     }
 
     #[test]
@@ -661,9 +887,9 @@ mod tests {
     //   DATABASE_URL=... cargo test --lib routes::keys:: -- --ignored
     // -----------------------------------------------------------------------
 
-    use crate::config::AppConfig;
     use crate::db::{
         credit_topup_transaction, debit_usage_transaction, TopupCreditResult, UsageSettlement,
+        SHIPPED_CREDIT_EXPIRY_MONTHS,
     };
     // Postgres keeps timestamptz at microsecond resolution, so the live tests
     // truncate a computed instant before comparing it to the stored value.
@@ -706,20 +932,14 @@ mod tests {
         }
     }
 
-    fn live_config() -> Arc<AppConfig> {
-        for path in ["../config/apikita.toml", "config/apikita.toml"] {
-            if std::path::Path::new(path).exists() {
-                return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
-            }
-        }
-        panic!("could not find apikita.toml for testing");
-    }
+    // The shipped config now lives in `crate::test_support::shipped_config`; the callers
+    // below reached for a live config through this local copy for five modules.
 
     /// The real application state, built the way main.rs builds it, so the
     /// handlers run against the same cache instance and the same config the
     /// process serves with.
     fn test_state(pool: SqlitePool) -> AppState {
-        let config = live_config();
+        let config = shipped_config();
         let events = Arc::new(RealtimeHub::new(&config.realtime));
         let trusted_proxies: Arc<[IpCidr]> = Arc::from(
             parse_cidrs(&config.network.trusted_proxy_cidrs)
@@ -733,6 +953,7 @@ mod tests {
             events,
             ip_salt: Arc::new(DailySalt::new()),
             trusted_proxies,
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 
@@ -792,7 +1013,7 @@ mod tests {
         .expect("create topup");
 
         assert_eq!(
-            credit_topup_transaction(pool, &order_id, opening_idr)
+            credit_topup_transaction(pool, &order_id, opening_idr, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("credit the opening balance"),
             TopupCreditResult::Settled {
@@ -837,27 +1058,7 @@ mod tests {
         .expect("insert usage_daily row");
     }
 
-    /// The reconciliation check from docs/observability.md, scoped to THIS
-    /// fixture's account: wallets.balance_idr must equal SUM(ledger.delta_idr).
-    /// It must return 0 rows.
-    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT w.account_id
-                FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
+    // see `the_drift_helper_sees_ledger_money_with_no_wallet_row` there.
 
     async fn json_body<T: serde::de::DeserializeOwned>(res: axum::response::Response) -> T {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
@@ -910,6 +1111,40 @@ mod tests {
                 .expect("prefix is a string")
                 .to_string(),
         )
+    }
+
+    /// Create a key with a NON-ZERO token ceiling, via the same handler the
+    /// dashboard calls. The other helper hard-codes `token_limit: 0`, which is
+    /// exactly the value a defect of this shape is invisible behind.
+    async fn create_key_with_limit_via_handler(
+        state: &AppState,
+        headers: &HeaderMap,
+        label: &str,
+        token_limit: i64,
+    ) -> Uuid {
+        let res = create_key(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateKeyRequest {
+                label: Some(label.to_string()),
+                models: vec!["flash".into()],
+                spend_limit_idr: 0,
+                token_limit,
+                rate_limit_rpm: 0,
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("create_key must succeed")
+        .into_response();
+
+        assert_eq!(
+            res.status(),
+            StatusCode::CREATED,
+            "creation must answer 201"
+        );
+        let body: Value = json_body(res).await;
+        serde_json::from_value(body["id"].clone()).expect("id is a UUID")
     }
 
     /// The whole application router, reached the way a caller reaches it: a real
@@ -1048,7 +1283,7 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
@@ -1118,7 +1353,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
@@ -1203,9 +1438,351 @@ mod tests {
         assert_eq!(body["error"]["code"], "key_revoked");
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
+        );
+        db.close().await;
+    }
+
+    /// Revoking a key ANNOUNCES it on the live stream, which nothing had ever done.
+    ///
+    /// WHY THIS TEST IS THE FIX, not a formality. `docs/realtime.md:73` promises the `key` event is
+    /// "Emitted when a key is created, edited, or revoked — so a second browser tab stays consistent",
+    /// `RealtimeEvent::key` and `publish_key_update` both existed for it, and
+    /// `website/src/lib/live.ts:167` LISTENS for it and records the id in `revokedKeyIds` so the key
+    /// greys out. MEASURED: `publish_key_update`'s ONLY caller in the repository was a test in
+    /// events.rs. Every link of that chain was present except the first, so a second tab showed a
+    /// revoked key as live until it was reloaded - a documented behaviour with no producer.
+    ///
+    /// The event must carry the SAME instant the row holds, which is why the handler binds
+    /// `revoked_at` to a name rather than writing `Utc::now()` inline: a second call would put a
+    /// slightly later timestamp on the wire than in the database, and the client keeps what it is sent.
+    ///
+    /// AND IT MUST NOT FIRE ON A SECOND REVOKE. The handler is idempotent - a repeat matches no row
+    /// and answers 204 - so there is no state change to announce. Publishing there would report a
+    /// revocation that did not happen, with a fresh timestamp.
+    #[tokio::test]
+    async fn revoking_a_key_announces_it_on_the_live_stream() {
+        let _cache = CacheLock::acquire();
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (id, _, _) = create_key_via_handler(&state, &headers, "announced", vec![], 0).await;
+
+        // Subscribed BEFORE the revoke, so an event published during it cannot be missed.
+        let mut rx = state.events.subscribe_for_test();
+
+        let res = revoke_key(State(state.clone()), Path(id), headers.clone())
+            .await
+            .expect("revoke must succeed")
+            .into_response();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let delivered: Vec<_> = std::iter::repeat(())
+            .map_while(|_| rx.try_recv().ok())
+            .collect();
+        let keys: Vec<_> = delivered.iter().filter(|e| e.name() == "key").collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "a revocation must publish exactly one `key` event, got [{}]. Zero is the state this test \
+             was written for - the documented event had no producer - and more than one would put a \
+             duplicate on every subscriber's stream",
+            delivered.iter().map(|e| e.name()).collect::<Vec<_>>().join(", ")
+        );
+        assert_eq!(
+            keys[0].account_id(),
+            account_id,
+            "the event must be scoped to the key's owner (DEFECT 1): another id puts this account's \
+             revocation on another customer's stream"
+        );
+
+        // The timestamp on the wire is the one in the row.
+        let stored: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM api_keys WHERE id = ?")
+                .bind(id.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("read revoked_at");
+        let payload: serde_json::Value =
+            serde_json::from_str(&keys[0].data_for_test()).expect("the key event carries JSON");
+        assert_eq!(
+            payload["key_id"],
+            json!(id.hyphenated().to_string()),
+            "the event names the key it is about: {payload}"
+        );
+        // Compared as INSTANTS, not as strings: the same moment serializes `Z` on the wire and
+        // `+00:00` out of SQLite, so a string comparison would fail on a correct event. My first
+        // version did exactly that.
+        let announced: DateTime<Utc> = payload["revoked_at"]
+            .as_str()
+            .expect("the event carries a revoked_at")
+            .parse()
+            .expect("revoked_at is an RFC3339 instant");
+        assert_eq!(
+            announced,
+            stored.expect("the row is revoked"),
+            "the announced instant must be the STORED one. A second `Utc::now()` in the publish would \
+             put a later timestamp on the wire than in the database, and the client keeps what it is \
+             sent"
+        );
+
+        // A SECOND revoke changes nothing, so it announces nothing.
+        let mut rx2 = state.events.subscribe_for_test();
+        let again = revoke_key(State(state.clone()), Path(id), headers.clone())
+            .await
+            .expect("a second revoke is not an error")
+            .into_response();
+        assert_eq!(again.status(), StatusCode::NO_CONTENT);
+        let dup: Vec<_> = std::iter::repeat(())
+            .map_while(|_| rx2.try_recv().ok())
+            .collect();
+        assert!(
+            dup.is_empty(),
+            "an idempotent re-revoke matches no row and changes nothing, so it must publish NOTHING. \
+             Got {:?}",
+            dup.iter().map(|e| e.name()).collect::<Vec<_>>()
+        );
+
+        db.close().await;
+    }
+
+    /// Creating and editing a key announce it too, and they are the two thirds of the promise that
+    /// were still missing after the revocation half was wired.
+    ///
+    /// `docs/realtime.md:73` says the `key` event is emitted when a key is "created, edited, or
+    /// revoked". Only the third worked, so a second browser tab never learned about a key created
+    /// elsewhere - the list is fetched ONCE when the island starts and nothing else refetches it -
+    /// and an edit made in one tab never reached the other.
+    ///
+    /// `revoked_at: null` is the documented encoding of a LIVE key, which is what a newly created or
+    /// freshly edited key is. The two are asserted separately because they are separate handlers with
+    /// separate SQL: a test that drove only `create_key` would leave `update_key`'s publish uncaught,
+    /// and vice versa.
+    #[tokio::test]
+    async fn creating_and_editing_a_key_announce_it_on_the_live_stream() {
+        let _cache = CacheLock::acquire();
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        // CREATE, subscribed before the call so the event cannot be missed.
+        let mut rx = state.events.subscribe_for_test();
+        let (id, _, _) =
+            create_key_via_handler(&state, &headers, "announced-create", vec![], 0).await;
+        let created: Vec<_> = std::iter::repeat(())
+            .map_while(|_| rx.try_recv().ok())
+            .collect();
+        let created_keys: Vec<_> = created.iter().filter(|e| e.name() == "key").collect();
+        assert_eq!(
+            created_keys.len(),
+            1,
+            "creating a key must publish exactly one `key` event, got [{}]",
+            created
+                .iter()
+                .map(|e| e.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            created_keys[0].account_id(),
+            account_id,
+            "scoped to the owner"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&created_keys[0].data_for_test()).expect("the event carries JSON");
+        assert_eq!(
+            payload["key_id"],
+            json!(id.hyphenated().to_string()),
+            "the event names the key just created: {payload}"
+        );
+        assert!(
+            payload["revoked_at"].is_null(),
+            "a CREATED key is LIVE, so `revoked_at` must be null - the documented encoding. A \
+             timestamp here would tell every other tab the new key is already dead: {payload}"
+        );
+
+        // EDIT, on its own handler and its own SQL.
+        let mut rx2 = state.events.subscribe_for_test();
+        let edited = update_key(
+            State(state.clone()),
+            Path(id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: Some("announced-edit".to_string()),
+                models: None,
+                spend_limit_idr: None,
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("update_key must succeed")
+        .into_response();
+        assert_eq!(edited.status(), StatusCode::OK);
+
+        let after: Vec<_> = std::iter::repeat(())
+            .map_while(|_| rx2.try_recv().ok())
+            .collect();
+        let edited_keys: Vec<_> = after.iter().filter(|e| e.name() == "key").collect();
+        assert_eq!(
+            edited_keys.len(),
+            1,
+            "editing a key must publish exactly one `key` event, got [{}]. Zero means a tab that \
+             changed a label or a limit stayed invisible to every other tab",
+            after
+                .iter()
+                .map(|e| e.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            edited_keys[0].account_id(),
+            account_id,
+            "scoped to the owner"
+        );
+        let edit_payload: serde_json::Value =
+            serde_json::from_str(&edited_keys[0].data_for_test()).expect("the event carries JSON");
+        assert!(
+            edit_payload["revoked_at"].is_null(),
+            "an EDITED key is still live, so `revoked_at` must be null: {edit_payload}"
+        );
+
+        db.close().await;
+    }
+
+    /// ONE UNDECODABLE KEY ROW IS SKIPPED AND LOGGED, NOT FATAL AND NOT A PANIC.
+    ///
+    /// THE CONTRACT THIS PINS was introduced when the UUID decodes stopped panicking, and it was
+    /// asserted in a COMMENT with nothing verifying it - so a later edit could have changed
+    /// `filter_map` back to `map(...)?` and the whole listing would have started failing for
+    /// every customer whose account had one bad row, with the comment still promising the
+    /// opposite.
+    ///
+    /// THE PROPERTY IS THE COUNT: three keys exist, one is undecodable, and the listing must
+    /// return the OTHER TWO. Asserting only that the call succeeded would pass for a
+    /// `filter_map` that dropped everything, which is why the numbers are here.
+    #[tokio::test]
+    async fn an_undecodable_key_row_is_skipped_and_the_rest_are_still_listed() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (first_id, _, _) =
+            create_key_via_handler(&state, &headers, "first", vec!["flash".into()], 0).await;
+        let (second_id, _, _) =
+            create_key_via_handler(&state, &headers, "second", vec!["flash".into()], 0).await;
+
+        // A THIRD ROW WHOSE `id` IS NOT A UUID, written through SQL because the API cannot
+        // produce one. `api_keys.id` is `TEXT PRIMARY KEY` with no format constraint, which is
+        // exactly why this is reachable in a real database.
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO api_keys (id, account_id, key_hash, prefix, models, created_at) \
+             VALUES ('not-a-uuid', ?, 'undecodable-hash', 'apk_broken', '[]', ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("the schema accepts a non-UUID api_keys.id");
+
+        let res = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("one bad row must not fail the listing")
+            .into_response();
+        let body: Value = json_body(res).await;
+        let keys = body.as_array().expect("a JSON array of keys");
+
+        assert_eq!(
+            keys.len(),
+            2,
+            "the two decodable keys must still be listed. Dropping EVERYTHING would also satisfy \
+             a looser assertion, so the count is the property"
+        );
+        for id in [first_id, second_id] {
+            let wanted = serde_json::to_value(id).expect("id serialises");
+            assert!(
+                keys.iter().any(|k| k["id"] == wanted),
+                "key {id} must appear in the listing"
+            );
+        }
+        // AND THE BAD ROW IS ABSENT, which is the other half of "skipped": a listing that
+        // returned three rows could not have skipped anything.
+        assert!(
+            !keys.iter().any(|k| k["prefix"] == "apk_broken"),
+            "the undecodable row must not appear"
+        );
+        db.close().await;
+    }
+
+    /// AN UNDECODABLE USAGE ROW LOWERS THE REPORT INSTEAD OF FAILING IT.
+    ///
+    /// THE OTHER HALF OF THE SKIP CONTRACT. A spend row whose `api_key_id` cannot be decoded is
+    /// dropped, so the key is listed with the spend that COULD be read rather than the endpoint
+    /// returning 500 for the customer's whole dashboard. That is a real trade - the figure is
+    /// then too low - which is why it is logged and why this test asserts BOTH: the listing
+    /// succeeds, AND the readable key is still there.
+    ///
+    /// THE FK MAKES THE FIXTURE AWKWARD AND THAT IS INFORMATIVE: `usage_daily.api_key_id`
+    /// references `api_keys(id)`, so a malformed usage row needs a malformed KEY row to point
+    /// at - which is exactly the situation in a real database, where the bad id came first and
+    /// propagated. The two defects travel together.
+    #[tokio::test]
+    async fn an_undecodable_usage_row_does_not_fail_the_key_listing() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (good_id, _, _) =
+            create_key_via_handler(&state, &headers, "good", vec!["flash".into()], 0).await;
+        sqlx::query(
+            "INSERT INTO api_keys (id, account_id, key_hash, prefix, models, created_at) \
+             VALUES ('not-a-uuid', ?, 'broken-hash', 'apk_broken', '[]', ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .expect("the schema accepts a non-UUID api_keys.id");
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens, \
+             cache_read_tokens, output_tokens, cost_idr) VALUES (?, 'not-a-uuid', ?, 10, 0, 5, 999)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(crate::ip_tracking::today_utc())
+        .execute(&pool)
+        .await
+        .expect("the FK is satisfied by the malformed key row");
+
+        let res = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("an undecodable usage row must not fail the listing")
+            .into_response();
+        let body: Value = json_body(res).await;
+        let keys = body.as_array().expect("a JSON array of keys");
+
+        // THE READABLE KEY IS STILL REPORTED with ITS OWN spend, unaffected by the bad row.
+        let wanted = serde_json::to_value(good_id).expect("id serialises");
+        let listed = keys
+            .iter()
+            .find(|k| k["id"] == wanted)
+            .expect("the readable key must still be listed");
+        assert_eq!(
+            listed["spend_used_idr"],
+            serde_json::json!(0),
+            "the dropped row belongs to the BROKEN key, so the good key's spend is untouched"
         );
         db.close().await;
     }
@@ -1231,7 +1808,7 @@ mod tests {
             &pool,
             account_id,
             used_id,
-            Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
             100,
             20,
             50,
@@ -1270,7 +1847,62 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        db.close().await;
+    }
+
+    /// LIST REPORTS THE TOKEN CEILING: every key the list returns carries the
+    /// `token_limit` it was created with, because the dashboard's edit form
+    /// submits the WHOLE field set on every save rather than a diff. A field
+    /// missing from this response is not merely absent from the UI - it is
+    /// submitted as its blank default, and the blank default for a limit is 0,
+    /// which means unlimited. So the omission this test pins did not hide a
+    /// value; it destroyed one, on the next unrelated save.
+    #[tokio::test]
+    async fn list_keys_publishes_the_token_ceiling_that_a_save_would_otherwise_clear() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let key_id = create_key_with_limit_via_handler(&state, &headers, "capped", 1_000).await;
+
+        let res = list_keys(State(pool.clone()), headers.clone())
+            .await
+            .expect("list keys")
+            .into_response();
+        let body: Value = json_body(res).await;
+        let row = body
+            .as_array()
+            .expect("a JSON array of keys")
+            .iter()
+            .find(|k| k["id"] == serde_json::to_value(key_id).expect("id serialises"))
+            .expect("the key just created must be listed");
+
+        assert_eq!(
+            row["token_limit"].as_i64(),
+            Some(1_000),
+            "the key was created with a ceiling of 1000 tokens and the list must say so. A \
+             missing or zero token_limit here is not a cosmetic gap: the dashboard reads \
+             this field to fill its edit form, and a form that opens blank submits 0 - \
+             unlimited - so the next rename would silently raise this key's ceiling to no \
+             ceiling at all."
+        );
+
+        // The field must be a number in the payload, not a string or null: the
+        // island types it `token_limit: number` and assigns it to a number input.
+        assert!(
+            row["token_limit"].is_i64(),
+            "token_limit must serialise as an integer, got {}",
+            row["token_limit"]
+        );
+
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
@@ -1292,7 +1924,7 @@ mod tests {
         let (key_id, _, _) =
             create_key_via_handler(&state, &headers, "window", vec!["flash".into()], 0).await;
 
-        let today = Utc::now().date_naive();
+        let today = crate::ip_tracking::today_utc();
 
         // The offsets are LITERALS, deliberately not derived from
         // SPEND_WINDOW_DAYS: a fixture computed from the constant under test
@@ -1338,7 +1970,7 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
@@ -1385,6 +2017,7 @@ mod tests {
             &pool,
             account_id,
             Some(at_limit_id),
+            "flash",
             10,
             0,
             10,
@@ -1402,9 +2035,14 @@ mod tests {
 
         // The key is exactly AT its ceiling: the window total equals the limit.
         assert_eq!(
-            key_spend_used(&pool, account_id, at_limit_id, Utc::now().date_naive())
-                .await
-                .expect("key_spend_used"),
+            key_spend_used(
+                &pool,
+                account_id,
+                at_limit_id,
+                crate::ip_tracking::today_utc()
+            )
+            .await
+            .expect("key_spend_used"),
             opening_idr
         );
 
@@ -1440,7 +2078,7 @@ mod tests {
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
@@ -1573,12 +2211,12 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&pool, account_a).await,
+            ledger_drift_rows(&pool, account_a).await,
             0,
             "fixture A must not drift"
         );
         assert_eq!(
-            drift_rows(&pool, account_b).await,
+            ledger_drift_rows(&pool, account_b).await,
             0,
             "fixture B must not drift"
         );
@@ -1657,7 +2295,7 @@ mod tests {
         assert_eq!(expires_at, Some(new_expiry), "expires_at must persist");
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
@@ -1706,7 +2344,7 @@ mod tests {
             &pool,
             account_id,
             stale_id,
-            Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
             100,
             20,
             50,
@@ -1747,7 +2385,7 @@ mod tests {
             &pool,
             account_id,
             id,
-            Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
             100,
             20,
             50,
@@ -1797,7 +2435,7 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
@@ -1872,11 +2510,131 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
         db.close().await;
+    }
+
+    /// THE KEY CAP NOW HOLDS UNDER CONCURRENCY, and this is the test that says so.
+    ///
+    /// The cap was a COUNT taken on the pool, with the INSERT that it guards
+    /// happening afterwards and outside any transaction - so concurrent callers all
+    /// read the same number and all created a key. The fix holds one write
+    /// transaction open across the COUNT and the INSERT, and SQLite serialises
+    /// writers, so a second caller either sees the first caller's row or is still
+    /// waiting for the lock.
+    ///
+    /// The assertion is the strict one, and deliberately so: the total must be
+    /// EXACTLY the cap, not "about the cap". A test that allowed a small overshoot
+    /// would pass against the old code on a fast machine, which is the whole problem
+    /// the old code had.
+    ///
+    /// It is driven through the real handler rather than a helper, so the
+    /// transaction the fix introduced is the one under test and not a stand-in for
+    /// it.
+    ///
+    /// IT DETECTS THE LOCK-GUARD MUTATION RARELY, which is worth stating rather than leaving to be
+    /// rediscovered. MEASURED: replacing `BEGIN IMMEDIATE` with a deferred `BEGIN` in
+    /// `db::begin_immediate` - the exact regression the helper exists to prevent - makes this test fail in
+    /// **1 of 10** runs, or **3 of 10** with a `tokio::sync::Barrier` added before the burst. It is not
+    /// weak for the reason this file's docstring worries about (a lenient assertion): the assertion is
+    /// exact. It is weak because the burst is not as simultaneous as it looks.
+    ///
+    /// THE GUARD UNDERNEATH IT DOES HOLD, measured rather than assumed. Driving the same race at
+    /// TRANSACTION level - `begin_immediate`, then `enforce_creation_cap_in`, then an INSERT, with a
+    /// barrier and 16 callers genuinely inside their transactions - the cap held at 10 rows against a
+    /// limit of 10 in **11 of 11** runs, 8 of them with the mutation applied and verified live. So this
+    /// test's flakiness is a property of this TEST, not evidence the cap is unprotected.
+    ///
+    /// WHAT DIFFERS IS THE PRE-TRANSACTION READ: `create_key` calls `resolve_account_from_cookie` before
+    /// `begin_immediate`, and a test cannot interpose on a read that happens inside the handler, so the
+    /// tasks arrive staggered. That is the likeliest cause and is NOT proven - what is proven is that the
+    /// transaction-level shape holds.
+    ///
+    /// So a GREEN run of this test is not evidence that the guard is intact. Two tests do detect that
+    /// mutation every time - `db::tests::a_hold_after_a_read_still_admits_exactly_one_of_many` and
+    /// `routes::telegram::tests::the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests`,
+    /// both 10/10 - and the file to read for the shape that makes a test able to see it is `db.rs`'s
+    /// `begin_immediate`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_key_creation_cap_holds_under_concurrent_requests() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = test_support::account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let limit = state.config.limits.key_creation_per_day;
+        assert!(limit > 0, "the fixture assumes a configured daily cap");
+
+        // Seed to ONE UNDER, so exactly one more caller is entitled to a key.
+        for i in 0..limit - 1 {
+            create_key_via_handler(
+                &state,
+                &headers,
+                &format!("seed-{i}"),
+                vec!["flash".into()],
+                0,
+            )
+            .await;
+        }
+
+        // Sixteen at once, of which at most one may succeed.
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let state = state.clone();
+            let headers = headers.clone();
+            handles.push(tokio::spawn(async move {
+                create_key(
+                    State(state),
+                    headers,
+                    Json(CreateKeyRequest {
+                        label: Some(format!("burst-{i}")),
+                        models: vec!["flash".into()],
+                        spend_limit_idr: 0,
+                        token_limit: 0,
+                        rate_limit_rpm: 0,
+                        expires_at: None,
+                    }),
+                )
+                .await
+                .map(|response| response.into_response().status())
+            }));
+        }
+
+        let mut created = 0usize;
+        let mut refused = 0usize;
+        for handle in handles {
+            match handle.await.expect("the create task must not panic") {
+                Ok(status) => {
+                    assert_eq!(
+                        status,
+                        StatusCode::CREATED,
+                        "a permitted key must answer 201, not {status}"
+                    );
+                    created += 1;
+                }
+                Err(AppError::RateLimited { .. }) => refused += 1,
+                Err(other) => panic!("unexpected error from a burst request: {other:?}"),
+            }
+        }
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id = ?")
+            .bind(account_id.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("count the keys");
+
+        assert_eq!(
+            total,
+            i64::from(limit),
+            "{total} keys for an account whose cap is {limit} ({created} created and \
+             {refused} refused across a burst of sixteen). The cap must hold \
+             EXACTLY: an assertion that allowed a small overshoot would pass against \
+             the old, non-transactional code on a fast machine"
+        );
     }
 
     /// A NEGATIVE CEILING IS REFUSED, AND NOTHING IS WRITTEN.
@@ -1960,7 +2718,7 @@ mod tests {
         assert_eq!(negative_rows, 0, "no negative limit may reach the row");
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
         );
@@ -2043,9 +2801,156 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&pool, account_id).await,
+            ledger_drift_rows(&pool, account_id).await,
             0,
             "fixture must not drift"
+        );
+        db.close().await;
+    }
+
+    /// LOWERING A LIMIT BELOW THE WINDOW'S SPEND IS ACCEPTED, and this test exists because a comment
+    /// here used to claim the opposite.
+    ///
+    /// The previous comment on `update_key`'s `spend_limit_idr` arm read *"Validate against the real
+    /// spend so the operator sees the number rather than a silently ineffective limit"*, which reads
+    /// as "a lowering below spend is refused". It is not: `check_spend_limit` rejects only a NEGATIVE
+    /// request, and `spend_used_idr` appears solely as a field in that negative-case error body.
+    /// MEASURED: replacing the caller's lookup with the constant `0` left all 22 `routes::keys` tests
+    /// green, which is what showed the value has no effect on the outcome.
+    ///
+    /// The behaviour is the RIGHT one, so this pins it rather than changing it.
+    /// docs/website/06-api-keys-and-limits.md says a lowering *"should warn that it may cut off
+    /// in-flight usage"* - a warn, not a refusal - and refusing would leave an operator unable to
+    /// close a runaway key, which is the situation the control exists for. The key simply sits over
+    /// its limit and `proxy.rs` refuses the next request.
+    ///
+    /// The other half is pinned too: the 402 for a negative still carries the real spend, so the
+    /// lookup keeps the justification the comment now gives it.
+    #[tokio::test]
+    async fn lowering_a_spend_limit_below_the_windows_spend_is_accepted_not_refused() {
+        let _cache = CacheLock::acquire();
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let headers = session_cookie(&pool, account_id).await;
+
+        let (key_id, _, _) =
+            create_key_via_handler(&state, &headers, "runaway", vec!["flash".into()], 0).await;
+
+        // Real spend inside the window, so there is something to lower BELOW.
+        let spent_idr: i64 = 7_500;
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, day, api_key_id, input_tokens,
+                                      cache_read_tokens, output_tokens, cost_idr)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(
+            crate::ip_tracking::today_utc()
+                .format("%Y-%m-%d")
+                .to_string(),
+        )
+        .bind(key_id.hyphenated())
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(spent_idr)
+        .execute(&pool)
+        .await
+        .expect("seed real spend for the key");
+
+        let read_back = key_spend_used(&pool, account_id, key_id, crate::ip_tracking::today_utc())
+            .await
+            .expect("the window spend is readable");
+        assert_eq!(
+            read_back, spent_idr,
+            "the fixture must actually have spend in the window, or this test asserts nothing"
+        );
+
+        // LOWER below it: accepted.
+        let res = update_key(
+            State(state.clone()),
+            Path(key_id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: None,
+                models: None,
+                spend_limit_idr: Some(spent_idr - 1),
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "lowering a spend limit below the window's spend must be ACCEPTED: the operator is \
+             closing a runaway key, and the key sitting over its limit is a state `proxy.rs`\
+             handles by refusing the next request. A refusal here would leave the limit unlowerable, \
+             which is the opposite of what the control is for."
+        );
+
+        let stored: i64 = sqlx::query_scalar("SELECT spend_limit_idr FROM api_keys WHERE id = ?")
+            .bind(key_id.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("read the limit back");
+        assert_eq!(
+            stored,
+            spent_idr - 1,
+            "the lowered limit must be what is STORED: the request is accepted, not silently ignored"
+        );
+
+        // And the negative case still carries the real spend, which is the lookup's whole purpose.
+        let err = match update_key(
+            State(state.clone()),
+            Path(key_id),
+            headers.clone(),
+            Json(UpdateKeyRequest {
+                label: None,
+                models: None,
+                spend_limit_idr: Some(-1),
+                token_limit: None,
+                rate_limit_rpm: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("a negative spend limit must be refused"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "key_limit_exceeded");
+        assert_eq!(
+            err.details().unwrap()["spend_used_idr"],
+            spent_idr,
+            "the refusal must report the REAL window spend: this is the one thing `spend_used_idr` \
+             does, and a refusal that reported 0 would tell the operator nothing"
+        );
+
+        assert_eq!(
+            ledger_drift_rows(&pool, account_id).await,
+            0,
+            "fixture must not drift"
+        );
+        db.close().await;
+    }
+    /// (wrong token, revoked, or expired) must resolve to `Unauthenticated`, never
+    /// to a panic or a default account. Covers the final `Err` arm at keys.rs:253
+    /// and the inner `if let Some(s)` fall-through at keys.rs:249.
+    #[tokio::test]
+    async fn a_session_cookie_with_no_matching_row_falls_through_to_unauthenticated() {
+        let db = TestDb::new().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("session=no-such-token"),
+        );
+        let result = resolve_account_from_cookie(&db.pool, &headers).await;
+        assert!(
+            matches!(result, Err(AppError::Unauthenticated)),
+            "an unmatched session cookie must be refused as unauthenticated: {result:?}"
         );
         db.close().await;
     }

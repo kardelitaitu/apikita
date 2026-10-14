@@ -49,7 +49,7 @@ CREATE TABLE identities (
   -- A password identity must carry a hash; an OAuth identity must not.
   CHECK ((provider = 'password') = (password_hash IS NOT NULL)),
 
-  -- Google guarantees a verified address (identity.md:100). Encode that so an
+  -- Google guarantees a verified address (architecture/identity.md:131). Encode that so an
   -- unverified Google identity cannot exist, rather than trusting the callback.
   CHECK (provider <> 'google' OR email_verified = 1)
 ) STRICT;
@@ -92,7 +92,8 @@ CREATE TABLE sessions (
   expires_at   TEXT NOT NULL CHECK (expires_at GLOB '????-??-??T??:??:??*+00:00'),
   -- NEW. The register specifies "30d absolute, 7d idle" but the Postgres schema
   -- had no column for the idle bound, so only the absolute half was enforceable
-  -- (auth.rs:255 notes this). Adding it now, while the schema is being rewritten.
+  -- (docs/decisions.md:97 states the pair). Adding it now, while the schema is
+-- being rewritten.
   last_seen_at TEXT NOT NULL CHECK (last_seen_at GLOB '????-??-??T??:??:??*+00:00'),
   revoked_at   TEXT CHECK (revoked_at IS NULL
                            OR revoked_at GLOB '????-??-??T??:??:??*+00:00'),

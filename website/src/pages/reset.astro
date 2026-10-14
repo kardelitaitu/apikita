@@ -41,7 +41,7 @@ const lead = 'Enter the email address on your account and we will send a single-
 </AuthLayout>
 
 <script>
-  import { pb } from '../lib/pocketbase';
+  import { requestPasswordReset } from '../lib/auth-api';
   import { isUnreachable, resetRequestReply } from '../lib/auth-flow';
 
   const errorBox = document.getElementById('auth-error') as HTMLDivElement;
@@ -69,7 +69,9 @@ const lead = 'Enter the email address on your account and we will send a single-
     setBusy(true);
 
     const email = String(new FormData(form).get('email') ?? '');
-    void pb.collection('users').requestPasswordReset(email)
+    // ONE request, and it answers 202 with the neutral reply for a known address
+    // and an unknown one alike. Nothing here can distinguish the two.
+    void requestPasswordReset(email)
       // Spec line 90: every server answer produces the same message. The reply
       // is built from the error only to tell "we asked and were answered" apart
       // from "the request never left" — never to tell one account from another.

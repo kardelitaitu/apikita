@@ -7,18 +7,26 @@ procedure itself.
 **An untested backup is a belief.** The only backup that counts is one that has been
 restored and verified.
 
+> **Superseded: identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the
+> PocketBase HTTP client is gone from `server/`, and identity is served natively
+> by this crate (`accounts` + `identities`, Argon2id). Where the text below still
+> says PocketBase is the current identity provider, this notice governs;
+> [`architecture/identity.md`](architecture/identity.md) is the operative
+> description.
+
 ## What must be backed up
 
 | Data | Where | Loss impact |
 | --- | --- | --- |
-| **The SQLite database file** (ledger, wallets, keys, usage) | Northflank persistent volume | **Total loss of funds data — unrecoverable** |
-| **PocketBase** (identity, passwords, emails) | Northflank | Loss of logins; customers cannot sign in |
+| **The SQLite database file** (ledger, wallets, keys, usage, **and identity** — `accounts` + `identities`) | Northflank persistent volume | **Total loss of funds data — unrecoverable** |
 | Relay nginx config | VPS | Rebuildable by hand, but annoying |
 | Config (routing/pricing) | Git | Low — versioned already |
 
-**Ranked by consequence: the database file first.** Losing PocketBase breaks logins;
-losing the database file destroys the record of what customers are owed. They are
-not equivalent.
+**One file, and it is the whole system.** The database holds identity as well as
+money now, so losing it loses logins *and* the record of what customers are owed.
+There is no second store to rank against it and no separate identity service to
+back up: identity lives in the `identities` table beside the ledger.
 
 ## Backup strategy
 
@@ -171,7 +179,13 @@ silent failure.** Alert on size, not just exit code.
       > **PORTED (was the sharpest open item in this document).** `tools/backup/backup.sh` and
       > `tools/drill/drill.sh` now implement the **SQLite** procedure: a `.backup` copy, header +
       > `integrity_check` on both the artifact and the **restored** file, and the reconcile gate.
-      > They refuse a `postgres://` `DATABASE_URL` by name (exit 2). Verified end-to-end against a
+      > **Both now** refuse a `DATABASE_URL` that is not a `sqlite://` URL, by name and at exit 2.
+      > That word was **"They"** and it was half wrong when written: `backup.sh` had the check and
+      > `drill.sh` did not, so a `postgres://` value reached the drill, was taken as a literal
+      > path, and surfaced much later as a restore failure (measured: exit 7) rather than as the
+      > misconfiguration it was. The drill validates it now, and — like its sibling — draws a
+      > separate message for `sqlite::memory:`, which parses as a scheme but names no file.
+      > Verified end-to-end against a
       > scratch database built from the migration: a balanced source restores and reconciles green; a
       > drifted source **fails** (exit 1); a truncated or zero-length artifact is caught by the header
       > check (exit 6); and a zero-length *source* is refused, because SQLite opens an empty file as a
@@ -187,17 +201,30 @@ silent failure.** Alert on size, not just exit code.
       The drill is now executable: [`tools/drill/drill.sh`](../tools/drill/README.md) restores into a
       scratch database, reuses the reconciliation query as its verdict, spot-checks a balance,
       measures the restore time and writes a log. Measured on the local dev database:
-      **~1–6 s** to restore a ~126 KB dump — orders of magnitude under the 4-hour RTO, but that is a
-      **dev-sized** database, measured against **PostgreSQL** before the port; the production number
-      is unmeasured until the drill runs there, and the drill itself still needs the port above.
+      **~0.1–0.8 s** to restore a ~288 KB SQLite file — orders of magnitude under the 4-hour RTO,
+      but that is a **dev-sized** database. The drill HAS been ported: it is SQLite-native now
+      (there is no `pg_dump` and no server — the artifact *is* the database file, taken with
+      SQLite's online backup API), and it has been re-measured on SQLite across many runs. The
+      production number is still unmeasured, because that needs production data and a deployed
+      database — not because the tool has not been ported.
 - [x] Where the drill log lives.
       `tools/drill/drill.sh` writes `.agents/drill-logs/drill-<UTC-timestamp>-<target>.log` (that
       directory is gitignored, since a log names row counts and account ids). Each log carries all
       five "Record the drill" fields: `date_utc`, `run_by`, `backup_age`, `restore_ms`, `result`,
-      plus the dump sha256/size, TOC count, the row-count table, the spot-check pair and the drift
-      verdict. Override with `--log-dir`/`DRILL_LOG_DIR` when the retention answer moves.
-- [ ] Whether PocketBase gets its own tested restore procedure.
-      **Still open.** Neither tool covers PocketBase: `backup.sh` backs up only the money database and
-      the drill restores only that, so identity data has no tested restore path today.
-- [ ] **Port `tools/backup` and `tools/drill` to the SQLite file.** Until then the tooling cannot
-      touch the shipped database — see the note under Backup tooling above.
+      plus the artifact sha256/size, the `PRAGMA integrity_check` verdict on the restored database,
+      the row-count table, the spot-check pair and the drift verdict. (There is no "TOC count":
+      that was a `pg_dump` field, and it went with the port — the current log carries no such line.)
+      Override with `--log-dir`/`DRILL_LOG_DIR` when the retention answer moves.
+- [x] Whether the identity store gets its own tested restore procedure.
+      **Moot — there is no separate identity store.** The Phase 6 port moved identity
+      into the same SQLite file as money (`accounts` + `identities`), so the
+      procedure above *is* the identity restore procedure: `backup.sh` backs the file
+      up and `drill.sh` restores and reconciles it. Nothing else needs a restore path.
+- [x] **Port `tools/backup/backup.sh` and `tools/drill/drill.sh` to the SQLite file.** Done — the
+      tools implement the `.backup` + `integrity_check` + reconcile procedure described above.
+      **Both paths are spelled out, because there are TWO drills in this repository and their
+      names differ by one word.** `tools/drill/drill.sh` restores and reconciles (this page's
+      procedure); `tools/rollback/drill.sh` rehearses a bad migration and belongs to
+      [`rollback`](../tools/rollback/README.md). This line said `tools/drill`, and a reader who
+      followed it to the wrong file would have found a tool that refuses to do what the sentence
+      promises — which is exactly the confusion the neighbouring lines avoid by naming the script.

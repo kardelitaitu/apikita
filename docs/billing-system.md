@@ -10,8 +10,6 @@
 >
 > Referenced from exactly one place: the register's wind-down rows.
 
-this is rough plan need to be audited:
-
 # Product Specification & Architecture Document: SaaS Top-Up Billing System
 **Project Name:** LLM API Token SaaS Billing Platform
 **Base Currency:** IDR (Indonesian Rupiah)

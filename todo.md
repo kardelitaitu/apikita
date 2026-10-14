@@ -15,6 +15,11 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
     [`docs/plans/sqlite-migration.md`](docs/plans/sqlite-migration.md))
   - [x] Define HTTP API specification ([`docs/server/api-spec.md`](docs/server/api-spec.md))
   - [x] Audit cross-document consistency and patch obsolete PocketBase/Pages references
+        — **re-audited 2026-09-30** after the identity port landed: the register, the
+        runbooks, the website docs and both READMEs now describe the Rust-owned
+        identity system. The phase narratives in
+        [`docs/plans/sqlite-migration.md`](docs/plans/sqlite-migration.md) are kept as a
+        dated log, per that document's own status line.
   - [x] Confirm official Midtrans SHA-512 constant-time signature formula
   - [x] Adopt competitive $M = 1.50$ pricing model (zero fixed server overhead)
 - [x] **Repository & Version Control**
@@ -130,7 +135,12 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
   - [ ] Deploy Astro frontend to **Cloudflare Pages**
   - [ ] Provision a **persistent volume** for the SQLite database file (not a
         database instance — there is none to provision)
-  - [ ] Deploy PocketBase auth instance on Northflank
+  - [x] ~~Deploy PocketBase auth instance on Northflank~~ — **VOID.** There is no
+        PocketBase to deploy: the identity port moved every credential check into the
+        Rust API over the `accounts` + `identities` tables in the same SQLite file
+        ([`docs/architecture/identity.md`](docs/architecture/identity.md)). The item
+        below it — the API container — is the whole deployment, and this entry was the
+        last place the roadmap still [planned a service that does not exist](docs/plans/sqlite-migration.md).
   - [ ] Deploy Rust API container to **Northflank** (0.2 vCPU developer tier)
   - [ ] Configure custom domain and SSL certificates on Cloudflare
 - [ ] **Operational Gating (Gates 0–5 from [`docs/launch-checklist.md`](docs/launch-checklist.md))**
@@ -163,5 +173,34 @@ The living development roadmap for the ApiKita high-throughput LLM arbitrage pro
           reconcile check, spot-checks a balance, measures the restore time, writes a drill log, and
           tears the scratch DB down. A refusal guard makes it impossible to point at the live database.
     - [ ] Run it against the **production** database once provisioned; that is the real RTO measurement.
-    - [ ] Alerts (webhook rejection, ledger drift, API down, circuit open) — the sweep scripts exist
-          but nothing schedules or alerts yet.
+    <!-- alert-scheduling: wired -->
+    - [ ] Alerts (webhook rejection, ledger drift, API down, circuit open) — **the code half is done**;
+          what remains is a deployment decision. **11 of its 12 alerts are `covered`** in
+           [`tools/alert/alerts.tsv`](tools/alert/alerts.tsv) — the one exception is `relay_5xx`,
+           `needs-metrics` because it cannot be derived from the database or `/health` alone.
+           (`proxy_undercharge` was the second exception until the money layer began counting clamped
+           settlements and `probe.sh` gained a check for it.)
+           The four named above are checked by
+          [`tools/alert/probe.sh`](tools/alert/probe.sh) (`api_down`, `webhook_rejection`,
+          `all_providers_unhealthy` — the "circuit open" one) and
+          [`tools/alert/check-alerts.sh`](tools/alert/check-alerts.sh) (`ledger_drift`, which needs
+          database access). [`tools/alert/alert.sh`](tools/alert/alert.sh) is the transport that
+          delivers one alert over a configured channel, with a cooldown so one incident pages once
+          rather than once per run. **The coupling is in place too**: the `scheduler` service in
+          [`docker-compose.yml`](docker-compose.yml) runs retention, reconcile, hold-sweep **and both
+          alert jobs** — `run_wired_jobs` calls `run_alert_checks` (the database-backed alerts) and
+          `run_alert_probes` (the HTTP ones) every night at `SCHEDULE_HOUR_UTC`, default 03:00 UTC,
+          which an operator can move. What is still missing is the **delivery channel**, and that is
+          the same reason [`docs/launch-checklist.md`](docs/launch-checklist.md) keeps its own copy of
+          this line unticked: with no channel a breach is reported UNMONITORED and the run exits
+          non-zero rather than passing, so a night nobody was told about cannot read as a clean
+          sheet. "The code half is done, and so is the wiring."
+
+          *(Correction: this line once asserted that **nothing invokes the alert checks on a
+          schedule**. That was true when written and was invalidated when the jobs were wired into
+          `run_wired_jobs`. The note existed to state what remained and was not revisited when the
+          remaining thing got done. [`docs/launch-checklist.md`](docs/launch-checklist.md) made the
+          same claim, and `tools/alert-check/check.sh` now holds BOTH files against the code in
+          `entrypoint.sh` through an explicit `alert-scheduling:` marker, so neither can go stale a
+          second time. The previous version grepped the checklist for one exact sentence; todo.md's
+          read "nothing CURRENTLY invokes…", which is why it got past.)*

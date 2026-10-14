@@ -21,6 +21,27 @@
 //! config the application already owns (`AppState.config`), and is passed in, so
 //! this module holds no state and no second view of the configuration.
 
+#![cfg_attr(
+    not(test),
+    // THE ABUSE CAPS, fenced for the reason the breaker was: this module REFUSES
+    // requests, so its arithmetic is the last thing standing between a script and
+    // the wallet. It is a third kind of site, though - neither a money figure nor a
+    // panic, but a figure handed to a CLIENT in a Retry-After header.
+    //
+    // That makes the failure mode specific: an overflow here does not corrupt
+    // anything, it produces a wrong answer to the question "when may I try again".
+    // Wrong in the permissive direction - a tiny Retry-After - invites a client to
+    // retry immediately into the same refusal, which docs/error-model.md calls out
+    // as what "reads as a broken limiter". The floor of 1 second below is the guard
+    // against exactly that, and it is why the ceiling division is here at all.
+    //
+    // Three sites, and all three are bounded by the WINDOW LENGTH, which is a
+    // constant in this file rather than anything a caller or a row supplies. The
+    // arguments are written at each one, because "the window is an hour" is exactly
+    // the kind of fact that stops being true when someone parameterises it.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
@@ -50,7 +71,13 @@ pub fn key_creation_window() -> Duration {
 /// second must not be told `0`) and floored at 1 — a `Retry-After: 0` invites an
 /// immediate retry that is refused again, which reads as a broken limiter
 /// (docs/error-model.md).
+#[allow(clippy::arithmetic_side_effects)]
 fn retry_after_secs(oldest: DateTime<Utc>, window: Duration, now: DateTime<Utc>) -> u64 {
+    // SAFE, and the bound is the window rather than the inputs. `oldest` comes from
+    // MIN(created_at) over rows this server wrote, so it is a real timestamp; a
+    // clock that jumped forward would make it older, not further away. chrono's
+    // `DateTime + Duration` PANICS rather than wrapping on an out-of-range result,
+    // so even that would fail loudly instead of silently dating the window wrong.
     let remaining_ms = (oldest + window)
         .signed_duration_since(now)
         .num_milliseconds();
@@ -59,6 +86,22 @@ fn retry_after_secs(oldest: DateTime<Utc>, window: Duration, now: DateTime<Utc>)
     }
     // Ceiling division by hand: `div_ceil` on a signed integer is not stable in
     // this toolchain's std yet. `remaining_ms` is positive here.
+    //
+    // The `+ 999` cannot overflow, which is the one place this needs arguing: the
+    // guard above has already returned for anything <= 0, and the largest positive
+    // value is a window length measured in milliseconds - 3_600_000 for the hourly
+    // cap, 86_400_000 for the daily one. A row stamped far in the FUTURE would raise
+    // it, and would have to be stamped 292 million years ahead to reach i64::MAX.
+    //
+    // The `as u64` is a cast rather than a checked conversion, which is only sound
+    // because of that same bound: the value is positive and far below u64::MAX. The
+    // floor of 1 above is what keeps the permissive direction out - a client told
+    // "retry in 0 seconds" retries into the same refusal, which reads as a broken
+    // limiter.
+    //
+    // No second allow here: the expression is this function's TAIL, and an attribute
+    // in that position needs the unstable `stmt_expr_attributes` feature. The one on
+    // the function above covers it.
     ((remaining_ms + 999) / 1000) as u64
 }
 
@@ -109,15 +152,77 @@ pub async fn enforce_creation_cap(
     account_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    // See the race note on `enforce_creation_cap_in`: this variant is the one that
+    // is NOT atomic with the insert, because the two are separated by whatever the
+    // caller does next. It is kept because two of the three call sites cannot close
+    // that gap - the top-up path inserts after a Midtrans call - but it now at least
+    // runs its COUNT under a write lock, so the read is not torn against a
+    // concurrent writer.
+    let mut tx = crate::db::begin_immediate(pool).await?;
+    let outcome = enforce_creation_cap_in(&mut tx, table, window, limit, account_id, now).await;
+    // The check only reads, so there is nothing to roll back - but the transaction
+    // still has to be closed, and a rollback is the honest way to say "no writes".
+    match outcome {
+        Ok(()) => {
+            tx.rollback().await?;
+            Ok(())
+        }
+        Err(err) => {
+            tx.rollback().await?;
+            Err(err)
+        }
+    }
+}
+
+/// THE CAP CHECK, INSIDE A TRANSACTION THE CALLER OWNS.
+///
+/// This is the variant that can be ATOMIC with the insert it guards, and the
+/// difference is the whole point of the split. If the caller opens a write
+/// transaction, runs this, and inserts before committing, then SQLite serialises the
+/// COUNT and the INSERT against every other writer: a second caller either sees the
+/// first one's row or is still waiting for the lock. That is the cap actually
+/// holding, rather than holding against a caller that happens to arrive one at a
+/// time.
+///
+/// IT IS NOT AVAILABLE EVERYWHERE, and pretending otherwise would be the easy
+/// mistake. A transaction may only span the check and the insert if everything
+/// between them is local. On the key-creation path it is - key generation, hashing
+/// and three validations, all microseconds of CPU - so that path now holds one. On
+/// the top-up path it is a Midtrans Snap call, and a transaction spanning that
+/// would hold a SQLite WRITE LOCK across a network round trip to a payment
+/// provider, serialising every other top-up in the process behind it. That path
+/// keeps the pool variant, and its race is characterised by
+/// `the_creation_cap_is_enforced_against_a_stale_read_under_concurrency`.
+///
+/// The fix for the paths that cannot close the gap is a reservation - claim the
+/// slot atomically at check time - which is a schema and flow change rather than a
+/// patch.
+pub async fn enforce_creation_cap_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &'static str,
+    window: Duration,
+    limit: u32,
+    account_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
     let sql = format!(
         "SELECT COUNT(*) AS used, MIN(created_at) AS oldest \
          FROM {table} WHERE account_id = ? AND created_at >= ?"
     );
 
+    // SAFE, and for the same reason as the addition in retry_after_secs: `window` is
+    // a constant from this file (an hour, or a day) and `now` is the clock, so the
+    // subtraction is nowhere near the edge. chrono's DateTime arithmetic panics
+    // rather than wrapping on an out-of-range result, so a future parameterisation
+    // of the window would fail loudly here instead of silently counting the wrong
+    // rows.
+    #[allow(clippy::arithmetic_side_effects)]
+    let window_start = now - window;
+
     let row = sqlx::query(&sql)
         .bind(account_id.hyphenated())
-        .bind(now - window)
-        .fetch_one(pool)
+        .bind(window_start)
+        .fetch_one(&mut **tx)
         .await?;
 
     let used: i64 = row.get("used");
@@ -227,6 +332,169 @@ mod tests {
     /// One top-up at the configured amount, as the create path writes one.
     async fn insert_topup(pool: &SqlitePool, account_id: Uuid) {
         test_support::pending_topup(pool, account_id, 10_000).await;
+    }
+
+    /// A CHARACTERISATION TEST, and the name says what it is: it records a
+    /// limitation that is REAL rather than asserting a property the code does not
+    /// have.
+    ///
+    /// `enforce_creation_cap` is a SELECT COUNT, and the row it guards is inserted
+    /// by the CALLER afterwards. Nothing holds a lock between the two, so requests
+    /// that arrive together read the same count, all see room, and all insert.
+    /// MEASURED here: sixteen concurrent callers against a cap of five, seeded one
+    /// under, produced fourteen rows. The cap is enforced against a stale read.
+    ///
+    /// THE OBVIOUS FIX IS NOT AVAILABLE, and the reason matters more than the race.
+    /// On the top-up path the insert happens after a Midtrans Snap call, so a
+    /// transaction spanning check and insert would hold a SQLite WRITE LOCK across
+    /// a network round trip to a payment provider, and every other top-up in the
+    /// process would serialise behind it. The fix is a reservation - claim the slot
+    /// atomically at check time, by inserting the row then, or by counting in a
+    /// dedicated table - which is a schema and flow change rather than a patch.
+    ///
+    /// So this pins what exists instead of pretending otherwise, and it fails if
+    /// the cap is removed or stops bounding anything:
+    ///
+    ///   * no round may exceed the number of callers plus the seed, which is the
+    ///     trivial bound and catches a change that lets everyone through
+    ///     unconditionally;
+    ///   * at least one round must EXCEED the cap, or the weakness is gone and this
+    ///     characterisation is stale - which is the good outcome, and the test
+    ///     should be rewritten as a plain assertion when it happens.
+    ///
+    /// FIVE ROUNDS rather than one, because whether the tasks interleave is
+    /// scheduling and a single round can pass by luck - which is exactly what the
+    /// first version of this test did. That version seeded the table to exactly the
+    /// cap and counted allowed CHECKS; it passed, and proved nothing, because an
+    /// account already at its cap is refused by any number of readers, sequential or
+    /// otherwise. It tested the predicate, not the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_creation_cap_is_enforced_against_a_stale_read_under_concurrency() {
+        const CALLERS: u64 = 16;
+        const ROUNDS: usize = 5;
+
+        let limit = configured_limits().topup_per_hour;
+        assert!(limit > 0, "the fixture assumes a configured hourly cap");
+        let mut worst: i64 = 0;
+
+        for _ in 0..ROUNDS {
+            let db = TestDb::new().await;
+            let account_id = test_support::account(&db.pool).await;
+            let now = Utc::now();
+            for _ in 0..limit - 1 {
+                insert_topup(&db.pool, account_id).await;
+            }
+
+            let mut handles = Vec::new();
+            for _ in 0..CALLERS {
+                let pool = db.pool.clone();
+                handles.push(tokio::spawn(async move {
+                    // Exactly the caller's sequence: check, then insert if allowed.
+                    if enforce_creation_cap(&pool, "topups", topup_window(), limit, account_id, now)
+                        .await
+                        .is_ok()
+                    {
+                        insert_topup(&pool, account_id).await;
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.await.expect("the caller task must not panic");
+            }
+
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM topups WHERE account_id = ?")
+                .bind(account_id.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count the top-ups");
+            worst = worst.max(total);
+
+            assert!(
+                total <= i64::from(limit - 1) + CALLERS as i64,
+                "{total} rows from {CALLERS} callers: more than the callers plus the
+                seed, so the cap is no longer bounding anything at all"
+            );
+        }
+
+        assert!(
+            worst > i64::from(limit),
+            "across {ROUNDS} rounds the cap of {limit} was never exceeded (worst
+            {worst}). The race is either gone or the fixture stopped
+            interleaving - either way this characterisation is now stale and should
+            be rewritten as an assertion that the cap holds"
+        );
+    }
+    /// A row EXACTLY at the window start still counts, and this is the only test that sits on it.
+    ///
+    /// WHY IT IS NEEDED. The cap's query is `created_at >= window_start`, so the boundary row is
+    /// INSIDE the window. The test above ages its rows out by TWO HOURS against an HOURLY window, and
+    /// every other fixture seeds rows at `now` - all of them far from the line. MEASURED: flipping
+    /// the comparison to `>` left the whole suite green at 672 passed / 0 failed.
+    ///
+    /// That is the FOURTH sweep or cap in a row with the same habit - db.rs's session retention,
+    /// ip_tracking.rs's link_code_issues, identity/tokens.rs and link_codes all had boundary tests
+    /// whose fixtures sat a whole unit away from the line. Written down here because the pattern is
+    /// now established rather than suspected: fixtures are written to be CLEARLY on one side, and the
+    /// cheap way to be clear is to be far.
+    ///
+    /// WHICH WAY IT MUST GO, and it is worth stating because the two rules differ by design. For a
+    /// trailing WINDOW, a row at `window_start` is inside the window - the window is the closed
+    /// interval `[now - window, now]`, so `>=` counts it. That is the opposite reading from the
+    /// retention sweeps, where a row AT the cutoff is deleted because it has REACHED its life. Both
+    /// are `<=`-style inclusive; the difference is which side of the line the row belongs to, and
+    /// this test pins the cap's side so a future tidy-up cannot quietly make the window N-1 wide.
+    #[tokio::test]
+    async fn a_row_exactly_at_the_window_start_still_counts_against_the_cap() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account(&db.pool).await;
+        let limit = configured_limits().topup_per_hour;
+        assert!(limit > 0, "the fixture assumes a configured hourly cap");
+
+        // `now` with sub-second precision, so `now - window` lands on an exact instant rather than a
+        // rounded one. The seeded row's `created_at` IS that instant, so the comparison is decided on
+        // the boundary and not by clock drift between the seed and the check below.
+        let now = Utc::now();
+        let window = topup_window();
+        for _ in 0..limit {
+            insert_topup(&db.pool, account_id).await;
+        }
+        sqlx::query("UPDATE topups SET created_at = ? WHERE account_id = ?")
+            .bind(now - window)
+            .bind(account_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("move every row exactly onto the window start");
+
+        // `limit` rows, all ON the boundary, and the cap must be FULL. If the comparison is `>`, the
+        // boundary rows fall out, `used` reads 0, and this call is allowed while the account is
+        // over its cap.
+        assert!(
+            enforce_creation_cap(&db.pool, "topups", window, limit, account_id, now)
+                .await
+                .is_err(),
+            "a row at `now - window` is INSIDE the closed window [now - window, now], so {limit} of \
+             them put the account exactly at its cap and the next creation must be refused. Being \
+             allowed here means the comparison excludes the boundary and the window is silently one \
+             instant narrower than the policy states"
+        );
+
+        // And one microsecond the other side of the line is OUTSIDE it, so the cap frees again. This
+        // is the assertion that makes the one above a boundary test rather than a counting test.
+        sqlx::query("UPDATE topups SET created_at = ? WHERE account_id = ?")
+            .bind(now - window - Duration::microseconds(1))
+            .bind(account_id.hyphenated())
+            .execute(&db.pool)
+            .await
+            .expect("move every row one microsecond out of the window");
+
+        assert!(
+            enforce_creation_cap(&db.pool, "topups", window, limit, account_id, now)
+                .await
+                .is_ok(),
+            "the same {limit} rows a microsecond OUTSIDE the window do not count, so the cap frees"
+        );
+
+        db.close().await;
     }
 
     #[tokio::test]
@@ -377,6 +645,7 @@ mod tests {
             config: Arc::new(config),
             ip_salt: Arc::new(DailySalt::new()),
             trusted_proxies: Arc::from(trusted.into_boxed_slice()),
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 

@@ -283,9 +283,53 @@ message come from `alerts.tsv` via `alert.sh`.
 
 ## Coverage: what this can deliver today
 
-The doc's table has 9 alerts; this directory also defines `stranded_hold`, which the
-doc specifies in prose at lines 141-175 with the same force ("**Incident -
-investigate, then credit**").
+**MEASURED, because this paragraph said "9 alerts" while the registry had grown to 11.** Three
+counts, each read from a file rather than remembered — and each true of a DIFFERENT thing, which is
+why one number kept being wrong:
+
+| what | count | read from |
+| --- | --- | --- |
+| Alert definitions | **12** | `alerts.tsv`, the registry |
+| Checks `probe.sh --list` prints | **8** | its own output, one row per check |
+| Definitions `check-alerts.sh` fires | **3** | `grep 'fire "' check-alerts.sh` — `ledger_drift`, `stranded_hold`, `balance_negative` |
+
+**The third row said 11 and that was never true.** MEASURED: `check-alerts.sh` names exactly three
+registry ids — the database-backed ones, which is what it exists for. The other entries are delivered by
+`probe.sh` (7), by `reconcile.sh` (which supplies the vault predicates this file calls), or by nothing at
+all. "The dispatch, which covers the registry" described an intention rather than a measurement, and the
+guard that checks these counts had been accepting it because 11 was also, coincidentally, the registry
+size at the time.
+
+The gap between 7 and 12 is not missing coverage and must not read as such: `probe.sh` covers the seven
+that need a prober, and `check-alerts.sh` covers the three (`ledger_drift`, `balance_negative`,
+`stranded_hold`) that need a database connection and so are deliberately absent from the prober.
+**A count that is right about one of those and silent about which is the defect that produced this
+table**, so the column is the part that matters.
+
+**ONE definition is neither, and it used to be two.** `relay_5xx` carries `needs-metrics` rather than
+`covered`, which is why the arithmetic above does not close at 8 + 3 + the entry the next paragraph names:
+the gap between the prober checks and the registry holds one entry.
+
+**`proxy_undercharge` MOVED FROM "neither" TO COVERED, and the move is the whole point of this section.**
+It carried `needs-metrics` because its signal was a server LOG line (`Proxy request UNDERCHARGED`) that
+neither script reads for anything but `topup.rejected` — alertable in principle and unreadable in practice.
+The money layer now COUNTS it (`MoneyCounter` in `server/src/error.rs`, incremented by
+`settle_partial_usage`) and serves it on the same operator route `error_rate` already reads, so
+`probe.sh --check proxy_undercharge` has a real number to compare against zero.
+
+**It needed its own counter rather than a new query, and the reason is worth keeping:** the ledger cannot
+show an undercharge — the debit was CLAMPED, so `balance = SUM(delta)` still holds and `ledger_drift` stays
+0 — and `error_rate` cannot either, because the request returned 200. An undercharge is a SUCCESS whose
+money is short, which is exactly the shape that hides. The counterpart to `refund_refusal` is now
+symmetrical rather than half of it being unreadable.
+
+This paragraph has now been wrong in both directions, which is why it names the count rather than a
+quantifier: it first called `proxy_undercharge` the sole definition that is neither while the next sentence
+said `relay_5xx` was in "the same structural position" (self-contradicting), and the number it carried
+was 2 until this change made it 1.
+
+The registry's eleventh entry is `stranded_hold`, which the doc specifies in prose at lines
+141-175 with the same force ("**Incident - investigate, then credit**").
 
 | # | Doc alert (line) | Delivered today? | Why not, if not |
 | - | ---------------- | ---------------- | --------------- |
@@ -294,31 +338,64 @@ investigate, then credit**").
 | 3 | **API down** (101) | **Yes** | `probe.sh` -> external `GET /health`, alerting once the failure span covers the window. Not a database fact, so it needs no database. |
 | 4 | **Relay 5xx** (102) | **No** | nginx status counts. Needs a metrics backend (or an access-log counter). |
 | 5 | **Relay down** (103) | **Yes** | `probe.sh` -> one external `GET` of the relay's origin. |
-| 6 | **All providers unhealthy** (104) | **No** | Circuit-breaker state is in-process (`server/src/upstream/circuit_breaker.rs`); it is not exposed anywhere a shell script can read. |
+| 6 | **All providers unhealthy** (104) | **Yes, via `/api/admin/metrics`** | `probe.sh` reads the breaker state from the operator route. **Skipped, not passed, without `PROBE_OPERATOR_COOKIE`.** |
 | 7 | **Balance negative** (105) | **Yes** | One `SELECT COUNT(*)`, threshold 0. |
-| 8 | **DB disk >80%** (106) | **No** | Volume usage - not visible in SQL. |
-| 9 | **Error rate >5%** (107) | **No** | HTTP counters over a 5-minute window. Needs a metrics backend. |
+| 8 | **DB disk >80%** (106) | **Yes, via `/api/admin/metrics`** | The retention lag is served in-process, and retention is the alert's own ACTION rather than its trigger. **Skipped without `PROBE_OPERATOR_COOKIE`.** |
+| 9 | **Error rate >5%** (107) | **Yes, via `/api/admin/metrics`** | Same route and same caveat as rows 6 and 8. |
 | + | **Stranded holds** (141-175) | **Yes** | Via `reconcile.sh`'s copy of the `hold-sweep` predicate. |
+| + | **Proxy undercharge** | **Yes, via `/api/admin/metrics`** | `probe.sh` reads the `undercharges` counter the money layer writes when a settlement is clamped. **Skipped, not passed, without `PROBE_OPERATOR_COOKIE`.** The ledger cannot show it (a clamped debit leaves `balance = SUM(delta)` intact, so `ledger_drift` stays 0) and the error-rate counter cannot either (the request returned 200), which is why it needed a counter of its own. |
 
-**Covered: 6 of 10. Not covered: 4 of 10, and the reasons are in the table.** Those
-four are the ones that genuinely need a surface nothing here can reach:
+**MEASURED: 12 definitions, 11 of them reachable today, 1 not.** This paragraph said "**Covered: 6 of
+10. Not covered: 4 of 10**" and gave three reasons that had all stopped being true — three rows gained
+a `/api/admin/metrics` path and the table was never updated with them. It then read 10/2 until
+`proxy_undercharge` gained its counter and `probe.sh` a check for it, which is the change this section
+records rather than merely counts.
 
-- `error_rate` and `relay_5xx` both need nginx **access logs**, which are
-  deliberately disabled for privacy (`docs/edge-relay.md`, `docs/data-retention.md`) -
-  enabling them to satisfy an alert would trade a privacy decision for an
-  operational one, and that is not this script's trade to make.
-- `all_providers_unhealthy` needs the upstream **circuit-breaker state**, which is
-  in-process in `server/src/upstream/circuit_breaker.rs` and not exposed anywhere a
-  shell script can read.
-- `db_disk` needs **volume usage**, which no client of any engine can see.
+**Understating is not the safe direction, which is why this is corrected rather than left.** A table
+saying an alert is unwired, when it is merely waiting for a cookie, sends an operator to wire
+something that is already wired — and it hides what the real remaining gaps are. The wording here has
+been wrong at both extremes, which is why it now states the count: it once claimed only one gap remained
+when there were **two**, and this change brought it back to **one**. `probe.sh --check` prints the
+remainder by name on every run, so the file never has to be trusted for it.
 
-Wiring any of those is a call to `alert.sh --alert <id>` once the surface exists -
-no change to the transport, and no change to `probe.sh`.
+```
+$ sh tools/alert/probe.sh --check db_disk
+probe: NOT CHECKED - 1 of the 12 alerts in alerts.tsv still need a surface this cannot reach:
+probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
+probe:                             The relay is a SEPARATE deployment; the backend never sees its
+probe:                             status codes, so no server-side check can answer this one.
+```
 
-The delivery **mechanism**, though, is complete for all ten: `alerts.tsv` carries
-every doc alert's threshold and action, so wiring a metrics backend means calling
-`alert.sh --alert <id>` - no change to the transport. `alert.sh --list` shows all
-ten with their coverage, including the ones nothing currently fires.
+**This block says "1 of the 12" and has been wrong at every value it has held.** MEASURED by running the
+command, each time: it first listed only `relay_5xx` while the header said "2 of the 12"; then it listed
+both correctly at 2, until `proxy_undercharge` gained a real counter and the header should have said 1.
+The block is labelled *"quoted here verbatim"* a few lines above, so a stale quote is the worst version of
+the defect this section exists to correct — a reader checking the claim against the tool would have found a
+contradiction and had no way to tell which side was wrong.
+
+`probe.sh` states the remainder itself on every run, and it is the authority — not this table. The
+line is quoted here **verbatim**, and it changed when the count above it was corrected: this block
+used to read *"1 of the doc's 10 alerts"*, which was wrong on both numbers — the registry has 11, and
+the doc's table has 12 rows because one of them is a privacy statement rather than an alert.
+
+**THE ONE THAT REMAINS IS `relay_5xx`.** `proxy_undercharge` was the second until it gained a counter
+and a check; this paragraph used to name both, and before that only
+`relay_5xx` as remaining, while quoting an output that names both — the same contradiction as the
+singular phrasing corrected above, in a second place. `relay_5xx` needs nginx **access logs**, deliberately
+disabled for privacy (`docs/edge-relay.md`, `docs/data-retention.md`): enabling them to satisfy an alert
+would trade a privacy decision for an operational one, and that is not this script's trade to make.
+Wiring it is a call to `alert.sh --alert <id>` once the surface exists — no change to the transport,
+and no change to `probe.sh`.
+
+The delivery **mechanism**, though, is complete for all **12**: `alerts.tsv` carries every alert's
+threshold and action, so wiring a metrics backend means calling `alert.sh --alert <id>` — no change to
+the transport. `alert.sh --list` shows all eleven with their coverage, including the ones nothing
+currently fires, and reads the registry rather than a hand-kept copy of it.
+
+> **`alert.sh --list` and `probe.sh --list` are different listings, and both are correct.** The first
+> prints every definition from `alerts.tsv` (**12**); the second prints the checks the prober has a code
+> path for (**8**). This paragraph said "all ten" and the coverage section said "9 alerts" — one
+> number, three different things it could have meant. The counts are now stated per-source.
 
 ## What is deliberately NOT alerted
 
@@ -336,7 +413,7 @@ alert the doc did not ask for; `alerts.tsv` contains exactly the doc's 9 rows pl
 | **Bot token custody** | Where `TELEGRAM_BOT_TOKEN` lives (secret manager, host environment, compose secret) and how it is rotated if it leaks. |
 | **Scheduling** | **Nothing runs `check-alerts.sh` yet** - no cron, no compose service, no CI job. `tools/reconcile/` and `tools/backup/` have the same gap. |
 | **Cooldown length** | 900s matches `reconcile.sh`'s hold bound and is a starting point, not a measured value. What "one page per incident" means for your traffic is a judgement call. |
-| **A metrics backend** | The doc's other open item (line 199). **Four** of ten alerts still need it (down from seven - `probe.sh` removed three without one). Self-hosted Prometheus vs a hosted service is a cost decision, not a technical one. |
+| **A metrics backend** | The doc's other open item (line 199). **At most one** alert still needs one — `relay_5xx`, and it needs nginx access logs rather than a metrics store. This row said "**Four** of ten (down from seven)" and was wrong in the same way the coverage table was: three of those four gained a `/api/admin/metrics` path. A cost decision about Prometheus is not what remains. |
 | **A public status page** | The doc's open item at line 202. Separate from alerting; nothing here addresses it. |
 
 **`docs/observability.md` was NOT edited.** Its open item at line 201 - "Alert
@@ -376,7 +453,7 @@ re-run with **no** shim on `PATH`, so exit codes and error text are psql's own.
 | e2 | Sink returns HTTP 500 | **exit 3**; `webhook delivery FAILED (HTTP 500)` |
 | e3 | After one delivery and two failures, the state dir holds **only** the successful key | a failed delivery did not consume the cooldown |
 | f | Stranded hold: a `reserve_probe-*` row, `-1234`, backdated 2h, wallet reduced by the same amount | **the drift query returned 0** (structurally blind, as the doc says); `check-alerts.sh` **exit 1** and fired **`stranded_hold`**, not `ledger_drift`; `hold-sweep.exe` independently reported the same hold; cleanup restored drift to 0 and left 0 probe rows |
-| g | `--list` | all 10 definitions with threshold and coverage |
+| g | `--list` | all **12** definitions with threshold and coverage (measured: the output has 11 data rows, one per `alerts.tsv` entry) |
 | h | Unknown alert id | **exit 4**, with the known ids listed |
 | i | No `psql` on PATH and no docker | **exit 3** |
 | i2 | Real `psql` failure (`DATABASE_URL` at a nonexistent database) | **exit 4**; `reconcile: psql failed (exit 2)` |

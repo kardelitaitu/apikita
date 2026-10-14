@@ -19,6 +19,28 @@ jobs:
   checks:
     runs-on: ubuntu-latest
 
+    # A JOB-LEVEL BOUND, because without one a hang costs SIX HOURS.
+    #
+    # MEASURED before adding this: the workflow had 36 steps, 30 of them a build, a test suite, a Docker
+    # build or a container smoke, and **zero** `timeout-minutes` anywhere. GitHub's default per-job
+    # timeout is 360 minutes, so one step that never returns - a `cargo test` blocked on a file lock, a
+    # `docker run` on a container that stays up, an HTTP call with no client timeout - would block every
+    # step after it and burn the whole window before failing. That is the same defect this repository
+    # writes gates against: a check whose failure mode is "never finishes" rather than "reports red".
+    #
+    # The only shell-level bound in the file was a single `timeout 20` around one container smoke.
+    #
+    # 45 IS CHOSEN FROM MEASURED WORK, not from a template. On this machine the 14 tool gates take
+    # ~150 s, `cargo test --lib` ~20 s and a warm `cargo build --tests` under 4 s; a cold CI runner adds
+    # the Rust toolchain install, two Docker image builds, `npm ci` and the website build. That is a
+    # 15-25 minute job on a clean runner, so 45 gives roughly 2x headroom for a slow day while still
+    # bounding a hang at a fraction of the 6-hour default.
+    #
+    # WHAT IT DOES NOT COVER: a step that hangs but is killed by this timeout still reports as a
+    # cancelled job rather than as a specific failing check, and the individual gates that shell out to
+    # containers have no per-step bound of their own. A job timeout is the coarse, always-present bound.
+    timeout-minutes: 45
+
     # No service container and no DATABASE_URL: SQLite is bundled, so the database
     # is a file. Nothing here needs a second process, and the test suite needs no
     # environment at all — see the integration step below.
@@ -78,6 +100,50 @@ jobs:
         working-directory: server
         run: cargo test
 
+      # THE STATED TEST COUNT, CHECKED WHERE IT IS CHEAP RATHER THAN WHERE IT IS TRUE.
+      #
+      # docs/ci-cd.md, README.md, server/README.md and the "Unit tests" step above all state the
+      # library suite's size, and website/tests/doc-counts.test.ts is what keeps those four documents
+      # agreeing with `SERVER_TESTS`. That constant has now gone stale five times - 656 vs 658, 658 vs
+      # 659, 664 vs 665, and twice at 665 vs 667 - every time because a commit added a test and did not
+      # bump the figure, and every time the four documents went on agreeing with a wrong number.
+      #
+      # The check existed, but it ran at the LAST step of this workflow, 908 lines below this one:
+      # `Website contract tests` needs `npm install` and a website build, and sits behind the server
+      # image build and two container smoke steps. So a contributor learned about a stale count minutes
+      # later, in a step whose name gives no clue that a Rust test count is what failed.
+      #
+      # `cargo test --lib -- --list` ENUMERATES the tests and EXECUTES none of them. MEASURED: 533 ms
+      # against ~130 s for the real run, and it needs no build beyond what this step's predecessor just
+      # produced. The constant is read by grep, because running the TypeScript test file here would
+      # need the Node dependencies this early step deliberately does not install.
+      #
+      # This is a FAST SIGNAL, NOT A SECOND SOURCE OF TRUTH: doc-counts.test.ts still compares the
+      # constant to the suite and to all four documents, and remains the guard. This step only moves
+      # the discovery of a stale figure 908 lines earlier, to the step whose name already says tests.
+      - name: The stated test count matches the suite
+        working-directory: server
+        run: |
+          set -euo pipefail
+
+          actual=$(cargo test --lib -- --list 2>/dev/null | sed -n 's/^\([0-9][0-9]*\) tests\?, [0-9][0-9]* benchmarks\?$/\1/p' | head -1)
+          if [ -z "$actual" ]; then
+            echo "::error::cargo test --list printed no 'N tests, M benchmarks' summary, so the stated count was not checked"
+            exit 1
+          fi
+
+          stated=$(sed -n 's/^const SERVER_TESTS = \([0-9][0-9]*\);$/\1/p' ../website/tests/doc-counts.test.ts | head -1)
+          if [ -z "$stated" ]; then
+            echo "::error::could not read SERVER_TESTS from website/tests/doc-counts.test.ts - the constant moved or was renamed, and this step cannot verify a figure it cannot find"
+            exit 1
+          fi
+
+          if [ "$stated" != "$actual" ]; then
+            echo "::error::SERVER_TESTS is $stated and the library suite has $actual tests. Bump SERVER_TESTS and the four SERVER_CLAIMS sites (README.md, server/README.md, docs/ci-cd.md, and the Unit tests count in this file) together."
+            exit 1
+          fi
+          echo "SERVER_TESTS ($stated) matches the $actual library tests"
+
       # Schema check: every migration must apply, in order, to an empty database.
       # `bin/migrate` is the mechanism the register names (`sqlx migrate`,
       # forward-only, never on application boot): it creates the file, applies the
@@ -92,25 +158,68 @@ jobs:
           rm -f ci-schema-check.db ci-schema-check.db-wal ci-schema-check.db-shm
           cargo run --bin migrate
 
+      # Schema DRIFT, not just applicability. The step above proves the migrations APPLY;
+      # this proves the shipped schema still matches the plan's Appendix A - "the plan is a
+      # lie about the database, which is worse than no plan" - and then runs 32 INVARIANT
+      # probes against the shipped migration: every table STRICT, no REAL/FLOAT column, the
+      # CHECK constraints actually refusing bad rows, FK and RESTRICT behaviour.
+      #
+      # It had never run in CI. docs/ci-cd.md:758 asked the question outright - "Whether the
+      # schema-drift check runs as a CI step or stays a local probe ... no workflow step
+      # invokes it yet". Answering it found the file had been FAILING: the plan was missing
+      # the `topups.rail` column, and because the drift check exits before the invariants,
+      # those 32 probes had never run anywhere. A red first half was hiding a whole second
+      # half.
+      - name: Validate the schema against the plan
+        run: python3 tools/sqlite-probes/validate-migration-schema.py
+
+      # THE OTHER TWO PROBES, which nothing ran - and one of them was BROKEN the whole time.
+      #
+      # docs/plans/sqlite-migration.md says to "run the probes first, before writing any Rust.
+      # They take seconds and they confirm the dialect assumptions the whole port rests on", and
+      # lists all three. CI invoked only `validate-migration-schema.py`. MEASURED on Python 3.14.5:
+      #
+      #   sqlite-port-probe.py   exit 1  AttributeError: module 'sqlite3' has no attribute 'version'
+      #   sqlite-timestamp-probe.py   exit 0
+      #
+      # `sqlite3.version` was REMOVED in Python 3.14, and the line sat in the script's own version
+      # banner - before the first probe ran - so the whole file died on its heading. Every
+      # assertion the plan cites from it was unverified by anything.
+      #
+      # AND IT WAS HIDING A SECOND FAILURE, which is the same shape as the comment above about the
+      # drift check: once the banner was fixed, `VACUUM INTO (the backup primitive)` reported
+      # `[ERROR] cannot VACUUM from within a transaction`. That was the probe forgetting to
+      # `commit()` - Python's sqlite3 opens an implied transaction before a DML statement - so the
+      # script had been saying the BACKUP PRIMITIVE does not work when it meant its own harness did
+      # not. Fixed in the probe; both now run 24 and N probes with exit 0.
+      #
+      # A red first line was again hiding a whole second half. Run all three.
+      - name: Probe the SQLite dialect assumptions the port rests on
+        run: |
+          python3 tools/sqlite-probes/sqlite-port-probe.py
+          python3 tools/sqlite-probes/sqlite-timestamp-probe.py
+
       # There is no second, `#[ignore]`d database tier any more. The database is a
       # file, so `server/src/test_support.rs` gives every database test its own
-      # migrated temp database and the money suite runs in the plain `cargo test`
-      # above — with no service container and no DATABASE_URL. Measured on
-      # `sqlite-port`: 134 passed / 0 failed / 0 ignored, without the old flag.
+      # migrated temp database and the whole suite runs with no service container
+      # and no DATABASE_URL.
       #
-      # This step runs the library suite explicitly — the invocation the port's own
-      # plan names — with the only two tests CI still cannot run named and skipped.
-      # They need a *configured* PocketBase (collections, not just a running
-      # container), which this workflow does not provide. Naming them keeps the
-      # exclusion explicit rather than leaving it to a bare `#[ignore]`:
-      #   - a_new_login_after_suspend_is_still_refused
-      #   - live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
+      # Nothing is skipped or `#[ignore]`d: the former live-PocketBase exchange
+      # test was replaced by a loopback stub, and the identity port has since
+      # deleted that route and its stub entirely, so the suite reports
+      # 803 passed / 0 failed / 0 ignored. Identity is
+      # served natively by the crate - there is no PocketBase to reach at runtime.
+      #
+      # THE FIGURE IS PINNED, not remembered. This comment carried a count dated
+      # 2026-09-30 and kept carrying it through several bumps, because the check
+      # that holds every other stated count - website/tests/doc-counts.test.ts -
+      # did not read this file. It does now. The retired number is deliberately
+      # NOT quoted here: naming it would put a stale count back into the file,
+      # and the guard that rejects retired figures elsewhere would reject it here
+      # the moment this file joins that list.
       - name: Integration tests (bundled SQLite)
         working-directory: server
-        run: >-
-          cargo test --lib
-          -- --skip a_new_login_after_suspend_is_still_refused
-          --skip live_exchange_token_returns_the_real_balance_and_stores_only_the_hash
+        run: cargo test --lib
 
       # The deployable artifact must BUILD, and it must RUN.
       #
@@ -172,8 +281,905 @@ jobs:
           # returns 200 for the wrong reason cannot pass.
           docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/health \
             | grep -q '"database":"connected"'
-          docker rm -f apikita-ci-api
-          docker volume rm apikita-ci-data
+
+          # The runtime image must not carry a PACKAGE MANAGER.
+          #
+          # server/Dockerfile states the rule in its header - "a compiler, a package
+          # manager and a shell in the final image are pure attack surface with no
+          # operational benefit" - and for a long time it was only two-thirds true: the
+          # compilers were gone, but apt/apt-get/dpkg arrive with debian:bookworm-slim and
+          # nothing removed them. The container holds provider credentials and the money
+          # database, and a local `dpkg -i` needs no network.
+          #
+          # This is a REGRESSION GUARD, not a hardening step: the removal is in the
+          # Dockerfile, and this fails if a future base change or apt-get brings them back.
+          for banned in apt apt-get dpkg; do
+            if docker exec apikita-ci-api sh -c "command -v $banned" >/dev/null 2>&1; then
+              echo "::error::the runtime image contains $banned; the Dockerfile header calls a package manager pure attack surface"
+              exit 1
+            fi
+          done
+
+          # And it must stay HEALTHY when the upstream providers are unreachable.
+          #
+          # docs/server/api-spec.md:809-811 states the rule and why: an upstream outage
+          # must not look like a dead server and trigger a restart loop. The CI container
+          # has no route to any provider either, so this is the real condition rather than
+          # a simulation - and the assertion is that a green health is the CORRECT answer
+          # here, not a symptom.
+          #
+          # The opposite direction (a broken database must report degraded) is covered by
+          # a unit test with an unreachable pool, health.rs:266, including a leak list.
+          # This step is the container-level half that a unit test cannot reach.
+          docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/health \
+            | grep -q '"status":"healthy"' \
+            || { echo "::error::health is not healthy with no upstream reachable - an upstream outage must not read as a dead server"; exit 1; }
+
+          # And the route table it serves must be the one we documented.
+          #
+          # The health poll above proves ONE endpoint. This proves the rest: every
+          # protected route must REFUSE an anonymous request with the documented error
+          # model, an unknown path must 404, and the routes the spec marks
+          # DESIGNED-NOT-BUILT must 404 rather than half-exist.
+          #
+          # A router test cannot cover this. Those drive the handler in-process and share
+          # the router - but they do not exercise the binary booting, reading its config,
+          # binding a listener, or assembling the middleware chain in main.rs. That is the
+          # seam these probes sit on, and it is the last one between the code and a
+          # customer.
+          echo "--- anonymous surface ---"
+          fail=0
+          # BusyBox wget has NO --method flag (it rejects it outright with "unrecognized
+          # option"), so GET is the default and POST is expressed with --post-data. Using
+          # --method here made every probe report "unrecognized" and would have failed the
+          # step on EVERY run - found by executing this helper against a live container
+          # rather than trusting it to be right.
+          status_of() {
+            method="$1"; path="$2"
+            if [ "$method" = "POST" ]; then
+              docker exec apikita-ci-api busybox wget -qO- --server-response \
+                --post-data="" "http://127.0.0.1:8080$path" 2>&1
+            else
+              docker exec apikita-ci-api busybox wget -qO- --server-response \
+                "http://127.0.0.1:8080$path" 2>&1
+            fi | grep -m1 '^  HTTP/' | awk '{print $2}'
+          }
+          check_route() {
+            want="$1"; method="$2"; path="$3"
+            got=$(status_of "$method" "$path")
+            if [ "$got" != "$want" ]; then
+              echo "::error::$method $path returned '$got', expected $want"
+              fail=1
+            fi
+          }
+          check_route 200 GET  /health
+          check_route 401 GET  /api/me
+          check_route 401 GET  /api/usage
+          check_route 401 GET  /api/keys
+          check_route 401 GET  /api/export
+          check_route 401 GET  /api/topups
+          # /api/telegram is registered for DELETE only, so GET is 405 - the method is
+          # wrong, which is a different fact from being unauthenticated. Asserting 401
+          # here was MY error, caught by running the helper against a live container.
+          #
+          # DELETE itself is NOT probed: BusyBox wget can send GET and POST and nothing
+          # else, so the probe cannot express it. Leaving it in asserted 405 against a
+          # 401 expectation and failed - the tool's limitation, not the server's, and a
+          # step that fails for a harness reason is worse than one that omits the case.
+          check_route 405 GET  /api/telegram
+          check_route 401 GET  /events
+          # The admin surface must refuse without a session. 401 rather than 403 is
+          # correct: the operator flag cannot be known before identity is.
+          check_route 401 GET  /api/admin/accounts
+          check_route 401 GET  /api/admin/metrics
+          check_route 401 POST /v1/chat/completions
+          # Unrouted paths are 404, not 401 - a route that does not exist must not
+          # pretend to be protected.
+          check_route 404 GET  /definitely-not-a-route
+          # The api-spec marks these four DESIGNED-NOT-BUILT. Serving them would make
+          # the spec wrong; 404 is what it claims.
+          # The rest of the mounted table. These six had NO probe: routes the server
+          # serves and the workflow never asked about. Expectations come from the CODE and
+          # the api-spec, not from the shape of the path.
+          check_route 401 GET  /api/admin/audit
+          check_route 401 GET  /api/usage/recent
+          check_route 401 POST /api/telegram/link-code
+          # LOGOUT IS INTENTIONALLY ANONYMOUS AND IDEMPOTENT. auth.rs:388-407 reads the
+          # cookie if present, revokes that session, and ALWAYS answers 204 with a cleared
+          # cookie - an unauthenticated logout is a no-op, not a leak. The api-spec table
+          # lists this group as "cookie / none", the only one that accepts no credential.
+          # A 204 here is the contract; asserting 401 would be asserting a bug.
+          check_route 204 POST /auth/logout
+          check_route 204 POST /auth/logout-all
+          # /auth/exchange was the ONE route whose status depended on an external
+          # service. The identity port deleted it along with the provider it spoke
+          # to, so it must now be an UNMOUNTED path: 404 is what pins the deletion.
+          # Asserting 422 here would assert that a route the server no longer
+          # serves still exists.
+          check_route 404 POST /auth/exchange
+
+          # EVERY error must be the documented JSON - not just "it refused".
+          #
+          # docs/error-model.md:10 promises "Every error returns the same JSON. No bare HTML
+          # error pages, no empty bodies", with a shape of error.code/message/request_id.
+          # Measured before this step existed, THREE paths returned something else: an
+          # unrouted 404 and the two DESIGNED-NOT-BUILT 404s had EMPTY bodies (axum's default,
+          # because the router had no fallback), and a malformed body on an auth verb returned
+          # axum's OWN statuses - 400 for a body that is not JSON, 422 for one whose shape does
+          # not match, 415 for a missing content type - instead of the documented error JSON.
+          #
+          # /auth/password-change is where that is now asserted, and it is the right route for
+          # it: its handler takes `Result<Json<T>, JsonRejection>` and maps the rejection
+          # itself, so those three axum responses all arrive as ONE shape. The mapping is
+          # pinned in the crate by
+          # routes::auth::tests::live_password_change_body_rejections_all_carry_the_documented_shape,
+          # which sends these same two bytes through the real router.
+          #
+          # The check asserts the SHAPE, which is what the contract is about. The `message`
+          # text may change freely; `code` and `request_id` may not.
+          # CURL FROM THE HOST, not wget from inside the container. BusyBox wget DISCARDS the
+          # body of a non-2xx response and prints "wget: server returned error: HTTP/1.1 404",
+          # so a shape check built on it sees its own client message and can never read an error
+          # body at all - it would fail on every run and report nothing useful. Measured before
+          # choosing: the same requests through curl return the JSON. The port is published
+          # below and curl is preinstalled on ubuntu-latest.
+          err_shape_ok() {
+            # $1 = method, $2 = path, $3 = optional body
+            if [ "$1" = "POST" ]; then
+              out=$(curl -s -X POST -H 'Content-Type: application/json' -d "$3" \
+                "http://127.0.0.1:18080$2" 2>&1)
+            else
+              out=$(curl -s "http://127.0.0.1:18080$2" 2>&1)
+            fi
+            case "$out" in
+              *'"code"'*) ;;
+              *) echo "::error::$1 $2 did not return the documented error shape (no code): $out"; fail=1 ;;
+            esac
+            case "$out" in
+              *'"request_id"'*) ;;
+              *) echo "::error::$1 $2 did not return a request_id: $out"; fail=1 ;;
+            esac
+          }
+          err_shape_ok GET  /definitely-not-a-route ""
+          err_shape_ok GET  /api/reviews/mine ""
+          err_shape_ok GET  /api/me ""
+          err_shape_ok GET  /api/admin/accounts ""
+          err_shape_ok POST /auth/password-change '{}'
+          err_shape_ok POST /auth/password-change '{,}'
+          err_shape_ok POST /api/reviews '{"rating":9}'
+          check_route 404 POST /api/bot/account
+          check_route 404 POST /api/bot/notify-topup
+
+          # The public reviews aggregate used to be asserted 404 here, because the review
+          # flow was bot-driven and the bot was not built. It is SERVED now: the customer's
+          # own session writes reviews and the aggregate is public, so the check is the
+          # opposite one. `average` must be JSON null rather than 0 on an empty database -
+          # "nobody has reviewed us" and "everybody gave us zero stars" are different facts
+          # and only one of them is representable in a number.
+          check_route 200 GET /api/reviews
+          out=$(curl -s "http://127.0.0.1:18080/api/reviews" 2>&1)
+          case "$out" in
+            *'"average":null'*) ;;
+            *) echo "::error::GET /api/reviews on an empty database must report a null average, got: $out"; fail=1 ;;
+          esac
+          # And the write path is session-scoped: no cookie must be 401, never a write.
+          check_route 401 POST /api/reviews
+
+          # The BOT endpoint is BUILT, and it is the one route with a different auth
+          # scheme (bot token, not cookie, not API key). It is also the endpoint
+          # docs/architecture/identity.md calls "the highest-risk endpoint in the
+          # Telegram surface": a 6-digit code is 10^6 possibilities.
+          #
+          # The property under test is ORDERING, and it is a security property rather
+          # than a status code: telegram.rs:331-335 checks the credential BEFORE the
+          # code shape, so an unauthenticated caller "learns nothing at all, not even
+          # whether their input was well formed". A refactor that swapped those two
+          # would leave every unit test green while turning the endpoint into an oracle
+          # for which codes are well formed.
+          #
+          # So the assertion is not "it refuses" - it is "it refuses IDENTICALLY".
+          bot_refusal() {
+            docker exec apikita-ci-api busybox wget -qO- --header='Content-Type: application/json' \
+              --post-data="$1" http://127.0.0.1:8080/api/bot/link 2>&1
+          }
+          bot_status() {
+            docker exec apikita-ci-api busybox wget -qO- --server-response \
+              --header='Content-Type: application/json' --post-data="$1" \
+              http://127.0.0.1:8080/api/bot/link 2>&1 \
+              | grep -m1 '^  HTTP/' | awk '{print $2}'
+          }
+          status_ok=$(bot_status '{"code":"123456"}')
+          status_bad=$(bot_status '{"code":"notacode"}')
+          if [ -z "$status_ok" ] || [ -z "$status_bad" ]; then
+            echo "::error::could not read a status from /api/bot/link (got '$status_ok' / '$status_bad')"
+            fail=1
+          elif [ "$status_ok" != "$status_bad" ]; then
+            echo "::error::/api/bot/link answers DIFFERENTLY for a well-formed and a malformed code with no credential ($status_ok vs $status_bad) - the credential must be checked before the shape"
+            fail=1
+          fi
+          body_ok=$(bot_refusal '{"code":"123456"}')
+          body_bad=$(bot_refusal '{"code":"notacode"}')
+          if [ "$body_ok" != "$body_bad" ]; then
+            echo "::error::/api/bot/link leaks the code shape in its refusal body"
+            fail=1
+          fi
+          # And the refusal must carry the documented error model, request_id included,
+          # or a client cannot report which request failed.
+          docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/api/me \
+            | grep -q '"code":"unauthenticated"' \
+            || { echo "::error::the 401 body is not the documented error model"; fail=1; }
+          docker exec apikita-ci-api busybox wget -qO- http://127.0.0.1:8080/api/me \
+            | grep -q '"request_id":"req_' \
+            || { echo "::error::the 401 body carries no request_id"; fail=1; }
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the booted binary does not serve the documented route table"
+            exit 1
+          fi
+
+          # STOP GRACEFULLY, AND TIME IT. This used to be `docker rm -f`, which sends SIGKILL - so the
+          # smoke never exercised the shutdown path at all, and the one thing it could not catch was the
+          # drain leaving connections cut.
+          #
+          # WHY THE WINDOW MATTERS. Docker sends SIGTERM, waits the grace period (default 10s), then
+          # SIGKILLs; `tini` forwards the signal but cannot extend that window. The server's drain budget
+          # is PER PHASE - the serve loop gets DRAIN_TIMEOUT and the task tracker gets it again - so the
+          # worst case is 2 x 5s = 10s, which is exactly the default grace period. docs/deployment.md now
+          # passes `--stop-timeout 30` for that reason, and this step uses the same value so the image is
+          # tested the way it is deployed.
+          #
+          # THE ASSERTION IS THE EXIT CODE, not the duration: `docker stop` returns non-zero when it has
+          # to SIGKILL after the window expires, which is precisely the regression worth failing on. A
+          # duration check would be a flaky proxy for the same thing.
+          stop_started=$(date +%s)
+          if ! docker stop --timeout 30 apikita-ci-api; then
+            echo "::error::the container did not stop within 30s and was SIGKILLed - the drain did not finish"
+            docker logs --tail 40 apikita-ci-api
+            exit 1
+          fi
+          stop_secs=$(( $(date +%s) - stop_started ))
+          echo "graceful stop took ${stop_secs}s (window 30s, drain worst case 10s)"
+
+          # The drain logs its own completion; assert it rather than inferring success from the exit code
+          # alone, so a stop that returned 0 for the wrong reason is still visible.
+          docker logs apikita-ci-api 2>&1 | grep -qiE 'drain|shutting down' \
+            || echo "::warning::no drain line in the container log; the shutdown path may not have run"
+
+          docker rm -f apikita-ci-api >/dev/null 2>&1 || true
+          # Cleanup is BEST-EFFORT and must never fail the step: the volume is
+          # scratch and a leftover one on a fresh CI runner is harmless. The
+          # `--rm` containers can hold it for a moment after they exit, so the
+          # final removal is allowed to fail.
+          docker volume rm apikita-ci-data >/dev/null 2>&1 || true
+
+
+      # The maintenance scheduler must actually RUN.
+      #
+      # This step exists because it did not, and nothing said so. `next_run_epoch`
+      # called GNU `date -u -d "today 3:00"`; the image is Alpine, so `date` is
+      # BUSYBOX date, which rejects that form with
+      #   date: invalid date 'today 3:00'
+      # The nightly loop therefore exited 2 on its FIRST iteration and Compose
+      # restart-looped it forever - the retention sweep and the Gate 2 money check
+      # could never have run. Every existing test used a ONE-SHOT verb
+      # (retention/reconcile/once), which skips `next_run_epoch` entirely, so a
+      # loop that could never execute looked exercised.
+      #
+      # So this checks BOTH halves: the loop can COMPUTE a next run (the actual
+      # bug), and the wired verbs still DO their work.
+      - name: Smoke the maintenance scheduler image
+        run: |
+          set -euo pipefail
+          docker build -f .docker/maintenance/Dockerfile -t apikita-scheduler:ci .
+
+          # The entrypoint is MOUNTED at runtime, exactly as docker-compose.yml
+          # does it - it is NOT baked into the image, so running the image without
+          # this mount would exercise nothing.
+          RUN="docker run --rm"
+          MOUNT="-v $PWD/.docker/maintenance/entrypoint.sh:/usr/local/bin/maintenance-entrypoint.sh:ro"
+          REC="-v $PWD/tools/reconcile:/usr/local/share/reconcile:ro"
+          # The alert jobs get the SAME mounts docker-compose.yml gives them. If the two
+          # sets drift apart, CI passes on a layout no deployment uses - which is how
+          # W49's three wiring faults each survived a green host check.
+          ALERT="-v $PWD/tools:/srv/apikita/tools:ro"
+          ALERT_ENV="-e ALERT_DIR=/srv/apikita/tools/alert -e ALERT_STATE_DIR=/srv/apikita/server/data/alert-state -e RELAY_HOST=nginx -e WEBHOOK_URL="
+          ENV="-e DATABASE_URL=sqlite://data/server.db -e RECONCILE_DATABASE_URL=sqlite://data/server.db -e APP_DIR=/srv/apikita"
+          EP=/usr/local/bin/maintenance-entrypoint.sh
+
+          docker volume create apikita-ci-data
+
+          # 1: the loop must compute a next run. `schedule` is a 24h loop, so run
+          # it under a timeout and require the next-run line rather than waiting.
+          timeout 20 $RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP schedule > /tmp/schedule.log 2>&1 || true
+          cat /tmp/schedule.log
+          if grep -q "could not compute the next run time" /tmp/schedule.log; then
+            echo "::error::the nightly loop cannot compute a next run time"
+            exit 1
+          fi
+          grep -q "next run in" /tmp/schedule.log || {
+            echo "::error::the nightly loop never reached its first wait"
+            exit 1
+          }
+
+          # 2: the wired verbs must still do their work. Seed the minimum schema
+          # the sweep touches plus one row PAST the window, then require the sweep
+          # to report success AND to have actually deleted it - a query that
+          # silently matches nothing (the failure mode a bare-date cutoff vs an
+          # RFC3339 timestamp would cause) is caught by the row count, not by the
+          # exit code alone.
+          $RUN -v $PWD/.docker/maintenance/ci/scheduler-smoke-seed.sql:/seed.sql:ro \
+            -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db < /seed.sql'
+
+          before=$($RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "SELECT COUNT(*) FROM usage_events;"')
+          out=$($RUN $MOUNT $REC $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP retention)
+          echo "$out"
+          echo "$out" | grep -q "job retention: OK" || {
+            echo "::error::the retention sweep did not report success"
+            exit 1
+          }
+          after=$($RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "SELECT COUNT(*) FROM usage_events;"')
+          if [ "$before" = "$after" ]; then
+            echo "::error::the sweep reported OK but deleted nothing ($before -> $after)"
+            exit 1
+          fi
+
+          # 2b: reconcile. THE ONLY WIRED JOB WITH NO SMOKE UNTIL NOW, and the worst one to
+          # leave out: it is the Gate 2 money-correctness check, the job whose whole purpose is
+          # to notice that the wallet cache and the authoritative ledger disagree.
+          #
+          # WHY IT NEEDED ONE. `run_reconcile` handed the DSN to reconcile.sh VERBATIM, and
+          # reconcile.sh resolves a relative `sqlite://` path against its CWD. The only reason
+          # it worked in production is `working_dir: /srv/apikita/server` in docker-compose.yml
+          # — a directory set in a DIFFERENT FILE. Run it anywhere else and it reports exit 6
+          # "no such database file", which this step would have seen immediately. MEASURED
+          # before the fix: exit 6 from `/` and exit 0 from `/srv/apikita/server`.
+          #
+          # TWO ASSERTIONS, because either alone is wrong. A balanced database must exit 0
+          # (the job RUNS), and a drifted one must exit NON-ZERO (the job still DETECTS). A
+          # check that cannot fail is worse than one that cannot run - it reports OK over a
+          # broken ledger, which is the failure this whole service exists to prevent.
+          out=$($RUN $MOUNT $REC $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP reconcile 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "job reconcile: OK" || {
+            echo "::error::reconcile did not report success on a balanced database - the Gate 2 money check is not running"
+            exit 1
+          }
+
+          # Inject REAL drift: the wallet cache is raised so it no longer equals the ledger
+          # total. `reconcile.sh` must name it and exit non-zero.
+          $RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "UPDATE wallets SET balance_idr = balance_idr + 500;"'
+
+          drift_rc=0
+          $RUN $MOUNT $REC $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP reconcile >/dev/null 2>&1 || drift_rc=$?
+          if [ "$drift_rc" -eq 0 ]; then
+            echo "::error::reconcile exited 0 on a database where the wallet cache disagrees with the ledger - the Gate 2 check is blind"
+            exit 1
+          fi
+          echo "reconcile detected the injected 500 IDR drift (exit $drift_rc)"
+
+          # Put the drift back: the alert and credit-expiry steps after this one assume a
+          # consistent database, and leaving it broken would make THEIR failures meaningless.
+          $RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "UPDATE wallets SET balance_idr = balance_idr - 500;"'
+          $RUN $MOUNT $REC $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP reconcile 2>&1 | grep -q "job reconcile: OK" || {
+            echo "::error::reconcile did not return to OK after the injected drift was removed - the later steps would be running against a database this one broke"
+            exit 1
+          }
+
+          # 3: hold-sweep. THE gap this step exists for: a stranded reservation hold
+          # is INVISIBLE MONEY - the ledger balances and reconcile.sh is structurally
+          # blind to it - so the scheduler must actually detect one, not merely claim to.
+          #
+          # The fixture seeds BOTH a stranded hold and a HEALTHY (paired) reservation.
+          # The distinction is the test: a detector that fires on both is noise, and one
+          # that fires on neither is absent.
+          $RUN -v $PWD/.docker/maintenance/ci/hold-sweep-smoke-seed.sql:/seed.sql:ro \
+            -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c "sqlite3 /srv/apikita/server/data/server.db < /seed.sql"
+
+          out=$($RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP hold-sweep 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "job hold-sweep: ALERT" || {
+            echo "::error::hold-sweep did not detect the seeded stranded hold"
+            exit 1
+          }
+          echo "$out" | grep -q "reserve_stranded" || {
+            echo "::error::hold-sweep did not NAME the stranded ref; a count nobody can act on is half an alert"
+            exit 1
+          }
+          # The HEALTHY reservation must NOT be reported, or the detector fires on
+          # normal operation.
+          if echo "$out" | grep -q "reserve_healthy"; then
+            echo "::error::hold-sweep reported a HEALTHY paired reservation as stranded"
+            exit 1
+          fi
+          # Exit non-zero when it found something: the scheduler must FAIL, not
+          # report a clean sheet over unaccounted money.
+          rc=0
+          $RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP hold-sweep >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::hold-sweep exited 0 while a stranded hold was present"
+            exit 1
+          fi
+          # And the banner must say it is WIRED - a stale banner is how the previous
+          # gap survived: the loop was broken and every test used a verb that skipped it.
+          $RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP hold-sweep 2>&1 \
+            | grep -q "WIRED     hold-sweep" || {
+            echo "::error::the startup banner does not report hold-sweep as WIRED"
+            exit 1
+          }
+
+          # 4: credit-expiry. THE JOB THAT MOVES MONEY, and it was added to this schedule
+          # without a line here.
+          #
+          # WHY IT NEEDS A CONTAINER TEST SPECIFICALLY. The job runs `db::expire_credit` from a
+          # binary rather than inline SQL, and the binary has to be REACHABLE FROM INSIDE THIS
+          # IMAGE. It was built into the SERVER image, which is a different image - so the job
+          # existed, the Dockerfile built the runner, and the scheduler could not see it. The
+          # banner would have said NOT WIRED every night in production while every host-side
+          # check passed, because on the host the path resolves. That is the same
+          # container-integration seam the alert-jobs step below exists for.
+          #
+          # The fixture settles a deposit whose credit_expires_at is in the PAST, balancing the
+          # wallet with its own funding ledger row so the Gate 2 comparison means something.
+          # Three things are required: the job reports OK, the MONEY ACTUALLY MOVED (balance
+          # down, credit_retired_at set), and the ledger invariant still holds - a sweep that
+          # debits without a ledger row would balance nothing.
+          $RUN -v $PWD/.docker/maintenance/ci/credit-expiry-smoke-seed.sql:/seed.sql:ro \
+            -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db < /seed.sql'
+
+          out=$($RUN $MOUNT $ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP credit-expiry 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "job credit-expiry: OK" || {
+            echo "::error::the credit-expiry job did not report success - the sweep behind a published term did not run"
+            exit 1
+          }
+          echo "$out" | grep -q "WIRED     credit-expiry" || {
+            echo "::error::the startup banner does not report credit-expiry as WIRED, so the runner is not reachable from this image"
+            exit 1
+          }
+          echo "$out" | grep -q "deposits_expired=1" || {
+            echo "::error::credit-expiry ran but expired nothing; the seeded deposit was past its instant, so a zero here means the sweep is not seeing it"
+            exit 1
+          }
+
+          # The three facts as three COLUMNS, joined by `-separator`. Written this way rather
+          # than with SQL string literals because the `-c` wrapper already spends both quote
+          # characters: `"/"` inside is an IDENTIFIER to SQLite, not a string, and the query
+          # fails with `no such column: "/"`. MEASURED while writing this - the first version
+          # did exactly that, and a failing query reads as "the sweep did not work".
+          after=$($RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 -separator / /srv/apikita/server/data/server.db \
+                "SELECT (SELECT balance_idr FROM wallets), (SELECT COALESCE(SUM(delta_idr),0) FROM ledger), (SELECT CASE WHEN credit_retired_at IS NULL THEN 0 ELSE 1 END FROM topups);"')
+          echo "credit-expiry result (balance/ledger/retired-0-or-1): $after"
+          if [ "$after" != "0/0/1" ]; then
+            echo "::error::credit-expiry did not retire the credit as the terms promise: expected 0/0/1 (balance/ledger/retired), got $after. A debit without its ledger row would break the Gate 2 invariant, and an untouched balance would mean the term is still not applied."
+            exit 1
+          fi
+
+          # 4: the ALERT jobs. Added in W48/W49 and exercised by nothing until now.
+          #
+          # WHY THIS IS THE RIGHT PLACE AND NOT A NEW STEP. The host-side
+          # `alert-check` validates the transport and is thorough, but every actual
+          # failure in these jobs was a CONTAINER-INTEGRATION seam that CANNOT occur on
+          # the host: on the host the paths resolve and 127.0.0.1 is real. Three of
+          # them were found by hand - a false api_down against the container's own
+          # loopback, check-alerts.sh resolving its sibling through $SCRIPT_DIR/../..,
+          # and the DATABASE_URL vs RECONCILE_DATABASE_URL split. A green host check
+          # was true in all three cases. So this asserts the wiring, in the container,
+          # with the compose mounts.
+          #
+          # The database is left as step 3 seeded it, which is enough: these jobs must
+          # reach a VERDICT, and the failure being guarded is a wiring error that stops
+          # them before any verdict is possible.
+
+          # 4a: the database-backed checks must RUN, not crash on a missing mount.
+          out=$($RUN $MOUNT $REC $ALERT $ENV $ALERT_ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP alerts 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "job alerts: start" || {
+            echo "::error::the alerts job never started - the alert mounts are missing from this step"
+            exit 1
+          }
+          # A verdict, not a crash. NOT RUN is the exit-6 path ("a check that could not
+          # run is not a check that passed"), and it is exactly what a bad mount produces.
+          if echo "$out" | grep -q "job alerts: NOT RUN"; then
+            echo "::error::the alerts job could not reach a verdict - check-alerts.sh ran but something it needs is not mounted"
+            exit 1
+          fi
+          echo "$out" | grep -q "check-alerts: OK\|check-alerts: ALERT\|job alerts: CLEAN\|job alerts: FIRED" || {
+            echo "::error::the alerts job produced no recognisable verdict"
+            exit 1
+          }
+          # The run must not claim a channel it does not have: WEBHOOK_URL is EMPTY here.
+          echo "$out" | grep -q "NO CHANNEL IS CONFIGURED" || {
+            echo "::error::with no channel configured the run must SAY so - an unmonitored stack reported as monitored is the W52 defect"
+            exit 1
+          }
+
+          # 4b: the HTTP probes. THE assertion is the one W49 got wrong.
+          #
+          # probe.sh defaults PROBE_API_URL to 127.0.0.1:8080, which INSIDE a container
+          # is its own loopback: nothing is listening, so an unselected check fires a
+          # FALSE api_down and the job exits non-zero every night. W49 measured exactly
+          # that. So with PROBE_API_URL unset the check must be SKIPPED AND NAMED, and
+          # a blanket api_down alert is a regression.
+          out=$($RUN $MOUNT $REC $ALERT $ENV $ALERT_ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP alert-probes 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "job alert-probes: start" || {
+            echo "::error::the alert-probes job never started"
+            exit 1
+          }
+          echo "$out" | grep -q "SKIPPED - api_down" || {
+            echo "::error::api_down was not explicitly skipped - with PROBE_API_URL unset, probe.sh falls back to the container loopback and fires a false breach (W49)"
+            exit 1
+          }
+          if echo "$out" | grep -q "ALERT api_down"; then
+            echo "::error::api_down FIRED with no PROBE_API_URL set - that is the false alarm W49 fixed, aimed at the container's own loopback"
+            exit 1
+          fi
+          # relay_down IS selected, and with no relay on this network it must report the
+          # failure rather than pass. A probe that cannot fail is not a probe.
+          echo "$out" | grep -q "relay_down enabled" || {
+            echo "::error::relay_down was not selected - the relay check is the one that CAN run here"
+            exit 1
+          }
+
+          # 5: `once`, THE COMBINED RUN, which nothing drove.
+          #
+          # Every step above drives ONE verb. `once` is different: it calls `run_wired_jobs`, which
+          # runs six jobs in sequence and returns non-zero if ANY of them failed. The README states
+          # the contract at .docker/maintenance/README.md:214 - "`once` and the individual verbs exit
+          # non-zero if any wired job failed, so this service can gate CI the same way
+          # tools/reconcile/reconcile.sh does" - and MEASURED, no automation ran it: the only
+          # references were a hand-recorded results table (README rows d/e/n/o) and a STATIC grep in
+          # tools/alert-check/check.sh that reads `run_wired_jobs`'s TEXT to confirm it schedules
+          # run_alert_checks. Neither executes the composition.
+          #
+          # WHAT THAT LEAVES UNTESTED is the part only the composition has:
+          #   - `run_retention || rc=1` accumulates rather than aborting, so a failure in an EARLY
+          #     job must still let the LATER ones run. An `|| exit 1` here would silently skip the
+          #     money check whenever retention failed - the failure mode where the sweep that
+          #     matters most is the one that stops being reported.
+          #   - the AGGREGATE exit code. Six jobs, one status: a `return 0` anywhere loses every
+          #     other job's verdict, and this service gates on that status.
+          #
+          # Both are asserted below with REAL drift, not a mocked failure.
+          echo "== once: the combined run, on a consistent database =="
+          once_ok=0
+          out=$($RUN $MOUNT $REC $ALERT $ENV $ALERT_ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP once 2>&1) || once_ok=$?
+          echo "$out"
+          if [ "$once_ok" -ne 0 ]; then
+            echo "::error::'once' exited $once_ok on a database every individual verb passed on. The combined run must succeed where its parts do."
+            exit 1
+          fi
+          # ALL SIX must appear. A `once` that ran three jobs and returned 0 would satisfy the
+          # exit-code check above, so the jobs are counted by name.
+          for job in retention reconcile hold-sweep credit-expiry alerts alert-probes; do
+            echo "$out" | grep -q "job $job: " || {
+              echo "::error::'once' never reached 'job $job' - run_wired_jobs runs six jobs and this run reported fewer, so a later job is unreachable behind an earlier one"
+              exit 1
+            }
+          done
+
+          # Now inject drift and require TWO things of the same run: a NON-ZERO exit, and the
+          # LATER jobs still reporting. The second is the accumulation property - an early `exit`
+          # would leave `alerts` and `alert-probes` unrun, which the loop above cannot see because
+          # this run is expected to fail.
+          $RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "UPDATE wallets SET balance_idr = balance_idr + 500;"'
+
+          once_rc=0
+          out=$($RUN $MOUNT $REC $ALERT $ENV $ALERT_ENV -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci $EP once 2>&1) || once_rc=$?
+          echo "$out"
+          if [ "$once_rc" -eq 0 ]; then
+            echo "::error::'once' exited 0 with injected ledger drift. The README promises it exits non-zero if ANY wired job failed, and reconcile is one of those jobs - a combined run that reports success over a failed money check is worse than no combined run at all."
+            exit 1
+          fi
+          # THE ACCUMULATION PROPERTY. reconcile failed, and the three jobs AFTER it must still have
+          # run. `run_reconcile || rc=1` continues; `run_reconcile || exit 1` does not, and the
+          # difference is invisible to the exit code alone.
+          for job in hold-sweep credit-expiry alert-probes; do
+            echo "$out" | grep -q "job $job: " || {
+              echo "::error::'once' stopped at reconcile (job $job never reported). A failing job must not abort the run - the jobs after it include the alert path, and a scheduler that goes silent precisely when something is wrong is the failure this service exists to prevent."
+              exit 1
+            }
+          done
+          # The failure must be NAMED, not merely counted: the aggregate exit says something broke,
+          # and only the job's own line says what.
+          echo "$out" | grep -q "job reconcile: FAILED" || {
+            echo "::error::'once' exited non-zero without naming the failing job - an operator has a status and no cause"
+            exit 1
+          }
+
+          # Put the drift back, so the cleanup below and anything after it see a consistent volume.
+          $RUN -v apikita-ci-data:/srv/apikita/server/data \
+            --entrypoint /bin/sh apikita-scheduler:ci \
+            -c 'sqlite3 /srv/apikita/server/data/server.db "UPDATE wallets SET balance_idr = balance_idr - 500;"'
+
+          # Cleanup is BEST-EFFORT and must NEVER fail the step. The volume is
+          # scratch, and the daemon can still hold it for a moment after the
+          # `--rm` containers exit, so the removal is allowed to fail.
+          docker volume rm apikita-ci-data >/dev/null 2>&1 || true
+
+# The edge relay must actually STREAM SSE.
+      #
+      # docs/edge-relay.md:110 - "A relay that buffers SSE is worse than no relay -
+      # the UI silently stops updating." The failure answers 200 and looks connected,
+      # so nothing else in this workflow would notice. Nothing looked at relay.conf
+      # at all before this step.
+      #
+      # BOTH halves run: the text check (are the directives present on both streaming
+      # locations) and the behavioural one (do they DO what the doc claims). A typo in
+      # a directive name passes a grep and still buffers, so they are different
+      # failures and both matter.
+      - name: Check the edge relay streams SSE
+        run: |
+          set -euo pipefail
+          sh tools/relay-check/check.sh
+          sh tools/relay-check/behaviour.sh
+
+      # The deployment definition must parse AND hold its documented invariants.
+      #
+      # docker-compose.yml is the file a new operator reads first and `docker compose
+      # up -d` obeys, and nothing validated it before this step. Its comments state
+      # several invariants as LOAD-BEARING - the scheduler working_dir (any other value
+      # makes the Gate 2 money check silently run against nothing), two DSNs that must
+      # stay separate, a data mount that must NOT be read-only, the relay config mounted
+      # where nginx actually reads it. A config that parses can still be wrong in ways
+      # that fail at 03:00 rather than at review time.
+      - name: Check the compose deployment definition
+        run: sh tools/compose-check/check.sh
+
+      # The backup tool must actually deliver the artifact OFFSITE.
+      #
+      # It had no CI coverage, and running it found a real defect: the offsite hook was
+      # invoked so that a SCRIPT hook received NOTHING while the backup reported
+      # success and exited 0. The one outcome the tool exists to prevent - a backup
+      # that never left the machine - was reachable through the ordinary hook shape.
+      #
+      # It was invisible because the README example used the INLINE form, which worked.
+      - name: Check the backup contract
+        run: sh tools/backup-check/check.sh
+
+      # The Gate 2 money check must actually RUN and actually FAIL on drift.
+      #
+      # docs/launch-checklist.md:277 calls tools/reconcile/reconcile.sh "the single best
+      # guard against silently wrong money". It was MOUNTED into the scheduler smoke and
+      # thus reachable - which is why a path grep found it and it looked covered - but no
+      # step ever RAN it. A mounted tool is not a run tool.
+      #
+      # The check proves the direction that matters: a drifted wallet/ledger fails AND
+      # names the account, while a consistent one passes. Mutation-tested against the SQL.
+      - name: Check the reconciliation gate
+        run: sh tools/reconcile-check/check.sh
+
+      # The restore drill must refuse every live-looking target BEFORE deleting anything.
+      #
+      # The drill DELETES a scratch database as part of teardown, and its safety guard is
+      # the only thing between that and production. docs/launch-checklist.md:279 says an
+      # untested backup is a belief - and the tool that produces the restore evidence was
+      # covered by nothing in CI.
+      #
+      # Both directions are asserted: the guard refuses and touches nothing, a consistent
+      # source drills to PASS, and a drifted one FAILS.
+      - name: Check the restore drill
+        run: sh tools/drill-check/check.sh
+
+      # The ROLLBACK drill must refuse live-looking targets, must FAIL on a deliberately
+      # wrong schema version, and must exit 8 - not 0 - when the bad migration it applies
+      # damages nothing a check can see.
+      #
+      # The restore drill proves a BACKUP restores. It restores a matched source/artifact
+      # pair, so it cannot show the thing a rollback depends on: that a snapshot taken
+      # BEFORE a migration still yields a usable database AFTER that migration went wrong,
+      # on the schema the old binary expects. That is the whole content of the last
+      # rollback row in docs/ci-cd.md, and until this tool existed nothing exercised it.
+      #
+      # Its check is honest about its own limits: read the KNOWN-UNCOVERED block at the top
+      # of check.sh. Four of the drill's assertions are covered by reading, not by this
+      # step, and saying so is the point - a check whose README implied total coverage
+      # would be the defect these directories exist to catch.
+      - name: Check the rollback drill
+        run: sh tools/rollback-check/check.sh
+
+      # The alert tool must DELIVER, and must not silence its own retry.
+      #
+      # Every other gate detects a problem; this one has to tell someone. It had no CI
+      # coverage, and its contract has deliberate distinctions a tidy-up can collapse:
+      # a throttled alert is exit 1 NOT 0, and the cooldown is recorded only AFTER the
+      # channel accepted - otherwise a failed delivery silences that incident for the
+      # whole window and nothing says so.
+      #
+      # The ordering property is tested by attempting twice against a failing channel and
+      # asserting BOTH attempts were made. Hermetic: the file channel, no network.
+      - name: Check the alert delivery contract
+        run: sh tools/alert-check/check.sh
+
+      # The wind-down payout report must classify, divide and REFUSE correctly.
+      #
+      # It is the read-only half of the closure runbook, and every number it prints is a
+      # number an operator will act on by hand - there is no treasury and no automation
+      # downstream to catch a mistake. Three distinctions a tidy-up can collapse:
+      # the payout threshold is STRICTLY greater (a balance of exactly 2x the frozen rate
+      # is sub-threshold), stablecoin units FLOOR rather than round, and the frozen rate
+      # must be SUPPLIED - looking it up live at closure would price the runbook against a
+      # rate that has moved since the decision to close.
+      #
+      # The check asserts each refusal returns its OWN exit code, because a detector that
+      # cannot fail is not a detector. It runs against a scratch database and verifies the
+      # report leaves that database byte-identical.
+      - name: Check the wind-down payout report
+        run: sh tools/wind-down-check/check.sh
+
+      # EVERY NUMBER A DOCUMENT STATES ABOUT THE CODE MUST BE THE NUMBER THE CODE HAS.
+      #
+      # docs/benchmark.md published a capacity figure of "connection pool size = 10" and a pass
+      # criterion built on it, while `db::POOL_MAX_CONNECTIONS` is 8. MEASURED: no commit has ever
+      # shipped 10, so the figure was never true and the criterion was never achievable.
+      #
+      # Nothing compared them and nothing could. The citation guard over docs/ checks LINE
+      # references; benchmark.md is excluded from it by a triage reason about CITATIONS ("a record
+      # of one measurement, not a contract"), so its numbers were unread for a different reason that
+      # the triage reason does not cover. The nearest guard couples that document to the benchmark
+      # BINARY's CLI, not to the config. The digit had no owner.
+      #
+      # The sweep reads every markdown file under docs/ for `<config_key> = <number>` and
+      # `<CONSTANT> = <number>`, and compares against config/apikita.toml and the server's `pub
+      # const`s. It has a floor (8 comparable statements, measured 10) because it also has a filter
+      # for statements about NON-SHIPPED settings - `config.rs` reads 0 as "off" for two keys, and
+      # three documents state `<key> = 0` while describing exactly that. A filter can hide a class of
+      # row, so a scan that finds too few FAILS rather than passing quietly.
+      - name: Check the figures the documents state
+        run: sh tools/doc-figures/check.sh
+
+      # THE SHELL CONSTRUCTS THAT DESTROY A MEASUREMENT.
+      #
+      # Three were made in this repository while writing guards, and each meant the guard could not
+      # fail:
+      #
+      #   `OUT=$(detector | tail -1)`   $? is tail's, so a non-zero detector reads as success.
+      #                                 MEASURED: reconcile.sh exits 6 for a missing database and
+      #                                 `... | tail -1` reports 0.
+      #   `... | while read; do F=1`    the loop is a subshell, so the flag is lost. The message
+      #                                 still prints, which is what makes it look like it worked.
+      #   `set -e`                      every gate runs detectors whose non-zero exit IS the
+      #                                 finding. MEASURED: adding -e aborts three gates on a CLEAN
+      #                                 tree.
+      #
+      # It does NOT flag the five correct pipelined captures already in tools/ - the rule is not
+      # "did it discard the exit code" but "is the captured value validated before it is trusted",
+      # and each of the five is, by name, with its validation asserted so deleting one fails.
+      - name: Check the shell hazards that destroy a measurement
+        run: sh tools/shell-hazards/check.sh
+
+      # EVERY GATE MUST BE ABLE TO SKIP LOUDLY.
+      #
+      # A gate that needs an optional tool and returns 0 when it is absent reports PASS on a machine that
+      # verified nothing - the failure mode this repository's whole tooling arrangement exists to avoid.
+      #
+      # MEASURED: `sqlite-probes-check` did exactly that. Its message said "SKIPPED - python3 is not on
+      # PATH, so nothing was verified" and then `exit 0`. On a runner without python3, fourteen gates would
+      # go green while the SQLite probes never ran. It was the ONLY gate in the repo in that position; the
+      # other thirteen exit 3. Fixed to exit 3, and this step is what keeps a new gate from repeating it.
+      #
+      # It also asserts every gate documents its exit codes and its usage, so a verdict can be acted on.
+      - name: Check that every gate can skip loudly
+        run: sh tools/mutation-check/check.sh
+
+      # EVERY `[PASS]` THE BENCHMARK PRINTS MUST BE EARNED.
+      #
+      # MEASURED over two rounds: three of its four scenarios printed `[PASS]` from a fixed string
+      # that no measurement could change. Scenario 3 printed it beside `Success Rate: 37.76%`, against
+      # a documented target of `>= 99.9%`, and would have printed it at 0%. Scenario 4's `{}` was the
+      # scenario's INPUT, not its result. And `Estimated Socket RAM` was `(concurrency * 35) / 1024` -
+      # arithmetic on two constants, where `35` is the document's own PASS CRITERION, printed as a
+      # passing reading.
+      #
+      # WHY A GATE: the binary has NO test coverage, and the only check coupling it to anything reads
+      # its CLI rather than its output, so three of four scenarios drifted with nothing watching.
+      #
+      # WHAT IT DOES NOT CATCH, because the tool was falsified against its own subject: a threshold
+      # changed to a vacuous one (`>= 10000` to `>= 0`) still looks like a comparison, and an `else`
+      # arm made UNREACHABLE is missed when that arm's verdict carries its value - rule 1 is satisfied
+      # by the interpolation. The distinction is the point: this catches a verdict that cannot CHANGE,
+      # not one that can change but can no longer be reported. Reachability is a different defect.
+      #
+      # It catches the shape that actually occurred three times: a verdict with no value and no branch.
+      - name: Check the benchmark verdicts are earned
+        run: sh tools/benchmark-verdicts/check.sh
+
+      # THE LOAD TEST'S VERDICTS MUST BE EARNED, AND ITS CALIBRATION MUST WORK.
+      #
+      # `docs/benchmark.md` publishes six metrics-matrix rows and TWO were owned by nothing:
+      # Key Validation Latency (p99) <= 1.5 ms, and CPU Saturation at 200 req/s <= 40%. The
+      # in-process benchmark binary cannot produce either - it has no HTTP client, no latency
+      # histogram and no RSS/CPU sampling - and the document's own section 4 says so about
+      # itself: "these numbers are not a load test and must not be quoted as one." So two
+      # PUBLISHED bars had no owner. That is the same defect class as the `max_connections = 10`
+      # figure this repository already records: not a wrong number, a number nobody measured.
+      #
+      # `tools/loadtest/` is the owner. This step gates it, and it RUNS code rather than reading
+      # it - which is the difference from the step above, and the reason for a second gate.
+      # MEASURED: the first pid sampler built for the harness was rejected by the Windows
+      # PowerShell parser and returned null from every call, which the harness reports
+      # downstream as "[NO DATA] the server process was never sampled" - for a healthy server,
+      # forever, on every run. It would have passed any source-shape check ever written. So this
+      # spawns a process that burns CPU and requires the sampler to observe the burn.
+      #
+      # The verdicts are FALSIFIED here rather than trusted: each is called with a measurement
+      # inside its bar and one outside it, and required to change kind, in BOTH directions - a
+      # verdict pinned to PASS and a verdict pinned to FAIL are the same defect with the sign
+      # flipped. MEASURED, ten mutations, all caught; the list is in the README beside the tool.
+      - name: Check the load test verdicts and calibration
+        run: sh tools/loadtest-check/check.sh
+
+      # The two fake services do what their READMEs say.
+      #
+      # fake-upstream publishes a six-row failure-injection table and fake-midtrans claims to compute the
+      # Midtrans signature "exactly the way the server does" - both are contracts that nothing executed.
+      # The last three gate defects found in this repository were all in tooling CI never ran, so these
+      # are run rather than read: the injection rows against a live instance, and the signature against
+      # the server's own pinned vector (server/src/money.rs).
+      # MEASURED against six mutations - a fail branch returning 200, a midstream cut removed, the
+      # signature's field order swapped, and three payload/signed-field drift shapes - all caught.
+      #
+      # RUN LIKE EVERY OTHER GATE. This step used to call `node tools/fake-check/fake-check.js` directly,
+      # which made it the only one of 16 CI checks not reachable through a `check.sh` - and so the only one
+      # outside the contract every other gate documents (Usage, an Exit line, a loud exit 3 when a required
+      # tool is absent) and outside `mutation-check`'s audit of exactly that shape. MEASURED, not assumed:
+      # 16 invocations, 15 via check.sh, this one raw.
+      - name: Check the fake upstream and payment tools
+        run: sh tools/fake-check/check.sh
+
+      # The probes behind a SHIPPED plan still run and still measure what the plan cites.
+      #
+      # docs/plans/sqlite-migration.md cites tools/sqlite-probes/ as the evidence for the whole SQLite
+      # port, and the port is shipped. Nothing re-ran them. MEASURED: the suite's banner printed the
+      # SQLite version and NOTHING checked it, while the plan requires >= 3.37 for the STRICT clause all
+      # 24 tables carry - so a host with an older library would run every probe green and then fail to
+      # create the first table.
+      #
+      # The plan calls STRICT "the single most important line in this appendix"; there was no STRICT
+      # probe. Four were added, and the gate names them so they cannot be removed quietly.
+      # MEASURED against three provocations - the STRICT probes dropped, a probe deleted, a probe made to
+      # crash - all caught.
+      - name: Check the SQLite probes behind the migration plan
+        run: sh tools/sqlite-probes-check/check.sh
+
+      # The CI document must describe the pipeline that actually runs.
+      #
+      # docs/ci-cd.md listed TEN stages while the workflow ran TWENTY-SIX: the seven
+      # tool-contract checks above were absent from the one document a reader consults to
+      # answer "what will stop my PR?". An understated pipeline teaches people to work
+      # around CI, so the table is checked rather than trusted.
+      - name: Check the CI documentation
+        run: sh tools/ci-docs-check/check.sh
 
       - name: Install website dependencies
         working-directory: website
@@ -185,13 +1191,71 @@ jobs:
         working-directory: website
         run: npx --yes -p typescript@5.6 tsc --noEmit -p tsconfig.json
 
-      - name: Website contract tests
-        working-directory: website
-        run: node --test 'tests/**/*.test.ts'
-
+      # THE BUILD COMES FIRST, and the order is load-bearing rather than tidiness.
+      #
+      # The contract tests read SOURCE - signup.astro, the .ts libs - and that is most of what they are
+      # for. But one of them, `tests/built-output.test.ts`, reads the RENDERED pages under
+      # `website/dist`, because a claim can hold in source and fail in output: `landing-claims.test.ts`
+      # pins the cross-border disclosure ABOVE the signup submit control by reading bytes of
+      # signup.astro, and a layout change can render that block below the button while the source
+      # assertion stays green.
+      #
+      # MEASURED: with the tests before the build, `dist/` does not exist yet, so that test reported
+      # ONE SKIP on every CI run and verified nothing. A guard that skips forever is the failure mode
+      # this repository writes checks against - it looks like a green tick in the summary. Running the
+      # build first turns the skip into a real assertion: 204 passed + 1 skipped becomes 205 passed.
+      #
+      # The cost is one build - about four seconds - and the build does not read the tests, so nothing
+      # else about the job moves. The build is also allowed to fail here for the same reason it did
+      # before: a site that does not compile is not deployable.
       - name: Build website
         working-directory: website
         run: npm run build
+
+      # THE SKIPS ARE COUNTED, because a skip is a green tick over an assertion that did not run.
+      #
+      # MEASURED, in this exact step: with `website/dist` present the run reports
+      # `# pass 211 / # skipped 0`, and with it ABSENT the run reports `# pass 210 / # skipped 1` -
+      # and BOTH exit 0. `node --test` does not fail on a skip, so "the rendered pages were verified"
+      # and "nothing was verified" produce the same exit code and the same green tick.
+      #
+      # Round 66 fixed the ORDER (`Build website` before this step) so that `dist/` exists, and
+      # tools/ci-docs-check/check.sh now pins that pair in both files. But that guard only holds the
+      # order; it cannot see whether the skip happened anyway - because of a build that produced no
+      # `dist/`, an `outDir` change in astro.config.mjs, or a new skip added to another test file.
+      # Before this step, nothing in this workflow read the skipped count at all: `git grep -F
+      # 'skipped 0'` matched no tool, no workflow line, and no test.
+      #
+      # So this asserts the FLOOR: zero skips, zero failures. It is deliberately not a count of
+      # PASSES - that figure lives in website/tests/doc-counts.test.ts, which sums to 211 - because a
+      # second copy of a count here would be the hand-kept figure this repository has had to re-bump
+      # five times. "Nothing was skipped" is stable under adding tests; "N passed" is not.
+      - name: Website contract tests
+        working-directory: website
+        run: |
+          set -euo pipefail
+          node --test 'tests/**/*.test.ts' 2>&1 | tee /tmp/website-tests.log
+
+          skipped=$(sed -n 's/^# skipped \([0-9][0-9]*\)$/\1/p' /tmp/website-tests.log | tail -1)
+          failed=$(sed -n 's/^# fail \([0-9][0-9]*\)$/\1/p' /tmp/website-tests.log | tail -1)
+
+          # A summary that could not be read is not a pass - the same fail-closed rule the count check
+          # above follows. `node --test` always prints these lines, so an empty read means the output
+          # shape changed and this guard no longer measures anything.
+          if [ -z "$skipped" ] || [ -z "$failed" ]; then
+            echo "::error::could not read the '# skipped' / '# fail' summary from the test output, so the skip count was NOT verified. The output shape changed; fix this guard rather than deleting it."
+            exit 1
+          fi
+
+          if [ "$failed" != "0" ]; then
+            echo "::error::$failed website contract tests failed"
+            exit 1
+          fi
+          if [ "$skipped" != "0" ]; then
+            echo "::error::$skipped website contract test(s) SKIPPED. A skip reports as a pass and verifies nothing - built-output.test.ts skips without website/dist, and doc-counts.test.ts skips without cargo. Run the same command locally to see which, and fix the cause instead of accepting the tick."
+            exit 1
+          fi
+          echo "website contract tests: 0 failed, 0 skipped"
 
       # A floor, not a full scanner: enough to catch the two mistakes that reach
       # history most often. docs/ci-cd.md leaves the tool open.

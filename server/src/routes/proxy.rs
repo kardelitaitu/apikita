@@ -1,3 +1,21 @@
+#![cfg_attr(
+    not(test),
+    // THE STREAMING HOT PATH, and the module where the fence has been worth the most.
+    //
+    // Everything money-shaped happens downstream of this file, but two of its own
+    // counters GATE ACCESS directly: the per-key rate window decides whether a
+    // request is served at all, and the cache generation decides whether an
+    // in-flight read may write its result back. Both were plain `+=`, and both
+    // wrap in a release build - which for a ceiling is the permissive direction, the
+    // failure shape this repository treats as worst. They now saturate, so a
+    // wrapped counter cannot hand out a fresh allowance or resurrect a stale entry.
+    //
+    // It is not free here: six sites, and the two counters above are the reason the
+    // fence was worth installing rather than merely tidy. The remaining four carry
+    // written arguments.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, State},
@@ -6,7 +24,7 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -15,7 +33,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
 use crate::config::AppConfig;
@@ -52,6 +69,13 @@ pub struct AppState {
     /// `resolve_client_ip` for why an untrusted peer's forwarded header is
     /// ignored rather than believed.
     pub trusted_proxies: Arc<[IpCidr]>,
+    /// Counts the detached tasks a graceful shutdown must wait for.
+    ///
+    /// Every money-path `tokio::spawn` in this module registers here, because
+    /// `with_graceful_shutdown` drains CONNECTIONS and a detached task is owned by the runtime, not by
+    /// the connection that started it. See `crate::shutdown` for the full reasoning and for what this
+    /// does NOT close.
+    pub tasks: Arc<crate::shutdown::TaskTracker>,
 }
 
 /// Records which address a served request came from, against the key that
@@ -73,7 +97,12 @@ fn record_request_source(state: &AppState, key_id: Uuid, peer: SocketAddr, heade
     let hash = ip_hash(&state.ip_salt.salt_for_day(day), &ip);
 
     let pool = state.pool.clone();
+    // Counted, so a shutdown waits for the signal write rather than losing it. The comment above says
+    // losing one is recoverable - true - but "recoverable" and "fine to drop on every deploy" are
+    // different claims, and the deploy is the common case.
+    let guard = state.tasks.begin();
     tokio::spawn(async move {
+        let _guard = guard;
         if let Err(err) = record_key_ip(&pool, key_id, day, &hash).await {
             warn!(key_id = %key_id, error = %err, "Could not record the request source");
         }
@@ -109,6 +138,14 @@ struct ReservationGuard {
     reservation_ref: String,
     model: String,
     defused: bool,
+    /// So the fire-and-forget release this guard spawns in `Drop` is still counted by the shutdown
+    /// drain. `Drop` cannot reach `AppState`, so the tracker travels with the hold that needs it.
+    ///
+    /// OPTIONAL, and that is deliberate rather than lazy. Fourteen call sites construct this guard -
+    /// one production and thirteen in tests - and threading a tracker through all of them would make
+    /// every test construct something it does not assert on. `None` means "nobody is draining", which
+    /// is exactly true of a test, and the release still runs; only the COUNTING is skipped.
+    tasks: Option<Arc<crate::shutdown::TaskTracker>>,
 }
 
 impl ReservationGuard {
@@ -126,7 +163,14 @@ impl ReservationGuard {
             reservation_ref: reservation_ref.to_string(),
             model: model.to_string(),
             defused: false,
+            tasks: None,
         }
+    }
+
+    /// Attach the shutdown tracker, so a drain waits for this guard's release.
+    fn tracked_by(mut self, tasks: &Arc<crate::shutdown::TaskTracker>) -> Self {
+        self.tasks = Some(Arc::clone(tasks));
+        self
     }
 
     /// The settlement transaction has committed and credited the hold back in the
@@ -150,7 +194,31 @@ impl Drop for ReservationGuard {
         let model = std::mem::take(&mut self.model);
         // Fire-and-forget: `Drop` cannot await and the hold must come back even
         // if this future is being torn down.
+        //
+        // THE GUARANTEE ENDS AT THE PROCESS, and the sentence above should not be read
+        // as saying otherwise. A dropped FUTURE always gets its spawned task run - the
+        // runtime is still alive, which is the case this guard exists for, and it covers a
+        // client reset, a `?`, an early return and a failed settlement.
+        //
+        // A killed PROCESS is different. If the container is stopped or the pod is
+        // rescheduled between the debit and the compensating credit, the spawned task
+        // never runs, the `reserve_*` row keeps its negative ledger row with no positive
+        // one under the same ref, and the money is out of the wallet until somebody
+        // releases it. That is not a bug to be fixed here - no ordering of statements
+        // removes the window - it is what `db::unpaired_hold_rows` detects, what the
+        // `stranded_hold` alert fires on, and what the hold sweep and its documented
+        // `hold-sweep --release` operator action exist for. The compensation path is
+        // deliberate recovery, not an oversight, and writing that here is what keeps a
+        // reader of the comment above from believing the window is closed.
+        //
+        // THE GUARD IS TAKEN BEFORE THE SPAWN, and the comment above is why the ordering matters
+        // rather than being tidiness: a shutdown landing between `spawn` and the task's first poll
+        // would find a task that exists and a count that does not. `tasks.begin()` closes that
+        // window; what it cannot close is a SIGKILL, which is the case the sweep still owns.
+        // The tracker is optional, so a guard with none still releases - it just is not counted.
+        let guard = self.tasks.as_ref().map(|t| t.begin());
         tokio::spawn(async move {
+            let _guard = guard;
             release_quietly(&pool, account_id, reserved_idr, &reservation_ref, &model).await;
         });
     }
@@ -174,15 +242,97 @@ struct RequestMeta {
 /// more than one usage chunk needs and stays a fixed, negligible allocation.
 const USAGE_TAIL_CAP: usize = 64 * 1024;
 
+/// Appends `chunk` to `tail`, keeping only the last `USAGE_TAIL_CAP` bytes.
+///
+/// ONE implementation, used by both the live tee (`MeteredStream::push`) and the
+/// hang-up drain (`drain_for_usage`). They were two identical copies of this
+/// arithmetic, which is one edit away from becoming two different answers about
+/// how much of the stream is retained — and the quantity at stake is the usage
+/// block that decides whether a customer is billed.
+///
+/// **The cap truncates the FRONT and never the end.** That asymmetry is the whole
+/// point: the usage block is the LAST thing in an SSE stream, so dropping the
+/// newest bytes would delete the very evidence the tail exists to preserve and
+/// silently under-bill every answer longer than the cap. Draining from the front
+/// (`drain(..excess)`) is therefore load-bearing, not an implementation detail.
+fn retain_usage_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    // SAFE, and the guard above it is the whole argument: the subtraction only runs
+    // when `len > USAGE_TAIL_CAP`, so `len - CAP` is at least 1 and cannot
+    // underflow. `len` is a Vec length, so it is bounded by the allocation and the
+    // drain is in bounds for the same reason.
+    #[allow(clippy::arithmetic_side_effects)]
+    if tail.len() > USAGE_TAIL_CAP {
+        let excess = tail.len() - USAGE_TAIL_CAP;
+        tail.drain(..excess);
+    }
+}
+
 /// The upstream client, built exactly once per process: it owns the connection
 /// pool, the per-endpoint key pools and the circuit breakers, all of which are
 /// worthless unless they are shared across requests.
 static UPSTREAM: OnceLock<UpstreamClient> = OnceLock::new();
 
-fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
+/// The models whose EVERY routed endpoint currently has an open circuit, i.e. the
+/// `all_providers_unhealthy` alert condition (the "All providers unhealthy" row of
+/// the Alerts table in `docs/observability.md`; cited by row because the line moved when
+/// the table gained an entry, which left this pointing at "Relay down").
+///
+/// Returns the model NAMES rather than a boolean so the operator reading the metrics
+/// route learns WHICH models are down, not merely that something is. An alert that
+/// says "a provider is unhealthy" without naming it costs a second investigation.
+///
+/// This is the accessor the metrics payload uses; `UpstreamClient::all_endpoints_unhealthy`
+/// is the per-model predicate behind it. Deliberately NOT built on
+/// `shortest_cooldown_secs`, which answers the opposite question - see that method.
+///
+/// Empty when nothing is registered yet: the client is initialised lazily on the first
+/// proxied request, so before then there is no pool to be unhealthy.
+pub fn models_with_no_healthy_endpoint() -> Vec<String> {
+    let Some(upstream) = UPSTREAM.get() else {
+        return Vec::new();
+    };
+    upstream
+        .allowed_models()
+        .into_iter()
+        .filter(|name| upstream.all_endpoints_unhealthy(name))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Per-endpoint traffic counters for the metrics payload: which endpoints have served
+/// work and which have not.
+///
+/// THE SAME LAZY-INITIALISATION RULE AS `models_with_no_healthy_endpoint`: the upstream
+/// client is built on the first proxied request, so before then there is no pool and an
+/// EMPTY list is the honest answer. That is why the payload reports this as a list rather
+/// than an object keyed by endpoint — "no data yet" and "every endpoint at zero" are
+/// different observations, and an empty object would make them look alike.
+///
+/// `(endpoint, served, failed)` in config order, and the endpoint NAME is safe here
+/// because this route is operator-authenticated (`require_operator` runs first). The
+/// PUBLIC `/health` route must never carry it — see the reasoning on
+/// `ServerErrorCounter`, which keeps even the error count to two integers for exactly
+/// that reason.
+pub fn endpoint_traffic() -> Vec<(String, u64, u64)> {
+    let Some(upstream) = UPSTREAM.get() else {
+        return Vec::new();
+    };
+    upstream.endpoint_traffic()
+}
+
+/// Mean time-to-first-byte per endpoint for the metrics payload, in whole milliseconds.
+///
+/// THE SAME LAZY-INITIALISATION RULE as its neighbours: the upstream client is built on the
+/// first proxied request, so an EMPTY list before then is the honest answer rather than a
+/// list of zeros. `docs/observability.md` names `proxy_upstream_latency_ms` with the reason
+/// "distinguish our latency from theirs", and until now no code produced it - this is the
+/// row's implementation, not a new invention.
+pub fn endpoint_latency_ms() -> Vec<(String, Option<u64>)> {
+    let Some(upstream) = UPSTREAM.get() else {
+        return Vec::new();
+    };
+    upstream.endpoint_latency_ms()
 }
 
 /// Whether `model` is permitted for a key whose stored allowlist is
@@ -264,7 +414,30 @@ impl RateWindow {
             };
         }
 
-        self.count += 1;
+        // SATURATING, and the honest reason is DEFENCE, not a fix.
+        //
+        // This is the rate limit's own counter, so a wrap would be the permissive
+        // failure: a window reading zero is a window that has just granted a full
+        // fresh allowance. That is why it is written this way rather than +=.
+        //
+        // BUT THE WRAP IS UNREACHABLE, and claiming otherwise would be a false claim
+        // of exactly the kind this repository keeps having to correct. The guard
+        // above refuses at `count >= limit_rpm`, and `limit_rpm` is itself a u32, so
+        // `count` can never pass `limit_rpm` and therefore can never reach
+        // u32::MAX + 1.
+        //
+        // The first version of this comment claimed a wrapping counter "returns to
+        // zero and grants a fresh allowance", and the test written to prove it could
+        // not: u32::MAX - 1 + 1 IS u32::MAX, and at u32::MAX the guard has already
+        // denied. The comment and the test were wrong in the same direction, and the
+        // test passed against the very code it claimed to disprove - which is why the
+        // real property is now asserted below instead.
+        //
+        // What is left is worth keeping: the invariant now lives HERE, at the
+        // increment, rather than depending on a guard some lines up. If someone later
+        // relaxes that guard - to let a burst over the ceiling through, say - this
+        // line still cannot hand out a fresh allowance.
+        self.count = self.count.saturating_add(1);
         RateDecision::Allow
     }
 }
@@ -430,7 +603,13 @@ impl KeyCache {
     fn remove(&mut self, key_hash: &str) {
         self.entries.remove(key_hash);
         self.order.retain(|key| key != key_hash);
-        self.generation += 1;
+        // SATURATING, for the same reason as the rate window: this is a counter a
+        // lookup compares against to decide whether the row it read is still
+        // current, so a wrap could make a pre-invalidation read look post-
+        // invalidation. Saturating keeps it monotonic, which is the property
+        // `insert_if_unchanged` actually relies on. Unreachable at 2^64
+        // invalidations, and free.
+        self.generation = self.generation.saturating_add(1);
     }
 
     /// The cached record, or None when it is absent or past its TTL.
@@ -565,9 +744,14 @@ async fn load_key_metadata(
         return Err(AppError::Unauthenticated);
     };
 
+    // THESE TWO DECODES ARE ON THE AUTHENTICATION PATH, which is what makes them the most
+    // consequential of the nineteen panicking sites this helper replaced. MEASURED before the
+    // fix: a key row whose `id` was not a UUID panicked here, so every request presenting that
+    // credential was closed with NO response and NO log line - a permanent, silent outage for one
+    // key, and nothing in the service said why. Now it is a 500 with the column named in the log.
     let meta = KeyMetadata {
-        key_id: row.get::<Hyphenated, _>("id").into_uuid(),
-        account_id: row.get::<Hyphenated, _>("account_id").into_uuid(),
+        key_id: crate::error::decode_uuid_column(&row, "id")?,
+        account_id: crate::error::decode_uuid_column(&row, "account_id")?,
         models: row.get("models"),
         spend_limit_idr: row.get("spend_limit_idr"),
         token_limit: row.get("token_limit"),
@@ -586,6 +770,40 @@ async fn load_key_metadata(
             Instant::now(),
             seen_generation,
         );
+
+    // LAST USED, WRITTEN HERE AND NOWHERE ELSE.
+    //
+    // `api_keys.last_used_at` is a column the schema defines, the data model
+    // documents ("updated lazily, not per request"), the key list publishes
+    // ("Updated lazily by proxy"), the dashboard renders ("Last used"), and the
+    // API SELECTs in three places - and NOTHING ever wrote it, so every key
+    // reported `null` and the dashboard column could only ever say "Never". A
+    // field whose only possible value is null is not a field.
+    //
+    // This is the one place it can be written without breaking the rule that
+    // forbids writing it per request: this function is the MISS path, so the
+    // write happens at most once per `limits.key_metadata_cache_seconds` per key
+    // - which is what "lazily" has to mean when the read path is cached. When the
+    // cache is disabled (`key_metadata_cache_seconds = 0`) this runs per request,
+    // but that setting is already documented as the trade that buys immediate
+    // revocation, and a caller who chose it chose the DB round-trip.
+    //
+    // It is deliberately NOT propagated as an error. A failure to record when a
+    // key was last used must not fail the request that is using it: the key is
+    // valid, the caller is authenticated, and the timestamp is an observability
+    // field. Failing closed here would turn a cosmetic write into an outage.
+    if let Err(err) = sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?")
+        .bind(chrono::Utc::now())
+        .bind(key_hash)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            key_id = %meta.key_id,
+            error = %err,
+            "could not record last_used_at; the request continues"
+        );
+    }
 
     Ok(meta)
 }
@@ -615,6 +833,13 @@ pub fn invalidate_key_cache(config: &AppConfig, key_hash: &str) {
         .remove(key_hash);
 }
 /// What the tee saw once the upstream stream ended.
+///
+/// `Debug` is derived so a test can report WHICH outcome arrived when an
+/// assertion fails. It is safe to derive here because `UpstreamStream`'s own
+/// manual `Debug` deliberately prints only the endpoint name and whether a lease
+/// is held — never the body — so a hangup outcome cannot spill streamed content
+/// into a log line (docs/error-model.md, rule 1: never leak internals).
+#[derive(Debug)]
 enum StreamEnd {
     /// The stream completed and the tail parsed into a usage report.
     Settled(Usage),
@@ -638,13 +863,48 @@ enum StreamEnd {
 /// rather than dropping it: the upstream generated that answer and will report
 /// usage for it, so abandoning the body would bill nothing while the provider
 /// charges us. The settlement task drains it and settles what the upstream
-/// reported (docs/failover.md:138-144).
+/// reported (docs/failover.md (Mid-stream failure and billing)).
 struct MeteredStream {
     inner: Option<UpstreamStream>,
     tail: Vec<u8>,
     /// Handed the outcome exactly once, when the stream ends.
     settle: Option<tokio::sync::oneshot::Sender<StreamEnd>>,
     done: bool,
+    /// Decrements the in-flight gauge WHEN THIS STRUCT DROPS, whichever way it goes.
+    ///
+    /// A FIELD RATHER THAN A DECREMENT IN `finish`, and that is the whole design. This
+    /// stream has three ways to end - the answer completes, the upstream dies, or the CLIENT
+    /// HANGS UP and the body is dropped - and only the first two pass through a method. A
+    /// gauge decremented in `finish` would leak one for every abandoned request, so a service
+    /// under exactly the load that matters (clients giving up) would report a rising
+    /// `active_streams` that never falls. Tying it to `Drop` makes the release structural
+    /// rather than something each exit path must remember - the same reasoning as the
+    /// `ReservationGuard` above it, which exists because a money release was forgotten on one
+    /// path and nobody could see it.
+    ///
+    /// It is a real field, not a `Drop` impl on `MeteredStream`, so the decrement is ordered
+    /// with the struct's own drops rather than racing them: the guard is dropped LAST because
+    /// it is declared last.
+    _in_flight: InFlightGuard,
+}
+
+/// One in-flight stream's claim on the `active_streams` gauge.
+///
+/// A separate type so the decrement cannot be forgotten at a construction site: `MeteredStream`
+/// cannot be built without one, because the field is not `Option`.
+struct InFlightGuard;
+
+impl InFlightGuard {
+    fn new() -> Self {
+        crate::error::stream_gauge().opened();
+        Self
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        crate::error::stream_gauge().closed();
+    }
 }
 
 impl MeteredStream {
@@ -654,15 +914,12 @@ impl MeteredStream {
             tail: Vec::new(),
             settle: Some(settle),
             done: false,
+            _in_flight: InFlightGuard::new(),
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
-        self.tail.extend_from_slice(chunk);
-        if self.tail.len() > USAGE_TAIL_CAP {
-            let excess = self.tail.len() - USAGE_TAIL_CAP;
-            self.tail.drain(..excess);
-        }
+        retain_usage_tail(&mut self.tail, chunk);
     }
 
     /// The upstream ended. `upstream_ok` is false when the end was a transport
@@ -772,9 +1029,9 @@ impl Stream for MeteredStream {
                 // The status line is long gone, so a mid-stream failure can
                 // only be announced in-band (docs/error-model.md). Never
                 // retried: a retry would append a second answer and bill for
-                // both (docs/failover.md:133). The detail is logged, not sent:
+                // both (docs/failover.md:209-212). The detail is logged, not sent:
                 // a reqwest error carries the provider URL, and the client must
-                // never see provider names (docs/error-model.md:159).
+                // never see provider names (docs/error-model.md, rule 1).
                 warn!(error = %err, "Upstream stream failed mid-answer");
                 Poll::Ready(Some(Ok(Bytes::from(error_event(
                     "upstream_failed",
@@ -787,12 +1044,21 @@ impl Stream for MeteredStream {
 
 /// The Retry-After for a 503, from the pool's shortest remaining cooldown.
 ///
-/// docs/error-model.md:99-110 defines the value as "the shortest remaining
-/// cooldown across the endpoint pool", floored at 1 second. A None from the
-/// accessor means NO breaker is open, so there is no cooldown to report: the
-/// documented 1-second floor applies, and `cause` records which path produced
-/// the 503 so an operator can see why the floor applied instead of a real
-/// number (docs/error-model.md:96 forbids an unexplained value).
+/// docs/error-model.md (Retry-After) defines the value as "the shortest remaining
+/// cooldown across the endpoint pool", floored at 1 second. A None means NOTHING is
+/// cooling — neither a breaker nor a key — so there is no cooldown to report: the
+/// documented 1-second floor applies, and `cause` records which path produced the
+/// 503 so an operator can see why the floor applied instead of a real number
+/// (docs/error-model.md (Retry-After) forbids an unexplained value).
+///
+/// THE ACCESSOR IT IS GIVEN IS `retry_after_secs`, WHICH READS BOTH COOLDOWNS, and
+/// that is a fix rather than a naming preference. Its predecessor read breaker
+/// cooldowns only, so the "all keys cooled down" case — which `docs/failover.md`
+/// lists explicitly as a 503-with-`Retry-After` outcome — had no breaker open, fell
+/// to this floor, and told a client to retry IMMEDIATELY into a key that was parked
+/// for `key_cooldown_seconds`. A throttled key parks inside the pool and never trips
+/// the endpoint breaker, so the two mechanisms are genuinely different sources and
+/// the header needs the earlier of them.
 fn no_upstream_retry_after(
     cooldown: Option<u64>,
     model: &str,
@@ -817,7 +1083,7 @@ fn no_upstream_retry_after(
 ///
 /// A transport error's Display embeds the provider URL, so it is logged and
 /// withheld: the client gets the generic upstream-unavailable error instead
-/// (DEFECT 3, docs/error-model.md:159). The other variants carry no provider URL
+/// (DEFECT 3, docs/error-model.md, rule 1). The other variants carry no provider URL
 /// or hostname.
 fn upstream_error(
     err: UpstreamError,
@@ -830,7 +1096,7 @@ fn upstream_error(
         // A breaker trip: a real cooldown exists, so report it.
         UpstreamError::NoHealthyUpstream(_) => AppError::NoUpstreamAvailable {
             retry_after_secs: no_upstream_retry_after(
-                upstream.shortest_cooldown_secs(model),
+                upstream.retry_after_secs(model),
                 model,
                 "every endpoint unhealthy",
                 account_id,
@@ -845,12 +1111,75 @@ fn upstream_error(
             );
             AppError::NoUpstreamAvailable {
                 retry_after_secs: no_upstream_retry_after(
-                    upstream.shortest_cooldown_secs(model),
+                    upstream.retry_after_secs(model),
                     model,
                     "transport error",
                     account_id,
                 ),
             }
+        }
+        // EVERY KEY ON EVERY ENDPOINT WAS THROTTLED, and this arm used to fall into the catch-all
+        // below, which made it a 500 `internal_error`.
+        //
+        // MEASURED: with an upstream scripting 429 forever, the client received `HTTP 500
+        // {"code":"internal_error"}` and no `Retry-After`, and the server's own log named the cause -
+        // `upstream rate limited every key status=500`.
+        //
+        // THAT CONTRADICTED THE DOCUMENT. docs/error-model.md:173: "429 (provider throttled) | Retry
+        // another key first; **only surface 503 if all fail**." The pool does retry another key first -
+        // the loop rotates up to `max_key_attempts` and this variant is only produced when every one of
+        // them was throttled - so the condition the document describes had been reached, and the
+        // documented answer is a 503.
+        //
+        // WHY THE OLD BEHAVIOUR LOOKED DEFENSIBLE, recorded because the test beside this function
+        // asserted it on purpose: a 503 reads as "come back later" and the concern was inviting a
+        // retry. That concern does not survive contact with the 503 path this arm now shares - it
+        // carries `Retry-After`, sourced from the pool's own shortest cooldown, so the client is told
+        // WHEN to return rather than left to guess. A 500 tells it to retry immediately or treat the
+        // service as broken, which is the worse of the two.
+        //
+        // A 429 is also the wrong answer here: the customer's key is fine and we are the throttled
+        // party, the same reasoning `docs/error-model.md:176` gives for never surfacing an upstream
+        // auth failure as a client 401.
+        UpstreamError::RateLimited => AppError::NoUpstreamAvailable {
+            retry_after_secs: no_upstream_retry_after(
+                upstream.retry_after_secs(model),
+                model,
+                "every key rate limited",
+                account_id,
+            ),
+        },
+        // EVERY ENDPOINT ANSWERED 404 FOR THE MODEL IT WAS ASKED FOR.
+        //
+        // THIS IS OUR CONFIGURATION FAULT, NOT THE CALLER'S, and it used to fall into the
+        // catch-all below as a 500 `internal_error` — which is at least the right STATUS
+        // (docs/error-model.md: our problem, not the client's) but a bad CODE, because
+        // "our bug" tells an operator to look for a defect rather than at
+        // `upstream_model` in the config. It also carried the joined endpoint names into
+        // the client-visible message via `Internal(other.to_string())`, which
+        // `docs/error-model.md` rule 1 forbids: an upstream error must not leak provider
+        // identity.
+        //
+        // The status stays 500 deliberately. 503 would claim a retry could succeed, and
+        // the whole point of this variant is that it cannot: every endpoint is up and
+        // answered, and the model name being rewritten to is not one any of them serves.
+        UpstreamError::NoEndpointServesModel {
+            model: asked,
+            tried,
+        } => {
+            error!(
+                account_id = %account_id,
+                model = %asked,
+                tried = %tried.join(", "),
+                "no routed endpoint serves the configured upstream model name; \
+                 check upstream_model for this model in config/apikita.toml"
+            );
+            // The DETAIL IS WITHHELD, exactly as the transport arm withholds its URL: the
+            // tried list names endpoints and their upstream model names, which is provider
+            // identity. The operator gets it in the log line above.
+            AppError::Internal(format!(
+                "no configured upstream serves model {asked}; the mapping is wrong, not the request"
+            ))
         }
         other => AppError::Internal(other.to_string()),
     }
@@ -864,7 +1193,7 @@ fn upstream_error(
 /// anywhere — there is no client left — and no chunk is retained except the tail.
 ///
 /// `None` means the upstream reported no usage. That is the documented washed case
-/// (docs/failover.md:138-144) and settles nothing: token counts are never invented.
+/// (docs/failover.md (Mid-stream failure and billing)) and settles nothing: token counts are never invented.
 async fn drain_for_usage(stream: Option<UpstreamStream>) -> Option<Usage> {
     let mut stream = stream?;
     let mut tail: Vec<u8> = Vec::new();
@@ -875,13 +1204,7 @@ async fn drain_for_usage(stream: Option<UpstreamStream>) -> Option<Usage> {
         futures_util::pin_mut!(bytes);
         while let Some(chunk) = bytes.next().await {
             match chunk {
-                Ok(chunk) => {
-                    tail.extend_from_slice(&chunk);
-                    if tail.len() > USAGE_TAIL_CAP {
-                        let excess = tail.len() - USAGE_TAIL_CAP;
-                        tail.drain(..excess);
-                    }
-                }
+                Ok(chunk) => retain_usage_tail(&mut tail, &chunk),
                 // The upstream died mid-answer. Whatever it reported before
                 // dying is all the evidence there is; a transport cut says
                 // nothing about the key, so it is not a rate-limit status.
@@ -956,12 +1279,12 @@ fn stream_flag_allowed(requested: Option<bool>) -> Result<(), AppError> {
 /// The input-token estimate behind the pre-flight hold: ONE definition, shared
 /// by the handler and the tests.
 ///
-/// The hold is a CEILING over every settlement of the request (proxy.rs:1094-1098,
-/// money.rs:400), and input tokens are NOT bytes. `len/4` holds only for ASCII: a
+/// The hold is a CEILING over every settlement of the request (this doc,
+/// `money.rs`), and input tokens are NOT bytes. `len/4` holds only for ASCII: a
 /// UTF-8-dense body is 3 bytes per CJK character and a byte-level BPE emits about
 /// ONE token per character, so the old estimate came out ~3x short on exactly the
 /// traffic this proxy sees. The shortfall is uncollectable: settlement clamps the
-/// debit to what was reserved (db.rs:266-271) and logs a Partial, so the excess is
+/// debit to what was reserved (the `clamp_debit` path in `db.rs`) and logs a Partial, so the excess is
 /// silently written off.
 ///
 /// So the two halves are counted differently:
@@ -978,6 +1301,14 @@ fn stream_flag_allowed(requested: Option<bool>) -> Result<(), AppError> {
 /// guard. Kept a free function rather than inlined because the handler and the
 /// test oracle each carried their own copy of `len/4`, and a rule written twice
 /// is a rule that can disagree with itself.
+///
+/// SAFE by the length of its own input. Both counters advance once per byte, so
+/// each is at most `body.len()`; the final sum is at most `len + len/4`, which for a
+/// 64-bit `len` cannot overflow because a slice of that size cannot be allocated.
+/// The direction of any underestimate is also the safe one - this figure sizes a
+/// HOLD, and the counter test above it pins that a dense body is counted generously
+/// rather than cheaply.
+#[allow(clippy::arithmetic_side_effects)]
 fn estimated_input_tokens(body: &[u8]) -> u64 {
     let mut ascii_bytes = 0u64;
     let mut multi_byte_bytes = 0u64;
@@ -1014,6 +1345,22 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, AppError> {
+    // 0. COUNT THE ATTEMPT, BEFORE ANY CHECK CAN REFUSE IT.
+    //
+    // This is the denominator for the refusal rate, and its POSITION is the whole point:
+    // a request refused for a missing Authorization header never reaches step 1, so
+    // recording anywhere later would leave exactly the refusals this metric exists to
+    // measure out of its own denominator - the rate would be computed against a shrinking
+    // base and could exceed 1.0.
+    //
+    // It sits inside the handler rather than in middleware because the handler IS the /v1
+    // admission gate: chat_completions is the one route whose refusals are
+    // RejectionCounter subject, and a layer-wide counter would mix in the dashboard,
+    // sign-in and /health. Same reason ServerErrorCounter::responses is NOT usable here -
+    // it moves for every response the process returns, so a rate built on it would fall
+    // as unrelated traffic rose.
+    crate::error::rejection_counter().record_request();
+
     // 1. Authenticate via Bearer token
     let auth_header = headers
         .get(header::AUTHORIZATION)
@@ -1025,7 +1372,29 @@ pub async fn chat_completions(
         .ok_or(AppError::Unauthenticated)?
         .trim();
 
-    let key_hash = hash_string(presented_key);
+    // THE ONE FUNCTION, and it has to be the one keys.rs WRITES with.
+    //
+    // This used to be a private hash_string here. The column api_keys.key_hash is
+    // written by create_key using routes::hash_token and read here, so the credential
+    // was accepted or refused by one function and issued by another, in the same
+    // column, with nothing asserting they agreed. They were byte-identical, so every
+    // key worked; a future edit to either would have made EVERY API KEY stop
+    // authenticating, with no compile error and no obvious cause.
+    //
+    // It is worth being honest about what pins this now, because THIS COMMENT USED TO CLAIM
+    // SOMETHING THAT WAS FALSE. It read "the guarantee is STRUCTURAL - there is only one
+    // function", and MEASURED, there were TWO: `routes/auth.rs` carried a byte-identical PRIVATE
+    // copy of this function with no doc comment of its own, and 20 call sites in that file used the
+    // copy while `routes/mod.rs` and `routes/account.rs` used this one - the same
+    // `sessions.token_hash` column, accepted by one function and written by another. Nothing
+    // failed, because the two bodies were identical, which is exactly what makes the defect
+    // invisible until someone edits one of them.
+    //
+    // A test asserting the two ends AGREE is not what pins it either: two copies that agree pass
+    // such a test happily. What pins it is that there is now ONE definition, and
+    // `there_is_one_credential_hash` counts the definitions of `hash_token` in the crate rather
+    // than trusting this comment - the same lesson the rest of the crate took from counts in prose.
+    let key_hash = crate::routes::hash_token(presented_key);
 
     // Served from the TTL cache when warm, from the database otherwise. The
     // checks below are identical either way - only the age of the row differs.
@@ -1052,6 +1421,7 @@ pub async fn chat_completions(
 
     // The upstream client is process-wide state: the pool, the key pools and
     // the breakers only do their job when every request shares them.
+    //
     let upstream = UPSTREAM.get_or_init(|| UpstreamClient::new(state.config.clone()));
 
     // Read only what the checks below need; the body itself goes upstream as-is.
@@ -1085,7 +1455,7 @@ pub async fn chat_completions(
         .ok_or_else(|| AppError::ModelNotAllowed(meta.model.clone()))?;
 
     // 3. The key's own requests-per-minute ceiling — step 3 of the documented
-    //    enforcement order (docs/failover.md:154, docs/server/api-spec.md:333):
+    //    enforcement order (docs/failover.md:222-231, docs/server/api-spec.md:762-774):
     //    authenticate, allowlist, RATE LIMIT, key spend/token limit, wallet.
     //    Throttling before the money checks is deliberate: a hammering key must
     //    be refused without touching the wallet at all.
@@ -1123,7 +1493,7 @@ pub async fn chat_completions(
             &state.pool,
             account_id,
             key_id,
-            chrono::Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
         )
         .await?;
         if limit_reached(spend_limit_idr, spend_used_idr) {
@@ -1144,7 +1514,7 @@ pub async fn chat_completions(
             &state.pool,
             account_id,
             key_id,
-            chrono::Utc::now().date_naive(),
+            crate::ip_tracking::today_utc(),
         )
         .await?;
         if limit_reached(token_limit, tokens_used) {
@@ -1168,7 +1538,7 @@ pub async fn chat_completions(
     // cap, clamped to the hard limit. The reservation must cover the dearest
     // endpoint in the pool, not the one that happens to serve the request —
     // otherwise a failover to a dearer provider can overdraw the balance
-    // (docs/failover.md:162-165).
+    // (docs/failover.md (Ordering with the wallet checks)).
     let estimated_input = estimated_input_tokens(&body);
     // The reservation must cover the worst case the upstream can actually emit,
     // not just the client's cap. A request that omits max_tokens (or asks for
@@ -1183,16 +1553,15 @@ pub async fn chat_completions(
     // under-reserve. The true cost is charged at settlement regardless, so only
     // the over-askers benefit from the extra headroom and the under-reserved case
     // is gone.
-    let max_output = meta
-        .max_tokens
-        .unwrap_or(0)
-        .max(model_cfg.max_output_tokens)
-        .min(state.config.streaming.hard_max_output_tokens);
+    let max_output = model_cfg.reserved_output_tokens(
+        meta.max_tokens,
+        state.config.streaming.hard_max_output_tokens,
+    );
 
     // One reservation per endpoint, and the DEAREST wins: the hold is taken
     // before routing and may be served by any endpoint in the pool, so it must
     // cover the dearest one or a failover to a dearer provider overdraws the
-    // balance (docs/failover.md:162-165). An endpoint may override the model's
+    // balance (docs/failover.md (Ordering with the wallet checks)). An endpoint may override the model's
     // peak rates, so each is priced at its OWN rates.
     //
     // The rule itself lives on ModelConfig, in ONE place: the upstream client
@@ -1256,7 +1625,10 @@ pub async fn chat_completions(
         reserved_idr,
         &reservation_ref,
         &meta.model,
-    );
+    )
+    // So the release this guard may spawn in Drop is counted by the shutdown drain. The guard cannot
+    // reach `AppState`, so the tracker is attached here where both are in scope.
+    .tracked_by(&state.tasks);
 
     // Every admission check has passed and the hold is out of the wallet, so
     // this request is actually being served — which is what makes its source
@@ -1305,6 +1677,11 @@ pub async fn chat_completions(
     // upstream body over so the usage the upstream still reports is settled.
     let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
 
+    // THE MOST IMPORTANT REGISTRATION IN THIS FILE. This task bills the usage for an answer that has
+    // already been sent to the customer. If a shutdown drops it, the customer has their answer and the
+    // wallet was never debited - which is the opposite direction from the stranded hold, and quieter,
+    // because nothing is left over to alert on.
+    let settle_guard = state.tasks.begin();
     tokio::spawn(settle_after_stream(
         settle_rx,
         state.pool.clone(),
@@ -1318,6 +1695,7 @@ pub async fn chat_completions(
         // defuses the guard; on any earlier exit the guard's Drop is the safety
         // net that gives the hold back.
         guard,
+        settle_guard,
     ));
 
     Response::builder()
@@ -1338,7 +1716,7 @@ enum SettlementPlan {
     Bill(Usage),
     /// No usage was reported — a truncated stream, a client hangup whose upstream
     /// said nothing, or a lost settlement channel. Settle NOTHING and give the whole
-    /// hold back. This is the documented washed case (docs/failover.md:138-144);
+    /// hold back. This is the documented washed case (docs/failover.md (Mid-stream failure and billing));
     /// token counts are never invented to fill the gap.
     Wash,
 }
@@ -1378,7 +1756,13 @@ async fn settle_after_stream(
     // has already credited the hold back in its own transaction. A guard can
     // therefore never double-credit the wallet.
     mut guard: ReservationGuard,
+    // The shutdown-drain guard. Held for the WHOLE task, including every early return, so the count
+    // is released by Drop wherever this function exits - the same discipline as `ReservationGuard`,
+    // and for the same reason: an exit path that forgets would strand the counter and make every
+    // later shutdown wait out its full timeout.
+    task_guard: crate::shutdown::Guard,
 ) {
+    let _task_guard = task_guard;
     // Each arm reports only what the upstream actually said; the single rule below
     // then decides bill-or-wash, so there is exactly one place a hold can be
     // released and exactly one place a charge can be made.
@@ -1490,6 +1874,7 @@ async fn settle_after_stream(
         &pool,
         account_id,
         Some(key_id),
+        &model,
         usage.input_tokens,
         usage.cache_read_tokens,
         usage.output_tokens,
@@ -1649,9 +2034,369 @@ async fn release_quietly(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{balance, ledger_drift_rows, shipped_config};
 
     // ---------------------------------------------------------------------
-    // The 503 Retry-After decision (docs/error-model.md:99-112)
+    // The usage tail: what decides whether a customer is billed at all.
+    // ---------------------------------------------------------------------
+
+    /// A LEAKED SLOT IS DETECTABLE BECAUSE IT ACCUMULATES.
+    ///
+    /// THIS IS THE PATH A `Drop`-BASED RELEASE EXISTS FOR, and the reason it is not a
+    /// decrement inside `finish`. A client can hang up mid-answer, at which point the
+    /// `MeteredStream` is simply DROPPED - no method runs, no `finish` is called. A gauge
+    /// decremented in `finish` would leak one slot for every abandoned request, so a service
+    /// under exactly the load that matters (clients giving up) would report a RISING
+    /// `active_streams` that never falls - and `docs/cost-and-sizing.md` sizes the instance
+    /// from that number.
+    ///
+    /// WHY MANY GUARDS AND NOT ONE, which is the part that took two attempts. The gauge is
+    /// PROCESS-WIDE and sibling tests stream concurrently, so a single open/close is
+    /// unobservable against that noise: the first version of this test asserted `active`
+    /// returned to `before`, and a mutation that REMOVED the `Drop` release still passed -
+    /// MEASURED. The leak is not visible in one slot; it is visible in the ACCUMULATION.
+    /// Opening 64 and releasing all 64 leaves the level 64 higher forever if the release is
+    /// gone, which no amount of concurrent traffic from a handful of sibling tests can
+    /// account for.
+    #[test]
+    fn the_in_flight_guard_releases_every_slot_it_takes() {
+        let gauge = crate::error::stream_gauge();
+        const GUARDS: usize = 64;
+
+        let baseline = gauge.active();
+
+        {
+            // Held in a Vec so all 64 are alive at once, then dropped together.
+            // Held in a Vec so all 64 are alive at once, then dropped together. Named with a
+            // leading underscore because it is deliberately never READ: the assertion is about
+            // what the gauge reports while they exist, and the drop is what closes the scope.
+            let _guards: Vec<InFlightGuard> = (0..GUARDS).map(|_| InFlightGuard::new()).collect();
+            assert!(
+                gauge.active() >= baseline + GUARDS as u64,
+                "holding {GUARDS} guards must raise the level by at least that much: {} vs a baseline of {baseline}",
+                gauge.active()
+            );
+            assert!(
+                gauge.peak() >= baseline + GUARDS as u64,
+                "and the PEAK must record it - the peak is what the capacity argument is checked against"
+            );
+        }
+
+        // THE LEAK DETECTOR. A missing release leaves all 64 slots held for the life of the
+        // process, so the level stays at least 64 above where this test found it. A
+        // concurrent sibling stream can move the figure by a few, which is why the bound is
+        // the guard count and not an exact value - the signal is 64, the noise is single
+        // digits.
+        let after = gauge.active();
+        assert!(
+            after < baseline + GUARDS as u64,
+            "{GUARDS} released guards must not leave {GUARDS} slots held: the level is {after} against a baseline of {baseline}, which means the Drop release is missing"
+        );
+    }
+
+    /// THE DENOMINATOR MUST BE RECORDED BEFORE ANY CHECK CAN REFUSE.
+    ///
+    /// This is a STRUCTURAL test rather than a behavioural one, and that is a deliberate
+    /// choice about what is checkable here. Driving `chat_completions` needs an `AppState`
+    /// (database, config, HTTP client, SSE hub) that the proxy test module has no builder
+    /// for, and building one to assert a single increment would be more scaffolding than
+    /// the property is worth.
+    ///
+    /// What the ORDER guarantees, and why it cannot be moved: a request refused for a
+    /// missing `Authorization` header never reaches step 1, so recording the attempt
+    /// anywhere later leaves exactly the refusals this metric measures OUT of its own
+    /// denominator. The rate is then a share of a shrinking base and can exceed 1.0 - a
+    /// percentage above 100, which is the kind of number that destroys trust in a metric.
+    ///
+    /// MEASURED against the source rather than asserted from memory: the call site and the
+    /// first refusal are located by their text, so a refactor that moves one past the other
+    /// fails here rather than silently changing what the rate means.
+    #[test]
+    fn the_attempt_is_counted_before_the_first_check_that_can_refuse_it() {
+        let src = include_str!("proxy.rs");
+        let entry = src
+            .find("pub async fn chat_completions(")
+            .expect("the handler this test describes must still exist by that name");
+        // BOTH SEARCHES START AT THE HANDLER, and that is not incidental: `find` reads the
+        // whole file, and `AppError::Unauthenticated` occurs in other handlers and tests
+        // above this one - MEASURED, the first file-wide occurrence is a DIFFERENT function,
+        // so an unscoped comparison failed against working code.
+        let body = &src[entry..];
+        let recorded = body
+            .find("rejection_counter().record_request()")
+            .expect("the attempt counter must still be recorded on the admission path");
+        let first_refusal = body
+            .find("AppError::Unauthenticated")
+            .expect("the first admission check must still refuse with Unauthenticated");
+
+        assert!(
+            body.len() > recorded,
+            "record_request must be INSIDE chat_completions, not somewhere else in the file"
+        );
+        assert!(
+            recorded < first_refusal,
+            "record_request must precede the first refusal, or a request refused for a missing \
+             credential becomes a numerator with no denominator and the rate can exceed 1.0"
+        );
+    }
+
+    /// A usage block exactly as an upstream sends it, in the tail of an SSE
+    /// stream: this is the ONLY evidence that an answer completed.
+    fn usage_sse() -> &'static str {
+        r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":2}}}"#
+    }
+
+    #[test]
+    fn the_tail_keeps_the_whole_stream_when_it_is_under_the_cap() {
+        let mut tail = Vec::new();
+        retain_usage_tail(&mut tail, b"data: one\n\n");
+        retain_usage_tail(&mut tail, b"data: two\n\n");
+        assert_eq!(tail, b"data: one\n\ndata: two\n\n");
+    }
+
+    /// THE ASYMMETRY THAT MATTERS: the cap must drop the OLDEST bytes and keep the
+    /// NEWEST, because the usage block is the LAST thing in an SSE stream. A cap
+    /// that truncated the end would delete the evidence and silently under-bill
+    /// every answer longer than the cap.
+    #[test]
+    fn the_cap_truncates_the_front_and_so_preserves_a_trailing_usage_block() {
+        let mut tail = Vec::new();
+
+        // Far more than the cap, in NEWLINE-TERMINATED lines, as a real SSE
+        // stream is. The parser reads line by line and only inspects a line that
+        // BEGINS with "data:", so filler without a trailing newline would glue the
+        // usage block onto the end of a junk line and it would never be seen -
+        // correct parser behaviour, but it would make this fixture prove nothing.
+        let mut filler = vec![b'x'; 4095];
+        filler.push(b'\n');
+        for _ in 0..(USAGE_TAIL_CAP / 4096 + 8) {
+            retain_usage_tail(&mut tail, &filler);
+        }
+        retain_usage_tail(&mut tail, b"\n");
+        retain_usage_tail(&mut tail, usage_sse().as_bytes());
+
+        assert_eq!(
+            tail.len(),
+            USAGE_TAIL_CAP,
+            "the tail must be exactly capped"
+        );
+        assert!(
+            tail.ends_with(usage_sse().as_bytes()),
+            "the NEWEST bytes must survive: the usage block is last in the stream, so truncating the end would lose it"
+        );
+        // And the block is still parseable, which is the point of keeping it.
+        assert!(
+            parse_usage_from_sse(&tail).is_some(),
+            "the trailing usage block must still parse after capping - this is what decides whether the customer is billed"
+        );
+    }
+
+    #[test]
+    fn the_cap_never_truncates_a_stream_that_fits() {
+        let mut tail = Vec::new();
+        let exact = vec![b'y'; USAGE_TAIL_CAP];
+        retain_usage_tail(&mut tail, &exact);
+        assert_eq!(
+            tail.len(),
+            USAGE_TAIL_CAP,
+            "exactly at the cap is not over it"
+        );
+        assert_eq!(tail, exact, "and nothing is dropped at exactly the cap");
+    }
+
+    /// A single chunk LARGER than the cap must still leave a capped tail ending
+    /// in that chunk's final bytes - the case a per-chunk copy would get wrong by
+    /// retaining the chunk's head instead of its tail.
+    #[test]
+    fn one_oversized_chunk_still_keeps_its_trailing_bytes() {
+        let mut tail = Vec::new();
+        let mut huge = vec![b'z'; USAGE_TAIL_CAP * 2];
+        let usage = usage_sse().as_bytes();
+        huge.extend_from_slice(usage);
+
+        retain_usage_tail(&mut tail, &huge);
+
+        assert_eq!(tail.len(), USAGE_TAIL_CAP);
+        assert!(
+            tail.ends_with(usage),
+            "an oversized chunk must be trimmed from its head, keeping its tail"
+        );
+    }
+
+    /// The live tee and the hang-up drain must produce the SAME tail for the same
+    /// input. They were two identical copies of this arithmetic; this pins that
+    /// they still agree, because a divergence would mean the billed amount depends
+    /// on whether the client hung up.
+    #[test]
+    fn the_tee_and_the_drain_agree_byte_for_byte() {
+        let chunks: Vec<Vec<u8>> = vec![
+            b"data: a\n\n".to_vec(),
+            vec![b'q'; 5000],
+            usage_sse().as_bytes().to_vec(),
+            vec![b'r'; USAGE_TAIL_CAP],
+            b"data: last\n\n".to_vec(),
+        ];
+
+        // Path A: the live tee, through MeteredStream::push.
+        let (settle, _rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+            _in_flight: InFlightGuard::new(),
+        };
+        for chunk in &chunks {
+            metered.push(chunk);
+        }
+
+        // Path B: the drain, through the same shared function.
+        let mut drained = Vec::new();
+        for chunk in &chunks {
+            retain_usage_tail(&mut drained, chunk);
+        }
+
+        assert_eq!(
+            metered.tail, drained,
+            "the billed usage tail must not depend on whether the client hung up"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // MeteredStream: the decision that bills a customer and cools a key.
+    // ---------------------------------------------------------------------
+
+    /// A stream that ended cleanly WITH a usage block reports Settled, and returns
+    /// true (the answer completed).
+    #[test]
+    fn finish_with_usage_reports_settled() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+            _in_flight: InFlightGuard::new(),
+        };
+        metered.push(usage_sse().as_bytes());
+
+        assert!(
+            metered.finish(true),
+            "a stream carrying usage completed and must be reported as such"
+        );
+
+        match rx.try_recv() {
+            Ok(StreamEnd::Settled(_)) => {}
+            other => panic!("expected Settled, got {other:?}"),
+        }
+    }
+
+    /// A stream that ended WITHOUT usage is the washed case: reported NoUsage, and
+    /// `finish` returns false so the caller can tell the client the answer was cut.
+    #[test]
+    fn finish_without_usage_reports_no_usage_and_returns_false() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+            _in_flight: InFlightGuard::new(),
+        };
+        metered.push(b"data: partial\n\n");
+
+        assert!(
+            !metered.finish(true),
+            "no usage block means the answer was truncated, so this is not a success"
+        );
+
+        match rx.try_recv() {
+            Ok(StreamEnd::NoUsage) => {}
+            other => panic!("expected NoUsage, got {other:?}"),
+        }
+    }
+
+    /// `finish` is idempotent with respect to the settle channel: a second call
+    /// cannot send a second outcome, which would double-report the stream.
+    #[test]
+    fn finish_twice_sends_exactly_one_outcome() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+            _in_flight: InFlightGuard::new(),
+        };
+        metered.push(usage_sse().as_bytes());
+
+        assert!(metered.finish(true));
+        // The second call finds no settle sender: it cannot report again.
+        assert!(metered.finish(true));
+
+        assert!(
+            matches!(rx.try_recv(), Ok(StreamEnd::Settled(_))),
+            "the first outcome must be the one delivered"
+        );
+        assert!(rx.try_recv().is_err(), "no second outcome may be sent");
+    }
+
+    /// DROPPING a live stream HANDS THE BODY OVER as `Hangup` rather than ending it
+    /// silently: the upstream already generated the partial answer and will report
+    /// usage for it, so dropping the body unread would bill nothing while the
+    /// provider charges us. That is the documented defect this path exists to fix,
+    /// and it had no test.
+    #[test]
+    fn dropping_a_live_stream_hands_the_body_over_as_a_hangup() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+            _in_flight: InFlightGuard::new(),
+        };
+
+        drop(metered);
+
+        match rx.try_recv() {
+            Ok(StreamEnd::Hangup(_)) => {}
+            other => panic!(
+                "a dropped live stream must hand its body to the settlement task, got {other:?}"
+            ),
+        }
+    }
+
+    /// A stream that already finished is NOT re-reported by `Drop`: `finish` took
+    /// the lease and sent the outcome, so a second send would be lost at best and
+    /// a double-settle at worst.
+    #[test]
+    fn dropping_an_already_finished_stream_sends_nothing_more() {
+        let (settle, mut rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream {
+            inner: None,
+            tail: Vec::new(),
+            settle: Some(settle),
+            done: false,
+            _in_flight: InFlightGuard::new(),
+        };
+        metered.push(usage_sse().as_bytes());
+        assert!(metered.finish(true));
+
+        drop(metered);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(StreamEnd::Settled(_))),
+            "the settle outcome must be the one finish sent"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "Drop must not send a second outcome"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The 503 Retry-After decision (docs/error-model.md, Retry-After)
     // ---------------------------------------------------------------------
 
     #[test]
@@ -1674,7 +2419,7 @@ mod tests {
 
     #[test]
     fn no_open_breaker_falls_back_to_the_documented_one_second_floor() {
-        // docs/error-model.md:112 - "Floor it at 1 second. A zero or negative
+        // docs/error-model.md (429 — rate limited) - "Floor it at 1 second. A zero or negative
         // value is a malformed header." The floor is the documented value, not
         // an estimate; the warn! inside records the cause.
         assert_eq!(
@@ -1841,7 +2586,7 @@ mod tests {
 
     /// A completed stream that reported usage is billed by exactly what the
     /// upstream said, and a stream that reported nothing is washed — never billed
-    /// against invented counts (docs/failover.md:138-144).
+    /// against invented counts (docs/failover.md (Mid-stream failure and billing)).
     #[test]
     fn a_reported_usage_is_billed_and_a_missing_one_is_washed() {
         let full = Usage {
@@ -2144,6 +2889,83 @@ mod tests {
         assert!(windows.len() <= capacity, "memory stays bounded");
     }
 
+    /// THE REACHABLE INVARIANT: a window's counter never passes its ceiling.
+    ///
+    /// This replaces a test that asserted something stronger and FALSE - that a
+    /// wrapping u32 counter would reset to zero at the ceiling and hand out a fresh
+    /// allowance. It cannot: u32::MAX - 1 + 1 IS u32::MAX, and the guard refuses at
+    /// count >= limit_rpm, and limit_rpm is itself a u32, so count can never pass
+    /// it. The original test passed against the very code it claimed to disprove,
+    /// which is the worst way for a test to be wrong: green, and worthless.
+    ///
+    /// What is worth pinning is the property that KEEPS the wrap unreachable,
+    /// because it is the one a future edit could break: if a change let the counter
+    /// rise past its ceiling, the u32 wrap stops being unreachable and the rate
+    /// limit starts switching itself off. So the counter is read back after every
+    /// request and required to stay within the limit.
+    ///
+    /// Swept rather than spot-checked, because the interesting limits are the ones
+    /// near a boundary: 1, the ordinary cap, and u32::MAX, where a wrap would be
+    /// one request away. A limit of 0 never reaches here - the caller skips the
+    /// whole mechanism for an unlimited key - so it is not swept.
+    #[test]
+    fn a_window_counter_never_passes_its_ceiling() {
+        let now = Instant::now();
+
+        for limit in [1u32, 2, 3, 17, 1000, u32::MAX - 1, u32::MAX] {
+            let key = Uuid::new_v4();
+            let mut windows: HashMap<Uuid, RateWindow> = HashMap::new();
+            windows.insert(
+                key,
+                RateWindow {
+                    started_at: now,
+                    count: 0,
+                },
+            );
+
+            // Ask for far more than the ceiling could ever grant, but CAP the
+            // number of requests. The first version of this test used
+            // limit.saturating_add(8) as the bound, which at limit = u32::MAX - 1
+            // saturates to u32::MAX rather than to 8 - so the sweep ran four billion
+            // iterations and had to be killed. The comment claimed the opposite,
+            // which is how it went unnoticed until the test did not finish.
+            //
+            // The cap is what makes the sweep possible, and it does not weaken the
+            // property: the counter is re-read on EVERY request, so a breach is
+            // caught the moment it happens rather than only at the end.
+            for _ in 0..limit.min(64).saturating_add(8) {
+                let _ = check_rate_limit_in(&mut windows, 16, key, limit, now);
+                let count = windows
+                    .get(&key)
+                    .expect("the window is never evicted")
+                    .count;
+                assert!(
+                    count <= limit,
+                    "a window capped at {limit} reached {count}: past the ceiling is
+                    how a u32 counter gets close enough to wrap, and a wrap there is
+                    a rate limit handing out a fresh allowance"
+                );
+            }
+
+            // And the ceiling is actually ENFORCED, not merely respected - a
+            // counter stuck at zero would also satisfy the bound above.
+            let mut one: HashMap<Uuid, RateWindow> = HashMap::new();
+            one.insert(
+                key,
+                RateWindow {
+                    started_at: now,
+                    count: limit,
+                },
+            );
+            assert!(
+                matches!(
+                    check_rate_limit_in(&mut one, 16, key, limit, now),
+                    RateDecision::Deny { .. }
+                ),
+                "a window sitting exactly on its ceiling of {limit} must refuse"
+            );
+        }
+    }
     // DEFECT 2 regression: the invalidation drops the entry, and a lookup that
     // read the row before the invalidation cannot put it back.
     #[test]
@@ -2265,7 +3087,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("the data field must be JSON: {e}"));
         parsed["error"]["request_id"]
             .as_str()
-            .expect("docs/error-model.md:171 - always include request_id")
+            .expect("docs/error-model.md, rule 3 - always include ")
             .to_string()
     }
 
@@ -2275,7 +3097,7 @@ mod tests {
 
     /// The hold is taken BEFORE the upstream is called and is the only thing
     /// standing between a request and the balance. The handler's own comment
-    /// (proxy.rs:1094-1098) and money.rs:400 state the invariant as "never
+    /// and `money.rs` state the invariant as "never
     /// under-reserve": the reservation is a CEILING over every settlement of the
     /// same request.
     ///
@@ -2284,10 +3106,10 @@ mod tests {
     /// for a typical BPE tokenizer) carries roughly 3x the tokens a `len/4`
     /// estimate assumes, so the hold comes out smaller than the true cost and the
     /// difference is never collected: settlement clamps the debit to what was
-    /// reserved (db.rs:266-271) and logs a Partial. Uncollected revenue.
+    /// reserved (the `clamp_debit` path in `db.rs`) and logs a Partial. Uncollected revenue.
     #[test]
     fn the_input_estimate_covers_a_utf8_dense_body() {
-        let config = live_config();
+        let config = shipped_config();
         let model = config
             .models
             .iter()
@@ -2327,7 +3149,7 @@ mod tests {
             hold(&sparse)
         );
 
-        // (2) The invariant itself (proxy.rs:1094-1098, money.rs:400): the hold
+        // (2) The invariant itself (the input-token estimate's doc, `money.rs`): the hold
         // is a CEILING over the settlement of this request, so it must cover the
         // tokens the body really is - one token per CJK character plus ~4 ASCII
         // bytes per token for the envelope.
@@ -2356,6 +3178,118 @@ mod tests {
         );
     }
 
+    /// The SAME invariant as the test above, swept instead of exemplified.
+    ///
+    /// the_input_estimate_covers_a_utf8_dense_body proves the ceiling for ONE body
+    /// shape, and that is the shape that broke. But the defect is a FUNCTION of the
+    /// byte mix and the length, not of one string, so one point is one example.
+    ///
+    /// This walks the space instead: almost-pure-ASCII through almost-pure-CJK, over
+    /// four orders of magnitude of length, asserting two properties.
+    ///
+    ///   1. THE CEILING. The hold covers the cost of the tokens the body really is.
+    ///      This is the invariant whose violation strands money: the debit is clamped
+    ///      to what was reserved, so a shortfall is written off silently and no alert
+    ///      fires.
+    ///   2. MONOTONICITY. A longer body never holds less. Not required by the money
+    ///      model, but a hold that DECREASES with size is the signature of the
+    ///      estimate and the charge disagreeing about which is bigger.
+    ///
+    /// The token model is a MODEL of a BPE tokenizer, not one - a byte-level BPE
+    /// cannot emit more tokens than the body has bytes, and a character-level one
+    /// emits about one per non-ASCII character. Every fixture is inside both bounds,
+    /// so the test is not asking the estimate to beat a bound it cannot be held to.
+    ///
+    /// A FIXED-SEED xorshift, as db.rs already does, rather than a new dependency: a
+    /// failure has to be reproducible, and a property test that cannot be re-run to
+    /// the same input is one that gets deleted the first time it is inconvenient.
+    #[test]
+    fn the_hold_covers_the_charge_for_every_body_shape() {
+        let config = shipped_config();
+        let model = config
+            .models
+            .iter()
+            .find(|m| m.name == "flash")
+            .expect("the shipped config must carry the flash model");
+
+        struct XorShift64(u64);
+        impl XorShift64 {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+        }
+        let mut rng = XorShift64(0x9E37_79B9_7F4A_7C15);
+
+        // Three bytes: the dense case. The sweep varies the MIX, which is what
+        // decides how many tokens a byte-length heuristic miscounts.
+        let cjk: Vec<u8> = "\u{4e2d}".as_bytes().to_vec();
+
+        let hold = |body: &[u8]| model.worst_case_reservation_idr(estimated_input_tokens(body), 0);
+        let charge = |body: &[u8]| {
+            let multi = body
+                .iter()
+                .filter(|b| !b.is_ascii() && **b & 0xC0 != 0x80)
+                .count() as u64;
+            let ascii = body.iter().filter(|b| b.is_ascii()).count() as u64;
+            calculate_token_cost_idr(
+                model.price,
+                multi + (ascii / 4).max(1),
+                model.rates.input_peak,
+                0,
+                model.rates.cache_read_peak,
+                0,
+                model.rates.output_peak,
+            )
+        };
+
+        let mut cases = 0usize;
+        for dense_every in [1usize, 2, 3, 5, 9, 64, usize::MAX] {
+            for size in [1usize, 7, 64, 997, 4096, 65_536] {
+                let mut body: Vec<u8> = Vec::new();
+                for i in 0..size {
+                    if i % dense_every == 0 {
+                        body.extend_from_slice(&cjk);
+                    } else {
+                        body.push(b'a' + (rng.next() % 26) as u8);
+                    }
+                }
+                let h = hold(&body);
+                let c = charge(&body);
+                assert!(
+                    h >= c,
+                    "{} bytes, every {dense_every}th multi-byte: hold {h} against a charge \
+                     of {c}",
+                    body.len()
+                );
+
+                let mut longer = body.clone();
+                for _ in 0..size {
+                    if size % dense_every == 0 {
+                        longer.extend_from_slice(&cjk);
+                    } else {
+                        longer.push(b'z');
+                    }
+                }
+                assert!(
+                    hold(&longer) >= h,
+                    "{} bytes holds {h} but {} bytes holds only {}",
+                    body.len(),
+                    longer.len(),
+                    hold(&longer)
+                );
+                cases += 1;
+            }
+        }
+
+        // The vacuity guard: a sweep that generated nothing passes every assertion
+        // above over an empty set.
+        assert_eq!(cases, 42, "the sweep must cover every mix at every size");
+    }
     #[test]
     fn the_error_frame_ends_with_a_blank_line() {
         let frame = error_event("upstream_failed", "boom");
@@ -2465,7 +3399,8 @@ mod tests {
     #[test]
     fn every_error_event_carries_a_fresh_documented_request_id() {
         // Per-event, not per-process: the same inputs must not produce the same
-        // id, or it correlates with nothing (docs/error-model.md:27).
+        // id, or it correlates with nothing (docs/error-model.md, Response shape:
+        // request_id correlates with logs).
         let first = request_id_of(&error_event("upstream_failed", "boom"));
         let second = request_id_of(&error_event("upstream_failed", "boom"));
         assert_ne!(first, second, "request_id must be generated per event");
@@ -2516,20 +3451,14 @@ mod tests {
     use crate::routes::events::RealtimeHub;
     use crate::test_support::{self, TestDb};
 
-    fn live_config() -> Arc<AppConfig> {
-        for path in ["../config/apikita.toml", "config/apikita.toml"] {
-            if std::path::Path::new(path).exists() {
-                return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
-            }
-        }
-        panic!("could not find apikita.toml for testing");
-    }
+    // The shipped config now lives in `crate::test_support::shipped_config`; the callers
+    // below reached for a live config through this local copy for five modules.
 
     /// The real application state, built the way main.rs builds it, so the
     /// handler runs against the same config and the same process-wide key cache
     /// the serving process uses.
     fn test_state(pool: SqlitePool) -> AppState {
-        test_state_with(pool, live_config())
+        test_state_with(pool, shipped_config())
     }
 
     /// The real application state over an EXPLICIT config.
@@ -2552,6 +3481,11 @@ mod tests {
             events,
             ip_salt: Arc::new(DailySalt::new()),
             trusted_proxies,
+            // A fresh tracker per test. Nothing drains it, which is the same position a test is in as
+            // the tests that pass `None` to `ReservationGuard::new`: the money-path work still runs,
+            // only the shutdown COUNTING is absent - and a test asserting on settlement does not want a
+            // drain racing it.
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 
@@ -2590,7 +3524,7 @@ mod tests {
         )
         .bind(id.hyphenated())
         .bind(account_id.hyphenated())
-        .bind(hash_string(plaintext))
+        .bind(crate::routes::hash_token(plaintext))
         .bind(serde_json::to_value(models).expect("models as JSON"))
         .bind(chrono::Utc::now())
         .execute(pool)
@@ -2599,26 +3533,83 @@ mod tests {
         id
     }
 
-    /// INVARIANT (a), scoped to THIS fixture's account: wallets.balance_idr must
-    /// equal SUM(ledger.delta_idr). It must return 0 rows.
-    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT w.account_id
-                FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
+    /// `record_request_source` files the source under TODAY, and nothing observed that.
+    ///
+    /// WHY THIS EXISTS. `record_key_ip` is well tested - with an explicit `day` the caller supplies.
+    /// The WRAPPER that DERIVES that day, `record_request_source`, had no test at all: its only
+    /// occurrence in the crate is its definition and the one call inside `chat_completions`, and the
+    /// handler tests do not read the `key_ip_seen` / `key_ip_daily` rows afterwards.
+    ///
+    /// MEASURED: replacing `let day = today_utc()` with a hardcoded `2020-01-01` left the whole suite
+    /// green at 679 passed / 0 failed. Every request source in production would then be filed under
+    /// one arbitrary day - the retention sweep deletes it immediately (its window is 7 days), so the
+    /// distinct-IP signal the abuse guard reads would be permanently empty, which is the silent
+    /// direction: a counter that never rises looks exactly like a key nobody abuses.
+    ///
+    /// The SAME day must reach both the hash and the row. `record_request_source` derives them
+    /// together, before its spawn, for the reason its own comment gives: after the spawn the UTC day
+    /// could roll over and the row would then be filed under a different day than the salt that
+    /// produced the hash - which makes the hash unusable for correlation, silently.
+    #[tokio::test]
+    async fn record_request_source_files_the_row_under_today() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        // A peer address the trusted-proxy rules pass through unchanged, so the hash is over a known
+        // value rather than over a forwarded header this test would also have to pin.
+        let peer = SocketAddr::from(([203, 0, 113, 77], 4321));
+        let headers = HeaderMap::new();
+
+        record_request_source(&state, key_id, peer, &headers);
+
+        // The write is SPAWNED, so wait for it rather than assuming it has landed. Polling is the
+        // honest way to observe a detached task.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for _ in 0..100 {
+            rows = sqlx::query_as("SELECT day, ip_hash FROM key_ip_seen WHERE api_key_id = ?")
+                .bind(key_id.hyphenated())
+                .fetch_all(&pool)
+                .await
+                .expect("read key_ip_seen");
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "one served request must write exactly one seen-address row"
+        );
+        let today = crate::ip_tracking::today_utc().to_string();
+        assert_eq!(
+            rows[0].0, today,
+            "the row must be filed under TODAY. A row for any other day is outside the 7-day window \
+             the retention sweep keeps, so it is deleted before the distinct-IP signal can ever be \
+             read - a counter that silently never rises"
+        );
+
+        // And the hash is the one THIS day's salt produces, so the two were derived together.
+        let expected = ip_hash(
+            &state.ip_salt.salt_for_day(crate::ip_tracking::today_utc()),
+            &resolve_client_ip(peer.ip(), &headers, &state.trusted_proxies),
+        );
+        assert_eq!(
+            rows[0].1, expected,
+            "the stored hash must be the one computed under TODAY's salt. If it differs, the day \
+             used for the hash and the day written to the row came from different reads - the race \
+             the function's own comment says it avoids by deriving both before the spawn"
+        );
+
+        db.close().await;
     }
+
+    // see `the_drift_helper_sees_ledger_money_with_no_wallet_row` there.
 
     /// Every ledger move of the fixture, in order: (delta_idr, ref).
     async fn ledger_deltas(pool: &SqlitePool, account_id: Uuid) -> Vec<(i64, Option<String>)> {
@@ -2627,14 +3618,6 @@ mod tests {
             .fetch_all(pool)
             .await
             .expect("read ledger")
-    }
-
-    async fn wallet_balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(pool)
-            .await
-            .expect("read balance")
     }
 
     /// Today's usage row for the account: the three token classes SEPARATELY
@@ -2693,10 +3676,8 @@ mod tests {
             .find(|m| m.name == model)
             .expect("the model must be in the config");
         let estimated_input = estimated_input_tokens(body);
-        let max_output = max_tokens
-            .unwrap_or(0)
-            .max(model_cfg.max_output_tokens)
-            .min(config.streaming.hard_max_output_tokens);
+        let max_output =
+            model_cfg.reserved_output_tokens(max_tokens, config.streaming.hard_max_output_tokens);
 
         let at = |input_peak: f64, output_peak: f64| {
             calculate_preflight_reservation_idr(
@@ -2750,15 +3731,139 @@ mod tests {
         .await
     }
 
-    /// Runs the money assertions, then closes the fixture's database whether they
-    /// passed or panicked.
+    // -----------------------------------------------------------------------
+    // THE LOG-PRIVACY PROMISE, AS A TEST RATHER THAN A REVIEW.
+    // -----------------------------------------------------------------------
+    //
+    // docs/observability.md:227 used to ask a human to "confirm prompts/completions
+    // are never logged, in code review". A review that happened once cannot stop a
+    // debug! printing a body from being added next month, so the promise is pinned
+    // here instead. The doc is explicit that this is a PRODUCT promise, not hygiene
+    // (:57-59): logging prompts "turns you into a data processor in a way they did
+    // not agree to".
+    //
+    // The technique is the one webhooks.rs already uses for the OPPOSITE assertion
+    // (that an expected event name APPEARS): a tracing subscriber writing into an
+    // in-memory sink. Nobody had used it to assert that something NEVER appears,
+    // which is what a privacy promise needs.
+
+    /// The process-wide log sink every capturing test reads.
     ///
-    /// The Postgres original deleted its rows by name here, so a failing run could
-    /// not leave residue in a database other runs shared. SQLite makes that
-    /// unnecessary: TestDb owns a private temp database and close() removes it.
-    /// close() is awaited rather than trusted to drop order, for the reason
-    /// documented in test_support - dropping the pool only signals the close, so
-    /// the removal would race it.
+    /// A `static` rather than a per-test value, because the subscriber that writes here
+    /// must be GLOBAL (see `install_global_capture`). Callers hold the crate's EnvLock
+    /// and call `clear()` before the code under test runs, so each test sees only its
+    /// own lines.
+    static CAPTURED_LOGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    /// Installs a GLOBAL capturing subscriber, once per process.
+    ///
+    /// GLOBAL, not thread-local, and that distinction is a bug this test had. The proxy
+    /// handler SPAWNS work (settlement runs on its own task), so `set_default` - which
+    /// is thread-local - captured only what was emitted on the test's own thread. The
+    /// first version used it and **passed when run alone, then FAILED in the full suite
+    /// with an empty capture**, because under load the spawn landed on a worker thread
+    /// whose subscriber was the global (absent) one. The test's own positive control -
+    /// "the request must still be observable" - is what caught it, which is the case for
+    /// writing controls that can fail.
+    ///
+    /// `set_global_default` errors when one is already installed (other tests in this
+    /// module run in the same process), and that is harmless: the first call wins and
+    /// keeps writing into CAPTURED_LOGS, which every test reads.
+    fn install_global_capture() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            // EVERYTHING, including DEBUG and TRACE: the promise is about what the
+            // server is CAPABLE of emitting at any level, and a test filtered to
+            // `info!` would miss exactly the `debug!` a developer adds while
+            // investigating a bug. That is how this promise breaks in practice.
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(|| LogSinkShared)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
+
+    /// A writer that appends into the shared static sink.
+    struct LogSinkShared;
+
+    impl std::io::Write for LogSinkShared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut sink) = CAPTURED_LOGS.lock() {
+                sink.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn clear_captured() {
+        CAPTURED_LOGS.lock().expect("log sink lock").clear();
+    }
+
+    fn captured() -> String {
+        String::from_utf8(CAPTURED_LOGS.lock().expect("log sink lock").clone())
+            .expect("log lines are utf-8")
+    }
+
+    /// A sentinel prompt sent through the REAL handler must never reach the log.
+    ///
+    /// The sentinel is deliberately unmistakeable and cannot collide with a token
+    /// count, a uuid, a model name or a timestamp, so a contains match is decisive
+    /// rather than a heuristic.
+    #[tokio::test]
+    async fn a_customer_prompt_never_reaches_the_log() {
+        const SENTINEL: &str = "SENTINEL_PROMPT_9f3a_do_not_log_me";
+
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        let body = format!(
+            r#"{{"model":"flash","stream":true,"messages":[{{"role":"user","content":"{SENTINEL}"}}]}}"#
+        );
+
+        // The global subscriber is installed BEFORE the work is spawned, so lines from
+        // the spawned settlement task are captured too. The EnvLock is held for the
+        // whole test because the sink is process-wide.
+        let _lock = crate::routes::test_env::EnvLock::acquire();
+        install_global_capture();
+        clear_captured();
+
+        // Driven through the REAL handler. This request cannot reach a provider
+        // (no key is configured for the endpoint in this fixture), so it exercises
+        // the failure paths - which is where a body is most tempting to log while
+        // debugging. The prompt is in the request regardless of the outcome.
+        let result = call_chat_completions(&state, &key, &body).await;
+        drop(result);
+        let logged = captured();
+
+        assert!(
+            !logged.contains(SENTINEL),
+            "docs/observability.md:46-59 - a customer prompt must NEVER be logged. It appeared in:\n{logged}"
+        );
+        // Nor may the raw request body appear, which would leak the prompt through a
+        // different door (the whole request rather than the field).
+        assert!(
+            !logged.contains("messages"),
+            "the request body must not be logged; the promise covers the prompt INSIDE it. Logged:\n{logged}"
+        );
+
+        // POSITIVE CONTROL, and it EARNED ITS PLACE: when this test ran under the full
+        // suite with a thread-local subscriber, the capture was EMPTY and the two
+        // assertions above passed VACUOUSLY. This is the assertion that failed instead,
+        // which is exactly why a privacy test needs a control that can fail.
+        assert!(
+            logged.contains("model") || logged.contains("account_id"),
+            "the request must still be OBSERVABLE (model, account, or a token count), or the privacy assertion is vacuous:\n{logged}"
+        );
+
+        db.close().await;
+    }
     async fn with_fixture<F>(db: TestDb, assertions: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
@@ -2766,6 +3871,252 @@ mod tests {
         let outcome = tokio::spawn(assertions).await;
         db.close().await;
         outcome.expect("the money-path assertions panicked");
+    }
+
+    /// Wait until the wallet balance STOPS MOVING, then return it.
+    ///
+    /// WHY THIS EXISTS. `ReservationGuard::drop` releases through `tokio::spawn`, because `Drop`
+    /// cannot await. So every `guard.defuse()` call site has a twin the tests never see: if the
+    /// defuse is missing, the guard's Drop fires a SECOND release on a detached task, and a test
+    /// that reads the balance right after the handler returns reads it BEFORE that task commits.
+    ///
+    /// MEASURED, and this is what prompted the helper: deleting `guard.defuse()` at each of the six
+    /// production call sites left all 77 `routes::proxy` tests green. Running
+    /// `a_failed_upstream_releases_the_whole_hold_and_never_strands_it` six times with the defuse at
+    /// site 1442 deleted caught it ZERO times - the assertion always won the race.
+    ///
+    /// Polling to a FIXED POINT rather than sleeping a fixed time is what makes the double credit
+    /// observable: a correct request lets the balance settle ONCE, while a double credit moves it a
+    /// second time after the handler has already returned. A fixed sleep would either be flaky (too
+    /// short) or slow (too long); a fixed point is neither.
+    ///
+    /// It returns the settled balance so the assertion can be about the number, not the timing.
+    async fn settled_balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
+        let mut last = balance(pool, account_id).await;
+        // Generous: 200 polls at 10ms is two seconds, well past any detached task on a test pool.
+        // `stable_for` requires the balance to agree across SEVERAL consecutive reads, so one slow
+        // task cannot be mistaken for a settled value.
+        let mut stable_for = 0;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let now = balance(pool, account_id).await;
+            if now == last {
+                stable_for += 1;
+                if stable_for >= 5 {
+                    return now;
+                }
+            } else {
+                last = now;
+                stable_for = 0;
+            }
+        }
+        last
+    }
+
+    /// A REQUEST THAT NEVER REACHED A PROVIDER COSTS NOTHING - asserted after the guard's detached
+    /// release has had its chance to land.
+    ///
+    /// This is `a_failed_upstream_releases_the_whole_hold_and_never_strands_it` with the race
+    /// removed, and it exists because that test cannot catch a missing `defuse` at site 1442: it
+    /// reads the wallet before the spawned release commits. With `settled_balance`, a missing defuse
+    /// credits the hold a second time and the settled balance is `opening_idr + held_idr`, which
+    /// this asserts against.
+    #[tokio::test]
+    async fn a_refused_request_settles_to_its_opening_balance_and_never_credits_twice() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let expected_hold = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        assert!(
+            expected_hold > 0,
+            "the worst case must be a real hold, otherwise the test asserts nothing: {expected_hold}"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            call_chat_completions(&state, &key, body)
+                .await
+                .expect_err("with no provider key in the environment the upstream is unreachable");
+
+            // The handler has returned. Now let any detached guard release commit, and read the
+            // balance once it has genuinely stopped moving.
+            let settled = settled_balance(&pool_for_assertions, account_id).await;
+            assert_eq!(
+                settled, opening_idr,
+                "a refused request must settle to its OPENING balance. The hold came back once \
+                 (expected_hold = {expected_hold}); a balance of {} means the guard's Drop released \
+                 it a SECOND time because `guard.defuse()` was not called on this path - money in \
+                 the wallet with no ledger row behind it",
+                opening_idr + expected_hold
+            );
+            assert_eq!(
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a) after the detached release settled: balance_idr must equal \
+                 SUM(ledger.delta_idr), so the double credit is not merely a wrong number but a \
+                 ledger the wallet cannot explain"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a refused request leaves ZERO stranded holds"
+            );
+
+            // The ledger agrees with the wallet. Scoped to THIS request's reservation ref, because
+            // the opening top-up is in the same ledger and would otherwise dominate the list.
+            let deltas = ledger_deltas(&pool_for_assertions, account_id).await;
+            let reservation_ref = deltas
+                .iter()
+                .find(|(delta, _)| *delta == -expected_hold)
+                .and_then(|(_, reference)| reference.clone())
+                .expect("the hold carries its reservation ref");
+            let request_rows: Vec<i64> = deltas
+                .iter()
+                .filter(|(_, reference)| reference.as_deref() == Some(reservation_ref.as_str()))
+                .map(|(delta, _)| *delta)
+                .collect();
+            assert_eq!(
+                request_rows,
+                vec![-expected_hold, expected_hold],
+                "the whole ledger move for a refused request is -hold then +hold, and NOTHING else: \
+                 a third row under this ref is the double release"
+            );
+        })
+        .await;
+    }
+
+    /// A WASHED STREAM (no usage reported) SETTLES TO ITS OPENING BALANCE, for the same reason.
+    ///
+    /// This drives `settle_after_stream` DIRECTLY, the way the settlement test does, rather than the
+    /// handler. That is deliberate and was corrected by measurement: driving the real handler cannot
+    /// reach the washed branch at all in this fixture, because with no provider key in the
+    /// environment the upstream is unreachable and the request exits at the FAILURE site instead.
+    /// MEASURED: with the handler-driven form, deleting the `defuse` at the washed call site left
+    /// the whole module green (79 passed / 0 failed); the assertion was testing the 503 path and
+    /// never the wash.
+    ///
+    /// Constructing the outcome and the guard here is what puts the washed branch under test, so the
+    /// call site's `defuse` is exercised rather than a different branch's.
+    #[tokio::test]
+    async fn a_washed_stream_settles_to_its_opening_balance_and_never_credits_twice() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let held_idr = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        assert!(
+            held_idr > 0,
+            "the fixture needs a real hold, got {held_idr}"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            assert!(matches!(
+                reserve_balance_transaction(
+                    &pool_for_assertions,
+                    account_id,
+                    held_idr,
+                    Some(&reservation_ref)
+                )
+                .await
+                .expect("place the hold"),
+                ReservationResult::Held { .. }
+            ));
+
+            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+            let guard = ReservationGuard::new(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                &reservation_ref,
+                "flash",
+            );
+            // NoUsage is the washed outcome: the stream ended without reporting anything.
+            assert!(
+                settle_tx.send(StreamEnd::NoUsage).is_ok(),
+                "the settlement task must still be listening"
+            );
+
+            settle_after_stream(
+                settle_rx,
+                pool_for_assertions.clone(),
+                state.config.clone(),
+                state.events.clone(),
+                account_id,
+                key_id,
+                "flash".to_string(),
+                held_idr,
+                guard,
+                state.tasks.begin(),
+            )
+            .await;
+
+            // Let any detached guard release commit before reading. With the washed call site's
+            // `defuse` present the guard is claimed and the balance is already final; without it the
+            // Drop fires a second release and the settled balance overshoots by exactly held_idr.
+            let settled = settled_balance(&pool_for_assertions, account_id).await;
+            assert_eq!(
+                settled,
+                opening_idr,
+                "a stream that reported no usage is billed NOTHING, so the wallet settles at its \
+                 opening balance (held_idr = {held_idr}). A balance of {} is the guard releasing a \
+                 hold the washed path already gave back",
+                opening_idr + held_idr
+            );
+            assert_eq!(
+                usage_today(&pool_for_assertions, account_id).await,
+                None,
+                "no usage was reported, so no usage row may exist"
+            );
+            assert_eq!(
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): the wallet and the ledger must agree after the release settled"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a washed request leaves ZERO stranded holds"
+            );
+
+            // Scoped to this request's ref: the opening top-up lives in the same ledger.
+            let request_rows: Vec<i64> = ledger_deltas(&pool_for_assertions, account_id)
+                .await
+                .into_iter()
+                .filter(|(_, reference)| reference.as_deref() == Some(reservation_ref.as_str()))
+                .map(|(delta, _)| delta)
+                .collect();
+            assert_eq!(
+                request_rows,
+                vec![-held_idr, held_idr],
+                "the hold went out and came back under one ref, and NOTHING else: a third row is \
+                 the double release"
+            );
+        })
+        .await;
     }
 
     /// THE FAILURE PATH, THROUGH THE REAL HANDLER. A request that never reaches a
@@ -2845,7 +4196,7 @@ mod tests {
             );
 
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr,
                 "a refused request must cost the customer nothing"
             );
@@ -2862,7 +4213,7 @@ mod tests {
                 "nothing was generated, so nothing may be billed"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
             );
@@ -2902,10 +4253,15 @@ mod tests {
             .find(|m| m.name == "flash")
             .expect("flash is configured");
 
+        // THESE COUNTS ARE LARGE ON PURPOSE, and the floor assertion below is what keeps them honest.
+        // At `1000 / 400 / 2000` the whole charge is 37 IDR and the classes are indistinguishable
+        // after `ceil()`; at this scale the charge is ~3,617 IDR and a swap moves it by ~4.8 IDR, so
+        // the assertion below can actually fail. The hold still covers it comfortably - the assertion
+        // just after this checks that, and the wallet is funded well above.
         let usage = Usage {
-            input_tokens: 1_000,
-            cache_read_tokens: 400,
-            output_tokens: 2_000,
+            input_tokens: 100_000,
+            cache_read_tokens: 40_000,
+            output_tokens: 200_000,
         };
         let cost_idr = calculate_token_cost_idr(
             model_cfg.price,
@@ -2919,6 +4275,66 @@ mod tests {
         assert!(
             held_idr > cost_idr,
             "the worst-case hold must cover the real cost, or the fixture proves nothing ({held_idr} vs {cost_idr})"
+        );
+
+        // THE INDEPENDENT CHARGE, computed HERE so it does not borrow the config the fixture moves.
+        //
+        // The `cost_idr` above cannot falsify a mistake in the settlement's own call: it is produced by
+        // the SAME function with the SAME `usage`, so a wrong count or a swapped rate cancels out on
+        // both sides. MEASURED: putting `usage.input_tokens` where `usage.cache_read_tokens` belongs at
+        // the production call site left the whole suite green at 679 passed / 0 failed.
+        //
+        // So the arithmetic is written out from the token counts and the three rates, rather than
+        // called. It is the same formula stated a second time on purpose - a second statement is what
+        // makes the first falsifiable.
+        let (price, r_in, r_cache, r_out) = (
+            model_cfg.price,
+            model_cfg.rates.input_peak,
+            model_cfg.rates.cache_read_peak,
+            model_cfg.rates.output_peak,
+        );
+        let expected_wholesale = (usage.input_tokens as f64 / 1_000_000.0) * r_in
+            + (usage.cache_read_tokens as f64 / 1_000_000.0) * r_cache
+            + (usage.output_tokens as f64 / 1_000_000.0) * r_out;
+        let expected_cost = (expected_wholesale * price).ceil() as i64;
+
+        // The fixture only proves anything if the classes have DISTINCT counts: were input and
+        // cache-read equal, a call site that confused them would charge the same either way and no
+        // assertion could tell.
+        assert_ne!(
+            usage.input_tokens, usage.cache_read_tokens,
+            "the fixture must use DIFFERENT counts for the input and cache-read classes, or a call \
+             site that swaps them is indistinguishable"
+        );
+
+        // AND THE COUNTS MUST BE LARGE ENOUGH THAT A SWAP SURVIVES THE CEILING.
+        //
+        // THIS IS THE DEFECT THE ASSERTION ABOVE COULD NOT SEE, and it took a second measurement to
+        // find. At `input=1000, cache_read=400, output=2000` the whole charge is **37 IDR**, and the
+        // difference a cache/input swap makes is 1.6 IDR - which `ceil()` absorbs. MEASURED on the
+        // real rates: correct 37, swapped 37. So the swap was invisible not because nothing checked
+        // it but because this fixture is too SMALL for the two answers to differ in whole rupiah.
+        //
+        // The threshold is arithmetic, not a guess. The mutation this guards replaces the
+        // CACHE-READ COUNT with the INPUT count, so the charge moves by
+        // `(input - cache_read) * r_cache / 1e6 * price` - the extra tokens priced at the CACHE rate,
+        // not at the difference between the two rates. MEASURED for the counts below:
+        // (1000-400)/1e6 * 53.54 * 1.5 = 0.048 IDR, which `ceil()` absorbs, while the two rounded
+        // totals are both 37. A first version of this formula used `(r_in - r_cache)` and was wrong
+        // about which rate the substituted tokens are charged at; it passed a fixture this check
+        // exists to reject.
+        let swap_idr = (usage.input_tokens.abs_diff(usage.cache_read_tokens) as f64 / 1_000_000.0)
+            * r_cache
+            * price;
+        assert!(
+            swap_idr >= 1.0,
+            "the fixture's input and cache-read counts differ too little for a call site that SWAPS \
+             them to change the rounded charge: the swap moves {swap_idr:.6} IDR, which `ceil()` \
+             absorbs, so every assertion about the charge passes either way. Raise the counts until \
+             this is at least 1 IDR. Counts in use: input={}, cache_read={}, r_cache={r_cache}, \
+             price={price}",
+            usage.input_tokens,
+            usage.cache_read_tokens
         );
 
         let pool_for_assertions = pool.clone();
@@ -2938,7 +4354,7 @@ mod tests {
                 "the wallet must cover the worst case, got {held:?}"
             );
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr - held_idr,
                 "the hold must be OUT of the wallet for the whole upstream call"
             );
@@ -2968,13 +4384,23 @@ mod tests {
                 "flash".to_string(),
                 held_idr,
                 guard,
+                state.tasks.begin(),
             )
             .await;
 
+            // SETTLED TO A FIXED POINT, not read once. This assertion used plain `wallet_balance`,
+            // and that was not enough: `settle_after_stream` defuses the guard on this arm, and if
+            // it ever stops doing so the guard's Drop fires a SECOND release on a DETACHED task -
+            // which commits after this line runs. MEASURED: deleting the Settled arm's
+            // `guard.defuse()` left the WHOLE `routes::proxy` module green at 79 passed, ten runs
+            // out of ten. The amount is right either way at the instant of the read; only the
+            // settled form can see the money arrive afterwards.
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                settled_balance(&pool_for_assertions, account_id).await,
                 opening_idr - cost_idr,
-                "the request must cost exactly the reported usage, not the hold"
+                "the request must cost exactly the reported usage, not the hold - and it must STAY \
+                 that way. A balance that keeps moving after the handler returned is the guard's \
+                 Drop releasing a hold the settlement already credited"
             );
 
             let (input, cache_read, output, cost) = usage_today(&pool_for_assertions, account_id)
@@ -2990,6 +4416,43 @@ mod tests {
                 "the three token classes are ALWAYS separate - never summed"
             );
             assert_eq!(cost, cost_idr, "usage_daily carries what the request cost");
+
+            // AND THE CHARGE IS THE ONE AN INDEPENDENT COMPUTATION GIVES.
+            //
+            // The assertion above is a TAUTOLOGY: `cost_idr` was produced by calling
+            // `calculate_token_cost_idr` with `usage`, and the settlement calls the SAME function with
+            // the SAME `usage`, so any mistake inside that call cancels out. MEASURED: replacing the
+            // cache-read COUNT with the input count at the production call site
+            // (`usage.input_tokens` where `usage.cache_read_tokens` belongs) left the whole suite
+            // green at 679 passed / 0 failed - because the fixture changed on both sides at once.
+            //
+            // The rate is pinned and the count is not, which is a subtle asymmetry: swapping
+            // `cache_read_peak` for `output_peak` DOES fail (the test's copy reads the same config
+            // field, so the two disagree with the independently derived fence below), while swapping
+            // the count does not.
+            //
+            // So this recomputes the charge from the TOKEN COUNTS AND RATES SPELLED OUT, with the
+            // arithmetic written here rather than called. It is the same formula, stated a second
+            // time on purpose: a second statement is what makes the first one falsifiable.
+            //
+            // `expected_cost` is computed OUTSIDE this closure, from the same three counts and rates,
+            // and captured as an `i64` - so this assertion cannot borrow the config the fixture moved.
+            assert_eq!(
+                cost, expected_cost,
+                "the settled charge must equal the three token classes priced at their OWN rates and \
+                 rounded up. A count charged at another class's rate, or one class dropped, moves this \
+                 number - and it moves it HERE even when it moves the test's own `cost_idr` copy by the \
+                 same amount, which is what made the assertion above blind to it"
+            );
+
+            // The fixture only proves anything if the three counts are DISTINCT: if input and
+            // cache-read were equal, a call site that confused them would charge the same either way
+            // and no assertion here could tell.
+            assert_ne!(
+                usage.input_tokens, usage.cache_read_tokens,
+                "the fixture must use DIFFERENT counts for the input and cache-read classes, or a \
+                 call site that swaps them is indistinguishable"
+            );
 
             // Scoped to THIS request's reservation ref: the opening top-up is in
             // the same ledger, so the account-wide sum would be dominated by it.
@@ -3018,7 +4481,7 @@ mod tests {
                 "INVARIANT (b): a settled hold must be paired, not stranded"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
             );
@@ -3026,8 +4489,503 @@ mod tests {
         .await;
     }
 
+    /// THE PARTIAL ARM, DRIVEN THROUGH `settle_after_stream`, so its `defuse` is actually exercised.
+    ///
+    /// The clamped-debit test proves the MONEY RULE - a debit that cannot be covered clamps and still
+    /// records the usage - but it calls `debit_usage_transaction` DIRECTLY, so it never enters the
+    /// `Partial` arm of `settle_after_stream`. MEASURED: deleting that arm's `guard.defuse()` left
+    /// the entire `routes::proxy` module green at 79 passed. The arm is where the hold is claimed
+    /// after a clamped debit, and without the claim the guard's Drop releases the hold a SECOND time
+    /// - on top of an undercharge, which would PAY the customer for usage they did not cover.
+    ///
+    /// **THE FIXTURE HAS TO MAKE THE COST EXCEED THE HOLD, and deriving that is the whole test.**
+    /// Draining the wallet is NOT enough, and the first two versions of this test were wrong because
+    /// they assumed it was. `debit_usage_transaction` credits the hold back BEFORE it debits
+    /// (`db.rs`, step 0 then step 1), so the balance at debit time is `wallet_after_hold + hold`
+    /// whatever the wallet held - draining it just makes that sum exactly `hold`. `Partial` needs
+    /// `try_debit(cost)` to fail, i.e. `cost > hold`, so the usage has to be large enough that the
+    /// charge outstrips the worst-case reservation. At `output_peak = 10707.12` IDR per million
+    /// tokens that is a few hundred thousand output tokens, which is what this fixture uses.
+    ///
+    /// The assertions then split the two things worth separating: the hold comes back exactly once
+    /// (a second release would be money invented), and the usage is recorded in full (an undercharge
+    /// is a shortfall, not a lost charge).
+    #[tokio::test]
+    async fn a_partial_settlement_through_the_caller_claims_the_hold_and_never_credits_twice() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let held_idr = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        let model_cfg = state
+            .config
+            .models
+            .iter()
+            .find(|m| m.name == "flash")
+            .expect("flash is configured");
+
+        // **THE CHARGE MUST EXCEED THE OPENING BALANCE, not the hold, and getting that wrong cost
+        // three attempts.** `debit_usage_transaction` credits the hold back BEFORE it debits, so by
+        // the time `try_debit(cost)` runs the wallet holds exactly what it held before the hold was
+        // placed - `opening - hold + hold`. Draining the wallet afterwards does not change that sum,
+        // and a cost above the HOLD is not enough either: measured twice, both times the full charge
+        // was collected and the ordinary `Settled` arm was taken. `Partial` needs `cost > opening`.
+        //
+        // The margin is deliberately large (4x the opening balance) so the test does not sit on the
+        // boundary of a rounding rule it does not mean to test.
+        let usage = Usage {
+            input_tokens: 0,
+            cache_read_tokens: 0,
+            output_tokens: 25_000_000,
+        };
+        let cost_idr = calculate_token_cost_idr(
+            model_cfg.price,
+            usage.input_tokens as u64,
+            model_cfg.rates.input_peak,
+            usage.cache_read_tokens as u64,
+            model_cfg.rates.cache_read_peak,
+            usage.output_tokens as u64,
+            model_cfg.rates.output_peak,
+        );
+        assert!(
+            cost_idr > opening_idr,
+            "the fixture must produce a charge the OPENING BALANCE cannot cover, or the clamped arm \
+             is unreachable: cost {cost_idr} vs opening {opening_idr} (hold {held_idr})"
+        );
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            let held = reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+            assert!(
+                matches!(&held, ReservationResult::Held { .. }),
+                "the hold must land, got {held:?}"
+            );
+
+            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+            let guard = ReservationGuard::new(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                &reservation_ref,
+                "flash",
+            );
+            assert!(
+                settle_tx.send(StreamEnd::Settled(usage)).is_ok(),
+                "the settlement task must still be listening"
+            );
+
+            // Subscribed BEFORE the settlement runs, so an event published during it cannot be missed.
+            let mut rx = state.events.subscribe_for_test();
+
+            settle_after_stream(
+                settle_rx,
+                pool_for_assertions.clone(),
+                state.config.clone(),
+                state.events.clone(),
+                account_id,
+                key_id,
+                "flash".to_string(),
+                held_idr,
+                guard,
+                state.tasks.begin(),
+            )
+            .await;
+
+            // The hold came back and the charge could not be covered, so the wallet is back where
+            // the hold left it - and it must STOP there. A balance that keeps climbing is the
+            // guard's Drop releasing the hold a second time, which pays the customer for usage they
+            // could not cover.
+            //
+            // The clamped debit takes whatever the wallet CAN cover, which here is the whole
+            // `opening - hold` residue: the charge is 4x the opening balance, so the shortfall is
+            // real and the part that was collected is `opening - hold`.
+            let settled = settled_balance(&pool_for_assertions, account_id).await;
+            assert_eq!(
+                settled, 0,
+                "the clamped debit takes every collectable rupiah - `opening - hold` - and leaves \
+                 the wallet at zero. A balance of {} is the guard's Drop releasing the hold a SECOND \
+                 time after the clamped debit already returned it, which pays the customer for usage \
+                 they could not cover. hold {held_idr}, cost {cost_idr}, opening {opening_idr}",
+                opening_idr - held_idr
+            );
+
+            // The usage is still recorded in full: an undercharge is a shortfall, not a lost charge.
+            let recorded = usage_today(&pool_for_assertions, account_id)
+                .await
+                .expect("a clamped settlement still records the usage");
+            assert_eq!(
+                (recorded.0, recorded.1, recorded.2),
+                (
+                    usage.input_tokens,
+                    usage.cache_read_tokens,
+                    usage.output_tokens
+                ),
+                "the clamped debit must still record the real counters, separately"
+            );
+
+            assert_eq!(
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a partial settlement pairs its hold, never strands it"
+            );
+
+            // AND THE EVENTS IT PUBLISHED ARE ADDRESSED TO THIS ACCOUNT.
+            //
+            // This arm publishes `publish_balance` AND `publish_usage`, and MEASURED, both could be
+            // sent to a DIFFERENT account - `publish_balance(&events, Uuid::new_v4(), ..)` - with the
+            // whole suite green at 675 passed / 0 failed. The same gap was found and closed on the
+            // webhook's settlement path last round; this is the STREAMING path, which carries the
+            // traffic, and it was still open.
+            //
+            // `publish_balance` is scoped by account so only that dashboard receives it - events.rs
+            // calls this the DEFECT 1 filter. A wrong id puts one customer's balance and daily usage
+            // on another customer's live stream.
+            //
+            // The subscription is taken from the SAME `state.events` the call above publishes into,
+            // and the harness is only viable because `subscribe_for_test` exists - the hub's own
+            // `subscribe` is private to events.rs.
+            let delivered: Vec<_> = std::iter::repeat(())
+                .map_while(|_| rx.try_recv().ok())
+                .collect();
+            let names: Vec<&str> = delivered.iter().map(|e| e.name()).collect();
+            assert_eq!(
+                delivered.len(),
+                2,
+                "the Partial arm publishes exactly a balance and a usage event, in that order, got \
+                 {names:?}. Zero means the subscriptions missed them; the negative control below is \
+                 what keeps this assertion from being satisfied by silence"
+            );
+            assert_eq!(
+                names,
+                vec!["balance", "usage"],
+                "the clamped settlement publishes the balance FIRST and the usage totals second: {names:?}"
+            );
+            for event in &delivered {
+                assert_eq!(
+                    event.account_id(),
+                    account_id,
+                    "every event here must be addressed to the account that was billed. Another id \
+                     puts this customer's balance and usage on another customer's live stream, which \
+                     is the leak the DEFECT 1 filter exists to stop"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A SETTLEMENT THAT FAILS GIVES THE HOLD BACK, and that release is the one thing standing
+    /// between a database fault and a customer losing money on a request that was never billed.
+    ///
+    /// This is the `Err` arm the comment calls "the exact bug this fix closes - the old code warned
+    /// and walked away". MEASURED before this test: deleting its `guard.defuse()` left the whole
+    /// `routes::proxy` module green at 80 passed. The arm is reached only when
+    /// `debit_usage_transaction` RETURNS A FAULT, and no fixture produced one:
+    ///
+    ///   - a short wallet is an OUTCOME, not an error - it takes the `Partial` arm;
+    ///   - a DELETED wallet is also not an error - `try_credit` returns `None`, the release records
+    ///     zero, and `try_debit` then finds no row, which is `Partial` again. Found by reading
+    ///     `debit_usage_transaction`'s step 0; it never reaches this arm.
+    ///
+    /// So the fixture has to break the WRITE rather than the wallet. Dropping `usage_events` makes
+    /// `record_usage` fail, which fails the whole settlement transaction, while leaving `wallets` and
+    /// `ledger` intact - and that distinction is what makes the test mean something:
+    /// `release_quietly` writes to `ledger`, not to the dropped table, so the release CAN still
+    /// succeed. A fixture that broke the ledger too would reach the arm and then prove nothing about
+    /// whether the arm helps.
+    #[tokio::test]
+    async fn a_failed_settlement_releases_the_hold_rather_than_stranding_it() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let state = test_state(pool.clone());
+        let opening_idr = 50_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let key_id = create_api_key(
+            &pool,
+            account_id,
+            &format!("apk_live_{}", Uuid::new_v4().simple()),
+            &["flash"],
+        )
+        .await;
+
+        let body = r#"{"model":"flash","stream":true}"#;
+        let held_idr = expected_hold_idr(&state.config, "flash", body.as_bytes(), None);
+        let usage = Usage {
+            input_tokens: 1_000,
+            cache_read_tokens: 400,
+            output_tokens: 2_000,
+        };
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+            let held = reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+            assert!(
+                matches!(&held, ReservationResult::Held { .. }),
+                "the hold must land, got {held:?}"
+            );
+            assert_eq!(
+                balance(&pool_for_assertions, account_id).await,
+                opening_idr - held_idr,
+                "the hold is out of the wallet before the settlement"
+            );
+
+            // Break the WRITE the settlement performs, not the wallet it debits. `usage_events` is
+            // written by `record_usage` inside the settlement transaction; `wallets` and `ledger`
+            // stay intact, so the recovery release still has somewhere to land.
+            sqlx::query("DROP TABLE usage_events")
+                .execute(&pool_for_assertions)
+                .await
+                .expect("drop the table the settlement writes");
+
+            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+            let guard = ReservationGuard::new(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                &reservation_ref,
+                "flash",
+            );
+            assert!(
+                settle_tx.send(StreamEnd::Settled(usage)).is_ok(),
+                "the settlement task must still be listening"
+            );
+
+            settle_after_stream(
+                settle_rx,
+                pool_for_assertions.clone(),
+                state.config.clone(),
+                state.events.clone(),
+                account_id,
+                key_id,
+                "flash".to_string(),
+                held_idr,
+                guard,
+                state.tasks.begin(),
+            )
+            .await;
+
+            // THE MONEY COMES BACK. The debit failed, so nothing was charged and the hold must be
+            // returned - and exactly once. A missing defuse on this arm means the explicit release
+            // above AND the guard's Drop both fire, crediting the hold twice.
+            let settled = settled_balance(&pool_for_assertions, account_id).await;
+            assert_eq!(
+                settled, opening_idr,
+                "a settlement that failed must give the WHOLE hold back and cost nothing. A balance \
+                 of {} is the guard's Drop releasing it a second time after `release_quietly` \
+                 already did - money invented against a request that was never billed. \
+                 hold {held_idr}, opening {opening_idr}",
+                opening_idr + held_idr
+            );
+
+            // And the release PAIRED the hold, so the stranded-hold detector stays quiet.
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "INVARIANT (b): a failed settlement must not leave the customer's money stranded - \
+                 this is the defect the arm exists to prevent"
+            );
+            assert_eq!(
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
+    /// A SETTLED GUARD MUST NOT RELEASE ITS HOLD, and `defuse` is the only thing stopping it.
+    ///
+    /// The settlement test above cannot see this, and the reason is structural rather than a gap in
+    /// that test: `ReservationGuard::drop` releases through `tokio::spawn`, because `Drop` cannot
+    /// await, so the second credit lands on a DETACHED task that the assertion typically runs ahead
+    /// of. MEASURED: deleting `guard.defuse()` from the `Settled` arm of `settle_after_stream` left
+    /// all 75 `routes::proxy` tests green across five consecutive runs.
+    ///
+    /// A DETACHED RELEASE IS TESTABLE IF THE TEST DRIVES IT ITSELF. This test takes a guard, defuses
+    /// it, drops it, and then YIELDS until the spawned task has had its chance - so the assertion is
+    /// about the guard's behaviour rather than about a race the scheduler decides.
+    ///
+    /// WHY IT MATTERS. `release_reservation_transaction` credits UNCONDITIONALLY: it never checks
+    /// whether the ref is already paired, and `try_credit` has no idempotency guard. So a guard that
+    /// releases after a committed settlement credits the hold a SECOND time - money appearing in the
+    /// wallet that no ledger row accounts for, which is the `drift_rows` invariant failing and the
+    /// shape this repository calls "invisible money". `defuse` is the entire barrier.
+    #[tokio::test]
+    async fn a_defused_guard_never_credits_the_hold_a_second_time() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let opening_idr = 50_000;
+        let held_idr = 10_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+            assert_eq!(
+                balance(&pool_for_assertions, account_id).await,
+                opening_idr - held_idr,
+                "the hold is out of the wallet"
+            );
+
+            // (1) DEFUSED: the settlement already credited the hold inside its own transaction.
+            {
+                let mut guard = ReservationGuard::new(
+                    &pool_for_assertions,
+                    account_id,
+                    held_idr,
+                    &reservation_ref,
+                    "flash",
+                );
+                guard.defuse();
+                // Dropped here. A defused guard must do nothing.
+            }
+
+            // Let any spawned task run, so the assertion is not racing the scheduler. Several
+            // yields and a short sleep cover a task queued behind other work.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            assert_eq!(
+                balance(&pool_for_assertions, account_id).await,
+                opening_idr - held_idr,
+                "a DEFUSED guard must not credit the hold back: the settlement already released it \
+                 inside its own committed transaction, and `release_reservation_transaction` \
+                 credits unconditionally, so a second release invents money the ledger cannot \
+                 account for"
+            );
+
+            // The pairing count is the same fact through the detector the alert uses: one negative
+            // row and no positive one, because the settlement never ran here.
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                1,
+                "the hold is still unpaired: the defused guard wrote no release row"
+            );
+        })
+        .await;
+    }
+
+    /// The other half, so the pair brackets the flag: a guard that is NOT defused DOES release.
+    ///
+    /// Without this, making `Drop` a no-op entirely would pass the test above - and silently turn
+    /// every aborted request into a stranded hold, which is the failure the guard exists to prevent.
+    #[tokio::test]
+    async fn an_undefused_guard_releases_the_hold_so_an_aborted_request_strands_nothing() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let opening_idr = 50_000;
+        let held_idr = 10_000;
+        open_wallet(&pool, account_id, opening_idr).await;
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+
+        let pool_for_assertions = pool.clone();
+        with_fixture(db, async move {
+            reserve_balance_transaction(
+                &pool_for_assertions,
+                account_id,
+                held_idr,
+                Some(&reservation_ref),
+            )
+            .await
+            .expect("place the hold");
+
+            // NOT defused: this is the aborted-request case - the client reset, or a `?` on an
+            // earlier step. The guard's Drop must give the whole hold back.
+            {
+                let _guard = ReservationGuard::new(
+                    &pool_for_assertions,
+                    account_id,
+                    held_idr,
+                    &reservation_ref,
+                    "flash",
+                );
+            }
+
+            // Poll until the detached release commits, rather than assuming a fixed delay: the
+            // spawned task has to open a transaction and take the write lock.
+            let mut balance = balance(&pool_for_assertions, account_id).await;
+            for _ in 0..200 {
+                if balance == opening_idr {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                balance = crate::test_support::balance(&pool_for_assertions, account_id).await;
+            }
+
+            assert_eq!(
+                balance, opening_idr,
+                "an UNDEFUSED guard must release the hold: this is the aborted-request path, and \
+                 failing to release leaves a stranded hold - the money out of the wallet until an \
+                 operator runs the sweep"
+            );
+            assert_eq!(
+                unpaired_hold_rows(&pool_for_assertions, account_id)
+                    .await
+                    .expect("stranded-hold sweep"),
+                0,
+                "the release must pair the hold, so the stranded-hold alert stays quiet"
+            );
+            assert_eq!(
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
+                0,
+                "the release must keep balance_idr equal to SUM(ledger.delta_idr)"
+            );
+        })
+        .await;
+    }
+
     /// THE WASHED CASE. A stream that ended without a usage report is billed
-    /// NOTHING and gives the whole hold back (docs/failover.md:138-144). Token
+    /// NOTHING and gives the whole hold back (docs/failover.md (Mid-stream failure and billing)). Token
     /// counts are never invented to fill the gap.
     #[tokio::test]
     async fn a_stream_without_usage_is_washed_and_the_whole_hold_returns() {
@@ -3090,11 +5048,12 @@ mod tests {
                 "flash".to_string(),
                 held_idr,
                 guard,
+                state.tasks.begin(),
             )
             .await;
 
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr,
                 "an unreported stream must not be billed against invented token counts"
             );
@@ -3129,7 +5088,7 @@ mod tests {
                 "INVARIANT (b): a washed request must leave ZERO stranded holds"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
             );
@@ -3181,6 +5140,7 @@ mod tests {
                 &pool_for_assertions,
                 account_id,
                 Some(key_id),
+                "flash",
                 500,
                 100,
                 1_000,
@@ -3200,10 +5160,19 @@ mod tests {
                 },
                 "a wallet that cannot cover the cost is a recorded shortfall, not a dropped charge"
             );
+            // SETTLED TO A FIXED POINT. The Partial arm defuses the guard because the clamped debit
+            // already credited the hold inside its own transaction - so a missing defuse credits it
+            // a SECOND time, on top of an UNDERCHARGE where the customer already paid less than the
+            // usage cost. A direct `wallet_balance` read cannot see that: the second release arrives
+            // on a detached task after the line runs. MEASURED: deleting this arm's
+            // `guard.defuse()` left the whole module green at 79 passed; with the fixed point it
+            // fails.
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                settled_balance(&pool_for_assertions, account_id).await,
                 0,
-                "the clamped debit lands on 0 and never below it"
+                "the clamped debit lands on 0 and never below it - and it must STAY there. A balance \
+                 that climbs after the handler returned is the guard's Drop releasing a hold the \
+                 clamped debit already gave back, which would pay the customer for an undercharge"
             );
 
             let (input, cache_read, output, cost) = usage_today(&pool_for_assertions, account_id)
@@ -3245,7 +5214,7 @@ mod tests {
                 "INVARIANT (b): a clamped settlement still pairs its hold"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): a clamped debit must not break balance_idr = SUM(ledger.delta_idr)"
             );
@@ -3256,7 +5225,7 @@ mod tests {
     // ---------------------------------------------------------------------
     // THE DEAREST-ENDPOINT RULE, made observable.
     //
-    // docs/failover.md:162-165: the hold is taken BEFORE routing and applies
+    // docs/failover.md (Ordering with the wallet checks): the hold is taken BEFORE routing and applies
     // whichever endpoint serves the request, so it must cover the DEAREST
     // endpoint in the pool. Until per-endpoint rates existed, every endpoint of
     // a model tied (rates lived only on the model), so max() and min() over the
@@ -3272,7 +5241,7 @@ mod tests {
     /// genuinely different peak rates, cheapest first. Returns the config and
     /// the per-endpoint holds the handler must choose between.
     fn heterogeneous_flash_config() -> Arc<AppConfig> {
-        let mut config = (*live_config()).clone();
+        let mut config = (*shipped_config()).clone();
         let flash = config
             .models
             .iter_mut()
@@ -3357,12 +5326,12 @@ mod tests {
 
             // The whole hold came back, so the account is untouched...
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr,
                 "a refused request must cost the customer nothing"
             );
             // ...and the ledger still reconciles (INVARIANT (a)).
-            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(ledger_drift_rows(&pool_for_assertions, account_id).await, 0);
             assert_eq!(
                 unpaired_hold_rows(&pool_for_assertions, account_id)
                     .await
@@ -3384,7 +5353,8 @@ mod tests {
     // permitted to use it."
     //
     // The order is only observable through the error the caller gets back, so
-    // these tests assert the documented `code` (docs/error-model.md:25 - "code
+    // these tests assert the documented `code` (docs/error-model.md, Response shape -
+    // "code
     // is the contract; message is not") and, for the leak itself, that the
     // answer is IDENTICAL at a generous balance and at zero.
     //
@@ -3411,7 +5381,7 @@ mod tests {
         )
         .bind(id.hyphenated())
         .bind(account_id.hyphenated())
-        .bind(hash_string(plaintext))
+        .bind(crate::routes::hash_token(plaintext))
         .bind(serde_json::to_value(models).expect("models as JSON"))
         .bind(spend_limit_idr)
         .bind(chrono::Utc::now())
@@ -3441,7 +5411,7 @@ mod tests {
         )
         .bind(account_id.hyphenated())
         .bind(key_id.hyphenated())
-        .bind(chrono::Utc::now().date_naive())
+        .bind(crate::ip_tracking::today_utc())
         .bind(cost_idr)
         .execute(pool)
         .await
@@ -3512,15 +5482,15 @@ mod tests {
                 "no balance may be reserved before the allowlist refuses: {deltas:?}"
             );
             assert_eq!(
-                wallet_balance(&pool_for_assertions, funded_account).await,
+                balance(&pool_for_assertions, funded_account).await,
                 funded_opening,
                 "the balance must be untouched by a model denial"
             );
-            assert_eq!(wallet_balance(&pool_for_assertions, broke_account).await, 0);
+            assert_eq!(balance(&pool_for_assertions, broke_account).await, 0);
 
             for account in [funded_account, broke_account] {
                 assert_eq!(
-                    drift_rows(&pool_for_assertions, account).await,
+                    ledger_drift_rows(&pool_for_assertions, account).await,
                     0,
                     "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
                 );
@@ -3588,13 +5558,13 @@ mod tests {
 
             // A reservation that matched no row writes nothing: no ledger row, no
             // drift, no stranded hold.
-            assert_eq!(wallet_balance(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(balance(&pool_for_assertions, account_id).await, 0);
             assert_eq!(
                 ledger_deltas(&pool_for_assertions, account_id).await,
                 Vec::<(i64, Option<String>)>::new(),
                 "a refused reservation must not write a ledger row"
             );
-            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(ledger_drift_rows(&pool_for_assertions, account_id).await, 0);
             assert_eq!(
                 unpaired_hold_rows(&pool_for_assertions, account_id)
                     .await
@@ -3640,7 +5610,7 @@ mod tests {
             assert_eq!(
                 err.status_code(),
                 StatusCode::PAYMENT_REQUIRED,
-                "a key limit is a 402, not a 429 (docs/error-model.md:73-86), got {err:?}"
+                "a key limit is a 402, not a 429 (docs/error-model.md, 402 vs 429), got {err:?}"
             );
             assert_eq!(err.code(), "key_limit_exceeded");
             assert_eq!(
@@ -3651,12 +5621,1216 @@ mod tests {
                 err.details()
             );
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr,
                 "the limit refuses before any money moves"
             );
-            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(ledger_drift_rows(&pool_for_assertions, account_id).await, 0);
         })
         .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // THE PURE HELPERS that decide billing and the client-facing error, reached
+    // on every request but never on the happy path: each is pinned without a
+    // database or an upstream so a regression in the rule shows up as a red test.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_event_carries_the_code_message_and_a_request_id() {
+        let event = error_event("upstream_incomplete", "the stream ended early");
+        assert!(event.starts_with("event: error\ndata: "));
+        let data: Value =
+            serde_json::from_str(event.trim_start_matches("event: error\ndata: ").trim())
+                .expect("the error event payload is JSON");
+        assert_eq!(data["error"]["code"], "upstream_incomplete");
+        assert_eq!(data["error"]["message"], "the stream ended early");
+        assert!(data["error"]["request_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("req_"));
+    }
+
+    #[test]
+    fn requested_stream_flag_reads_only_an_explicit_bool() {
+        assert_eq!(requested_stream_flag(&json!({"stream": true})), Some(true));
+        assert_eq!(
+            requested_stream_flag(&json!({"stream": false})),
+            Some(false)
+        );
+        // absent, null and a non-bool value all fall through to "unset", never to false.
+        assert_eq!(requested_stream_flag(&json!({})), None);
+        assert_eq!(requested_stream_flag(&json!({"stream": null})), None);
+        assert_eq!(requested_stream_flag(&json!({"stream": "yes"})), None);
+    }
+
+    #[test]
+    fn stream_flag_allowed_refuses_an_explicit_false_and_accepts_everything_else() {
+        // DEFECT 3: an explicit stream:false used to be silently answered with SSE.
+        assert!(matches!(
+            stream_flag_allowed(Some(false)),
+            Err(AppError::ValidationFailed { .. })
+        ));
+        assert!(stream_flag_allowed(Some(true)).is_ok());
+        assert!(stream_flag_allowed(None).is_ok());
+    }
+
+    #[test]
+    fn estimated_input_tokens_counts_multi_byte_bytes_whole_and_floors_at_one() {
+        // ASCII: ~4 bytes per token, integer-divided.
+        assert_eq!(estimated_input_tokens(b"hello"), 1);
+        assert_eq!(estimated_input_tokens(b"a".repeat(40).as_slice()), 10);
+        // A multi-byte CJK character is held as a whole token per byte, never a fraction.
+        assert_eq!(estimated_input_tokens("日本語".as_bytes()), 9);
+        // An empty body cannot reserve zero and slip past the balance guard.
+        assert_eq!(estimated_input_tokens(b""), 1);
+    }
+
+    #[test]
+    fn force_streaming_inserts_stream_true_and_refuses_a_non_object() {
+        let value = json!({"model": "flash"});
+        let out = force_streaming(value).expect("an object body is valid");
+        assert_eq!(out["stream"], true);
+        assert_eq!(out["model"], "flash");
+
+        let err = force_streaming(Value::String("not an object".into()))
+            .expect_err("a non-object body is refused before any money moves");
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn no_upstream_retry_after_reports_the_cooldown_or_the_documented_floor() {
+        let account_id = Uuid::new_v4();
+        // A real breaker cooldown is reported verbatim.
+        assert_eq!(
+            no_upstream_retry_after(Some(42), "flash", "every endpoint unhealthy", account_id),
+            42
+        );
+        // No open breaker: the documented 1-second floor, with the cause logged.
+        assert_eq!(
+            no_upstream_retry_after(None, "flash", "transport error", account_id),
+            1
+        );
+    }
+
+    #[test]
+    fn upstream_error_maps_every_variant_without_leaking_provider_detail() {
+        let account_id = Uuid::new_v4();
+        let client = UpstreamClient::new(shipped_config());
+
+        // An unknown model is an allowlist error, not an upstream outage.
+        assert!(matches!(
+            upstream_error(
+                UpstreamError::NoModel("flash".into()),
+                "flash",
+                account_id,
+                &client
+            ),
+            AppError::ModelNotAllowed(_)
+        ));
+
+        // Every endpoint open: a 503 carrying the cooldown (or the 1s floor).
+        let AppError::NoUpstreamAvailable { retry_after_secs } = upstream_error(
+            UpstreamError::NoHealthyUpstream("flash".into()),
+            "flash",
+            account_id,
+            &client,
+        ) else {
+            panic!("NoHealthyUpstream must become NoUpstreamAvailable");
+        };
+        assert!(retry_after_secs >= 1);
+
+        // A transport error is withheld from the client and surfaced as a 503.
+        let AppError::NoUpstreamAvailable { retry_after_secs } = upstream_error(
+            UpstreamError::Transport("tls alert".into()),
+            "flash",
+            account_id,
+            &client,
+        ) else {
+            panic!("Transport must become NoUpstreamAvailable");
+        };
+        assert!(retry_after_secs >= 1);
+
+        // Every key throttled is a 503 with a Retry-After, NOT a 500.
+        //
+        // THIS ASSERTION USED TO REQUIRE `AppError::Internal`. MEASURED, that made the client receive
+        // `500 {"code":"internal_error"}` where docs/error-model.md:173 promises "only surface 503 if
+        // all fail" - and the condition was met, because `UpstreamError::RateLimited` is only produced
+        // after the pool has rotated through every key. The old comment justified the 500 as avoiding
+        // "a 503 that would invite a retry"; the 503 carries `Retry-After`, so it invites a retry AT A
+        // STATED TIME, which is the point.
+        let AppError::NoUpstreamAvailable { retry_after_secs } =
+            upstream_error(UpstreamError::RateLimited, "flash", account_id, &client)
+        else {
+            panic!(
+                "RateLimited means every key was throttled, which docs/error-model.md answers with a \
+                 503 - not the 500 this used to assert"
+            );
+        };
+        assert!(
+            retry_after_secs >= 1,
+            "a 503 must carry a Retry-After, or the client is left guessing when to return"
+        );
+
+        // A 4xx from the upstream that is neither 401/403 nor 429 is the caller's request, and stays
+        // internal: there is nothing for the client to wait for.
+        assert!(matches!(
+            upstream_error(
+                UpstreamError::ServerError(400),
+                "flash",
+                account_id,
+                &client
+            ),
+            AppError::Internal(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // THE EARLY REFUSALS of the real handler, each reached BEFORE any upstream
+    // call so they cost nothing and need no provider: the money-shaped gates.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_expired_key_is_refused_before_any_money_moves() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+        sqlx::query("UPDATE api_keys SET expires_at = ? WHERE key_hash = ?")
+            .bind(chrono::Utc::now() - chrono::Duration::hours(2))
+            .bind(crate::routes::hash_token(&key))
+            .execute(&pool)
+            .await
+            .expect("expire the key");
+
+        let err = call_chat_completions(
+            &test_state(pool.clone()),
+            &key,
+            r#"{"model":"flash","stream":true}"#,
+        )
+        .await
+        .expect_err("an expired key must not authenticate");
+        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.code(), "key_expired");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_key_over_its_rate_limit_is_refused_with_a_retry_after() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+        sqlx::query("UPDATE api_keys SET rate_limit_rpm = 1 WHERE key_hash = ?")
+            .bind(crate::routes::hash_token(&key))
+            .execute(&pool)
+            .await
+            .expect("cap the key at one request per minute");
+
+        let state = test_state(pool.clone());
+        // Admitted once (count -> 1); it fails downstream at the upstream, which
+        // is irrelevant to the rate-limit decision.
+        let _ = call_chat_completions(&state, &key, r#"{"model":"flash","stream":true}"#).await;
+        // A second request in the same minute is refused by the limiter.
+        let err = call_chat_completions(&state, &key, r#"{"model":"flash","stream":true}"#)
+            .await
+            .expect_err("the second request must hit the rate limit");
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.code(), "rate_limited");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_key_over_its_token_limit_is_refused_before_any_money_moves() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+        sqlx::query("UPDATE api_keys SET token_limit = 1 WHERE key_hash = ?")
+            .bind(crate::routes::hash_token(&key))
+            .execute(&pool)
+            .await
+            .expect("cap the key at one token");
+
+        let today: String = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens, output_tokens)
+             VALUES (?, ?, ?, 5, 5)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(key_id.hyphenated())
+        .bind(&today)
+        .execute(&pool)
+        .await
+        .expect("record prior token usage");
+
+        let err = call_chat_completions(
+            &test_state(pool.clone()),
+            &key,
+            r#"{"model":"flash","stream":true}"#,
+        )
+        .await
+        .expect_err("a key at its token ceiling must be refused");
+        assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(err.code(), "key_limit_exceeded");
+        assert_eq!(
+            err.details()
+                .and_then(|d| d["reason"].as_str().map(str::to_string)),
+            Some("token_limit_reached".to_string())
+        );
+        db.close().await;
+    }
+
+    /// The token ceiling counts ALL THREE classes, and the CACHE-READ one is the case nothing drove.
+    ///
+    /// WHY THIS IS SEPARATE. The test above seeds `input_tokens` and `output_tokens` only - its INSERT
+    /// does not name `cache_read_tokens` - so the ceiling it exercises is decided by the two obvious
+    /// classes. MEASURED: dropping `cache_read_tokens` from `key_tokens_used`'s SUM left the whole
+    /// suite green at 677 passed / 0 failed.
+    ///
+    /// `keys.rs` states the rule and argues it: "All three token classes are summed because
+    /// `token_limit` counts tokens, not money: cache-read tokens are ~50x cheaper than output tokens
+    /// but they are still tokens consumed". A key could therefore sit at its ceiling having consumed
+    /// nothing but cache reads, and the ceiling would not bite - spend would be negligible while the
+    /// token count was over. The two limits are deliberately different questions and this pins the
+    /// token one to the class that is cheapest and most easily overlooked.
+    #[tokio::test]
+    async fn the_token_ceiling_counts_cache_read_tokens_too() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 50_000).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
+        sqlx::query("UPDATE api_keys SET token_limit = 1 WHERE key_hash = ?")
+            .bind(crate::routes::hash_token(&key))
+            .execute(&pool)
+            .await
+            .expect("cap the key at one token");
+
+        let today: String = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // CACHE-READ ONLY: the other two columns are 0, so a SUM that skips this column reads 0 and
+        // the ceiling cannot bite.
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens, cache_read_tokens, output_tokens)
+             VALUES (?, ?, ?, 0, 5, 0)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(key_id.hyphenated())
+        .bind(&today)
+        .execute(&pool)
+        .await
+        .expect("record cache-read-only usage");
+
+        let err = call_chat_completions(
+            &test_state(pool.clone()),
+            &key,
+            r#"{"model":"flash","stream":true}"#,
+        )
+        .await
+        .expect_err(
+            "a key whose only recorded usage is CACHE READS is still over its token ceiling, and \
+             must be refused before any money moves. Being served here means the SUM skips \
+             cache_read_tokens, so the cheapest class is the one that can run a key past its limit",
+        );
+        assert_eq!(err.status_code(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(err.code(), "key_limit_exceeded");
+        assert_eq!(
+            err.details()
+                .and_then(|d| d["reason"].as_str().map(str::to_string)),
+            Some("token_limit_reached".to_string())
+        );
+        db.close().await;
+    }
+
+    /// ONE KEY'S USAGE MUST NOT COUNT AGAINST ANOTHER, and nothing asserted that.
+    ///
+    /// Both enforcement reads - `key_spend_used` and `key_tokens_used` - filter
+    /// `account_id = ? AND api_key_id = ?`. MEASURED: making BOTH predicates ignore `api_key_id`
+    /// (`OR 1 = 1`) left the whole suite green at 677 passed / 0 failed.
+    ///
+    /// The account half is well covered - `a_key_of_one_account_is_invisible_and_unrevokable_to_another`
+    /// pins cross-ACCOUNT tenancy - but the per-KEY half had no fixture with two keys on one account
+    /// and usage on only one of them. The spend test that comes closest creates a second key with a
+    /// DIFFERENT limit, so both keys still behave as before when the scope widens; a shared-limit
+    /// fixture is what makes the difference visible.
+    ///
+    /// WHY IT MATTERS: a key's limit is a per-key ceiling an operator sets per key. If a read is not
+    /// scoped, one busy key exhausts every OTHER key on the account - every sibling starts answering
+    /// `key_limit_exceeded` for traffic it never generated, which reads to the customer as a broken
+    /// account rather than as a limit being reached.
+    #[tokio::test]
+    async fn one_keys_usage_does_not_count_against_another_key() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        open_wallet(&pool, account_id, 500_000).await;
+
+        let busy_key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let quiet_key = format!("apk_live_{}", Uuid::new_v4().simple());
+        let busy_id = create_api_key(&pool, account_id, &busy_key, &["flash"]).await;
+        let quiet_id = create_api_key(&pool, account_id, &quiet_key, &["flash"]).await;
+
+        // The SAME ceiling on both, so a widened scope cannot be distinguished by the limit value.
+        let ceiling = 1_000;
+        sqlx::query("UPDATE api_keys SET spend_limit_idr = ? WHERE account_id = ?")
+            .bind(ceiling)
+            .bind(account_id.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("give both keys the same ceiling");
+
+        // Usage on the BUSY key only, comfortably over the ceiling. The quiet key has NONE.
+        let today: String = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        sqlx::query(
+            "INSERT INTO usage_daily (account_id, api_key_id, day, input_tokens, output_tokens, cost_idr)
+             VALUES (?, ?, ?, 10, 10, ?)",
+        )
+        .bind(account_id.hyphenated())
+        .bind(busy_id.hyphenated())
+        .bind(&today)
+        .bind(ceiling * 5)
+        .execute(&pool)
+        .await
+        .expect("record usage against the busy key only");
+
+        // The reads themselves, for the reason the mutation is about: this is where the scope lives.
+        let today_utc = crate::ip_tracking::today_utc();
+        assert_eq!(
+            crate::routes::keys::key_spend_used(&pool, account_id, busy_id, today_utc)
+                .await
+                .expect("read the busy key's spend"),
+            ceiling * 5,
+            "the busy key's own spend is what was recorded against it"
+        );
+        assert_eq!(
+            crate::routes::keys::key_spend_used(&pool, account_id, quiet_id, today_utc)
+                .await
+                .expect("read the quiet key's spend"),
+            0,
+            "the QUIET key's window spend must be ZERO: nothing was ever recorded against it. A \
+             non-zero answer means the read is not scoped by api_key_id, so one key's usage is \
+             charged against its siblings and every other key on the account refuses traffic it \
+             never generated"
+        );
+        assert_eq!(
+            crate::routes::keys::key_tokens_used(&pool, account_id, quiet_id, today_utc)
+                .await
+                .expect("read the quiet key's tokens"),
+            0,
+            "and the TOKEN read must be scoped the same way - it is a second statement, so a fix to \
+             one leaves the other"
+        );
+
+        // And the enforcement path agrees: the quiet key is not refused for a spend limit it never hit.
+        let state = test_state(pool.clone());
+        if let Err(e) =
+            call_chat_completions(&state, &quiet_key, r#"{"model":"flash","stream":true}"#).await
+        {
+            assert_ne!(
+                e.details()
+                    .and_then(|d| d["reason"].as_str().map(str::to_string)),
+                Some("spend_limit_idr_reached".to_string()),
+                "the QUIET key was refused for a spend limit it never reached, because the read \
+                 counted the busy key's usage: {e:?}"
+            );
+        }
+
+        db.close().await;
+    }
+
+    /// THE COLUMN THE KEY LIST PUBLISHES MUST ACTUALLY GET WRITTEN.
+    ///
+    /// `api_keys.last_used_at` is defined by the schema, documented in the data
+    /// model ("updated lazily, not per request"), published in the key-list
+    /// contract as the "Last used" column, rendered by the dashboard, and SELECTed
+    /// by three endpoints - and NOTHING wrote it. Every key therefore reported
+    /// `null` forever and that column could only ever say "Never".
+    ///
+    /// The fixture leaves the column NULL, so this is a real before-and-after: the
+    /// assertion below is false on the code as it was, and the mutation that
+    /// removes the write makes it fail again.
+    ///
+    /// It drives `load_key_metadata` - the MISS path - because that is where the
+    /// write lives, and it asserts the value is a real instant rather than merely
+    /// non-null: a write of the wrong column, or of a sentinel, would satisfy
+    /// "not null" while leaving the dashboard lying.
+    #[tokio::test]
+    async fn resolving_a_key_records_when_it_was_last_used() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let account_id = create_account(&pool).await;
+        let key = format!("apk_live_{}", Uuid::new_v4().simple());
+        create_api_key(&pool, account_id, &key, &["flash"]).await;
+        let digest = crate::routes::hash_token(&key);
+
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM api_keys WHERE key_hash = ?")
+                .bind(&digest)
+                .fetch_one(&pool)
+                .await
+                .expect("read the column before the request");
+        assert!(
+            before.is_none(),
+            "the fixture must start with an unused key, or this test proves nothing: got {before:?}"
+        );
+
+        let state = test_state(pool.clone());
+        let started = chrono::Utc::now();
+        load_key_metadata(key_cache(&state.config), &state.pool, &digest)
+            .await
+            .expect("the key resolves");
+
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM api_keys WHERE key_hash = ?")
+                .bind(&digest)
+                .fetch_one(&pool)
+                .await
+                .expect("read the column after the request");
+
+        let stamp = after
+            .as_deref()
+            .unwrap_or_else(|| panic!("resolving a key must record last_used_at; it is still NULL, so the dashboard can only ever say \"Never\""));
+        let parsed = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap_or_else(|e| {
+                panic!("last_used_at must be a real RFC3339 instant, got {stamp:?}: {e}")
+            })
+            .with_timezone(&chrono::Utc);
+        assert!(
+            parsed >= started - chrono::Duration::seconds(5),
+            "the recorded instant must be this request's, not a stale or placeholder value: {stamp}"
+        );
+
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // THE STREAMING PATH, DRIVEN DIRECTLY.
+    //
+
+    // The handler's streaming half is exercised one layer down: a private
+    // UpstreamClient (NOT the process-wide UPSTREAM static, which other tests
+    // already initialise against the shipped config) points at a loopback SSE
+    // stub, its UpstreamStream is wrapped in MeteredStream, and
+    // settle_after_stream is AWAITED rather than spawned - so every settlement
+    // assertion is deterministic instead of a race against a detached task.
+    // -----------------------------------------------------------------------
+
+    use crate::config::{ModelConfig, ModelEndpoint, ModelRates};
+
+    /// The model name every streaming test routes.
+    const STREAM_MODEL: &str = "mock-stream-model";
+    /// The env var the mock endpoint's key pool reads at client construction.
+    const STREAM_KEY_ENV: &str = "APK_TEST_STREAM_MOCK_KEY";
+
+    /// A one-shot loopback SSE upstream: it answers the next request with the
+    /// given raw HTTP response and closes. `content_length_pad` lets a test
+    /// declare MORE bytes than it sends, which is how a mid-answer transport
+    /// cut is produced.
+    async fn streaming_upstream(http: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the streaming upstream");
+        let addr = listener.local_addr().expect("stub address");
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(http.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}/v1")
+    }
+
+    fn sse_http(status_line: &str, body: &str, content_length_pad: usize) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len() + content_length_pad
+        )
+    }
+
+    /// Headers carrying the FULL body length but whose written body is only
+    /// part 1 - so the connection stays open until part 2 arrives.
+    fn sse_http_first_part(status_line: &str, part1: &str, part2: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{part1}",
+            part1.len() + part2.len()
+        )
+    }
+
+    /// A loopback SSE upstream delivered in TWO parts, the second after a
+    /// delay: a client that polls part 1 and hangs up is genuinely hanging up
+    /// mid-answer, with the usage block still in flight. This is what makes the
+    /// drain-what-the-client-abandoned contract observable.
+    async fn streaming_upstream_in_two_parts(
+        headers_with_part1: String,
+        part2: String,
+        delay_ms: u64,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the streaming upstream");
+        let addr = listener.local_addr().expect("stub address");
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(headers_with_part1.as_bytes()).await;
+                let _ = socket.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let _ = socket.write_all(part2.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}/v1")
+    }
+
+    /// A config identical to the shipped one except that it carries exactly one
+    /// model, routed to the loopback stub, with rates small enough that a
+    /// hand-checkable cost comes out of a 10/5-token usage report.
+    fn streaming_config(endpoint_url: String) -> Arc<AppConfig> {
+        let mut config =
+            AppConfig::load_from_file("../config/apikita.toml").expect("parse apikita.toml");
+        config.models = vec![ModelConfig {
+            name: STREAM_MODEL.to_string(),
+            description: String::new(),
+            price: 1.5,
+            max_context_tokens: 1_000_000,
+            max_output_tokens: 100,
+            supports_vision: false,
+            supports_thinking: false,
+            billing_basis: "peak".to_string(),
+            rates: ModelRates {
+                cache_read_offpeak: 13.0,
+                cache_read_peak: 26.0,
+                input_offpeak: 600.0,
+                input_peak: 1200.0,
+                output_offpeak: 2400.0,
+                output_peak: 4800.0,
+            },
+            endpoints: vec![ModelEndpoint {
+                name: "mock".to_string(),
+                url: endpoint_url,
+                upstream_model: "mock-upstream-model".to_string(),
+                api_key_envs: vec![STREAM_KEY_ENV.to_string()],
+                concurrency_per_key: 0,
+                weight: 1.0,
+                supports_stream_options: true,
+                input_peak: None,
+                output_peak: None,
+            }],
+        }];
+        Arc::new(config)
+    }
+
+    /// The reservation the HANDLER would take for `body`, computed through the
+    /// same helpers the handler calls.
+    fn reservation_for(config: &AppConfig, body: &str) -> i64 {
+        let model_cfg = &config.models[0];
+        let estimated_input = estimated_input_tokens(body.as_bytes());
+        let max_output =
+            model_cfg.reserved_output_tokens(Some(50), config.streaming.hard_max_output_tokens);
+        model_cfg.worst_case_reservation_idr(estimated_input, max_output)
+    }
+
+    /// An SSE body that streams one content chunk and then the usage block.
+    fn happy_sse() -> String {
+        "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+         data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+         data: [DONE]\n\n"
+            .to_string()
+    }
+
+    /// The full streaming fixture: funded wallet, key, client, config. The
+    /// caller owns the TestDb and closes it.
+    async fn stream_fixture(
+        db: &TestDb,
+        endpoint_url: String,
+    ) -> (Uuid, Uuid, UpstreamClient, Arc<AppConfig>, String) {
+        let config = streaming_config(endpoint_url);
+        let account_id = create_account(&db.pool).await;
+        open_wallet(&db.pool, account_id, 1_000_000).await;
+        let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
+
+        let client = UpstreamClient::new(config.clone());
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        (account_id, key_id, client, config, reservation_ref)
+    }
+
+    /// The happy path: every chunk is forwarded in order, the trailing usage
+    /// block is billed, the hold is released inside the settlement transaction,
+    /// and the ledger nets to exactly -cost. Covers MeteredStream's forwarding
+    /// (815-818), its end-of-stream finish (801-814, 723-747), the Settled arm
+    /// of settle_after_stream (1429, 1551-1591) and the bill path through
+    /// debit_usage_transaction.
+    #[tokio::test]
+    async fn a_completed_stream_bills_exactly_what_the_upstream_reported() {
+        let _env = crate::routes::test_env::EnvLock::acquire();
+        let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
+        let db = TestDb::new().await;
+
+        let endpoint = streaming_upstream(sse_http("200 OK", &happy_sse(), 0)).await;
+        let (account_id, key_id, client, config, reservation_ref) =
+            stream_fixture(&db, endpoint).await;
+
+        let body = format!(
+            r#"{{"model":"{STREAM_MODEL}","stream":true,"max_tokens":50,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let reservation = reservation_for(&config, &body);
+        assert!(reservation > 0, "the fixture's hold must be a real hold");
+
+        let held =
+            reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+                .await
+                .expect("the funded wallet covers the worst case");
+        assert!(
+            matches!(held, ReservationResult::Held { .. }),
+            "the fixture wallet must be able to hold: {held:?}"
+        );
+
+        let upstream_body = serde_json::from_str::<Value>(&body).expect("fixture body parses");
+        let upstream_stream = client
+            .stream_chat(STREAM_MODEL, upstream_body)
+            .await
+            .expect("the mock upstream is healthy");
+
+        // The Debug contract (`impl fmt::Debug for UpstreamStream`, client.rs): names the endpoint
+        // and whether a lease is held - never the body.
+        let debugged = format!("{upstream_stream:?}");
+        assert!(debugged.contains("mock"), "names the endpoint: {debugged}");
+        assert!(
+            debugged.contains("lease_held"),
+            "reports the lease state: {debugged}"
+        );
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream::new(upstream_stream, settle_tx);
+
+        let mut forwarded = String::new();
+        use futures_util::StreamExt;
+        while let Some(item) = metered.next().await {
+            forwarded.push_str(
+                std::str::from_utf8(&item.expect("no transport error on the happy path"))
+                    .expect("chunks are utf-8"),
+            );
+        }
+
+        assert!(
+            forwarded.contains("Hi"),
+            "the client sees the upstream's own chunk: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("error"),
+            "a completed stream announces no in-band error: {forwarded}"
+        );
+
+        // The stream ended, so the outcome is already on the channel. Settle it
+        // deterministically - no detached task, no sleep.
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config.clone(),
+            Arc::new(RealtimeHub::new(&config.realtime)),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+            crate::shutdown::TaskTracker::new().begin(),
+        )
+        .await;
+
+        // Billed exactly the upstream's own report: 10 in, 0 cached, 5 out.
+        let (input, cached, output, cost) = usage_today(&db.pool, account_id)
+            .await
+            .expect("usage recorded");
+        assert_eq!((input, cached, output), (10, 0, 5));
+        assert!(cost > 0, "a reported answer must cost something");
+
+        // The hold came back inside the settlement transaction, so the wallet
+        // ends at funded - cost and the ledger explains every rupiah.
+        assert_eq!(
+            balance(&db.pool, account_id).await,
+            1_000_000 - cost,
+            "balance must be funded minus the true cost"
+        );
+        let deltas = ledger_deltas(&db.pool, account_id).await;
+        // Scope to THIS reservation: the fixture's funding top-up also has a
+        // ledger row, and it is not the settlement's business.
+        let reservation_rows: Vec<i64> = deltas
+            .iter()
+            .filter(|(_, r)| r.as_deref() == Some(reservation_ref.as_str()))
+            .map(|(d, _)| *d)
+            .collect();
+        assert_eq!(
+            reservation_rows.len(),
+            3,
+            "hold, release, charge: {deltas:?}"
+        );
+        assert_eq!(
+            reservation_rows.iter().sum::<i64>(),
+            -cost,
+            "the reservation nets to exactly -cost"
+        );
+        assert_eq!(
+            deltas.iter().map(|(d, _)| d).sum::<i64>(),
+            1_000_000 - cost,
+            "the whole ledger (funding included) nets to the balance"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A stream that ends WITHOUT a usage block is the documented washed case:
+    /// nothing is billed, the whole hold comes back, and the client is told the
+    /// answer was incomplete. Covers the no-usage branch of poll_next
+    /// (801-814) and the Wash arm of settle_after_stream (1480-1493).
+    #[tokio::test]
+    async fn a_stream_that_reports_no_usage_washes_and_returns_the_hold() {
+        let _env = crate::routes::test_env::EnvLock::acquire();
+        let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
+        let db = TestDb::new().await;
+
+        let truncated_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        let endpoint = streaming_upstream(sse_http("200 OK", truncated_sse, 0)).await;
+        let (account_id, key_id, client, config, reservation_ref) =
+            stream_fixture(&db, endpoint).await;
+
+        let body = format!(
+            r#"{{"model":"{STREAM_MODEL}","stream":true,"max_tokens":50,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let reservation = reservation_for(&config, &body);
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("the funded wallet covers the worst case");
+
+        let upstream_stream = client
+            .stream_chat(STREAM_MODEL, serde_json::from_str(&body).unwrap())
+            .await
+            .expect("the mock upstream is healthy");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream::new(upstream_stream, settle_tx);
+
+        use futures_util::StreamExt;
+        let mut forwarded = String::new();
+        while let Some(item) = metered.next().await {
+            forwarded.push_str(
+                std::str::from_utf8(&item.expect("no transport error here"))
+                    .expect("chunks are utf-8"),
+            );
+        }
+
+        assert!(
+            forwarded.contains("upstream_incomplete"),
+            "a stream that never reported usage says so in band: {forwarded}"
+        );
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config.clone(),
+            Arc::new(RealtimeHub::new(&config.realtime)),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+            crate::shutdown::TaskTracker::new().begin(),
+        )
+        .await;
+
+        // Washed: nothing billed, the hold back in full. The reservation's own
+        // rows (hold + release) net to zero; the funding row is the fixture's.
+        assert!(
+            usage_today(&db.pool, account_id).await.is_none(),
+            "token counts are never invented for a washed stream"
+        );
+        assert_eq!(balance(&db.pool, account_id).await, 1_000_000);
+        let reservation_rows: Vec<i64> = ledger_deltas(&db.pool, account_id)
+            .await
+            .into_iter()
+            .filter(|(_, r)| r.as_deref() == Some(reservation_ref.as_str()))
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(reservation_rows, vec![-reservation, reservation]);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A client hangup mid-answer must NOT make the answer free: the abandoned
+    /// upstream body is drained to its end and billed from the usage the
+    /// upstream still reports. Covers MeteredStream's Drop (759-782), the
+    /// Hangup arm (1440-1463) and drain_for_usage (917-949).
+    #[tokio::test]
+    async fn a_hungup_stream_is_drained_and_billed_from_the_upstreams_own_report() {
+        let _env = crate::routes::test_env::EnvLock::acquire();
+        let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
+        let db = TestDb::new().await;
+
+        let content_part =
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        let usage_part =
+            "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n";
+        let endpoint = streaming_upstream_in_two_parts(
+            sse_http_first_part("200 OK", content_part, usage_part),
+            usage_part.to_string(),
+            400,
+        )
+        .await;
+        let (account_id, key_id, client, config, reservation_ref) =
+            stream_fixture(&db, endpoint).await;
+
+        let body = format!(
+            r#"{{"model":"{STREAM_MODEL}","stream":true,"max_tokens":50,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let reservation = reservation_for(&config, &body);
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("the funded wallet covers the worst case");
+
+        let upstream_stream = client
+            .stream_chat(STREAM_MODEL, serde_json::from_str(&body).unwrap())
+            .await
+            .expect("the mock upstream is healthy");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream::new(upstream_stream, settle_tx);
+
+        // The client reads ONE chunk and then hangs up: the tee is dropped with
+        // `done == false`, which is the hangup contract. The usage block is
+        // still in flight, so this is a real mid-answer hangup.
+        use futures_util::StreamExt;
+        let _first = metered.next().await.expect("at least one chunk");
+        drop(metered);
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config.clone(),
+            Arc::new(RealtimeHub::new(&config.realtime)),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+            crate::shutdown::TaskTracker::new().begin(),
+        )
+        .await;
+
+        // The drained body still carried the usage block, so the tokens the
+        // upstream generated are on the books.
+        let (input, cached, output, cost) = usage_today(&db.pool, account_id)
+            .await
+            .expect("drained usage is billed");
+        assert_eq!((input, cached, output), (10, 0, 5));
+        assert!(cost > 0);
+        assert_eq!(balance(&db.pool, account_id).await, 1_000_000 - cost);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A transport cut MID-answer is announced in band (never retried, never a
+    /// provider name), reports no usage, and washes. Covers the error branch of
+    /// poll_next (819-832), `finish(false)` and `UpstreamStream::finish_status`
+    /// (client.rs).
+    #[tokio::test]
+    async fn a_stream_that_dies_mid_answer_announces_the_failure_in_band_and_washes() {
+        let _env = crate::routes::test_env::EnvLock::acquire();
+        let _key = crate::routes::test_env::EnvGuard::set(STREAM_KEY_ENV, "sk-mock");
+        let db = TestDb::new().await;
+
+        // Content-Length promises 500 more bytes than are sent, then the
+        // connection closes: hyper reports a transport error mid-body.
+        let endpoint = streaming_upstream(sse_http("200 OK", "data: {\"ch", 500)).await;
+        let (account_id, key_id, client, config, reservation_ref) =
+            stream_fixture(&db, endpoint).await;
+
+        let body = format!(
+            r#"{{"model":"{STREAM_MODEL}","stream":true,"max_tokens":50,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let reservation = reservation_for(&config, &body);
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("the funded wallet covers the worst case");
+
+        let upstream_stream = client
+            .stream_chat(STREAM_MODEL, serde_json::from_str(&body).unwrap())
+            .await
+            .expect("the mock upstream accepted the connection");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        let mut metered = MeteredStream::new(upstream_stream, settle_tx);
+
+        use futures_util::StreamExt;
+        let mut forwarded = String::new();
+        while let Some(item) = metered.next().await {
+            forwarded.push_str(&String::from_utf8_lossy(
+                &item.expect("the tee yields Ok chunks"),
+            ));
+        }
+
+        assert!(
+            forwarded.contains("upstream_failed"),
+            "a mid-answer cut is announced in band: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("127.0.0.1"),
+            "the provider location must never reach the client: {forwarded}"
+        );
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config.clone(),
+            Arc::new(RealtimeHub::new(&config.realtime)),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+            crate::shutdown::TaskTracker::new().begin(),
+        )
+        .await;
+
+        assert!(usage_today(&db.pool, account_id).await.is_none());
+        assert_eq!(balance(&db.pool, account_id).await, 1_000_000);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// The settlement channel closing with no outcome at all still releases the
+    /// hold - the safety net for a lost tee. Covers the Err arm (1464-1475).
+    #[tokio::test]
+    async fn a_settlement_channel_closed_without_an_outcome_still_releases_the_hold() {
+        let db = TestDb::new().await;
+        let config = streaming_config("http://127.0.0.1:1/v1".to_string());
+        let account_id = create_account(&db.pool).await;
+        open_wallet(&db.pool, account_id, 1_000_000).await;
+        let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        let reservation = 500;
+
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("hold the reservation");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        drop(settle_tx); // the tee died without ever reporting
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config,
+            Arc::new(RealtimeHub::new(
+                &AppConfig::load_from_file("../config/apikita.toml")
+                    .expect("parse apikita.toml")
+                    .realtime,
+            )),
+            account_id,
+            key_id,
+            STREAM_MODEL.to_string(),
+            reservation,
+            guard,
+            crate::shutdown::TaskTracker::new().begin(),
+        )
+        .await;
+
+        assert!(usage_today(&db.pool, account_id).await.is_none());
+        assert_eq!(balance(&db.pool, account_id).await, 1_000_000);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// A model that was routed but is no longer configured at settlement time
+    /// (a config reload mid-request) must not strand the hold. Covers
+    /// 1495-1517 - the arm that cannot happen without a reload, driven by
+    /// sending the outcome DIRECTLY through the channel.
+    #[tokio::test]
+    async fn a_settlement_for_a_model_no_longer_configured_releases_the_hold() {
+        let db = TestDb::new().await;
+        let config = streaming_config("http://127.0.0.1:1/v1".to_string());
+        let account_id = create_account(&db.pool).await;
+        open_wallet(&db.pool, account_id, 1_000_000).await;
+        let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
+        let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
+        let reservation = 500;
+
+        reserve_balance_transaction(&db.pool, account_id, reservation, Some(&reservation_ref))
+            .await
+            .expect("hold the reservation");
+
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<StreamEnd>();
+        settle_tx
+            .send(StreamEnd::Settled(Usage {
+                input_tokens: 10,
+                cache_read_tokens: 0,
+                output_tokens: 5,
+            }))
+            .expect("the tee reported a usage block");
+
+        let guard = ReservationGuard::new(
+            &db.pool,
+            account_id,
+            reservation,
+            &reservation_ref,
+            STREAM_MODEL,
+        );
+        settle_after_stream(
+            settle_rx,
+            db.pool.clone(),
+            config,
+            Arc::new(RealtimeHub::new(
+                &AppConfig::load_from_file("../config/apikita.toml")
+                    .expect("parse apikita.toml")
+                    .realtime,
+            )),
+            account_id,
+            key_id,
+            "ghost-model".to_string(), // routed moments ago, gone at settlement
+            reservation,
+            guard,
+            crate::shutdown::TaskTracker::new().begin(),
+        )
+        .await;
+
+        // The usage the upstream reported is NOT billed (its model's rates are
+        // gone), but the customer's hold must come back either way.
+        assert!(usage_today(&db.pool, account_id).await.is_none());
+        // SETTLED TO A FIXED POINT. A direct `wallet_balance` read was not enough here: this arm
+        // defuses the guard because `release_quietly` already gave the hold back, and without the
+        // defuse the Drop fires a SECOND release on a detached task that commits after this line.
+        // MEASURED: deleting the arm's `guard.defuse()` left the whole module green at 81 passed
+        // while this assertion read the pre-release balance.
+        assert_eq!(
+            settled_balance(&db.pool, account_id).await,
+            1_000_000,
+            "the hold must come back ONCE, and the wallet must STOP moving. A balance above the \
+             opening 1_000_000 is the guard's Drop releasing it a second time after \
+             `release_quietly` did - money invented for a request whose model no longer exists"
+        );
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
+        db.close().await;
+    }
+
+    /// THE HANDLER MUST NOT WAIT FOR SETTLEMENT, asserted on the SOURCE because it cannot be driven.
+    ///
+    /// `chat_completions` serves the client and hands billing to `tokio::spawn(settle_after_stream(...))`.
+    /// MEASURED: replacing that task with one that drops the guard without settling left every other
+    /// test in this module green - a served request would be billed NOTHING, because the hold returns
+    /// through the guard's Drop and no charge is written. Nothing in the suite noticed.
+    ///
+    /// **WHY THIS IS A TEXT ASSERTION RATHER THAN A TEST THAT DRIVES THE HANDLER.** The handler takes
+    /// its upstream from `static UPSTREAM: OnceLock<UpstreamClient>` (line 240), built once per
+    /// PROCESS from whichever config got there first. A test cannot inject a streaming upstream into
+    /// it, so no test can reach a successful handler stream at all - which is why every existing
+    /// `chat_completions` test expects an ERROR, and why the four streaming-stub tests call
+    /// `stream_at`/`settle_after_stream` themselves. THIS FILE ALREADY SAYS SO at line 5520.
+    ///
+    /// A first attempt at this test drove the real handler through the loopback stub and failed with
+    /// `ModelNotAllowed("mock-stream-model")`, because the OnceLock had already been initialised with
+    /// another test's config. That is the limit, stated rather than worked around.
+    ///
+    /// So the property is pinned where it is visible: the settlement is SPAWNED, not awaited, and the
+    /// spawn is the last thing before the response is built. A future edit that turns it into
+    /// `.await` would block the client on billing - and would fail here.
+    #[test]
+    fn the_handler_spawns_settlement_rather_than_awaiting_it() {
+        // `include_str!` reads this same file, so the assertion cannot drift from the code it is
+        // about - the technique `doc_claims` uses for citations it cannot resolve structurally.
+        let source = include_str!("proxy.rs");
+
+        // THE MATCH MUST BE ON CODE, NOT ON THE WHOLE FILE, and the first version of this test got
+        // that wrong in exactly the way `tools/backup-check` describes about itself: a whole-file
+        // `contains()` also matched this test's OWN assertion string, so RENAMING the real spawn
+        // left it passing. MEASURED. Comments and string literals are stripped first, so no message
+        // in this file can satisfy the search.
+        let mut code = String::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        for line in source.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for ch in line.chars() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                if ch == '"' {
+                    in_string = true;
+                    continue;
+                }
+                code.push(ch);
+            }
+            code.push('\n');
+        }
+
+        assert!(
+            code.contains("tokio::spawn(settle_after_stream("),
+            "`chat_completions` no longer spawns `settle_after_stream`. If it awaits it instead, the \
+             client is blocked on a billing write it does not need - and if it drops the future, a \
+             served request is never charged at all. Both are silent: no other test in this module \
+             reaches a successful handler stream, because the upstream client is a process-wide \
+             `OnceLock` that no test can inject into."
+        );
     }
 }

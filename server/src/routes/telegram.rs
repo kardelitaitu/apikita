@@ -1,3 +1,42 @@
+//
+// FENCED, and the allow is at the TOP of the module rather than on each site,
+// because there is one production site here and it is a constant-bounded date
+// subtraction already argued in full above it. A per-site allow for a single site
+// would be the same thing with more ceremony.
+#![cfg_attr(
+    not(test),
+    // THE HIGHEST-RISK ENDPOINT IN THE PRODUCT, fenced for that reason rather than
+    // for the arithmetic.
+    //
+    // docs/architecture/identity.md calls this "the highest-risk endpoint in the
+    // Telegram surface", and the reason is money: a 6-digit code is 10^6
+    // possibilities, and a successful guess attaches an attacker's Telegram to a
+    // FUNDED WALLET. Two of this module's three caps are what stand between the
+    // public internet and somebody else's balance - the per-IP redemption cap on
+    // guessing, and the per-account issuance cap on how many codes exist to guess.
+    //
+    // The third cap is the reason this file is worth fencing at all. The issuance
+    // cap once counted link_codes, a table this very handler DELETEs from, so it
+    // could not fire at all; a cap that cannot fire is indistinguishable from a cap
+    // that is not being hit, and the suite was green throughout. It now counts
+    // link_code_issues, so the count is bounded by admissions rather than by
+    // surviving rows. A module whose job is enforcing limits should not be the one
+    // place where a limit is quietly inert.
+    //
+    // THIS SAID "which nothing deletes from", AND THAT WAS WRONG. `ip_tracking::purge_expired` has
+    // swept `link_code_issues` on `LINK_CODE_ISSUE_RETENTION_DAYS` (7) since the table landed; the
+    // sibling comment further down said the same thing. What is true, and is the property the cap
+    // actually relies on, is that the table is not deleted from BY THIS HANDLER and not deleted from
+    // on a timescale shorter than the window the cap is stated over - the counter cannot be reset by
+    // the traffic it is counting. That is what makes the cap reachable; "nothing deletes from it"
+    // would have been a table that grows forever, which is a different (and false) claim.
+    //
+    // The distinction cost a round to find: the sweep's own boundary was pinned by NOTHING until
+    // `the_timestamp_sweeps_delete_their_cutoff_instant_and_keep_the_one_inside` existed, because
+    // this comment and its sibling reasoned as though the sweep did not exist.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 //! Telegram link-code redemption: the binding of a chat to a funded account.
 //!
 //! `docs/architecture/identity.md` names this the **highest-risk endpoint in the
@@ -11,9 +50,9 @@
 //! Two independent caps, because they defend against two different attacks:
 //!
 //! - **per ACCOUNT** (`limits.link_code_issuance_per_hour`) — bounds how many codes
-//!   one account can have in flight, reusing `abuse::enforce_creation_cap` over
-//!   `link_codes (account_id, created_at)`. This is the same guard `topups` and
-//!   `api_keys` use, not a second copy of the boundary rule.
+//!   one account may ISSUE in an hour, counting `link_code_issues`, the record that
+//!   survives the one-live-code DELETE. Reuses `abuse::enforce_creation_cap_in`, the
+//!   same boundary rule `topups` and `api_keys` use, not a second copy of it.
 //! - **per IP** (`limits.link_redemption_per_hour`) — bounds guessing from one
 //!   host. A single attacker must not be able to walk the code space by cycling
 //!   accounts, which the per-account cap would not notice at all.
@@ -43,7 +82,6 @@ use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{Row, SqlitePool};
-use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
 use crate::abuse;
@@ -60,6 +98,32 @@ use crate::routes::proxy::AppState;
 /// stated in the contract, and a config knob would let a deployment widen it by
 /// accident.
 pub const LINK_CODE_TTL_MINUTES: i64 = 5;
+
+/// How long a link code outlives its own usefulness: a code the customer already
+/// redeemed, or one that hit `LINK_CODE_TTL_MINUTES` unused, is kept one more day
+/// and then deleted.
+///
+/// The number is a TRANSCRIPTION, not a discovery. `website/src/lib/privacy.ts` and
+/// `docs/data-retention.md:77` have both stated "Until used or expired + 24h" since
+/// before any code did it, and this constant exists so the two can be compared
+/// rather than trusted - the same reasoning as `ip_tracking`'s
+/// `LINK_CODE_ISSUE_RETENTION_DAYS`, which was named for the same purpose.
+///
+/// WHY +24h AND NOT "immediately", which would be simpler to implement and is what
+/// `identity_tokens` does: a link code is read by a HUMAN who may be holding it open
+/// in a chat window, and the page says a day. Deleting at expiry would also be a
+/// defensible policy, but it would make the published sentence false, and the
+/// published sentence is the thing this repository treats as the contract - the
+/// whole point of the retention sweep is that the document is what the code
+/// executes.
+///
+/// The grace applies to BOTH terminal states, and `used_at` is what tells them
+/// apart: an UNUSED code is stale once `expires_at` passed, a USED one once
+/// `used_at` did. Comparing only `expires_at` would retain a redeemed code for the
+/// whole grace period even though nothing can redeem it twice - which is precisely
+/// the window `issue_link_code`'s "issuing a code deletes this account's previous
+/// codes" already refuses to honour.
+pub const LINK_CODE_RETENTION_GRACE_DAYS: i64 = 1;
 
 /// How many digits a link code carries.
 const CODE_DIGITS: u32 = 6;
@@ -183,6 +247,37 @@ pub fn link_code_window() -> Duration {
 /// The boundary arithmetic is `abuse::cap_outcome`, the same pure function the
 /// per-account caps use, so "exactly at the cap is refused", "floor the
 /// Retry-After at 1" and "0 disables" cannot drift between the two.
+///
+/// **WHAT THIS ACTUALLY LIMITS IS N PER UTC DAY, NOT N PER WINDOW — and that is a
+/// consequence of the salt, not a bug in the window.** The counter is keyed on
+/// `ip_hash`, which is an HMAC under a salt that `ip_tracking` replaces at the UTC day
+/// boundary. At midnight the same caller hashes to a different value, so the counter
+/// starts empty and every attempt before midnight becomes invisible. A sliding
+/// `link_code_window` is therefore really a daily allowance that resets on the hour,
+/// and an attacker who times it gets the full budget at 23:59 and again at 00:00.
+///
+/// **THE EXPOSURE IS BOUNDED, and it is small: one extra budget per DAY.** The window
+/// here is an hour and the salt rotates every twenty-four, so a salt boundary can fall
+/// inside a window at most once a day. The worst case is one additional hour of
+/// attempts, once, at midnight.
+///
+/// I first wrote this as a limit that quietly stops limiting, which reads as though the
+/// cap were unbounded. It is not, and the difference is the whole point: an operator
+/// needs the worst case, not the mood. A rule that sounds alarming is a rule people
+/// disable, and this one is a price worth paying - one budget a day for history that is
+/// unlinkable across days, which is the property the privacy page promises.
+///
+/// It is written down rather than fixed because the two properties are in genuine
+/// conflict: a salt that does not rotate makes the counter work across days, and it also
+/// makes every day linkable, which is the whole privacy design in ip-tracking.md and the
+/// reason this is documented on a public page. Restoring the cross-day count would mean
+/// keeping a stable per-caller identifier, which is precisely what that document says is
+/// not kept.
+///
+/// So the honest statement of the control is: it stops an unbounded attempt stream from
+/// one caller within a day. It does not stop a caller who is willing to spend two
+/// budgets across midnight, and anyone reading `review_per_hour`-style numbers here
+/// should know that is the shape of what they have.
 async fn record_and_check_attempt(
     pool: &SqlitePool,
     ip_key: &str,
@@ -197,12 +292,21 @@ async fn record_and_check_attempt(
     }
 
     let window: i64 = link_code_window().num_hours();
+    // SAFE, and the same argument as every other date subtraction in this
+    // repository: chrono's DateTime arithmetic PANICS on an out-of-range result
+    // rather than wrapping, and the operand is `link_code_window()` - an hour, a
+    // constant in abuse.rs - rather than anything a caller supplies. The subtraction
+    // is on the ATTACK path, so a panic here would be a denial of service by
+    // anyone who can make this run; the bound is what keeps that unreachable.
+    #[allow(clippy::arithmetic_side_effects)]
+    let window_start = now - Duration::hours(window);
+
     let row = sqlx::query(
         "SELECT COUNT(*) AS used, MIN(attempted_at) AS oldest \
          FROM link_redemption_attempts WHERE ip_hash = ? AND attempted_at >= ?",
     )
     .bind(ip_key)
-    .bind(now - Duration::hours(window))
+    .bind(window_start)
     .fetch_one(pool)
     .await?;
 
@@ -253,23 +357,85 @@ pub async fn issue_link_code(
 ) -> Result<impl IntoResponse, AppError> {
     let account_id = crate::routes::resolve_account_from_cookie(&state.pool, &headers).await?;
 
-    // Abuse guard: how many codes this ACCOUNT has issued this hour. Note this is
-    // the account cap, not the guessing cap - it bounds codes in flight, and the
-    // per-IP redemption cap is what stops the brute force.
-    abuse::enforce_creation_cap(
-        &state.pool,
-        "link_codes",
-        link_code_window(),
-        state.config.limits.link_code_issuance_per_hour,
-        account_id,
-        Utc::now(),
-    )
-    .await?;
-
     let now = Utc::now();
+    // SAFE: LINK_CODE_TTL_MINUTES is a compile-time constant, so the operand cannot be
+    // anything but a few minutes and the addition cannot leave the representable
+    // range. Worth saying because chrono's DateTime arithmetic PANICS rather than
+    // wrapping, and this is the code that mints a link code - a panic here is a
+    // refusal of a legitimate customer, not a wrong number.
+    #[allow(clippy::arithmetic_side_effects)]
     let expires_at = now + Duration::minutes(LINK_CODE_TTL_MINUTES);
 
     let mut tx = crate::db::begin_immediate(&state.pool).await?;
+
+    // Abuse guard: how many codes this ACCOUNT has issued this hour. Note this is
+    // the account cap, not the guessing cap - it bounds issuance VOLUME, and
+    // the per-IP redemption cap is what stops the brute force.
+    //
+    // COUNTS link_code_issues, NOT link_codes, and that is the fix rather than a
+    // detail. It used to count link_codes - which 20260926000000 records as
+    // deliberate - and that was true when written and stopped being true when the
+    // DELETE below was added for the one-live-code guarantee. The DELETE makes the
+    // row count always 0 or 1, so a cap of 10 could never be approached: the guard
+    // parsed, ran, and did nothing. Issuances are recorded in a table that survives
+    // the delete, so the count means what the cap says it means.
+    //
+    // INSIDE THE TRANSACTION, which is NECESSARY BUT NOT SUFFICIENT here - and the
+    // second half of that sentence is the more important half.
+    //
+    // Necessary: this was a COUNT on the pool with the INSERT it governs inside a
+    // separate transaction, so concurrent callers would each read the same count.
+    // The transaction was already open for the DELETE below, so the COUNT joins it
+    // for free.
+    //
+    // THIS PARAGRAPH USED TO SAY THE CAP CANNOT FIRE, and that is now false. It is
+    // kept as a record of the wrong answer rather than deleted, because the wrong
+    // answer is the one a reader is most likely to reach for: counting ISSUES
+    // rather than LIVE ROWS needs a record that survives the delete, and it is easy
+    // to conclude from there that no such record exists. One does, two lines below.
+    //
+    // The counting is `link_code_issues`, which THIS HANDLER never deletes from, so the
+    // number the cap compares against grows with every admission instead of being
+    // reset by the DELETE. (It IS swept by `ip_tracking::purge_expired` at 7 days - the
+    // earlier wording here said "a table nothing deletes from", which was false. What the
+    // cap needs is narrower and is what holds: no deletion happens on a timescale
+    // shorter than the hour the cap is stated over, so traffic cannot reset its own
+    // counter.) The cap therefore FIRES, and holds under concurrency,
+    // because the COUNT and the INSERT and the issuance record commit in ONE
+    // transaction: a concurrent caller either sees the earlier row or waits on the
+    // lock. MEASURED by
+    // `the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests` below:
+    // a burst of cap+8 concurrent issues admits exactly `cap`, refuses the rest
+    // with 429, writes exactly one issuance row per admission, and leaves exactly
+    // one code alive.
+    //
+    // Superseding old rows instead of deleting them would have made the count work
+    // too, and was rejected: the DELETE is what expresses the one-live-code
+    // guarantee, and a second mechanism for the same guarantee is a second thing to
+    // get wrong.
+    abuse::enforce_creation_cap_in(
+        &mut tx,
+        "link_code_issues",
+        link_code_window(),
+        state.config.limits.link_code_issuance_per_hour,
+        account_id,
+        now,
+    )
+    .await?;
+
+    // The ISSUANCE RECORD, in this same transaction and stamped with the same
+    // `now` as the cap check above.
+    //
+    // It has to be here and not after the commit: a record written outside the
+    // transaction would be a second failure mode, in which the code exists but the
+    // issuance was never counted and the next caller is admitted too - the exact
+    // defect this table exists to remove, reintroduced one line down. Together with
+    // the cap check, the count and the record commit as one fact.
+    sqlx::query("INSERT INTO link_code_issues (account_id, created_at) VALUES (?, ?)")
+        .bind(account_id.hyphenated())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
 
     // One live code per account. Deleting the predecessor inside the same
     // transaction as the insert means a crash cannot leave two live codes.
@@ -379,7 +545,7 @@ pub async fn redeem_link_code(
         return Ok(invalid_code_response());
     };
 
-    let account_id: Uuid = row.get::<Hyphenated, _>("account_id").into_uuid();
+    let account_id: Uuid = crate::error::decode_uuid_column(&row, "account_id")?;
 
     // 4. Bind the chat. `telegram_links` is keyed by telegram_id, so re-linking the
     //    same chat REPLACES its account rather than violating the primary key. That
@@ -404,6 +570,48 @@ pub async fn redeem_link_code(
         status: "linked",
         account_id,
     }))
+}
+
+/// Removes link codes that are past their usefulness plus the published grace
+/// period, for the retention sweep.
+///
+/// `now` is an argument rather than read from the clock so the window can be
+/// tested at its boundaries - the same shape as `identity::tokens::purge_expired`,
+/// and the SQL is written once because `db::purge_expired_usage` calls THIS rather
+/// than restating the predicate.
+///
+/// THE `COALESCE` IS THE WHOLE RULE. A code reaches a terminal state two ways, and
+/// which way it went decides when its day starts:
+/// - redeemed -> `used_at` is set, and the day runs from there;
+/// - never redeemed -> `used_at` is NULL and the day runs from `expires_at`.
+///
+/// So the governing instant is `COALESCE(used_at, expires_at)` plus the grace, and
+/// it is compared against `now` rather than a midnight cutoff. A midnight cutoff
+/// would be wrong here for the same reason it would be wrong for `identity_tokens`:
+/// the boundary is the code's OWN lifetime, not a nightly policy boundary, so a code
+/// that became stale at 23:50 would get a grace a day short or a day long depending
+/// on what hour the container happens to restart at.
+///
+/// NOTHING ELSE DELETES FROM THIS TABLE except the one code being superseded
+/// (`DELETE FROM link_codes WHERE account_id = ?`, which reaches only that account's
+/// current attempt). An unused code a customer requested and never redeemed had no
+/// delete path at all: every row ever issued stayed on disk, and expired codes
+/// accumulated behind a page that said twenty-four hours. That is the third time a
+/// published retention window has had no code behind it, which is why the
+/// maintenance entrypoint's table list is now compared to Rust's in both directions.
+pub async fn purge_terminal(pool: &SqlitePool, now: DateTime<Utc>) -> Result<u64, AppError> {
+    // SAFE: `LINK_CODE_RETENTION_GRACE_DAYS` is a compile-time constant (1), and
+    // chrono panics rather than wraps on an out-of-range date - see the note on
+    // `db::oldest_row_past_window` for the full argument, which is the same shape.
+    #[allow(clippy::arithmetic_side_effects)]
+    let cutoff = now - Duration::days(LINK_CODE_RETENTION_GRACE_DAYS);
+
+    let result = sqlx::query("DELETE FROM link_codes WHERE COALESCE(used_at, expires_at) <= ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+
+    Ok(result.rows_affected())
 }
 
 /// `DELETE /api/telegram` — unlink the signed-in account's chat.
@@ -449,9 +657,33 @@ fn bot_token() -> Result<String, AppError> {
 
 /// Checks the `Authorization: Bearer <token>` header against the bot secret.
 ///
-/// Compared in CONSTANT TIME via `subtle`, the same primitive the Midtrans
-/// signature uses: a byte-by-byte early-exit comparison leaks the secret's prefix
-/// through timing, and this secret authorises a wallet binding.
+/// Compared with `subtle`, the same primitive the Midtrans signature uses: a byte-by-byte
+/// early-exit comparison leaks the secret's prefix through timing, and this secret authorises a
+/// wallet binding.
+///
+/// WHAT THAT GUARANTEE ACTUALLY IS, because the primitive is weaker than "constant time" and the
+/// difference is reachable HERE. `subtle`'s `ConstantTimeEq for [T]` short-circuits on the LENGTHS of
+/// its arguments before comparing any byte - its own source says so: "Short-circuit on the *lengths*
+/// of the slices, not their contents" (subtle 2.6.1, lib.rs). So this comparison leaks the EXPECTED
+/// token's length through its running time, and does not leak its prefix.
+///
+/// Why that is acceptable here, stated rather than assumed: a Telegram bot token has a public shape,
+/// so its length is not a secret, and length is not the credential. What matters is that no PREFIX is
+/// leaked, which `subtle` does guarantee.
+///
+/// Why the Midtrans comparison in `money.rs` is not the same case despite sharing the primitive:
+/// its left operand is `hex::encode(Sha512::...)` - a 128-character hex digest - and its right
+/// operand is the notification's `signature_key`, which Midtrans also sends as a hex digest. Both
+/// sides are therefore the same fixed width, so the short-circuit is reachable only for a malformed
+/// notification, never for a well-formed one. This function compares an environment-supplied secret
+/// against whatever the caller sends, so the lengths differ on every wrong guess - which is why the
+/// distinction is written down here rather than there.
+///
+/// This comment is the ONLY specification of the comparison's behaviour: a timing property cannot be
+/// asserted in a unit test, and no test in this module attempts to. A reader who took "constant time"
+/// at face value would believe the length was protected, and would then be wrong about which property
+/// the next change has to preserve - hashing both sides to a fixed width is what would make the length
+/// safe, and that is a change nobody would make while the looser wording stands.
 fn require_bot_token(headers: &HeaderMap) -> Result<(), AppError> {
     let expected = bot_token()?;
 
@@ -522,6 +754,27 @@ mod tests {
         }
     }
 
+    /// `record_and_check_attempt` with limit 0 is the DISABLED ceiling: it records
+    /// the attempt (the audit signal) but never refuses, whatever the prior
+    /// volume. This is the `limit == 0` arm at telegram.rs:192-196, which the live
+    /// handler tests never reach because the deployed config sets a positive cap.
+    #[tokio::test]
+    async fn a_disabled_link_attempt_ceiling_records_but_never_refuses() {
+        let db = TestDb::new().await;
+        let now = chrono::Utc::now();
+        let result = record_and_check_attempt(&db.pool, "ip-test-disabled", 0, now).await;
+        assert!(result.is_ok(), "limit 0 must never refuse: {result:?}");
+        // The attempt was recorded despite the refusal being disabled.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM link_redemption_attempts WHERE ip_hash = ?")
+                .bind("ip-test-disabled")
+                .fetch_one(&db.pool)
+                .await
+                .expect("count attempts");
+        assert_eq!(count, 1, "the attempt must be recorded even when disabled");
+        db.close().await;
+    }
+
     // -----------------------------------------------------------------------
     // Live tests: the properties that make this endpoint safe.
     //
@@ -546,6 +799,7 @@ mod tests {
             events,
             ip_salt: std::sync::Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 
@@ -580,7 +834,10 @@ mod tests {
             .fetch_optional(pool)
             .await
             .expect("read telegram_links");
-        row.map(|r| r.get::<Hyphenated, _>("account_id").into_uuid())
+        row.map(|r| {
+            crate::error::decode_uuid_column(&r, "account_id")
+                .expect("the fixture must store a decodable telegram_links.account_id")
+        })
     }
 
     /// Attempts recorded across ALL hash keys.
@@ -608,15 +865,6 @@ mod tests {
         headers.insert(
             axum::http::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
-        );
-        headers
-    }
-
-    fn cookie_headers(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            format!("session={token}").parse().unwrap(),
         );
         headers
     }
@@ -971,7 +1219,7 @@ mod tests {
         let cookie = redeem_link_code(
             State(state.clone()),
             peer(),
-            cookie_headers(&session),
+            test_support::session_request_headers(&session),
             Json(RedeemLinkCodeRequest {
                 code: "424242".into(),
                 telegram_id: "5550007".into(),
@@ -1029,6 +1277,121 @@ mod tests {
         db.close().await;
     }
 
+    /// THE ISSUANCE CAP NOW FIRES, and under concurrency.
+    ///
+    /// This guard was DEAD, and the way that was found is the part worth keeping.
+    /// `link_code_issuance_per_hour` is documented in docs/server/api-spec.md and
+    /// docs/decisions.md as bounding how many link codes an ACCOUNT may issue in an
+    /// hour, and migration 20260926000000 records the design: it counts `link_codes`
+    /// rows, "which the existing table already carries (account_id, created_at), so
+    /// it needs nothing new and reuses abuse::enforce_creation_cap unchanged."
+    ///
+    /// That was true when written and stopped being true when issue_link_code gained
+    /// the DELETE that keeps one live code per account. The DELETE makes the row
+    /// count always 0 or 1, so a cap of 10 was never approached: the guard parsed,
+    /// ran, and did nothing.
+    ///
+    /// A test written to assert the OPPOSITE is what surfaced it, failing with "1
+    /// codes issued for an account whose cap is 10 (18 answered 200, 0 refused)". The
+    /// 1 was the giveaway rather than the problem - the table can only ever hold one
+    /// row for the account, so the row count CANNOT measure the cap whatever it
+    /// does. The number that measures it is how many requests were ADMITTED, and
+    /// every one of them was.
+    ///
+    /// The fix is a table that survives the delete: issuances are recorded in
+    /// `link_code_issues`, the cap counts that, and the count and the record commit
+    /// in the same transaction as the code itself. Superseding the old rows instead
+    /// would have fixed the count too, but the DELETE is what expresses the
+    /// one-live-code guarantee, and a second mechanism for it is a second thing to get
+    /// wrong.
+    ///
+    /// The assertion is EXACT rather than approximate: a burst of cap+8 produces
+    /// exactly `cap` admissions, the rest are refused, exactly one issuance row is
+    /// written per admission, and exactly one code survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_link_code_issuance_cap_fires_and_holds_under_concurrent_requests() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+        let state = state_for(db.pool.clone());
+        let session = session_for(&db.pool, account).await;
+
+        let limit = state.config.limits.link_code_issuance_per_hour;
+        assert!(limit > 0, "the fixture assumes a configured hourly cap");
+
+        let mut handles = Vec::new();
+        for _ in 0..(limit + 8) {
+            let state = state.clone();
+            let headers = test_support::session_request_headers(&session);
+            handles.push(tokio::spawn(async move {
+                issue_link_code(State(state), headers)
+                    .await
+                    .map(|response| response.into_response().status())
+            }));
+        }
+
+        let mut issued = 0usize;
+        let mut refused = 0usize;
+        for handle in handles {
+            match handle.await.expect("the issue task must not panic") {
+                Ok(status) => {
+                    assert_eq!(status, StatusCode::OK, "a permitted issue answers 200");
+                    issued += 1;
+                }
+                Err(AppError::RateLimited { .. }) => refused += 1,
+                Err(other) => panic!("unexpected error from a burst request: {other:?}"),
+            }
+        }
+
+        // The cap must hold EXACTLY, under a burst, against a table that survives
+        // the delete. A test allowing a small overshoot would pass against the old
+        // link_codes counting on a fast machine - which is the whole problem the old
+        // counting had, since it could not fire at all.
+        let burst = limit as usize + 8;
+        assert_eq!(
+            issued, limit as usize,
+            "{issued} of {burst} concurrent issues were admitted against a cap of \
+             {limit}, with {refused} refused. The count and the record commit in one \
+             transaction, so the cap must hold EXACTLY"
+        );
+        assert_eq!(
+            refused,
+            burst - limit as usize,
+            "every request past the cap must be refused, and refused with 429 rather \
+             than silently succeeding"
+        );
+
+        // The issuance record is what makes the cap countable, so it is asserted
+        // directly: exactly one row per ADMITTED issue, not per surviving code.
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM link_code_issues WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count the issuance record");
+        assert_eq!(
+            recorded,
+            i64::from(limit),
+            "one issuance row per admitted issue: a refused request must not leave a \
+             record, or the cap would ratchet on every attempt and refuse an account \
+             that never actually issued anything"
+        );
+
+        // And the one-live-code guarantee is untouched by any of this.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_codes WHERE account_id = ?")
+            .bind(account.hyphenated())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count the surviving rows");
+        assert_eq!(
+            rows, 1,
+            "only one code may survive per account, whatever the cap does - the \
+             guarantee the DELETE exists for, and the reason the cap needed a \
+             separate table rather than a change to this one"
+        );
+
+        db.close().await;
+    }
+
     /// Issuing requires a session, writes a live code, and REPLACES any prior one.
     #[tokio::test]
     async fn issuing_replaces_the_previous_code_and_requires_a_session() {
@@ -1047,14 +1410,20 @@ mod tests {
 
         let session = session_for(&db.pool, account).await;
 
-        let first = issue_link_code(State(state.clone()), cookie_headers(&session))
-            .await
-            .expect("an authenticated issue succeeds");
+        let first = issue_link_code(
+            State(state.clone()),
+            test_support::session_request_headers(&session),
+        )
+        .await
+        .expect("an authenticated issue succeeds");
         assert!(body_text(first).await.contains("ttl_minutes"));
 
-        issue_link_code(State(state.clone()), cookie_headers(&session))
-            .await
-            .expect("a second issue succeeds");
+        issue_link_code(
+            State(state.clone()),
+            test_support::session_request_headers(&session),
+        )
+        .await
+        .expect("a second issue succeeds");
 
         let live: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM link_codes WHERE account_id = ? AND used_at IS NULL AND expires_at > ?",
@@ -1094,9 +1463,12 @@ mod tests {
         let ledger_before = test_support::ledger_sum(&db.pool, account).await;
 
         let session = session_for(&db.pool, account).await;
-        unlink_telegram(State(state.clone()), cookie_headers(&session))
-            .await
-            .expect("unlink succeeds");
+        unlink_telegram(
+            State(state.clone()),
+            test_support::session_request_headers(&session),
+        )
+        .await
+        .expect("unlink succeeds");
 
         assert_eq!(linked_account(&db.pool, "5550009").await, None);
 
@@ -1157,6 +1529,75 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rows, 1, "a rebind must replace, not accumulate");
+
+        // AND THE OTHER HALF OF THE `SET`, which this test was not reading.
+        //
+        // The upsert updates TWO columns - `account_id` and `linked_at` - and only the account was
+        // asserted. `linked_at` was written and read by nothing: three references in the whole tree,
+        // all of them INSERT/UPDATE text. MEASURED: deleting `linked_at = excluded.linked_at` from
+        // the `SET` left the whole 682-test suite green, while deleting the `account_id` half was
+        // caught by the assertion above. A `SET` clause with one covered assignment and one not is
+        // the shape where the uncovered half is the one nobody notices.
+        //
+        // WHY THE TIMESTAMP MATTERS RATHER THAN BEING ORNAMENT. It records when this chat last
+        // proved control of an account, and the semantics above are explicitly "a chat belongs to
+        // whoever MOST RECENTLY proved control". A rebind that moved the account but kept the old
+        // timestamp would leave the row naming the current account while recording when the previous
+        // one proved control.
+        //
+        // THE ASSERTION CANNOT COMPARE THE TWO REDEMPTIONS' STAMPS, and that was measured: both are
+        // `Utc::now()` calls milliseconds apart, and a `relinked_at >= first_linked_at` comparison
+        // STILL PASSED with the assignment deleted, because the two values came out equal. So the
+        // test plants a timestamp it knows is old on the existing row and requires the rebind to
+        // replace it. A `SET` that carried the old value forward would leave that planted string.
+        const PLANTED: &str = "2000-01-01T00:00:00+00:00";
+        let planted_owned = PLANTED.to_string();
+        let planted = sqlx::query("UPDATE telegram_links SET linked_at = ? WHERE telegram_id = ?")
+            .bind(PLANTED)
+            .bind("5550010")
+            .execute(&db.pool)
+            .await
+            .expect("plant an old timestamp");
+        assert_eq!(
+            planted.rows_affected(),
+            1,
+            "the chat must be bound before this point, or the plant proves nothing"
+        );
+
+        // A FRESH code for the same account: the two above were consumed by the loop, and a spent
+        // code is refused before it reaches the upsert.
+        seed_code(&db.pool, first_account, "333333", 5, false).await;
+
+        let response = redeem_link_code(
+            State(state.clone()),
+            peer(),
+            bot_headers(BOT_TOKEN),
+            Json(RedeemLinkCodeRequest {
+                code: "333333".into(),
+                telegram_id: "5550010".into(),
+            }),
+        )
+        .await
+        .expect("a redemption after planting a timestamp must still succeed");
+        assert!(body_text(response).await.contains("linked"));
+
+        let after: String =
+            sqlx::query_scalar("SELECT linked_at FROM telegram_links WHERE telegram_id = ?")
+                .bind("5550010")
+                .fetch_one(&db.pool)
+                .await
+                .expect("read the rebind's timestamp");
+        assert_ne!(
+            after, PLANTED,
+            "the rebind left the PREVIOUS `linked_at` ({PLANTED}) in place. The upsert's SET must \
+             carry `linked_at = excluded.linked_at`, or the row names the account that most recently \
+             proved control while recording when the one before it did. MEASURED: dropping that \
+             assignment left the whole 682-test suite green."
+        );
+        assert!(
+            after >= planted_owned,
+            "the rebind wrote a `linked_at` ({after}) EARLIER than the one it replaced ({PLANTED})"
+        );
 
         db.close().await;
     }
@@ -1232,5 +1673,97 @@ mod tests {
         assert!(!is_well_formed("١٢٣٤٥٦"));
         // A leading/trailing newline is a classic bypass of a length-only check.
         assert!(!is_well_formed("123456\n"));
+    }
+
+    /// `purge_terminal`'s boundary: a code whose governing instant IS the cutoff is deleted.
+    ///
+    /// WHY THIS EXISTS. `purge_terminal` had NO test of its own boundary - it is called from db.rs's
+    /// sweep, and nothing seeded a row near the cutoff it computes. MEASURED: flipping its comparison
+    /// to `<` left the whole suite green at 670 passed / 0 failed. Making the sweep a complete no-op
+    /// WAS caught, so the sweep ran; only its exact cut was unpinned.
+    ///
+    /// THE SAME SHAPE AS TWO SIBLING SWEEPS. `db.rs`'s session retention and `ip_tracking.rs`'s
+    /// link_code_issues both had boundary tests whose fixtures sat a whole unit away from the cutoff.
+    /// Three sweeps, one habit: a fixture written to be clearly on one side of a boundary and never
+    /// ON it.
+    ///
+    /// THE GOVERNING INSTANT IS AN EXPRESSION, not a column - `COALESCE(used_at, expires_at)`, because
+    /// a redeemed code stops being usable at `used_at` and an unredeemed one at `expires_at`. Both
+    /// arms are seeded at the cutoff so the test cannot pass by exercising only one of them, and a
+    /// REDEEMED code has `expires_at` far in the FUTURE: a statement that read `expires_at` alone
+    /// would keep it and this assertion would fail while the sweep looked wired.
+    #[tokio::test]
+    async fn purge_terminal_deletes_the_code_whose_governing_instant_is_the_cutoff() {
+        let db = TestDb::new().await;
+        let account_id = test_support::account_with_wallet(&db.pool).await;
+        let now = Utc::now();
+        let cutoff = now - Duration::days(LINK_CODE_RETENTION_GRACE_DAYS);
+        let future = now + Duration::days(30);
+
+        async fn seed_at(
+            pool: &SqlitePool,
+            account_id: Uuid,
+            code: &str,
+            expires_at: chrono::DateTime<Utc>,
+            used_at: Option<chrono::DateTime<Utc>>,
+        ) {
+            sqlx::query(
+                "INSERT INTO link_codes (code, account_id, expires_at, used_at, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(code)
+            .bind(account_id.hyphenated())
+            .bind(expires_at)
+            .bind(used_at)
+            .bind(used_at.unwrap_or(expires_at))
+            .execute(pool)
+            .await
+            .expect("seed a link code at a chosen instant");
+        }
+
+        // (a) unredeemed, expiring EXACTLY at the cutoff -> deleted, on `expires_at`.
+        seed_at(&db.pool, account_id, "cutoff-unredeemed", cutoff, None).await;
+        // (b) REDEEMED exactly at the cutoff with an `expires_at` far in the FUTURE -> deleted, on
+        //     `used_at`. This is the arm that proves the COALESCE is read.
+        seed_at(
+            &db.pool,
+            account_id,
+            "cutoff-redeemed",
+            future,
+            Some(cutoff),
+        )
+        .await;
+        // (c) one microsecond the near side of the cutoff -> kept.
+        seed_at(
+            &db.pool,
+            account_id,
+            "just-inside",
+            cutoff + Duration::microseconds(1),
+            None,
+        )
+        .await;
+
+        let purged = purge_terminal(&db.pool, now).await.expect("purge");
+        assert_eq!(
+            purged, 2,
+            "the unredeemed code expiring AT the cutoff and the redeemed code whose used_at IS the \
+             cutoff are both deleted, and the code a microsecond inside survives. 1 means the \
+             comparison is `<`; 0 means the COALESCE is not being read and the redeemed arm was \
+             kept on its future expires_at"
+        );
+
+        let surviving: Vec<String> =
+            sqlx::query_scalar("SELECT code FROM link_codes WHERE account_id = ? ORDER BY code")
+                .bind(account_id.hyphenated())
+                .fetch_all(&db.pool)
+                .await
+                .expect("read surviving codes");
+        assert_eq!(
+            surviving,
+            vec!["just-inside".to_string()],
+            "only the code one microsecond inside the window survives"
+        );
+
+        db.close().await;
     }
 }

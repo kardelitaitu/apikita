@@ -5,7 +5,19 @@
 # Two configs with the same rates and different keys is a startup failure.
 #
 # SECRETS: this file names ENVIRONMENT VARIABLES only. Never inline a key.
-# The names here must match .env.example exactly.
+#
+# The names here should match `.env.example`, and this line used to say they must,
+# which was false. `APK_V4PRO_PRIMARY_KEY_1` names a real endpoint below and is NOT in
+# `.env.example`, so an operator who copies that file to `.env` and fills it in never
+# sets it, and the v4pro endpoint has no key to lease. It is listed there rather than
+# added to `.env.example` because the resale terms for that route are unverified and it
+# is not one to invite an operator to configure until they are.
+#
+# The `APK_DUMMY_*` names further down are the other direction and are CORRECTLY absent:
+# they are placeholders in example endpoint blocks, and shipping a dummy key in a file
+# meant to be copied into production invites someone to leave it there. So the rule is
+# not "identical" - it is that a name an operator is expected to set appears in both, and
+# a name that is a placeholder or an unconfigured route appears only here.
 #
 # Deployment: docs/deployment.md · Decisions: docs/decisions.md
 
@@ -66,12 +78,41 @@ min_monthly_tokens = 0
 # The model has no mechanism for this yet; see docs/business/03-financial-model.md.
 dormancy_days = 0
 
+# How long a deposit's credit stays spendable, in months, counted from that
+# deposit's own settlement date. Per deposit, NOT per account and NOT from last
+# activity - the last-activity reading would silently extend old credit every
+# time a customer spends, which is the reading docs/decisions.md:76 rejects.
+#
+# Read by the sweep (`expire_credit_transaction`) and by the top-up settlement
+# that stamps each row's `credit_expires_at`. Set to 0 to disable expiry, which
+# leaves the terms promising something the code does not do - so 0 is a
+# development setting, not a supported operator choice.
+credit_expiry_months = 24
+
 # Upstream prepaid float policy. Hold roughly one settlement cycle of
 # unpurchased liability so a provider outage does not stall paid customers.
+#
+# NOT ENFORCED, and this one is about money: nothing reads this key, so whatever the
+# float policy is, it is not this number. The comment describes the reason it would be
+# worth having, which is why the value is kept rather than deleted - the intent is the
+# useful part, and an unenforced key with a stated intent is a task, whereas an
+# unenforced key presented as live is a trap.
 reserve_settlement_cycles = 1
 
 # Low-balance warning, sent by the Telegram bot as a DM (never in a shared
 # room). Capped so it cannot become spam.
+#
+# NOT ENFORCED. Neither key is read by anything. There is no low-balance alert in
+# tools/alert/alerts.tsv, and the bot has no DM capability, so nothing will be sent and
+# nothing will complain that it was not. The comment above used to read as a description
+# of a working safety net, and an operator reading it would set a threshold and wait for
+# a warning that cannot arrive - about the upstream float running low, which is the case
+# where a provider outage stalls paid customers.
+#
+# The value is kept so the intended policy is recorded, and the same is true of
+# reserve_settlement_cycles above. Both are on the worklist produced by the field-access
+# measurement described in docs/testing.md: 17 config keys are named somewhere in the
+# crate and read as a field access nowhere.
 low_balance_threshold_idr = 10000
 low_balance_max_per_day = 1
 
@@ -92,6 +133,99 @@ absolute_days = 30
 idle_days = 7
 
 # ===========================================================================
+# AUTH
+# ===========================================================================
+#
+# Identity mechanics: how a password is hashed, what a password must be, and
+# how long a verification or reset link stays valid. The rate limits that bound
+# these endpoints live in [limits] with every other cap - the section that
+# already owns "how many per hour" keeps owning it.
+
+[auth]
+# Argon2id cost. Read on EVERY hash and EVERY verify
+# (server/src/identity/password.rs::hash_password and ::verify_password), so a
+# value changed here changes the work factor for new hashes immediately and for
+# the verification of an existing hash on the next sign-in.
+#
+# 19456 KiB (19 MiB) with 2 passes is the OWASP-recommended floor for Argon2id
+# and RFC 9106's second recommended option. memory_kib is the dominant knob and
+# the one to raise first; raising it multiplies sign-in latency, and the hash
+# runs on a blocking thread so a slow hash costs latency rather than throughput.
+argon2_memory_kib = 19456
+argon2_iterations = 2
+argon2_parallelism = 1
+
+# Password policy. Read by server/src/identity/password.rs::validate_password
+# before hashing, and that one function is the only gate on both signup and
+# password reset, so the two paths cannot drift.
+#
+# min_length is a FLOOR, not a composition rule: there is no character-class
+# requirement, because a length floor is the only password rule that measurably
+# helps and the signup page already states this number to the user. The loader
+# refuses a value below 8 for exactly that reason - the page would be describing
+# a rule we do not enforce.
+password_min_length = 8
+# max_length bounds the Argon2 INPUT, not its cost. Argon2's cost is set by the
+# parameters above, so a 1 MiB "password" buys an attacker nothing and costs us
+# the copy of it.
+password_max_length = 128
+
+# Link lifetimes. Read by server/src/identity/tokens.rs::issue, which computes
+# expires_at, and ::consume, which refuses a row past it.
+#
+# Verification is generous: the user may open the mail tomorrow.
+verification_ttl_minutes = 1440
+# Reset is short, and the reset page says so to the user.
+reset_ttl_minutes = 30
+
+# Google sign-in. The client id is the audience the ID token must name; it is
+# not a secret, so it lives here rather than in the environment. Read by
+# server/src/identity/google.rs::verify_id_token.
+google_client_id = "000000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com"
+
+# How long the Google JWKS response is reused in memory. Read by
+# server/src/identity/google.rs::jwks. Without a cache every sign-in is an
+# outbound request to Google, which makes Google's availability our sign-in
+# latency and our sign-in failure mode.
+google_jwks_cache_seconds = 3600
+
+# ===========================================================================
+# EMAIL
+# ===========================================================================
+#
+# The SMTP relay that carries verification and reset links.
+#
+# This is SMTP rather than a transactional vendor's HTTP API, deliberately: the
+# launch credentials must not pick the architecture. An operator points this at
+# whatever relay they already have, and swapping relays is four values here
+# rather than a code change.
+#
+# smtp_host = "" IS A SUPPORTED STATE, not a misconfiguration. With no relay,
+# signup still works: the account is created unverified, and an unverified
+# account cannot hold a balance, so it is inert. The operator sees one WARN at
+# startup and each failed send is logged against the account. See
+# docs/decisions.md (the identity row) for why a mail outage must not become a
+# signup outage.
+
+[email]
+# Hostname of the relay. Empty means no provider is configured.
+smtp_host = ""
+# 587 is submission with STARTTLS; 465 is implicit TLS. Both are accepted
+# because relays differ.
+smtp_port = 587
+# Empty means the relay takes no authentication, which is the norm for a relay
+# on the same private network.
+smtp_username = ""
+# NAME of the environment variable holding the SMTP password, never the
+# password itself. Same rule as this file's header and as api_key_envs on the
+# model endpoints.
+smtp_password_env = ""
+from_address = ""
+from_name = "apikita"
+reply_to = ""
+request_timeout_seconds = 10
+
+# ===========================================================================
 # RATE LIMITS
 # ===========================================================================
 
@@ -105,17 +239,93 @@ idle_days = 7
 topup_per_hour = 5
 
 # Protects the wallet mutation path generally.
+#
+# NOT ENFORCED, and the word GENERALLY is the part that would mislead. Nothing reads
+# this key. What exists is limits.topup_per_hour, enforced on the one caller-controlled
+# wallet-mutation route (POST /api/topups) and covered by a test that drives the handler
+# at its cap. So today the wallet is protected, but by the specific key on the specific
+# route - not by this one. They agree only because that is the only such route: the
+# webhook credit is not caller-paced, and the proxy debit is bounded by the balance.
+# The moment a second caller-controlled wallet mutation appears, this is the line that
+# should be enforcing it and it will not.
+#
+# **AND WITH THESE TWO VALUES IT WOULD NOT BIND ANYWAY, which changes how urgent that is.**
+# `topup_per_hour` is 5 per hour, which is one request every 12 minutes - so the busiest a client
+# can be on that route while still being admitted is an order of magnitude below the 10 per MINUTE
+# this key would allow, and no client can reach this cap on ANY route while `topup_per_hour` is the
+# smaller number. (It read "5 per hour is 5 per minute", which is not a true statement about the
+# rate; the comparison it was carrying is 5/hour < 10/minute, which holds by a factor of 120.) Wiring
+# this key without raising that one would add a second query per request and change no outcome - so
+# the trigger to wire it is a NEW ROUTE, and the arithmetic below says when the arithmetic changes too.
+#
+#     5/hour  <  10/minute        this key can never bind    (5/hour = 0.083/min)
+#     600/hour >  10/minute       this key WOULD bind, and nothing would enforce it
+#                                 (600/hour = 10/min, exactly - so the trigger is > 600)
+#
+# So there are two ways this becomes real, and they need different responses: a second
+# caller-controlled wallet mutation (wire this key), or `topup_per_hour` raised above 600
+# (which removes all per-minute protection with nothing failing). The second is the one
+# that is a single edit away today, and it is invisible from either value alone.
 wallet_mutations_per_minute = 10
 
 # Blunts limit circumvention by key-spam.
 key_creation_per_day = 10
 
 # Review submissions. Edits are legitimate; flooding is not.
+#
+# NOT ENFORCED, and moot for now only because the review endpoints are marked DESIGNED,
+# NOT BUILT in the api-spec. There is nothing to rate limit yet. Whoever builds them
+# should read this as a requirement, not as a setting: a review endpoint with no rate
+# limit is a moderation problem from its first request, and a body limit alongside it.
 review_per_hour = 3
 
 # Telegram link codes the account may have ISSUED in an hour. Bounds codes in
 # flight per account; it does NOT stop guessing (see the redemption cap below).
 link_code_issuance_per_hour = 10
+
+# Sign-in ATTEMPTS one client IP may make in an hour. Read by
+# server/src/routes/identity.rs::login.
+#
+# A sign-in is the one endpoint where the caller controls the secret being
+# guessed, so only a count bounds a password list. This cap is per IP and the
+# one below is per ACCOUNT on purpose, because they fail differently: a
+# distributed guesser defeats the IP cap without noticing it, and a guesser
+# walking one account from one address is caught by the account cap, which no
+# amount of proxying dilutes. FAILED attempts count - a cap that only counts
+# successes never fires. 0 disables.
+login_per_hour_per_ip = 20
+
+# Sign-in ATTEMPTS against ONE ACCOUNT in an hour, from any address. Read by
+# server/src/routes/identity.rs::login. Deliberately SMALLER than the per-IP
+# cap: a person signing in normally needs one or two, so ten is already
+# generous, and the smaller the number the less a leaked password list is worth.
+login_per_hour_per_account = 10
+
+# Accounts one client IP may CREATE in an hour. Read by
+# server/src/routes/identity.rs::signup.
+#
+# Signup is unauthenticated and sends mail, so it is the one place a caller can
+# spend our money and our sending reputation without an account. FIVE is chosen
+# against the real need rather than against the abuser: a household or an office
+# behind one address shares an IP, and a shared NAT is the case that must not
+# break. 0 disables.
+signup_per_hour_per_ip = 5
+
+# PASSWORD RESET requests one account may make in an hour. Read by
+# server/src/routes/identity.rs::request_reset.
+#
+# Resets send mail, so this bounds both the mail bill and the use of the reset
+# endpoint to flood somebody else's inbox. Per ACCOUNT rather than per IP,
+# because the resource being protected is the victim's mailbox, not our edge.
+password_reset_per_hour_per_account = 3
+
+# VERIFICATION EMAILS one account may be sent in an hour. Read by
+# server/src/routes/identity.rs::resend_verification.
+#
+# The resend control is a button a user can hold down, and every press is a
+# message we pay for and one more chance to be marked as a sender of unwanted
+# mail. 0 disables.
+verification_resend_per_hour = 3
 
 # Redemption ATTEMPTS one client IP may make in an hour. This is the cap that
 # makes the endpoint safe: a 6-digit code is 10^6 possibilities and the endpoint
@@ -179,6 +389,83 @@ key_metadata_cache_seconds = 60
 trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128", "172.21.0.0/16"]
 
 # ===========================================================================
+# INBOUND LIMITS — what this server enforces on ITSELF
+# ===========================================================================
+#
+# WHY THIS SECTION EXISTS. docs/topology.md:50 states the relay is "a cost and
+# load boundary, not a security boundary" and that "Both endpoints must be
+# hardened" — the backend needs "its own rate limits, body caps". MEASURED
+# before this section existed: it had none of the three.
+#
+#   * 800 half-open connections were accepted and held with ZERO timeouts in 30
+#     seconds, while /health kept answering. A slowloris needs no credentials,
+#     and `max_connections_per_account` does not gate it — that limit applies to
+#     /events only, after the session resolves.
+#   * a single half-open client made SHUTDOWN hang for 2,101 SECONDS, because
+#     with_graceful_shutdown waits for connections to finish and such a
+#     connection never finishes.
+#   * the 2 MiB body cap was axum's own DefaultBodyLimit, set by no line in this
+#     repository — so an axum upgrade could have changed it silently.
+#
+# Every value here is a DECISION in one place rather than a framework default
+# inherited by accident.
+[server]
+
+# Maximum requests being served at once, across all connections.
+#
+# A CAP, NOT A QUEUE: a request over the limit is refused rather than parked,
+# because a parked request still holds a connection and a socket — the resource
+# this exists to bound.
+#
+# SIZED FROM THE DOCUMENTED BOX. docs/cost-and-sizing.md:49 says streaming
+# connections cost "kilobytes each, not megabytes" and the target is a 0.2 vCPU
+# container. 512 concurrent is generous for that shape while keeping worst-case
+# socket memory well inside it. The point is a number that was CHOSEN rather
+# than one that was reached.
+max_concurrent_requests = 512
+
+# A `header_read_timeout_seconds = 10` key WAS HERE, and it is DELETED rather than tuned.
+#
+# WHAT IT CLAIMED: "How long a client has to send its complete request HEADERS... THE SLOWLORIS DEFENCE",
+# on the argument that a client opening a socket and sending a partial request line was otherwise held
+# indefinitely.
+#
+# WHAT IT DID: nothing of the sort. It was applied as
+# `TimeoutLayer::with_status_code(503, header_read_timeout_seconds)` over the whole router, and a
+# `TimeoutLayer` wraps the SERVICE - which only begins once the request has been parsed. So it never
+# bounded header arrival, and a slow-loris (which holds the connection BEFORE the handler runs) was
+# unaffected by it. MEASURED: a handler taking 6s under `header_read_timeout_seconds = 2` returned
+# `503 Service Unavailable` at 2007ms. The one thing the field actually did was abort long requests.
+#
+# AND THAT WAS A LIVE BUG, not a curiosity: with 10s here and
+# `[circuit_breaker] request_timeout_seconds = 120`, a chat completion that took longer than ten seconds -
+# the ordinary case this product exists for - was killed with a 503 while its upstream was still working.
+# The two budgets disagreed by 12x and the tighter one won.
+#
+# WHAT ACTUALLY DEFENDS AGAINST SLOWLORIS, since the field is gone and the reader should know what took
+# over:
+#   1. THE EDGE, which is the layer that can: nginx terminates the TCP connection and its
+#      `client_header_timeout` (60s default) is the real header-arrival bound. The deleted comment claimed
+#      the backend's defence was "deliberately tighter" than the edge's - but the backend never had one.
+#   2. `max_concurrent_requests = 512`, which bounds how many connections can be held open at all.
+# A backend-side header timeout COULD be wired (hyper exposes one on its HTTP/1 builder). It is not wired,
+# and it is not claimed: this key is removed rather than left looking like a defence that exists.
+
+# Maximum request body the server will read, in bytes.
+#
+# THIS WAS AXUM'S DEFAULT AND IS NOW A DECISION. MEASURED: the boundary was
+# exactly 2,097,153 bytes — axum-core's DefaultBodyLimit, described in its own
+# source as "the default limit of 2MB" and set by nothing here.
+#
+# 2 MiB KEEPS THE SHIPPED BEHAVIOUR DELIBERATELY. This makes the number explicit
+# and tested rather than changing what clients experience.
+#
+# KNOWN INCONSISTENCY, stated rather than silently fixed: the relay allows
+# client_max_body_size 25m, so a 3 MiB body passes the relay and is refused
+# here. Reconciling that is a product decision this line cannot make alone.
+max_body_bytes = 2097152
+
+# ===========================================================================
 # REALTIME (SSE)
 # ===========================================================================
 
@@ -202,7 +489,45 @@ max_stream_seconds = 1800
 
 [key_pool]
 # HTTP status treated as "this key is saturated, rotate to the next".
-rate_limit_status = [429]
+# 401 IS HERE BECAUSE IT IS A KEY, NOT A CALLER. A 429 says this key is saturated;
+# a 401 says this key is REJECTED - revoked, misconfigured, or out of provider quota at
+# the auth layer - and it is just as specific to this key. Parking it matters more than it
+# looks: selection is least in-flight, so a key that fails fast is in flight for LESS time
+# and therefore gets picked MORE often. With 401 absent, a dead key drifts towards being
+# the one every request tries.
+#
+# 403 is deliberately NOT here. It usually means the key is valid but lacks access to the
+# model, which is a configuration decision rather than a broken credential, and parking it
+# would hide a misconfiguration behind a silent key rotation.
+#
+# THIS IS ALSO WHAT MAKES THE CLIENT RETRY. `UpstreamClient::is_rate_limit` reads this
+# same config value, so a 401 takes the park-and-rotate branch of the retry loop rather
+# than falling through to "any other 4xx is the caller's request" and being returned to
+# the customer as though they had failed to authenticate. Adding 401 here therefore fixes
+# both halves: which key is tried next, and whether the failure is ours to keep.
+#
+# The order matters. The 4xx-is-the-caller branch is CORRECT for 400, 404 and 422, where
+# retrying the same body elsewhere would be wrong. 401 is different in kind - it is our
+# credential - and it is the value above that sorts the two, not a new branch in the loop.
+#
+# HOW FAR THIS IS VERIFIED, precisely, because a note here went stale once already.
+# Checked by READING: `is_rate_limit` consults this value, so a 401 takes the park-and-
+# rotate branch. Checked by TEST: `the_shipped_config_parks_a_401` reads this file and
+# fails if 401 leaves the set, and `a_401_frees_the_slot_without_parking_the_key` pins the
+# pool's behaviour for a 429-only set.
+#
+# Verified END TO END now, in two halves that are checked separately because neither
+# alone is the claim. `the_shipped_config_parks_a_401` reads THIS FILE and fails if 401
+# leaves the set, so the shipped value is pinned. And `a_401_from_the_upstream_rotates_to_
+# the_next_key` drives a stubbed upstream that answers 401 then 200 and requires the
+# stream to succeed, so the BEHAVIOUR is observed rather than argued. The first test does
+# not need a stub and the second does not need this file, which is why neither can quietly
+# cover for the other.
+#
+# That test needs TWO keys: a 401 parks the first, so rotating requires somewhere to rotate
+# to. With one key the pool is simply exhausted and the caller sees a rate-limit error - a
+# different bug, which an earlier attempt at that test read as the 401 leaking through.
+rate_limit_status = [429, 401]
 
 # Seconds a key stays out of rotation after being throttled. Short: the
 # provider's own concurrency window frees up quickly.
@@ -216,6 +541,17 @@ max_key_attempts = 3
 #   "queue"      - hold the request until capacity frees (needs a queue)
 #   "reject_503" - fail fast with Retry-After
 # "reject_503" is the honest default for a proxy: the caller can retry.
+# RECORDED, NOT A SWITCH. Nothing reads on_pool_exhausted, and the behaviour it
+# names is what the code does unconditionally: when no key can be leased the underlying
+# error is WITHHELD from the client and surfaced as a 503 with Retry-After
+# (routes/proxy.rs). Setting this to fail_open would change nothing, and the key is
+# where someone would first try. The same is true of the three keys noted at the health
+# check below: health_check_interval_seconds, health_check_failures and
+# mid_stream_cutoff. On that last one the value is the CURRENT behaviour and it is
+# fortunate rather than coordinated - the pre-flight hold IS taken before routing and
+# an insufficient balance IS refused up front (routes/proxy.rs), which is the
+# mitigation the key describes, but it happens because the code does it, not because
+# this is set to false.
 on_pool_exhausted = "reject_503"
 
 [circuit_breaker]
@@ -241,6 +577,12 @@ cooldown_multiplier = 2.0
 request_timeout_seconds = 120
 
 # External health check interval for relay/backend failover (see topology.md).
+#
+# NOT ENFORCED, along with health_check_failures below and mid_stream_cutoff further
+# down - all three are named in the note above on_pool_exhausted, which is where the
+# full statement of why they are not switches lives. In short: the failover circuit and
+# the pre-flight rejection they describe are both hardcoded to the behaviour these
+# values already name, so an operator who needs to change one has to change code.
 health_check_interval_seconds = 30
 # Consecutive failed checks before failing over.
 health_check_failures = 2
@@ -249,33 +591,81 @@ health_check_failures = 2
 # On balance exhaustion, reject at pre-flight rather than cutting a stream
 # mid-answer. A truncated answer on non-refundable funds is the most likely
 # source of a delivery dispute. See docs/business/05-risk.md R3.
+#
+# NOT ENFORCED as a switch, and the value below is the CURRENT behaviour rather than a
+# setting that produced it. The mitigation this describes IS implemented: the
+# pre-flight hold is taken before routing and an insufficient balance is refused up
+# front, unconditionally, in routes/proxy.rs. So the risk is mitigated - but by the code,
+# not by this line, and there is no way to turn it off by setting this to true.
 mid_stream_cutoff = false
 
 hard_max_output_tokens = 384000
 
 # Context window, for pre-flight input validation.
+#
+# NOT ENFORCED, and the comment above is the misleading part: the pre-flight input
+# validation does NOT read this. It calls money::calculate_preflight_reservation_idr,
+# which estimates from the request as it stands. Nothing compares a prompt against a
+# model context ceiling, so an over-long request is sent to the provider and fails there
+# - or, on some providers, is silently truncated. A context ceiling that is recorded
+# rather than applied is a task; the value is kept because the intent is the useful part.
 max_context_tokens = 1000000
 
 # ===========================================================================
 # PROVIDERS AND MODELS
 # ===========================================================================
 #
-# ONE VERIFIED PROVIDER. The endpoint list below has three entries, but only
-# the first is a real, terms-checked supplier:
+# ONE VERIFIED PROVIDER, AND TWO PLACEHOLDERS HELD AT WEIGHT 0.
+# The flash endpoint list below has three entries, and only the first is a real,
+# terms-checked supplier:
 #
-#   primary    - the reseller in config/provider1.md. VERIFIED.
+#   primary    - the reseller in config/provider1.md. VERIFIED. weight 1.0.
 #   secondary  - PLACEHOLDER URL. No provider identified, terms unread.
+#                weight 0.0. It carried weight 1.0 - so it WAS routed, which
+#                contradicted the rule stated below. That is now corrected: the
+#                rule and the weights agree, and nothing unverified is routable.
 #   tertiary   - PLACEHOLDER URL. weight 0, so never routed.
 #
 # The placeholder URLs are NOT real endpoints. They exist so the config shape
 # is visible; replace them before deploying, or delete the entries.
 #
-# Consequence for failover: with one real provider there is nothing to fail
+# Consequence for failover: with one real provider there is nothing real to fail
 # over TO. Circuit breaking and key rotation work today; cross-provider
 # failover does not. See docs/failover.md.
 #
-# A provider must not be enabled until its resale terms are read - the config
-# enforces this with weight = 0 on unverified entries.
+# A provider must not be enabled until its resale terms are read, and the way
+# this file expresses that is weight = 0. IT USED TO NOT ENFORCE IT: two
+# placeholders were listed, one at weight 0 and one at weight 1.0. That is fixed
+# - the flash list now has exactly one routable endpoint, the verified one - but
+# the rule is STILL a convention here rather than a constraint. There is no
+# verified flag to check, so nothing rejects an unverified entry that someone
+# later raises to a positive weight: the rule is a convention, not a constraint,
+# and a reader who takes it for an enforced invariant would believe the opposite.
+# `server/src/config.rs` pins the count so the header cannot drift from the
+# weights, but it cannot tell a verified endpoint from an unverified one.
+#
+# FAILOVER, and what weight 1.0 on a placeholder USED TO DO. Kept because the
+# shape recurs the moment anyone adds a second provider. The router selects every
+# endpoint with weight > 0, so on a primary 429 or 5xx the request was offered to
+# the secondary. With its key variables unset it had an EMPTY key pool, the
+# failover loop stepped past it, and the request failed - no worse than before,
+# but the attempt and the timeout were real. Had an operator set
+# APK_FLASH_SECONDARY_KEY_1, traffic would have been sent to api.xyz.com, which
+# is not the provider. Weight 0 removes all of that: a weight-0 endpoint is
+# registered for shape and never selected.
+#
+# It had one more effect that is easy to miss, and the server was fixed for it:
+# a weighted endpoint with no keys can never answer, and its circuit breaker never
+# trips, so it used to vote "this model is available" in all_providers_unhealthy
+# and hide a real outage of the primary. That is corrected in the code
+# (upstream/client.rs, an endpoint counts only if it also has keys) and the cause
+# is now removed here as well - the endpoint that could never serve is no longer
+# weighted. The code fix still matters: it is what protects the next placeholder
+# somebody adds at weight 1.0.
+#
+# RAISING THE WEIGHT BACK is a deployment decision, not a code one, and it has
+# two preconditions: a real endpoint URL, and resale terms that have actually
+# been read. See config/README.md, "Resale terms are per provider."
 
 # ===========================================================================
 # MODEL LIST
@@ -296,10 +686,18 @@ max_context_tokens = 1000000
 #   SCOPE: flash only. deepseek-v4-pro is deliberately NOT offered -- it is
 #   7x the output cost of flash and the arbitrage there is unproven.
 #
-# Off-peak is exactly HALF of peak. Peak is 01:00-04:00 and 06:00-10:00 UTC,
-# Mon-Fri, excluding Chinese public holidays -- about 21% of the week.
-# billing_basis="peak" reserves at the PEAK rate so a request can never lose
-# money; adjust once real traffic shows the actual peak/off-peak split.
+# Off-peak is HALF OF THE PROVIDER'S YUAN FIGURE, which is not always exactly
+# half of the IDR figure below -- the CNY->IDR conversion is not exact, so halving
+# before converting and halving after differ by a fraction of a rupiah per million
+# tokens. Two of the six models show it: input_offpeak 6022.76 against a half of
+# 12045.50 (6022.75), and 3212.14 against a half of 6424.27 (3212.135). The other
+# four land exactly. Nothing depends on the difference, and the property that IS
+# required - off-peak never exceeds peak - is asserted by a test over every model.
+#
+# Peak is 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri, excluding Chinese public
+# holidays -- about 21% of the week. billing_basis="peak" reserves at the PEAK rate so
+# a request can never lose money; adjust once real traffic shows the actual
+# peak/off-peak split.
 #
 # Customer price = rate x price, per token class.
 
@@ -314,16 +712,34 @@ max_context_tokens = 1000000
 # flash -- the cheap, high-concurrency workhorse. THIS IS WHERE THE MARGIN IS.
 # ===========================================================================
 
+# THREE FIELDS HERE ARE RECORDED, NOT ENFORCED: supports_vision, supports_thinking
+# and billing_basis. The model struct parses all three and nothing reads them - there is
+# no GET /v1/models, and no document advertises a vision or thinking capability, so
+# nothing customer-facing is currently false. The consequence
+# is behavioural rather than a false claim: a request carrying an image is NOT rejected
+# because this model is marked supports_vision = false, so the failure arrives as
+# whatever the provider does with it. Recorded here so the flags read as intent rather
+# than as a feature. billing_basis in particular does not affect the reserve: the
+# reservation is still made at the rate the code computes, not at the peak rate this
+# key names.
 [[models]]
 name = "flash"
 description = "Fast, low-cost general model. 1M context, vision capable."
 price = 1.5                    # 50% markup over wholesale (M = 1.50)
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -355,12 +771,29 @@ output_peak        = 10707.12  # ¥4.00
 #   - Key values come from ENV VARS ONLY, named here. Never inline a key.
 #
 # concurrency_per_key: the ceiling the provider enforces for ONE key.
-#   0 = unknown, in which case the router should learn it from 429s and back
-#   off, and a warning should be logged because capacity is then a guess.
+#   0 = unknown. THE ROUTER NOW ENFORCES THIS as an admission gate: a key already
+#   holding this many concurrent streams is SKIPPED, not selected, so the next key
+#   takes the request and the pool only reports exhaustion when every key is at its
+#   ceiling (server/src/upstream/key_pool.rs, KeyPool::acquire). It skips rather
+#   than queues, because docs/failover.md commits to failing fast instead of
+#   parking a request on a socket.
 #
-# weight is relative; 0 = registered but never routed (unverified terms).
-# Selection is weighted-random across weight>0; set precedence explicitly if
-# strict primary->secondary->tertiary order is wanted.
+#   The shipped value is 0 for every endpoint, which admits everything and is the
+#   correct setting while the ceiling is unknown: guessing low would refuse
+#   capacity the provider would have served. Set it when a provider states its
+#   per-key limit, and the 429s that limit would otherwise produce stop being
+#   generated. What 0 does NOT do is warn - the comment here used to say a warning
+#   "should be logged because capacity is then a guess", and no such warning
+#   exists.
+#
+# weight is a GATE, not a probability: 0 = registered but never routed
+# (unverified terms), anything >0 = routable. It is NOT weighted-random.
+#
+# Selection is DETERMINISTIC: endpoints are tried in the order written below,
+# skipping any weight-0 entry and any whose circuit is open
+# (server/src/upstream/client.rs, the routing loop). So the ORDER of these
+# blocks is the failover precedence — put the primary first. An earlier version
+# of this comment said "weighted-random"; the implementation never was.
 
 [[models.endpoints]]
 name = "primary"
@@ -384,7 +817,18 @@ api_key_envs = [
   "APK_FLASH_SECONDARY_KEY_2",
 ]
 concurrency_per_key = 0
-weight = 1.0
+# PLACEHOLDER, and weight 0 for the same reason `tertiary` below is. This URL is
+# not a real provider: it is a stand-in that gives the router a second endpoint to
+# demonstrate failover against, and its resale terms were never read. Weight 1.0
+# said "route here" about a host that cannot serve and that nobody has cleared to
+# resell. Two consequences followed from that, and both are recorded elsewhere in
+# this file: an operator who filled APK_FLASH_SECONDARY_KEY_1 would send paying
+# traffic to api.xyz.com, and until the code was fixed a keyless weighted endpoint
+# voted in `all_providers_unhealthy` and could mask a real outage of the primary.
+# The code fix is in place; this line removes the cause rather than compensating
+# for it. Raise the weight when a real second provider exists AND its resale terms
+# have been read - see config/README.md, "Resale terms are per provider".
+weight = 0.0
 supports_stream_options = true
 
 [[models.endpoints]]
@@ -411,11 +855,19 @@ name = "deepseek-v4-flash"
 description = "Legacy alias of flash. Identical pricing."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -472,11 +924,19 @@ name = "deepseek-v4-pro"
 description = "Higher-capability reasoning tier. Priced above flash."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -485,7 +945,13 @@ billing_basis = "peak"
 cache_read_offpeak = 200.76     # ¥0.075
 cache_read_peak    = 401.52     # ¥0.15
 input_offpeak      = 6022.76    # ¥2.25
-input_peak         = 12045.50   # ¥4.50
+# 4.50 x 2676.78 = 12045.51; this read 12045.50, a cent low, and it was the ONLY cell of 36 in
+# the price card that was not exact against its own CNY comment - measured across all six
+# models at both bases. It is displayed on /models as a coming-soon price, and the website's
+# 18,068 is unchanged either way (12045.50 x 1.5 and 12045.51 x 1.5 both round to it), so
+# this was invisible until something asked whether each rate is the conversion of the CNY
+# printed beside it.
+input_peak         = 12045.51   # ¥4.50
 output_offpeak     = 18068.27   # ¥6.75
 output_peak        = 36136.53   # ¥13.50
 
@@ -521,11 +987,19 @@ name = "dummy-glm-5.3-flash"
 description = "PLACEHOLDER -- not a real model. Never routed."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -555,11 +1029,19 @@ name = "dummy-glm-5.2"
 description = "PLACEHOLDER -- not a real model. Never routed."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]
@@ -589,11 +1071,19 @@ name = "dummy-qwen-4-max"
 description = "PLACEHOLDER -- not a real model. Never routed."
 price = 1.5
 
+# max_context_tokens, supports_vision and supports_thinking are RECORDED, NOT
+# ENFORCED, as the header of this block sets out. The context ceiling is not enforced
+# against a request, and a vision request is not refused because the model is marked
+# supports_vision = false. billing_basis, further down, is the fourth of the same kind.
 max_context_tokens = 1000000
 max_output_tokens = 384000
 supports_vision = true
 supports_thinking = true
 
+# RECORDED, NOT A SWITCH: billing_basis names a reserve rate and does not affect the
+# reserve. The hold is taken at the rate the code computes, from the price above. Set to
+# something other than "peak" and nothing moves, which matters because a key that names
+# money arithmetic reads like it participates in it.
 billing_basis = "peak"
 
 [models.rates]

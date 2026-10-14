@@ -9,6 +9,8 @@ use tracing::{error, info, warn};
 use uuid::fmt::Hyphenated;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::db::SHIPPED_CREDIT_EXPIRY_MONTHS;
 use crate::db::{credit_topup_transaction, TopupCreditResult};
 use crate::error::AppError;
 use crate::money::{
@@ -161,7 +163,13 @@ pub async fn handle_midtrans_webhook(
     let action = evaluate_payment_status(&payload.transaction_status, gross_idr);
     match action {
         PaymentAction::Credit { amount_idr } => {
-            let result = credit_topup_transaction(pool, &payload.order_id, amount_idr).await;
+            let result = credit_topup_transaction(
+                pool,
+                &payload.order_id,
+                amount_idr,
+                state.config.wallet.credit_expiry_months,
+            )
+            .await;
 
             // Only a fresh settle moves the wallet, so only a fresh settle is
             // announced. The value is the POST-credit balance the transaction
@@ -192,6 +200,27 @@ pub async fn handle_midtrans_webhook(
                     );
                     (StatusCode::OK, Json(json!({"status": "already_settled"})))
                 }
+                // NOT AN ALERT AND A 404, AND BOTH ARE WORTH A SECOND LOOK. The two
+                // neighbouring rejections are more careful than this one: an amount
+                // mismatch emits the documented `topup.rejected` event, which is what the
+                // `webhook_rejection` alert fires on, and an unverifiable signature emits
+                // its own. This arm warns and stops - so a payment for an order we do not
+                // have, which means a customer paid and we cannot credit them, is visible
+                // only in a log line nobody is required to read.
+                //
+                // The 404 is the other half. Midtrans, like most senders, treats a non-2xx
+                // as a failed delivery and retries on its own schedule, so a condition
+                // that can never succeed - the order does not exist and never will - is
+                // answered in a way that invites the sender to keep asking. A 200 with a
+                // refusal body would stop the retries; the credit behaviour is identical
+                // either way, since `NotFound` means no row and no row means no credit.
+                //
+                // NEITHER IS DECIDED HERE, because both are judgements about the payment
+                // provider's contract rather than bugs: 404 is more honest to the sender
+                // about what happened, and retrying is harmless for an unknown order while
+                // an alert that fires on every stray webhook trains people to ignore it.
+                // What is not defensible is leaving it undocumented, which is what this
+                // comment is for.
                 Ok(TopupCreditResult::NotFound) => {
                     warn!(
                         order_id = %payload.order_id,
@@ -266,7 +295,22 @@ pub async fn handle_midtrans_webhook(
         // never assumed to be in progress. The refusal is enumerated explicitly in
         // `money::REFUND_STATUSES`.
         PaymentAction::RefundRefused => {
+            // The event field is the machine-readable marker an operator's probe greps
+            // for, exactly as the two rejections above set topup.rejected
+            // (webhooks.rs:133, :208). Without it this refusal is INVISIBLE to alerting,
+            // which is the gap docs/launch-checklist.md:68 names.
+            //
+            // A DISTINCT name, deliberately, not topup.rejected. They look similar and
+            // mean opposite things: a rejection is a payment that failed to land and may
+            // owe someone money, while a refusal is a refund DECLINED BY POLICY, which is
+            // the system working. Sharing the name would page on routine enforcement and
+            // would let a refusal spike hide inside a rejection count.
+            //
+            // Alerting matters even though the behaviour is correct, because a refusal is
+            // the ONE webhook outcome where nothing moves - and a status-mapping
+            // regression routing real events into this arm would look identical.
             error!(
+                event = "refund.refused",
                 order_id = %payload.order_id,
                 midtrans_status = %payload.transaction_status,
                 "Refund refused: this platform does not do refunds; no money moved"
@@ -355,6 +399,9 @@ pub async fn handle_midtrans_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        balance, ledger_drift_rows, ledger_row_count, ledger_rows, topup_status,
+    };
     // Only the tests exercise the raw status mapping: production code reaches it
     // through `evaluate_payment_status`, which is what the import above names.
     use crate::money::terminal_status;
@@ -627,6 +674,7 @@ mod tests {
             config: Arc::new(config),
             ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
             trusted_proxies: Arc::from(trusted.into_boxed_slice()),
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 
@@ -673,6 +721,80 @@ mod tests {
     /// abuse.rs suites use. The SQLite schema has no DEFAULT for id, created_at
     /// or updated_at, so the Postgres RETURNING id shape would fail at runtime
     /// with a NOT NULL constraint error rather than here.
+    /// The live-balance event is addressed to the account that PAID, and to no other.
+    ///
+    /// WHY THIS EXISTS. A settlement publishes `publish_balance(&state.events, account_id, ..)` where
+    /// `account_id` comes from `topup_account_id` - a separate query. MEASURED: making that query
+    /// ignore its `order_id` and return ANY topup row left the whole suite green at 674 passed /
+    /// 0 failed, and making it return NOTHING did too. Nothing observed which account the event was
+    /// addressed to, because `RealtimeHub::subscribe` is private to events.rs and no test outside it
+    /// could look.
+    ///
+    /// WHY THE WRONG ACCOUNT IS A LEAK RATHER THAN A COSMETIC BUG. `publish_balance` is scoped to that
+    /// id so only its dashboard receives it - the module doc calls this the DEFECT 1 filter. Handing
+    /// it another account's id puts CUSTOMER A'S NEW BALANCE on CUSTOMER B'S live stream. The
+    /// second-worst outcome, returning None, silently drops the event and leaves the paying customer's
+    /// dashboard stale until its next snapshot.
+    ///
+    /// THE NEGATIVE CONTROL IS THE POINT, and `events.rs`'s
+    /// `a_subscriber_receives_only_its_own_accounts_events` records why: an isolation assertion is
+    /// VACUOUS if the event never arrives at all, because "nothing leaked" and "nothing was sent" look
+    /// identical. So this drains the receiver and requires BOTH that an event arrived AND that it
+    /// names the payer.
+    #[tokio::test]
+    async fn a_settlement_publishes_the_balance_to_the_paying_account_only() {
+        run_live(|pool, account_id, state| async move {
+            // A SECOND account that also has a TOPUP ROW, so a lookup that ignores its `order_id`
+            // has something wrong to return. This is load-bearing and was MEASURED: with the
+            // bystander holding only a wallet, `SELECT account_id FROM topups LIMIT 1` still returned
+            // the payer - because `topups` had one row - and the mutation survived the test. The
+            // bystander's row is created FIRST, so it is the one an unordered lookup finds.
+            let bystander = test_support::account_with_wallet(&pool).await;
+            let _bystander_order = pending_topup(&pool, bystander, 50_000).await;
+
+            // 50000 IDR matches the `gross_amount` signed below, so the settlement is not refused for
+            // an amount mismatch - which would leave no event to observe and make this test's
+            // assertions vacuous rather than failing.
+            let order_id = pending_topup(&pool, account_id, 50_000).await;
+
+            // Subscribe BEFORE the webhook, so the event cannot be missed.
+            let mut rx = state.events.subscribe_for_test();
+
+            let payload = notification(&order_id, "200", "50000.00", "settlement", LIVE_TEST_SERVER_KEY);
+            let (status, body) = post(&state, payload).await;
+            assert_eq!(status, StatusCode::OK, "the settlement must be accepted: {body}");
+
+            let delivered: Vec<_> = std::iter::repeat(())
+                .map_while(|_| rx.try_recv().ok())
+                .collect();
+            let balance: Vec<_> = delivered
+                .iter()
+                .filter(|e| e.name() == "balance")
+                .collect();
+
+            assert_eq!(
+                balance.len(),
+                1,
+                "a fresh settlement publishes exactly ONE balance event. Zero means the lookup \
+                 returned None and the paying customer's dashboard was left stale; more than one \
+                 means the webhook published twice"
+            );
+            assert_eq!(
+                balance[0].account_id(),
+                account_id,
+                "the balance event must be addressed to the account that PAID. Another id here puts \
+                 one customer's balance on another customer's live stream"
+            );
+            assert_ne!(
+                balance[0].account_id(),
+                bystander,
+                "the event was addressed to the bystander account, which is the cross-account leak \
+                 this test exists to catch"
+            );
+        })
+        .await;
+    }
+
     async fn fixture_account(pool: &SqlitePool) -> Uuid {
         test_support::account_with_wallet(pool).await
     }
@@ -737,75 +859,14 @@ mod tests {
         (status, body)
     }
 
-    async fn balance_of(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(pool)
-            .await
-            .expect("read balance")
-    }
-
-    async fn topup_status_of(pool: &SqlitePool, order_id: &str) -> String {
-        sqlx::query_scalar("SELECT status FROM topups WHERE order_id = ?")
-            .bind(order_id)
-            .fetch_one(pool)
-            .await
-            .expect("read topup status")
-    }
-
-    async fn ledger_count(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(pool)
-            .await
-            .expect("count ledger rows")
-    }
-
-    /// Every ledger row for the account with that reason, oldest first, as
-    /// (delta_idr, ref).
-    async fn ledger_rows_of(
-        pool: &SqlitePool,
-        account_id: Uuid,
-        reason: &str,
-    ) -> Vec<(i64, Option<String>)> {
-        sqlx::query_as(
-            "SELECT delta_idr, ref FROM ledger WHERE account_id = ? AND reason = ? ORDER BY id",
-        )
-        .bind(account_id.hyphenated())
-        .bind(reason)
-        .fetch_all(pool)
-        .await
-        .expect("read ledger rows")
-    }
-
-    /// The reconciliation check from docs/observability.md: wallets.balance_idr
-    /// must equal SUM(ledger.delta_idr). Scoped to THIS fixture's account, so a
-    /// concurrent writer cannot fail it for a reason unrelated to the handler.
-    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT w.account_id
-                FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
+    // see `the_drift_helper_sees_ledger_money_with_no_wallet_row` there.
 
     /// THE INVARIANT, asserted after EVERY branch of every test below. A write
     /// that lands on one side only - a credit with no ledger row, a debit with
     /// no ledger row - cannot pass this, whatever the HTTP status said.
     async fn assert_reconciled(pool: &SqlitePool, account_id: Uuid, context: &str) {
         assert_eq!(
-            drift_rows(pool, account_id).await,
+            ledger_drift_rows(pool, account_id).await,
             0,
             "{context}: wallets.balance_idr must equal SUM(ledger.delta_idr)"
         );
@@ -839,7 +900,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
-            "docs/server/api-spec.md:274 - a signature mismatch is 401. body: {body}"
+            "docs/server/api-spec.md, POST /webhooks/midtrans - a signature mismatch is 401. body: {body}"
         );
         assert_eq!(body["error"], json!("invalid signature"), "{body}");
 
@@ -847,17 +908,17 @@ mod tests {
         // HTTP status: a handler that answered 401 and credited anyway would
         // pass a status-only test.
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             0,
             "a rejected webhook must not credit the wallet"
         );
         assert_eq!(
-            topup_status_of(&pool, &order_id).await,
+            topup_status(&pool, &order_id).await,
             "pending",
             "a rejected webhook must not settle the topup"
         );
         assert_eq!(
-            ledger_count(&pool, account_id).await,
+            ledger_row_count(&pool, account_id).await,
             0,
             "a rejected webhook must append no ledger row"
         );
@@ -893,21 +954,21 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "docs/server/api-spec.md:276 - an amount that disagrees with the stored row is              rejected. body: {body}"
+            "docs/server/api-spec.md:684 - an amount that disagrees with the stored row is              rejected. body: {body}"
         );
         assert_eq!(body["error"], json!("amount mismatch"), "{body}");
 
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             0,
             "a mismatched amount must credit NOTHING - not the payload amount, not the stored one"
         );
         assert_eq!(
-            topup_status_of(&pool, &order_id).await,
+            topup_status(&pool, &order_id).await,
             "pending",
             "a mismatched amount must leave the topup pending"
         );
-        assert_eq!(ledger_count(&pool, account_id).await, 0);
+        assert_eq!(ledger_row_count(&pool, account_id).await, 0);
         assert_reconciled(&pool, account_id, "after a mismatched amount").await;
     }
 
@@ -946,13 +1007,13 @@ mod tests {
         );
 
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             AMOUNT,
             "the wallet must be up by EXACTLY the amount"
         );
-        assert_eq!(topup_status_of(&pool, &order_id).await, "settled");
+        assert_eq!(topup_status(&pool, &order_id).await, "settled");
 
-        let rows = ledger_rows_of(&pool, account_id, "topup").await;
+        let rows = ledger_rows(&pool, account_id, "topup").await;
         assert_eq!(
             rows.len(),
             1,
@@ -972,17 +1033,17 @@ mod tests {
         assert_eq!(body["status"], json!("already_settled"), "{body}");
 
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             AMOUNT,
             "a replayed webhook must NOT credit again"
         );
         assert_eq!(
-            ledger_count(&pool, account_id).await,
+            ledger_row_count(&pool, account_id).await,
             1,
             "the ledger row COUNT must be unchanged by the replay"
         );
-        assert_eq!(ledger_rows_of(&pool, account_id, "topup").await.len(), 1);
-        assert_eq!(topup_status_of(&pool, &order_id).await, "settled");
+        assert_eq!(ledger_rows(&pool, account_id, "topup").await.len(), 1);
+        assert_eq!(topup_status(&pool, &order_id).await, "settled");
         assert_reconciled(&pool, account_id, "after a replayed settlement").await;
     }
 
@@ -1021,16 +1082,16 @@ mod tests {
 
             assert_eq!(status, StatusCode::OK, "{midtrans_status}: body: {body}");
             assert_eq!(
-                topup_status_of(&pool, &order_id).await,
+                topup_status(&pool, &order_id).await,
                 expected,
                 "{midtrans_status} must persist the SCHEMA word `{expected}`, not Midtrans'                  own. A silent no-op answers 200 too, so the row is the assertion. body: {body}"
             );
             assert_eq!(
-                balance_of(&pool, account_id).await,
+                balance(&pool, account_id).await,
                 0,
                 "{midtrans_status} must not move money"
             );
-            assert_eq!(ledger_count(&pool, account_id).await, 0);
+            assert_eq!(ledger_row_count(&pool, account_id).await, 0);
             assert_reconciled(&pool, account_id, &format!("after {midtrans_status}")).await;
         }
     }
@@ -1057,22 +1118,22 @@ mod tests {
 
         // The topup must be EXACTLY as it was - not merely "not settled".
         assert_eq!(
-            topup_status_of(&pool, &order_id).await,
+            topup_status(&pool, &order_id).await,
             "pending",
             "an unrecognised status performs NO write. body: {body}"
         );
-        assert_eq!(balance_of(&pool, account_id).await, 0);
-        assert_eq!(ledger_count(&pool, account_id).await, 0);
+        assert_eq!(balance(&pool, account_id).await, 0);
+        assert_eq!(ledger_row_count(&pool, account_id).await, 0);
         assert_reconciled(&pool, account_id, "after an unrecognised status").await;
 
         // ...and it must not report a money-moving outcome. The status code is
-        // 200 because docs/server/api-spec.md:293 requires a fast 2xx so
+        // 200 because docs/server/api-spec.md:699 requires a fast 2xx so
         // Midtrans does not retry; the BODY is therefore the only signal, and
         // it must not be any of the success words.
         assert_eq!(
             status,
             StatusCode::OK,
-            "docs/server/api-spec.md:293 - respond 200 quickly so Midtrans does not retry: {body}"
+            "docs/server/api-spec.md:699 - respond 200 quickly so Midtrans does not retry: {body}"
         );
         for success in [
             "settled",
@@ -1119,7 +1180,7 @@ mod tests {
         // very drift the reconciliation assertion below then reports.
         let order_id = pending_topup(&pool, account_id, AMOUNT).await;
         assert_eq!(
-            credit_topup_transaction(&pool, &order_id, AMOUNT)
+            credit_topup_transaction(&pool, &order_id, AMOUNT, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("settle the fixture topup"),
             TopupCreditResult::Settled {
@@ -1153,22 +1214,22 @@ mod tests {
             // handler that answered the refusal body and debited anyway would pass a
             // status-only test.
             assert_eq!(
-                balance_of(&pool, account_id).await,
+                balance(&pool, account_id).await,
                 AMOUNT,
                 "attempt {attempt}: a refused refund must not debit the wallet"
             );
             assert_eq!(
-                topup_status_of(&pool, &order_id).await,
+                topup_status(&pool, &order_id).await,
                 "settled",
                 "attempt {attempt}: a refused refund must leave the topup settled"
             );
             assert_eq!(
-                ledger_rows_of(&pool, account_id, "refund").await.len(),
+                ledger_rows(&pool, account_id, "refund").await.len(),
                 0,
                 "attempt {attempt}: a refused refund must append no ledger row"
             );
             assert_eq!(
-                ledger_count(&pool, account_id).await,
+                ledger_row_count(&pool, account_id).await,
                 1,
                 "attempt {attempt}: the credit must remain the ONLY ledger row"
             );
@@ -1193,9 +1254,9 @@ mod tests {
             json!("already_settled"),
             "a settlement replayed after a refusal must credit nothing: {body}"
         );
-        assert_eq!(balance_of(&pool, account_id).await, AMOUNT);
-        assert_eq!(ledger_count(&pool, account_id).await, 1);
-        assert_eq!(topup_status_of(&pool, &order_id).await, "settled");
+        assert_eq!(balance(&pool, account_id).await, AMOUNT);
+        assert_eq!(ledger_row_count(&pool, account_id).await, 1);
+        assert_eq!(topup_status(&pool, &order_id).await, "settled");
         assert_reconciled(
             &pool,
             account_id,
@@ -1232,7 +1293,7 @@ mod tests {
 
         let first = pending_topup(&pool, account_id, STORED).await;
         assert_eq!(
-            credit_topup_transaction(&pool, &first, STORED)
+            credit_topup_transaction(&pool, &first, STORED, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("settle the first fixture topup"),
             TopupCreditResult::Settled {
@@ -1241,7 +1302,7 @@ mod tests {
         );
         let second = pending_topup(&pool, account_id, STORED).await;
         assert_eq!(
-            credit_topup_transaction(&pool, &second, STORED)
+            credit_topup_transaction(&pool, &second, STORED, SHIPPED_CREDIT_EXPIRY_MONTHS)
                 .await
                 .expect("settle the second fixture topup"),
             TopupCreditResult::Settled {
@@ -1272,22 +1333,22 @@ mod tests {
         );
 
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             2 * STORED,
             "a refused refund must debit NOTHING - not the payload amount, not the stored one"
         );
         assert_eq!(
-            topup_status_of(&pool, &first).await,
+            topup_status(&pool, &first).await,
             "settled",
             "a refused refund must not mark the top-up refunded"
         );
         assert_eq!(
-            ledger_rows_of(&pool, account_id, "refund").await.len(),
+            ledger_rows(&pool, account_id, "refund").await.len(),
             0,
             "a refused refund must append no ledger row"
         );
         assert_eq!(
-            ledger_count(&pool, account_id).await,
+            ledger_row_count(&pool, account_id).await,
             2,
             "only the two credits may exist"
         );
@@ -1300,8 +1361,8 @@ mod tests {
         let (status, body) = post(&state, honest).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(body["status"], json!("refund_not_supported"), "{body}");
-        assert_eq!(balance_of(&pool, account_id).await, 2 * STORED);
-        assert_eq!(topup_status_of(&pool, &first).await, "settled");
+        assert_eq!(balance(&pool, account_id).await, 2 * STORED);
+        assert_eq!(topup_status(&pool, &first).await, "settled");
         assert_reconciled(&pool, account_id, "after the stored-amount refund").await;
     }
 
@@ -1358,6 +1419,10 @@ mod tests {
     #[tokio::test]
     async fn live_webhook_answers_a_malformed_body_with_json_not_plain_text() {
         run_live(|pool, _account_id, state| async move {
+            // Install a capturing subscriber so the extractor-rejection
+            // `warn!` field expressions (webhooks.rs:85-86) are evaluated and
+            // counted as covered - they are skipped when no subscriber is active.
+            let _capture = capture_logs();
             // (a) Valid JSON that is not a MidtransNotification: required
             //     fields are missing.
             let (status, content_type, body) = post_raw(&state, r#"{"order_id":"x"}"#).await;
@@ -1452,6 +1517,60 @@ mod tests {
         String::from_utf8(sink.lock().expect("log sink lock").clone()).expect("log lines are utf-8")
     }
 
+    /// `fraud_status` is parsed and never read, and this pins what that means.
+    ///
+    /// Midtrans sends its own fraud verdict alongside `transaction_status`. This
+    /// crate treats the latter as the authority and ignores the former, so a
+    /// validly-signed notification that says `fraud_status: "deny"` alongside
+    /// `transaction_status: "settlement"` is CREDITED. That is the current
+    /// behaviour, asserted here so it is a decision rather than an oversight.
+    ///
+    /// The test is built on the reasoning that makes it safe today: a challenged
+    /// payment arrives as `pending` (no credit) and a fraud-rejected one as
+    /// `deny` (`TerminalNoAction`), so `fraud_status` adds nothing the primary
+    /// signal does not already carry. What is NOT claimed is that Midtrans can never
+    /// send `settlement` with a non-`accept` fraud verdict — that is a claim about a
+    /// third party's API, and this repository is not the place to assert it.
+    ///
+    /// Worth pinning for a second reason: the SIGNATURE DOES NOT COVER
+    /// `fraud_status`. `compute_midtrans_signature` hashes order_id, status_code,
+    /// gross_amount and the server key, so this field is the one part of the payload
+    /// an attacker could alter freely. That is precisely why it must not become an
+    /// authority without also becoming signed — and why treating it as one now would
+    /// be worse than ignoring it.
+    #[tokio::test]
+    async fn a_validly_signed_settlement_credits_even_when_fraud_status_says_deny() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let order_id = pending_topup(&db.pool, account_id, 50_000).await;
+        let mut payload = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+        // Signed correctly for every field the signature ACTUALLY covers.
+        payload.fraud_status = Some("deny".into());
+
+        let (status, body) = post(&state, payload).await;
+        assert_eq!(status, StatusCode::OK, "the body is {body}");
+        assert_eq!(body["status"], json!("settled"), "the body is {body}");
+        assert_eq!(
+            topup_status(&db.pool, &order_id).await,
+            "settled",
+            "fraud_status is deliberately not consulted: transaction_status is the \
+             authority, and Midtrans reports a challenged payment as pending and a \
+             fraud-rejected one as deny. If this ever needs to change, the change is \
+             to consult it HERE and to add it to compute_midtrans_signature, because a \
+             field the signature does not cover cannot be an authority."
+        );
+    }
+
     #[tokio::test]
     async fn a_webhook_rejection_is_logged_under_the_documented_topup_rejected_event() {
         let _env = EnvLock::acquire();
@@ -1517,5 +1636,340 @@ mod tests {
 
         assert_reconciled(&db.pool, account_id, "after the rejection logging").await;
         db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // THE REFUND-REFUSAL EVENT. docs/launch-checklist.md:68 names this as the one
+    // outstanding code-shaped item in Gate 2: "unalerted, a refusal is
+    // indistinguishable from a bug".
+    //
+    // WHY IT NEEDS ITS OWN EVENT RATHER THAN REUSING `topup.rejected`: they look
+    // similar and mean opposite things. A `topup.rejected` is a payment that FAILED to
+    // land - someone may be owed money and the registry says "investigate
+    // immediately". A refund refusal is a refund REQUESTED AND DECLINED BY POLICY, which
+    // is the system working. Folding them together would page on routine policy
+    // enforcement, and - worse - would let a refund-refusal spike hide inside a
+    // rejection count.
+    //
+    // WHY IT NEEDS ALERTING AT ALL, since the behaviour is correct: a refusal is the
+    // ONE webhook outcome where NOTHING MOVES - the topup stays `settled`, no ledger
+    // row is appended, the balance is untouched. That is also exactly what a
+    // status-mapping regression routing real events into this arm would look like. Both
+    // cases are "no visible change", so without a distinct log marker they are
+    // indistinguishable to an operator.
+    // -----------------------------------------------------------------------
+
+    /// The refusal carries a stable, greppable event name - the thing `probe.sh`
+    /// greps for. RED FIRST: the log line has a MESSAGE and two fields but no `event`,
+    /// so the one alert path that could see it cannot.
+    #[tokio::test]
+    async fn a_refund_refusal_is_logged_under_its_own_documented_event() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let order_id = pending_topup(&db.pool, account_id, 50_000).await;
+        let refund = notification(&order_id, "200", "50000.00", "refund", LIVE_TEST_SERVER_KEY);
+
+        let (status, body) = {
+            let (_guard, sink) = capture_logs();
+            let (status, body) = post(&state, refund).await;
+            let logged = captured_lines(&sink);
+
+            // The event name an operator's probe keys on. Without it the refusal is
+            // invisible to alerting, which is the whole finding.
+            assert!(
+                logged.contains("refund.refused"),
+                "a refund refusal must carry the documented event `refund.refused`, or the probe cannot see it and an unalerted refusal stays indistinguishable from a bug (docs/launch-checklist.md:68). Logged:\n{logged}"
+            );
+            // The order id must travel with it, or an operator who sees the page cannot
+            // find which top-up to look at.
+            assert!(
+                logged.contains(&order_id),
+                "the refusal must name the order so it can be investigated. Logged:\n{logged}"
+            );
+            // POSITIVE CONTROL: a refusal must NOT also raise the REJECTION event, or
+            // the two would be conflated and a policy decision would page as a failed
+            // payment.
+            assert!(
+                !logged.contains("topup.rejected"),
+                "a refund refusal is a POLICY decision, not a failed payment: raising topup.rejected would page on routine enforcement. Logged:\n{logged}"
+            );
+            (status, body)
+        };
+
+        // The behaviour is unchanged and still correct: 200 with the explicit refusal
+        // body, and NO money moved.
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["status"], json!("refund_not_supported"));
+        assert_reconciled(&db.pool, account_id, "after the refusal logging").await;
+
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // SHARED HELPER. `post` does not install a subscriber, so the handler's
+    // `warn!`/`error!`/`info!` field expressions are skipped (and left
+    // uncovered) when no subscriber is active. This variant installs a capturing
+    // subscriber for the duration of the call so those arms are fully exercised.
+    // -----------------------------------------------------------------------
+    async fn post_logged(
+        state: &AppState,
+        payload: MidtransNotification,
+    ) -> (StatusCode, serde_json::Value) {
+        let (_guard, _sink) = capture_logs();
+        post(state, payload).await
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. SERVER MISCONFIGURATION: the signing secret is absent or empty.
+    // -----------------------------------------------------------------------
+
+    /// An EMPTY/whitespace secret is refused as `server misconfigured`, NOT a
+    /// forged-signature 401: an empty key makes the published formula compute a
+    /// matchable signature, so it must never be used. The env is mutated here
+    /// under the shared lock, with the previous value restored on drop.
+    #[tokio::test]
+    async fn live_webhook_refuses_an_empty_or_whitespace_server_key() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", "   ");
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        // The signature is computed with the same (refused) key, so it would be
+        // valid - but the handler refuses BEFORE verifying, which is the point.
+        let payload = notification("order_x", "200", "50000.00", "settlement", "   ");
+        let (status, body) = post_logged(&state, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an empty/whitespace key must refuse verification, not attempt it: {body}"
+        );
+        assert_eq!(body["error"], json!("server misconfigured"), "{body}");
+        assert_reconciled(&db.pool, account_id, "after a misconfigured empty key").await;
+        db.close().await;
+    }
+
+    /// The secret is entirely ABSENT (not merely empty). Distinct from the empty
+    /// case so an operator can tell the two misconfigurations apart.
+    #[tokio::test]
+    async fn live_webhook_refuses_a_missing_server_key() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::remove("MIDTRANS_SERVER_KEY");
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let payload = notification("order_x", "200", "50000.00", "settlement", "whatever");
+        let (status, body) = post_logged(&state, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a missing key must refuse verification: {body}"
+        );
+        assert_eq!(body["error"], json!("server misconfigured"), "{body}");
+        assert_reconciled(&db.pool, account_id, "after a missing key").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. A BAD gross_amount format is rejected before any money moves.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_rejects_an_unparseable_gross_amount() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        // A valid signature over a non-numeric amount: the amount parse runs
+        // AFTER the signature check, so this exercises the parse failure arm
+        // specifically, not the rejection arm.
+        let payload = notification(
+            "order_x",
+            "200",
+            "not-a-number",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+        let (status, body) = post(&state, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unparseable gross_amount is a 400: {body}"
+        );
+        assert_eq!(
+            body["error"],
+            json!("invalid gross_amount format"),
+            "{body}"
+        );
+        assert_reconciled(&db.pool, account_id, "after a bad gross_amount").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. A settlement for an UNKNOWN order is NotFound, not a credit.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_rejects_a_settlement_for_an_unknown_order() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let order_id = "no-such-order-00000000";
+        let payload = notification(
+            order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+        let (status, body) = post_logged(&state, payload).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a settlement for an order that does not exist is 404: {body}"
+        );
+        assert_eq!(body["error"], json!("order not found"), "{body}");
+        assert_eq!(balance(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_row_count(&db.pool, account_id).await, 0);
+        assert_reconciled(&db.pool, account_id, "after an unknown-order settlement").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. A settlement for a row that is NOT settleable (denied/expire/cancel)
+    //     is refused with 200 + not_settleable; NO money moves.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_refuses_a_settlement_for_a_non_settleable_order() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        const AMOUNT: i64 = 50_000;
+        let order_id = pending_topup(&db.pool, account_id, AMOUNT).await;
+        // First move the row out of `pending` via a real terminal status, so the
+        // later settlement finds a non-settleable row.
+        let deny = notification(&order_id, "200", "50000.00", "deny", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post(&state, deny).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(topup_status(&db.pool, &order_id).await, "denied");
+
+        let settle = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+        let (status, body) = post_logged(&state, settle).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["status"],
+            json!("not_settleable"),
+            "a settlement for a denied order must be refused as not_settleable: {body}"
+        );
+        assert_eq!(body["order_status"], json!("denied"), "{body}");
+        assert_eq!(balance(&db.pool, account_id).await, 0, "no money moved");
+        assert_eq!(ledger_row_count(&db.pool, account_id).await, 0);
+        assert_reconciled(&db.pool, account_id, "after a not_settleable settlement").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. A terminal status for a row that is ALREADY past pending records
+    //     nothing and answers terminal_not_applicable.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_terminal_status_for_a_non_pending_row_is_not_applicable() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        const AMOUNT: i64 = 50_000;
+        let order_id = pending_topup(&db.pool, account_id, AMOUNT).await;
+        // Settle it first; the row is now `settled`, not `pending`.
+        let settle = notification(
+            &order_id,
+            "200",
+            "50000.00",
+            "settlement",
+            LIVE_TEST_SERVER_KEY,
+        );
+        let (status, body) = post(&state, settle).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(topup_status(&db.pool, &order_id).await, "settled");
+
+        // Now a terminal status (expire -> expired). The UPDATE WHERE status =
+        // 'pending' affects 0 rows, so it records nothing.
+        let expire = notification(&order_id, "200", "50000.00", "expire", LIVE_TEST_SERVER_KEY);
+        let (status, body) = post_logged(&state, expire).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["status"],
+            json!("terminal_not_applicable"),
+            "a terminal status for a non-pending row must be not_applicable: {body}"
+        );
+        assert_eq!(
+            topup_status(&db.pool, &order_id).await,
+            "settled",
+            "the row must be left untouched"
+        );
+        assert_reconciled(&db.pool, account_id, "after a not_applicable terminal").await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. A legitimate in-progress status answers 200 pending and writes nothing.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_webhook_an_in_progress_status_is_pending_and_writes_nothing() {
+        let _env = EnvLock::acquire();
+        let _key = EnvGuard::set("MIDTRANS_SERVER_KEY", LIVE_TEST_SERVER_KEY);
+        let db = TestDb::new().await;
+        let account_id = fixture_account(&db.pool).await;
+        let state = live_app_state(db.pool.clone());
+
+        let order_id = pending_topup(&db.pool, account_id, 50_000).await;
+        let payload = notification(
+            &order_id,
+            "201",
+            "50000.00",
+            "pending",
+            LIVE_TEST_SERVER_KEY,
+        );
+        let (status, body) = post(&state, payload).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["status"], json!("pending"), "{body}");
+        assert_eq!(balance(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_row_count(&db.pool, account_id).await, 0);
+        assert_eq!(topup_status(&db.pool, &order_id).await, "pending");
+        assert_reconciled(&db.pool, account_id, "after a pending status").await;
+        db.close().await;
+    }
+
+    /// The flat refusal body shape the handler shares with the rest of the
+    /// endpoint. Pure, so it is pinned directly.
+    #[test]
+    fn error_body_produces_the_flat_error_and_message_shape() {
+        let body = error_body("internal_processing_error", "internal processing error");
+        assert_eq!(body.0["error"], json!("internal_processing_error"));
+        assert_eq!(body.0["message"], json!("internal processing error"));
     }
 }

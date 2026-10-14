@@ -1,6 +1,6 @@
 # Server — API Specification
 
-The Rust service on Northflank. It is the **entire backend**: auth exchange,
+The Rust service on Northflank. It is the **entire backend**: native auth,
 wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 
 > Supersedes the scope in [`server/README.md`](../../server/README.md), which
@@ -11,18 +11,49 @@ wallet, keys, limits, payments webhook, live updates, and the LLM proxy.
 
 | Group | Endpoints | Auth |
 | --- | --- | --- |
-| Auth | `POST /auth/exchange`, `POST /auth/logout`, `POST /auth/logout-all` | cookie / none |
-| Account | `GET /api/me`, `GET /api/usage`, `GET /api/topups` | cookie |
+| Auth | `POST /auth/signup`, `POST /auth/login`, `POST /auth/google`, `POST /auth/verify-email`, `POST /auth/password-reset/request`, `POST /auth/password-reset/confirm`, `POST /auth/verification/resend`, `POST /auth/logout`, `POST /auth/logout-all`, `POST /auth/password-change`, `GET /auth/providers` | cookie / none |
+
+**The auth verbs need no external service, and that is a change.** Identity used to live in a
+separate PocketBase instance, and `POST /auth/exchange` (now deleted) was the one route whose
+failure mode depended on it: it verified a `pb_token` before creating a session, so an
+unreachable identity provider answered **500**. The identity port moved every credential check
+into this crate over the `identities` table, so a login either verifies locally or answers a
+credential error — the only outbound calls left in the auth path are the verification mail and
+Google's JWKS endpoint for `POST /auth/google`, and neither is consulted to decide a password.
+
+`logout`/`logout-all` are **intentionally idempotent** — they
+revoke the presented session if there is one and always answer **204** with a cleared cookie,
+so an anonymous call is a no-op rather than an error.
+| Account | `GET /api/me`, `GET /api/usage`, `GET /api/usage/recent`, `GET /api/topups`, `GET /api/export` | cookie |
 | Keys | `GET/POST /api/keys`, `PATCH /api/keys/:id`, `POST /api/keys/:id/revoke` | cookie |
 | Wallet | `POST /api/topups` | cookie |
 | Telegram | `POST /api/telegram/link-code`, `DELETE /api/telegram` | cookie |
-| Reviews | `GET /api/reviews` (read), `POST /api/reviews` (**bot token only**) | cookie / bot |
+| Reviews | `GET /api/reviews` (public), `GET /api/reviews/mine`, `POST /api/reviews`, `POST /api/reviews/withdraw` | none / cookie |
 | Webhooks | `POST /webhooks/midtrans` | **signature** |
 | Live | `GET /events` (SSE) | cookie |
 | Proxy | `POST /v1/chat/completions` | **API key** |
-| **Bot** | `POST /api/bot/link`, `GET /api/bot/account`, `GET /api/bot/reviews/mine`, `POST /api/bot/notify-topup` | **bot token** |
-| **Admin** | `GET /api/admin/accounts/:id`; `POST /api/admin/accounts/:id/suspend`; `POST /api/admin/accounts/:id/resume` (**alias `/restore`**) | **cookie + operator flag** |
+| **Bot** ⚠ | `POST /api/bot/link` ✅, `GET /api/bot/account` ⚠, `GET /api/bot/reviews/mine` ⚠, `POST /api/bot/notify-topup` ⚠ | **bot token** |
+| **Admin** | `GET /api/admin/accounts/:id`; `POST /api/admin/accounts/:id/suspend`; `POST /api/admin/accounts/:id/resume` (**alias `/restore`**); `POST /api/admin/accounts/:id/adjust` (**money**) | **cookie + operator flag** |
 | Ops | `GET /health` | none |
+
+**⚠ MARKED ROUTES ARE DESIGNED, NOT BUILT.** Three endpoints in the table above have a
+schema, a documented contract, and **no handler**: `GET /api/bot/account`,
+`GET /api/bot/reviews/mine` and `POST /api/bot/notify-topup`. They are not missing by
+accident — the whole top-up-feed flow is driven by the Telegram **bot**, and the launch
+checklist records that the bot itself is still design-only, so their HTTP halves have
+nothing to exercise them.
+
+**The reviews routes are no longer in this list.** They were, while the review flow was
+bot-driven; they are now served by the customer's own session, which is why the ⚠ marker
+moved to the Bot row above. `/api/reviews/mine` likewise changed from a bot-token read of
+someone else's review to a cookie read of the caller's own.
+
+They are marked because this table describes the CURRENT surface, and an integrator who
+reads it would call one of the three, get a 404, and conclude the **server** was broken.
+The distinction is enforced by a test
+(`the_spec_marks_exactly_the_designed_but_unbuilt_routes_as_designed` in
+`server/src/routes/mod.rs`), so an endpoint cannot be mounted without this document
+being updated with it.
 
 **Two authentication schemes, deliberately separate:**
 
@@ -40,25 +71,174 @@ cookie on `/v1/*`, or a Bearer key on a cookie endpoint, returns 401
 
 ## Auth
 
-### `POST /auth/exchange`
-
-Exchanges a PocketBase auth token for a Rust session cookie. Called once after
-login.
+### `POST /auth/signup`
 
 ```json
 // request
-{ "pb_token": "<pocketbase jwt>" }
+{ "email": "you@example.com", "password": "at least 8 characters" }
+
+// 202 response — ALWAYS this, whatever happened
+{ "message": "If that address can be registered, a confirmation link is on its way." }
+```
+
+Creates an account with a password identity and mails a verification link.
+
+**This sentence used to be false, and the code it described looked fine.** The route
+built the message with `to: String::new()` — an empty recipient, in a function that
+had the address in hand and did not use it. `EmailSender::send` parses that field as
+a `Mailbox`, so every message failed with `EmailError::Build` before anything was
+dialled, and the caller logged "a verification or reset link could not be sent"
+against an *account id and no address*. An operator reading those lines would look
+at the SMTP relay; the relay was never reached. Signup still answered
+`"a confirmation link is on its way"`, and password reset — the only recovery path —
+was dead for as long as the flow existed.
+
+Nothing caught it because every test of the mailer built its own `Email` with a
+written-out address. The module was covered; the one place in the program that
+assembles a message for a real customer was not. The route's message construction
+now lives in a pure `link_mail` function that a test calls, and three mutations
+(empty recipient, a different recipient, a link built from another address) each
+fail it.
+
+**The reply does not depend on whether the address was already registered.** The
+endpoint is unauthenticated, so any difference in status or body between
+"created" and "already exists" would make it a membership test for the address
+space. The already-registered branch does the same observable work — including
+the password hash — and returns the identical body.
+
+A mail failure does not fail the request: the account is created unverified,
+which is inert (it cannot hold a balance until a top-up, and a top-up needs a
+verified address), and the failure is logged against the account id. Mail is
+never a dependency of an account existing.
+
+Errors: `422` malformed address or a password below `[auth] password_min_length`.
+`429` beyond `[limits] signup_per_hour_per_ip`.
+
+### `POST /auth/login`
+
+```json
+// request
+{ "email": "you@example.com", "password": "..." }
 
 // 200 response
-{ "account_id": "uuid", "balance_idr": 50000 }
+{}
 // sets: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax
 ```
 
-Server verifies the token with PocketBase, resolves `pb_user_id` → `accounts`
-(creating the account on first login), inserts a `sessions` row, and returns the
-cookie. **The PocketBase token is not stored**; only the session is.
+**The body is empty, and it used to carry `account_id` and `balance_idr`.** It is
+not an oversight: neither field was read by anything. The website declared the
+matching `SessionResult`, passed it to its own `postAuth`, and then every caller
+threw the value away — `login.astro` redirects on success and never looks at it.
+The payload that signs a caller in is the `Set-Cookie` beside the body, which is
+HttpOnly and was always the real credential.
 
-Errors: `401` invalid token.
+`balance_idr` was the more expensive half: it made this route run a wallet
+`SELECT` whose result no client consumed, and the balance has a delivery path
+clients DO read — the SSE `balance` event, published by `events::stream` and
+consumed in `website/src/lib/live.ts`. A field that is published but unread is a
+second definition of a fact free to drift from the one in use, so a client
+wanting `account_id` asks `GET /api/me`.
+
+Errors: `401` wrong address or password (the same answer for both, and a missing
+account still pays for a hash so the timing does not distinguish them). `429`
+beyond the per-IP or per-account login cap — both are spent by FAILED attempts,
+which is the only thing that makes the cap worth having.
+
+### `POST /auth/google`
+
+```json
+// request
+{ "id_token": "<Google Identity Services credential>" }
+
+// 200 response
+{}
+// sets: Set-Cookie: session=<opaque>; HttpOnly; Secure; SameSite=Lax
+```
+
+Verifies the ID token against Google's published keys (RS256 only; the algorithm
+is never taken from the token header) and resolves it to an account.
+
+A Google sign-in whose address matches an existing **password** identity links to
+it **only when that identity was verified before the Google identity was
+created** (`verified_at < google_identity.created_at`). Otherwise a separate
+account is created and `auth.email_collision_unverified` is logged. Without that
+ordering rule, an attacker could register the victim's address with a password of
+their own, wait for the victim to verify it, and then sign in with Google into
+the victim's account.
+
+Errors: `401` invalid, expired, or wrong-audience token; `500` when
+`[auth] google_client_id` is unset (a deployment misconfiguration, not a failed
+sign-in).
+
+### `POST /auth/verify-email`
+
+```json
+// request
+{ "token": "<from the emailed link>" }
+
+// 204
+```
+
+Marks the address verified. The mark and the validity check are one SQL
+statement, so a link cannot be redeemed twice. Every other outstanding token for
+the account is cleared.
+
+Errors: `401` for an unknown, expired, already-used, or wrong-purpose token — one
+answer for all four, so a caller holding a stale link cannot learn it was once
+real.
+
+### `POST /auth/password-reset/request`
+
+```json
+// request
+{ "email": "you@example.com" }
+
+// 202 — ALWAYS this, whatever happened
+{ "message": "If that address has an account, a reset link is on its way." }
+```
+
+Neutral reply, for the reason signup has one. The cap is applied per **account**
+where one exists, because the resource being protected is the victim's mailbox
+and a per-IP cap alone would let a distributed sender flood it.
+
+### `POST /auth/password-reset/confirm`
+
+```json
+// request
+{ "token": "<from the emailed link>", "email": "you@example.com", "password": "new password" }
+
+// 204
+```
+
+Sets the new password. This may land on an account with **no** password identity
+— a Google-only signup — in which case one is created: completing a reset already
+required control of the mailbox.
+
+**Every session for the account is revoked.** A reset is what a person does when
+they believe someone else has their credential, so leaving a session opened with
+the old password alive would defeat the point. The address is **not** marked
+verified by this route: a reset proves the mailbox was reachable, but the
+verified transition is its own claim.
+
+Errors: `401` for an invalid token, or when the token's account and the supplied
+address disagree (there is no correct merge, so nothing happens). `422` password
+policy.
+
+### `POST /auth/verification/resend`
+
+```json
+// request
+{ "email": "you@example.com" }
+
+// 202 — the same neutral reply as signup
+```
+
+Mails a fresh verification link, invalidating the previous one. A verified
+address asking again is not an error and does not get a link: a working
+verification link for an already-proven address is a credential with nothing left
+to do.
+
+Errors: `429` beyond `[limits] verification_resend_per_hour`.
 
 ### `POST /auth/logout`
 
@@ -68,6 +248,55 @@ Revokes the current session row. `204`. Clears the cookie.
 
 Revokes **every** session for the account. `204`. This is real revocation, not
 just discarding a token — other devices are logged out immediately.
+
+**The caller's own cookie must be a live session, by the same rule every other
+route uses.** It is not enough that the row is unrevoked and unexpired: the idle
+bound applies too, so a session that has gone unused for longer than
+`sessions.idle_days` cannot authorise this call. That was false — the lookup
+filtered on `revoked_at IS NULL AND expires_at > ?` only — and the consequence ran
+in the dangerous direction: a cookie that no longer authenticated anything
+anywhere else could still sign every other device on the account out. The idle
+check now runs through the same `session_is_live_at` the shared resolver uses, so
+the two cannot disagree about what "live" means. An idle cookie gets the same
+`204` an expired one does: it is not an error, it is just not a credential.
+
+### `POST /auth/password-change`
+
+Changes the password of the signed-in account. `204`, and clears the cookie:
+**every** session on the account is revoked, including the caller's own. A
+password change is something someone does when they suspect another device holds
+a session, so leaving those alive would defeat the gesture — the caller signs in
+again rather than being handed a fresh cookie.
+
+`current_password` is required. Without it a stolen session cookie alone would be
+enough to take permanent ownership of the account.
+
+```json
+// request
+{ "current_password": "...", "new_password": "..." }
+
+// 401 unauthenticated — no session cookie, or current_password is wrong
+// 422 validation_failed — new_password breaks the policy, or the account signs
+//                         in with Google and has no password to change
+```
+
+A mismatch on `current_password` is `401`, the same answer a bad sign-in
+credential earns, so the endpoint does not confirm which half of the pair was
+wrong.
+
+### `GET /auth/providers`
+
+Which sign-in methods the signed-in account has, for the settings panel.
+
+```json
+// 200 response
+{ "providers": ["google", "password"] }
+```
+
+A list, not a `google`/`password` pair of booleans: the providers that exist
+today are not the set that will exist, and a boolean per provider turns every
+addition into a schema change. Reports the account's own rows and takes no
+address or id, so it cannot be used to probe another account.
 
 ---
 
@@ -88,11 +317,26 @@ Everything the dashboard needs on load.
     "cost_idr": 0
   },
   "telegram_linked": false,
-  "status": "active"
+  "status": "active",
+  "is_operator": false,
+  "email": "you@example.com",
+  "email_verified": true
 }
 ```
 
+`email` is `null` when the account holds no identity row at all, and `email_verified`
+is `false` then. Both come from the SAME identity row (`ORDER BY email_verified DESC,
+created_at ASC`), so the pair cannot describe two different identities, and the answer
+does not move when a second sign-in method is linked. A missing address renders as a
+dash, never as an empty string: "" and "we do not have one" are different answers.
+
 **This is the polling fallback** when SSE drops. Keep it cheap.
+
+`is_operator` is a **rendering hint, not authorization**: it lets the browser
+decide whether to show the admin entry points at all, instead of presenting links
+that answer `403`. Every admin route independently re-checks
+`accounts.is_operator` server-side (`admin.rs::require_operator`), so a forged
+value here grants nothing.
 
 ### `GET /api/usage?from=&to=`
 
@@ -106,6 +350,38 @@ window. **Both ends are inclusive**, so `from == to` returns exactly that one da
 Only when neither parameter is present is the window the last 30 buckets; a bounded
 range that matches nothing returns `[]`, never that default. **No maximum span is
 enforced.**
+
+### `GET /api/usage/recent?limit=`
+
+The last N **metered requests** for the account, newest first — the detail behind
+the dashboard's "Recent requests" panel. Source is **`usage_events`**, one row per
+billed request, written by the settlement transaction. `usage_daily` cannot serve
+this: it is an aggregate with no model and no per-request rows.
+
+`limit` defaults to 20 and is clamped to 1–100. Each row is
+`{id, api_key_id, model, input_tokens, cache_read_tokens, output_tokens, cost_idr, created_at}`.
+The three token classes are returned **separately**, never as one total, because
+each is priced differently. `api_key_id` is null when the key was deleted after
+the request (`ON DELETE SET NULL`). **Only this account's rows are ever returned**;
+nothing exposes a prompt, a completion or a key's plaintext.
+
+### `GET /api/export`
+
+The account's **own** data as one JSON document — the export
+[data-retention.md](../data-retention.md) specifies under "Access and deletion
+requests". Scope is fixed by that document's IN/OUT table, and the rule is
+**metadata, not secrets**:
+
+- **In**: account, wallet, ledger rows, top-ups, `usage_daily`, `usage_events`,
+  and API-key **metadata** (prefix, label, models, limits, expiry).
+- **Out**: `key_hash`, `token_hash`, `snap_token`, session rows,
+  IP hashes and the Telegram chat id. **`admin_audit` is also out** — whether
+  operator actions reach the customer is a separate open decision
+  ([admin-surface.md](../admin-surface.md) Open items), which this does not
+  pre-empt.
+
+Every query is bound to the cookie-resolved account id, so a customer can only
+export their own rows.
 
 ### `GET /api/topups?limit=`
 
@@ -123,6 +399,7 @@ List active and revoked keys. **Never returns `key_hash`.**
 [{
   "id": "uuid", "prefix": "apk_live_a1b2", "label": "prod",
   "models": ["flash"], "spend_limit_idr": 50000,
+  "token_limit": 0,
   "spend_used_idr": 12340, "rate_limit_rpm": 60,
   "expires_at": null, "last_used_at": "2026-01-01T00:00:00Z",
   "revoked_at": null
@@ -131,6 +408,24 @@ List active and revoked keys. **Never returns `key_hash`.**
 
 `spend_used_idr` is computed over the configured window, from `usage_daily`.
 Returning it here saves the UI a second call.
+
+**`token_limit` is the stored ceiling, `0` meaning unlimited, and it must be
+returned for the edit form to be safe.** The dashboard's edit form submits the
+whole field set on every save rather than a diff — deliberately, so clearing a
+limit is expressible — which means any field this response omits is submitted as
+its blank default, and a blank limit parses to `0`, i.e. unlimited. This field
+was omitted, so the form opened with the token input blank and **renaming a key
+raised its token ceiling to no ceiling at all**, with nothing on screen to show
+it. The account export (`GET /api/account`) read `token_limit` from the start,
+which is part of why the omission looked deliberate.
+
+`last_used_at` is written on the key-metadata cache MISS in the proxy
+(`server/src/routes/proxy.rs`), so it lags a request by at most
+`limits.key_metadata_cache_seconds` and is `null` only for a key that has never been
+used. **It was `null` for every key, always**: the column was defined, selected and
+documented, and no code ever wrote it, so this field — and the dashboard's "Last used"
+column — could only ever report `Never`. A test now resolves a key and asserts the
+column is a real instant from that request.
 
 ### `POST /api/keys`
 
@@ -257,14 +552,27 @@ closed. A cookie is not a bot credential.
 
 ## Reviews
 
-**Reviews are written from Telegram only.** The website may *display* an aggregate;
-it can never create or edit a review. Attempting to post one from a browser session
-must fail — reviews are the Telegram channel's contribution, and mixing writers
-makes "who reviewed" ambiguous.
+**Reviews are written by the customer's own session.** The website reads the
+aggregate publicly and writes its own review with its session cookie.
+
+> **This replaces a bot-only design.** This section previously read "Reviews are
+> written from Telegram only" and answered a cookie with `403`. The Telegram bot
+> was never built — `telegram/` holds a README and nothing else — so the only
+> writer the product ever had was a writer that did not exist, and the launch gate
+> that hung off it (one review per account, editable, withdrawal as a flag) was
+> blocked on code rather than on the data model: the `reviews` table has carried
+> all three properties since the initial migration. The bot is formally deferred;
+> the gate is closed by serving it here.
+>
+> The identity a review is attributed to now comes from the **session**, never
+> from the request body. That is strictly stronger than the bot shape it replaces:
+> a bot has already authenticated the chat, so a `telegram_id` in the body was
+> safe there and is an impersonation vector anywhere else.
 
 ### `GET /api/reviews`
 
-Public aggregate. Read-only, cookie-authenticated.
+Public aggregate. **No authentication.** A prospect decides whether to buy from
+this before signing up, so requiring a session would defeat its purpose.
 
 ```json
 {
@@ -274,40 +582,92 @@ Public aggregate. Read-only, cookie-authenticated.
 }
 ```
 
+`average` is `null`, never `0`, when nothing has been reviewed — "nobody has
+reviewed us" and "everybody gave us zero stars" are different facts and only one
+of them is representable in a number.
+
+Withdrawn reviews are excluded from all three figures.
+
 **Returns the aggregate, never the list.** Publishing individual reviews with
 usernames invites retaliation against reviewers — see
 [`docs/telegram/README.md`](../telegram/README.md).
 
-There is deliberately **no `"mine"` field** on this endpoint, and the dashboard
-cannot read an individual review.
+### `GET /api/reviews/mine`
 
-**The bot reads its user's own review through `GET /api/reviews/mine`** — a
-separate bot-token endpoint, so the dashboard's aggregate view stays aggregate.
+The caller's own review, so a form can open on what they already wrote.
+Cookie-authenticated; scoped to the session's account and nothing else.
+
+```json
+{ "has_review": true, "rating": 5, "body": "fast and cheap", "withdrawn": false }
+```
+
+Answers `has_review: false` rather than `404` when the account has not reviewed:
+not having reviewed yet is a new customer's normal state, not an error.
+
+**A withdrawn review is still returned, with `withdrawn: true`.** This is worth
+stating because the implementation got it wrong: the query filtered
+`withdrawn_at IS NULL`, so a customer who withdrew was told `has_review: false`
+stating they had never written anything, and `withdrawn` was hard-coded `false`
+on every reachable path — a field that could not be true. The row is flagged, not
+deleted (`POST /api/reviews/withdraw` below), and it still occupies the account's
+one slot, so `has_review: true` is the only honest answer. The **rating and body
+are returned too**: withdrawal removes the review from the public aggregate, not
+from its author, who needs to re-read what they are about to rewrite.
+
+```json
+{ "has_review": true, "rating": 2, "body": "withdrawn words", "withdrawn": true }
+```
 
 ### `POST /api/reviews`
 
-**Bot token only. Never a cookie.** The dashboard must not reach this endpoint.
+Cookie-authenticated. Writes the session's own review. There is no path by which
+a caller names somebody else's account — the body carries only content.
 
 ```json
-{ "telegram_id": "...", "rating": 5, "body": "fast and cheap" }
+{ "rating": 5, "body": "fast and cheap" }
 ```
 
-- **Upsert**, not append. One review per user; a second submission edits the first.
-- `rating` required, 1-5. `body` optional, max 1000 chars.
-- **Never silently truncate `body`** — reject with an error the bot can show.
+- **Upsert**, not append. One review per account, enforced by
+  `reviews_account_uniq`; a second submission edits the first.
+- `rating` required, an integer 1-5. `body` optional, at most 1000 characters.
+- **Never silently truncate `body`** — reject with a `422` naming the field. A
+  truncated review publishes words the author did not write, and the author never
+  learns.
 - Before overwriting, copy the old values into `review_history` **in the same
   transaction**.
 - `is_customer` is computed server-side from whether a settled top-up exists.
-  **Never accept it from the caller.**
-- The account is resolved from `telegram_id`: `account_id` if linked, else
-  `telegram_id` alone.
+  **Never accept it from the caller** — `reviews.is_customer` has a `DEFAULT 0`,
+  so a self-awarded badge would not even fail loudly.
+- **Submitting a new review clears `withdrawn_at` in place.** The partial index
+  ignores withdrawn rows, so an INSERT after a withdrawal would create a SECOND
+  row and leave the account holding two reviews.
+- **Rate-limited** by `limits.review_per_hour` (shipped default `3`), counted per
+  account over a rolling hour and applied inside the write transaction so a burst
+  cannot slip past a stale read. `config/apikita.toml` frames this value as a
+  requirement rather than a setting: a review endpoint with no limit is a
+  moderation problem from its first request.
 
-Errors: `403` if called with a cookie instead of a bot token.
+  **MEASURED: this cap cannot refuse, and the `429` below cannot be returned.** The cap counts rows in
+  `reviews` for one account, and `reviews_account_uniq` allows that account at most ONE row ever — so the
+  counted value is permanently 0 or 1 against a limit of 3. A burst from one account produces one creation
+  and takes the edit path for the rest (6 concurrent writes measured: `[200,200,200,200,200,200]`,
+  `review_rows=1`, `history_rows=5`, reproducible across 5 runs). What bounds this endpoint is the
+  **one-review-per-account index**, not the cap. The cap stays as a second bound that would take effect if
+  that rule were relaxed; it is not the moderation control. Kept in the spec rather than deleted because
+  the endpoint IS limited — just by a different mechanism than the paragraph implies.
+
+Errors: `401` without a session; `422` for a rating outside 1-5 or an overlong
+body; `429` past the hourly cap — **unreachable, see above**.
 
 ### `POST /api/reviews/withdraw`
 
-Bot token only. Sets `withdrawn_at` — **does not delete**. A deleted row would
-free the unique slot and let the user submit a second review.
+Cookie-authenticated. Sets `withdrawn_at` — **does not delete**. A deleted row
+would free the unique slot and let the account submit a second review, which is
+exactly what "one review per account" forbids.
+
+Idempotent, and answers `204` whether or not the account had a review: a
+distinguishable error would reveal whether an account has reviewed us, which the
+aggregate deliberately does not.
 
 ## Webhooks
 
@@ -382,7 +742,8 @@ data: {"input_tokens": 1200, "cache_read_tokens": 8000, "output_tokens": 400, "c
 : heartbeat        (every 20-30s, keeps proxies from closing it)
 ```
 
-- PocketBase's realtime is useless here — our data is in SQLite. This is ours.
+- Realtime is ours to serve — the data (balance, usage) is in the same embedded
+  SQLite file, so there is no third-party collection stream to lean on.
 - Emit on: webhook settlement, usage settlement, key changes.
 - **Heartbeat is required.** Cloudflare and intermediaries close idle streams, and
   a silently dropped stream looks like "the balance stopped updating".
@@ -419,9 +780,21 @@ the wallet before the allowlist leaks the existence of models a key may not use.
 
 **On balance exhaustion, prefer rejecting at pre-flight over cutting mid-stream.**
 With non-refundable funds, a truncated answer is the most likely source of a
-delivery dispute. Let an in-flight request finish even if it briefly overdraws;
-refuse the next one. (This contradicts the whitepaper's Phase 2 — the whitepaper
-is wrong here, see [`docs/business/05-risk.md`](../business/05-risk.md) R1.)
+delivery dispute. Let an in-flight request finish, then refuse the next one.
+(This contradicts the **retired** whitepaper's Phase 2, which cut streams
+mid-answer — the whitepaper was wrong here, see
+[`docs/business/05-risk.md`](../business/05-risk.md) R1.)
+
+**The balance never goes negative — "let it finish" does NOT mean overdraft.**
+`docs/decisions.md` §Money settles overdraft as **not permitted** (the
+`CHECK (balance_idr >= 0)` on `wallets` is the backstop), and the stale
+`allow_negative_balance_overdraft` flag that used to suggest otherwise was
+**removed** — see [plans/proxy-hot-path-audit.md §5.2 F2](../plans/proxy-hot-path-audit.md).
+What actually happens at settlement when the real cost exceeds what was reserved:
+`settle_partial_usage` (`db.rs`) clamps the debit to the balance available
+(`clamp_debit(cost_idr, available_idr)`), so the wallet is charged only what it
+holds and the shortfall is logged at `error!` as a company loss. The earlier
+"briefly overdraws" phrasing described a behaviour the code does not have.
 
 **Usage is recorded on stream completion.** A crash mid-stream loses the record and
 the customer got free tokens — so reconcile against upstream usage on a schedule as
@@ -444,6 +817,13 @@ server and trigger a restart loop. Unauthenticated.
 **Called by the Telegram bot with a bot token, never by a browser.** These exist
 because the bot needs capabilities the dashboard deliberately does not have.
 
+> **Only `POST /api/bot/link` is built.** The Telegram bot is formally deferred, so
+> the three read/notify endpoints below are contracts without handlers — see the
+> MARKED ROUTES note under the route table. The review endpoints the dashboard
+> needs now live in the `## Reviews` section above, under **cookie** auth; this
+> table's `GET /api/bot/reviews/mine` is a separate, bot-token-authenticated
+> endpoint that would serve `/review show` if the bot is ever built.
+
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /api/bot/link` | Redeem a `/link` code: bind `telegram_id` → account |
@@ -453,19 +833,29 @@ because the bot needs capabilities the dashboard deliberately does not have.
 
 ### `POST /api/bot/link`
 
-```json
-{ "telegram_id": "123456", "code": "482913" }
-```
+**Documented once, in full, in the `POST /api/bot/link — redemption (bot token)`
+section above.** This section used to restate it, and the restatement had drifted into
+contradicting both the code and the full section two ways:
 
-- **Rate-limited per Telegram user and per IP.** A 6-digit code is
-  brute-forceable and a guess attaches an attacker's Telegram to a funded wallet.
-  This is the highest-risk endpoint in the system.
-- Codes are single-use and expire in 5 minutes; issuing a new one invalidates the
-  previous code for that account.
-- **Re-attribution runs in the same transaction**: a review submitted before
-  linking is moved to the account, or the same person gets two review rows.
-- Errors: `404` unknown code, `409` account already linked to another Telegram,
-  `422` expired or used.
+- it gave the errors as "`404` unknown code, `409` account already linked to another
+  Telegram, `422` expired or used". The handler returns **`200` with
+  `{"status":"invalid_code"}` for every unsuccessful redemption** — wrong, expired, used,
+  malformed and unknown alike — and the only other success status is `linked`. A 4xx would
+  invite the bot's transport to retry a guess, which is the opposite of what the cap is
+  for. Pinned by `every_kind_of_bad_code_produces_the_same_refusal`, which drives all four
+  kinds and compares the bodies.
+- it said "rate-limited per Telegram user and per IP". The limit is **per IP**, over
+  attempts, counted by salted hash in `link_redemption_attempts`; there is no per-user
+  counter.
+
+Two descriptions of one endpoint in one document is a failure mode this file has hit
+before, and the reason it is fixed by deletion rather than by correcting the second copy:
+the second copy has nothing the first does not, so keeping it only creates another place
+to go stale.
+
+What is worth keeping from here, and is NOT in the full section: **re-attribution runs in
+the same transaction** — a review submitted before linking is moved to the account, so the
+same person does not end up with two review rows.
 
 ### Authentication
 
@@ -485,21 +875,40 @@ Authorization is the `accounts.is_operator` flag, plus a normal session cookie.
 
 ### Implemented routes
 
-These four exist in `server/src/routes/mod.rs` and are the whole admin surface
-today. There is **no admin UI** — routes only.
+These routes exist in `server/src/routes/mod.rs` and are the whole admin surface
+today. The **operator console** at `/admin`
+(`website/src/pages/admin/index.astro`) is the UI over them — browse/search,
+lookup, plus suspend/resume. The UI adds no capability; it calls these routes
+with the same session cookie and every guard is enforced here, server-side.
 
 | Endpoint | Handler | Effect |
 | --- | --- | --- |
+| `GET /api/admin/accounts` | `admin::list_accounts` | Bounded listing. Query: `q` (matches the account id), `status`, `limit` (1–100, default 25), `offset`. Returns `{accounts, limit, offset}` |
 | `GET /api/admin/accounts/:id` | `admin::get_account` | Read-only: `status`, `is_operator`, `created_at`, `balance_idr`, live session count, live key count. Never a credential hash |
+| `GET /api/admin/accounts/:id/audit` | `admin::get_account_audit` | The account's `admin_audit` trail, newest first. Same operator + self-action guard as the read-only view. Query: `limit` (1–200, default 50) |
+| `GET /api/admin/audit` | `admin::list_recent_audit` | **Cross-account** recent operator actions, newest first. Served by `admin_audit_recent_idx`. Query: `limit` (1–200, default 50) |
 | `POST /api/admin/accounts/:id/suspend` | `admin::suspend_account` | `status='suspended'`; **revokes sessions and keys atomically**; one `admin_audit` row in the same transaction |
 | `POST /api/admin/accounts/:id/resume` | `admin::resume_account` | `status='active'`; audits it; does not restore keys |
 | `POST /api/admin/accounts/:id/restore` | `admin::resume_account` | **Alias of `/resume`** — same handler, same `action='resume'` audit row |
+| `POST /api/admin/accounts/:id/adjust` | `admin::adjust_account` | **The only money-moving admin action.** Body `{delta_idr, reason, note}`. Writes one `ledger` row with `reason='adjustment'` and the explanation as its `ref`, **atomic with the wallet update**; refuses a debit the balance cannot cover (with both figures) and refuses `delta_idr: 0`; requires an explanation of at least 12 characters; `admin_audit` action `'adjust'` carries both balances. Self-action refused |
+| `GET /api/admin/metrics` | `health::operator_metrics` | Operational counts: `server_errors`, `responses`, `error_rate` (null when nothing has been served), `unhealthy_models` (models with no usable endpoint), and `retention` (whether any age-based table holds a row past its window, naming it). Backs the `error_rate`, `all_providers_unhealthy` and `db_disk` alerts |
 
 **`/resume` and `/restore` are two spellings of one action.** Both are mounted;
 neither is deprecated. Pick either.
 
 **Response shape.** The read-only route returns
-`{account_id, status, is_operator, created_at, balance_idr, live_sessions, live_keys}`.
+`{account_id, status, is_operator, created_at, balance_idr, live_sessions, live_keys}`,
+and the listing returns the same fields per row inside `accounts`.
+
+**The listing exists because lookup-by-id requires knowing a UUID.** It is the
+index the single-account routes assume. `q` is matched case-insensitively
+against the account id — **not email**, which lives in the `identities` table and
+must not be duplicated into the operator listing. `%` and `_` in `q` are
+escaped with an explicit `ESCAPE` clause, so a literal percent sign searches for
+that sign rather than matching every row. An unknown `status` value matches
+nothing rather than erroring: an empty page is a normal answer, not a bad
+request. `limit` is clamped to 1–100 and `offset` to ≥ 0, and both are echoed so
+a client can page deterministically.
 Suspend/resume return
 `{account_id, status, sessions_revoked, keys_revoked}`; resume reports both counts
 as `0` explicitly, so the caller can see that nothing was handed back.
@@ -549,6 +958,14 @@ Three consequences worth stating rather than discovering:
    so a misconfiguration can never cut a session shorter than the register
    promises.
 
+**`POST /auth/logout-all` is the one endpoint that reads a session without
+touching it.** It is checked against this same rule — idle included — but it does
+not move `last_seen_at`, because it revokes the session it was given and the row
+is about to be dead; recording activity on the way out would order the writes
+pointlessly. It previously checked only `revoked_at` and `expires_at`, so an idle
+cookie was accepted there and nowhere else, and could revoke every other device on
+the account. See the endpoint's own section above.
+
 **403 is authorization, not authentication** — the caller is authenticated, we
 know who they are, and they may not do this ([error-model.md](../error-model.md),
 the 401-vs-403 table). **`forbidden` is a new stable code**, added under
@@ -570,7 +987,7 @@ documented cost of the key-metadata cache and is **not closed by these routes**.
 
 | Endpoint | Effect |
 | --- | --- |
-| `POST /api/admin/accounts/:id/adjust` | Money: ledger row, `reason='adjustment'` |
+| ~~`POST /api/admin/accounts/:id/adjust`~~ | **Built.** See the Admin table above |
 | ~~`POST /api/admin/topups/:id/refund`~~ | **Not planned.** The wallet-debiting refund machinery was removed — see [the webhook section](#post-webhooksmidtrans). A refund happens at the rail, never against the wallet |
 | `POST /api/admin/keys/:id/revoke` | `revoked_at` (the customer route `POST /api/keys/:id/revoke` exists today) |
 | `POST /api/admin/accounts/:id/logout-all` | Revoke all sessions |
@@ -589,9 +1006,9 @@ documented cost of the key-metadata cache and is **not closed by these routes**.
    from theft during an audit.
 6. **Nothing here can read prompts or plaintext keys** — neither is stored.
 
-Rollout: **read-only and suspend/restore are built; the admin key-revoke route is
-still planned.** Money actions arrive with the first revenue, not on day one.
-There is no admin UI.
+Rollout: **read-only and suspend/restore are built, API and UI; the admin
+key-revoke route is still planned.** Money actions arrive with the first revenue,
+not on day one.
 
 ## Cross-cutting rules
 
@@ -602,7 +1019,7 @@ There is no admin UI.
 | Return only needed fields | Prevents `key_hash` or internal ids leaking |
 | Key metadata cached ≤60s | The DB must not be on every token's hot path |
 | Rate-limit: login, key creation, link-code redemption, top-up creation | All are abuse targets |
-| Money is `BIGINT` IDR end to end | No floats, ever |
+| Money is `INTEGER` IDR end to end | No floats, ever. `BIGINT` was the Postgres type; `STRICT` SQLite tables admit only `INTEGER` |
 | Log every wallet mutation with actor and reason | The `ledger` table is that record |
 | Admin endpoints require the operator flag | Not a separate credential, and never a shared secret |
 | Admin endpoints return 403 `forbidden`, not 401, for a non-operator | The caller is authenticated; this is authorization, not authentication |

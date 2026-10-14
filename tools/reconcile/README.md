@@ -85,12 +85,25 @@ DATABASE_URL='<dsn>' cargo run --manifest-path server/Cargo.toml --bin hold-swee
 
 `hold-sweep` needs `DATABASE_URL` and is **report-only**: it never moves money
 unless you pass `--release`, which is an opt-in operator action with an audit
-trail. Nothing schedules it yet - no CI workflow, no compose service, no reference
-anywhere in `.github/`, `docker-compose.yml` or `server/Dockerfile` (only a
-"NOT WIRED" log line in `.docker/maintenance/entrypoint.sh`). Until it is wired,
-running it is a manual step of this gate, and **a hold still unpaired at two
-consecutive sweeps is an incident**: investigate the release path and credit the
-account if the hold is lost.
+trail.
+
+**The DETECTOR is scheduled; the RELEASE is not, and that split is deliberate.**
+`run_hold_sweep` in `.docker/maintenance/entrypoint.sh` applies the SAME predicate
+as `server/src/bin/hold-sweep.rs` nightly through `sqlite3`, with the same 900s
+bound, and exits non-zero when a hold is over it. `docker-compose.yml` says so
+("hold-sweep RUNS HERE, for real, REPORT-ONLY") and it is reachable as a one-shot
+`hold-sweep` verb. What stays manual is crediting an account back - **silently
+returning money on a timer is the invisible-money anti-pattern this whole gate
+exists to catch.**
+
+So **a hold still unpaired at two consecutive sweeps is an incident**: investigate
+the release path and credit the account if the hold is lost.
+
+*(Correction: this paragraph used to assert the sweep was unscheduled and that the
+entrypoint carried only a "NOT WIRED" line for it. Both were false once the detector
+was wired - and the assertion was PRINTED BY `reconcile.sh` on every scheduled run,
+so the nightly log carried the job's own OK line and the denial a few lines apart.
+Kept as a note rather than deleted so the next reader knows the claim was checked.)*
 
 The bound is `HOLD_MAX_AGE_SECONDS` (default `900`, matching hold-sweep's
 `DEFAULT_MAX_HOLD_AGE_SECONDS`). A younger hold may be a request still in flight,
@@ -135,6 +148,27 @@ sqlite3 run is exit 4, not a warning.
 | `4`  | `sqlite3` ran but failed (unreadable file, or a SQL error). |
 | `5`  | **Stranded hold** - at least one reservation hold unpaired for more than `HOLD_MAX_AGE_SECONDS` (default 900s): money left a wallet and came back nowhere. Run `hold-sweep`. |
 | `6`  | The database file `DATABASE_URL` names does not exist. |
+
+### Every code exercised, and how
+
+AN EXIT-CODE TABLE IS A CONTRACT WITH WHATEVER SCHEDULES THIS, and a code no run produces is a promise
+nobody has kept. MEASURED, one round ran the codes it could stage:
+
+| code | how it was produced | what it printed |
+| --- | --- | --- |
+| `0` | a freshly migrated database | `OK - wallet balances reconcile with the ledger (0 drifting accounts); 0 holds over the 900s bound` |
+| `1` | an account whose `wallets.balance_idr` disagrees with `SUM(ledger.delta_idr)` | `DRIFT DETECTED - 1 account(s) where the wallet cache disagrees with the authoritative ledger`, then the offending row |
+| `2` | `DATABASE_URL` unset, and separately set to `postgres://x/y` | `DATABASE_URL is not set` / `DATABASE_URL is not a SQLite URL` |
+| `6` | a `sqlite://` URL naming a file that is not there | `no such database file: does/not/exist.db`, plus the `cargo run --bin migrate` hint |
+
+`3` and `4` need `sqlite3` removed from `PATH` and a corrupt file respectively, and `5` needs a hold
+older than the bound - none of which this round staged. THEY ARE RECORDED AS UNTESTED RATHER THAN
+IMPLIED TO WORK, because the point of the table above is that a reader can tell which codes have been
+seen running and which have only been read.
+
+**The `1` case is worth noting for its message.** It does not stop at the count: it names the columns
+(`account_id|balance_idr|ledger_sum`) and flags `NO WALLET ROW` separately, because that is the shape a
+`LEFT JOIN` driven from `wallets` cannot see - the same weaker-rule case `reconcile.sql` documents.
 
 Codes `0`-`4` and `5` keep their original meanings. `6` is the single addition the
 SQLite port forced: the port had wanted `5` for a missing database file, but `5`

@@ -28,7 +28,13 @@ We must answer five concrete questions through empirical testing:
   - Pre-flight arithmetic and context window validation.
 * **Pass Criteria:**
   - $> 5,000\text{ req/sec}$ throughput on 0.2 vCPU.
-  - $p99 \le 2\text{ ms}$.
+  - $p99 \le 1.5\text{ ms}$ — the same figure as the **Key Validation Latency (p99)** row of the
+    metrics matrix below. This line previously stated a LARGER bar than the matrix, so the document
+    published two targets for one metric and neither the benchmark nor any guard read either. The
+    matrix figure is the one kept, because its warning and critical columns read as the refinement of
+    a single target. The superseded figure is quoted in the commit that reconciled them rather than
+    here: restating it as maths on this line put the old value back in the searchable text, which made
+    the guard that checks for exactly this contradiction unable to fail.
 
 ### Scenario 2: High-Concurrency SSE Streaming Passthrough (I/O & Memory Bound)
 * **Target Endpoint:** Active streaming proxy pipeline.
@@ -50,12 +56,47 @@ We must answer five concrete questions through empirical testing:
   - Single-writer serialisation on `topups` and `wallets` — `BEGIN IMMEDIATE` plus a
     conditional-`UPDATE` claim (the SQLite replacement for `SELECT ... FOR UPDATE`,
     which SQLite does not have).
-  - Connection pool saturation (`max_connections = 10` on 0.2 vCPU).
+  - Connection pool saturation (`max_connections = 8` on 0.2 vCPU — the value
+    `db.rs`'s `init_pool` actually sets).
   - Append-only write throughput on `ledger` and `usage_daily` upserts.
 * **Pass Criteria:**
   - Zero `SQLITE_BUSY` failures and zero write-transaction deadlocks.
   - Zero balance discrepancies: post-test reconciliation query returns 0 errors.
-  - $> 100\text{ settlements/sec}$ with connection pool size = 10.
+  - $> 100\text{ settlements/sec}$ with connection pool size = 8.
+
+> **WHO OWNS THESE NOW, because for a long time nothing did.** This scenario is the one the
+> benchmark binary does not run, and `doc_claims.rs` records that as a decision. But "the binary
+> does not run it" is not the same as "nobody measures it", and two of the three criteria were
+> stated in this document and in **no other file**:
+>
+> | Criterion | Owner |
+> | --- | --- |
+> | Zero `SQLITE_BUSY` failures | `db::busy_timeout` — its doc comment records the measurement behind the 5s value |
+> | Zero balance discrepancies | `tools/reconcile` — the launch Gate 2 money check |
+> | `> 100` settlements/sec | **`tools/settle-bench`** — added because this line was the only place that number appeared, and a criterion owned by a comment is not owned |
+>
+> `tools/settle-bench` seeds its own pending top-ups, drives signed settlement notifications, and
+> reads reconciliation through the shipped gate **before and after** — so "no drift" is a delta
+> rather than a coincidence. **MEASURED locally at 452.5 settlements/sec across 50 accounts at
+> concurrency 16**, which is what a development box produces and **not** the deployment's; see
+> [`tools/loadtest`](../tools/loadtest/README.md) for why local figures are not quoted as
+> production ones.
+
+> **These two figures said `10` until they were corrected, and nothing could have caught it.**
+> MEASURED: the code has never shipped `max_connections(10)` — `git log -S 'max_connections(10)'
+> -- server/src/db.rs` returns no commit — and the plan that specified the SQLite migration
+> (`plans/sqlite-migration.md`) states **8**, twice, alongside the contention measurement taken at 8.
+> The benchmark binary does not set a pool of its own, so there is no "different scenario" reading:
+> the number was simply wrong, and a pass criterion of *"> 100 settlements/sec at pool size 10"* was
+> never achievable against the shipped configuration.
+>
+> **Why it survived.** This document is triaged in `doc_claims.rs` as *"a record of one measurement,
+> not a contract"* — a reason about **line citations**, which is what that triage decides. A
+> configuration number stated as fact is a different kind of claim, and the triage reason does not
+> cover it. The nearest guard, `the_benchmark_doc_describes_a_command_the_binary_actually_has`,
+> couples this file to the **CLI**, not to the config, so nothing was ever looking at this digit.
+> `a_published_pool_size_is_the_pool_size_the_code_opens` now reads this line and the constant.
+
 
 ### Scenario 4: 100-Key Pool Under 429 Infiltration (Router Resilience)
 * **Target Endpoint:** Proxy router with 100 simulated upstream keys.
@@ -89,11 +130,99 @@ We must answer five concrete questions through empirical testing:
 We provide a dedicated benchmarking harness binary in `server/src/bin/benchmark.rs`:
 
 ```bash
-# Run the benchmark harness against local server
-cargo run --release --bin benchmark -- --concurrency 250 --duration 60s --scenarios streaming,ledger
+cargo run --release --bin benchmark
 ```
 
-The benchmark runner outputs:
-- Summary table: Throughput (RPS), Latency percentiles ($p50, p90, p95, p99$), Error rate.
-- Resource telemetry: Peak RSS RAM, CPU user/system time.
-- Automated Ledger Invariant Check: Runs `verify_wallet_reconciliation` across all modified accounts at completion.
+**It takes no arguments**, and that is not an oversight to fix by adding a parser — it is a
+different kind of tool from what this section used to describe. It is an **in-process capacity
+suite**: one OS thread (`current_thread`, standing in for a 0.2 vCPU container) running four
+synthetic scenarios — key-auth maths, Midtrans SHA-512 verification, 100-key pool routing under a
+10% 429 rate, and concurrent SSE stream simulation at 500 and 1,000 streams. It never starts a
+server and never opens the database.
+
+> ~~`cargo run --release --bin benchmark -- --concurrency 250 --duration 60s --scenarios
+> streaming,ledger`~~ — **the flags do nothing.** MEASURED: that exact command runs to completion,
+> because `cargo` passes the arguments and the binary ignores them. The output is the fixed four
+> scenarios, not the requested `streaming,ledger`. A documented invocation that silently succeeds
+> while doing something else is worse than one that fails, which is why the line is struck rather
+> than corrected.
+
+> ~~The benchmark runner outputs: Summary table: Throughput (RPS), Latency percentiles (p50, p90,
+> p95, p99), Error rate. Resource telemetry: Peak RSS RAM, CPU user/system time.~~ — **not
+> produced.** The binary has no HTTP client, no latency histogram and no RSS/CPU sampling. What it
+> actually prints per scenario is a line of `Throughput` in scenario-native units (`ops/sec`,
+> `sigs/sec`, `req/sec`, `tokens/sec`), an average latency where the scenario has one, and a
+> `[PASS]`/`[WARN]` verdict against a **hardcoded** target. Neither the units nor the thresholds
+> are configurable.
+>
+> **It follows that these numbers are not a load test and must not be quoted as one.** An
+> in-process loop over a hash function measures the hash function; it says nothing about latency
+> under real request concurrency, connection handling, or the SQLite write path. Real figures come
+> from the drill and the reconcile tools against a running stack.
+
+> ~~Automated Ledger Invariant Check~~ — **not implemented.** This line claimed the
+> benchmark runs `verify_wallet_reconciliation` across all modified accounts at
+> completion. It does not: `bin/benchmark.rs` never calls that function, and the only
+> callers of it are its own tests in `db.rs`. The money invariant is checked by
+> `tools/reconcile/reconcile.sh` against the real database, which is where it belongs —
+> a benchmark process holds a synthetic wallet that the reconcile query would not
+> recognise. The claim is struck rather than deleted so the next reader knows it was
+> checked, not missed.
+
+**A second defect, in the binary itself and fixed with this note.** Scenario 4 printed
+`[PASS] 0.2 vCPU easily handles 500 concurrent active streams` from a **literal 500**, so the
+1,000-stream run reported its result under the 500-stream heading. The message now interpolates the
+count that ran. The lesson is the same one this section keeps recording: a number written twice
+drifts, and the copy nobody re-reads is the one a reader trusts.
+
+### 4.1 What DOES produce the two rows the binary cannot
+
+The metrics matrix in §3 publishes six rows. Four are covered in code — the in-process binary behind
+them, a config constant, or a `tools/` sweep. **Two were covered by nothing; both are now measured, and
+this section is what changed:**
+
+| row | target | what measures it now | measured |
+| :--- | :--- | :--- | :--- |
+| **Key Validation Latency (p99)** | `<= 1.5 ms` | `tools/loadtest/loadtest.js` — concurrent HTTP against a running server, a real latency distribution | **1.198 ms** debug / **1.559 ms** release; see below |
+| **CPU Saturation at 200 req/s** | `<= 40%` | the same tool — CPU and RSS sampled from the server PID for the duration of the run | **27%** (release) — PASSES |
+
+**Both rows are now filled, in [`docs/load-test.md`](load-test.md), and neither was straightforward.**
+
+```bash
+node tools/loadtest/loadtest.js --base-url http://127.0.0.1:8080 --pid <server-pid> --rps 200 --seconds 30
+```
+
+**On the CPU row**, the first measurement of it FAILED — the debug build read **54.5% / 60% / 56.3%**,
+consistently over the bar — and `--release` reads **27%**. The difference is `opt-level`, established by
+measuring a third build (opt-level 3, no LTO) rather than assumed: it lands at 32.0%, beside release's
+31.0%. So the row passes, and the release profile's LTO buys about one percentage point rather than
+being what makes it pass.
+
+**On the p99 row**, debug and release land 0.36 ms apart while the instrument's own floor is ~0.8 ms, so
+both are "near 1.5 ms" rather than decisively on one side. That is a limit of a round-trip measurement
+without a server-side timer, and `docs/load-test.md` says so rather than picking the better number.
+
+**A capability gap had to be closed to measure the CPU row at all.** The sampler shelled out to
+PowerShell's `Win32_Process`, which sees only Windows pids — so it could not sample a server inside WSL,
+and `powershell.exe` does not exist there either. Since the exact 0.2-vCPU pin needs cgroup v2 and
+therefore Linux, the one combination the row requires was the one the tool could not sample. It now
+reads `/proc/<pid>/stat` on Linux, verified against a known workload (a 0.3-second spin reported
+0.310 s).
+
+`tools/loadtest/README.md` carries the measured numbers, the falsification commands, and — the part
+worth reading before quoting anything — **what those numbers do not mean.** Two limits apply to both:
+
+* **The p99 is a round trip, not the server's key-validation time.** The row describes compute
+  (SHA-256, the 60s cache lookup, pre-flight arithmetic); a loopback client measures that PLUS the
+  client's own cost, the kernel's TCP path and the server's accept and parse. The tool measures its
+  own client-side floor on every run and **refuses to report a p99 verdict when that floor is at or
+  above 1.5 ms**, because a percentile the instrument cannot resolve is not a reading about the
+  server. MEASURED on the build host: one Node process recorded a p99 of **3.172 ms against a handler
+  doing no work at all**.
+* **The CPU percentage is a normalisation.** A percentage needs a denominator, and the only one this
+  matrix is coherent against is the `0.2 vCPU` its own header names — the row's `> 75%` warning and
+  `100% (Throttling)` critical columns are container-throttling semantics. The tool divides by that,
+  says so in its output, and prints core-equivalents beside it.
+
+Neither number is the deployment's. `docs/load-test.md` is how to take those: a machine separate from
+the server, with the server pinned to `--cpus=0.2`.

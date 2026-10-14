@@ -67,6 +67,7 @@ months.** The daily aggregate is what you keep.
 | --- | --- | --- |
 | `key_ip_seen` hashes | **7 days** | Enough to investigate a live incident |
 | `link_redemption_attempts` hashes | **7 days** | Same class as `key_ip_seen`: a salted hash answering "who was this". Kept only so a live credential attack can be investigated — the `link_redemption_per_hour` cap is a rolling 1-hour window, so anything older than an hour is already inert for enforcement |
+| `auth_attempts` rows | **7 days** | The credential-guessing counter behind the five `_per_hour` caps. Its **IP-keyed** rows are the same class as the two above: a salted hash answering "who was this", and every cap reads a one-hour window, so a seven-day-old hash is already inert. Its **account-keyed** rows hold the account id and the time and **no address at all** — the writer stores an empty string in `ip_hash`, which the column's NOT NULL requires and which no address produced — and they take the same 7 days because a per-account log of who tried to sign in is still a record about an identifiable person |
 | `key_ip_daily` counts | 90 days | Trend without history |
 | Daily salt | **deleted after the day** | Makes the hashes unlinkable forever |
 
@@ -88,7 +89,7 @@ what was settled:
 | Where does the salt live? | **Process memory only.** 32 bytes from the OS RNG, replaced at the UTC day boundary, never written to disk or to the database |
 | Relay or backend computes the hash? | **The backend.** It owns the salt and the tables; the relay has neither |
 | How is the caller's address known? | `X-Forwarded-For`, but **only from a peer inside `network.trusted_proxy_cidrs`** |
-| What enforces retention? | `cargo run --bin ip-purge`, run nightly alongside the backup and reconciliation jobs |
+| What enforces retention? | The maintenance scheduler (`.docker/maintenance/entrypoint.sh`), nightly, in inline SQL alongside the other jobs. **Not** `cargo run --bin ip-purge` — that binary is not shipped in the server image, and the scheduler logs it as NOT WIRED. See "Not enforced" below. |
 
 **The salt is never persisted, on purpose.** A salt derived from a stored server
 secret plus the date would behave identically in every test — stable within a
@@ -201,5 +202,18 @@ the kind of statements that become false through a well-intentioned feature addi
 - [x] Whether the edge relay or the backend computes the hash — the backend, with
       the relay's `X-Forwarded-For` trusted only from a configured CIDR. See
       §Implementation.
-- [ ] The purge is a binary with no scheduler behind it yet; it needs to be added
-      to whatever runs the nightly backup and reconciliation jobs.
+- [ ] The purge BINARY has no scheduler behind it; its WORK runs nightly. These are two
+      different statements and only the second is a privacy property.
+      **ENFORCED TODAY.** `run_retention` in `.docker/maintenance/entrypoint.sh` applies
+      both windows through `sqlite3` on every scheduled run:
+      `DELETE FROM key_ip_seen WHERE day <= today - 7` and
+      `DELETE FROM key_ip_daily WHERE day <= today - 90`. A delete that does not run is
+      reported as `job retention: FAILED`, so a missed sweep is loud rather than silent.
+      **NOT ENFORCED.** The standalone `server/src/bin/ip-purge.rs` is not shipped in the
+      server image, so an operator cannot trigger a one-off purge on demand without a Rust
+      toolchain. That is a convenience, not a retention gap - the windows above hold.
+      *(Correction: this item once stated that no nightly job ran the purge and that it
+      was still pending. That was true when written and went false when the retention
+      sweep took the work inline - the "well-intentioned feature addition" the paragraph
+      above this list warns about. It is corrected rather than deleted because the
+      distinction it now draws is the one a reader of a privacy document actually needs.)*

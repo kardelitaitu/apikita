@@ -120,8 +120,25 @@ stays there. See [`docs/server/api-spec.md`](server/api-spec.md).
 | Tier | Key | Limit | Purpose |
 | --- | --- | --- | --- |
 | Connection/IP | client IP | **30 req/s sustained, 60 burst** | Stop floods and brute force |
-| Request/API key | `Authorization` header or key prefix | **100 req/s** | Stop a runaway client |
+| Request/API key | `Authorization` header or key prefix | **100 req/s, 200 burst** | Stop a runaway client |
 | Concurrent connections | client IP | **50** | Slow-loris and connection exhaustion |
+| Midtrans callbacks | client IP | **200 req/s, 1000 burst** | Bound a flood without refusing a payment callback |
+
+**Every API location names the IP tier AS WELL AS the key tier, and that is load-bearing.**
+A location that names only a key-keyed zone is **unlimited for a caller who sends no
+`Authorization` header** — two nginx rules combine: `limit_req` is *replace*-not-merge, so naming
+a zone **discards** the inherited one; and an **empty zone key disables the limit entirely**.
+Keying on `$http_authorization` therefore means an unauthenticated request is not counted at all.
+Measured before the fix, with both zones at 1 req/s and burst 2: `/auth/login`, `/v1/` and
+`/webhooks/` returned **200 for all eight** rapid requests, while the same path **with** a header
+503'd after three. `/auth/login` unlimited is credential-stuffing surface, which is why the IP
+tier is not optional in any API location.
+
+**The webhook is the one place where the RATE is deliberately different.** Midtrans sends no
+`Authorization` header and may fan out from few addresses, and a 503 here is a **missed credit** —
+the backend is never asked and the money is not recorded. So `/webhooks/` uses its own per-IP zone
+at 200 req/s rather than the 30 req/s sized for a browser: high enough that a legitimate provider
+retry storm is never refused, still bounded so a single host cannot flood the endpoint.
 
 ### Why these numbers
 
@@ -229,6 +246,32 @@ idle most of the time.
 | ~200 customers, normal traffic | Comfortable |
 | TLS handshakes at high rate | The real CPU cost — session resumption helps |
 | Volumetric flood | Cloudflare absorbs it first |
+
+**THE TABLE ABOVE REASONS ABOUT MEMORY, AND THE BINDING RESOURCE IS CONNECTION SLOTS.** Memory per idle
+connection really is small and SSE connections really are idle most of the time — that reasoning is sound
+and it is about the resource that is *not* scarce here.
+
+**`worker_connections` is not set**, so nginx applies its own default, and that default is a hard ceiling
+on simultaneous connections. It decides how many live dashboards this relay can hold, because an SSE stream
+holds a connection for its whole life. Nobody chose the number, measured it, or wrote it down.
+
+The arithmetic, so the gap has a size — `realtime.max_connections_per_account = 5` and
+`max_stream_seconds = 1800` let each customer hold five streams for thirty minutes:
+
+```
+200 customers x 5 streams  = 1000 simultaneous connections
+an SSE connection costs    = 2 slots (client side + upstream side)
+to carry the "comfortable" load you need at least 2000 slots
+```
+
+**It cannot be fixed in `relay.conf`.** That file is mounted at `/etc/nginx/conf.d/default.conf`, which
+nginx includes *inside* its `http {}` block — `events {}` is a `main`-context directive, so adding it there
+is a configuration error and the relay refuses to start. It has to go in the image's own `nginx.conf`
+(or `--worker-connections`), together with `worker_rlimit_nofile`, because a process can hit its
+file-descriptor limit first. nginx logs **"worker_connections are not enough"** when this binds.
+
+**Open item, not a mystery:** until the image sets it, the ceiling is whatever nginx defaults to, and the
+Sizing table's "comfortable" claim is unverified against the resource that actually binds.
 
 See [`docs/cost-and-sizing.md`](cost-and-sizing.md) for how this fits the budget.
 

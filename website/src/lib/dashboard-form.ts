@@ -13,15 +13,24 @@
 import { confirmationError, passwordRuleError } from './auth-flow.ts';
 
 /**
- * The models the proxy exposes by name: config/apikita.toml, [[models]]
+ * Every model the CONFIG knows by name: config/apikita.toml, [[models]]
  * `name = ...`, in file order. Two are routed today (`flash`,
  * `deepseek-v4-flash`); `deepseek-v4-pro` and the three `dummy-*` entries
  * are registered with `weight = 0.0` on every endpoint and can never be
- * selected. The KeyManagement island offers its own subset and is not driven
- * from this list, so the two can differ while this list stays the config's
- * full inventory.
+ * selected.
+ *
+ * IT WAS CALLED `ENABLED_MODELS`, which said the opposite of what it holds: four of
+ * the five entries are disabled on every endpoint, and the summary this feeds tells
+ * the customer so in as many words - "model(s) that are not currently enabled". The
+ * name and the user-facing text contradicted each other, and a reader of the code had
+ * to take the comment below on trust to learn it. It is the full INVENTORY because a
+ * key's allowlist can name a model that has since been retired, and
+ * `describeModelAccess` reports those rather than dropping them.
+ *
+ * The KeyManagement island offers its own routable subset and is not driven from this
+ * list, so the two can differ while this one stays the config's full inventory.
  */
-export const ENABLED_MODELS: readonly string[] = [
+export const KNOWN_MODELS: readonly string[] = [
   'flash',
   'deepseek-v4-flash',
   'deepseek-v4-pro',
@@ -59,7 +68,7 @@ export function allowsModel(allowlist: readonly string[], model: string): boolea
  */
 export function describeModelAccess(
   allowlist: readonly string[],
-  enabled: readonly string[] = ENABLED_MODELS,
+  enabled: readonly string[] = KNOWN_MODELS,
 ): string {
   const granted = enabled.filter((model) => allowsModel(allowlist, model));
   const retired = allowlist.filter((model) => !enabled.includes(model));
@@ -284,4 +293,123 @@ export function passwordChangeError(
 ): string | null {
   if (current.length === 0) return 'Enter your current password.';
   return passwordRuleError(next) ?? confirmationError(next, confirm);
+}
+
+/**
+ * The Telegram link flow, as pure logic.
+ *
+ * docs/server/api-spec.md: `POST /api/telegram/link-code` issues a 6-digit
+ * code — single-use, 5-minute TTL, bound to the account — and `DELETE
+ * /api/telegram` unlinks. The server owns issuance, expiry and the hourly cap;
+ * these helpers only format what it returns and validate what the user typed.
+ */
+
+/** The body of `POST /api/telegram/link-code` (server/src/routes/telegram.rs). */
+export interface LinkCodeResponse {
+  code: string;
+  expires_at: string;
+  ttl_minutes: number;
+}
+
+/**
+ * The Telegram code as the user should read it back.
+ *
+ * The server zero-pads the code ("000042") because redemption compares the
+ * string, so the leading zeros ARE the code. Trimming or stripping them would
+ * send the bot a different value than was issued, so this preserves them and
+ * only guards against an unexpectedly short code by refusing to pad in a way
+ * that changes meaning — it returns the code unchanged.
+ */
+export function formatLinkCode(code: string): string {
+  return code.trim();
+}
+
+/**
+ * Whether the typed code is the 6-digit shape `/link` expects.
+ *
+ * The bot redeems `{code, telegram_id}`; a code that is not six digits cannot
+ * match any issued code, so the dashboard refuses to show a "sent" state for it.
+ * Digits only — the server draws from `next_u32() % 1_000_000` and zero-pads,
+ * so letters never occur.
+ */
+export function isPlausibleLinkCode(candidate: string): boolean {
+  return /^\d{6}$/.test(candidate.trim());
+}
+
+/**
+ * The instruction text to show beside an issued code.
+ *
+ * It names the exact chat command so the user does not have to guess the syntax,
+ * and states the TTL the server reported rather than a hardcoded number — a
+ * hardcoded "5 minutes" would silently lie if the TTL changed.
+ */
+export function linkCodeInstruction(code: string, ttlMinutes: number): string {
+  return `Send /link ${formatLinkCode(code)} to the apikita bot in Telegram. The code works once and expires in ${ttlMinutes} minute${ttlMinutes === 1 ? '' : 's'}.`;
+}
+
+/**
+ * Which stored limit a field is being compared against, for the TTL warning.
+ *
+ * The create form has no previous value; an EDIT does, and the difference drives
+ * a real user-facing consequence (see `describeLimitChange`).
+ */
+export interface ExistingKeyLimits {
+  spend_limit_idr: number;
+  token_limit: number;
+  rate_limit_rpm: number;
+}
+
+/** The edit form's raw fields — the same shape as create, so one parser serves both. */
+export type UpdateKeyFields = CreateKeyFields;
+
+/**
+ * The `PATCH /api/keys/:id` body, or the first reason it must not be sent.
+ *
+ * Every field the API accepts is optional (server/src/routes/keys.rs:72-80), and
+ * this always sends the full set the form shows rather than a diff: the form is
+ * the source of truth for what the key should be, and sending only changed fields
+ * would silently preserve a value the user deliberately cleared. It reuses
+ * `buildCreateKeyRequest`'s validation verbatim — same limits, same expiry rules,
+ * same "impossible date is refused" behaviour — so create and edit cannot drift.
+ */
+export function buildUpdateKeyRequest(fields: UpdateKeyFields): CreateKeyBuild {
+  return buildCreateKeyRequest(fields);
+}
+
+/**
+ * Whether an edit LOWERS any limit, and therefore takes up to the metadata cache
+ * TTL to apply.
+ *
+ * docs/server/api-spec.md:397-398 — "Raising takes effect immediately; lowering is
+ * subject to the proxy's metadata cache TTL (≤60s). The response should say so,
+ * so the UI can warn honestly." This is that warning's trigger.
+ *
+ * Only a STRICT decrease counts. Raising, or leaving a limit unchanged, is not a
+ * reduction and must not raise the warning — a warning shown when nothing was
+ * lowered is noise the user learns to ignore.
+ */
+export function lowersAnyLimit(
+  before: ExistingKeyLimits,
+  after: ExistingKeyLimits,
+): boolean {
+  return (
+    after.spend_limit_idr < before.spend_limit_idr ||
+    after.token_limit < before.token_limit ||
+    after.rate_limit_rpm < before.rate_limit_rpm
+  );
+}
+
+/**
+ * The warning to show when an edit lowers a limit, or null when it does not.
+ *
+ * The sentence is deliberately specific about the window rather than saying
+ * "shortly": the whole point of telling the user is that a reduction is NOT
+ * instant, and a vague promise would defeat it.
+ */
+export function limitReductionWarning(
+  before: ExistingKeyLimits,
+  after: ExistingKeyLimits,
+): string | null {
+  if (!lowersAnyLimit(before, after)) return null;
+  return 'You lowered a limit. The proxy applies a reduction within its metadata cache TTL, up to 60 seconds — until then, requests a reduced limit would refuse can still pass. A RAISE takes effect immediately.';
 }

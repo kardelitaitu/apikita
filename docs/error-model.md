@@ -9,6 +9,21 @@ status. Clients code against this, so it is a contract.
 
 **Every error returns the same JSON.** No bare HTML error pages, no empty bodies.
 
+This is **enforced against the running binary** by the CI smoke step, not merely asserted
+here. It was not always true: until recently an unrouted path returned an **empty body**
+(axum's default, because the router had no fallback) and a malformed body on the auth
+endpoints returned axum's **plain text** — on the auth verbs with no credential guard,
+where a malformed body actually reaches the extractor before any check can refuse it.
+Both now route through `AppError`, so the shape, the `code` vocabulary and the
+`request_id` come from the one place that defines them. (The endpoint this passage once
+named, `POST /auth/exchange`, is gone — the identity port deleted it and the provider it
+spoke to; `POST /auth/login` and `POST /auth/signup` are the unguarded auth verbs that
+exist today and carry the same property.)
+
+The extractor's own detail text is deliberately **not** echoed into `message`: the body
+being parsed is the caller's credential, and `InvalidRequest` sends its string to the
+client verbatim.
+
 ```json
 {
   "error": {
@@ -45,10 +60,23 @@ matching on its text is a bug waiting to happen.
 | 403 | `wrong_credential_type` | **Reserved, never emitted** — a cookie on `/v1/*`, or a key on a cookie endpoint, returns 401 `unauthenticated` | Treat as 401 |
 | 404 | `not_found` | No such resource | Check the id |
 | 409 | `conflict` | Duplicate (e.g. Telegram already linked) | Reconcile state |
-| 422 | `validation_failed` | Well-formed but invalid (rating out of range) | Fix the value |
+| 422 | `validation_failed` | Well-formed but invalid (e.g. a top-up amount below the provider minimum, or a date that is not `YYYY-MM-DD`) | Fix the value |
 | 429 | `rate_limited` | Too fast | Back off; respect `Retry-After` |
 | 500 | `internal_error` | Our bug | Retry once, then report |
 | 503 | `no_upstream_available` | Every upstream is unhealthy | Retry after `Retry-After` |
+| 503 | `unavailable` | A service THIS server depends on cannot be reached — currently the session store, when the database cannot be queried | Retry after `Retry-After`; do **not** treat as a bad session |
+
+**`unavailable` is separate from `no_upstream_available` on purpose, and separate from 401 above all.**
+Both answer 503, and the difference is what failed: `no_upstream_available` means the model providers
+are unhealthy and browsing the dashboard still works; `unavailable` means the store behind
+authentication cannot be read, so the request could be neither authorised nor refused. It must not be
+a 401 — a 401 tells a signed-in customer their session is bad, and the web client acts on a 401 by
+redirecting to `/login`, so a database blip would log the whole site out. 503 says "try again", which
+is what is true. See `routes/mod.rs::unusable_session_store`.
+
+This row was MISSING until now, and that was the defect rather than a gap in paperwork: the server
+emitted `unavailable` while this table — the client contract, "the `code` is the contract" — did not
+define it at all.
 
 ## 401 vs 403 — the distinction that matters
 
@@ -142,8 +170,19 @@ provider we may switch away from.
 | --- | --- |
 | 400 (bad request from client) | 400 `invalid_request`, our wording |
 | 401/403 (our provider key is bad) | 500 or 503 — **this is our problem, not the client's** |
+| 404 (model not found at ONE provider) | **Failover**: `upstream_model` is per-endpoint, so the next provider may carry it |
+| 404 (model not found at EVERY provider) | 500 — our `upstream_model` mapping is wrong. The endpoint list is logged, never sent |
 | 429 (provider throttled) | Retry another key first; only surface 503 if all fail |
 | 5xx | Try another endpoint; else 503 |
+
+**A 404 is the one 4xx that is NOT the caller's fault, and the distinction is
+structural.** Every other 4xx aborts the loop immediately, because a malformed body is
+malformed at every provider and retrying it would spend a second upstream call on a
+request that cannot succeed. But the model NAME is rewritten per endpoint from
+`upstream_model` — that is what the `(url + upstream_model)` pair is for — so one
+provider saying "no such model" is a fact about THAT supplier only. It rotates. When
+every endpoint refuses, the fault is ours: the request was valid and the mapping is
+wrong, which is why that answer is a 500 and not a 404.
 
 **An upstream auth failure must never surface as a client 401.** The customer's key
 is fine; our provider key is not. Returning 401 would send them chasing a

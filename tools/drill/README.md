@@ -283,9 +283,10 @@ gets. Verified: a zero-length source is **exit 6**.
 - **Encryption is not exercised.** `tools/backup/backup.sh` writes encrypted
   artifacts; the drill restores a plain `.db`. Decrypting first is the operator's
   step, and the decryption time is not in `restore_ms`.
-- **PocketBase has no restore procedure here**, and the doc's open item
-  *"Whether PocketBase gets its own tested restore procedure"* stays open. This
-  tool covers the SQLite money database only - the doc ranks it first, not only.
+- **Identity has no separate restore procedure, because it has no separate store.**
+  The identity port moved identity into the same SQLite file as the money, so this
+  tool's restore of that file *is* the identity restore path - there is no second
+  database to rank below the first.
 - **Nothing schedules this.** No CI workflow and no compose service runs
   `drill.sh`; running it quarterly is a manual step, exactly as
   `tools/reconcile/README.md` says of `hold-sweep`.

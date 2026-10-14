@@ -7,8 +7,8 @@
 // component must not add one. It never asks whether the visitor is signed in;
 // that state belongs to the dashboard island, not to a static nav.
 interface Props {
-  /** `dashboard` = the authenticated shell: the dashboard routes, no sign-in CTA. */
-  variant?: 'marketing' | 'dashboard';
+  /** `dashboard` = the authenticated customer shell; `admin` = the operator shell. */
+  variant?: 'marketing' | 'dashboard' | 'admin';
   /** Layout classes for the shell that mounts it (the nav itself owns no width). */
   class?: string;
 }
@@ -24,11 +24,16 @@ const links =
         { href: '/dashboard/usage', label: 'Usage' },
         { href: '/dashboard/settings', label: 'Settings' },
       ]
-    : [
-        { href: '/', label: 'Home' },
-        { href: '/models', label: 'Models' },
-        { href: '/docs/quickstart', label: 'Docs' },
-      ];
+    : variant === 'admin'
+      ? [
+          { href: '/admin', label: 'Admin' },
+          { href: '/dashboard', label: 'My dashboard' },
+        ]
+      : [
+          { href: '/', label: 'Home' },
+          { href: '/models', label: 'Models' },
+          { href: '/docs/quickstart', label: 'Docs' },
+        ];
 
 const path = Astro.url.pathname.replace(/\/+$/, '') || '/';
 // /dashboard prefixes every route below it, so only the leaf routes claim their
@@ -47,7 +52,9 @@ const isCurrent = (href: string) =>
     className,
   ]}
 >
-  <a href="/" class="font-semibold tracking-tight text-ink">apikita</a>
+  <a href={variant === 'admin' ? '/admin' : '/'} class="font-semibold tracking-tight text-ink">
+    apikita{variant === 'admin' && <span class="ml-1 rounded border border-warn-edge px-1.5 py-0.5 align-middle text-[0.65rem] font-medium uppercase tracking-wide text-warn">admin</span>}
+  </a>
 
   <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
     {links.map(({ href, label }) => (

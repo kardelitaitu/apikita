@@ -9,6 +9,28 @@
 //!
 //! Thread-safe and dependency-free: one Mutex, no I/O, no clock abstraction.
 
+#![cfg_attr(
+    not(test),
+    // THIS MODULE'S FAILURE MODE IS A PANIC, NOT A WRONG NUMBER, and that is worth
+    // recording because it is the opposite of the money modules.
+    //
+    // `Instant + Duration` does not saturate - a bare `+` that leaves the
+    // representable range PANICS. The breaker holds a Mutex while it does this, so
+    // the panic happens under a lock, on a request, with no field name in sight.
+    //
+    // It took a measurement to find the boundary, and it is further out than the
+    // shape of the code suggests: a trillion seconds - 31,700 years - is fine, and
+    // only a nineteen-digit value panics. So this module is not carrying a live bug.
+    // What it carries is an unvalidated config value reaching an operation that
+    // panics rather than degrading, which is why config.rs now refuses a cooldown
+    // the clock cannot represent at LOAD, where the message can name the field.
+    //
+    // The remaining site here is the backoff multiplication, which is float and
+    // already guarded: cooldown_multiplier is checked for finiteness at its use
+    // site AND at config load, and the result is clamped to cooldown_max_seconds.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use crate::config::CircuitBreakerConfig;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -87,6 +109,46 @@ impl CircuitBreaker {
         }
     }
 
+    /// Would a request be refused *right now*, judged WITHOUT perturbing the
+    /// breaker?
+    ///
+    /// SAME SIDE-EFFECT-FREE REQUIREMENT AS `remaining_cooldown`, AND THE REASON
+    /// THIS EXISTS RATHER THAN THE ALERT PREDICATE CALLING `allow_request`.
+    /// `all_endpoints_unhealthy` is the `all_providers_unhealthy` ALERT condition,
+    /// reached from `metrics_payload`, `/api/admin/metrics` and
+    /// `tools/alert/probe.sh`. Asking a question in order to page an operator is
+    /// the case where the answer must not change the thing it asks about — but
+    /// `allow_request` is a MUTATING call in the one state that matters: in
+    /// HalfOpen it consumes the single trial slot (`trial_in_flight = true`).
+    ///
+    /// MEASURED WHAT THAT COST: a monitor that evaluated the predicate took the
+    /// one half-open trial and exited, leaving `trial_in_flight = true` so the
+    /// next real customer was refused until its own `record_*` cleared the flag.
+    /// The half-open mechanism exists to admit exactly ONE trial and it was being
+    /// burned by a poll that never sent a request — degrading failover, which is
+    /// the only thing this whole module is for, on the quietest possible path.
+    ///
+    /// WHAT IT REPORTS, precisely: `true` when the state is Open AND the cooldown
+    /// has not elapsed — the only answer the alert predicate needs. Unlike
+    /// `state()` it does NOT promote an elapsed-cooldown Open breaker to HalfOpen,
+    /// and unlike `allow_request` it never takes a trial. A breaker whose cooldown
+    /// elapsed reads `false` here even though it is still nominally Open, and that
+    /// is deliberate: a trial is plausible immediately, so it is not a cause to
+    /// page. It is the same 1-second-floor reasoning `no_upstream_retry_after`
+    /// applies for the opposite question.
+    pub fn is_refusing(&self) -> bool {
+        let inner = self.lock();
+        if inner.state != BreakerState::Open {
+            return false;
+        }
+        // A cooldown that has already elapsed means a retry is plausible NOW, so
+        // the breaker is open on paper but is not refusing anything.
+        match inner.open_until {
+            Some(until) => self.now(&inner) < until,
+            None => false,
+        }
+    }
+
     /// How long until this breaker's Open window ends, or `None` when no Open
     /// window is in effect (the breaker is Closed, or already HalfOpen).
     ///
@@ -98,7 +160,7 @@ impl CircuitBreaker {
     ///
     /// A cooldown that has already elapsed still reports `Some(0)` while the
     /// breaker reads Open, because a retry is plausible immediately; the caller
-    /// floors the reported value (docs/error-model.md:112).
+    /// floors the reported value (docs/error-model.md (429 — rate limited)).
     pub fn remaining_cooldown(&self) -> Option<Duration> {
         let inner = self.lock();
         if inner.state != BreakerState::Open {
@@ -122,6 +184,22 @@ impl CircuitBreaker {
     /// A request failed (5xx, timeout, transport error). Trips the breaker once
     /// the consecutive-failure threshold is reached, and doubles the cooldown
     /// when a HalfOpen trial fails.
+    /// The `Instant + Duration` below is SAFE only because config.rs refuses a
+    /// cooldown the clock cannot represent, at LOAD, naming the field. A bare
+    /// `Instant + Duration` PANICS rather than saturating, and this runs while the
+    /// breaker lock is held. `inner.cooldown` is `base_cooldown()` or
+    /// `next_cooldown(...)`, and both are bounded by the two cooldown settings that
+    /// validation checks with `checked_add`.
+    ///
+    /// `checked_add` here as well would turn a missed validation into a tripped
+    /// breaker rather than a panic - but the two would then disagree about what "too
+    /// long" means, and the config check is the one that can name the operator's
+    /// mistake. This allow records that the line depends on it.
+    ///
+    /// On the function, not the statement: an attribute on an expression-statement
+    /// needs the unstable `stmt_expr_attributes` feature, and the compiler says so
+    /// rather than accepting it.
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn record_failure(&self) {
         let mut inner = self.lock();
         inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
@@ -165,6 +243,12 @@ impl CircuitBreaker {
 
     /// Multiply the current cooldown by cooldown_multiplier, clamped to
     /// cooldown_max_seconds. A multiplier of 1.0 or less disables the backoff.
+    ///
+    /// SAFE, and the guard is the line below it: a non-finite multiplier falls back
+    /// to 1.0 rather than producing a NaN duration, which the `.min` at the end
+    /// would then have to reason about. `as u64` on a float that is already finite
+    /// and non-negative saturates in Rust, and the result is clamped regardless.
+    #[allow(clippy::arithmetic_side_effects)]
     fn next_cooldown(&self, current: Duration) -> Duration {
         let multiplier =
             if self.cfg.cooldown_multiplier.is_finite() && self.cfg.cooldown_multiplier > 1.0 {
@@ -190,8 +274,16 @@ impl CircuitBreaker {
     }
 
     /// Test-only: advance this breaker's virtual clock.
+    ///
+    /// `pub(crate)` rather than private so a test OUTSIDE this module can drive it.
+    /// The predicate that had to be checked — `all_endpoints_unhealthy` in `client.rs` —
+    /// lives in the sibling module, and the defect it carried (consuming a half-open
+    /// trial on a read) is only observable once the breaker has been advanced past its
+    /// cooldown into HalfOpen. A private clock would have forced that test to sleep 30
+    /// real seconds or to reconstruct the breaker's internals, which is how a
+    /// regression test ends up not being written.
     #[cfg(test)]
-    fn advance(&self, elapsed: Duration) {
+    pub(crate) fn advance(&self, elapsed: Duration) {
         let mut inner = self.lock();
         inner.clock_offset += elapsed;
     }
@@ -229,6 +321,38 @@ mod tests {
         b.record_failure();
         b.record_failure();
         assert_eq!(b.state(), BreakerState::Open);
+    }
+
+    /// EVERY FAILURE IS WORTH THE SAME ONE, WHATEVER CAUSED IT.
+    ///
+    /// THE PROPERTY IS VISIBLE IN THE SIGNATURE: `record_failure(&self)` takes no argument, so a
+    /// caller cannot say WHAT failed. The routing loop's transport arm (a refused connection or a
+    /// dead socket) and its 5xx arm call the SAME method, so both increment the same
+    /// `consecutive_failures` and are compared to the same `failure_threshold`.
+    ///
+    /// THIS IS PINNED BECAUSE `docs/failover.md` SAID THE OPPOSITE. Its trip-condition table
+    /// carried `| Connection refused | 1 - an unreachable host is unambiguous |`, which is a
+    /// plausible rule this breaker has never implemented. The row is corrected, and this test is
+    /// what stops it drifting back: a change to weight transport failures must alter THIS, and
+    /// cannot arrive as an edit to a document.
+    #[test]
+    fn every_failure_counts_the_same_toward_the_threshold() {
+        let b = CircuitBreaker::new(cfg());
+
+        // TWO failures do not trip it, whichever kind they would have been.
+        b.record_failure();
+        b.record_failure();
+        assert!(
+            b.allow_request(),
+            "two failures must not trip a threshold of three - a refused connection is worth one of three, not three of three"
+        );
+
+        // The THIRD does, so the count is what decides and nothing else.
+        b.record_failure();
+        assert!(
+            !b.allow_request(),
+            "three consecutive failures must trip it, whatever caused them"
+        );
     }
 
     #[test]
@@ -439,5 +563,43 @@ mod tests {
         assert!(!b.allow_request());
         advance(&b, 1);
         assert!(b.allow_request(), "the cooldown is capped at 900s");
+    }
+
+    #[test]
+    fn a_stale_failure_report_does_not_extend_an_already_open_breaker() {
+        let b = CircuitBreaker::new(cfg());
+        trip(&b);
+
+        // A request admitted BEFORE the trip reports its failure now. The
+        // breaker is already Open, so the report must change nothing: without
+        // that guard every in-flight straggler would re-enter the cooldown
+        // math and keep pushing the trial further out, indefinitely.
+        b.record_failure();
+        assert_eq!(b.state(), BreakerState::Open);
+        assert_cooldown_is(b.remaining_cooldown(), 30);
+
+        advance(&b, 30);
+        assert!(
+            b.allow_request(),
+            "the stale report must not have pushed the trial further out"
+        );
+    }
+
+    #[test]
+    fn a_multiplier_of_one_or_less_disables_the_backoff() {
+        let mut config = cfg();
+        config.cooldown_multiplier = 1.0;
+        let b = CircuitBreaker::new(config);
+        trip(&b);
+
+        advance(&b, 30);
+        assert!(b.allow_request());
+        b.record_failure();
+        assert_eq!(b.state(), BreakerState::Open);
+
+        // multiplier 1.0: the failed HalfOpen trial re-opens at the SAME 30s
+        // cooldown instead of doubling - the documented "backoff disabled"
+        // behaviour, not a silent 30 -> 60.
+        assert_cooldown_is(b.remaining_cooldown(), 30);
     }
 }

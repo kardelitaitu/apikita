@@ -22,7 +22,7 @@ That is the budget. Everything below is sized against it.
 | --- | --- | --- |
 | **Rust API + proxy** | CPU-light, memory-light, I/O-bound | Streams bytes; the work is waiting, not computing |
 | **SQLite** (embedded) | **No instance, no extra CPU/RAM line item** | The wallet ledger is a file inside the API process; it needs the persistent volume below, not a server |
-| **PocketBase** | Tiny | One binary, SQLite, low traffic (logins only) |
+| **Identity** | **No line item** | Served in-process by the same Rust crate (`accounts` + `identities` in that same SQLite file). There is no separate identity service to run |
 | **Frontend** | **Free** | Cloudflare Pages static hosting |
 | **Edge relay** | Cheap VPS, ~2 vCPU / 4 GB | Absorbs connection load so Northflank stays small |
 
@@ -49,8 +49,9 @@ upstream socket, not computing. That has direct sizing consequences:
   streaming connections cost kilobytes each, not megabytes.
 
 - **Memory does not scale with request size.** Responses are streamed, not
-  buffered. The whitepaper's zero-copy passthrough is the reason a small box can
-  serve large completions.
+  buffered (`server/src/upstream/client.rs`: the body is "never buffered whole").
+  That passthrough is the reason a small box can serve large completions — the
+  retired whitepaper proposed it, the code is what guarantees it.
 
 - **The database is off the hot path.** API key metadata is cached with a <=60s
   TTL, so a request does not touch the database. Without that cache, the database
@@ -65,7 +66,7 @@ business will ever throw at it.** Do not size for imagined scale.
 | --- | --- | --- |
 | API/proxy instance | **1 vCPU / 1 GB** | I/O-bound; start here and measure |
 | Database | **in-process — $0, no separate line item** | Embedded SQLite. Tiny row counts: thousands of rows, not millions, and no server to size |
-| PocketBase | **smallest offering** | Logins only |
+| Identity | **in-process — $0, no separate line item** | No service to size: `accounts` + `identities` are tables in the same SQLite file |
 | Volume for the database file | **10-20 GB** | Ledger + usage; usage dominates |
 
 **Start smaller than you think.** A single 1 vCPU box with 1 GB is plausibly enough
@@ -146,14 +147,25 @@ Adding server capacity fixes nothing and doubles the bill.
 - **Running the proxy and the API as separate services** before it is necessary —
   two instances, two deploys, no benefit at this scale.
 - **Writing `last_used_at` on every request** — turns a read path into a write
-  path and pushes load onto the database.
+  path and pushes load onto the database. This one is deliberately avoided rather
+  than hypothetical: the write sits on the key-metadata cache MISS, so it happens
+  at most once per `limits.key_metadata_cache_seconds` per key instead of once per
+  request. See [website/02-data-model.md](website/02-data-model.md).
 - **A load balancer in front of one instance** — cost with no benefit.
 
 ## Open items
 
 - [ ] Actual prices from Northflank for the target instance sizes.
 - [ ] Confirm the Cloudflare Pages free tier covers this usage.
-- [ ] Measure real memory per concurrent stream once implemented.
+- [ ] Measure real memory per concurrent stream against a DEPLOYED instance. **The instrument
+  and the arithmetic are both done**: `active_streams` / `peak_streams` on
+  `GET /api/admin/metrics` ([observability.md](observability.md)) report the level and the
+  high-water mark, and `tools/loadtest` now reads that peak (`--operator-cookie`) and divides
+  it into its own RSS sample, reporting **KB per stream** against the `< 35 KB` row of
+  [benchmark.md](benchmark.md). **What is still open is the RUN**: the published row is about a
+  deployed instance under Scenario 2's `50 -> 1,000` concurrent streams against a working
+  upstream. Locally the upstream is a placeholder, so a run authenticates, is refused at the
+  provider, counts **zero** streams, and reports NO DATA rather than a pass.
 - [x] ~~Decide whether Postgres runs as a managed add-on or self-hosted.~~ **Moot** —
   the port to embedded SQLite removed the decision along with the service
   ([§Stack](../README.md#stack), [`plans/sqlite-migration.md`](plans/sqlite-migration.md)).

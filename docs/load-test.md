@@ -1,0 +1,289 @@
+# Load test — what to run, where, and what the numbers mean
+
+`docs/benchmark.md` publishes six metrics-matrix rows. **Four are verified in code.** Two are not, and
+cannot be by the in-process binary:
+
+| row | target | why the in-process binary cannot own it |
+| --- | --- | --- |
+| Key Validation Latency (p99) | $\le 1.5$ ms | the in-process binary has no HTTP client and no latency histogram — see "Measuring the p99" below for the client that does |
+| CPU Saturation at 200 req/s | $\le 40\%$ | the binary has no RSS/CPU sampling |
+
+The document already says this and says it plainly: *"these numbers are not a load test and must not be
+quoted as one... Real figures come from the drill and the reconcile tools against a running stack."* This
+page was written as the missing half — **how to take those two measurements — and both have now been
+taken.** They are in "Recording the result" below, with the caveat that they are a first honest data
+point rather than the deployment's number.
+
+## What you need before starting
+
+| thing | why | how to check |
+| --- | --- | --- |
+| The server running | the whole point | `curl -s localhost:8080/health` returns `{"status":"healthy","database":"connected"}` |
+| A migrated database | the request path reads it | `DATABASE_URL=... cargo run --bin migrate` |
+| **A machine with the same CPU as production** | the target is stated per 0.2 vCPU | see "Why the box matters" below |
+| A load generator | concurrency, not a loop | [`tools/loadtest/`](../tools/loadtest/README.md) — `node tools/loadtest/loadtest.js --help` |
+| `ps`/`/proc` access to the server PID | CPU sampling | the harness takes `--pid`; the same host is the simple case |
+
+**Do not run this against production.** The generator writes wallet rows through the proxy path. Use a
+restored copy — `tools/drill/drill.sh` produces exactly that, and `tools/reconcile/reconcile.sh` is how
+you confirm the copy is sound before and after.
+
+## Why the box matters, and this is the part people skip
+
+Both targets are stated **for 0.2 vCPU**. A p99 measured on a 16-core workstation is not evidence about
+the deployment, because the published bar assumes the process is CPU-starved. MEASURED in an earlier
+round: the whole benchmark suite runs on **one OS thread** precisely to model that container.
+
+So: **run the generator on a different machine from the server**, and pin the server to 0.2 vCPU
+(`--cpus=0.2` under Docker, or `cpulimit`). A generator sharing the CPU it is measuring reports its own
+contention as the server's latency.
+
+## Measuring the p99 — and why a Node client cannot
+
+**The 1.5 ms bar is below the floor of a Node load generator, so no amount of hardware fixes the Node
+route.** MEASURED (`tools/loadtest/loadtest.js:40-57`) against a handler doing NO work:
+
+| generator | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| one Node process | 1.208 ms | 2.095 ms | **3.172 ms** |
+| four Node processes | ~0.59 ms | ~1.5 ms | **~2.4 ms** |
+
+A no-op handler answering from memory, reported at 2.4 ms: that is the **instrument**, not the server.
+`tools/loadtest/` handles this honestly — it measures its own floor first and refuses a verdict when the
+floor is at or above the bar — which is why this row is still blank rather than filled with a
+fabrication.
+
+**A 16-core host and Docker both fail to fix this**, and it is worth saying why because the reflex is to
+reach for hardware: the constraint is the *measuring instrument*, not capacity. A client whose own floor
+exceeds the bar cannot resolve that bar on any machine.
+
+### The native client
+
+`server/src/bin/loadgen.rs` is a Rust HTTP client with no event loop, no GC and no dependency on a
+millisecond-resolution timer between the request and the reading. Build and use it:
+
+```sh
+cargo build --bin loadgen
+
+# ALWAYS measure the floor first, at the SAME concurrency as the run you intend to make.
+./target/debug/loadgen --base-url http://127.0.0.1:8080 --path /health --measure-floor --concurrency 8
+
+# Then the real run. THE METHOD AND HEADER MATTER: this route is POST-only, and without them the
+# client times the router's 405 rejection and reports it as the endpoint's latency. MEASURED: a bare
+# GET to /v1/chat/completions answers 405.
+./target/debug/loadgen --base-url http://127.0.0.1:8080 --path /v1/chat/completions \
+  --method POST --expect-status 401 \
+  --header 'Authorization: Bearer sk-unknown-not-a-real-key' --body '{}' \
+  --rate 200 --concurrency 8
+```
+
+It refuses a verdict when its own floor is at or above the target, retains every sample for a real
+percentile rather than a mean, and **prints the warm-up it discarded** — so a figure it produces can be
+attributed rather than trusted.
+
+**The floor must be measured at the SAME CONCURRENCY as the run**, and the reason is not a tidy scaling
+curve — it is that the floor is dominated by **variance**. The first table published here claimed a
+monotonic rise with concurrency (1.131 / 1.290 / 1.231 / 1.377 / **1.892** ms at concurrency 1/4/8/16/32),
+and that was wrong.
+
+**MEASURED, and it retracts the row above:** on the same host, 7 trials at each concurrency gave medians
+of **1.30 / 2.06 / 2.07 / 1.25 / 1.42 ms** — noisy, non-monotonic, and **concurrency 32 landed UNDER the
+1.5 ms bar**. Individual runs swung **1.14–7.77 ms for an identical configuration**. The quoted 1.892 ms
+was a one-shot artifact, and two conclusions drawn from it are withdrawn: the floor does not rise
+reliably with concurrency, and "past concurrency 16 it crosses the bar" was not reproducible.
+
+**What replaces it is a rule rather than a table: a single run on this host is a coin flip, so every
+figure recorded here must be a median of repeated interleaved trials, with the host's CPU stated.** The
+table above was taken while a crypto-miner was running — the same command read **13.7–23.7 ms** under
+that load and ~1.4 ms quiet, a 20× swing from the environment alone.
+
+**AND THE FLOOR'S COMPOSITION MATTERED MORE THAN ITS LEVEL.** Instrumenting the original generator
+split each request slot into *timer lateness* versus *actual RTT*: the sleep-timer overshoot was
+**p50 ~7–8 ms / p99 ~15–16 ms** — an order of magnitude larger than the latency being measured, since
+RTT itself was p99 1.34 ms at concurrency 8. It was never request cost. It was N independent per-worker
+sleep schedules waking late and colliding, which is why the figure swung so wildly.
+
+The generator was subsequently rebuilt on **one shared release schedule** (a token bucket, so lateness
+does not compound with N) over **pre-connected `TcpStream`s** instead of a `reqwest` call per request.
+The author reports a floor of **0.48–0.78 ms, flat across concurrency 1→32**.
+
+**THAT FIGURE IS NOT VERIFIED IN THIS DOCUMENT.** It was measured on a host the author's own report
+describes as contaminated, and I could not reproduce it: every attempt since has found the machine
+carrying unrelated load (a separate project's build process holding ~18 cores). The instrument refuses
+to take a floor reading on a busy host, which is the correct behaviour and also why the claim stood
+unconfirmed.
+
+**IT IS NOW VERIFIED. Independent reproduction, medians of 7 trials per concurrency, on a quiet host
+(22% CPU), same box:**
+
+| concurrency | floor p99 (median) | range across 7 trials |
+| --- | --- | --- |
+| 1 | **0.664 ms** | 0.624–0.718 |
+| 4 | **0.698 ms** | 0.637–0.746 |
+| 8 | **0.658 ms** | 0.615–0.738 |
+| 16 | **0.681 ms** | 0.635–0.872 |
+| 32 | **0.675 ms** | 0.605–0.941 |
+
+**Spread across concurrency 1→32 is 0.040 ms** — flatter even than the 0.11 ms reported. The ranges are
+0.6–0.9 ms, against the **1.14–7.77 ms swing** the old generator showed for an identical configuration.
+The instrument's floor is now well under the 1.5 ms bar and effectively independent of concurrency,
+which is the property that matters: a floor that moves with N cannot be compared against a bar quoted
+at some other N.
+
+**What this still is NOT.** It is a debug build on Windows over loopback at ~200 req/s. A floor is a
+statement about the *instrument*; it says nothing about server throughput, and nothing here has been
+measured on the 0.2 vCPU deployment shape. The two rows in "Recording the result" remain blank.
+
+## The run
+
+Three phases, because one number cannot distinguish the three failures it could be:
+
+1. **Warm-up.** Drive the target for ~30s and discard it. The first requests pay for connection setup
+   and cache population; including them measures start-up, not steady state.
+2. **Steady state.** The measurement window. This is where p50/p95/p99 come from.
+3. **Saturation.** Ramp until the p99 crosses the target. **The number worth recording is the throughput
+   at which it crosses**, not the peak throughput — a service that meets its latency at 200 req/s and
+   falls over at 2,000 is a different product from one that does not.
+
+## What the two numbers mean, and what they do not
+
+**The p99 is about the request path, not the model.** What is being timed is key validation, the hold,
+the upstream call and the settlement — the gateway's own work. Upstream latency dominates the
+end-to-end figure and is **not** what the 1.5 ms target is about. Report the two separately or the
+number is uninterpretable.
+
+**The CPU figure is only meaningful with the throughput it was taken at.** "40% CPU" alone says nothing;
+`40% at 200 req/s` is the claim the document makes, and the row states it that way for that reason.
+
+**An idle measurement is not a measurement.** CPU read while nothing is in flight is the baseline, and
+reporting it as the figure would be the same defect class as the `[PASS]` that could not fail: a number
+presented as a result that nothing in the run produced.
+
+## Recording the result
+
+Fill this in with **real** values and note the date, the box, and the vCPU pin — a figure without those
+three is not reproducible and the next reader cannot tell whether it still holds.
+
+| metric | target | measured | box | vCPU | date |
+| --- | --- | --- | --- | --- | --- |
+| Key validation p99 | $\le 1.5$ ms | **1.198 ms** (debug), **1.559 ms** (release) | Linux (WSL2), 32 logical cores, Ryzen 9 7950X, loopback, load 0.01x CPUs | **0.200** (cgroup v2 `cpu.max = 20000 100000`) | 2026-10-13 |
+| CPU at 200 req/s | $\le 40\%$ | **27%** — **PASSES** | same box, same pin, `tools/loadtest/loadtest.js --pid` | **0.200** | 2026-10-13 |
+
+**THE CPU ROW PASSES, AND THE FIRST READING OF IT DID NOT — the build was the difference.** An earlier
+run of the same measurement against the **debug** binary gave **0.109 / 0.120 / 0.113 core-equivalents =
+54.5% / 60% / 56.3%**, consistently over the `<= 40%` bar. **`--release` gives 0.054 cores = 27%.**
+
+| build | core-equivalents | % of 0.2 vCPU | verdict |
+| --- | --- | --- | --- |
+| debug | 0.109–0.120 | 54.5–60% | FAILS |
+| **release** | **0.054** | **27%** | **PASSES** |
+
+The conclusion is not "the debug number was wrong" — it was correct, and it is why this row was worth
+measuring. It is that **an unoptimised build's CPU cost is not the shipped one, and the two differ by
+2.2×.** A row recorded without saying which build produced it would be a row a reader could not use.
+
+**THE GAP IS `opt-level` AND NOTHING ELSE — established so nobody chases it.** A 2.2× difference between
+two builds could have been a debug-only assertion doing real work on the hot path, or a different code
+path compiled in. Three builds, same measurement, medians of 3 runs each, server pinned to 0.200 cores:
+
+| build | core-equivalents | % of 0.2 vCPU |
+| --- | --- | --- |
+| **A** opt-level 0 (plain debug) | 0.134 / 0.141 / 0.137 | **68.5%** |
+| **B** opt-level 3, *no* LTO, default codegen units | 0.062 / 0.064 / 0.067 | **32.0%** |
+| **C** release: opt-level 3 + thin LTO + `codegen-units = 1` | 0.061 / 0.063 / 0.062 | **31.0%** |
+
+**B ≈ C.** Optimisation alone accounts for the whole gap, and the release profile's LTO and
+single-codegen-unit settings buy about **one percentage point** on this path — they are worth having for
+the reasons `Cargo.toml` gives, but they are not what stands between passing and failing this row.
+
+Release figures: **0.2776 CPU-seconds per 1,000 requests**, peak RSS **9.70 MB** (down from 19.53 MB in
+debug), p99 **1.559 ms**.
+
+**The p99 on the release build is ABOVE the 1.5 ms bar (1.559 ms), and I am not treating that as a
+regression.** The two builds' p99 differ by 0.36 ms while the instrument's own floor is ~0.8 ms, so this
+is at the edge of what the round trip can resolve — and the row above is the loadgen figure (1.198 ms)
+from a run whose floor was explicitly verified first. A p99 taken over a round trip without a
+server-side timer cannot settle a 0.36 ms difference; the honest statement is that both builds land
+**near** 1.5 ms and neither is decisively on one side.
+
+**The first row is filled, and here is exactly what it is and is not.**
+
+The run drove `POST /v1/chat/completions` with an unknown `Bearer` key, answered `401` at key lookup — so
+it exercises key validation, the hold and the refusal, with **no upstream, no wallet and no write**. That
+is the path this row is about. 3000 samples, 0 errors, achieved 199.5 of 200 req/s.
+
+**It is a valid reading because the instrument's own floor was measured first, at the same concurrency,
+and landed below the bar: 0.803 ms.** The server's own CPU over the run was 2,506,436 µs against 17 s of
+wall time — 0.147 cores averaged, inside the 0.2 quota, with 2 of 213 periods throttled.
+
+**What it is NOT.** The box is 32 cores, not the deployment shape; the generator shared the host with the
+server, which the section above says not to do — with the server capped to 0.2 cores and the generator
+free, the contention that warning is about is largely avoided, but this is **not** the documented
+two-machine protocol. It is a debug build over loopback. Treat 1.198 ms as a first honest data point for
+this row, not as the deployment's number.
+
+### How 0.2 vCPU was pinned, because the obvious tools cannot
+
+`tools/vcpu-pin/` (a Windows Job Object) **refuses** this value: its granularity is 1% of total, so on 32
+cores the nearest expressible rate is 0.320 cores — 60% over, and the tool declines to substitute rather
+than make every figure optimistic.
+
+**cgroup v2's `cpu.max` expresses it exactly**, on any core count: `20000 100000` **is** 0.20 cores. It
+needs root, and it needs the quota applied to the server's pid. MEASURED against a 3-second spin:
+`usage_usec 622639` = **0.208 cores** with `nr_throttled 31` of 31 periods — the cap bit.
+
+```sh
+mkdir -p /sys/fs/cgroup/loadtest
+echo 20000 100000 > /sys/fs/cgroup/loadtest/cpu.max    # 0.20 cores, exact
+echo $SERVER_PID  > /sys/fs/cgroup/loadtest/cgroup.procs
+```
+
+**One trap:** `echo $$` inside a subshell writes the *parent's* pid, so the process you meant to cap never
+enters the cgroup. It reported `usage_usec 1008` against a 2-second spin, which reads as "capped
+perfectly" and means "nothing was capped". Check `nr_throttled` is non-zero before believing a run.
+
+The two rows below the table remain blank, and the section that follows explains why they are a different
+claim.
+
+**The CPU row is still empty, and it stays empty for the reason below.** This sentence used to say *"the
+two rows above are deliberately empty"* — now false, since the p99 row is filled. It is corrected rather
+than deleted so a reader who saw the earlier version knows which changed.
+
+What the NODE harness has produced is in a different table, because it is a different claim:
+
+**Measured on the DEVELOPMENT host, which is NOT the deployment shape.** Windows 11 Pro, 32 logical
+cores, 61.7 GB RAM, node v22.23.2, release `apikita-server`, loopback, against a migrated scratch
+SQLite. `POST /v1/chat/completions` with a well-formed but unknown Bearer key — refused `401` at key
+lookup, so no upstream, no wallet and no write path. Taken with `tools/loadtest/loadtest.js`; the
+full transcript, the falsification commands and the limits are in
+[`tools/loadtest/README.md`](../tools/loadtest/README.md).
+
+| run | offered | achieved | p99 | server cores | % of 0.2 vCPU |
+| --- | --- | --- | --- | --- | --- |
+| published shape | 200 req/s | 200 req/s | **1.559 ms** | 0.045 | **22.28%** |
+| published shape | 200 req/s | 200 req/s | **1.145 ms** | — | — |
+| saturation | tight | 78,710 req/s | 1.443 ms | 11.681 | 5,840% |
+
+**Do not put those in the table above.** They do not satisfy this page's own rules — the generator
+shared the box with the server, and the server was not pinned to 0.2 vCPU — so they are not evidence
+about the deployment. What they ARE is evidence about the INSTRUMENT, and that is worth recording:
+
+* **A p99 that straddles the bar across runs at identical load is not resolving the bar.** These runs
+  land at 1.145 ms and 1.559 ms against a 1.5 ms target, and the difference between them is the
+  host's loopback client, not the server. The harness now measures its own client-side floor first and
+  **refuses to report a p99 verdict when that floor is at or above the bar** — MEASURED, one Node
+  process reported a p99 of **3.172 ms against a handler doing no work at all**.
+* **The CPU row is a normalisation, not a reading.** It is a percentage, so it needs a denominator,
+  and the only one this document's matrix is coherent against is the `0.2 vCPU` its header names. The
+  harness divides by that, prints which denominator it used, and prints core-equivalents beside it.
+
+So the two rows above remain blank **not** because nothing was measured, but because what was measured
+cannot answer the question they ask. A figure from the wrong box in those cells would be worse than the
+gap — and now there is a tool whose output says which of the two it is.
+
+
+## If the measurement misses the target
+
+That is a **finding**, not a failure of the harness. Record it, then look at where the time goes before
+changing anything — the document's warning and critical columns ($> 5.0$ ms and $> 20$ ms) exist so that
+a miss has a severity rather than just a sign.

@@ -30,14 +30,13 @@
 //! connection (same file, line 185), and it is asserted explicitly below so that a
 //! future non-sqlx connection cannot quietly remove the backstop.
 
-use std::env;
+use apikita_server::bin_prelude;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Resolved at compile time from `CARGO_MANIFEST_DIR`, so the binary does not
 /// depend on the process working directory.
@@ -45,17 +44,9 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    bin_prelude::init_tracing(bin_prelude::TOOL_LOG);
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,apikita_server=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
+    let database_url = bin_prelude::database_url()?;
 
     run(&database_url).await
 }
@@ -273,7 +264,18 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("read the sqlx migrations table");
-        assert_eq!(applied, 20_260_925_000_000, "the fixture migration ran");
+
+        // Derived from the embedded migration list, not hard-coded: a pinned
+        // constant here rotted the moment a second migration was added (the
+        // 20260926000000 redemption-attempts file). Whatever migrations exist,
+        // the database must have applied the newest of them.
+        let expected: i64 = MIGRATOR
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("the migration list is never empty");
+        assert_eq!(applied, expected, "the fixture migration ran");
 
         assert_eq!(
             applied_schema_version(&pool).await,
@@ -307,6 +309,52 @@ mod tests {
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE DIRECTORY-CREATION BRANCH, which nothing drove.
+    ///
+    /// `run` creates the database's parent directory when it is absent (see the comment on that
+    /// branch: "SQLite creates the database file but never its parent directory, and a missing
+    /// directory surfaces only as 'unable to open database file'"). Every other test here uses
+    /// `temp_db_url`, which writes into `std::env::temp_dir()` - a directory that ALWAYS exists - so
+    /// `parent.exists()` was true in all of them and the branch never executed.
+    ///
+    /// MEASURED: deleting the branch entirely, and separately turning its body into a comment, both
+    /// left this binary's suite at 8 passed / 0 failed. That is the one code path between a fresh
+    /// checkout and a working database, and it had no guard at all.
+    ///
+    /// WHY IT MATTERS BEYOND THE FRESH CHECKOUT. `docker compose up` on a clone with no
+    /// `server/data` bind-mounts a source Docker creates SILENTLY, as a root-owned directory (exit 0,
+    /// no warning - measured). The compose comment calls that harmless, and it is for the SCHEDULER,
+    /// which only reads. The host API is the process that must then create the file inside a
+    /// directory it may not own, and this branch is what makes the ordinary case work.
+    #[tokio::test]
+    async fn run_creates_the_database_directory_when_it_is_absent() {
+        // A parent that is guaranteed NOT to exist: a fresh uuid under the temp dir, never created.
+        let parent = std::env::temp_dir().join(format!("apikita-migrate-dir-{}", Uuid::new_v4()));
+        assert!(
+            !parent.exists(),
+            "the probe's parent directory must not exist, or this test proves nothing"
+        );
+        let db_path = parent.join("server.db");
+        let url = format!("sqlite://{}", db_path.to_str().unwrap().replace('\\', "/"));
+
+        run(&url)
+            .await
+            .expect("migrate must create a missing parent directory rather than failing to open");
+
+        assert!(
+            parent.is_dir(),
+            "run() returned Ok but the parent directory was not created, so the next connection \
+             would fail with 'unable to open database file'"
+        );
+        assert!(
+            db_path.exists(),
+            "run() returned Ok but created no database file inside the directory it made"
+        );
+
+        // Clean up the tree the test created, not just the file.
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[tokio::test]

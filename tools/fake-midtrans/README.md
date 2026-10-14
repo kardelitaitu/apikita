@@ -199,7 +199,7 @@ its error message:
 { "error_messages": ["forced failure via the fake Snap server"], "status_code": "500" }
 ```
 
-Use it to prove the handler **persists nothing** when Snap errors: account.rs:511
+Use it to prove the handler **persists nothing** when Snap errors: account.rs:512
 places the Snap call before the `INSERT INTO topups`, so a `?fail=500` run must
 leave no row and return a 500 with no `topup_id`. The query string wins over the
 environment default — but `FAKE_SNAP_FAIL` makes **every** request fail, so a

@@ -8,6 +8,14 @@ procedure.
 termination, which ends the business's supply. Responding late is far more costly
 than responding over-cautiously.
 
+> **Superseded: identity is Rust-owned.** The Phase 6 identity port has landed —
+> `accounts.pb_user_id` is dropped, `POST /auth/exchange` is deleted, the
+> PocketBase HTTP client is gone from `server/`, and identity is served natively
+> by this crate (`accounts` + `identities`, Argon2id). Where the text below still
+> says PocketBase is the current identity provider, this notice governs;
+> [`architecture/identity.md`](architecture/identity.md) is the operative
+> description.
+
 ## What abuse looks like here
 
 Cheap access to capable models attracts specific uses. Expected categories:
@@ -169,7 +177,21 @@ proof of abuse on its own.
 
 **Signal:** failed logins, link-code redemption failures, enumeration attempts.
 
-1. Rate limits should already contain it (login, link-code redemption).
+1. Rate limits should already contain it — **both halves are ours.**
+   Link-code redemption is capped by `limits.link_redemption_per_hour`, enforced in
+   `routes/telegram.rs`, and login is capped by the five `[limits]` keys read and
+   enforced in `server/src/auth_attempts.rs`: `login_per_hour_per_ip` and
+   `login_per_hour_per_account` cover sign-in, and `signup_per_hour_per_ip`,
+   `password_reset_per_hour_per_account` and `verification_resend_per_hour` cover the
+   surrounding auth surface. Nothing in auth is PocketBase's decision any more, and
+   there is no `POST /auth/exchange` to limit.
+   This row used to say login was **NOT** contained — that nothing in
+   `server/src/routes/auth.rs` called a limiter and that any login limit was
+   "configured on the PocketBase side". That was true before the identity port and is
+   false now: the counters live in `auth_attempts`, the Rust server enforces them, and
+   an operator working a credential attack should confirm the cap in
+   `config/apikita.toml` rather than reach for a PocketBase admin UI that no longer has
+   anything to configure.
 2. If it is sustained, block the source at the **edge relay**, not in the backend.
 3. Alert the affected account if there is evidence of a successful attempt.
 
@@ -190,12 +212,15 @@ proof of abuse on its own.
 | Distinct IPs per key | **Built** — `key_ip_daily`, salted daily hash; see [`ip-tracking.md`](ip-tracking.md) |
 | Key creation rate per account | **Enforced** — `limits.key_creation_per_day`, counted from `api_keys` rows |
 | Top-up rate per account | **Enforced** — `limits.topup_per_hour`, counted from `topups` rows |
-| Account suspend/restore | Specified in [`admin-surface.md`](admin-surface.md) — **endpoints not yet built** |
-| Incident log | **Not specified** |
+| Account suspend/restore | **Built** — `POST /api/admin/accounts/:id/suspend`, `/restore` (alias `/resume`). Revokes sessions and keys in one transaction, with an audit row. See [`admin-surface.md`](admin-surface.md) §Non-money actions |
+| Incident log | **Built** — the suspend/restore action trail (`admin_audit`) is readable per account and across accounts via `GET /api/admin/accounts/:id/audit` and `GET /api/admin/audit` |
 
-**The admin path is a real gap.** Suspending an account is a required capability with
-no specified endpoint. Options: PocketBase admin UI (manual, no audit trail) or a
-internal API endpoint (auditable, needs building).
+**The admin path is no longer a gap.** It was: suspending an account is a required
+capability, and at the time this table was written it had no endpoint at all. It now
+has one — auditable, in a single transaction, refusing self-action — so an operator
+responding to a live incident should use the operator console at `/admin` rather than
+any external admin UI. See [`admin-surface.md`](admin-surface.md). There is no
+PocketBase admin UI to reach for: that service does not exist.
 
 ## Open items
 
@@ -204,5 +229,25 @@ internal API endpoint (auditable, needs building).
 - [ ] Thresholds for behavioural abuse signals — **starting values exist** in
       [`ip-tracking.md`](ip-tracking.md) §Abuse signals; they need tuning against real
       traffic before they are trusted.
-- [ ] An abuse-report contact, published in the terms.
+- [ ] An abuse-report contact, published in the terms. **Two halves, both still open.**
+      There is no mailbox (no `abuse@` anywhere in the tree — checked) and no published
+      channel: [`terms-of-service.md`](terms-of-service.md) §10 "Contact and complaints"
+      is now written as a **clause** — 10.1 to 10.8, with its response times taken from
+      this document's own severity table — but every contact detail in it is a
+      **placeholder token** (`[[ABUSE_EMAIL]]`, `[[OWNER_LEGAL_NAME]]`), and that document
+      contains no address, URL or named form at all. §10 says so explicitly rather than
+      reading as a finished clause. Writing a plausible address would be worse than the gap —
+      the Terms would promise a channel nobody monitors, which is the exact failure the
+      doc's own warning about "a policy claiming something the code does not do" names.
+      **Neither half is code**, so this cannot be closed from this repository.
+      > **What changed here, and why the item did not.** This said "§10 is a requirements
+      > list, not a clause" — true then, false once §10 became one. The half of the gate
+      > that MOVED is the wording; the half that did not is whether a monitored mailbox
+      > exists, which is still no. A gate whose description is corrected must not read as a
+      > gate that closed, so the item stays unticked and this note is what says so.
+      > **Three places describe this one gate and move together:** this item,
+      > [`launch-checklist.md`](launch-checklist.md)'s "Publish the Terms of Service", and
+      > §10's own "Before publishing this section" checklist. The first two were corrected
+      > in the same change that rewrote §10; correcting one and not the others leaves a
+      > reader holding two live descriptions of one gate.
 - [ ] Whether abuse detection warrants a limited-retention prompt sampling policy.

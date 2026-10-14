@@ -23,6 +23,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import { ApiError, apiFetch } from '../src/lib/api.ts';
 import { describeError, fieldInput, inlineNotice, renderFieldError, renderNotice } from '../src/lib/errors.ts';
@@ -281,4 +282,116 @@ test('the login renderer focuses the input a server-named field points at', asyn
   assert.equal(box.textContent, 'Invalid value for "email".');
   assert.equal(email.focusCount, 1);
   assert.equal(password.focusCount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// THE CASE SET, which the table above cannot see.
+//
+// Every test above drives a code I TYPED, through the real mapper, and asserts
+// what comes out. That is the right test for the mapping of a code. It is not a
+// test that the mapper HAS a case for every code the server can send: a code
+// added to `AppError` and to docs/error-model.md, with no `case` in
+// `describeError`, falls into `default` and renders the generic "Something was
+// wrong with that request." to a user who just hit, say, a spend limit. Every
+// assertion above stays green, because none of them asks about the code that is
+// missing.
+//
+// docs/error-model.md's own reasoning is the argument: "a dashboard that only
+// handles five of them shows a raw error or a blank screen for the rest." Five
+// against fifteen, or fourteen against fifteen, is the same failure with a
+// smaller number. And it is the direction a hand-kept list fails silently in,
+// which is the lesson docs/error-model.md records about the retention tables and
+// this file records about its own DOCUMENTED copy.
+//
+// So the case set is read out of the real source and compared, as a SET, to the
+// real document. Both sides are parsed rather than transcribed - the point is to
+// compare the two artifacts, not a third copy of them.
+
+/** The `case 'x':` labels in `describeError`, from the real source. */
+function mappedCodes(): string[] {
+  const src = readFileSync(new URL('../src/lib/errors.ts', import.meta.url), 'utf8');
+  const start = src.indexOf('export function describeError');
+  assert.ok(start > -1, 'describeError must exist, or this reads a file that is not the mapper');
+  // To the end of the function: the next top-level `\n}` after the switch. The
+  // switch is the last statement, so the closing brace at column 0 ends it.
+  const end = src.indexOf('\n}', start);
+  const body = src.slice(start, end > -1 ? end : src.length);
+  return [...body.matchAll(/^\s*case '([a-z_]+)':/gm)].map((m) => m[1]);
+}
+
+/** The codes in the published status table, which is the contract. */
+function publishedCodes(): string[] {
+  const doc = readFileSync(new URL('../../docs/error-model.md', import.meta.url), 'utf8');
+  const start = doc.indexOf('## Status codes and their meanings');
+  assert.ok(start > -1, 'the Status codes section is the contract and must be findable');
+  const section = doc.slice(start);
+  const next = section.indexOf('\n## ', 2);
+  const table = next > -1 ? section.slice(0, next) : section;
+
+  const codes: string[] = [];
+  for (const line of table.split('\n')) {
+    const cells = line.split('|').map((c) => c.trim());
+    // cells[0] is the empty run before the leading pipe.
+    if (cells.length < 4) continue;
+    if (!/^\d{3}$/.test(cells[1])) continue;
+    const code = cells[2].replaceAll('`', '').trim();
+    if (code) codes.push(code);
+  }
+  return codes;
+}
+
+test('every code the contract publishes has a case in the mapper', () => {
+  const published = publishedCodes();
+  const mapped = mappedCodes();
+
+  // Vacuity, both directions: an unparsable document or a renamed function would
+  // otherwise compare two empty sets and pass.
+  assert.ok(
+    published.length >= 10,
+    `only ${published.length} code(s) parsed out of the published status table, so this is not a comparison`,
+  );
+  assert.ok(
+    mapped.length >= 10,
+    `only ${mapped.length} case label(s) parsed out of describeError, so this is not a comparison`,
+  );
+
+  const missing = published.filter((c) => !mapped.includes(c));
+  assert.deepEqual(
+    missing,
+    [],
+    `describeError has no case for ${missing.join(', ')}. A code the server can send with no case here falls into \`default\` and renders "Something was wrong with that request." - a generic message for a specific, actionable failure. Every case in this file's table is driven by a code typed into the test, so none of them notices a code that is missing.`,
+  );
+
+  // And the reverse, which is the other half of "as a SET": a case for a code the
+  // contract does not publish means the mapper knows something the contract does
+  // not, and a client coding against the document has no row for what they see.
+  const extra = mapped.filter((c) => !published.includes(c));
+  assert.deepEqual(
+    extra,
+    [],
+    `describeError maps ${extra.join(', ')}, which docs/error-model.md does not publish as a status code. Either the code needs a row - a client coding against the document has nothing to match on - or it is reserved and should say so, as wrong_credential_type does.`,
+  );
+});
+
+test('the reserved code is mapped, and the document says it is reserved', () => {
+  // This is the one row where "publish it" and "the server emits it" genuinely
+  // differ, and the difference is deliberate: docs/error-model.md marks
+  // `wrong_credential_type` "Reserved, never emitted - a cookie on /v1/*, or a key
+  // on a cookie endpoint, returns 401 unauthenticated". The mapper keeps a case
+  // for it anyway. Both halves of that decision are asserted, because either one
+  // changing alone is the drift this file exists to catch: dropping the case makes
+  // a reserved code render generically if it ever IS emitted, and dropping the
+  // "Reserved" note turns a deliberate non-emission into a bug report.
+  const doc = readFileSync(new URL('../../docs/error-model.md', import.meta.url), 'utf8');
+  const row = doc.split('\n').find((l) => l.includes('`wrong_credential_type`'));
+  assert.ok(row, 'the reserved code must have a row in the published table');
+  assert.match(
+    row,
+    /Reserved, never emitted/,
+    'the row for wrong_credential_type must still say it is reserved and never emitted; without it a reader finds a documented code the server never sends and files it as a bug',
+  );
+  assert.ok(
+    mappedCodes().includes('wrong_credential_type'),
+    'the mapper must keep a case for the reserved code, so that IF it is ever emitted it renders as a deliberate unexpected-credential-type message rather than the generic one',
+  );
 });

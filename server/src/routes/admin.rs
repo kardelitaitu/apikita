@@ -13,7 +13,8 @@
 //!   the one session-cookie parser and resolver - never a query parameter, never
 //!   a header, never a separate admin credential (docs/server/api-spec.md:421);
 //! - revocation reuses the same predicate logout_all uses for sessions
-//!   (auth.rs:309) - `revoked_at IS NULL` - and stamps the keys the way
+//!   (the session-revocation statement in `auth::logout_all`) - `revoked_at IS NULL` - and
+//!   stamps the keys the way
 //!   revoke_key does;
 //! - a revoked key is evicted from the proxy's process-wide metadata cache with
 //!   proxy::invalidate_key_cache, exactly as revoke_key does - without it a
@@ -26,14 +27,38 @@
 //! Rollout is read-only + suspend/restore (docs/admin-surface.md:179-185); the
 //! money actions are deliberately absent.
 
+// -----------------------------------------------------------------------
+// An operator surface that ARITHMETIC cannot quietly get wrong.
+// -----------------------------------------------------------------------
+#![cfg_attr(
+    not(test),
+    // Fenced like the money modules, and for the same structural reason: this file's
+    // own header says it is 'deliberately built from the SAME pieces the customer
+    // surface uses, so there is no second code path to drift'. That claim is about
+    // behaviour, and a lint makes it structural instead - a limit computed here
+    // would have to be written again, and the fence refuses it.
+    //
+    // NOT because an operator types money into this surface. They cannot: the
+    // header is explicit that the money actions are deliberately absent, and this
+    // module is a read-only lookup plus suspend and resume. An earlier version of
+    // this comment justified the fence by an operator-entered balance adjustment,
+    // which is a feature this file does not have - the same overstatement this
+    // repository keeps having to correct, written here by the same hand.
+    //
+    // What the fence actually costs: nothing. Measured before adding it, ZERO
+    // arithmetic_side_effects sites outside this module's tests. The counts and
+    // limits it reports are all read or computed in db.rs.
+    deny(clippy::arithmetic_side_effects)
+)]
+
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
@@ -45,6 +70,19 @@ use crate::routes::resolve_account_from_cookie;
 /// admin_audit.action values written by this module.
 const ACTION_SUSPEND: &str = "suspend";
 const ACTION_RESUME: &str = "resume";
+/// The one action in this module that MOVES MONEY. Its own constant rather than reusing a
+/// neighbouring string, because the audit trail is read by someone asking "did an operator
+/// ever touch a balance" and a value that shares a prefix with a status change is the wrong
+/// thing to search for.
+const ACTION_ADJUST: &str = "adjust";
+/// The minimum length of an adjustment note, in characters.
+///
+/// `docs/admin-surface.md` rule 3 is "an unexplained adjustment is indistinguishable from theft
+/// during an audit", and a note of "." satisfies the LETTER of a non-empty check while failing
+/// the rule. Twelve characters is not a security boundary - it is the point below which a note
+/// cannot name a reason ("recon fix" is 9 and is a reason; "x" is not). The rule is asserted by a
+/// test rather than trusted to a reviewer.
+const MIN_ADJUSTMENT_NOTE_CHARS: usize = 12;
 
 /// admin_audit.target_type for every action here.
 const TARGET_TYPE_ACCOUNT: &str = "account";
@@ -57,16 +95,17 @@ const TARGET_TYPE_ACCOUNT: &str = "account";
 ///
 /// The two variants exist because the crate's AppError has no 403 that is honest
 /// here: ModelNotAllowed is about a model allowlist and WrongCredentialType is
-/// documented as RESERVED AND NEVER EMITTED (docs/error-model.md:44, :67-71), so
+/// documented as RESERVED AND NEVER EMITTED (docs/error-model.md, Status codes,
+/// wrong_credential_type row), so
 /// emitting either would make a documented promise false. Forbidden therefore
 /// renders the crate's own error envelope (the same ApiErrorResponse /
 /// ApiErrorBody structs AppError serialises) with the new stable code
-/// "forbidden" - which docs/error-model.md:186 rule 4 permits ("code values are
+/// "forbidden" - which docs/error-model.md, rule 4 rule 4 permits ("
 /// permanent. Adding is fine; changing meaning is not").
 ///
 /// The status is 403 and not 401/404 on purpose. The caller IS authenticated:
 /// the cookie resolved to a real account, we know exactly who they are, and they
-/// may not do this (docs/error-model.md:52-59, the 401-vs-403 table). A 404
+/// may not do this (docs/error-model.md, 401 vs 403). A 404
 /// would be a lie about a resource the operator surface exists to administer,
 /// and a 401 would tell an operator with a perfectly good session to re-login
 /// for a permissions problem.
@@ -88,7 +127,8 @@ impl From<AppError> for AdminError {
 }
 
 /// A raw sqlx failure on the request path is an AppError::Database, exactly as
-/// it is everywhere else in the crate (error.rs:84). Without this, every
+/// it is everywhere else in the crate (the `AppError::Database` variant in
+/// `error.rs`). Without this, every
 /// question-mark on a query inside this module would have to be spelled
 /// map_err(AppError::from) by hand.
 impl From<sqlx::Error> for AdminError {
@@ -141,7 +181,15 @@ fn forbidden_response(message: &str) -> Response {
 /// ids. An operator - already trusted with every account - gets an honest 404
 /// for an absent target, because hiding it from them would only make the surface
 /// harder to use.
-async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Uuid, AdminError> {
+///
+/// `pub(crate)` so the ops metrics route (`routes/health.rs`) can reuse it rather
+/// than re-implementing the check. Duplicating the guard would let the two copies
+/// drift, and the whole point of this function is that the ORDER of the checks is
+/// defined once.
+pub(crate) async fn require_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Uuid, AdminError> {
     let actor = resolve_account_from_cookie(&state.pool, headers).await?;
 
     let is_operator: Option<bool> =
@@ -156,6 +204,20 @@ async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Uuid,
         // A live session whose account row is gone cannot be authorised: the FK
         // makes this unreachable, and if it ever is reached the safe answer is
         // the same 401 a dead session gets.
+        //
+        // MEASURED, not assumed: changing this arm to `Ok(actor)` - authorising a session whose
+        // account row is gone - survives the ENTIRE suite at 681 passed / 0 failed. That is the
+        // correct outcome rather than a missing test, and the reason is worth stating so nobody
+        // "fixes" it by adding a fixture that cannot exist:
+        //
+        //   `sessions.account_id` is `TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE`
+        //   (migrations/20260925000000_initial_schema.sql:90), and `db::init_pool` sets
+        //   `foreign_keys(true)` on every connection - sqlx's SQLite default, but set explicitly
+        //   because with it off every CASCADE in the schema is silently inert. So the row this
+        //   query reads cannot outlive its account, and `None` is unreachable by construction.
+        //
+        // A test for it would have to disable foreign keys to seed the state, which would make the
+        // guard look load-bearing while proving only that the fixture had broken the schema.
         None => Err(AdminError::App(AppError::Unauthenticated)),
     }
 }
@@ -205,6 +267,154 @@ pub struct AdminActionResult {
     pub keys_revoked: i64,
 }
 
+/// The body of an adjustment request.
+///
+/// THREE FIELDS, AND `reason` IS NOT THE LEDGER'S `reason` COLUMN. The column is fixed at
+/// `'adjustment'` - that is the whole point of the enum value - so a caller cannot choose
+/// it. The field here is the operator's own category ("reconciliation fix", "goodwill"),
+/// and it is folded into the note so the ledger's `ref` carries both parts.
+#[derive(Debug, Deserialize)]
+pub struct AdjustRequest {
+    pub delta_idr: i64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// The outcome of an adjustment.
+#[derive(Debug, Serialize)]
+pub struct AdjustResult {
+    pub account_id: Uuid,
+    pub delta_idr: i64,
+    pub balance_before_idr: i64,
+    pub balance_after_idr: i64,
+}
+
+/// POST /api/admin/accounts/{id}/adjust - THE ONLY MONEY-MOVING ADMIN ACTION.
+///
+/// `docs/admin-surface.md` specifies four rules and each is enforced at a DIFFERENT layer,
+/// which is worth naming because a reader checking them all in the handler would find only
+/// one:
+///
+///   1. "Writes a ledger row with reason='adjustment'" - `db::adjust_balance_transaction`.
+///   2. "Atomic with the wallet update" - the same transaction, `begin_immediate`.
+///   3. "Requires a note" - HERE, as a floor on length, because a non-empty check accepts
+///      "x" and the rule is about being able to tell what happened.
+///   4. "Logged with the operator's account id" - HERE, in `admin_audit`.
+///
+/// THE SELF-ACTION REFUSAL APPLIES, and it is the strongest form of it in this module. Every
+/// other admin route refuses a self-action to keep one rule with no exception; this one refuses
+/// it because an operator crediting their own wallet is the exact action the rule exists to
+/// prevent. `refuse_self_action` is reused rather than restated, so the two cannot drift into
+/// disagreeing about what "self" means.
+///
+/// BOTH SIGNS ARE ALLOWED, and the asymmetry is in the STORAGE layer rather than here: a
+/// negative delta on a wallet that cannot cover it is refused with the balance in the message
+/// (see `AdjustOutcome::Insufficient`), never clamped.
+pub async fn adjust_account(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<AdjustRequest>,
+) -> Result<Response, AdminError> {
+    let operator_id = require_operator(&state, &headers).await?;
+    refuse_self_action(operator_id, id)?;
+
+    // RULE 3, and the floor is on the COMBINED text: a reason alone ("goodwill") is a
+    // category, and a note alone may be "see ticket 1234". Either can carry the explanation,
+    // so requiring each separately would refuse a legitimate request that named its cause
+    // once. What is refused is having said nothing.
+    let explanation = match (body.reason.trim(), body.note.trim()) {
+        ("", note) => note.to_string(),
+        (reason, "") => reason.to_string(),
+        (reason, note) => format!("{reason}: {note}"),
+    };
+    if explanation.chars().count() < MIN_ADJUSTMENT_NOTE_CHARS {
+        return Err(AppError::ValidationFailed {
+            message: format!(
+                "an adjustment must carry an explanation that names its cause, and {} characters is too short to do that - got {:?}. An unexplained adjustment is indistinguishable from theft during an audit",
+                MIN_ADJUSTMENT_NOTE_CHARS,
+                explanation
+            ),
+            field: "note".to_string(),
+        }
+        .into());
+    }
+
+    // ZERO IS REFUSED BEFORE THE TRANSACTION, because it writes a ledger row that moves
+    // nothing - which an audit cannot tell from a real action whose delta was mistyped.
+    if body.delta_idr == 0 {
+        return Err(AppError::ValidationFailed {
+            message: "delta_idr must not be zero: a zero adjustment writes a ledger row that \
+                      moves no money, which an audit cannot tell from a mistyped amount"
+                .to_string(),
+            field: "delta_idr".to_string(),
+        }
+        .into());
+    }
+
+    let before = crate::db::read_wallet_balance(&state.pool, id).await?;
+
+    let outcome =
+        crate::db::adjust_balance_transaction(&state.pool, id, body.delta_idr, &explanation)
+            .await?;
+
+    let new_balance = match outcome {
+        crate::db::AdjustOutcome::Applied { new_balance } => new_balance,
+        crate::db::AdjustOutcome::NoWallet => {
+            return Err(AppError::NotFound("Account has no wallet to adjust.".into()).into());
+        }
+        crate::db::AdjustOutcome::Insufficient { balance_idr } => {
+            // THE FIGURES ARE IN THE MESSAGE, because the operator's next action depends on
+            // them: 4,000 against a 1,000 wallet is a typo to correct, while 1,000,000
+            // against 400,000 is a decision to reconsider. A bare "insufficient balance"
+            // sends them back to look it up.
+            return Err(AppError::ValidationFailed {
+                message: format!(
+                    "cannot debit {} from a balance of {}: an adjustment that exceeds the \
+                     balance is refused rather than clamped, because nothing has been consumed \
+                     yet - this is an arithmetic mistake, and taking what is there would confirm \
+                     an action nobody asked for",
+                    body.delta_idr.unsigned_abs(),
+                    balance_idr
+                ),
+                field: "delta_idr".to_string(),
+            }
+            .into());
+        }
+    };
+
+    // RULE 4: THE OPERATOR IS RECORDED, and `balance_before_idr` with the delta is what makes
+    // the entry auditable without a join - a reader can reproduce the arithmetic from the row.
+    let detail = json!({
+        "delta_idr": body.delta_idr,
+        "balance_before_idr": before,
+        "balance_after_idr": new_balance,
+        "note": explanation,
+    });
+    sqlx::query(
+        "INSERT INTO admin_audit
+             (operator_id, action, target_type, target_id, detail, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(operator_id.hyphenated())
+    .bind(ACTION_ADJUST)
+    .bind(TARGET_TYPE_ACCOUNT)
+    .bind(id.to_string())
+    .bind(&detail)
+    .bind(Utc::now())
+    .execute(&state.pool)
+    .await?;
+
+    Ok(Json(AdjustResult {
+        account_id: id,
+        delta_idr: body.delta_idr,
+        balance_before_idr: before,
+        balance_after_idr: new_balance,
+    })
+    .into_response())
+}
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -265,6 +475,315 @@ pub async fn get_account(
     .into_response())
 }
 
+/// Query parameters for `GET /api/admin/accounts`.
+///
+/// Deliberately raw strings rather than a typed int: a malformed value must
+/// produce a JSON 422 naming the field, not axum's plain-text extractor
+/// rejection (docs/error-model.md requires every response to be JSON), which is
+/// the same reasoning `account.rs`'s UsageQuery documents.
+#[derive(Debug, Deserialize)]
+pub struct AdminListQuery {
+    /// Free-text filter, matched case-insensitively against the account id.
+    ///
+    /// The id is now the only handle a support operator has here, which is a real
+    /// regression against the PocketBase era - a record id was at least
+    /// recognisable to whoever had the PocketBase admin open. The honest fix is to
+    /// join `identities` and search the addresses, and it belongs in its own
+    /// change: it widens what an operator can enumerate from the account id space
+    /// to the address space, which is a privacy decision (docs/website) rather
+    /// than a query rewrite. Until then this filter does not silently pretend to
+    /// match an address by looking at a column that no longer exists.
+    pub q: Option<String>,
+    /// Optional status filter. A value outside the schema's vocabulary simply
+    /// matches nothing rather than erroring: a filter with no rows is a normal
+    /// outcome, not a bad request.
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// The listing row. Carries the same counts as the single-account view and
+/// NOTHING that could read a credential - no token, no key hash, no email
+/// (docs/admin-surface.md:158-166).
+#[derive(Debug, Serialize)]
+pub struct AdminAccountSummary {
+    pub account_id: Uuid,
+    pub status: String,
+    pub is_operator: bool,
+    pub created_at: DateTime<Utc>,
+    pub balance_idr: i64,
+    pub live_sessions: i64,
+    pub live_keys: i64,
+}
+
+/// `GET /api/admin/accounts` - a bounded, filterable account listing.
+///
+/// Why this exists: the single-account route requires the caller to already know
+/// a UUID, so an operator had no way to FIND an account. That made the console
+/// usable only for accounts whose id had been captured elsewhere, which is not
+/// what "administer accounts" means. This is the index that lookup-by-id assumes.
+///
+/// Safety, in the same order as every sibling handler:
+///
+/// 1. `require_operator` runs FIRST, before any row is read, so a non-operator
+///    gets a 403 that reveals nothing about whether any account exists.
+/// 2. `refuse_self_action` deliberately does NOT apply. Reading a LIST is not
+///    acting on one account, and the operator's own row is legitimately one row
+///    among many - excluding it would make the total count out by one and hide
+///    the operator from their own inventory. The self-action rule protects
+///    against ACTING on oneself; there is no action here.
+/// 3. Only then does the query run, bounded by `limit` so a large table cannot
+///    be pulled in one request.
+pub async fn list_accounts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminListQuery>,
+) -> Result<Response, AdminError> {
+    // Step 1: authorize before touching the account space, like every sibling.
+    require_operator(&state, &headers).await?;
+
+    let limit = query.limit.unwrap_or(25).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0).max(0);
+
+    // An absent or empty filter is "no filter". A non-empty one becomes a LIKE
+    // pattern; '%' and '_' are escaped with an explicit ESCAPE clause so a
+    // literal percent sign in the input does not silently become a wildcard.
+    let needle = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let pattern = needle.map(|s| {
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("%{escaped}%")
+    });
+    let status = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // Every placeholder is positional and bound in order. The two NULL tests let
+    // one statement serve the filtered and unfiltered cases, so there is no
+    // second query to drift from this one.
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            a.id,
+            a.status,
+            a.is_operator,
+            a.created_at,
+            COALESCE(w.balance_idr, 0) AS balance_idr,
+            (SELECT COUNT(*) FROM sessions s
+              WHERE s.account_id = a.id AND s.revoked_at IS NULL AND s.expires_at > ?)
+                AS live_sessions,
+            (SELECT COUNT(*) FROM api_keys k
+              WHERE k.account_id = a.id AND k.revoked_at IS NULL)
+                AS live_keys
+        FROM accounts a
+        LEFT JOIN wallets w ON w.account_id = a.id
+        WHERE (? IS NULL OR a.id LIKE ? ESCAPE '\')
+          AND (? IS NULL OR a.status = ?)
+        ORDER BY a.created_at DESC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    // The session-expiry bound is BOUND FROM RUST, never SQLite's now(): its
+    // space-separated output sorts before the RFC3339 values every timestamp
+    // column holds, so a SQL now() here would count expired sessions as live.
+    .bind(Utc::now())
+    .bind(pattern.as_deref())
+    .bind(pattern.as_deref())
+    .bind(status)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut accounts: Vec<AdminAccountSummary> = Vec::with_capacity(rows.len());
+    for row in rows {
+        // id is TEXT in the schema; decode it the way the rest of the crate does.
+        let id_raw: String = row.try_get("id")?;
+        let account_id = Uuid::parse_str(&id_raw).map_err(|e| {
+            AdminError::App(AppError::Internal(format!(
+                "accounts.id is not a uuid: {e}"
+            )))
+        })?;
+        accounts.push(AdminAccountSummary {
+            account_id,
+            status: row.try_get("status")?,
+            is_operator: row.try_get("is_operator")?,
+            created_at: row.try_get("created_at")?,
+            balance_idr: row.try_get("balance_idr")?,
+            live_sessions: row.try_get("live_sessions")?,
+            live_keys: row.try_get("live_keys")?,
+        });
+    }
+
+    Ok(Json(json!({
+        "accounts": accounts,
+        "limit": limit,
+        "offset": offset,
+    }))
+    .into_response())
+}
+
+/// Query parameters for the global recent-actions read.
+#[derive(Debug, Deserialize)]
+pub struct AdminRecentAuditQuery {
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/admin/audit` - the most recent operator actions across ALL accounts.
+///
+/// The per-account trail answers "what happened to THIS account". This answers
+/// the other question an operator asks: "what has been happening at all" - the
+/// overview that catches an action taken on the wrong account, or a burst of
+/// suspensions during an incident, without already knowing which account to look
+/// at. It is the same table, read newest-first without a target filter.
+///
+/// Served by `admin_audit_recent_idx (created_at DESC, id DESC)` (migration
+/// 20260927000000), so the ordered read is index-served rather than a sort per
+/// load. The index is small and grows with actions, not with traffic.
+///
+/// Safety: `require_operator` first, before any row is read. No target filter
+/// means `refuse_self_action` cannot apply - there is no single target - and the
+/// operator's OWN past actions are legitimately part of the global history, so
+/// they appear here (this is a LIST of actions, not an action on one account).
+pub async fn list_recent_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminRecentAuditQuery>,
+) -> Result<Response, AdminError> {
+    require_operator(&state, &headers).await?;
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, operator_id, action, target_type, target_id, detail, created_at
+        FROM admin_audit
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut entries: Vec<AdminAuditEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let operator_raw: String = row.try_get("operator_id")?;
+        let operator_uuid = Uuid::parse_str(&operator_raw).map_err(|e| {
+            AdminError::App(AppError::Internal(format!(
+                "admin_audit.operator_id is not a uuid: {e}"
+            )))
+        })?;
+        entries.push(AdminAuditEntry {
+            id: row.try_get("id")?,
+            operator_id: operator_uuid,
+            action: row.try_get("action")?,
+            target_type: row.try_get("target_type")?,
+            target_id: row.try_get("target_id")?,
+            detail: row.try_get("detail")?,
+            created_at: row.try_get("created_at")?,
+        });
+    }
+
+    Ok(Json(json!({ "entries": entries, "limit": limit })).into_response())
+}
+
+/// Query parameters for the audit read. A single optional limit, kept local
+/// rather than shared with `account.rs`'s LimitQuery, which is that module's
+/// own type.
+#[derive(Debug, Deserialize)]
+pub struct AdminAuditQuery {
+    pub limit: Option<i64>,
+}
+
+/// The audit row the operator surface reveals. Never a credential; `detail` is
+/// whatever the action recorded (counts, prior status), and is free-form text the
+/// handlers wrote.
+#[derive(Debug, Serialize)]
+pub struct AdminAuditEntry {
+    pub id: i64,
+    pub operator_id: Uuid,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// `GET /api/admin/accounts/{id}/audit` - what operators have done to an account.
+///
+/// Why this exists: every admin action writes an `admin_audit` row
+/// (docs/admin-surface.md, Audit trail section), but **nothing read them back**, so the
+/// trail the doc calls "the audit trail that makes disputes resolvable" was invisible
+/// to the very operator meant to consult it. This is the read side of a table that
+/// was write-only.
+///
+/// Safety, same order as every sibling:
+///
+/// 1. `require_operator` runs first, before any row is read.
+/// 2. `refuse_self_action`: an operator may not read the audit of their **own**
+///    account through the admin surface. This is the same rule the read-only
+///    `get_account` enforces, and it matters more here: the trail names the
+///    OPERATOR on each row, so reading one's own would expose the audit of
+///    actions taken against oneself - which the self-action rule exists to keep
+///    out of this surface. An operator can still see their own account at
+///    `GET /api/me`.
+/// 3. Only then the query, newest first, bounded.
+pub async fn get_account_audit(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Query(query): Query<AdminAuditQuery>,
+) -> Result<Response, AdminError> {
+    let operator_id = require_operator(&state, &headers).await?;
+    refuse_self_action(operator_id, id)?;
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    // The index `admin_audit_target_idx (target_type, target_id)` serves the
+    // WHERE; the ORDER BY is a small sort over one account's rows.
+    let rows = sqlx::query(
+        r#"
+        SELECT id, operator_id, action, target_type, target_id, detail, created_at
+        FROM admin_audit
+        WHERE target_type = ? AND target_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(TARGET_TYPE_ACCOUNT)
+    .bind(id.hyphenated())
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut entries: Vec<AdminAuditEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let operator_raw: String = row.try_get("operator_id")?;
+        let operator_uuid = Uuid::parse_str(&operator_raw).map_err(|e| {
+            AdminError::App(AppError::Internal(format!(
+                "admin_audit.operator_id is not a uuid: {e}"
+            )))
+        })?;
+        entries.push(AdminAuditEntry {
+            id: row.try_get("id")?,
+            operator_id: operator_uuid,
+            action: row.try_get("action")?,
+            target_type: row.try_get("target_type")?,
+            target_id: row.try_get("target_id")?,
+            detail: row.try_get("detail")?,
+            created_at: row.try_get("created_at")?,
+        });
+    }
+
+    Ok(Json(json!({ "entries": entries, "limit": limit })).into_response())
+}
+
 /// POST /api/admin/accounts/{id}/suspend - the security-critical action.
 ///
 /// ONE transaction does all three things, and the audit row is written inside it
@@ -283,7 +802,8 @@ pub async fn get_account(
 /// Only an 'active' account can be suspended. Anything else (already suspended,
 /// or closed) is a 409 and writes NO audit row: there is nothing to do, and a
 /// non-active account cannot acquire new credentials in the meantime - the login
-/// path refuses a non-active account outright (auth.rs:204), so it cannot mint a
+/// path refuses a non-active account outright (`auth::login`'s `status != "active"`
+/// check), so it cannot mint a
 /// session, and the only way to mint a key is with one.
 ///
 /// The cache eviction is deliberately AFTER the commit: evicting before it would
@@ -321,6 +841,27 @@ pub async fn suspend_account(
         .into());
     }
 
+    // TWO ASSIGNMENTS, AND TWO DIFFERENT GUARDS - worth distinguishing, because only one of them
+    // survives deleting the test suite.
+    //
+    // `docs/testing.md`'s sweep table says of this statement and `resume_account`'s: "MEASURED:
+    // dropping either assignment breaks the query's bind count". That is true - deleting
+    // `updated_at = ?` leaves one placeholder against two `.bind()` calls, and 6 admin tests fail.
+    //
+    // But the bind count is the WEAKER guard, and it is a property of the TESTS. MEASURED separately:
+    // keeping both placeholders and both binds while aiming `updated_at` at the account id instead of
+    // an instant fails 10 admin tests - and it fails at the SCHEMA, as a 500 out of the handler, not
+    // at an assertion. `accounts.updated_at` carries
+    // `CHECK (updated_at GLOB '????-??-??T??:??:??*+00:00')`
+    // (migrations/20260925000000_initial_schema.sql:30), so a value that is not an RFC3339 instant is
+    // refused by SQLite itself and the whole UPDATE - including `status = 'suspended'` - never lands.
+    //
+    // WHY THE DISTINCTION MATTERS: the bind-count mistake is a coding error a test catches; the format
+    // mistake is a DATA error the schema catches, in production, for a caller whose tests never ran.
+    // It is why `Utc::now()` is bound rather than anything string-shaped that merely looks like a
+    // timestamp - `2026-01-01 12:00:00`, and `2026-01-01T12:00:00` without an offset, are both
+    // rejected by that GLOB, and the failure surfaces as an opaque 500 rather than as a suspension
+    // that never happened.
     sqlx::query("UPDATE accounts SET status = 'suspended', updated_at = ? WHERE id = ?")
         .bind(Utc::now())
         .bind(id.hyphenated())
@@ -488,6 +1029,7 @@ pub async fn resume_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ledger_drift_rows;
 
     use std::sync::Arc;
 
@@ -496,15 +1038,27 @@ mod tests {
     use axum::Router;
     use tower::ServiceExt;
 
-    use crate::config::AppConfig;
     use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
-    use crate::routes::auth::{exchange_token, AuthExchangeRequest};
     use crate::routes::events::RealtimeHub;
     use crate::routes::hash_token;
     use crate::routes::keys::{create_key, CreateKeyRequest};
-    use crate::test_support::{self, TestDb};
+    use crate::test_support::{self, shipped_config, TestDb};
     use serde_json::Value;
     use sqlx::SqlitePool;
+
+    // -----------------------------------------------------------------------
+    // The loopback PocketBase stub that used to live here is DELETED with the
+    // service it stood in for. It existed to drive `exchange_token` against a
+    // real `verify_pb_token` without a live PocketBase, and both of those are
+    // gone from this crate: identity is a local row now. Keeping the stub would
+    // leave a fixture that starts a listener nothing dials - a test-shaped
+    // object describing a program that is not running.
+    //
+    // The login-after-suspend test it served is now stronger for it: it signs in
+    // through the native `login` handler with a real Argon2id hash, so it needs
+    // no external service at all. It was THE LAST `#[ignore]` in the crate and
+    // it now runs by construction rather than by stubbing.
+    // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
     // Fixtures. Same style as keys.rs/account.rs: a real, migrated database, the
@@ -513,19 +1067,13 @@ mod tests {
     // the suite runs with no live server and no row-by-row teardown.
     // -----------------------------------------------------------------------
 
-    fn live_config() -> Arc<AppConfig> {
-        for path in ["../config/apikita.toml", "config/apikita.toml"] {
-            if std::path::Path::new(path).exists() {
-                return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
-            }
-        }
-        panic!("could not find apikita.toml for testing");
-    }
+    // The shipped config now lives in `crate::test_support::shipped_config`; the callers
+    // below reached for a live config through this local copy for five modules.
 
     /// The real application state, built the way main.rs builds it, so the
     /// handler evicts from the same process-wide key cache the proxy reads.
     fn test_state(pool: SqlitePool) -> AppState {
-        let config = live_config();
+        let config = shipped_config();
         let events = Arc::new(RealtimeHub::new(&config.realtime));
         let trusted_proxies: Arc<[IpCidr]> = Arc::from(
             parse_cidrs(&config.network.trusted_proxy_cidrs)
@@ -539,6 +1087,7 @@ mod tests {
             events,
             ip_salt: Arc::new(DailySalt::new()),
             trusted_proxies,
+            tasks: crate::shutdown::TaskTracker::new(),
         }
     }
 
@@ -563,11 +1112,10 @@ mod tests {
         let id = Uuid::new_v4();
         let now = Utc::now();
         sqlx::query(
-            "INSERT INTO accounts (id, pb_user_id, is_operator, created_at, updated_at)
-             VALUES (?, ?, 1, ?, ?)",
+            "INSERT INTO accounts (id, is_operator, created_at, updated_at)
+             VALUES (?, 1, ?, ?)",
         )
         .bind(id.hyphenated())
-        .bind(format!("test_op_{}", id.simple()))
         .bind(now)
         .bind(now)
         .execute(pool)
@@ -599,15 +1147,6 @@ mod tests {
         .await
         .expect("create session");
         token
-    }
-
-    fn cookie_headers(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            format!("a=1; session={token}; b=2").parse().unwrap(),
-        );
-        headers
     }
 
     /// Money enters a wallet ONLY through credit_topup_transaction, which writes
@@ -701,7 +1240,12 @@ mod tests {
             "SELECT operator_id, action, target_type, detail FROM admin_audit
               WHERE target_id = ? ORDER BY id",
         )
-        .bind(target_id.to_string())
+        // `.hyphenated()` rather than `.to_string()`, which would also work: `Uuid`'s `Display`
+        // emits the hyphenated form, so the two agree today. The explicit call is the crate's
+        // single spelling for a UUID going into a TEXT column, and
+        // `doc_claims::tests::no_uuid_is_bound_to_a_statement_without_its_hyphenated_form` holds
+        // every bind to it - a rule with one permitted alternative is a rule that rots.
+        .bind(target_id.hyphenated())
         .fetch_all(pool)
         .await
         .expect("read admin_audit");
@@ -722,30 +1266,64 @@ mod tests {
 
     /// docs/observability.md's reconciliation, scoped to THIS fixture's account:
     /// wallets.balance_idr must equal SUM(ledger.delta_idr). Must return 0.
-    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT w.account_id
-                FROM wallets w
-                LEFT JOIN ledger l ON l.account_id = w.account_id
-                WHERE w.account_id = ?
-                GROUP BY w.account_id, w.balance_idr
-                HAVING w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
+    ///
+    /// FULL OUTER JOIN, matching `tools/reconcile/reconcile.sh`, the gate this
+    /// transcribes. A LEFT JOIN driven from `wallets` asks a weaker question: it sees
+    /// only accounts that HAVE a wallet row, while `ledger.account_id` references
+    /// `accounts(id)` and not `wallets`, so a ledger row with no wallet is permitted by
+    /// the schema and was invisible to the old form. Measured: 5000 IDR of ledger with
+    /// no wallet row reports drift=1 here and reported drift=0 before, so an assertion
+    /// built on this helper could pass on an account the shipped gate fails. It is a
+    /// sibling of `ledger_drift_rows` in `db.rs`, `routes/auth.rs` and
+    /// A test OF THE HELPER ABOVE, because it is a transcription of the shipped gate and a
+    /// transcription that has quietly become weaker is invisible while it stays green.
+    ///
+    /// This is the same guard as
+    /// `routes::account::tests::the_reconciliation_helper_sees_ledger_money_with_no_wallet_row`,
+    /// and it exists in both places on purpose: the two helpers are separate definitions of
+    /// one rule (four, with `keys.rs` and `proxy.rs` and `webhooks.rs`), and the whole
+    /// reason this defect recurred is that a fix in one copy said nothing to the others.
+    /// Two guards is not the four it would take to check every copy, but it is the
+    /// difference between "the rule is pinned somewhere" and "one file is pinned".
+    #[tokio::test]
+    async fn the_admin_drift_helper_sees_ledger_money_with_no_wallet_row() {
+        let db = TestDb::new().await;
+        let account = test_support::account(&db.pool).await;
+
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) \
+             VALUES (?, 5000, 'adjustment', 5000, '2026-01-01T00:00:00+00:00')",
         )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
+        .bind(account.hyphenated())
+        .execute(&db.pool)
         .await
-        .expect("reconciliation query")
+        .expect("insert the orphan ledger row");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count wallets"),
+            0,
+            "the fixture must have NO wallet row, or this test is not testing the case"
+        );
+
+        assert_eq!(
+            ledger_drift_rows(&db.pool, account).await,
+            1,
+            "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate says \
+             so. A helper returning 0 here has become a weaker rule than the one that ships."
+        );
+
+        db.close().await;
     }
 
     /// Every branch of every test ends here: the fixture must not have drifted.
     async fn assert_no_drift(pool: &SqlitePool, account_ids: &[Uuid]) {
         for account_id in account_ids {
             assert_eq!(
-                drift_rows(pool, *account_id).await,
+                ledger_drift_rows(pool, *account_id).await,
                 0,
                 "wallets.balance_idr must equal SUM(ledger.delta_idr) for {account_id}"
             );
@@ -793,6 +1371,77 @@ mod tests {
         };
         let status = res.status();
         (status, json_body(res).await)
+    }
+
+    /// `forbidden` obeys docs/error-model.md's rules, and it has no variant to enforce them.
+    ///
+    /// WHY THIS IS SEPARATE FROM error.rs's CHECKS. `forbidden` is the ONE error code built outside
+    /// `AppError` - `forbidden_response` assembles its own envelope, because the operator surface
+    /// needs a message that says WHICH denial, and no `AppError` variant carries one. Every guard in
+    /// error.rs iterates `every_variant()`, so none of them can see this response at all.
+    ///
+    /// MEASURED: replacing the generated `request_id` with an empty string left the whole suite GREEN
+    /// at 668 passed / 0 failed - while `every_error_carries_a_request_id_in_the_documented_format`
+    /// passes for all fourteen real variants, because rule 3's enforcement is scoped to them.
+    /// docs/error-model.md, rule 3 is flat: "**Always include `request_id`.** It is the support
+    /// conversation's starting point."
+    #[tokio::test]
+    async fn a_forbidden_response_follows_the_documented_error_rules() {
+        let res = forbidden_response("operator access is required");
+        let status = res.status();
+        let body = json_body(res).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "docs/error-model.md publishes 403 for `forbidden`. A 401 here would be acted on by the \
+             web client as a dead session and redirect to /login."
+        );
+        let error = &body["error"];
+        assert_eq!(
+            error["code"], "forbidden",
+            "the code is the contract (docs/error-model.md, rule 4)"
+        );
+        assert_eq!(
+            error["message"], "operator access is required",
+            "the operator surface's whole reason for building this envelope by hand is that its \
+             message says WHICH denial"
+        );
+
+        // RULE 3, and the assertion the mutation above walked past.
+        let id = error["request_id"]
+            .as_str()
+            .expect("docs/error-model.md, rule 3 - always include `request_id`");
+        assert!(
+            id.starts_with("req_"),
+            "request_id must follow the documented req_... form, got {id}"
+        );
+        let hex = &id["req_".len()..];
+        assert_eq!(
+            hex.len(),
+            32,
+            "request_id suffix should be a bare uuid, got {id}"
+        );
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "request_id suffix must be hex, got {id}"
+        );
+
+        // The documented shape, field for field. `details` is OMITTED when there is none -
+        // `ApiErrorBody` carries `#[serde(skip_serializing_if = "Option::is_none")]`, so absence is
+        // the documented encoding and not a gap. Asserted this way round because my first version
+        // required the key to be PRESENT and failed on a correct response.
+        assert!(
+            error["details"].is_null(),
+            "a forbidden has no field-level detail, so `details` is either absent or null - never a \
+             populated object: {body}"
+        );
+        assert_eq!(
+            error.as_object().map(|o| o.len()),
+            Some(3),
+            "the envelope is code, message, request_id and nothing else when details is absent. An \
+             extra key is a field a client may come to depend on: {body}"
+        );
     }
 
     /// A request through the whole router, so the real extractors and the real
@@ -847,7 +1496,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         open_wallet(&pool, victim, 50_000).await;
 
@@ -856,7 +1506,8 @@ mod tests {
         // EXPIRED-but-unrevoked row: the revocation predicate is
         // "revoked_at IS NULL" (the statement logout_all uses), so the expired
         // row is revoked too, and the LIVE count is what must reach zero.
-        let victim_headers = cookie_headers(&issue_session(&pool, victim).await);
+        let victim_headers =
+            test_support::session_request_headers(&issue_session(&pool, victim).await);
         issue_session(&pool, victim).await;
         // The expired row carries every NOT NULL column from Rust, and its
         // expiry is computed in Rust: now() - interval has no SQLite spelling
@@ -889,6 +1540,30 @@ mod tests {
             .execute(&pool)
             .await
             .expect("pre-revoke one key");
+
+        // AND THE SESSION-SIDE HALF OF THE SAME IDEA, which the key half above has had since it was
+        // written and the session half never did.
+        //
+        // The comment above says of the pre-revoked KEY that it "must NOT be counted or re-stamped".
+        // `suspend_account` revokes sessions with `UPDATE sessions SET revoked_at = ? WHERE
+        // account_id = ? AND revoked_at IS NULL` - the same predicate - and MEASURED: deleting that
+        // guard left the whole suite at 665 passed / 0 failed. Nothing observed it.
+        //
+        // WHY RE-STAMPING MATTERS. `revoked_at` is what the retention sweep reads -
+        // `db.rs`: `DELETE FROM sessions WHERE COALESCE(revoked_at, expires_at) <= ?` - so stamping
+        // an already-revoked row with `now` pushes its collection instant forward by the full
+        // window. A row due to be deleted is retained another 30 days, and each suspend re-stamps
+        // it again.
+        //
+        // Pinned to a FIXED PAST INSTANT so the assertion compares a value, not an ordering.
+        let dead_session_stamped = Utc::now() - chrono::Duration::days(3);
+        let dead_session_token = issue_session(&pool, victim).await;
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?")
+            .bind(dead_session_stamped)
+            .bind(hash_token(&dead_session_token))
+            .execute(&pool)
+            .await
+            .expect("pre-revoke one session");
 
         assert_eq!(
             live_sessions(&pool, victim).await,
@@ -929,6 +1604,32 @@ mod tests {
             live_keys(&pool, victim).await,
             0,
             "EVERY live key must be revoked by the suspend"
+        );
+
+        // AND THE PRE-REVOKED SESSION WAS NOT RE-STAMPED - the session-side half of the comment
+        // above about the pre-revoked KEY.
+        //
+        // `revoked_at` is what the retention sweep reads (`db.rs`: `DELETE FROM sessions WHERE
+        // COALESCE(revoked_at, expires_at) <= ?`), so stamping an already-revoked row with `now`
+        // pushes its collection instant forward by the full window: a row due to be deleted is
+        // retained another 30 days, and every suspend re-stamps it again.
+        //
+        // The key-side equivalent has been asserted here since this test was written. MEASURED, for
+        // the session side: deleting `AND revoked_at IS NULL` from suspend's UPDATE left the whole
+        // suite at 665 passed / 0 failed.
+        let dead_session_after: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
+                .bind(hash_token(&dead_session_token))
+                .fetch_one(&pool)
+                .await
+                .expect("read the pre-revoked session's revocation time");
+        assert_eq!(
+            dead_session_after,
+            Some(dead_session_stamped),
+            "suspend must NOT re-stamp an already-revoked session. If this moved, the UPDATE ran \
+             without its `revoked_at IS NULL` guard, and the retention sweep - which reads \
+             COALESCE(revoked_at, expires_at) - keeps the row for the full window from this moment \
+             instead of deleting it on schedule."
         );
 
         // Not one unrevoked session row is left, expired ones included.
@@ -985,6 +1686,179 @@ mod tests {
         assert_no_drift(&pool, &[operator, victim]).await;
         db.close().await;
     }
+    // -----------------------------------------------------------------------
+    // The adjustment: the only admin action that moves money
+    // -----------------------------------------------------------------------
+
+    /// AN OPERATOR CANNOT ADJUST THEIR OWN BALANCE - the strongest form of the self-action
+    /// rule in this module.
+    ///
+    /// Every other route refuses a self-action to keep ONE rule with no exception. This one
+    /// refuses it because crediting your own wallet is what the rule exists to prevent, so a
+    /// regression here is not a consistency problem - it is a back door.
+    #[tokio::test]
+    async fn an_operator_cannot_adjust_their_own_balance() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        // `create_operator` makes an ACCOUNT and no wallet - the same fixture gap that catches
+        // every new money test here. Without a row, the assertion below would fail on a missing
+        // wallet rather than on the refusal it is about, which is a test measuring the fixture.
+        test_support::wallet(&pool, operator).await;
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(adjust_account(
+            State(state.clone()),
+            Path(operator),
+            headers.clone(),
+            Json(AdjustRequest {
+                delta_idr: 1_000_000,
+                reason: "nice try".to_string(),
+                note: "crediting myself".to_string(),
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+
+        // THE MONEY ASSERTION, not just the status: a 403 that still moved the balance would
+        // be the worst outcome available here.
+        assert_eq!(
+            test_support::balance(&pool, operator).await,
+            0,
+            "a refused self-adjustment must not move the operator's own wallet"
+        );
+        assert_eq!(
+            audit_rows(&pool, operator).await.len(),
+            0,
+            "a refused adjustment must write no audit row"
+        );
+        assert_no_drift(&pool, &[operator]).await;
+        db.close().await;
+    }
+
+    /// A NOTE TOO SHORT TO NAME A CAUSE IS REFUSED.
+    ///
+    /// `docs/admin-surface.md` rule 3 is "an unexplained adjustment is indistinguishable from
+    /// theft during an audit". A non-empty check accepts "x", which satisfies the letter and
+    /// fails the rule - so the floor is on LENGTH and this pins it. The assertion is also on
+    /// the money: a refusal that still moved the wallet would be a refusal in name only.
+    #[tokio::test]
+    async fn an_adjustment_without_a_real_explanation_is_refused_and_moves_nothing() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        // `account_with_wallet`, not `account`: `fund` settles a top-up into a wallet, and an
+        // account with no wallet row makes it fail on the fixture rather than on the code under
+        // test.
+        let target = test_support::account_with_wallet(&pool).await;
+        test_support::fund(&pool, target, 10_000).await;
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        for (reason, note) in [("", ""), ("x", ""), ("", "y"), ("recon", "fix")] {
+            let (status, body) = render(adjust_account(
+                State(state.clone()),
+                Path(target),
+                headers.clone(),
+                Json(AdjustRequest {
+                    delta_idr: 500,
+                    reason: reason.to_string(),
+                    note: note.to_string(),
+                }),
+            ))
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a note too short to name a cause must be refused: {reason:?}/{note:?} gave {body}"
+            );
+            assert_eq!(body["error"]["code"], json!("validation_failed"));
+            assert_eq!(
+                body["error"]["details"]["field"],
+                json!("note"),
+                "the refusal must name the field, so a UI can highlight it"
+            );
+        }
+
+        assert_eq!(
+            test_support::balance(&pool, target).await,
+            10_000,
+            "every refusal above must have left the wallet untouched"
+        );
+        assert_eq!(audit_rows(&pool, target).await.len(), 0);
+        assert_no_drift(&pool, &[operator, target]).await;
+        db.close().await;
+    }
+
+    /// THE HAPPY PATH: THE BALANCE MOVES, THE AUDIT NAMES THE OPERATOR, AND THE LEDGER
+    /// AGREES WITH THE WALLET.
+    ///
+    /// Three assertions because the three can fail independently: the money could move
+    /// without an audit row (rule 4), the audit could be written for the wrong actor, or the
+    /// wallet could move without a ledger row - which is the drift
+    /// `docs/admin-surface.md` names as the first anti-pattern.
+    #[tokio::test]
+    async fn an_adjustment_moves_the_balance_audits_the_operator_and_keeps_no_drift() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        // `account_with_wallet`, not `account`: `fund` settles a top-up into a wallet, and an
+        // account with no wallet row makes it fail on the fixture rather than on the code under
+        // test.
+        let target = test_support::account_with_wallet(&pool).await;
+        test_support::fund(&pool, target, 10_000).await;
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(adjust_account(
+            State(state.clone()),
+            Path(target),
+            headers.clone(),
+            Json(AdjustRequest {
+                delta_idr: -2_500,
+                reason: "reconciliation fix".to_string(),
+                note: "double-credited on 2026-09-30".to_string(),
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["delta_idr"], json!(-2_500));
+        assert_eq!(body["balance_before_idr"], json!(10_000));
+        assert_eq!(body["balance_after_idr"], json!(7_500));
+
+        assert_eq!(test_support::balance(&pool, target).await, 7_500);
+        assert_no_drift(&pool, &[operator, target]).await;
+
+        let rows = audit_rows(&pool, target).await;
+        assert_eq!(rows.len(), 1, "an adjustment must be audited exactly once");
+        assert_eq!(
+            rows[0].1, "adjust",
+            "the action must be findable by name, not by diffing the audit table"
+        );
+        // THE OPERATOR IS IN THE DETAIL as well as the row's own operator column, so the
+        // entry survives an export that drops the column.
+        // THE FIGURES ARE IN THE DETAIL, which is what makes the entry reproducible from the
+        // audit table alone - a reader can redo the arithmetic without joining the ledger.
+        assert_eq!(
+            rows[0].2, "account",
+            "the target type, so the row is addressable"
+        );
+        let detail = rows[0]
+            .3
+            .as_ref()
+            .expect("the detail column must be populated");
+        assert_eq!(detail["balance_before_idr"], json!(10_000));
+        assert_eq!(detail["balance_after_idr"], json!(7_500));
+        assert_eq!(detail["delta_idr"], json!(-2_500));
+        assert_eq!(
+            detail["note"],
+            json!("reconciliation fix: double-credited on 2026-09-30"),
+            "the combined explanation travels into the audit, so the reason and the note are not lost"
+        );
+        db.close().await;
+    }
+
     /// (d), second half: a FAILED suspend writes no audit row - and changes
     /// nothing else either.
 
@@ -995,7 +1869,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         let (status, body) = render(suspend_account(
             State(state.clone()),
@@ -1042,7 +1917,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let victim_token = issue_session(&pool, victim).await;
         let app = app(state.clone());
 
@@ -1088,7 +1964,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let app = app(state.clone());
 
         open_wallet(&pool, victim, 1_000).await;
@@ -1097,7 +1974,8 @@ mod tests {
         // authenticating - which WARMS the metadata cache without ever reaching
         // an upstream. The key belongs to the VICTIM: it is the victim's
         // credential the suspend must kill.
-        let victim_headers = cookie_headers(&issue_session(&pool, victim).await);
+        let victim_headers =
+            test_support::session_request_headers(&issue_session(&pool, victim).await);
         let (key_id, plaintext) =
             create_key_via_handler(&state, &victim_headers, "victim", vec![]).await;
 
@@ -1150,12 +2028,13 @@ mod tests {
         let state = test_state(pool.clone());
         let nobody = create_account(&pool).await;
         let victim = create_account(&pool).await;
-        let nobody_headers = cookie_headers(&issue_session(&pool, nobody).await);
+        let nobody_headers =
+            test_support::session_request_headers(&issue_session(&pool, nobody).await);
         let app = app(state.clone());
 
         open_wallet(&pool, victim, 1_000).await;
         let victim_token = issue_session(&pool, victim).await;
-        let victim_headers = cookie_headers(&victim_token);
+        let victim_headers = test_support::session_request_headers(&victim_token);
         let (_, _) = create_key_via_handler(&state, &victim_headers, "live", vec![]).await;
 
         // 403, not 401 (the session is real) and not 404 (the target is real).
@@ -1221,7 +2100,8 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let self_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let self_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let victim = create_account(&pool).await;
 
         open_wallet(&pool, operator, 1_000).await;
@@ -1300,7 +2180,7 @@ mod tests {
 
         open_wallet(&pool, victim, 1_000).await;
         let victim_token = issue_session(&pool, victim).await;
-        let victim_headers = cookie_headers(&victim_token);
+        let victim_headers = test_support::session_request_headers(&victim_token);
         let (key_id, _) = create_key_via_handler(&state, &victim_headers, "live", vec![]).await;
 
         // Suspended by hand: the point of this test is what RESUME does, and a
@@ -1316,7 +2196,7 @@ mod tests {
         let (status, body) = render(resume_account(
             State(state.clone()),
             Path(victim),
-            cookie_headers(&issue_session(&pool, operator).await),
+            test_support::session_request_headers(&issue_session(&pool, operator).await),
         ))
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -1360,7 +2240,7 @@ mod tests {
         let (status, _) = render(suspend_account(
             State(state.clone()),
             Path(victim),
-            cookie_headers(&issue_session(&pool, operator).await),
+            test_support::session_request_headers(&issue_session(&pool, operator).await),
         ))
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1368,7 +2248,7 @@ mod tests {
         let (status, _) = render(resume_account(
             State(state.clone()),
             Path(victim),
-            cookie_headers(&issue_session(&pool, operator).await),
+            test_support::session_request_headers(&issue_session(&pool, operator).await),
         ))
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1397,12 +2277,18 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         open_wallet(&pool, victim, 7_500).await;
         let victim_token = issue_session(&pool, victim).await;
-        let (_, _) =
-            create_key_via_handler(&state, &cookie_headers(&victim_token), "live", vec![]).await;
+        let (_, _) = create_key_via_handler(
+            &state,
+            &test_support::session_request_headers(&victim_token),
+            "live",
+            vec![],
+        )
+        .await;
 
         let (status, body) = render(get_account(
             State(state.clone()),
@@ -1459,45 +2345,165 @@ mod tests {
         db.close().await;
     }
     /// (h) The login path still refuses a suspended account - the behaviour
-    /// auth.rs:204 already had, now asserted next to the suspension that makes it
+    /// `auth::login` already had, now asserted next to the suspension that makes it
     /// matter.
     ///
-    /// Driven against the REAL PocketBase, because verify_pb_token has no seam to
-    /// fake and mocking the network would test the mock. The identity is a real
-    /// PocketBase record; the account row is created here with that record's id
-    /// as its pb_user_id, exactly as the first login would.
-    // The database half of this fixture is now a per-test SQLite file, but the
-    // LOGIN half is not portable: exchange_token verifies its token against a
-    // real PocketBase over the network, and faking that would test the fake. So
-    // this is the one test here that still needs a live external service
-    // (POCKETBASE_URL); nothing about it needs Postgres.
-    #[ignore = "requires the local PocketBase: POCKETBASE_URL"]
+    /// Driven through the REAL login handler. There is no external identity
+    /// provider left to stand in for: the identity is a row this crate writes,
+    /// with a password hash this crate computes, so the test creates it directly
+    /// and then signs in with the password it chose.
+    ///
+    /// THE LAST `#[ignore]` IN THE CRATE, now running by default.
+    ///
+    /// It proves the second half of Gate 3's suspension requirement: after an
+    /// operator suspends an account, that account cannot log back in, the refusal
+    /// is a 401 `unauthenticated`, and the refused login MINTS NOTHING (no session
+    /// row) and leaves no ledger drift. `auth.rs` refuses a non-active status at
+    /// login time; this is the test that proves the refusal holds through the
+    /// real handler end to end - and until now it had never run in CI.
+    ///
+    /// The fixture is a real migrated SQLite file with a real password identity in
+    /// it, which is what makes it runnable: nothing here reaches the network.
+    // -----------------------------------------------------------------------
+    // The documented status contract for suspend/resume.
+    //
+    // docs/server/api-spec.md fixes these responses and nothing asserted them:
+    // an absent target is 404 `not_found`, and a target in the wrong state is 409
+    // `conflict`. They are user-visible contract, not internals - an operator
+    // tooling against this API branches on them.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn suspending_an_absent_account_is_404_not_found() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(suspend_account(
+            State(state.clone()),
+            Path(Uuid::new_v4()),
+            headers,
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn resuming_an_absent_account_is_404_not_found() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(resume_account(
+            State(state.clone()),
+            Path(Uuid::new_v4()),
+            headers,
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+
+        db.close().await;
+    }
+
+    /// Resuming an account that is NOT suspended is a 409, not a silent success.
+    ///
+    /// The distinction matters: a resume that quietly "succeeded" on an active
+    /// account would write an `admin_audit` row for a state change that never
+    /// happened, and the audit trail is only worth having if it records what
+    /// actually occurred.
+    #[tokio::test]
+    async fn resuming_an_active_account_is_409_conflict_and_writes_no_audit_row() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        // A fresh, ACTIVE account that was never suspended.
+        let victim = test_support::account(&pool).await;
+
+        let (status, body) =
+            render(resume_account(State(state.clone()), Path(victim), headers)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], json!("conflict"));
+
+        // No audit row for a state change that did not happen.
+        let audits: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit WHERE target_id = ?")
+                .bind(victim.hyphenated())
+                .fetch_one(&pool)
+                .await
+                .expect("count audit rows");
+        assert_eq!(
+            audits, 0,
+            "a refused resume must write no audit row - an audit trail that records non-events is worse than none"
+        );
+
+        db.close().await;
+    }
+
+    /// Suspending an account that is ALREADY suspended is a 409 too, and changes
+    /// nothing.
+    #[tokio::test]
+    async fn suspending_an_already_suspended_account_is_409_conflict() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        let victim = test_support::account(&pool).await;
+        sqlx::query("UPDATE accounts SET status = 'suspended' WHERE id = ?")
+            .bind(victim.hyphenated())
+            .execute(&pool)
+            .await
+            .expect("park the account in the suspended state");
+
+        let (status, body) =
+            render(suspend_account(State(state.clone()), Path(victim), headers)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], json!("conflict"));
+
+        db.close().await;
+    }
+
     #[tokio::test]
     async fn a_new_login_after_suspend_is_still_refused() {
         let db = TestDb::new().await;
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
-        let client = reqwest::Client::new();
-        let tag = Uuid::new_v4().simple().to_string();
-        let (record_id, pb_token) = pocketbase_identity(&client, &tag).await;
-
-        // Every NOT NULL column is bound from Rust: the SQLite schema has no
-        // DEFAULT for id, created_at or updated_at.
-        let victim = Uuid::new_v4();
-        let victim_now = Utc::now();
-        sqlx::query(
-            "INSERT INTO accounts (id, pb_user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        // A real password identity, created through the same production helper the
+        // signup handler uses, so the credential the login below presents is a real
+        // Argon2id hash and not a fixture value the verifier happens to accept.
+        let auth = shipped_config().auth.clone();
+        let password = "correct horse battery staple".to_string();
+        let hash = crate::identity::password::hash_password(auth, password.clone())
+            .await
+            .expect("hash the fixture password");
+        let victim = crate::identity::accounts::create_password_account(
+            &pool,
+            "victim@example.com",
+            &hash,
+            Utc::now(),
         )
-        .bind(victim.hyphenated())
-        .bind(&record_id)
-        .bind(victim_now)
-        .bind(victim_now)
-        .execute(&pool)
         .await
-        .expect("create the account the login would have created");
+        .expect("create the account the login would have signed in to");
 
         let (status, _) = render(suspend_account(
             State(state.clone()),
@@ -1508,12 +2514,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let (status, body) = render_axum(
-            exchange_token(
-                State(pool.clone()),
+            crate::routes::auth::login(
+                State(state.clone()),
+                axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 12345))),
                 HeaderMap::new(),
-                Json(AuthExchangeRequest {
-                    pb_token: pb_token.clone(),
-                }),
+                Ok(Json(crate::routes::auth::LoginRequest {
+                    email: "victim@example.com".to_string(),
+                    password,
+                })),
             )
             .await,
         )
@@ -1539,77 +2547,854 @@ mod tests {
 
         assert_no_drift(&pool, &[operator, victim]).await;
         db.close().await;
-        delete_pocketbase_identity(&client, &record_id, &pb_token).await;
+    }
+
+    // The live-PocketBase fixtures (pb_collection_url, pocketbase_identity,
+    // delete_pocketbase_identity and their base-url helper) stood here. They are
+    // DELETED with the test that needed them: the loopback stub above replaces the
+    // approach, and a fixture that creates REAL PocketBase records would now imply
+    // this suite still needs an external service.
+
+    // -----------------------------------------------------------------------
+    // GET /api/admin/accounts - the listing.
+    //
+    // Why these matter: the listing is the ONE admin route that returns many
+    // accounts at once, so it is the only place a bad WHERE clause could leak the
+    // whole account space to a non-operator, and the only place a filter bug
+    // could return a page that looks complete but is not. Each test attacks one
+    // of those two.
+    // -----------------------------------------------------------------------
+
+    /// A non-operator must not be able to list. The 403 is the same answer an
+    /// unknown id gets, so the listing cannot be used to probe the account space.
+    #[tokio::test]
+    async fn listing_requires_an_operator() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let outsider = create_account(&pool).await;
+
+        // No cookie at all -> 401, before anything is read.
+        let (status, _) = render(list_accounts(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A real, live session on a NON-operator account -> 403.
+        let outsider_headers =
+            test_support::session_request_headers(&issue_session(&pool, outsider).await);
+        let (status, body) = render(list_accounts(
+            State(state.clone()),
+            outsider_headers,
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+        assert_eq!(body["error"]["code"], json!("forbidden"));
+
+        // And the operator's own listing works, proving the same call succeeds
+        // for the right caller - the 403 above is authorization, not a broken route.
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+        let (status, _) = render(list_accounts(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_no_drift(&pool, &[operator, outsider]).await;
+        db.close().await;
+    }
+
+    /// The listing carries the same safe fields as the single view and NOTHING
+    /// that could read a credential.
+    #[tokio::test]
+    async fn listing_rows_never_expose_a_credential() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let customer = create_account(&pool).await;
+        open_wallet(&pool, customer, 7_000).await;
+
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+        let (status, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminListQuery {
+                q: Some(customer.hyphenated().to_string()),
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let accounts = body["accounts"].as_array().expect("accounts is an array");
+        assert_eq!(
+            accounts.len(),
+            1,
+            "the id filter must select exactly one row"
+        );
+        let row = &accounts[0];
+
+        // The exact field set. A new field here would have to be justified
+        // against docs/admin-surface.md:158-166.
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "account_id",
+                "balance_idr",
+                "created_at",
+                "is_operator",
+                "live_keys",
+                "live_sessions",
+                "status",
+            ],
+        );
+        assert_eq!(row["account_id"], json!(customer));
+        assert_eq!(row["balance_idr"], json!(7_000));
+
+        // Belt and braces: the rendered body contains none of the secret column
+        // names, so a future SELECT * could not sneak one through unnoticed.
+        let text = body.to_string();
+        for forbidden in ["token_hash", "key_hash", "pb_user_id", "snap_token"] {
+            assert!(
+                !text.contains(forbidden),
+                "the listing leaked {forbidden}: {text}"
+            );
+        }
+
+        assert_no_drift(&pool, &[operator, customer]).await;
+        db.close().await;
+    }
+
+    /// The filter narrows to matching accounts and excludes the rest, and the
+    /// status filter composes with it.
+    #[tokio::test]
+    async fn listing_filters_by_text_and_status() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        // Two customers; one will be suspended, so the status filter has a
+        // difference to find. A filter that returned everything would still
+        // satisfy a count of "at least one", which is why the count is exact.
+        let active = create_account(&pool).await;
+        let suspended = create_account(&pool).await;
+
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        // Suspend one through the real handler so its status is genuine.
+        let (status, _) = render(suspend_account(
+            State(state.clone()),
+            Path(suspended),
+            operator_headers.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // No filter: every account, including the operator, appears.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(100),
+                offset: None,
+            }),
+        ))
+        .await;
+        let all = body["accounts"].as_array().unwrap();
+        assert_eq!(all.len(), 3, "operator + two customers: {body}");
+
+        // status=suspended selects exactly the suspended one.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery {
+                q: None,
+                status: Some("suspended".into()),
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+        let only = body["accounts"].as_array().unwrap();
+        assert_eq!(only.len(), 1, "only one account is suspended: {body}");
+        assert_eq!(only[0]["account_id"], json!(suspended));
+
+        // A text filter on the active account's id selects just it - proving the
+        // LIKE clause narrows rather than matching all.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery {
+                q: Some(active.hyphenated().to_string()),
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+        let matched = body["accounts"].as_array().unwrap();
+        assert_eq!(
+            matched.len(),
+            1,
+            "the id filter selects one account: {body}"
+        );
+        assert_eq!(matched[0]["account_id"], json!(active));
+
+        // A status value outside the vocabulary matches nothing, and is not an
+        // error: an empty page is a valid answer.
+        let (status, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery {
+                q: None,
+                status: Some("nonsense".into()),
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 0);
+
+        assert_no_drift(&pool, &[operator, active, suspended]).await;
+        db.close().await;
+    }
+
+    /// A literal '%' in the search box must not become a wildcard. Without the
+    /// ESCAPE clause it would match every account, turning a narrow search into a
+    /// full dump.
+    #[tokio::test]
+    async fn listing_treats_a_percent_sign_literally() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let customer = create_account(&pool).await;
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        let (status, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminListQuery {
+                q: Some("%".into()),
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["accounts"].as_array().unwrap().len(),
+            0,
+            "a literal '%' must match nothing here, not every account: {body}"
+        );
+
+        assert_no_drift(&pool, &[operator, customer]).await;
+        db.close().await;
+    }
+
+    /// The page size is bounded and echoed, so a caller can page deterministically.
+    #[tokio::test]
+    async fn listing_bounds_and_echoes_the_page() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        for _ in 0..3 {
+            create_account(&pool).await;
+        }
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        // limit=0 is raised to the minimum (1), never left at 0 (which SQLite
+        // reads as "no limit").
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(0),
+                offset: None,
+            }),
+        ))
+        .await;
+        assert_eq!(body["limit"], json!(1), "limit is clamped up: {body}");
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 1);
+
+        // A request for more than the cap is clamped to the cap.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(10_000),
+                offset: None,
+            }),
+        ))
+        .await;
+        assert_eq!(body["limit"], json!(100), "limit is clamped down: {body}");
+
+        // offset is echoed and skips rows.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers.clone(),
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(100),
+                offset: Some(1),
+            }),
+        ))
+        .await;
+        assert_eq!(body["offset"], json!(1));
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 3);
+
+        // A negative offset is treated as zero, not passed to SQLite as-is.
+        let (_, body) = render(list_accounts(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: Some(100),
+                offset: Some(-5),
+            }),
+        ))
+        .await;
+        assert_eq!(body["offset"], json!(0));
+
+        assert_no_drift(&pool, &[operator]).await;
+        db.close().await;
+    }
+
+    /// The router mounts the listing at `GET /api/admin/accounts`, and it is
+    /// reached through the production stack - not only by calling the handler.
+    #[tokio::test]
+    async fn listing_route_is_mounted_and_requires_a_cookie() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        create_account(&pool).await;
+        let app = app(state.clone());
+
+        // No cookie -> 401 through the router.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/admin/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // With the operator cookie -> 200 and a JSON body with the documented keys.
+        let token = issue_session(&pool, operator).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/admin/accounts?limit=5")
+                    .header(header::COOKIE, format!("session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_body(res).await;
+        assert!(body["accounts"].is_array(), "body: {body}");
+        assert_eq!(body["limit"], json!(5));
+
+        assert_no_drift(&pool, &[operator]).await;
+        db.close().await;
+    }
+
+    #[test]
+    fn a_sqlx_error_maps_to_the_app_database_variant() {
+        // The `?` operator on every admin query funnels sqlx failures through
+        // this conversion; if it ever wrapped the wrong variant, operators
+        // would see a misleading error code for a database outage.
+        assert!(matches!(
+            AdminError::from(sqlx::Error::RowNotFound),
+            AdminError::App(AppError::Database(_))
+        ));
     }
 
     // -----------------------------------------------------------------------
-    // PocketBase identity fixture. exchange_token verifies its token against
-    // PocketBase over the network, so the fixture is a REAL PocketBase record
-    // with a real auth token - never a stub, and never a faked POCKETBASE_URL
-    // (which would race the live auth.rs tests in the same process).
+    // GET /api/admin/accounts/{id}/audit - the read side of admin_audit.
+    //
+    // The table was write-only until this route: the doc calls the trail "the
+    // record that makes disputes resolvable", but nothing read it back. These
+    // tests prove the read works AND keeps the two rules that matter: only an
+    // operator may read it, and an operator may not read their OWN account's
+    // trail through this surface (which get_account also refuses).
     // -----------------------------------------------------------------------
 
-    const PB_USERS_COLLECTION: &str = "users";
+    #[tokio::test]
+    async fn account_audit_requires_an_operator_and_refuses_self() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let outsider = create_account(&pool).await;
+        let victim = create_account(&pool).await;
 
-    fn pocketbase_base_url() -> String {
-        std::env::var("POCKETBASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string())
+        // No cookie -> 401, before any row is read.
+        let (status, _) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            HeaderMap::new(),
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A live NON-operator session -> 403.
+        let outsider_headers =
+            test_support::session_request_headers(&issue_session(&pool, outsider).await);
+        let (status, body) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            outsider_headers,
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+        assert_eq!(body["error"]["code"], json!("forbidden"));
+
+        // The operator reading their OWN trail -> 403 (refuse_self_action).
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+        let (status, _) = render(get_account_audit(
+            State(state.clone()),
+            Path(operator),
+            operator_headers.clone(),
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an operator may not read their own audit here"
+        );
+
+        assert_no_drift(&pool, &[operator, outsider, victim]).await;
+        db.close().await;
     }
 
-    fn pb_collection_url() -> String {
-        format!(
-            "{}/api/collections/{}",
-            pocketbase_base_url().trim_end_matches('/'),
-            PB_USERS_COLLECTION
+    #[tokio::test]
+    async fn account_audit_returns_the_actions_in_order_with_their_details() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let victim = create_account(&pool).await;
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        // Before any action: an empty trail, not an error.
+        let (status, body) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["entries"].as_array().unwrap().len(),
+            0,
+            "a fresh account has no trail"
+        );
+
+        // Suspend then resume through the real handlers, so the rows are the
+        // ones production writes.
+        let (status, _) = render(suspend_account(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = render(resume_account(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+            Query(AdminAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let entries = body["entries"].as_array().expect("entries is an array");
+        assert_eq!(entries.len(), 2, "two actions, two rows: {body}");
+
+        // Newest first: resume then suspend.
+        assert_eq!(entries[0]["action"], json!("resume"));
+        assert_eq!(entries[0]["target_type"], json!("account"));
+        assert_eq!(
+            entries[0]["target_id"],
+            json!(victim.hyphenated().to_string())
+        );
+        assert_eq!(entries[1]["action"], json!("suspend"));
+
+        // The exact field set - never a credential.
+        let mut keys: Vec<&str> = entries[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "created_at",
+                "detail",
+                "id",
+                "operator_id",
+                "target_id",
+                "target_type"
+            ],
+            "docs/server/api-spec.md: {body}"
+        );
+        assert_eq!(entries[0]["operator_id"], json!(operator));
+        let text = body.to_string();
+        for forbidden in ["token_hash", "key_hash", "snap_token"] {
+            assert!(
+                !text.contains(forbidden),
+                "the audit leaked {forbidden}: {text}"
+            );
+        }
+
+        // The limit is bounded.
+        let (_, body) = render(get_account_audit(
+            State(state.clone()),
+            Path(victim),
+            operator_headers.clone(),
+            Query(AdminAuditQuery { limit: Some(1) }),
+        ))
+        .await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["limit"], json!(1));
+
+        assert_no_drift(&pool, &[operator, victim]).await;
+        db.close().await;
+    }
+
+    /// The route is reachable through the router, not only by calling the handler.
+    #[tokio::test]
+    async fn account_audit_route_is_mounted() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let victim = create_account(&pool).await;
+        let app = app(state.clone());
+
+        let token = issue_session(&pool, operator).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/admin/accounts/{}/audit", victim.hyphenated()))
+                    .header(header::COOKIE, format!("session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_body(res).await;
+        assert!(body["entries"].is_array(), "body: {body}");
+
+        assert_no_drift(&pool, &[operator, victim]).await;
+        db.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/admin/audit - the global recent-actions read.
+    //
+    // Unlike the per-account trail, this spans every account and has no target
+    // filter, so it is the one place a missing guard would expose all operator
+    // activity to a non-operator. These tests pin the guard and the ordering.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recent_audit_requires_an_operator() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let outsider = create_account(&pool).await;
+
+        // No cookie -> 401.
+        let (status, _) = render(list_recent_audit(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AdminRecentAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A non-operator session -> 403, before any row is read.
+        let outsider_headers =
+            test_support::session_request_headers(&issue_session(&pool, outsider).await);
+        let (status, body) = render(list_recent_audit(
+            State(state.clone()),
+            outsider_headers,
+            Query(AdminRecentAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+
+        assert_no_drift(&pool, &[operator, outsider]).await;
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn recent_audit_spans_accounts_newest_first() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let a = create_account(&pool).await;
+        let b = create_account(&pool).await;
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        // Two actions on two DIFFERENT accounts, so a target-filtered read would
+        // miss one and this test would catch it.
+        let (s, _) = render(suspend_account(
+            State(state.clone()),
+            Path(a),
+            operator_headers.clone(),
+        ))
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = render(suspend_account(
+            State(state.clone()),
+            Path(b),
+            operator_headers.clone(),
+        ))
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let (status, body) = render(list_recent_audit(
+            State(state.clone()),
+            operator_headers,
+            Query(AdminRecentAuditQuery { limit: None }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let entries = body["entries"].as_array().expect("entries is an array");
+        let targets: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["action"] == json!("suspend"))
+            .map(|e| e["target_id"].as_str().unwrap())
+            .collect();
+        // Both accounts appear; the later suspend (b) is first.
+        assert_eq!(
+            targets.first().copied(),
+            Some(b.hyphenated().to_string().as_str())
+        );
+        assert!(
+            targets.contains(&a.hyphenated().to_string().as_str()),
+            "both accounts must appear: {body}"
+        );
+
+        // The limit is bounded and echoed.
+        let (_, body) = render(list_recent_audit(
+            State(state.clone()),
+            test_support::session_request_headers(&issue_session(&pool, operator).await),
+            Query(AdminRecentAuditQuery { limit: Some(1) }),
+        ))
+        .await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["limit"], json!(1));
+
+        assert_no_drift(&pool, &[operator, a, b]).await;
+        db.close().await;
+    }
+
+    /// The `accounts.id` decode is defensive: the column is TEXT, so a row whose
+    /// id is not a uuid (a future migration path could introduce one) must be
+    /// reported as a 500, never an unchecked panic. This is the one defensive
+    /// parse in this module that is genuinely reachable - `sessions.account_id`
+    /// and `admin_audit.operator_id` both carry FK constraints to `accounts.id`,
+    /// so the parallel parses there can never see a non-uuid and are left as
+    /// documented exceptions. Covers the `Uuid::parse_str` arm of `get_account`.
+    #[tokio::test]
+    async fn a_non_uuid_account_id_is_reported_not_panicked() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let operator = create_operator(&pool).await;
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
+
+        // `accounts.id` has no outward FK, so a malformed id is insertable and
+        // is the first row the DESC-ordered listing hits.
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO accounts (id, status, is_operator, created_at, updated_at)
+             VALUES (?, 'active', 0, ?, ?)",
         )
+        .bind("not-a-uuid")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert a malformed-id account");
+
+        let (status, body) = render(list_accounts(
+            State(test_state(pool.clone())),
+            operator_headers,
+            Query(AdminListQuery {
+                q: None,
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        ))
+        .await;
+
+        // The public body is the generic internal_error (the detailed parse
+        // message is deliberately not leaked); the contract is that a malformed
+        // id yields a 500 rather than an unchecked panic.
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+        assert_eq!(body["error"]["code"], json!("internal_error"), "{body}");
+        db.close().await;
     }
 
-    /// (record_id, auth_token)
-    async fn pocketbase_identity(client: &reqwest::Client, tag: &str) -> (String, String) {
-        let email = format!("test_admin_{tag}@apikita-test.invalid");
-        let password = format!("test-pw-{tag}");
+    /// TWO SUSPENDS OF ONE ACCOUNT, CONCURRENTLY: exactly one may report a successful revocation.
+    ///
+    /// WHY THIS EXISTS, and it is the sentence `suspend_account` was already making. Its comment says the
+    /// up-front write lock "is what serialises two concurrent suspends of one account: the second then
+    /// sees 'suspended' and refuses, instead of both reporting a successful revocation". MEASURED before
+    /// this test: nothing in the suite detected that lock's removal at this site - 0 of 8 runs against a
+    /// deferred `BEGIN` - because the neighbouring
+    /// `suspending_an_already_suspended_account_is_409_conflict` is SEQUENTIAL. It parks the account in the
+    /// suspended state with a direct UPDATE and then makes ONE request, so there is no interleaving to
+    /// lose and it passes under either lock.
+    ///
+    /// A BARRIER, NOT JUST SPAWNED TASKS. Four tasks that merely start together do not reliably overlap;
+    /// `Barrier::wait` holds every competitor until all four are ready, so the four transactions really do
+    /// contend. MEASURED with the barrier: the property holds on the shipped code (3 of 3 passes, always
+    /// one 200 and three 409), and replacing `BEGIN IMMEDIATE` with a deferred `BEGIN` makes this test
+    /// fail in 7 of 10 runs.
+    ///
+    /// SEVEN IN TEN IS THE HONEST NUMBER, stated rather than rounded up: whether a deferred transaction
+    /// actually loses the upgrade depends on interleaving, and this is a four-way race rather than a
+    /// deterministic ordering. The test is a real detector, not a certain one, and `db::begin_immediate`
+    /// carries the two tests that DO detect it every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_suspends_admit_exactly_one() {
+        let db = TestDb::new().await;
+        let pool = db.pool.clone();
+        let state = test_state(pool.clone());
+        let operator = create_operator(&pool).await;
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
+        let victim = test_support::account(&pool).await;
 
-        let created: Value = client
-            .post(format!("{}/records", pb_collection_url()))
-            .json(&json!({
-                "email": email,
-                "password": password,
-                "passwordConfirm": password,
-            }))
-            .send()
-            .await
-            .expect("PocketBase must be reachable: docker compose up -d")
-            .json()
-            .await
-            .expect("PocketBase answers JSON");
-        let record_id = created["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("PocketBase did not return a record id: {created}"))
-            .to_string();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let state = state.clone();
+            let headers = headers.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                render(suspend_account(State(state), Path(victim), headers)).await
+            }));
+        }
 
-        let auth: Value = client
-            .post(format!("{}/auth-with-password", pb_collection_url()))
-            .json(&json!({ "identity": email, "password": password }))
-            .send()
-            .await
-            .expect("PocketBase auth must answer")
-            .json()
-            .await
-            .expect("PocketBase answers JSON");
-        let token = auth["token"]
-            .as_str()
-            .unwrap_or_else(|| panic!("PocketBase did not return a token: {auth}"))
-            .to_string();
+        let mut revoked = 0;
+        let mut conflicted = 0;
+        for h in handles {
+            let (status, body) = h.await.expect("a suspend task panicked");
+            match status {
+                StatusCode::OK => revoked += 1,
+                StatusCode::CONFLICT => {
+                    assert_eq!(body["error"]["code"], json!("conflict"), "{body}");
+                    conflicted += 1;
+                }
+                other => panic!("unexpected status from a concurrent suspend: {other}"),
+            }
+        }
 
-        (record_id, token)
-    }
+        assert_eq!(
+            revoked, 1,
+            "exactly one of four concurrent suspends may report a successful revocation; {revoked} did, \
+             which is the double-report the up-front write lock exists to prevent"
+        );
+        assert_eq!(
+            conflicted, 3,
+            "the other three must see 'suspended' and refuse with 409"
+        );
 
-    /// Best effort: it runs after the assertions, and a cleanup hiccup must not
-    /// masquerade as a failed assertion.
-    async fn delete_pocketbase_identity(client: &reqwest::Client, record_id: &str, token: &str) {
-        let _ = client
-            .delete(format!("{}/records/{}", pb_collection_url(), record_id))
-            .header(reqwest::header::AUTHORIZATION, token.to_string())
-            .send()
-            .await;
+        let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?1")
+            .bind(victim.hyphenated())
+            .fetch_one(&pool)
+            .await
+            .expect("status");
+        assert_eq!(status, "suspended");
+        db.close().await;
     }
 }

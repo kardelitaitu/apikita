@@ -9,9 +9,9 @@ import Base from '../layouts/Base.astro';
   <section class="mx-auto max-w-sm py-8">
     <h1 class="text-2xl font-semibold tracking-tight">Sign in</h1>
     <p class="mt-3 text-sm text-ink-muted">
-      Identity is handled by PocketBase. After it authenticates you, the browser
-      exchanges that token once for a session cookie with the API — the PocketBase
-      token is never the API credential.
+      Sign in with Google or an email address and password. The API issues an
+      opaque session cookie; no third party holds your credential and no token is
+      ever the API credential itself.
     </p>
 
     <div id="auth-error" hidden class="mt-6 rounded-lg border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
@@ -63,9 +63,8 @@ import Base from '../layouts/Base.astro';
     </form>
 
     <p class="mt-6 text-xs text-ink-muted">
-      Failed attempts are rate-limited by PocketBase. Signing in creates your
-      account on first use; the dashboard needs a verified email address before a
-      balance can be held.
+      Sign-in attempts are rate-limited per address and per account. The dashboard
+      needs a verified email address before a balance can be held.
     </p>
   </section>
 </Base>
@@ -73,7 +72,7 @@ import Base from '../layouts/Base.astro';
 <script>
   // The auth island. Marketing pages ship no JavaScript; this page is an
   // interactive surface and is the only place this bundle loads.
-  import { pb, exchangeForSession } from '../lib/pocketbase';
+  import { googleIdToken, googleSignIn, login as loginRequest } from '../lib/auth-api';
   import { renderLoginError } from '../lib/login-error';
   import { apiFetch, ApiError, type Me } from '../lib/api';
 
@@ -94,8 +93,8 @@ import Base from '../layouts/Base.astro';
   // redirectOn401 MUST stay false. With the default (true) a signed-out visitor
   // gets a 401, apiFetch calls redirectToLogin(), and the browser lands on
   // /login?next=/login — a loop that looks like the page reloading forever.
-  // Probing from an auth page means owning the 401 yourself, exactly as
-  // /auth/exchange does (lib/pocketbase.ts).
+  // Probing from an auth page means owning the 401 yourself — the same reason the
+  // signup page does not let apiFetch decide what a 401 means.
   void apiFetch<Me>('/api/me', { redirectOn401: false })
     .then(() => window.location.replace(destination))
     // 401 is the normal signed-out case, not an error: stay on the form and stay
@@ -121,17 +120,12 @@ import Base from '../layouts/Base.astro';
     submit.disabled = busy;
   }
 
-  /** PocketBase authenticates, then the API issues its own session cookie. */
-  async function finishLogin(): Promise<void> {
-    await exchangeForSession();
-    window.location.assign(destination);
-  }
-
   googleButton.addEventListener('click', () => {
     clearError();
     setBusy(true);
-    void pb.collection('users').authWithOAuth2({ provider: 'google' })
-      .then(finishLogin)
+    void googleIdToken()
+      .then(googleSignIn)
+      .then(() => window.location.assign(destination))
       .catch(showError)
       .finally(() => setBusy(false));
   });
@@ -141,11 +135,10 @@ import Base from '../layouts/Base.astro';
     clearError();
     setBusy(true);
     const data = new FormData(form);
-    void pb.collection('users').authWithPassword(
-      String(data.get('email') ?? ''),
-      String(data.get('password') ?? ''),
-    )
-      .then(finishLogin)
+    // One request. The login handler verifies the password and sets the session
+    // cookie itself, so there is no exchange step and no second credential.
+    void loginRequest(String(data.get('email') ?? ''), String(data.get('password') ?? ''))
+      .then(() => window.location.assign(destination))
       .catch(showError)
       .finally(() => setBusy(false));
   });

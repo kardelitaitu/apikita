@@ -14,6 +14,7 @@
 // server/src/routes/mod.rs, so a button calling them would be a dead control.
 // GET /api/me reports telegram_linked, which is what is displayed.
 import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import Skeleton from '../../components/Skeleton.astro';
 ---
 
 <DashboardLayout title="Settings">
@@ -38,19 +39,19 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
     <dl class="mt-3 space-y-2 text-sm">
       <div class="flex flex-wrap gap-x-3">
         <dt class="w-40 shrink-0 text-ink-muted">Email</dt>
-        <dd id="profile-email" class="font-mono">Loading…</dd>
+        <dd id="profile-email" class="font-mono"><Skeleton width="w-48" /></dd>
       </div>
       <div class="flex flex-wrap gap-x-3">
         <dt class="w-40 shrink-0 text-ink-muted">Email verified</dt>
-        <dd id="profile-verified" class="font-mono">Loading…</dd>
+        <dd id="profile-verified" class="font-mono"><Skeleton width="w-16" /></dd>
       </div>
       <div class="flex flex-wrap gap-x-3">
         <dt class="w-40 shrink-0 text-ink-muted">Account id</dt>
-        <dd id="profile-account" class="break-all font-mono">Loading…</dd>
+        <dd id="profile-account" class="break-all font-mono"><Skeleton width="w-64" /></dd>
       </div>
       <div class="flex flex-wrap gap-x-3">
         <dt class="w-40 shrink-0 text-ink-muted">Account status</dt>
-        <dd id="profile-status" class="font-mono">Loading…</dd>
+        <dd id="profile-status" class="font-mono"><Skeleton width="w-20" /></dd>
       </div>
     </dl>
     <p class="mt-3 text-xs text-ink-muted">
@@ -123,10 +124,60 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
     </p>
     <p class="mt-2 text-sm text-ink-muted">
       Unlinking removes only the link: <strong>the account and its balance remain</strong>,
-      and the Telegram account can be relinked later. Linking is not yet available
-      from the dashboard — the endpoints are specified but not deployed — so the
-      current link state is shown read-only above.
+      and the Telegram account can be relinked later.
     </p>
+
+    <!-- Link code ------------------------------------------------------- -->
+    <div id="telegram-link-panel" hidden class="mt-4 rounded-md border border-edge-strong bg-surface-sunken p-4">
+      <p class="text-sm font-medium">Your link code</p>
+      <p id="link-code" class="mt-2 font-mono text-2xl tracking-[0.3em] tabular-nums">&mdash;</p>
+      <p id="link-code-instruction" class="mt-2 text-sm text-ink-muted"></p>
+      <button id="link-code-again" type="button"
+        class="mt-3 rounded-md border border-edge-strong px-3 py-1.5 text-xs font-medium hover:border-brand">
+        Issue a new code
+      </button>
+    </div>
+
+    <div id="telegram-error" hidden role="alert"
+      class="mt-3 rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+    <div id="telegram-done" hidden role="status"
+      class="mt-3 rounded-md border border-ok-edge bg-ok-surface p-3 text-sm text-ok-ink"></div>
+
+    <div class="mt-4 flex flex-wrap gap-3">
+      <button id="telegram-link" type="button" hidden
+        class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">
+        Link Telegram
+      </button>
+      <button id="telegram-unlink" type="button" hidden
+        class="rounded-md border border-danger-edge bg-danger-surface px-4 py-2 text-sm font-medium text-danger-ink hover:border-danger">
+        Unlink Telegram
+      </button>
+    </div>
+  </section>
+
+  <!-- Your data ------------------------------------------------------------ -->
+  <section class="mt-8 max-w-2xl rounded-lg border border-edge bg-surface-raised p-4">
+    <h2 class="text-lg font-semibold tracking-tight">Your data</h2>
+    <p class="mt-2 text-sm text-ink-muted">
+      Download a machine-readable copy of what this service holds for your
+      account: balance, ledger, top-ups, usage and API-key metadata. It is your
+      record to keep — for accounting, or to take elsewhere.
+    </p>
+    <p class="mt-2 text-xs text-ink-muted">
+      <strong>Metadata, not secrets.</strong> Credential hashes, session records,
+      IP hashes and internal identifiers are deliberately excluded — they are not
+      yours to hold, and they were hashed so they could not be handed out.
+    </p>
+
+    <div id="export-error" hidden role="alert"
+      class="mt-3 rounded-md border border-danger-edge bg-danger-surface p-3 text-sm text-danger-ink"></div>
+    <div id="export-done" hidden role="status"
+      class="mt-3 rounded-md border border-ok-edge bg-ok-surface p-3 text-sm text-ok-ink"></div>
+
+    <button id="export-btn" type="button"
+      class="mt-4 rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink hover:bg-brand-strong">
+      Download my data
+    </button>
   </section>
 
   <!-- Session controls ---------------------------------------------------- -->
@@ -139,9 +190,9 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
       here that could drift from them.
     </p>
     <p class="mt-2">
-      Logging out discards this device's token; the token itself stays
-      cryptographically valid until it expires. Only "Sign out everywhere" revokes
-      every token immediately.
+      Logging out revokes this device's session on the server, so the credential
+      stops working immediately rather than merely being discarded here. "Sign out
+      everywhere" revokes every session on the account at once.
     </p>
   </section>
 </DashboardLayout>
@@ -150,9 +201,13 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
   import { apiFetch, ApiError } from '../../lib/api';
   import type { Me } from '../../lib/api';
   import { describeError, renderNotice } from '../../lib/errors';
-  import { pb } from '../../lib/pocketbase';
+  import { changePassword, listProviders } from '../../lib/auth-api';
   import { describeAuthError } from '../../lib/auth-flow';
-  import { passwordChangeError } from '../../lib/dashboard-form';
+  import {
+    linkCodeInstruction,
+    passwordChangeError,
+    type LinkCodeResponse,
+  } from '../../lib/dashboard-form';
 
   /** Spec line 71: a password change invalidates every session, by design. */
   const PASSWORD_CHANGED_MESSAGE =
@@ -182,28 +237,30 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
   }
 
   // --- Profile ------------------------------------------------------------
-  // The email and its verified flag come from the PocketBase record the session
-  // was exchanged from; everything the wallet owns comes from GET /api/me. Neither
-  // is guessed: a missing value shows a dash, never a zero.
-  function renderIdentity(): void {
-    const record = pb.authStore.record as { email?: unknown; verified?: unknown } | null;
+  // The email and its verified flag arrive on GET /api/me, from the account's own
+  // identity row. It used to be read off the PocketBase record, which is gone; the
+  // API is now the only source, and a missing value shows a dash, never a zero.
+  function renderIdentity(email: string | null, verified: boolean): void {
     $('profile-email').textContent =
-      typeof record?.email === 'string' && record.email.length > 0 ? record.email : '\u2014';
-    $('profile-verified').textContent =
-      typeof record?.verified === 'boolean' ? (record.verified ? 'Yes' : 'No') : '\u2014';
+      typeof email === 'string' && email.length > 0 ? email : '\u2014';
+    $('profile-verified').textContent = verified ? 'Yes' : 'No';
   }
 
   async function loadProfile(): Promise<void> {
-    renderIdentity();
     try {
       const me = await apiFetch<Me>('/api/me');
+      renderIdentity(me.email, me.email_verified);
       $('profile-account').textContent = me.account_id;
       $('profile-status').textContent = me.status;
       // The balance is not repeated here — the header already shows it live.
       $('linked-telegram').textContent = me.telegram_linked ? 'Linked' : 'Not linked';
+      // Reveal the correct control: "Link" when unlinked, "Unlink" when linked.
+      renderTelegram(me.telegram_linked);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
       // A failed fetch says so. The placeholders stay dashes, not stale values.
+      $('profile-email').textContent = '\u2014';
+      $('profile-verified').textContent = '\u2014';
       $('profile-account').textContent = '\u2014';
       $('profile-status').textContent = '\u2014';
       $('linked-telegram').textContent = '\u2014';
@@ -211,26 +268,21 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
     }
   }
 
-  // --- Linked Google identity ---------------------------------------------
-  // listExternalAuths is the SDK's own wrapper over
-  // GET /api/collections/users/records/{id}/external-auths. It is marked
-  // @deprecated in favour of the _externalAuths collection, which needs a filter
-  // over a system collection; the wrapper endpoint is the stable one.
+  // --- Linked identity ----------------------------------------------------
+  // GET /auth/providers reports the providers this account actually has a row for,
+  // and takes no address or id, so it cannot be pointed at anyone else. It is a
+  // list rather than a google/password pair of booleans, so a provider added later
+  // does not need a new field here.
   async function loadLinkedGoogle(): Promise<void> {
-    const id = pb.authStore.record?.id;
-    if (typeof id !== 'string' || id.length === 0) {
-      $('linked-google').textContent = '\u2014';
-      return;
-    }
     try {
-      const auths = await pb.collection('users').listExternalAuths(id);
-      const providers = auths.map((a: { provider?: unknown }) => String(a.provider ?? ''));
+      const { providers } = await listProviders();
       $('linked-google').textContent = providers.includes('google')
         ? 'Linked'
         : 'Not linked';
     } catch {
-      // The identity service is not reachable, or the record is not readable.
-      // This is not a dashboard failure, so it does not raise the page banner.
+      // The request failed, or the session ended mid-page. This is not a dashboard
+      // failure, so it does not raise the page banner — a dash is honest, and the
+      // 401 path has already redirected.
       $('linked-google').textContent = 'Unknown';
     }
   }
@@ -256,32 +308,125 @@ import DashboardLayout from '../../layouts/DashboardLayout.astro';
       return;
     }
 
-    const id = pb.authStore.record?.id;
-    if (typeof id !== 'string' || id.length === 0) {
-      showPasswordError('Your session has ended. Sign in again.');
-      return;
-    }
-
     passwordSubmit.disabled = true;
     passwordSubmit.textContent = 'Changing\u2026';
-    // Password change is PocketBase-side (docs/architecture/identity.md line 38:
-    // password hashing is deliberately not ours). oldPassword is required, so a
-    // stolen session alone cannot set a new password.
-    void pb.collection('users')
-      .update(id, { oldPassword: current, password: next, passwordConfirm: confirmation })
+    // POST /auth/password-change, which REQUIRES the current password: a stolen
+    // session cookie alone must not be enough to take over the account. It revokes
+    // every session, including this one, so the page does not clear a cookie — it
+    // is already dead server-side — and it does not try to stay signed in. Sending
+    // the user to /login is the honest end state of a password change.
+    void changePassword(current, next)
       .then(() => {
         passwordForm.hidden = true;
         passwordDone.textContent = PASSWORD_CHANGED_MESSAGE;
         passwordDone.hidden = false;
-        // The change rotated the token key, so this device's token is already
-        // dead. Drop it here rather than leaving a token that will 401.
-        pb.authStore.clear();
         window.setTimeout(() => window.location.assign('/login'), 2500);
       })
       .catch((err: unknown) => showPasswordError(describeAuthError(err, 'That did not work.')))
       .finally(() => {
         passwordSubmit.disabled = false;
         passwordSubmit.textContent = 'Change password';
+      });
+  });
+
+  // --- Telegram link / unlink ---------------------------------------------
+  // The endpoints were specified and are now mounted (server/src/routes/mod.rs:338-339), so
+  // this is a live control, not the read-only display it used to be. The server
+  // owns the 5-minute TTL, single-use, and the hourly issuance cap; the UI only
+  // shows what it returns.
+  const linkBtn = $('telegram-link');
+  const unlinkBtn = $('telegram-unlink');
+  const linkPanel = $('telegram-link-panel');
+  const telegramError = $('telegram-error');
+  const telegramDone = $('telegram-done');
+
+  function telegramFail(err: unknown): void {
+    telegramDone.hidden = true;
+    telegramError.textContent = describeError(err).message;
+    telegramError.hidden = false;
+  }
+
+  function showLinkCode(response: LinkCodeResponse): void {
+    telegramError.hidden = true;
+    $('link-code').textContent = response.code;
+    $('link-code-instruction').textContent = linkCodeInstruction(response.code, response.ttl_minutes);
+    linkPanel.hidden = false;
+  }
+
+  function renderTelegram(linked: boolean): void {
+    linkBtn.hidden = linked;
+    unlinkBtn.hidden = !linked;
+    if (linked) linkPanel.hidden = true;
+  }
+
+  linkBtn.addEventListener('click', () => {
+    telegramError.hidden = true;
+    telegramDone.hidden = true;
+    void apiFetch<LinkCodeResponse>('/api/telegram/link-code', { method: 'POST' })
+      .then(showLinkCode)
+      .catch(telegramFail);
+  });
+
+  $('link-code-again').addEventListener('click', () => {
+    telegramError.hidden = true;
+    void apiFetch<LinkCodeResponse>('/api/telegram/link-code', { method: 'POST' })
+      .then(showLinkCode)
+      .catch(telegramFail);
+  });
+
+  unlinkBtn.addEventListener('click', () => {
+    telegramError.hidden = true;
+    telegramDone.hidden = true;
+    void apiFetch<{ status: string; removed: number }>('/api/telegram', { method: 'DELETE' })
+      .then(() => {
+        renderTelegram(false);
+        $('linked-telegram').textContent = 'Not linked';
+        telegramDone.textContent = 'Telegram unlinked. Your account and balance are unchanged; you can link a chat again at any time.';
+        telegramDone.hidden = false;
+      })
+      .catch(telegramFail);
+  });
+
+  // --- Data export -----------------------------------------------------------
+  // GET /api/export returns the account's own data as JSON. Downloaded via a
+  // Blob rather than a plain link so a failed request surfaces as a message here
+  // instead of navigating the tab to a raw error body. The filename is dated, so
+  // several exports do not collide in the downloads folder.
+  const exportBtn = $('export-btn') as HTMLButtonElement;
+  const exportError = $('export-error');
+  const exportDone = $('export-done');
+
+  exportBtn.addEventListener('click', () => {
+    exportError.hidden = true;
+    exportDone.hidden = true;
+    exportBtn.disabled = true;
+    const original = exportBtn.textContent;
+    exportBtn.textContent = 'Preparing…';
+
+    void apiFetch<Record<string, unknown>>('/api/export')
+      .then((data) => {
+        const text = JSON.stringify(data, null, 2);
+        const blob = new Blob([text], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const stamp = new Date().toISOString().slice(0, 10);
+        a.href = url;
+        a.download = `apikita-export-${stamp}.json`;
+        document.body.append(a);
+        a.click();
+        a.remove();
+        // Release the object URL on the next tick, once the click has been handled.
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        exportDone.textContent = `Downloaded ${(blob.size / 1024).toFixed(1)} KB.`;
+        exportDone.hidden = false;
+      })
+      .catch((err: unknown) => {
+        exportError.textContent = describeError(err).message;
+        exportError.hidden = false;
+      })
+      .finally(() => {
+        exportBtn.disabled = false;
+        exportBtn.textContent = original;
       });
   });
 

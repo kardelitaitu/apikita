@@ -57,12 +57,37 @@
 # Exit codes (3, 4 and 6 keep tools/reconcile/reconcile.sh's meanings):
 #   0  PASS    - restore completed, integrity ok, zero drifting rows, every criterion met
 #   1  FAIL    - a check failed: drift, integrity, row counts, spot-check, or no key hashes
-#   2  usage   - no --target, a bad option, a target that is not a bare *.db
-#                 filename, or a knob that is not a usable number
+#   2  cannot start - the run never reached a check, and NOTHING was touched. This list was
+#                 four items long and the code had EIGHT exit-2 sites, so three whole classes
+#                 of failure were undocumented. Enumerated from the code:
+#                   * usage            - no --target, an unknown option, an option missing its
+#                                        value, a target that is not a bare *.db filename
+#                   * a knob           - DRILL_ROW_TOLERANCE / _PCT / RTO_BUDGET_SECONDS not a
+#                                        non-negative integer, DRILL_KEEP_SCRATCH not 0 or 1
+#                   * a bad source URL - DRILL_SOURCE_URL/DATABASE_URL that is not sqlite:*, or
+#                                        one naming no file (`sqlite://` or `:memory:`)
+#                   * an unusable environment - the log directory or the staging directory
+#                                        could not be created. NOTHING TO FIX ON THE COMMAND
+#                                        LINE; this is a permissions or disk problem, which is
+#                                        why it is not called "usage" any more.
+#                 The distinction the old wording obscured: an operator seeing 2 would re-read
+#                 their flags, and three of the classes above have no flag to correct. The
+#                 environment case in particular is the one a first deployment hits, and it
+#                 printed the same code as a typo.
 #   3  missing - a required tool is absent (sqlite3, reconcile.sh, verify.sql)
 #   4  db      - a sqlite3 command failed (unreadable file, SQL error)
 #   5  REFUSED - the target looks like the live database. NOTHING was touched.
-#   6  dump    - the artifact is missing, empty, or not a readable SQLite database
+#   6  dump    - the artifact, OR THE SOURCE, is missing, empty, or not a readable SQLite
+#                 database. The source half matters more than it reads: SQLite opens a
+#                 zero-length file as a brand-new EMPTY database, so without this the drill
+#                 would compare 0 rows against 0 rows, report zero drifting accounts, and PASS
+#                 a restore of nothing. Both guards are the `is_sqlite_file` check, on
+#                 `$SOURCE_PATH` and on `$DUMP` - cited by NAME rather than by line, and that
+#                 is not fastidiousness: the first draft of this table cited the pair by line
+#                 number, and correcting the table moved them before the edit was even
+#                 finished. A line number inside the header of the file it numbers is stale the
+#                 moment the header grows, which is the same defect `server/src/doc_claims.rs`
+#                 exists to prevent for `docs/`.
 #   7  restore - the restore itself failed, or the RESTORED file failed integrity_check
 #   8  teardown- the scratch file could not be deleted (it is still there)
 #

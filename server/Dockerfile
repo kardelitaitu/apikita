@@ -9,6 +9,13 @@
 # are pure attack surface with no operational benefit - and the image is also
 # ~40x smaller, which is what makes a rollback fast.
 #
+# THE PACKAGE MANAGER HAS TO BE REMOVED EXPLICITLY, which is not obvious from the
+# paragraph above: multi-stage keeps the BUILDER's toolchain out, but it cannot
+# remove what the RUNTIME base itself ships, and debian:bookworm-slim ships apt
+# and dpkg. They were present in this image until W48, so the sentence above was
+# two-thirds true for as long as it existed. There is now a RUN that deletes them
+# and a CI step that fails if they come back - see the comment at that RUN.
+#
 # WHICH BASE, AND WHY BOTH ENDS ARE PINNED. The builder is the official
 # `rust` image at an explicit minor version; the runtime is
 # `debian:bookworm-slim`. Both are pinned rather than `:latest` for the reason
@@ -62,7 +69,7 @@ COPY server/migrations ./migrations
 
 # Touch so cargo cannot consider the stale dummy artefact fresh.
 #
-# TWO binaries, not one. `apikita-server` is the service; `migrate` is the schema
+# THREE binaries, not two. `apikita-server` is the service; `migrate` is the schema
 # tool, and it ships in the same image because deployment step [2] ("run
 # migrations") otherwise has NO artifact to run — the pipeline would have a step
 # with no executable, which is the same defect as the missing Dockerfile itself.
@@ -70,17 +77,35 @@ COPY server/migrations ./migrations
 # `bin/migrate.rs` and NEVER on server boot, so this cannot be folded into the
 # server's startup: the operator must be able to migrate the schema BEFORE the
 # new binary starts, and against a database the old binary is still writing.
+#
+# `usage-purge` is here for ONE of its two sweeps: `db::expire_credit`, the
+# credit-expiry sweep. The wallet page and docs/terms-of-service.md both promise
+# "credit expires 2 years after each deposit", and until this line that promise
+# had no runner — the binary existed, the sweep inside it was tested by seventeen
+# tests, and nothing shipped it. The maintenance scheduler could not reimplement
+# it safely: the sweep is a GUARDED DEBIT plus a ledger row carrying
+# `balance_after`, i.e. the Gate 2 ledger invariant, and writing that a second
+# time in shell SQL is the duplication this repository has removed before.
+# Shipping the tested function is the safer half of the two resolutions
+# docs/launch-checklist.md allows.
+#
+# Its OTHER sweep (`purge_expired_usage`) duplicates four DELETEs that
+# `.docker/maintenance/entrypoint.sh run_retention` already performs inline. That
+# is deliberate and harmless — the statements are idempotent, and the alternative
+# is a second copy of them — but the scheduler reports both, so an operator sees
+# two counts rather than one.
 RUN touch src/main.rs src/lib.rs \
-    && cargo build --release --locked --bin apikita-server --bin migrate
+    && cargo build --release --locked \
+        --bin apikita-server --bin migrate --bin usage-purge
 
 # -----------------------------------------------------------------------------
 # Stage 2: runtime
 # -----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
-# ca-certificates: the proxy and the auth exchange make outbound TLS calls to
-# upstream providers and to PocketBase, so the CA bundle is a hard requirement,
-# not a nicety. tini is the PID 1 init: the server is a tokio process that
+# ca-certificates: the proxy and the auth endpoints make outbound TLS calls to
+# upstream providers and to Google's JWKS (and SMTP), so the CA bundle is a hard
+# requirement, not a nicety. tini is the PID 1 init: the server is a tokio process that
 # spawns work, and without a real init a container stop signals only PID 1
 # instead of the process group - which turns a graceful shutdown into a timeout
 # and a SIGKILL. wget comes from busybox: a HEALTHCHECK needs an HTTP client,
@@ -98,6 +123,32 @@ RUN apt-get update \
 RUN groupadd --system --gid 10001 apikita \
     && useradd --system --uid 10001 --gid apikita --create-home apikita
 
+
+# THE PACKAGE MANAGER IS REMOVED, because the comment at the top of this file says it
+# should be and it was not.
+#
+# The header claims "a compiler, a package manager and a shell in the final image are pure
+# attack surface with no operational benefit". Measured against the built image, the
+# compilers WERE gone (the multi-stage COPY does that) but `apt`, `apt-get` and `dpkg` were
+# PRESENT - they arrive with `debian:bookworm-slim`, and the only apt-get in this file
+# uses them at BUILD time, after which nothing needs them again.
+#
+# WHY IT MATTERS FOR THIS IMAGE SPECIFICALLY. The container holds provider credentials and
+# the money database. A package manager is post-exploitation convenience that needs no
+# network - `dpkg -i` a local payload - and it is also what lets the image be modified from
+# INSIDE. docs/security notes the non-root user below is the primary control; this removes
+# the tooling that would make the next step after a compromise easier.
+#
+# VERIFIED, not assumed: the variant was BUILT AND BOOTED before this line was added. It
+# reaches `healthy`, serves the full route table (200 /health, 401 on every protected route,
+# 404 on unknown and DESIGNED-NOT-BUILT paths), the busybox HEALTHCHECK still works, the CA
+# bundle (3697 lines) and tini both survive, and `apikita-migrate` still runs. Only these
+# binaries are removed, and the image does NOT shrink measurably - 149MB either way.
+# THE BENEFIT IS ATTACK SURFACE, NOT SIZE; claiming both would be dishonest.
+RUN rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache /usr/bin/apt-key \
+    /usr/bin/apt-mark /usr/bin/dpkg /usr/bin/dpkg-deb /usr/bin/dpkg-divert \
+    /usr/bin/dpkg-query /usr/bin/dpkg-split /usr/bin/dpkg-statoverride
+
 # /srv/apikita is the same root .docker/maintenance uses (APP_DIR), so the two
 # images agree about where the repo and the data directory live:
 #   /srv/apikita/config     the routing/pricing config
@@ -106,6 +157,12 @@ WORKDIR /srv/apikita/server
 
 COPY --from=builder /build/target/release/apikita-server /usr/local/bin/apikita-server
 COPY --from=builder /build/target/release/migrate /usr/local/bin/apikita-migrate
+# The credit-expiry sweep. It lives in this image rather than in the maintenance
+# scheduler's because the sweep is money-moving Rust that is already tested, and
+# the scheduler image is Alpine with no toolchain — it would have to run a static
+# copy of this same binary. One image that can run it is enough; what matters is
+# that SOME shipped artifact does, which until now none did.
+COPY --from=builder /build/target/release/usage-purge /usr/local/bin/apikita-usage-purge
 
 # The config is baked in because it is source, not a secret: it is versioned in
 # the repository and a deployment that mounts a different one is a deployment

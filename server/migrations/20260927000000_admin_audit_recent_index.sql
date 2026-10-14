@@ -1,0 +1,25 @@
+-- =============================================================================
+-- admin_audit: an index for the GLOBAL recent-actions read.
+--
+-- WHY ANOTHER INDEX ON admin_audit
+--
+-- The two existing indexes serve lookup BY something: by operator
+-- (operator_id, created_at DESC) and by target (target_type, target_id). Neither
+-- serves the operator question "what has been happening across the whole
+-- platform, newest first" - that query has no leading equality column, so it would
+-- sort the entire table on every load. admin_audit is small today, but it grows
+-- with every suspend/resume (and, later, every money action), and a table scan to
+-- answer "recent actions" is the exact shape an index is for.
+--
+-- The index is (created_at DESC, id DESC), matching the ORDER BY exactly. id is
+-- the tiebreaker the query uses for rows written in the same instant (SQLite's
+-- created_at has sub-second precision, but two rows in the same transaction share
+-- a bound timestamp), so the composite keeps the sort fully index-served rather
+-- than falling back to a temp b-tree for ties.
+--
+-- ADDITIVE ONLY, per docs/decisions.md "Migration safety: additive only". An
+-- index adds no column and constrains no existing write, so it is safe to apply
+-- to a live database. Forward-only: there is no down migration.
+-- =============================================================================
+
+CREATE INDEX admin_audit_recent_idx ON admin_audit (created_at DESC, id DESC);

@@ -1,27 +1,42 @@
 #!/bin/sh
-# apikita alert probe - the three docs/observability.md alerts that need NO database.
+# apikita alert probe - the docs/observability.md alerts that need NO database.
 #
-# docs/observability.md:97-107 lists 9 alerts. tools/alert/check-alerts.sh runs the
-# three answerable with psql alone and PRINTS the rest as not-checked. Of those
-# seven, three never needed a metrics backend - they needed a prober:
+# MEASURED, because this header said "the three" while the script had grown to seven and its own
+# `--list` printed the seven. The counts below are read from the files, not remembered:
+#
+#   alerts.tsv            12 definitions   <- the registry; the single place a threshold lives
+#   this script            7 code paths     <- what `--list` prints, per check
+#   check-alerts.sh       11 definitions   <- names every one, and runs the database-backed set
+#
+# A script whose header understates what it does is the same defect as a document that
+# understates a pipeline: a reader trusts the number instead of the output.
+#
+# The checks that needed a prober rather than a database connection:
 #
 #   api_down          - external GET /health, alert after a 2-minute window of failures
 #   relay_down        - external check against the relay's own origin
 #   webhook_rejection - the server's captured stdout, counted for topup.rejected
+#   refund_refusal    - the same stdout, counted for refund.refused
+#   error_rate        - GET /api/admin/metrics, operator-authenticated
+#   all_providers_unhealthy - the same route: every endpoint's breaker open
+#   db_disk           - the same route: retention lag, which is the alert's own ACTION
 #
-# This script is that prober, and it opens NO DATABASE CONNECTION - deliberately.
-# The stack is being migrated from PostgreSQL to SQLite (a concurrent change under
-# server/), and an alert path that goes blind during a database migration is blind
-# at the worst possible moment. Nothing here knows what a DSN is.
+# A check that is configured but cannot run prints **skipped** and says why, which is the
+# property this directory exists for - see the note above `--list`.
+#
+# This script opens NO DATABASE CONNECTION - deliberately. The stack is being migrated from
+# PostgreSQL to SQLite (a concurrent change under server/), and an alert path that goes blind
+# during a database migration is blind at the worst possible moment. Nothing here knows what a
+# DSN is.
 #
 # Delivery is NOT reimplemented. Every firing is routed through alert.sh --alert <id>,
 # so the cooldown, the channel precedence and the delivery exit codes stay in ONE
 # place. See tools/alert/README.md.
 #
 # Usage:
-#   probe.sh                          # all three checks
+#   probe.sh                          # every check
 #   probe.sh --check api_down         # one check (repeatable)
-#   probe.sh --list                   # the three, and whether each can run
+#   probe.sh --list                   # every check, and whether each can run
 #   probe.sh --help
 #
 # Exit codes - check-alerts.sh's table, so an operator learns one numbering:
@@ -44,6 +59,10 @@ set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 ALERT_SH="$SCRIPT_DIR/alert.sh"
+# The registry, named once. `probe.sh` counts its `needs-metrics` rows for the NOT CHECKED summary, so
+# this path is load-bearing rather than decorative - an unset variable printed "0 of the 0 alerts"
+# rather than failing, which is the wrong direction for a count to be wrong in.
+REGISTRY="$SCRIPT_DIR/alerts.tsv"
 
 # --- knobs (every one overridable so the checks are testable without a 2-minute wait)
 API_URL="${PROBE_API_URL:-http://127.0.0.1:8080}"
@@ -53,6 +72,9 @@ RELAY_URL="${PROBE_RELAY_URL:-http://127.0.0.1:8000}"
 LOG_FILE="${PROBE_LOG_FILE:-}"
 STATE_DIR="${PROBE_STATE_DIR:-${TMPDIR:-/tmp}/apikita-probe}"
 HTTP_TIMEOUT="${PROBE_HTTP_TIMEOUT:-5}"
+# The operator session cookie the metrics route requires. UNSET means the error_rate
+# check is visibly skipped, never silently passed.
+OPERATOR_COOKIE="${PROBE_OPERATOR_COOKIE:-}"
 
 TMP="${TMPDIR:-/tmp}"
 CURL_ERR="$TMP/probe.$$.curl.err"
@@ -70,7 +92,7 @@ MODE="run"
 
 usage() {
     echo "probe: usage: probe.sh [--check <id>]... | --list | --help" >&2
-    echo "probe: checks: api_down, relay_down, webhook_rejection (no database access at all)" >&2
+    echo "probe: checks: api_down, relay_down, webhook_rejection, refund_refusal, error_rate, all_providers_unhealthy, db_disk, proxy_undercharge (no database access at all)" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -100,7 +122,43 @@ if [ "$MODE" = "list" ]; then
         printf 'probe: %-20s %-8s %s\n' "webhook_rejection" "skipped" \
             "PROBE_LOG_FILE is unset - no log source configured, so this alert is NOT checked"
     fi
-    echo "probe: not checked by anything in tools/alert yet: relay_5xx, error_rate, all_providers_unhealthy, db_disk"
+    if [ -n "$LOG_FILE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "refund_refusal" "covered" \
+            "counts 'refund.refused' in lines of $LOG_FILE not yet scanned"
+    else
+        printf 'probe: %-20s %-8s %s\n' "refund_refusal" "skipped" \
+            "PROBE_LOG_FILE is unset - no log source configured, so this alert is NOT checked"
+    fi
+    if [ -n "$OPERATOR_COOKIE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "error_rate" "covered" \
+            "GET $API_URL/api/admin/metrics as an operator; alerts above a 5% 5xx rate"
+    else
+        printf 'probe: %-20s %-8s %s\n' "error_rate" "skipped" \
+            "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+    fi
+    if [ -n "$OPERATOR_COOKIE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "proxy_undercharge" "covered" \
+            "the undercharge counters on $API_URL/api/admin/metrics; alerts when money the wallet could not cover went uncollected"
+    else
+        printf 'probe: %-20s %-8s %s\n' "proxy_undercharge" "skipped" \
+            "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+    fi
+
+    if [ -n "$OPERATOR_COOKIE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "all_providers_unhealthy" "covered" \
+            "GET $API_URL/api/admin/metrics as an operator; alerts when a model has NO usable endpoint"
+    else
+        printf 'probe: %-20s %-8s %s\n' "all_providers_unhealthy" "skipped" \
+            "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+    fi
+    if [ -n "$OPERATOR_COOKIE" ]; then
+        printf 'probe: %-20s %-8s %s\n' "db_disk" "covered" \
+            "the retention report on $API_URL/api/admin/metrics; alerts when a table holds a row past its window"
+    else
+        printf 'probe: %-20s %-8s %s\n' "db_disk" "skipped" \
+            "PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+    fi
+    echo "probe: not checked by anything in tools/alert yet: relay_5xx"
     exit 0
 fi
 
@@ -122,9 +180,9 @@ esac
 if [ -n "$CHECKS" ]; then
     for id in $CHECKS; do
         case "$id" in
-            api_down|relay_down|webhook_rejection) ;;
+            api_down|relay_down|webhook_rejection|refund_refusal|error_rate|all_providers_unhealthy|db_disk|proxy_undercharge) ;;
             *) echo "probe: unknown check: $id" >&2
-               echo "probe: known checks: api_down, relay_down, webhook_rejection" >&2
+               echo "probe: known checks: api_down, relay_down, webhook_rejection, refund_refusal, error_rate, all_providers_unhealthy, db_disk" >&2
                exit 2 ;;
         esac
     done
@@ -205,6 +263,303 @@ check_api_down() {
     done
 }
 
+# --- check: db_disk -----------------------------------------------------------
+# The alert is NAMED "DB disk >80%" but its ACTION is "Usage rows growing; check
+# retention", and that is what this check measures: whether any age-based table is
+# holding a row past its retention window. A volume percentage cannot answer it - 80%
+# full is normal for a working database - and a sweep that silently STOPPED is an
+# incident at any size, because it breaks a published retention promise.
+#
+# The route reports `retention.behind` (bool) plus `retention.oldest_days` naming the
+# lagging tables. `behind` can be NULL when the server could not run the query, and
+# null is NOT false: an unknown must never read as healthy.
+check_db_disk() {
+    if [ -z "$OPERATOR_COOKIE" ]; then
+        echo "probe: skipped db_disk: PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+        return 0
+    fi
+
+    BODY_FILE="$TMP/probe-retention.$$.json"
+    CODE=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+        --connect-timeout "$HTTP_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -H "Cookie: $OPERATOR_COOKIE" \
+        "$API_URL/api/admin/metrics" 2>"$CURL_ERR")
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        REASON=$(first_err "curl exit $RC")
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED db_disk: the metrics route did not answer ($REASON)" >&2
+        fail_with 4
+        return 0
+    fi
+    if [ "$CODE" != "200" ]; then
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED db_disk: /api/admin/metrics returned HTTP $CODE (401 = bad or expired cookie, 403 = not an operator)" >&2
+        fail_with 4
+        return 0
+    fi
+
+    BEHIND=$(sed -n 's/.*"behind":[[:space:]]*\([^,}]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    OLDEST=$(sed -n 's/.*"oldest_days":[[:space:]]*{\([^}]*\)}.*/\1/p' "$BODY_FILE" | head -n 1)
+    rm -f "$BODY_FILE"
+
+    case "$BEHIND" in
+        null)
+            # The server reported a FAILED retention read. Unknown is not healthy.
+            echo "probe: FAILED db_disk: the server could not run the retention query (behind=null); unknown is not clean" >&2
+            fail_with 6
+            return 0
+            ;;
+        true)
+            DETAIL=$(printf '%s' "$OLDEST" | tr ',' ' ' | tr -d '"' | tr ':' '=')
+            echo "probe: ALERT db_disk: retention is behind - $DETAIL"
+            fire db_disk "retention is not keeping up; rows past their window: $DETAIL"
+            return 0
+            ;;
+        false)
+            echo "probe: OK  db_disk: every age-based table is inside its retention window"
+            return 0
+            ;;
+        *)
+            echo "probe: FAILED db_disk: could not parse 'behind' from the metrics route" >&2
+            fail_with 6
+            return 0
+            ;;
+    esac
+}
+# --- check: all_providers_unhealthy -------------------------------------------
+# Threshold from alerts.tsv: "every endpoint open". The metrics route reports
+# `unhealthy_models` - the models whose EVERY routed endpoint has an open circuit -
+# so this check reads the same payload error_rate does and fires once per model.
+#
+# The server deliberately does NOT reuse its cooldown accessor for this: one open
+# endpoint means failover is WORKING, and alerting on that would page an operator
+# during normal operation. See UpstreamClient::all_endpoints_unhealthy.
+check_all_providers_unhealthy() {
+    if [ -z "$OPERATOR_COOKIE" ]; then
+        echo "probe: skipped all_providers_unhealthy: PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+        return 0
+    fi
+
+    BODY_FILE="$TMP/probe-unhealthy.$$.json"
+    CODE=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+        --connect-timeout "$HTTP_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -H "Cookie: $OPERATOR_COOKIE" \
+        "$API_URL/api/admin/metrics" 2>"$CURL_ERR")
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        REASON=$(first_err "curl exit $RC")
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED all_providers_unhealthy: the metrics route did not answer ($REASON)" >&2
+        fail_with 4
+        return 0
+    fi
+    if [ "$CODE" != "200" ]; then
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED all_providers_unhealthy: /api/admin/metrics returned HTTP $CODE (401 = bad or expired cookie, 403 = not an operator)" >&2
+        fail_with 4
+        return 0
+    fi
+
+    # `unhealthy_models` is a JSON array of names, possibly empty. Pull the array
+    # body and strip the brackets rather than parse JSON: the payload is flat.
+    MODELS=$(sed -n 's/.*"unhealthy_models":[[:space:]]*\[\([^]]*\)\].*/\1/p' "$BODY_FILE" | head -n 1)
+    rm -f "$BODY_FILE"
+
+    # Trim whitespace and quotes to get bare names, one per line.
+    NAMES=$(printf '%s' "$MODELS" | tr ',' '\n' | tr -d '"' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$')
+    if [ -z "$NAMES" ]; then
+        echo "probe: OK  all_providers_unhealthy: every model has at least one usable endpoint"
+        return 0
+    fi
+
+    N=$(printf '%s\n' "$NAMES" | wc -l | tr -d ' ')
+    echo "probe: ALERT all_providers_unhealthy: $N model(s) with NO usable endpoint: $(printf '%s' "$NAMES" | tr '\n' ' ')"
+    fire all_providers_unhealthy "$N model(s) have every endpoint circuit-open: $(printf '%s' "$NAMES" | tr '\n' ' ')"
+}
+# --- check: error_rate --------------------------------------------------------
+# Threshold from alerts.tsv: "5% over 5 min". The server counts 5xx responses and
+# total responses in process (`error.rs`), and serves them at
+# `GET /api/admin/metrics` behind the OPERATOR guard - not on /health, whose body is
+# pinned because the deploy gate parses it and a leak test forbids any digit in it.
+#
+# This is why the check needs PROBE_OPERATOR_COOKIE: the route is authenticated, so a
+# prober without a session cannot read it. An unset cookie is a VISIBLY SKIPPED check
+# rather than a silent pass, the same rule as an unset PROBE_LOG_FILE.
+#
+# The rate is a RATIO of two counters, and `null` is NOT zero: the server sends null
+# when it has served nothing, which is the fresh-deploy case. Treating null as 0.0
+# would report a perfectly healthy service and suppress the alert - the exact
+# failure mode the counter was built to avoid. So null is NO DATA and the check
+# says so.
+check_error_rate() {
+    if [ -z "$OPERATOR_COOKIE" ]; then
+        echo "probe: skipped error_rate: PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+        return 0
+    fi
+
+    BODY_FILE="$TMP/probe-metrics.$$.json"
+    CODE=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+        --connect-timeout "$HTTP_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -H "Cookie: $OPERATOR_COOKIE" \
+        "$API_URL/api/admin/metrics" 2>"$CURL_ERR")
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        REASON=$(first_err "curl exit $RC")
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED error_rate: the metrics route did not answer ($REASON)" >&2
+        fail_with 4
+        return 0
+    fi
+    if [ "$CODE" != "200" ]; then
+        rm -f "$BODY_FILE"
+        # 401 means the cookie is wrong or expired, 403 that it is not an operator.
+        # Either way this is a CONFIGURATION problem, not a healthy service: reporting
+        # a pass here would be the silent-absence failure this directory exists to
+        # prevent.
+        echo "probe: FAILED error_rate: /api/admin/metrics returned HTTP $CODE (401 = bad or expired cookie, 403 = not an operator)" >&2
+        fail_with 4
+        return 0
+    fi
+
+    # Pull the three fields without a JSON parser (sqlite3/curl only, no jq): the
+    # payload is flat, so a targeted grep is honest and sufficient.
+    RATE=$(sed -n 's/.*"error_rate":[[:space:]]*\([^,}]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    ERRORS=$(sed -n 's/.*"server_errors":[[:space:]]*\([0-9]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    RESPONSES=$(sed -n 's/.*"responses":[[:space:]]*\([0-9]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    rm -f "$BODY_FILE"
+
+    if [ "$RATE" = "null" ]; then
+        echo "probe: OK  error_rate: no data (null) - the service has served nothing in this window; NOT a healthy 0%"
+        return 0
+    fi
+    case "$RATE" in
+        ''|*[!0-9.]*)
+            echo "probe: FAILED error_rate: could not parse a rate from the metrics route" >&2
+            fail_with 6
+            return 0
+            ;;
+    esac
+
+    # THE OTHER TWO FIELDS ARE VALIDATED THE SAME WAY, and MEASURED, they were not.
+    #
+    # `RATE` has the case above; `ERRORS` and `RESPONSES` were read by the same `sed` and then used
+    # unchecked at the two messages below and in the alert body. A body that carries `error_rate` but
+    # not `server_errors` - which is what a RENAME on the server produces, and what this parser cannot
+    # tell apart from a genuinely absent field - left ERRORS empty while RATE parsed cleanly, so the
+    # gate passed the rate check and FIRED:
+    #
+    #     " of 100 responses are 5xx (0.42), above the 5% threshold"
+    #
+    # A sentence with no subject, sent to whoever is being paged, about a rate that was real. The
+    # reachability is what makes this worth a check rather than a comment: curl failure and a non-200
+    # are both caught above, so the remaining exposure is exactly a 200 whose shape changed - the
+    # case a schema edit produces and a test of THIS script would not see.
+    #
+    # Digits only, because both are counts. An empty value is the failure, and so is anything that is
+    # not a run of digits - the same rule the rate applies, one field over.
+    for pair in "server_errors:$ERRORS" "responses:$RESPONSES"; do
+        field=${pair%%:*}
+        value=${pair#*:}
+        case "$value" in
+            ''|*[!0-9]*)
+                echo "probe: FAILED error_rate: the metrics route answered 200 but '$field' did not parse (got '$value')." >&2
+                echo "probe:   The rate itself parsed, so without this the alert below fires with a" >&2
+                echo "probe:   missing figure in its message. /api/admin/metrics always sends it, so a" >&2
+                echo "probe:   field that does not parse means the payload shape changed." >&2
+                fail_with 6
+                return 0
+                ;;
+        esac
+    done
+
+    # Compare in tenths of a percent using integer arithmetic: the threshold is 5%,
+    # and shell has no float. `awk` is already a dependency of this directory.
+    BREACH=$(awk -v r="$RATE" 'BEGIN { print (r > 0.05) ? "yes" : "no" }')
+    if [ "$BREACH" = "yes" ]; then
+        echo "probe: ALERT error_rate: $RATE ($ERRORS of $RESPONSES responses) exceeds the 5% threshold"
+        fire error_rate "$ERRORS of $RESPONSES responses are 5xx ($RATE), above the 5% threshold"
+    else
+        echo "probe: OK  error_rate: $RATE ($ERRORS of $RESPONSES) is within the 5% threshold"
+    fi
+}
+
+# --- check: proxy_undercharge --------------------------------------------------
+# Threshold from alerts.tsv: "any (>=1 in the window)".
+#
+# THIS ROW WAS needs-metrics for as long as it existed, because its signal was a server
+# LOG line that neither script reads for anything but topup.rejected. The money layer now
+# counts it (server/src/error.rs::MoneyCounter, written by settle_partial_usage) and
+# serves it on the SAME operator route error_rate reads, so the gap is closed.
+#
+# WHY IT NEEDS ITS OWN COUNTER AND CANNOT BE DERIVED FROM THE ONES THAT EXIST:
+#   * the ledger cannot show it - the debit was CLAMPED, so balance = SUM(delta) still
+#     holds and ledger_drift stays 0. A clamped settlement is arithmetically perfect,
+#     which is exactly why it is invisible to the money gate.
+#   * error_rate cannot either - the request returned 200. An undercharge is a SUCCESS
+#     whose money is short.
+#
+# The counterpart to refund_refusal is now genuinely symmetrical rather than half of it
+# being unreadable.
+#
+# ZERO IS A REAL AND GOOD READING, not "no data". Unlike error_rate's null for an empty
+# window, this counter is expected to be zero on a healthy service, so 0 passes and a
+# MISSING figure is the failure (the same rule error_rate's parse check uses).
+check_proxy_undercharge() {
+    if [ -z "$OPERATOR_COOKIE" ]; then
+        echo "probe: skipped proxy_undercharge: PROBE_OPERATOR_COOKIE is unset - the route is operator-authenticated, so this alert is NOT checked"
+        return 0
+    fi
+
+    BODY_FILE="$TMP/probe-metrics.$$.json"
+    CODE=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+        --connect-timeout "$HTTP_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -H "Cookie: $OPERATOR_COOKIE" \
+        "$API_URL/api/admin/metrics" 2>"$CURL_ERR")
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        REASON=$(first_err "curl exit $RC")
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED proxy_undercharge: the metrics route did not answer ($REASON)" >&2
+        fail_with 4
+        return 0
+    fi
+    if [ "$CODE" != "200" ]; then
+        rm -f "$BODY_FILE"
+        echo "probe: FAILED proxy_undercharge: /api/admin/metrics returned HTTP $CODE (401 = bad or expired cookie, 403 = not an operator)" >&2
+        fail_with 4
+        return 0
+    fi
+
+    # Pull both fields without a JSON parser, the same way error_rate does: the payload
+    # is flat, so a targeted grep is honest and sufficient.
+    EVENTS=$(sed -n 's/.*"undercharges":[[:space:]]*\([0-9]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+    IDR=$(sed -n 's/.*"undercharged_idr":[[:space:]]*\([0-9]*\).*/\1/p' "$BODY_FILE" | head -n 1)
+
+    # A body carrying one figure but not the other is a schema edit neither this script
+    # nor a test of it would otherwise notice. A silently-missing value would parse as
+    # empty and read as zero, which SUPPRESSES the alert.
+    for pair in "undercharges=$EVENTS" "undercharged_idr=$IDR"; do
+        name=${pair%%=*}
+        value=${pair#*=}
+        case "$value" in
+            ''|*[!0-9]*)
+                rm -f "$BODY_FILE"
+                echo "probe: FAILED proxy_undercharge: the metrics route answered 200 but '$name' did not parse (got '$value')." >&2
+                echo "probe:   /api/admin/metrics always sends both, so something changed the payload." >&2
+                fail_with 4
+                return 0
+                ;;
+        esac
+    done
+
+    if [ "$EVENTS" -gt 0 ]; then
+        echo "probe: ALERT proxy_undercharge: $EVENTS clamped settlement(s), $IDR IDR never collected since start"
+        fire proxy_undercharge "$EVENTS request(s) answered with money the wallet could not cover ($IDR IDR uncollected). The ledger still balances, so only this counter shows it. Check the reservation size against the model rates."
+    else
+        echo "probe: OK  proxy_undercharge: 0 undercharges, 0 IDR uncollected"
+    fi
+}
 # --- check: relay_down --------------------------------------------------------
 # Threshold is "1 failed external check": ONE request, no window. Any HTTP answer at
 # all means the relay is up - a 502/504 is relay_5xx's alert (still unchecked), not
@@ -230,9 +585,17 @@ check_relay_down() {
 # a line offset in PROBE_STATE_DIR: one page per rejection, not one page per run.
 # A rotation (the file shrank) rescans from the start.
 record_offset() {
+    record_offset_file "$STATE_FILE" "$1"
+}
+
+# record_offset_file <path> <value> - the same write, for a check that owns an offset
+# file other than the shared one. Checks that scan the SAME log for DIFFERENT events
+# need separate markers: a shared one would let whichever event is scanned first
+# advance past the other and silently swallow it.
+record_offset_file() {
     if mkdir -p "$STATE_DIR" 2>/dev/null; then
-        printf '%s\n' "$1" > "$STATE_FILE" 2>/dev/null || \
-            echo "probe: warning: cannot write $STATE_FILE; the same log lines will be re-scanned" >&2
+        printf '%s\n' "$2" > "$1" 2>/dev/null || \
+            echo "probe: warning: cannot write $1; the same log lines will be re-scanned" >&2
     else
         echo "probe: warning: state dir not writable ($STATE_DIR); the same log lines will be re-scanned" >&2
     fi
@@ -299,12 +662,92 @@ check_webhook_rejection() {
     return 0
 }
 
+# --- check: refund_refusal ----------------------------------------------------
+# The registry condition is "any refund.refused". docs/launch-checklist.md:68 names
+# this as the one outstanding code-shaped item in Gate 2: "unalerted, a refusal is
+# indistinguishable from a bug".
+#
+# WHY ALERT AT ALL, when the behaviour is correct: a refund refusal is the ONE
+# webhook outcome where NOTHING MOVES - the topup stays `settled`, no ledger row is
+# appended, the balance is untouched. That is also exactly what a status-mapping
+# regression routing real events into this arm would look like, so without a distinct
+# marker the two are indistinguishable. A spike therefore means either a customer
+# genuinely disputing, or a routing bug - both worth a look, neither visible any other
+# way.
+#
+# A SEPARATE offset file from webhook_rejection, deliberately. They share the log, but
+# a shared marker would let a rejection advance past a refusal (or the reverse) and
+# silently swallow the other event. One offset per alert is one event type per scan.
+check_refund_refusal() {
+    if [ -z "$LOG_FILE" ]; then
+        echo "probe: SKIPPED refund_refusal - no log source configured (PROBE_LOG_FILE unset)."
+        echo "probe:   This alert is NOT being checked. Set PROBE_LOG_FILE to the server's captured"
+        echo "probe:   stdout to enable it. A skip stated out loud, not a pass."
+        return 0
+    fi
+    if [ ! -e "$LOG_FILE" ]; then
+        echo "probe: UNKNOWN refund_refusal - PROBE_LOG_FILE=$LOG_FILE does not exist, so" >&2
+        echo "probe:   'no refusals' cannot be claimed. Unknown is not clean." >&2
+        fail_with 6
+        return 0
+    fi
+    if [ ! -r "$LOG_FILE" ]; then
+        echo "probe: FAILED refund_refusal - PROBE_LOG_FILE=$LOG_FILE is not readable" >&2
+        fail_with 4
+        return 0
+    fi
+
+    STATE_FILE="$STATE_DIR/refund_refusal.offset"
+    LAST=0
+    if [ -f "$STATE_FILE" ]; then
+        LAST=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+        case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+    fi
+    TOTAL=$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' \t')
+    case "$TOTAL" in
+        ''|*[!0-9]*)
+            echo "probe: FAILED refund_refusal - could not count lines in $LOG_FILE" >&2
+            fail_with 4
+            return 0
+            ;;
+    esac
+    if [ "$TOTAL" -lt "$LAST" ]; then
+        echo "probe: note: $LOG_FILE shrank (rotated or truncated); scanning it from the start"
+        LAST=0
+    fi
+    NEW=$((TOTAL - LAST))
+    N=0
+    if [ "$NEW" -gt 0 ]; then
+        N=$(tail -n "+$((LAST + 1))" "$LOG_FILE" | grep -c -F 'refund.refused')
+    fi
+
+    if [ "$N" -gt 0 ]; then
+        echo "probe: ALERT refund_refusal: $N 'refund.refused' line(s) in $NEW new line(s) of $LOG_FILE"
+        fire refund_refusal "$N refund refusal(s) in the $NEW new line(s) of $LOG_FILE since the last scan. No money moved on this path: check for a status-mapping regression, or a customer disputing"
+        # The scan marker advances only when somebody was actually told, for the reason
+        # webhook_rejection documents: a failed delivery must not consume the event.
+        if [ "$FIRE_RC" -eq 0 ] || [ "$FIRE_RC" -eq 1 ]; then
+            record_offset_file "$STATE_FILE" "$TOTAL"
+        else
+            echo "probe:   -> scan marker NOT advanced; the next run will see these lines again" >&2
+        fi
+    else
+        echo "probe: OK  refund_refusal: 0 'refund.refused' in $NEW new line(s) of $LOG_FILE ($TOTAL total; scanned from line $((LAST + 1)))"
+        record_offset_file "$STATE_FILE" "$TOTAL"
+    fi
+    return 0
+}
 # --- run ----------------------------------------------------------------------
 run_check() {
     case "$1" in
         api_down) check_api_down ;;
         relay_down) check_relay_down ;;
+        error_rate) check_error_rate ;;
+        all_providers_unhealthy) check_all_providers_unhealthy ;;
+        db_disk) check_db_disk ;;
         webhook_rejection) check_webhook_rejection ;;
+        refund_refusal) check_refund_refusal ;;
+        proxy_undercharge) check_proxy_undercharge ;;
     esac
     return 0
 }
@@ -318,15 +761,37 @@ else
 fi
 
 # --- what still is not checked, on EVERY run ----------------------------------
-# The three checks above are covered now. These four are not, and saying so every run
-# is the whole point of this directory: a check that is silently absent is the
-# failure mode, and four silent absences would be four.
-cat >&2 <<'NOTCHECKED'
-probe: NOT CHECKED - 4 of the doc's 10 alerts still need a surface this cannot reach:
-probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off)
-probe:   error_rate              - HTTP counters over a 5-minute window (same access logs)
-probe:   all_providers_unhealthy - upstream circuit-breaker state, in-process under server/
-probe:   db_disk                 - volume usage, not visible to any client
+# SIX checks are covered now. ONE is not, and saying so every run is the whole point of
+# this directory: a check that is silently absent is the failure mode.
+#
+# db_disk MOVED OUT of this list: the retention lag is measured in-process and served at
+# GET /api/admin/metrics. The old line said "volume usage, not visible to any client",
+# which was true of the VOLUME but missed that the alert's own ACTION is "check
+# retention" - and retention is something the server can answer.
+#
+# all_providers_unhealthy MOVED OUT of this list earlier: the breaker state is in-process and
+#
+# error_rate MOVED OUT of this list: the counters are in-process (server/src/error.rs)
+# and served at GET /api/admin/metrics, so it is a real check now. The line that used
+# to sit here said it needed "HTTP counters over a 5-minute window (same access logs)",
+# which was true before the counter existed and is now stale.
+# THE COUNT AND THE LIST ARE DERIVED, NOT TYPED. This block used to hardcode "1 of the 11 alerts",
+# and both halves went stale without anything failing: the registry grew to 12 when `proxy_undercharge`
+# was added, and this line still said 11. It was caught only because `tools/alert-check` compares the
+# README's quoted transcript against the file - the transcript was accurate, which is what made the
+# script's own number the thing that was wrong.
+#
+# So the number is counted from `alerts.tsv` and the names come from it too. The reasons stay prose,
+# because a reason is not derivable - but a NAME that is not in the registry can no longer be printed.
+UNREACHABLE=$(grep -v '^#' "$REGISTRY" 2>/dev/null | grep -v '^id' | awk -F'\t' '$6 == "needs-metrics" { print $1 }')
+UNREACHABLE_N=$(printf '%s\n' "$UNREACHABLE" | grep -c . || true)
+TOTAL_N=$(grep -v '^#' "$REGISTRY" 2>/dev/null | grep -v '^id' | grep -c . || true)
+
+cat >&2 <<NOTCHECKED
+probe: NOT CHECKED - $UNREACHABLE_N of the $TOTAL_N alerts in alerts.tsv still need a surface this cannot reach:
+probe:   relay_5xx               - nginx access-log status counts (access logs are deliberately off).
+probe:                             The relay is a SEPARATE deployment; the backend never sees its
+probe:                             status codes, so no server-side check can answer this one.
 probe: Full table and the reasons: tools/alert/README.md. Every definition: alert.sh --list
 NOTCHECKED
 
