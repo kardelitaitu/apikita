@@ -768,4 +768,73 @@ mod tests {
 
         second.close().await;
     }
+    /// A NEGATIVE CONTROL FOR THE SHARED DRIFT HELPER, and the reason three copies of it were deleted.
+    ///
+    /// This test existed VERBATIM in `routes/keys.rs`, `routes/proxy.rs` and `routes/webhooks.rs` -
+    /// 55 lines each, 165 in total - while the helper they tested was duplicated seven ways beside them.
+    /// Round 54 lifted the helper into one definition, and the ARGUMENT FOR KEEPING THREE DETECTORS
+    /// DIED WITH IT: the three copies were the articles of faith in a duplicated helper's honesty, and
+    /// once the helper is one definition they are three tests of the same statement.
+    ///
+    /// What survives here is the case they were each pinning, stated once: a ledger row with NO wallet
+    /// row is DRIFT, and the helper reports 0 once a wallet row agrees the ledger. The shipped gate
+    /// (`tools/reconcile/reconcile.sql`) is a FULL OUTER JOIN for exactly this case, so a helper that
+    /// regressed to a LEFT JOIN would be a WEAKER rule than the one on the reconciliation path - and
+    /// every caller asserts == 0 as a fixture check, which a weakened helper satisfies perfectly.
+    ///
+    /// WHY IT LIVES HERE RATHER THAN IN A ROUTE MODULE. It tests a `test_support` helper, so its natural
+    /// home is beside that helper. A route module also works, but a reader of the route module would
+    /// reasonably assume the case was about that route's behaviour rather than about the harness.
+    #[tokio::test]
+    async fn the_drift_helper_sees_ledger_money_with_no_wallet_row() {
+        let db = crate::test_support::TestDb::new().await;
+        let account = crate::test_support::account(&db.pool).await;
+
+        // A ledger row with no wallets row. The account exists (the FK needs it); the wallet
+        // deliberately does not.
+        sqlx::query(
+            "INSERT INTO ledger (account_id, delta_idr, reason, balance_after, created_at) \
+         VALUES (?, 5000, 'adjustment', 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the orphan ledger row");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wallets WHERE account_id = ?")
+                .bind(account.hyphenated())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count wallets"),
+            0,
+            "the fixture must have NO wallet row, or this test is not testing the case"
+        );
+
+        assert_eq!(
+        ledger_drift_rows(&db.pool, account).await,
+        1,
+        "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate reports it \
+         (reconcile.sql is a FULL OUTER JOIN for this case). This helper returning 0 here means it \
+         has silently become a weaker rule than the one that ships"
+    );
+
+        // And it stops reporting drift once a wallet row agrees, so this is a detector rather than a
+        // constant.
+        sqlx::query(
+            "INSERT INTO wallets (account_id, balance_idr, updated_at) \
+         VALUES (?, 5000, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(account.hyphenated())
+        .execute(&db.pool)
+        .await
+        .expect("insert the wallet row");
+
+        assert_eq!(
+        ledger_drift_rows(&db.pool, account).await,
+        0,
+        "once the wallet holds the ledger's 5000 IDR there is no drift, so the helper must report \
+         0 - otherwise this test would pass on a helper that always says 1"
+    );
+    }
 }

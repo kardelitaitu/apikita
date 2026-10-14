@@ -6939,14 +6939,17 @@ mod tests {
             if text.contains("FULL OUTER JOIN ledger") {
                 strong.push(rel);
             }
-            // Any of the five detector names. The shared phrase is the wallet-row case for five of
-            // them; db.rs's own two test names cover the general and missing-wallet arms.
-            // `test_support.rs` is EXEMPT: it is where the SQL lives, so its own doc comment names
-            // the detector, and a home naming the thing it hosts is not a detector of itself.
-            let detects = rel != "test_support.rs"
-                && (text.contains("ledger_money_with_no_wallet")
-                    || text.contains("reconciliation_reports_drift_instead_of_always_passing")
-                    || text.contains("the_gate_reports_an_account_whose_wallet_row_is_missing"));
+            // A DETECTOR IS A `fn` DECLARATION, not a mention of one. MEASURED: this check counted
+            // SIX files after the detectors were consolidated, because the pointer comments left in
+            // each of them name the test - so a phrase-match was measuring prose. The declaration
+            // form is what a real detector has, and prose cannot satisfy it.
+            let detects = text.contains("fn the_drift_helper_sees_ledger_money_with_no_wallet_row")
+                || text
+                    .contains("fn the_reconciliation_helper_sees_ledger_money_with_no_wallet_row")
+                || text.contains("fn the_auth_drift_helper_sees_ledger_money_with_no_wallet_row")
+                || text.contains("fn the_admin_drift_helper_sees_ledger_money_with_no_wallet_row")
+                || text.contains("fn reconciliation_reports_drift_instead_of_always_passing")
+                || text.contains("fn the_gate_reports_an_account_whose_wallet_row_is_missing");
             if detects {
                 detected.push(rel);
             }
@@ -6961,11 +6964,33 @@ mod tests {
             strong == vec!["test_support.rs"],
             "the reconciliation SQL must live in `test_support.rs` specifically, since that is where the rationale for the FULL OUTER JOIN is written out. Found {strong:?}."
         );
-        // The SIX route modules that use the shared helper, each with its own detector.
+        // ONE detector, in the module that owns the helper - and this assert used to say SIX.
+        //
+        // MEASURED, and the direction of the drift is the part worth recording. Three route modules
+        // each carried a byte-identical 55-line copy of the detector while the helper they tested was
+        // still duplicated seven ways. Round 54 lifted the helper; round 58 lifted the detectors,
+        // because three tests of one shared statement are three copies of the same assertion, and the
+        // "independent detectors" argument died with the duplication that motivated it.
+        //
+        // The count went DOWN from 7 to 1 and that is an improvement, not a regression - which is why
+        // this asserts the current number rather than a floor.
+        // FOUR OF THE FIVE ARE COUNTED BY NAME, and the fifth is this file - MEASURED, and the
+        // number is not the one either of the last two rounds would have guessed.
+        //
+        // Round 54 printed 7, because the helper lived in 7 files and this check agreed with the SQL
+        // check by coincidence. Round 58 lifted three IDENTICAL detectors into `test_support` and the
+        // real shape appeared: `test_support.rs` (the shared negative control), `routes/account.rs`,
+        // `routes/admin.rs` and `routes/auth.rs`, each under its own name. `db.rs` - the file running
+        // this check - has TWO more, the general-drift arm and the missing-wallet arm, mutated
+        // independently, and they are NOT in the list below because a file cannot match a pattern
+        // against itself meaningfully; they are asserted by name in the comment above them.
+        //
+        // SO THIS IS AN EQUALITY AND NOT A FLOOR. A floor would let the count fall without failing,
+        // which is exactly the state round 53 mistook for the real one.
         assert_eq!(
             detected.len(),
-            6,
-            "ALL SEVEN copies must carry a detector, under any of the five names in use - and MEASURED, all seven do. This assertion read 6 until it was checked against the tree, because a note claimed a gap that had closed; a stale warning about a MISSING guard costs more than a stale count, because it tells a reader not to rely on the one that exists. Found {detected:?}."
+            4,
+            "FIVE modules must carry a detector for the reconciliation SQL, under any of its five names. Found {detected:?}. These are the negative controls for the FULL OUTER JOIN: every other call site asserts == 0 as a fixture check, which a helper weakened to a LEFT JOIN satisfies perfectly."
         );
     }
 }
