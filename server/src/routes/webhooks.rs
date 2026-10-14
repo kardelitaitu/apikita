@@ -399,6 +399,7 @@ pub async fn handle_midtrans_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ledger_drift_rows;
     // Only the tests exercise the raw status mapping: production code reaches it
     // through `evaluate_payment_status`, which is what the import above names.
     use crate::money::terminal_status;
@@ -931,30 +932,9 @@ mod tests {
     /// Adding a fourth identical test would close the symptom and leave four copies of one
     /// rule, which is the condition that produced the defect. If this helper is touched
     /// again the real fix is to delete the copies and call one shared definition - the
-    /// duplication has now cost two rounds.
-    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT COALESCE(w.account_id, l.account_id) AS account_id
-                FROM wallets w
-                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
-                WHERE COALESCE(w.account_id, l.account_id) = ?
-                GROUP BY w.account_id, l.account_id, w.balance_idr
-                HAVING w.account_id IS NULL
-                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
-
     /// THE DETECTING TEST for `drift_rows` above, which had none.
     ///
-    /// All 1 of this file's call sites assert `drift_rows(...) == 0` as a fixture sanity
+    /// All 1 of this file's call sites assert `ledger_drift_rows(...) == 0` as a fixture sanity
     /// check ("fixture must not drift"). A helper that ALWAYS returns 0 satisfies that
     /// perfectly, so none of them can catch the helper weakening - MEASURED: replacing the
     /// `HAVING` clause with `HAVING 0` leaves every test in the suite passing.
@@ -996,7 +976,7 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&db.pool, account).await,
+            ledger_drift_rows(&db.pool, account).await,
             1,
             "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate \
              reports it (reconcile.sql is a FULL OUTER JOIN for this case). This helper \
@@ -1017,7 +997,7 @@ mod tests {
         .expect("insert the wallet row");
 
         assert_eq!(
-            drift_rows(&db.pool, account).await,
+            ledger_drift_rows(&db.pool, account).await,
             0,
             "once the wallet holds the ledger's 5000 IDR there is no drift, so the helper \
              must report 0 - otherwise this test would pass on a helper that always says 1"
@@ -1031,7 +1011,7 @@ mod tests {
     /// no ledger row - cannot pass this, whatever the HTTP status said.
     async fn assert_reconciled(pool: &SqlitePool, account_id: Uuid, context: &str) {
         assert_eq!(
-            drift_rows(pool, account_id).await,
+            ledger_drift_rows(pool, account_id).await,
             0,
             "{context}: wallets.balance_idr must equal SUM(ledger.delta_idr)"
         );

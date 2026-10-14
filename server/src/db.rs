@@ -2307,6 +2307,7 @@ pub async fn unpaired_hold_rows(pool: &SqlitePool, account_id: Uuid) -> Result<i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ledger_drift_rows;
     use crate::test_support::{self, TestDb};
 
     /// Rows returned by the reconciliation check: wallets.balance_idr must equal
@@ -2354,27 +2355,6 @@ mod tests {
     /// invariant's DETECTION ability rests on two tests, and deleting either is a silent
     /// loss for the other 35 callers. The SHIPPED rule is pinned separately and more
     /// thoroughly - `tools/reconcile-check` mutation-tests the SQL, four mutants as of the
-    /// last re-run, plus the hold predicate's clauses.
-    async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT COALESCE(w.account_id, l.account_id) AS account_id
-                FROM wallets w
-                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
-                WHERE COALESCE(w.account_id, l.account_id) = ?
-                GROUP BY w.account_id, l.account_id, w.balance_idr
-                HAVING w.account_id IS NULL
-                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
-
     /// Everything an operator needs to see when reconciliation fails: the wallet
     /// balance, the ledger sum, and every ledger row that produced it. A bare
     /// "drift" count says money is wrong but not which row is missing.
@@ -6959,11 +6939,13 @@ mod tests {
     /// was named for the module it was written in. The check accepts any of them by looking for the
     /// phrase they share.
     #[test]
-    fn every_copy_of_the_reconciliation_helper_has_a_detector() {
+    fn the_reconciliation_sql_lives_in_one_place_and_each_user_detects_it() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
+        // SEVEN FILES USED TO CARRY THE SQL; now ONE does. The list below is what the copy-modules
+        // must NOT contain on their own account, and `test_support.rs` is where it lives.
         let copies = [
-            "db.rs",
+            "test_support.rs",
             "routes/auth.rs",
             "routes/account.rs",
             "routes/admin.rs",
@@ -6986,9 +6968,12 @@ mod tests {
             }
             // Any of the five detector names. The shared phrase is the wallet-row case for five of
             // them; db.rs's own two test names cover the general and missing-wallet arms.
-            let detects = text.contains("ledger_money_with_no_wallet")
-                || text.contains("reconciliation_reports_drift_instead_of_always_passing")
-                || text.contains("the_gate_reports_an_account_whose_wallet_row_is_missing");
+            // `test_support.rs` is EXEMPT: it is where the SQL lives, so its own doc comment names
+            // the detector, and a home naming the thing it hosts is not a detector of itself.
+            let detects = rel != "test_support.rs"
+                && (text.contains("ledger_money_with_no_wallet")
+                    || text.contains("reconciliation_reports_drift_instead_of_always_passing")
+                    || text.contains("the_gate_reports_an_account_whose_wallet_row_is_missing"));
             if detects {
                 detected.push(rel);
             }
@@ -6996,12 +6981,17 @@ mod tests {
 
         assert_eq!(
             strong.len(),
-            7,
-            "all seven files must carry the FULL OUTER JOIN form; found {strong:?}. A copy that regressed to a LEFT JOIN cannot see ledger money with no wallet row."
+            1,
+            "the FULL OUTER JOIN form must appear ONLY in `test_support.rs`. Found {strong:?}. The seven copies this replaced survived three rounds of being written down; a second one appearing here is that duplication returning, and a copy that regressed to a LEFT JOIN cannot see ledger money with no wallet row."
         );
+        assert!(
+            strong == vec!["test_support.rs"],
+            "the reconciliation SQL must live in `test_support.rs` specifically, since that is where the rationale for the FULL OUTER JOIN is written out. Found {strong:?}."
+        );
+        // The SIX route modules that use the shared helper, each with its own detector.
         assert_eq!(
             detected.len(),
-            7,
+            6,
             "ALL SEVEN copies must carry a detector, under any of the five names in use - and MEASURED, all seven do. This assertion read 6 until it was checked against the tree, because a note claimed a gap that had closed; a stale warning about a MISSING guard costs more than a stale count, because it tells a reader not to rely on the one that exists. Found {detected:?}."
         );
     }

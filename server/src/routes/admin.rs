@@ -1029,6 +1029,7 @@ pub async fn resume_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ledger_drift_rows;
 
     use std::sync::Arc;
 
@@ -1290,27 +1291,6 @@ mod tests {
     /// no wallet row reports drift=1 here and reported drift=0 before, so an assertion
     /// built on this helper could pass on an account the shipped gate fails. It is a
     /// sibling of `ledger_drift_rows` in `db.rs`, `routes/auth.rs` and
-    /// `routes/account.rs`, which carry the same note.
-    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT COALESCE(w.account_id, l.account_id) AS account_id
-                FROM wallets w
-                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
-                WHERE COALESCE(w.account_id, l.account_id) = ?
-                GROUP BY w.account_id, l.account_id, w.balance_idr
-                HAVING w.account_id IS NULL
-                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
-
     /// A test OF THE HELPER ABOVE, because it is a transcription of the shipped gate and a
     /// transcription that has quietly become weaker is invisible while it stays green.
     ///
@@ -1346,7 +1326,7 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&db.pool, account).await,
+            ledger_drift_rows(&db.pool, account).await,
             1,
             "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate says \
              so. A helper returning 0 here has become a weaker rule than the one that ships."
@@ -1359,7 +1339,7 @@ mod tests {
     async fn assert_no_drift(pool: &SqlitePool, account_ids: &[Uuid]) {
         for account_id in account_ids {
             assert_eq!(
-                drift_rows(pool, *account_id).await,
+                ledger_drift_rows(pool, *account_id).await,
                 0,
                 "wallets.balance_idr must equal SUM(ledger.delta_idr) for {account_id}"
             );

@@ -393,6 +393,48 @@ pub async fn balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
         .expect("read the wallet balance")
 }
 
+/// The reconciliation the shipped gate runs: how many ways this account's wallet row DISAGREES
+/// with its ledger.
+///
+/// WELCOME TO THE ONE COPY. This SQL was transcribed SEVEN TIMES — in `db.rs`, `routes/auth.rs`,
+/// `routes/account.rs`, `routes/admin.rs`, `routes/keys.rs`, `routes/proxy.rs` and
+/// `routes/webhooks.rs` — each carrying the same query and its own hand-written note. Every one of
+/// those notes ended by asking for the copies to be lifted into a single helper, because a helper
+/// duplicated seven ways is seven chances to weaken one, and at least one note described a detector
+/// gap that had already closed. The duplication survived three rounds of being written down before
+/// this landed.
+///
+/// IT IS THE STRONG FORM, AND THAT IS THE WHOLE POINT. A `LEFT JOIN` driven from `wallets` asks a
+/// weaker question: it sees only accounts that HAVE a wallet row, while `ledger.account_id`
+/// references `accounts(id)` and not `wallets`, so a ledger row with no wallet row is permitted by
+/// the schema and invisible to the old shape. Measured: 5000 IDR of ledger money with no wallet row
+/// reports drift=1 here and reported drift=0 before, so an assertion built on the weak form could
+/// pass on an account the shipped gate fails.
+///
+/// THE DETECTORS ARE PER-MODULE (`the_drift_helper_sees_ledger_money_with_no_wallet_row`, under
+/// five different names — which is part of the same problem) and `db.rs` holds the JOIN form via
+/// `every_copy_of_the_reconciliation_helper_has_a_detector`. That guard never checked the copies
+/// were ONE; this function is that, and it now points at itself.
+pub async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM (
+            SELECT COALESCE(w.account_id, l.account_id) AS account_id
+            FROM wallets w
+            FULL OUTER JOIN ledger l ON l.account_id = w.account_id
+            WHERE COALESCE(w.account_id, l.account_id) = ?
+            GROUP BY w.account_id, l.account_id, w.balance_idr
+            HAVING w.account_id IS NULL
+                OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
+        ) AS drift
+        "#,
+    )
+    .bind(account_id.hyphenated())
+    .fetch_one(pool)
+    .await
+    .expect("reconciliation query")
+}
+
 /// The sum of the account's ledger rows — the other side of the invariant.
 pub async fn ledger_sum(pool: &SqlitePool, account_id: Uuid) -> i64 {
     sqlx::query_scalar("SELECT COALESCE(SUM(delta_idr), 0) FROM ledger WHERE account_id = ?")

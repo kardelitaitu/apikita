@@ -1398,6 +1398,7 @@ pub async fn list_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ledger_drift_rows;
 
     #[test]
     fn session_cookie_carries_expected_attributes() {
@@ -1593,27 +1594,6 @@ mod tests {
     ///
     /// `the_auth_drift_helper_sees_ledger_money_with_no_wallet_row` below is that detecting
     /// test. It asserts the statement this comment already makes - 5000 IDR of ledger money
-    /// with no wallet row is drift=1 - which until now was prose with nothing checking it.
-    async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT COALESCE(w.account_id, l.account_id) AS account_id
-                FROM wallets w
-                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
-                WHERE COALESCE(w.account_id, l.account_id) = ?
-                GROUP BY w.account_id, l.account_id, w.balance_idr
-                HAVING w.account_id IS NULL
-                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
-
     /// THE DETECTING TEST for `ledger_drift_rows` above, which had none.
     ///
     /// Both of its callers assert `ledger_drift_rows(...) == 0` as a fixture sanity check

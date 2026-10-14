@@ -1047,6 +1047,7 @@ pub async fn create_topup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ledger_drift_rows;
 
     fn wallet(min_topup: u64, min_first_deposit: u64) -> WalletConfig {
         WalletConfig {
@@ -1326,27 +1327,6 @@ mod tests {
     /// every assertion in this module would have passed on an account the real Gate 2
     /// reconcile fails. The shipped gate has always used the FULL OUTER JOIN (its own
     /// header says so - "so it also catches a ledger account with NO wallets row");
-    /// this is the test helper being brought back into agreement with it.
-    async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT COALESCE(w.account_id, l.account_id) AS account_id
-                FROM wallets w
-                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
-                WHERE COALESCE(w.account_id, l.account_id) = ?
-                GROUP BY w.account_id, l.account_id, w.balance_idr
-                HAVING w.account_id IS NULL
-                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
-
     /// A test OF THE HELPER ABOVE, which is the thing that let this module drift from the
     /// shipped gate for several rounds. `ledger_drift_rows` is a transcription of
     /// `tools/reconcile/reconcile.sh`, and a transcription that has quietly become weaker

@@ -2034,6 +2034,7 @@ async fn release_quietly(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ledger_drift_rows;
 
     // ---------------------------------------------------------------------
     // The usage tail: what decides whether a customer is billed at all.
@@ -3647,30 +3648,9 @@ mod tests {
     /// Adding a fourth identical test would close the symptom and leave four copies of one
     /// rule, which is the condition that produced the defect. If this helper is touched
     /// again the real fix is to delete the copies and call one shared definition - the
-    /// duplication has now cost two rounds.
-    async fn drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT COALESCE(w.account_id, l.account_id) AS account_id
-                FROM wallets w
-                FULL OUTER JOIN ledger l ON l.account_id = w.account_id
-                WHERE COALESCE(w.account_id, l.account_id) = ?
-                GROUP BY w.account_id, l.account_id, w.balance_idr
-                HAVING w.account_id IS NULL
-                    OR w.balance_idr <> COALESCE(SUM(l.delta_idr), 0)
-            ) AS drift
-            "#,
-        )
-        .bind(account_id.hyphenated())
-        .fetch_one(pool)
-        .await
-        .expect("reconciliation query")
-    }
-
     /// THE DETECTING TEST for `drift_rows` above, which had none.
     ///
-    /// EVERY OTHER call site in this file asserts `drift_rows(...) == 0` as a fixture sanity
+    /// EVERY OTHER call site in this file asserts `ledger_drift_rows(...) == 0` as a fixture sanity
     /// check ("fixture must not drift"). A helper that ALWAYS returns 0 satisfies that
     /// perfectly, so none of them can catch the helper weakening - MEASURED: replacing the
     /// `HAVING` clause with `HAVING 0` leaves every test in the suite passing.
@@ -3719,7 +3699,7 @@ mod tests {
         );
 
         assert_eq!(
-            drift_rows(&db.pool, account).await,
+            ledger_drift_rows(&db.pool, account).await,
             1,
             "5000 IDR of ledger money with no wallet row is DRIFT, and the shipped gate \
              reports it (reconcile.sql is a FULL OUTER JOIN for this case). This helper \
@@ -3740,7 +3720,7 @@ mod tests {
         .expect("insert the wallet row");
 
         assert_eq!(
-            drift_rows(&db.pool, account).await,
+            ledger_drift_rows(&db.pool, account).await,
             0,
             "once the wallet holds the ledger's 5000 IDR there is no drift, so the helper \
              must report 0 - otherwise this test would pass on a helper that always says 1"
@@ -4103,7 +4083,7 @@ mod tests {
                 opening_idr + expected_hold
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a) after the detached release settled: balance_idr must equal \
                  SUM(ledger.delta_idr), so the double credit is not merely a wrong number but a \
@@ -4236,7 +4216,7 @@ mod tests {
                 "no usage was reported, so no usage row may exist"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): the wallet and the ledger must agree after the release settled"
             );
@@ -4359,7 +4339,7 @@ mod tests {
                 "nothing was generated, so nothing may be billed"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
             );
@@ -4627,7 +4607,7 @@ mod tests {
                 "INVARIANT (b): a settled hold must be paired, not stranded"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
             );
@@ -4789,7 +4769,7 @@ mod tests {
             );
 
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
             );
@@ -4967,7 +4947,7 @@ mod tests {
                  this is the defect the arm exists to prevent"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
             );
@@ -5122,7 +5102,7 @@ mod tests {
                 "the release must pair the hold, so the stranded-hold alert stays quiet"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "the release must keep balance_idr equal to SUM(ledger.delta_idr)"
             );
@@ -5234,7 +5214,7 @@ mod tests {
                 "INVARIANT (b): a washed request must leave ZERO stranded holds"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
             );
@@ -5360,7 +5340,7 @@ mod tests {
                 "INVARIANT (b): a clamped settlement still pairs its hold"
             );
             assert_eq!(
-                drift_rows(&pool_for_assertions, account_id).await,
+                ledger_drift_rows(&pool_for_assertions, account_id).await,
                 0,
                 "INVARIANT (a): a clamped debit must not break balance_idr = SUM(ledger.delta_idr)"
             );
@@ -5477,7 +5457,7 @@ mod tests {
                 "a refused request must cost the customer nothing"
             );
             // ...and the ledger still reconciles (INVARIANT (a)).
-            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(ledger_drift_rows(&pool_for_assertions, account_id).await, 0);
             assert_eq!(
                 unpaired_hold_rows(&pool_for_assertions, account_id)
                     .await
@@ -5636,7 +5616,7 @@ mod tests {
 
             for account in [funded_account, broke_account] {
                 assert_eq!(
-                    drift_rows(&pool_for_assertions, account).await,
+                    ledger_drift_rows(&pool_for_assertions, account).await,
                     0,
                     "INVARIANT (a): balance_idr must equal SUM(ledger.delta_idr)"
                 );
@@ -5710,7 +5690,7 @@ mod tests {
                 Vec::<(i64, Option<String>)>::new(),
                 "a refused reservation must not write a ledger row"
             );
-            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(ledger_drift_rows(&pool_for_assertions, account_id).await, 0);
             assert_eq!(
                 unpaired_hold_rows(&pool_for_assertions, account_id)
                     .await
@@ -5771,7 +5751,7 @@ mod tests {
                 opening_idr,
                 "the limit refuses before any money moves"
             );
-            assert_eq!(drift_rows(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(ledger_drift_rows(&pool_for_assertions, account_id).await, 0);
         })
         .await;
     }
@@ -6547,7 +6527,7 @@ mod tests {
             1_000_000 - cost,
             "the whole ledger (funding included) nets to the balance"
         );
-        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
 
@@ -6631,7 +6611,7 @@ mod tests {
             .map(|(d, _)| d)
             .collect();
         assert_eq!(reservation_rows, vec![-reservation, reservation]);
-        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
 
@@ -6710,7 +6690,7 @@ mod tests {
         assert_eq!((input, cached, output), (10, 0, 5));
         assert!(cost > 0);
         assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000 - cost);
-        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
 
@@ -6786,7 +6766,7 @@ mod tests {
 
         assert!(usage_today(&db.pool, account_id).await.is_none());
         assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
-        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
 
@@ -6836,7 +6816,7 @@ mod tests {
 
         assert!(usage_today(&db.pool, account_id).await.is_none());
         assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
-        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
 
@@ -6907,7 +6887,7 @@ mod tests {
              opening 1_000_000 is the guard's Drop releasing it a second time after \
              `release_quietly` did - money invented for a request whose model no longer exists"
         );
-        assert_eq!(drift_rows(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
 
