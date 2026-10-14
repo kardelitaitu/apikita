@@ -1684,6 +1684,70 @@ mod tests {
             "a 503 is a server-side failure and must move the shared counter: counting only Internal/Database would under-report exactly while the upstream is down"
         );
     }
+    /// THE COUNTERS HAVE ONE PRODUCTION CALL SITE, AND A SECOND WOULD UNDERCOUNT SILENTLY.
+    ///
+    /// `AppError::into_response` claims to be the ONE place every error response is built, so the
+    /// server-error ratio and the rejection breakdown cannot drift from what is returned. The
+    /// claim is load-bearing: `record_response` moves the DENOMINATOR, so a response built any
+    /// other way is absent from the rate `docs/observability.md` publishes and the alerts read.
+    ///
+    /// MEASURED, and the claim holds while its definition is NARROW. Three paths produce a status
+    /// without reaching this function - `AdminError::Forbidden`'s 403 envelope, the `map_response`
+    /// rewrite of a framework 413, and a handler's own `(StatusCode, ...)` return. None is an
+    /// oversight: the 403 is not in the rejection set because that set is the PROXY's OWN
+    /// admission refusals, and the doc above the match says so directly ("a 401 on /api/* is
+    /// authentication, not a proxy decision"). `AdminError::App` DELEGATES here, so its half is
+    /// counted.
+    ///
+    /// SO THIS PINS THE NARROW CLAIM RATHER THAN DEMANDING ONE PATH, which would fail on correct
+    /// code. What it can pin is that nobody added a SECOND counter site - the drift the doc fears
+    /// is a count moved elsewhere while the sentence above it stays.
+    #[test]
+    fn the_response_counters_have_one_production_call_site() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/error.rs"),
+        )
+        .expect("error.rs must be readable, or this checks nothing");
+
+        // the BOUNDARY is `#[cfg(test)]`, not the string "mod tests": that phrase appears in the
+        // comments above, in this doc comment, and in the guard's own failure text, so a search
+        // for it resolves to the wrong place. Searching for the attribute is unambiguous.
+        let tests_at = source.find("#[cfg(test)]").expect(
+            "the test module moved, so this guard can no longer tell production from tests",
+        );
+        let production = &source[..tests_at];
+
+        let responses: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let l = line.trim_start();
+                !l.starts_with("//")
+                    && (l.contains("record_response()") || l.contains("record_error()"))
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(
+            responses.len(),
+            2,
+            "exactly two counter moves in production - `record_response` and `record_error`, both inside the ONE `into_response`. Found at lines {responses:?}. A second site means the ratio's denominator is assembled from two places, which is the drift the doc comment above it exists to prevent"
+        );
+
+        let rejections: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let l = line.trim_start();
+                !l.starts_with("//") && l.contains("rejection_counter().record(")
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(
+            rejections.len(),
+            1,
+            "`rejection_counter().record(` appears at lines {rejections:?} outside tests; the claim is exactly one site. A second means two vocabularies can disagree, which is the failure its own doc-note names"
+        );
+    }
 
     /// Drives a variant through the real response path and reads everything the
     /// caller would see.
