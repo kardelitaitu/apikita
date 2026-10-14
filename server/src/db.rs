@@ -6938,4 +6938,71 @@ mod tests {
         assert_eq!(topup_status(&db.pool, &pending).await, "pending");
         db.close().await;
     }
+
+    /// THE SEVEN COPIES OF THE RECONCILIATION HELPER, AND THE PROPERTY THEIR NOTES PROMISE.
+    ///
+    /// `ledger_drift_rows` exists in SEVEN files, each transcribing the same FULL OUTER JOIN:
+    /// `db.rs`, `routes/auth.rs`, `routes/account.rs`, `routes/admin.rs`, `routes/keys.rs`,
+    /// `routes/proxy.rs` and `routes/webhooks.rs`. Every one of their notes asks for the copies to be
+    /// lifted to a single shared helper, and that has not been done - so what is checked here is the
+    /// weaker property the notes actually rely on: a copy cannot be silently weakened without a test
+    /// noticing.
+    ///
+    /// MEASURED, AND THE FIRST VERSION OF THIS TEST WAS WRONG IN THE SAME WAY THE NOTES WERE. The
+    /// notes claimed three copies had no detector. I believed them and asserted SIX of seven - and
+    /// the test failed immediately, because ALL SEVEN have one. The stale sentence had understated
+    /// the coverage rather than overstating it, which is the direction nobody checks: a reader
+    /// trusts a warning that a guard is missing, so a stale warning makes them distrust a guard
+    /// that exists.
+    ///
+    /// FIVE DISTINCT NAMES across the seven, which is part of the same duplication: each detector
+    /// was named for the module it was written in. The check accepts any of them by looking for the
+    /// phrase they share.
+    #[test]
+    fn every_copy_of_the_reconciliation_helper_has_a_detector() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let copies = [
+            "db.rs",
+            "routes/auth.rs",
+            "routes/account.rs",
+            "routes/admin.rs",
+            "routes/keys.rs",
+            "routes/proxy.rs",
+            "routes/webhooks.rs",
+        ];
+
+        let mut strong: Vec<&str> = Vec::new();
+        let mut detected: Vec<&str> = Vec::new();
+        for rel in copies {
+            let path = manifest.join("src").join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{rel} must be readable, or this checks nothing: {e}"));
+            // The FULL OUTER JOIN is what makes this the strong form. A LEFT JOIN driven from
+            // `wallets` cannot see a ledger row with no wallet row, which is the weaker rule the
+            // note on each copy is about.
+            if text.contains("FULL OUTER JOIN ledger") {
+                strong.push(rel);
+            }
+            // Any of the five detector names. The shared phrase is the wallet-row case for five of
+            // them; db.rs's own two test names cover the general and missing-wallet arms.
+            let detects = text.contains("ledger_money_with_no_wallet")
+                || text.contains("reconciliation_reports_drift_instead_of_always_passing")
+                || text.contains("the_gate_reports_an_account_whose_wallet_row_is_missing");
+            if detects {
+                detected.push(rel);
+            }
+        }
+
+        assert_eq!(
+            strong.len(),
+            7,
+            "all seven files must carry the FULL OUTER JOIN form; found {strong:?}. A copy that regressed to a LEFT JOIN cannot see ledger money with no wallet row."
+        );
+        assert_eq!(
+            detected.len(),
+            7,
+            "ALL SEVEN copies must carry a detector, under any of the five names in use - and MEASURED, all seven do. This assertion read 6 until it was checked against the tree, because a note claimed a gap that had closed; a stale warning about a MISSING guard costs more than a stale count, because it tells a reader not to rely on the one that exists. Found {detected:?}."
+        );
+    }
 }

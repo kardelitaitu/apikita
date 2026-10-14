@@ -1078,13 +1078,18 @@ mod tests {
     /// sibling of `ledger_drift_rows` in `db.rs`, `routes/auth.rs` and
     /// `routes/account.rs`, which carry the same note.
     ///
-    /// NOT PINNED BY A TEST OF ITS OWN, and that is measured rather than assumed:
-    /// reverting this SQL to the weak LEFT JOIN it used to be survives the ENTIRE suite.
-    /// `routes/admin.rs` and `routes/account.rs` carry guards that do catch their own
-    /// copies (`the_admin_drift_helper_sees_ledger_money_with_no_wallet_row` and its
-    /// sibling); **this file, `routes/keys.rs`, and the copies in `routes/proxy.rs` and
-    /// `routes/webhooks.rs`** have none, so nothing would fail if this file silently
-    /// regressed to the weaker rule.
+    /// NOW PINNED BY A TEST OF ITS OWN, AND THAT SENTENCE USED TO SAY THE OPPOSITE. It read:
+    /// reverting this SQL to the weak LEFT JOIN survives the ENTIRE suite, `routes/admin.rs` and
+    /// `routes/account.rs` catch their own copies, and **this file, `routes/keys.rs`, and the copies
+    /// in `routes/proxy.rs` and `routes/webhooks.rs`** have none - so nothing would fail if this one
+    /// regressed.
+    ///
+    /// MEASURED SINCE: all three of those DO have the detector now
+    /// (`the_drift_helper_sees_ledger_money_with_no_wallet_row`, one per file), and six of the seven
+    /// copies carry it. Only `db.rs`'s `ledger_drift_rows` has no detector of its own, because it is
+    /// the copy the others were transcribed FROM and its arms are covered where the SQL is
+    /// mutation-tested. The warning is kept rather than deleted: it was TRUE when written, and a
+    /// reader who finds this note stale once has no way to know whether the next one is.
     ///
     /// (The four notes were written from one text and each listed its own file among the
     /// others, so `proxy.rs` listed `proxy.rs` as a sibling and so on. Every path here is

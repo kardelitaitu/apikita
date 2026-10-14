@@ -1012,7 +1012,9 @@ mod tests {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                let shown = path.strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR"))).unwrap_or(&path);
+                let shown = path
+                    .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+                    .unwrap_or(&path);
                 for (i, line) in text.lines().enumerate() {
                     // The definition, not a call: a `pub fn` or a module-private `fn` named exactly
                     // hash_token. A call is `hash_token(`, which this excludes because a definition
@@ -1024,10 +1026,7 @@ mod tests {
                         // Forward slashes and only the last two components: a Windows checkout
                         // renders backslashes, and the depth of the checkout root differs between
                         // contributors, so the path is normalised rather than compared as text.
-                        let rel = shown
-                            .display()
-                            .to_string()
-                            .replace('\\', "/");
+                        let rel = shown.display().to_string().replace('\\', "/");
                         let tail = rel
                             .rsplit('/')
                             .take(2)
@@ -1065,7 +1064,6 @@ mod tests {
     /// so the count above has to exclude them. The boundary is the attribute rather than the string
     /// "mod tests", which appears in prose and resolves to the wrong place.
     fn defined_in_a_test_module(text: &str, i: usize) -> bool {
-
         // The line AFTER an attribute must declare `mod tests`, not `mod <anything_else>`.
         let mut attr = false;
         for (n, line) in text.lines().enumerate() {
