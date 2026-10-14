@@ -1151,14 +1151,6 @@ mod tests {
     /// request through create_router, with the peer address mocked so
     /// ConnectInfo resolves. This is the only way to exercise the proxy's
     /// documented enforcement order, which is where a spend limit actually
-    /// blocks.
-    fn proxy_app(state: AppState) -> axum::Router {
-        use axum::extract::connect_info::MockConnectInfo;
-        use std::net::SocketAddr;
-        crate::routes::create_router(state)
-            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
-    }
-
     /// POST /v1/chat/completions with a bearer key, returning the status and the
     /// parsed error/JSON body.
     async fn call_proxy(app: &axum::Router, key: &str, model: &str) -> (StatusCode, Value) {
@@ -1301,7 +1293,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
-        let app = proxy_app(state.clone());
+        let app = test_support::app(state.clone());
 
         // The control: a live key with an empty allowlist authenticates and is
         // then refused for its model - 403, not 401. That proves the credential
@@ -1374,7 +1366,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
-        let app = proxy_app(state.clone());
+        let app = test_support::app(state.clone());
 
         let ttl = state.config.limits.key_metadata_cache_seconds;
         assert!(
@@ -1988,7 +1980,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
-        let app = proxy_app(state.clone());
+        let app = test_support::app(state.clone());
 
         // The wallet is funded through the real top-up path and the usage is
         // recorded through the real settlement path, so the row the proxy reads
@@ -2321,7 +2313,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
-        let app = proxy_app(state.clone());
+        let app = test_support::app(state.clone());
 
         let ttl = state.config.limits.key_metadata_cache_seconds;
         assert!(
@@ -2455,7 +2447,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let headers = session_cookie(&pool, account_id).await;
-        let app = proxy_app(state.clone());
+        let app = test_support::app(state.clone());
 
         let (id, key, _) =
             create_key_via_handler(&state, &headers, "narrowed", vec!["flash".into()], 0).await;

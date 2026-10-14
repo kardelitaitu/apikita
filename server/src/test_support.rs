@@ -487,6 +487,40 @@ pub fn session_request_headers(token: &str) -> axum::http::HeaderMap {
     );
     headers
 }
+/// The real router, wrapped so a test can reach it the way an HTTP caller does.
+///
+/// ONE COPY, from SIX test modules that each wrote these three lines: `routes/mod.rs`,
+/// `routes/admin.rs`, `routes/admin_auth_boundary.rs`, `routes/keys.rs`, `routes/auth.rs` and a second
+/// site inside `routes/auth.rs`.
+///
+/// `MockConnectInfo` IS NOT DECORATION, and that is why the six agreed rather than drifted: the address
+/// it supplies is what `Extract<ConnectInfo<SocketAddr>>` reads in `proxy::chat_completions`, so without
+/// this layer that extractor fails with a **500** and a route-table assertion would be measuring the
+/// absence of a layer rather than the presence of a route. The address is loopback and the port is
+/// arbitrary - nothing reads the port - so the value is only required to be present and parseable.
+///
+/// Every test that asserts THROUGH the router needs this, and none of them needs a different one. A
+/// test that wants a custom peer address (the trusted-proxy cases in `ip_tracking`) can layer its own on
+/// top; this is the floor, not a ceiling.
+pub fn app(state: crate::routes::proxy::AppState) -> axum::Router {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    crate::routes::create_router(state)
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+}
+/// Give an account a wallet funded with `opening_idr` - the two steps in one call.
+///
+/// ONE COPY, from `routes/admin.rs` and `routes/proxy.rs`, where it was named `open_wallet` and was
+/// already nothing but `wallet` followed by `fund`. The duplication had shrunk to two lines by the time
+/// this round found it, which is why it is worth stating that the shape is a CONVENIENCE and not a
+/// rule: an opening balance of 0 is legitimate (a wallet row with nothing in it, which is a state the
+/// reconcile gate distinguishes from a missing row), and a caller that needs only one of the two steps
+/// should call that one.
+pub async fn open_wallet(pool: &SqlitePool, account_id: Uuid, opening_idr: i64) {
+    wallet(pool, account_id).await;
+    fund(pool, account_id, opening_idr).await;
+}
 /// The stored status of a topup, by `order_id`.
 ///
 /// ONE COPY, from `db.rs` and `routes/webhooks.rs`, where it was named `topup_status` and

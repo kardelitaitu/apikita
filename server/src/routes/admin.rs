@@ -1091,14 +1091,6 @@ mod tests {
         }
     }
 
-    /// The whole router, reached the way a caller reaches it.
-    fn app(state: AppState) -> Router {
-        use axum::extract::connect_info::MockConnectInfo;
-        use std::net::SocketAddr;
-        crate::routes::create_router(state)
-            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
-    }
-
     /// An account row. The SQLite schema has no DEFAULT for id, created_at or
     /// updated_at (plan section 4.1, correction 1), so the Postgres
     /// RETURNING id shape would fail at runtime rather than here.
@@ -1153,11 +1145,6 @@ mod tests {
     /// the matching ledger row in the same transaction. Writing
     /// wallets.balance_idr directly manufactures exactly the drift the
     /// reconciliation assertion at the end of every test looks for.
-    async fn open_wallet(pool: &SqlitePool, account_id: Uuid, opening_idr: i64) {
-        test_support::wallet(pool, account_id).await;
-        test_support::fund(pool, account_id, opening_idr).await;
-    }
-
     /// A key created through the REAL handler, returning (id, plaintext). The
     /// plaintext is needed to present the key to the proxy; the id to read the
     /// row back.
@@ -1499,7 +1486,7 @@ mod tests {
         let operator_headers =
             test_support::session_request_headers(&issue_session(&pool, operator).await);
 
-        open_wallet(&pool, victim, 50_000).await;
+        test_support::open_wallet(&pool, victim, 50_000).await;
 
         // Two live sessions - one of which is the victim's own dashboard
         // session, used below to create the victim's keys - plus one
@@ -1920,9 +1907,9 @@ mod tests {
         let operator_headers =
             test_support::session_request_headers(&issue_session(&pool, operator).await);
         let victim_token = issue_session(&pool, victim).await;
-        let app = app(state.clone());
+        let app = test_support::app(state.clone());
 
-        open_wallet(&pool, victim, 1_000).await;
+        test_support::open_wallet(&pool, victim, 1_000).await;
 
         // Control: the victim's session is live and authenticates.
         let (status, body) = get_me(&app, &victim_token).await;
@@ -1966,9 +1953,9 @@ mod tests {
         let victim = create_account(&pool).await;
         let operator_headers =
             test_support::session_request_headers(&issue_session(&pool, operator).await);
-        let app = app(state.clone());
+        let app = test_support::app(state.clone());
 
-        open_wallet(&pool, victim, 1_000).await;
+        test_support::open_wallet(&pool, victim, 1_000).await;
 
         // An empty allowlist so the request is refused for its model (403) after
         // authenticating - which WARMS the metadata cache without ever reaching
@@ -2030,9 +2017,9 @@ mod tests {
         let victim = create_account(&pool).await;
         let nobody_headers =
             test_support::session_request_headers(&issue_session(&pool, nobody).await);
-        let app = app(state.clone());
+        let app = test_support::app(state.clone());
 
-        open_wallet(&pool, victim, 1_000).await;
+        test_support::open_wallet(&pool, victim, 1_000).await;
         let victim_token = issue_session(&pool, victim).await;
         let victim_headers = test_support::session_request_headers(&victim_token);
         let (_, _) = create_key_via_handler(&state, &victim_headers, "live", vec![]).await;
@@ -2104,7 +2091,7 @@ mod tests {
             test_support::session_request_headers(&issue_session(&pool, operator).await);
         let victim = create_account(&pool).await;
 
-        open_wallet(&pool, operator, 1_000).await;
+        test_support::open_wallet(&pool, operator, 1_000).await;
         let (_, _) = create_key_via_handler(&state, &self_headers, "own", vec![]).await;
 
         for (status, body) in [
@@ -2178,7 +2165,7 @@ mod tests {
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
 
-        open_wallet(&pool, victim, 1_000).await;
+        test_support::open_wallet(&pool, victim, 1_000).await;
         let victim_token = issue_session(&pool, victim).await;
         let victim_headers = test_support::session_request_headers(&victim_token);
         let (key_id, _) = create_key_via_handler(&state, &victim_headers, "live", vec![]).await;
@@ -2257,7 +2244,7 @@ mod tests {
             0,
             "resume must not resurrect a session revoked by the suspend"
         );
-        let (status, _) = get_me(&app(state.clone()), &victim_token).await;
+        let (status, _) = get_me(&test_support::app(state.clone()), &victim_token).await;
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
@@ -2280,7 +2267,7 @@ mod tests {
         let operator_headers =
             test_support::session_request_headers(&issue_session(&pool, operator).await);
 
-        open_wallet(&pool, victim, 7_500).await;
+        test_support::open_wallet(&pool, victim, 7_500).await;
         let victim_token = issue_session(&pool, victim).await;
         let (_, _) = create_key_via_handler(
             &state,
@@ -2636,7 +2623,7 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let customer = create_account(&pool).await;
-        open_wallet(&pool, customer, 7_000).await;
+        test_support::open_wallet(&pool, customer, 7_000).await;
 
         let operator_headers =
             test_support::session_request_headers(&issue_session(&pool, operator).await);
@@ -2917,7 +2904,7 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         create_account(&pool).await;
-        let app = app(state.clone());
+        let app = test_support::app(state.clone());
 
         // No cookie -> 401 through the router.
         let res = app
@@ -3145,7 +3132,7 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let app = app(state.clone());
+        let app = test_support::app(state.clone());
 
         let token = issue_session(&pool, operator).await;
         let res = app

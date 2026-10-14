@@ -30,7 +30,6 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use sqlx::SqlitePool;
@@ -41,6 +40,7 @@ use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
 use crate::routes::proxy::AppState;
 use crate::routes::{events::RealtimeHub, hash_token};
 use crate::test_support as support;
+use crate::test_support;
 
 /// The three admin account-control verbs. All must be unreachable without an OPERATOR session.
 const ADMIN_VERBS: &[(&str, &str)] = &[
@@ -77,13 +77,6 @@ fn test_state(pool: SqlitePool) -> AppState {
         trusted_proxies,
         tasks: crate::shutdown::TaskTracker::new(),
     }
-}
-
-/// The whole router, reached the way a caller reaches it.
-fn app(state: AppState) -> Router {
-    use std::net::SocketAddr;
-    crate::routes::create_router(state)
-        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
 }
 
 /// A real sessions row plus the token its cookie resolves to, so the request below travels the
@@ -136,7 +129,7 @@ async fn via_router(
 #[tokio::test]
 async fn every_admin_verb_refuses_a_request_with_no_credential() {
     let db = support::TestDb::new().await;
-    let app = app(test_state(db.pool.clone()));
+    let app = test_support::app(test_state(db.pool.clone()));
 
     for (method, uri) in ADMIN_VERBS {
         let (status, body) = via_router(&app, method, uri, None).await;
@@ -180,7 +173,7 @@ async fn every_admin_verb_refuses_an_ordinary_authenticated_customer() {
          'authorization refused' from 'authorization absent'"
     );
 
-    let app = app(test_state(pool.clone()));
+    let app = test_support::app(test_state(pool.clone()));
     for (method, uri) in ADMIN_VERBS {
         let (status, body) = via_router(&app, method, uri, Some(&token)).await;
 
@@ -217,7 +210,7 @@ async fn an_operator_session_gets_past_the_authorization_layer() {
         .expect("promote to operator");
     let token = issue_session(pool, operator).await;
 
-    let app = app(test_state(pool.clone()));
+    let app = test_support::app(test_state(pool.clone()));
     let mut got_past = 0;
     for (method, uri) in ADMIN_VERBS {
         let (status, _) = via_router(&app, method, uri, Some(&token)).await;

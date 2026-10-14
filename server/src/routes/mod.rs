@@ -1549,11 +1549,7 @@ mod tests {
     /// extracts: without a ConnectInfo layer that extractor fails with 500, which
     /// would tell us nothing about whether the route matched.
     fn table_app() -> Router {
-        use axum::extract::connect_info::MockConnectInfo;
-        use std::net::SocketAddr;
-
-        create_router(table_state())
-            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+        crate::test_support::app(table_state())
     }
 
     /// Sends one credential-free request through the real router and returns the

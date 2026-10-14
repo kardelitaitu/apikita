@@ -60,9 +60,6 @@ pub fn database_url() -> Result<String, Box<dyn std::error::Error>> {
     env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set".into())
 }
 
-
-
-
 /// The two lines that open EVERY scheduled binary: initialise logging, then resolve the database.
 ///
 /// ONE COPY, and this is the duplication that round 57's consolidation CREATED rather than fixed - it

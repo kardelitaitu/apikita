@@ -3502,12 +3502,6 @@ mod tests {
     /// reconciliation assertion at the end of every test looks for.
     ///
     /// test_support::fund does exactly this - the wallet row, the topups row and
-    /// the real credit - so the fixture cannot drift from the money-in path.
-    async fn open_wallet(pool: &SqlitePool, account_id: Uuid, opening_idr: i64) {
-        test_support::wallet(pool, account_id).await;
-        test_support::fund(pool, account_id, opening_idr).await;
-    }
-
     /// An api_keys row whose key_hash is the SAME hash chat_completions derives
     /// from the bearer token, so the lookup under test is the production one and
     /// not a bypass around it.
@@ -3819,7 +3813,7 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let account_id = create_account(&pool).await;
-        open_wallet(&pool, account_id, 50_000).await;
+        test_support::open_wallet(&pool, account_id, 50_000).await;
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         create_api_key(&pool, account_id, &key, &["flash"]).await;
 
@@ -3928,7 +3922,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
 
@@ -4013,7 +4007,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key_id = create_api_key(
             &pool,
             account_id,
@@ -4133,7 +4127,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
 
@@ -4235,7 +4229,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key_id = create_api_key(
             &pool,
             account_id,
@@ -4517,7 +4511,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key_id = create_api_key(
             &pool,
             account_id,
@@ -4725,7 +4719,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key_id = create_api_key(
             &pool,
             account_id,
@@ -4853,7 +4847,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let opening_idr = 50_000;
         let held_idr = 10_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
 
         let pool_for_assertions = pool.clone();
@@ -4925,7 +4919,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let opening_idr = 50_000;
         let held_idr = 10_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
 
         let pool_for_assertions = pool.clone();
@@ -4994,7 +4988,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 50_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key_id = create_api_key(
             &pool,
             account_id,
@@ -5109,7 +5103,7 @@ mod tests {
         let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
         let opening_idr = 1_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key_id = create_api_key(
             &pool,
             account_id,
@@ -5272,7 +5266,7 @@ mod tests {
         let config = heterogeneous_flash_config();
         let state = test_state_with(pool.clone(), config.clone());
         let opening_idr = 500_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
 
@@ -5437,7 +5431,7 @@ mod tests {
 
         let funded_account = create_account(&pool).await;
         let funded_opening = 50_000;
-        open_wallet(&pool, funded_account, funded_opening).await;
+        test_support::open_wallet(&pool, funded_account, funded_opening).await;
         let funded_key = format!("apk_live_{}", Uuid::new_v4().simple());
         create_api_key(&pool, funded_account, &funded_key, &["flash"]).await;
 
@@ -5586,7 +5580,7 @@ mod tests {
         let account_id = create_account(&pool).await;
         let state = test_state(pool.clone());
         let opening_idr = 500_000;
-        open_wallet(&pool, account_id, opening_idr).await;
+        test_support::open_wallet(&pool, account_id, opening_idr).await;
 
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let spend_limit_idr = 10_000;
@@ -5795,7 +5789,7 @@ mod tests {
         let db = TestDb::new().await;
         let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
-        open_wallet(&pool, account_id, 50_000).await;
+        test_support::open_wallet(&pool, account_id, 50_000).await;
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
         sqlx::query("UPDATE api_keys SET expires_at = ? WHERE key_hash = ?")
@@ -5822,7 +5816,7 @@ mod tests {
         let db = TestDb::new().await;
         let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
-        open_wallet(&pool, account_id, 50_000).await;
+        test_support::open_wallet(&pool, account_id, 50_000).await;
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let _key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
         sqlx::query("UPDATE api_keys SET rate_limit_rpm = 1 WHERE key_hash = ?")
@@ -5849,7 +5843,7 @@ mod tests {
         let db = TestDb::new().await;
         let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
-        open_wallet(&pool, account_id, 50_000).await;
+        test_support::open_wallet(&pool, account_id, 50_000).await;
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
         sqlx::query("UPDATE api_keys SET token_limit = 1 WHERE key_hash = ?")
@@ -5905,7 +5899,7 @@ mod tests {
         let db = TestDb::new().await;
         let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
-        open_wallet(&pool, account_id, 50_000).await;
+        test_support::open_wallet(&pool, account_id, 50_000).await;
         let key = format!("apk_live_{}", Uuid::new_v4().simple());
         let key_id = create_api_key(&pool, account_id, &key, &["flash"]).await;
         sqlx::query("UPDATE api_keys SET token_limit = 1 WHERE key_hash = ?")
@@ -5970,7 +5964,7 @@ mod tests {
         let db = TestDb::new().await;
         let pool = db.pool.clone();
         let account_id = create_account(&pool).await;
-        open_wallet(&pool, account_id, 500_000).await;
+        test_support::open_wallet(&pool, account_id, 500_000).await;
 
         let busy_key = format!("apk_live_{}", Uuid::new_v4().simple());
         let quiet_key = format!("apk_live_{}", Uuid::new_v4().simple());
@@ -6266,7 +6260,7 @@ mod tests {
     ) -> (Uuid, Uuid, UpstreamClient, Arc<AppConfig>, String) {
         let config = streaming_config(endpoint_url);
         let account_id = create_account(&db.pool).await;
-        open_wallet(&db.pool, account_id, 1_000_000).await;
+        test_support::open_wallet(&db.pool, account_id, 1_000_000).await;
         let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
 
         let client = UpstreamClient::new(config.clone());
@@ -6651,7 +6645,7 @@ mod tests {
         let db = TestDb::new().await;
         let config = streaming_config("http://127.0.0.1:1/v1".to_string());
         let account_id = create_account(&db.pool).await;
-        open_wallet(&db.pool, account_id, 1_000_000).await;
+        test_support::open_wallet(&db.pool, account_id, 1_000_000).await;
         let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
         let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
         let reservation = 500;
@@ -6703,7 +6697,7 @@ mod tests {
         let db = TestDb::new().await;
         let config = streaming_config("http://127.0.0.1:1/v1".to_string());
         let account_id = create_account(&db.pool).await;
-        open_wallet(&db.pool, account_id, 1_000_000).await;
+        test_support::open_wallet(&db.pool, account_id, 1_000_000).await;
         let key_id = create_api_key(&db.pool, account_id, "apk_test_stream", &[STREAM_MODEL]).await;
         let reservation_ref = format!("reserve_{}", Uuid::new_v4().simple());
         let reservation = 500;
