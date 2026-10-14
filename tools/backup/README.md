@@ -97,6 +97,32 @@ operator learns one table. The rest are this tool's own.
 | `8`  | The offsite hook failed. The local artifact is kept; the offsite copy is missing. |
 | `9`  | Destination not writable, or retention pruning failed. |
 
+### Which codes have been seen running
+
+A DISASTER-RECOVERY CONTRACT IS THE WORST PLACE FOR AN UNTESTED BRANCH: a code nobody has produced is a
+promise about the tool's behaviour on the one night it matters. MEASURED, one round drove SIX of the ten
+against a scratch database and a stub offsite hook:
+
+| code | how it was produced |
+| --- | --- |
+| `0` | a minimal migrated database, `BACKUP_ENCRYPTION_KEY` set, and an `OFFSITE_CMD` that copies the artifact - the full path: copy, `integrity_check=ok`, AES-256-CBC, offsite, retention |
+| `1` | the same without `OFFSITE_CMD` - the artifact is written and kept, and the tool still exits 1 |
+| `2` | `DATABASE_URL=postgres://x/y` |
+| `4` | a `sqlite://` URL naming a file that is not there; ALSO a file that exists but is not a database, which fails inside `.backup` with `Error: file is not a database` |
+| `6` | `BACKUP_ENCRYPTION_KEY` unset |
+| `8` | `OFFSITE_CMD=cp` with no destination - the hook fails, and the message says the local artifact is KEPT and the offsite copy is MISSING |
+
+`3`, `5`, `7` and `9` were NOT staged. `3` needs `sqlite3` off the `PATH`, `5` needs a `.backup` that
+succeeds at the source and produces an unreadable copy, `7` needs a decryption failure, and `9` needs a
+read-only `BACKUP_DIR` or a retention failure. They are listed here as UNTESTED so a reader can tell
+which rows have been exercised from which have only been read.
+
+**ONE THING THE RUN SETTLED ABOUT `4` VERSUS `5`.** A corrupt file reached `4`, not `5`, because the
+failure happens while READING the source - `.backup` refuses it before any copy exists. `5` is for a copy
+that was produced and is then unusable, which is a different failure with a different fix: `4` says "the
+source could not be read", `5` says "what we wrote is not a backup". The table keeps them apart and the
+run shows the boundary is where the script says it is.
+
 Codes `1`, `5`, `6`, `7` and `8` are distinct from each other deliberately: "no
 offsite copy" is an alert with a different fix from "the copy is unreadable", and
 collapsing them into a generic failure is how the wrong thing gets investigated.
