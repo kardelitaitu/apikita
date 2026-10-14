@@ -766,6 +766,75 @@ mod tests {
         assert_eq!(snapshot.len(), 2, "balance and usage, always both");
     }
 
+    /// THE FILTER IS ONE FUNCTION, AND NOTHING BUT A COMMENT SAID SO.
+    ///
+    /// `for_account` exists because the rule was written in THREE places - the live arm, the replay
+    /// arm, and inside the isolation test, which re-implemented it while claiming to mirror
+    /// production. The comment at the live arm explains the consequence: a test that mirrors the
+    /// handler exercises the MIRROR, so dropping the production filter left the test green and the
+    /// stream leaking one account's balance to another.
+    ///
+    /// A THIRD PRODUCTION FILTER IS WHAT THIS PREVENTS, and it is a real risk rather than a
+    /// hypothetical one: the natural way to write a new arm is `if event.account_id == owner`, which
+    /// reads as obviously correct and reintroduces exactly the duplication the extraction removed.
+    ///
+    /// SO THIS COUNTS THE COMPARISONS. `for_account`'s own body is the one place the comparison may
+    /// appear OUTSIDE a test, and the second assertion is the half a count cannot see: a filter that
+    /// exists but is called by nothing is the same defect one step over.
+    #[test]
+    fn the_account_filter_is_the_only_one_in_production_code() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/events.rs"),
+        )
+        .expect("events.rs must be readable, or this checks nothing");
+
+        let tests_at = source.find("mod tests").expect(
+            "the test module moved, so this guard can no longer tell production from tests",
+        );
+        let production = &source[..tests_at];
+
+        // A SHAPE RATHER THAN AN EXACT SPELLING, and that distinction was MEASURED: the first
+        // version matched the literal string "event.account_id == account_id", and an added
+        // `|e: &RealtimeEvent, account_id: Uuid| e.account_id == account_id` - a second filter
+        // doing exactly the forbidden thing - passed it, because the mutation happened to name its
+        // binding differently. A guard that only recognises one spelling of a defect is a guard
+        // against that spelling.
+        //
+        // No regex crate in this build, so the shapes are listed: a comparison of an `account_id`
+        // against an `account_id`, against `owner`, or with the operands reversed. Prose cannot
+        // match any of them because every one requires the two sides to be identifiers.
+        let compared: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let l = line.trim_start();
+                // Comments describe the rule; only code can break it.
+                if l.starts_with("//") {
+                    return false;
+                }
+                [
+                    "account_id == account_id",
+                    "account_id == owner",
+                    "owner == account_id",
+                    "account_id == event.account_id",
+                ]
+                .iter()
+                .any(|shape| line.contains(shape))
+            })
+            .collect();
+        assert_eq!(
+            compared.len(),
+            1,
+            "exactly ONE place in production code may compare an event's account to the subscriber's - `for_account`'s own body. Found: {compared:?}. Forward any new comparison through `for_account`: the rule was written in three places once, and the test that mirrored it kept passing while the stream leaked one account's balance to another"
+        );
+
+        let calls = production.matches("for_account(").count();
+        assert!(
+            calls >= 3,
+            "the live arm and the replay arm must both call `for_account`, plus its own definition - found {calls}. A filter nobody calls isolates nothing."
+        );
+    }
+
     /// DEFECT 1 regression: a subscriber whose account is X must never observe an
     /// event published for account Y, even though the broadcast channel is shared
     /// process-wide.
