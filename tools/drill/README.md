@@ -22,16 +22,27 @@ repository root, `sqlite://data/drill-src.db` resolves to `<repo>/data/drill-src
 exist - and the drill fails with exit `6` and a message telling you to `cargo run --bin migrate`. From
 `server/` the same URL resolves to `<repo>/server/data/drill-src.db` and the drill passes.
 
-**`tools/backup/backup.sh` USES A DIFFERENT RULE FOR THE SAME VARIABLE, and states it.** It PREPENDS
-`server/` to a relative path, because `docs/local-development.md` defines `DATABASE_URL` as relative to
-`server/`. So the two tools disagree about what `sqlite://data/server.db` means - and only one of them
-says which it is. A reader who learned the convention from `backup.sh` would run this one from the
-repository root and get a failure that reads as a missing database.
+**THIS IS THE SAME RULE THE SERVER USES, WHICH IS THE POINT.** A first version of this section
+said the other tool was the odd one; reading the code says the reverse:
 
-Which behaviour is right is a separate question. What is not defensible is a documented convention
-implemented two ways with the difference unstated, so this section states this tool's half. The
-practical rule: **run the drill from `server/`, or pass an absolute `sqlite:///...` URL** (the third
-slash is what makes it absolute), or set `--source` explicitly.
+  * `server/src/main.rs` reads `DATABASE_URL` with `env::var` and passes it straight to
+    `db::init_pool`, which calls `SqliteConnectOptions::from_str` with NO path rewriting.
+  * sqlx resolves a relative SQLite path against the process's working directory, exactly as this
+    drill does.
+  * `docs/local-development.md:230` states the value is "relative to `server/`", and its `First run`
+    block runs migrate and the server from `server/` - so that sentence describes WHERE BINARIES ARE
+    RUN FROM, not a rule a tool has to apply.
+
+**`tools/backup/backup.sh` IS THE ONE THAT DIFFERS: it prefixes `server/` to a relative path.** That is
+a judgement it makes so the tool works from the repository root, and it says so - but it means the two
+tools give different answers for one string, and only one of them states its rule. A reader who learned
+the convention from `backup.sh` would run this drill from the repository root and get a failure that
+reads as a missing database.
+
+Neither behaviour is wrong - the drill mirrors the server, which is the strongest argument there is -
+but the difference has to be stated, which this section now does. The practical rule: **run the drill
+from `server/` (the same directory the server runs from), or pass an absolute `sqlite:///...` URL** (the
+third slash is what makes it absolute), or set `--source` explicitly.
 
 ## What it does, in the doc's order
 
