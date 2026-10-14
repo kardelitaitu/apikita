@@ -2034,7 +2034,7 @@ async fn release_quietly(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ledger_drift_rows;
+    use crate::test_support::{balance, ledger_drift_rows};
 
     // ---------------------------------------------------------------------
     // The usage tail: what decides whether a customer is billed at all.
@@ -3738,14 +3738,6 @@ mod tests {
             .expect("read ledger")
     }
 
-    async fn wallet_balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(pool)
-            .await
-            .expect("read balance")
-    }
-
     /// Today's usage row for the account: the three token classes SEPARATELY
     /// plus the cost. None means nothing was ever billed.
     async fn usage_today(pool: &SqlitePool, account_id: Uuid) -> Option<(i64, i64, i64, i64)> {
@@ -4018,14 +4010,14 @@ mod tests {
     ///
     /// It returns the settled balance so the assertion can be about the number, not the timing.
     async fn settled_balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        let mut last = wallet_balance(pool, account_id).await;
+        let mut last = balance(pool, account_id).await;
         // Generous: 200 polls at 10ms is two seconds, well past any detached task on a test pool.
         // `stable_for` requires the balance to agree across SEVERAL consecutive reads, so one slow
         // task cannot be mistaken for a settled value.
         let mut stable_for = 0;
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let now = wallet_balance(pool, account_id).await;
+            let now = balance(pool, account_id).await;
             if now == last {
                 stable_for += 1;
                 if stable_for >= 5 {
@@ -4322,7 +4314,7 @@ mod tests {
             );
 
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr,
                 "a refused request must cost the customer nothing"
             );
@@ -4480,7 +4472,7 @@ mod tests {
                 "the wallet must cover the worst case, got {held:?}"
             );
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr - held_idr,
                 "the hold must be OUT of the wallet for the whole upstream call"
             );
@@ -4884,7 +4876,7 @@ mod tests {
                 "the hold must land, got {held:?}"
             );
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr - held_idr,
                 "the hold is out of the wallet before the settlement"
             );
@@ -4993,7 +4985,7 @@ mod tests {
             .await
             .expect("place the hold");
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr - held_idr,
                 "the hold is out of the wallet"
             );
@@ -5019,7 +5011,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr - held_idr,
                 "a DEFUSED guard must not credit the hold back: the settlement already released it \
                  inside its own committed transaction, and `release_reservation_transaction` \
@@ -5079,13 +5071,13 @@ mod tests {
 
             // Poll until the detached release commits, rather than assuming a fixed delay: the
             // spawned task has to open a transaction and take the write lock.
-            let mut balance = wallet_balance(&pool_for_assertions, account_id).await;
+            let mut balance = balance(&pool_for_assertions, account_id).await;
             for _ in 0..200 {
                 if balance == opening_idr {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                balance = wallet_balance(&pool_for_assertions, account_id).await;
+                balance = crate::test_support::balance(&pool_for_assertions, account_id).await;
             }
 
             assert_eq!(
@@ -5179,7 +5171,7 @@ mod tests {
             .await;
 
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr,
                 "an unreported stream must not be billed against invented token counts"
             );
@@ -5452,7 +5444,7 @@ mod tests {
 
             // The whole hold came back, so the account is untouched...
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr,
                 "a refused request must cost the customer nothing"
             );
@@ -5608,11 +5600,11 @@ mod tests {
                 "no balance may be reserved before the allowlist refuses: {deltas:?}"
             );
             assert_eq!(
-                wallet_balance(&pool_for_assertions, funded_account).await,
+                balance(&pool_for_assertions, funded_account).await,
                 funded_opening,
                 "the balance must be untouched by a model denial"
             );
-            assert_eq!(wallet_balance(&pool_for_assertions, broke_account).await, 0);
+            assert_eq!(balance(&pool_for_assertions, broke_account).await, 0);
 
             for account in [funded_account, broke_account] {
                 assert_eq!(
@@ -5684,7 +5676,7 @@ mod tests {
 
             // A reservation that matched no row writes nothing: no ledger row, no
             // drift, no stranded hold.
-            assert_eq!(wallet_balance(&pool_for_assertions, account_id).await, 0);
+            assert_eq!(balance(&pool_for_assertions, account_id).await, 0);
             assert_eq!(
                 ledger_deltas(&pool_for_assertions, account_id).await,
                 Vec::<(i64, Option<String>)>::new(),
@@ -5747,7 +5739,7 @@ mod tests {
                 err.details()
             );
             assert_eq!(
-                wallet_balance(&pool_for_assertions, account_id).await,
+                balance(&pool_for_assertions, account_id).await,
                 opening_idr,
                 "the limit refuses before any money moves"
             );
@@ -6500,7 +6492,7 @@ mod tests {
         // The hold came back inside the settlement transaction, so the wallet
         // ends at funded - cost and the ledger explains every rupiah.
         assert_eq!(
-            wallet_balance(&db.pool, account_id).await,
+            balance(&db.pool, account_id).await,
             1_000_000 - cost,
             "balance must be funded minus the true cost"
         );
@@ -6603,7 +6595,7 @@ mod tests {
             usage_today(&db.pool, account_id).await.is_none(),
             "token counts are never invented for a washed stream"
         );
-        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
+        assert_eq!(balance(&db.pool, account_id).await, 1_000_000);
         let reservation_rows: Vec<i64> = ledger_deltas(&db.pool, account_id)
             .await
             .into_iter()
@@ -6689,7 +6681,7 @@ mod tests {
             .expect("drained usage is billed");
         assert_eq!((input, cached, output), (10, 0, 5));
         assert!(cost > 0);
-        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000 - cost);
+        assert_eq!(balance(&db.pool, account_id).await, 1_000_000 - cost);
         assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
@@ -6765,7 +6757,7 @@ mod tests {
         .await;
 
         assert!(usage_today(&db.pool, account_id).await.is_none());
-        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
+        assert_eq!(balance(&db.pool, account_id).await, 1_000_000);
         assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }
@@ -6815,7 +6807,7 @@ mod tests {
         .await;
 
         assert!(usage_today(&db.pool, account_id).await.is_none());
-        assert_eq!(wallet_balance(&db.pool, account_id).await, 1_000_000);
+        assert_eq!(balance(&db.pool, account_id).await, 1_000_000);
         assert_eq!(ledger_drift_rows(&db.pool, account_id).await, 0);
         db.close().await;
     }

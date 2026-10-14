@@ -3402,14 +3402,6 @@ mod tests {
         order_id
     }
 
-    async fn wallet_balance(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(pool)
-            .await
-            .expect("read balance")
-    }
-
     async fn topup_id(pool: &SqlitePool, order_id: &str) -> Uuid {
         // Ported: `topups.id` is TEXT in the SQLite schema, so it decodes through
         // `Hyphenated` and never as a bare 16-byte `Uuid` - the decode error is
@@ -3423,40 +3415,8 @@ mod tests {
         id.into_uuid()
     }
 
-    async fn topup_status(pool: &SqlitePool, order_id: &str) -> String {
-        sqlx::query_scalar("SELECT status FROM topups WHERE order_id = ?")
-            .bind(order_id)
-            .fetch_one(pool)
-            .await
-            .expect("read topup status")
-    }
-
     /// Every ledger row for the account with that reason, oldest first, as
     /// (delta_idr, ref). Ordering by id keeps the assertion about the append order,
-    /// not about whatever the planner returns.
-    async fn ledger_rows(
-        pool: &SqlitePool,
-        account_id: Uuid,
-        reason: &str,
-    ) -> Vec<(i64, Option<String>)> {
-        sqlx::query_as(
-            "SELECT delta_idr, ref FROM ledger WHERE account_id = ? AND reason = ? ORDER BY id",
-        )
-        .bind(account_id.hyphenated())
-        .bind(reason)
-        .fetch_all(pool)
-        .await
-        .expect("read ledger rows")
-    }
-
-    async fn ledger_row_count(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(pool)
-            .await
-            .expect("count ledger rows")
-    }
-
     /// Every ledger row under one ref, oldest first, as (reason, delta_idr).
     ///
     /// This is the join the audit trail depends on: one ref value must select every
@@ -3520,10 +3480,13 @@ mod tests {
             },
             "a fresh credit must move the wallet by the stored amount"
         );
-        assert_eq!(wallet_balance(&pool, account_id).await, AMOUNT);
-        assert_eq!(topup_status(&pool, &order_id).await, "settled");
+        assert_eq!(test_support::balance(&pool, account_id).await, AMOUNT);
         assert_eq!(
-            ledger_rows(&pool, account_id, "topup").await,
+            test_support::topup_status(&pool, &order_id).await,
+            "settled"
+        );
+        assert_eq!(
+            test_support::ledger_rows(&pool, account_id, "topup").await,
             vec![(AMOUNT, Some(stored_id.to_string()))],
             "the credit must append exactly one +topup row, ref'd to the topup id"
         );
@@ -3543,12 +3506,14 @@ mod tests {
             "the second webhook for one order must not credit again"
         );
         assert_eq!(
-            wallet_balance(&pool, account_id).await,
+            test_support::balance(&pool, account_id).await,
             AMOUNT,
             "a replayed top-up must leave the balance alone"
         );
         assert_eq!(
-            ledger_rows(&pool, account_id, "topup").await.len(),
+            test_support::ledger_rows(&pool, account_id, "topup")
+                .await
+                .len(),
             1,
             "a replayed top-up must not append a second ledger row"
         );
@@ -3561,7 +3526,7 @@ mod tests {
         let mismatch_order = format!("test_topup_{}", Uuid::new_v4().simple());
         create_topup(&pool, account_id, OTHER, &mismatch_order).await;
         let mismatch_id = topup_id(&pool, &mismatch_order).await;
-        let ledger_before = ledger_row_count(&pool, account_id).await;
+        let ledger_before = test_support::ledger_row_count(&pool, account_id).await;
 
         assert_eq!(
             credit_topup_transaction(
@@ -3576,22 +3541,22 @@ mod tests {
             "an amount that disagrees with the stored topup must be refused"
         );
         assert_eq!(
-            topup_status(&pool, &mismatch_order).await,
+            test_support::topup_status(&pool, &mismatch_order).await,
             "pending",
             "a refused credit must not settle the topup"
         );
         assert_eq!(
-            wallet_balance(&pool, account_id).await,
+            test_support::balance(&pool, account_id).await,
             AMOUNT,
             "a refused credit must not move the wallet"
         );
         assert_eq!(
-            ledger_row_count(&pool, account_id).await,
+            test_support::ledger_row_count(&pool, account_id).await,
             ledger_before,
             "a refused credit must not append a ledger row"
         );
         assert_eq!(
-            ledger_rows(&pool, account_id, "topup").await,
+            test_support::ledger_rows(&pool, account_id, "topup").await,
             vec![(AMOUNT, Some(stored_id.to_string()))],
             "the only topup ledger row must still be the first order's"
         );
@@ -3612,12 +3577,12 @@ mod tests {
             "an unknown order_id must be reported as NotFound"
         );
         assert_eq!(
-            wallet_balance(&pool, account_id).await,
+            test_support::balance(&pool, account_id).await,
             AMOUNT,
             "an unknown order must not move the wallet"
         );
         assert_eq!(
-            ledger_row_count(&pool, account_id).await,
+            test_support::ledger_row_count(&pool, account_id).await,
             ledger_before,
             "an unknown order must not append a ledger row"
         );
@@ -3651,12 +3616,14 @@ mod tests {
              the one that fails."
         );
         assert_eq!(
-            wallet_balance(&pool, account_id).await,
+            test_support::balance(&pool, account_id).await,
             AMOUNT,
             "the replay must still not move the wallet"
         );
         assert_eq!(
-            ledger_rows(&pool, account_id, "topup").await.len(),
+            test_support::ledger_rows(&pool, account_id, "topup")
+                .await
+                .len(),
             1,
             "the replay must still not append a second ledger row"
         );
@@ -3735,7 +3702,10 @@ mod tests {
             },
             "the hold must be a real, guarded debit"
         );
-        assert_eq!(wallet_balance(&pool, account_id).await, FUNDING - HOLD);
+        assert_eq!(
+            test_support::balance(&pool, account_id).await,
+            FUNDING - HOLD
+        );
         assert_eq!(
             unpaired_hold_rows(&pool, account_id)
                 .await
@@ -3753,12 +3723,12 @@ mod tests {
             "the release must credit the whole hold back"
         );
         assert_eq!(
-            wallet_balance(&pool, account_id).await,
+            test_support::balance(&pool, account_id).await,
             FUNDING,
             "after the release the wallet must be exactly where it started"
         );
         assert_eq!(
-            ledger_rows(&pool, account_id, "usage").await,
+            test_support::ledger_rows(&pool, account_id, "usage").await,
             vec![
                 (-HOLD, Some(hold_ref.clone())),
                 (HOLD, Some(hold_ref.clone()))
@@ -3785,7 +3755,7 @@ mod tests {
 
         // Nothing held, nothing released: a zero-delta ledger row is noise in an
         // append-only money log.
-        let rows_before = ledger_row_count(&pool, account_id).await;
+        let rows_before = test_support::ledger_row_count(&pool, account_id).await;
         assert_eq!(
             release_reservation_transaction(&pool, account_id, 0, Some("reserve_zero"))
                 .await
@@ -3794,11 +3764,11 @@ mod tests {
             "a zero reservation has nothing to release"
         );
         assert_eq!(
-            ledger_row_count(&pool, account_id).await,
+            test_support::ledger_row_count(&pool, account_id).await,
             rows_before,
             "a zero release must not append a zero-delta ledger row"
         );
-        assert_eq!(wallet_balance(&pool, account_id).await, FUNDING);
+        assert_eq!(test_support::balance(&pool, account_id).await, FUNDING);
 
         // No wallet row: nothing was ever held, so a credit would be money the
         // ledger cannot back.
@@ -3811,7 +3781,7 @@ mod tests {
             "an account with no wallet row has nothing to release"
         );
         assert_eq!(
-            ledger_row_count(&pool, bare).await,
+            test_support::ledger_row_count(&pool, bare).await,
             0,
             "a release with no wallet row must write no ledger row"
         );
@@ -3988,7 +3958,7 @@ mod tests {
                 .expect("release the non-reserve hold"),
             Some(FUNDING)
         );
-        assert_eq!(wallet_balance(&pool, account_id).await, FUNDING);
+        assert_eq!(test_support::balance(&pool, account_id).await, FUNDING);
         assert_eq!(
             ledger_drift_rows(&pool, account_id).await,
             0,
@@ -6915,7 +6885,10 @@ mod tests {
             None,
             "and is not marked retired either"
         );
-        assert_eq!(topup_status(&db.pool, &pending).await, "pending");
+        assert_eq!(
+            test_support::topup_status(&db.pool, &pending).await,
+            "pending"
+        );
         db.close().await;
     }
 

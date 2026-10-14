@@ -435,6 +435,49 @@ pub async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
     .expect("reconciliation query")
 }
 
+/// The stored status of a topup, by `order_id`.
+///
+/// ONE COPY, from `db.rs` and `routes/webhooks.rs`, where it was named `topup_status` and
+/// `topup_status_of`. Both are test helpers reading the same column of the same table, so the two
+/// names were the only difference.
+pub async fn topup_status(pool: &SqlitePool, order_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM topups WHERE order_id = ?")
+        .bind(order_id)
+        .fetch_one(pool)
+        .await
+        .expect("read topup status")
+}
+
+/// Every ledger row for one account and reason, oldest first: `(delta_idr, ref)`.
+///
+/// ONE COPY, from `db.rs` and `routes/webhooks.rs` (`ledger_rows` and `ledger_rows_of`). The
+/// `ORDER BY id` is load-bearing for callers that assert the SEQUENCE of -hold/+hold/-charge,
+/// which an unordered read would make flaky rather than wrong.
+pub async fn ledger_rows(
+    pool: &SqlitePool,
+    account_id: Uuid,
+    reason: &str,
+) -> Vec<(i64, Option<String>)> {
+    sqlx::query_as(
+        "SELECT delta_idr, ref FROM ledger WHERE account_id = ? AND reason = ? ORDER BY id",
+    )
+    .bind(account_id.hyphenated())
+    .bind(reason)
+    .fetch_all(pool)
+    .await
+    .expect("read ledger rows")
+}
+
+/// How many ledger rows the account has, whatever their reason.
+///
+/// ONE COPY, from `db.rs` and `routes/webhooks.rs` (`ledger_row_count` and `ledger_count`).
+pub async fn ledger_row_count(pool: &SqlitePool, account_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
+        .bind(account_id.hyphenated())
+        .fetch_one(pool)
+        .await
+        .expect("count ledger rows")
+}
 /// The sum of the account's ledger rows — the other side of the invariant.
 pub async fn ledger_sum(pool: &SqlitePool, account_id: Uuid) -> i64 {
     sqlx::query_scalar("SELECT COALESCE(SUM(delta_idr), 0) FROM ledger WHERE account_id = ?")

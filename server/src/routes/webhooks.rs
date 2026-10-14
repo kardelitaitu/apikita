@@ -399,7 +399,9 @@ pub async fn handle_midtrans_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ledger_drift_rows;
+    use crate::test_support::{
+        balance, ledger_drift_rows, ledger_row_count, ledger_rows, topup_status,
+    };
     // Only the tests exercise the raw status mapping: production code reaches it
     // through `evaluate_payment_status`, which is what the import above names.
     use crate::money::terminal_status;
@@ -857,47 +859,7 @@ mod tests {
         (status, body)
     }
 
-    async fn balance_of(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT balance_idr FROM wallets WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(pool)
-            .await
-            .expect("read balance")
-    }
-
-    async fn topup_status_of(pool: &SqlitePool, order_id: &str) -> String {
-        sqlx::query_scalar("SELECT status FROM topups WHERE order_id = ?")
-            .bind(order_id)
-            .fetch_one(pool)
-            .await
-            .expect("read topup status")
-    }
-
-    async fn ledger_count(pool: &SqlitePool, account_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM ledger WHERE account_id = ?")
-            .bind(account_id.hyphenated())
-            .fetch_one(pool)
-            .await
-            .expect("count ledger rows")
-    }
-
     /// Every ledger row for the account with that reason, oldest first, as
-    /// (delta_idr, ref).
-    async fn ledger_rows_of(
-        pool: &SqlitePool,
-        account_id: Uuid,
-        reason: &str,
-    ) -> Vec<(i64, Option<String>)> {
-        sqlx::query_as(
-            "SELECT delta_idr, ref FROM ledger WHERE account_id = ? AND reason = ? ORDER BY id",
-        )
-        .bind(account_id.hyphenated())
-        .bind(reason)
-        .fetch_all(pool)
-        .await
-        .expect("read ledger rows")
-    }
-
     /// The reconciliation check from docs/observability.md: wallets.balance_idr
     /// must equal SUM(ledger.delta_idr). Scoped to THIS fixture's account, so a
     /// concurrent writer cannot fail it for a reason unrelated to the handler.
@@ -1053,17 +1015,17 @@ mod tests {
         // HTTP status: a handler that answered 401 and credited anyway would
         // pass a status-only test.
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             0,
             "a rejected webhook must not credit the wallet"
         );
         assert_eq!(
-            topup_status_of(&pool, &order_id).await,
+            topup_status(&pool, &order_id).await,
             "pending",
             "a rejected webhook must not settle the topup"
         );
         assert_eq!(
-            ledger_count(&pool, account_id).await,
+            ledger_row_count(&pool, account_id).await,
             0,
             "a rejected webhook must append no ledger row"
         );
@@ -1104,16 +1066,16 @@ mod tests {
         assert_eq!(body["error"], json!("amount mismatch"), "{body}");
 
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             0,
             "a mismatched amount must credit NOTHING - not the payload amount, not the stored one"
         );
         assert_eq!(
-            topup_status_of(&pool, &order_id).await,
+            topup_status(&pool, &order_id).await,
             "pending",
             "a mismatched amount must leave the topup pending"
         );
-        assert_eq!(ledger_count(&pool, account_id).await, 0);
+        assert_eq!(ledger_row_count(&pool, account_id).await, 0);
         assert_reconciled(&pool, account_id, "after a mismatched amount").await;
     }
 
@@ -1152,13 +1114,13 @@ mod tests {
         );
 
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             AMOUNT,
             "the wallet must be up by EXACTLY the amount"
         );
-        assert_eq!(topup_status_of(&pool, &order_id).await, "settled");
+        assert_eq!(topup_status(&pool, &order_id).await, "settled");
 
-        let rows = ledger_rows_of(&pool, account_id, "topup").await;
+        let rows = ledger_rows(&pool, account_id, "topup").await;
         assert_eq!(
             rows.len(),
             1,
@@ -1178,17 +1140,17 @@ mod tests {
         assert_eq!(body["status"], json!("already_settled"), "{body}");
 
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             AMOUNT,
             "a replayed webhook must NOT credit again"
         );
         assert_eq!(
-            ledger_count(&pool, account_id).await,
+            ledger_row_count(&pool, account_id).await,
             1,
             "the ledger row COUNT must be unchanged by the replay"
         );
-        assert_eq!(ledger_rows_of(&pool, account_id, "topup").await.len(), 1);
-        assert_eq!(topup_status_of(&pool, &order_id).await, "settled");
+        assert_eq!(ledger_rows(&pool, account_id, "topup").await.len(), 1);
+        assert_eq!(topup_status(&pool, &order_id).await, "settled");
         assert_reconciled(&pool, account_id, "after a replayed settlement").await;
     }
 
@@ -1227,16 +1189,16 @@ mod tests {
 
             assert_eq!(status, StatusCode::OK, "{midtrans_status}: body: {body}");
             assert_eq!(
-                topup_status_of(&pool, &order_id).await,
+                topup_status(&pool, &order_id).await,
                 expected,
                 "{midtrans_status} must persist the SCHEMA word `{expected}`, not Midtrans'                  own. A silent no-op answers 200 too, so the row is the assertion. body: {body}"
             );
             assert_eq!(
-                balance_of(&pool, account_id).await,
+                balance(&pool, account_id).await,
                 0,
                 "{midtrans_status} must not move money"
             );
-            assert_eq!(ledger_count(&pool, account_id).await, 0);
+            assert_eq!(ledger_row_count(&pool, account_id).await, 0);
             assert_reconciled(&pool, account_id, &format!("after {midtrans_status}")).await;
         }
     }
@@ -1263,12 +1225,12 @@ mod tests {
 
         // The topup must be EXACTLY as it was - not merely "not settled".
         assert_eq!(
-            topup_status_of(&pool, &order_id).await,
+            topup_status(&pool, &order_id).await,
             "pending",
             "an unrecognised status performs NO write. body: {body}"
         );
-        assert_eq!(balance_of(&pool, account_id).await, 0);
-        assert_eq!(ledger_count(&pool, account_id).await, 0);
+        assert_eq!(balance(&pool, account_id).await, 0);
+        assert_eq!(ledger_row_count(&pool, account_id).await, 0);
         assert_reconciled(&pool, account_id, "after an unrecognised status").await;
 
         // ...and it must not report a money-moving outcome. The status code is
@@ -1359,22 +1321,22 @@ mod tests {
             // handler that answered the refusal body and debited anyway would pass a
             // status-only test.
             assert_eq!(
-                balance_of(&pool, account_id).await,
+                balance(&pool, account_id).await,
                 AMOUNT,
                 "attempt {attempt}: a refused refund must not debit the wallet"
             );
             assert_eq!(
-                topup_status_of(&pool, &order_id).await,
+                topup_status(&pool, &order_id).await,
                 "settled",
                 "attempt {attempt}: a refused refund must leave the topup settled"
             );
             assert_eq!(
-                ledger_rows_of(&pool, account_id, "refund").await.len(),
+                ledger_rows(&pool, account_id, "refund").await.len(),
                 0,
                 "attempt {attempt}: a refused refund must append no ledger row"
             );
             assert_eq!(
-                ledger_count(&pool, account_id).await,
+                ledger_row_count(&pool, account_id).await,
                 1,
                 "attempt {attempt}: the credit must remain the ONLY ledger row"
             );
@@ -1399,9 +1361,9 @@ mod tests {
             json!("already_settled"),
             "a settlement replayed after a refusal must credit nothing: {body}"
         );
-        assert_eq!(balance_of(&pool, account_id).await, AMOUNT);
-        assert_eq!(ledger_count(&pool, account_id).await, 1);
-        assert_eq!(topup_status_of(&pool, &order_id).await, "settled");
+        assert_eq!(balance(&pool, account_id).await, AMOUNT);
+        assert_eq!(ledger_row_count(&pool, account_id).await, 1);
+        assert_eq!(topup_status(&pool, &order_id).await, "settled");
         assert_reconciled(
             &pool,
             account_id,
@@ -1478,22 +1440,22 @@ mod tests {
         );
 
         assert_eq!(
-            balance_of(&pool, account_id).await,
+            balance(&pool, account_id).await,
             2 * STORED,
             "a refused refund must debit NOTHING - not the payload amount, not the stored one"
         );
         assert_eq!(
-            topup_status_of(&pool, &first).await,
+            topup_status(&pool, &first).await,
             "settled",
             "a refused refund must not mark the top-up refunded"
         );
         assert_eq!(
-            ledger_rows_of(&pool, account_id, "refund").await.len(),
+            ledger_rows(&pool, account_id, "refund").await.len(),
             0,
             "a refused refund must append no ledger row"
         );
         assert_eq!(
-            ledger_count(&pool, account_id).await,
+            ledger_row_count(&pool, account_id).await,
             2,
             "only the two credits may exist"
         );
@@ -1506,8 +1468,8 @@ mod tests {
         let (status, body) = post(&state, honest).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(body["status"], json!("refund_not_supported"), "{body}");
-        assert_eq!(balance_of(&pool, account_id).await, 2 * STORED);
-        assert_eq!(topup_status_of(&pool, &first).await, "settled");
+        assert_eq!(balance(&pool, account_id).await, 2 * STORED);
+        assert_eq!(topup_status(&pool, &first).await, "settled");
         assert_reconciled(&pool, account_id, "after the stored-amount refund").await;
     }
 
@@ -1706,7 +1668,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "the body is {body}");
         assert_eq!(body["status"], json!("settled"), "the body is {body}");
         assert_eq!(
-            topup_status_of(&db.pool, &order_id).await,
+            topup_status(&db.pool, &order_id).await,
             "settled",
             "fraud_status is deliberately not consulted: transaction_status is the \
              authority, and Midtrans reports a challenged payment as pending and a \
@@ -1984,8 +1946,8 @@ mod tests {
             "a settlement for an order that does not exist is 404: {body}"
         );
         assert_eq!(body["error"], json!("order not found"), "{body}");
-        assert_eq!(balance_of(&db.pool, account_id).await, 0);
-        assert_eq!(ledger_count(&db.pool, account_id).await, 0);
+        assert_eq!(balance(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_row_count(&db.pool, account_id).await, 0);
         assert_reconciled(&db.pool, account_id, "after an unknown-order settlement").await;
         db.close().await;
     }
@@ -2010,7 +1972,7 @@ mod tests {
         let deny = notification(&order_id, "200", "50000.00", "deny", LIVE_TEST_SERVER_KEY);
         let (status, body) = post(&state, deny).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert_eq!(topup_status_of(&db.pool, &order_id).await, "denied");
+        assert_eq!(topup_status(&db.pool, &order_id).await, "denied");
 
         let settle = notification(
             &order_id,
@@ -2027,8 +1989,8 @@ mod tests {
             "a settlement for a denied order must be refused as not_settleable: {body}"
         );
         assert_eq!(body["order_status"], json!("denied"), "{body}");
-        assert_eq!(balance_of(&db.pool, account_id).await, 0, "no money moved");
-        assert_eq!(ledger_count(&db.pool, account_id).await, 0);
+        assert_eq!(balance(&db.pool, account_id).await, 0, "no money moved");
+        assert_eq!(ledger_row_count(&db.pool, account_id).await, 0);
         assert_reconciled(&db.pool, account_id, "after a not_settleable settlement").await;
         db.close().await;
     }
@@ -2058,7 +2020,7 @@ mod tests {
         );
         let (status, body) = post(&state, settle).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert_eq!(topup_status_of(&db.pool, &order_id).await, "settled");
+        assert_eq!(topup_status(&db.pool, &order_id).await, "settled");
 
         // Now a terminal status (expire -> expired). The UPDATE WHERE status =
         // 'pending' affects 0 rows, so it records nothing.
@@ -2071,7 +2033,7 @@ mod tests {
             "a terminal status for a non-pending row must be not_applicable: {body}"
         );
         assert_eq!(
-            topup_status_of(&db.pool, &order_id).await,
+            topup_status(&db.pool, &order_id).await,
             "settled",
             "the row must be left untouched"
         );
@@ -2102,9 +2064,9 @@ mod tests {
         let (status, body) = post(&state, payload).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(body["status"], json!("pending"), "{body}");
-        assert_eq!(balance_of(&db.pool, account_id).await, 0);
-        assert_eq!(ledger_count(&db.pool, account_id).await, 0);
-        assert_eq!(topup_status_of(&db.pool, &order_id).await, "pending");
+        assert_eq!(balance(&db.pool, account_id).await, 0);
+        assert_eq!(ledger_row_count(&db.pool, account_id).await, 0);
+        assert_eq!(topup_status(&db.pool, &order_id).await, "pending");
         assert_reconciled(&db.pool, account_id, "after a pending status").await;
         db.close().await;
     }
