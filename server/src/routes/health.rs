@@ -444,6 +444,7 @@ pub async fn operator_metrics(
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::test_support;
     use crate::test_support::TestDb;
     use axum::body::to_bytes;
     use serde_json::{json, Value};
@@ -753,15 +754,6 @@ mod tests {
         token
     }
 
-    fn session_cookie(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            format!("a=1; session={token}; b=2").parse().unwrap(),
-        );
-        headers
-    }
-
     /// The real application state, built the way main.rs builds it.
     fn metrics_state(pool: SqlitePool) -> AppState {
         for path in ["../config/apikita.toml", "config/apikita.toml"] {
@@ -842,7 +834,7 @@ mod tests {
         let token = account_with_session(&db.pool, false).await;
         let state = metrics_state(db.pool.clone());
 
-        let (status, body) = metrics(state, session_cookie(&token)).await;
+        let (status, body) = metrics(state, test_support::session_request_headers(&token)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
         assert_eq!(body["error"]["code"], json!("forbidden"));
@@ -867,7 +859,7 @@ mod tests {
         }
         counter.record_error();
 
-        let (status, body) = metrics(state, session_cookie(&token)).await;
+        let (status, body) = metrics(state, test_support::session_request_headers(&token)).await;
 
         assert_eq!(status, StatusCode::OK, "body: {body}");
         // MONOTONIC, not an exact value: the counter is process-wide and other tests
@@ -1541,7 +1533,7 @@ mod tests {
             .await
             .expect("the fixture must be able to drop the table the lag query reads");
 
-        let (status, body) = metrics(state, session_cookie(&token)).await;
+        let (status, body) = metrics(state, test_support::session_request_headers(&token)).await;
 
         // Still a 200: the operator asked for counters during an incident and gets
         // them. Failing the request would hide the counters exactly when they matter.

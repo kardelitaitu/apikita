@@ -460,6 +460,33 @@ pub fn shipped_config() -> Arc<AppConfig> {
     }
     panic!("could not find apikita.toml for testing");
 }
+/// A REQUEST's cookie header carrying `token` as the session, with decoys on both sides.
+///
+/// NAMED FOR THE DIRECTION. `routes/auth.rs` has a PRODUCTION `session_cookie` that BUILDS a
+/// `Set-Cookie` response header, so a fixture with the same name would read as the same thing in a
+/// grep. This one is the request side: what a browser sends, not what the server sets.
+///
+/// ONE COPY, from FIVE: `routes/account.rs` and `routes/auth.rs` called it `cookie_header`,
+/// `routes/telegram.rs` and `routes/admin.rs` called it `cookie_headers`, and `routes/health.rs`
+/// called it `session_cookie` - the same seven lines with the same `"a=1; session={token}; b=2"`
+/// literal under five names.
+///
+/// THE DECOYS ARE THE POINT, NOT DECORATION. `session_token_from_cookie_header` documents three
+/// load-bearing rules, and this fixture is what exercises two of them: the name must match EXACTLY
+/// (so the `a=1` before it and the `b=2` after it must not be mistaken for the session), and the
+/// value is everything after the first `=`. A fixture that sent a bare `session={token}` would let a
+/// parser that splits on `;` and takes index 0 pass while failing on a real browser's header.
+///
+/// Built through `HeaderMap` rather than a raw string so a caller can hand it to `Request::builder`
+/// without re-parsing, and so an invalid token panics HERE rather than in the caller's setup.
+pub fn session_request_headers(token: &str) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        format!("a=1; session={token}; b=2").parse().unwrap(),
+    );
+    headers
+}
 /// The stored status of a topup, by `order_id`.
 ///
 /// ONE COPY, from `db.rs` and `routes/webhooks.rs`, where it was named `topup_status` and

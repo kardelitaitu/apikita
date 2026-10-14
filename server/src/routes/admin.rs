@@ -1149,15 +1149,6 @@ mod tests {
         token
     }
 
-    fn cookie_headers(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            format!("a=1; session={token}; b=2").parse().unwrap(),
-        );
-        headers
-    }
-
     /// Money enters a wallet ONLY through credit_topup_transaction, which writes
     /// the matching ledger row in the same transaction. Writing
     /// wallets.balance_idr directly manufactures exactly the drift the
@@ -1505,7 +1496,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         open_wallet(&pool, victim, 50_000).await;
 
@@ -1514,7 +1506,8 @@ mod tests {
         // EXPIRED-but-unrevoked row: the revocation predicate is
         // "revoked_at IS NULL" (the statement logout_all uses), so the expired
         // row is revoked too, and the LIVE count is what must reach zero.
-        let victim_headers = cookie_headers(&issue_session(&pool, victim).await);
+        let victim_headers =
+            test_support::session_request_headers(&issue_session(&pool, victim).await);
         issue_session(&pool, victim).await;
         // The expired row carries every NOT NULL column from Rust, and its
         // expiry is computed in Rust: now() - interval has no SQLite spelling
@@ -1713,7 +1706,7 @@ mod tests {
         // every new money test here. Without a row, the assertion below would fail on a missing
         // wallet rather than on the refusal it is about, which is a test measuring the fixture.
         test_support::wallet(&pool, operator).await;
-        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         let (status, body) = render(adjust_account(
             State(state.clone()),
@@ -1761,7 +1754,7 @@ mod tests {
         // test.
         let target = test_support::account_with_wallet(&pool).await;
         test_support::fund(&pool, target, 10_000).await;
-        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         for (reason, note) in [("", ""), ("x", ""), ("", "y"), ("recon", "fix")] {
             let (status, body) = render(adjust_account(
@@ -1816,7 +1809,7 @@ mod tests {
         // test.
         let target = test_support::account_with_wallet(&pool).await;
         test_support::fund(&pool, target, 10_000).await;
-        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         let (status, body) = render(adjust_account(
             State(state.clone()),
@@ -1876,7 +1869,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         let (status, body) = render(suspend_account(
             State(state.clone()),
@@ -1923,7 +1917,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let victim_token = issue_session(&pool, victim).await;
         let app = app(state.clone());
 
@@ -1969,7 +1964,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let app = app(state.clone());
 
         open_wallet(&pool, victim, 1_000).await;
@@ -1978,7 +1974,8 @@ mod tests {
         // authenticating - which WARMS the metadata cache without ever reaching
         // an upstream. The key belongs to the VICTIM: it is the victim's
         // credential the suspend must kill.
-        let victim_headers = cookie_headers(&issue_session(&pool, victim).await);
+        let victim_headers =
+            test_support::session_request_headers(&issue_session(&pool, victim).await);
         let (key_id, plaintext) =
             create_key_via_handler(&state, &victim_headers, "victim", vec![]).await;
 
@@ -2031,12 +2028,13 @@ mod tests {
         let state = test_state(pool.clone());
         let nobody = create_account(&pool).await;
         let victim = create_account(&pool).await;
-        let nobody_headers = cookie_headers(&issue_session(&pool, nobody).await);
+        let nobody_headers =
+            test_support::session_request_headers(&issue_session(&pool, nobody).await);
         let app = app(state.clone());
 
         open_wallet(&pool, victim, 1_000).await;
         let victim_token = issue_session(&pool, victim).await;
-        let victim_headers = cookie_headers(&victim_token);
+        let victim_headers = test_support::session_request_headers(&victim_token);
         let (_, _) = create_key_via_handler(&state, &victim_headers, "live", vec![]).await;
 
         // 403, not 401 (the session is real) and not 404 (the target is real).
@@ -2102,7 +2100,8 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let self_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let self_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let victim = create_account(&pool).await;
 
         open_wallet(&pool, operator, 1_000).await;
@@ -2181,7 +2180,7 @@ mod tests {
 
         open_wallet(&pool, victim, 1_000).await;
         let victim_token = issue_session(&pool, victim).await;
-        let victim_headers = cookie_headers(&victim_token);
+        let victim_headers = test_support::session_request_headers(&victim_token);
         let (key_id, _) = create_key_via_handler(&state, &victim_headers, "live", vec![]).await;
 
         // Suspended by hand: the point of this test is what RESUME does, and a
@@ -2197,7 +2196,7 @@ mod tests {
         let (status, body) = render(resume_account(
             State(state.clone()),
             Path(victim),
-            cookie_headers(&issue_session(&pool, operator).await),
+            test_support::session_request_headers(&issue_session(&pool, operator).await),
         ))
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -2241,7 +2240,7 @@ mod tests {
         let (status, _) = render(suspend_account(
             State(state.clone()),
             Path(victim),
-            cookie_headers(&issue_session(&pool, operator).await),
+            test_support::session_request_headers(&issue_session(&pool, operator).await),
         ))
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -2249,7 +2248,7 @@ mod tests {
         let (status, _) = render(resume_account(
             State(state.clone()),
             Path(victim),
-            cookie_headers(&issue_session(&pool, operator).await),
+            test_support::session_request_headers(&issue_session(&pool, operator).await),
         ))
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -2278,12 +2277,18 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         open_wallet(&pool, victim, 7_500).await;
         let victim_token = issue_session(&pool, victim).await;
-        let (_, _) =
-            create_key_via_handler(&state, &cookie_headers(&victim_token), "live", vec![]).await;
+        let (_, _) = create_key_via_handler(
+            &state,
+            &test_support::session_request_headers(&victim_token),
+            "live",
+            vec![],
+        )
+        .await;
 
         let (status, body) = render(get_account(
             State(state.clone()),
@@ -2374,7 +2379,7 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         let (status, body) = render(suspend_account(
             State(state.clone()),
@@ -2395,7 +2400,7 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         let (status, body) = render(resume_account(
             State(state.clone()),
@@ -2422,7 +2427,7 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         // A fresh, ACTIVE account that was never suspended.
         let victim = test_support::account(&pool).await;
@@ -2456,7 +2461,7 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         let victim = test_support::account(&pool).await;
         sqlx::query("UPDATE accounts SET status = 'suspended' WHERE id = ?")
@@ -2480,7 +2485,8 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         // A real password identity, created through the same production helper the
         // signup handler uses, so the credential the login below presents is a real
@@ -2584,7 +2590,8 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         // A real, live session on a NON-operator account -> 403.
-        let outsider_headers = cookie_headers(&issue_session(&pool, outsider).await);
+        let outsider_headers =
+            test_support::session_request_headers(&issue_session(&pool, outsider).await);
         let (status, body) = render(list_accounts(
             State(state.clone()),
             outsider_headers,
@@ -2601,7 +2608,8 @@ mod tests {
 
         // And the operator's own listing works, proving the same call succeeds
         // for the right caller - the 403 above is authorization, not a broken route.
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let (status, _) = render(list_accounts(
             State(state.clone()),
             operator_headers,
@@ -2630,7 +2638,8 @@ mod tests {
         let customer = create_account(&pool).await;
         open_wallet(&pool, customer, 7_000).await;
 
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let (status, body) = render(list_accounts(
             State(state.clone()),
             operator_headers,
@@ -2704,7 +2713,8 @@ mod tests {
         let active = create_account(&pool).await;
         let suspended = create_account(&pool).await;
 
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         // Suspend one through the real handler so its status is genuine.
         let (status, _) = render(suspend_account(
@@ -2797,7 +2807,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let customer = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         let (status, body) = render(list_accounts(
             State(state.clone()),
@@ -2831,7 +2842,8 @@ mod tests {
         for _ in 0..3 {
             create_account(&pool).await;
         }
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         // limit=0 is raised to the minimum (1), never left at 0 (which SQLite
         // reads as "no limit").
@@ -2985,7 +2997,8 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         // A live NON-operator session -> 403.
-        let outsider_headers = cookie_headers(&issue_session(&pool, outsider).await);
+        let outsider_headers =
+            test_support::session_request_headers(&issue_session(&pool, outsider).await);
         let (status, body) = render(get_account_audit(
             State(state.clone()),
             Path(victim),
@@ -2997,7 +3010,8 @@ mod tests {
         assert_eq!(body["error"]["code"], json!("forbidden"));
 
         // The operator reading their OWN trail -> 403 (refuse_self_action).
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
         let (status, _) = render(get_account_audit(
             State(state.clone()),
             Path(operator),
@@ -3022,7 +3036,8 @@ mod tests {
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
         let victim = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         // Before any action: an empty trail, not an error.
         let (status, body) = render(get_account_audit(
@@ -3179,7 +3194,8 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         // A non-operator session -> 403, before any row is read.
-        let outsider_headers = cookie_headers(&issue_session(&pool, outsider).await);
+        let outsider_headers =
+            test_support::session_request_headers(&issue_session(&pool, outsider).await);
         let (status, body) = render(list_recent_audit(
             State(state.clone()),
             outsider_headers,
@@ -3200,7 +3216,8 @@ mod tests {
         let operator = create_operator(&pool).await;
         let a = create_account(&pool).await;
         let b = create_account(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         // Two actions on two DIFFERENT accounts, so a target-filtered read would
         // miss one and this test would catch it.
@@ -3246,7 +3263,7 @@ mod tests {
         // The limit is bounded and echoed.
         let (_, body) = render(list_recent_audit(
             State(state.clone()),
-            cookie_headers(&issue_session(&pool, operator).await),
+            test_support::session_request_headers(&issue_session(&pool, operator).await),
             Query(AdminRecentAuditQuery { limit: Some(1) }),
         ))
         .await;
@@ -3269,7 +3286,8 @@ mod tests {
         let db = TestDb::new().await;
         let pool = db.pool.clone();
         let operator = create_operator(&pool).await;
-        let operator_headers = cookie_headers(&issue_session(&pool, operator).await);
+        let operator_headers =
+            test_support::session_request_headers(&issue_session(&pool, operator).await);
 
         // `accounts.id` has no outward FK, so a malformed id is insertable and
         // is the first row the DESC-ordered listing hits.
@@ -3332,7 +3350,7 @@ mod tests {
         let pool = db.pool.clone();
         let state = test_state(pool.clone());
         let operator = create_operator(&pool).await;
-        let headers = cookie_headers(&issue_session(&pool, operator).await);
+        let headers = test_support::session_request_headers(&issue_session(&pool, operator).await);
         let victim = test_support::account(&pool).await;
 
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));

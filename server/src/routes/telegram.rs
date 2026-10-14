@@ -869,25 +869,6 @@ mod tests {
         headers
     }
 
-    /// The session cookie AMONG OTHERS, which is what a browser actually sends.
-    ///
-    /// This helper used to build a bare "session={token}". Four other route modules
-    /// build "a=1; session={token}; b=2", and the difference is not cosmetic: a bare
-    /// header never exercises the parser's scan past another cookie's "=", so a
-    /// regression in `session_token_from_cookie_header` that broke multi-cookie
-    /// parsing would have left every test in this file green.
-    ///
-    /// The header a customer's browser sends is never a lone cookie, so the fixture
-    /// that should be impossible is the one this file was using.
-    fn cookie_headers(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            format!("a=1; session={token}; b=2").parse().unwrap(),
-        );
-        headers
-    }
-
     /// A session for the account, returning its plaintext token.
     async fn session_for(pool: &SqlitePool, account_id: Uuid) -> String {
         let token = format!("apk_sess_{}", Uuid::new_v4().simple());
@@ -1238,7 +1219,7 @@ mod tests {
         let cookie = redeem_link_code(
             State(state.clone()),
             peer(),
-            cookie_headers(&session),
+            test_support::session_request_headers(&session),
             Json(RedeemLinkCodeRequest {
                 code: "424242".into(),
                 telegram_id: "5550007".into(),
@@ -1340,7 +1321,7 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..(limit + 8) {
             let state = state.clone();
-            let headers = cookie_headers(&session);
+            let headers = test_support::session_request_headers(&session);
             handles.push(tokio::spawn(async move {
                 issue_link_code(State(state), headers)
                     .await
@@ -1429,14 +1410,20 @@ mod tests {
 
         let session = session_for(&db.pool, account).await;
 
-        let first = issue_link_code(State(state.clone()), cookie_headers(&session))
-            .await
-            .expect("an authenticated issue succeeds");
+        let first = issue_link_code(
+            State(state.clone()),
+            test_support::session_request_headers(&session),
+        )
+        .await
+        .expect("an authenticated issue succeeds");
         assert!(body_text(first).await.contains("ttl_minutes"));
 
-        issue_link_code(State(state.clone()), cookie_headers(&session))
-            .await
-            .expect("a second issue succeeds");
+        issue_link_code(
+            State(state.clone()),
+            test_support::session_request_headers(&session),
+        )
+        .await
+        .expect("a second issue succeeds");
 
         let live: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM link_codes WHERE account_id = ? AND used_at IS NULL AND expires_at > ?",
@@ -1476,9 +1463,12 @@ mod tests {
         let ledger_before = test_support::ledger_sum(&db.pool, account).await;
 
         let session = session_for(&db.pool, account).await;
-        unlink_telegram(State(state.clone()), cookie_headers(&session))
-            .await
-            .expect("unlink succeeds");
+        unlink_telegram(
+            State(state.clone()),
+            test_support::session_request_headers(&session),
+        )
+        .await
+        .expect("unlink succeeds");
 
         assert_eq!(linked_account(&db.pool, "5550009").await, None);
 

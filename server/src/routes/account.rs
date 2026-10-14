@@ -1413,15 +1413,6 @@ mod tests {
         LiveAccount { account_id, token }
     }
 
-    fn cookie_header(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            format!("a=1; session={token}; b=2").parse().unwrap(),
-        );
-        headers
-    }
-
     /// Money enters a wallet only through the REAL path: a topups row, then
     /// credit_topup_transaction, which settles it and appends the matching +
     /// ledger row in the same transaction. Writing wallets.balance_idr directly
@@ -1564,7 +1555,11 @@ mod tests {
 
         // POSITIVE CONTROL: the same session, used now, must work. Without this the
         // refusal below would also be satisfied by a handler that refuses everything.
-        let (ok, _) = respond(get_me(State(pool.clone()), cookie_header(&live.token))).await;
+        let (ok, _) = respond(get_me(
+            State(pool.clone()),
+            test_support::session_request_headers(&live.token),
+        ))
+        .await;
         assert_eq!(
             ok,
             StatusCode::OK,
@@ -1574,7 +1569,11 @@ mod tests {
         // 8 days idle against a 30-day absolute expiry: far from expiring, so the
         // only rule that can refuse it is the idle bound.
         age_session(&pool, &live.token, 8).await;
-        let (status, body) = respond(get_me(State(pool.clone()), cookie_header(&live.token))).await;
+        let (status, body) = respond(get_me(
+            State(pool.clone()),
+            test_support::session_request_headers(&live.token),
+        ))
+        .await;
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
@@ -1585,7 +1584,11 @@ mod tests {
         // still be admitted. A single-sided assertion would pass against a handler
         // that refused everything older than a minute.
         age_session(&pool, &live.token, 6).await;
-        let (status, _) = respond(get_me(State(pool.clone()), cookie_header(&live.token))).await;
+        let (status, _) = respond(get_me(
+            State(pool.clone()),
+            test_support::session_request_headers(&live.token),
+        ))
+        .await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -1644,7 +1647,11 @@ mod tests {
         let other_opening = 11_000;
         settle_topup(&pool, other_account_id, other_opening).await;
 
-        let (status, body) = respond(get_me(State(pool.clone()), cookie_header(&token))).await;
+        let (status, body) = respond(get_me(
+            State(pool.clone()),
+            test_support::session_request_headers(&token),
+        ))
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         // Cross-checked against a direct SELECT, so the test cannot pass on a
@@ -1858,7 +1865,7 @@ mod tests {
 
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(None, None),
         ))
         .await;
@@ -2034,7 +2041,7 @@ mod tests {
         // must not appear, which is precisely what the old handler got wrong.
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(Some(&days[3].to_string()), Some(&days[1].to_string())),
         ))
         .await;
@@ -2089,7 +2096,7 @@ mod tests {
         // --- BOTH BOUNDS ARE INCLUSIVE. ---
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(Some(&days[1].to_string()), Some(&days[1].to_string())),
         ))
         .await;
@@ -2106,7 +2113,7 @@ mod tests {
         // --- A range with no rows is EMPTY, never a fallback. ---
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(Some("2001-01-01"), Some("2001-01-31")),
         ))
         .await;
@@ -2125,7 +2132,7 @@ mod tests {
         // --- A range that starts after today is still empty, not a fallback. ---
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(
                 Some(&(today + chrono::Duration::days(10)).to_string()),
                 Some(&(today + chrono::Duration::days(20)).to_string()),
@@ -2138,7 +2145,7 @@ mod tests {
         // --- No params: the documented default window still holds. ---
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(None, None),
         ))
         .await;
@@ -2188,7 +2195,7 @@ mod tests {
         ] {
             let (status, body) = respond(get_usage(
                 State(pool.clone()),
-                cookie_header(&token),
+                test_support::session_request_headers(&token),
                 usage_query(from, to),
             ))
             .await;
@@ -2210,7 +2217,7 @@ mod tests {
         // The valid path is untouched by the refusals above.
         let (status, body) = respond(get_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             usage_query(None, None),
         ))
         .await;
@@ -2286,7 +2293,7 @@ mod tests {
 
         let (status, body) = respond(get_topups(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Query(LimitQuery { limit: None }),
         ))
         .await;
@@ -2363,7 +2370,7 @@ mod tests {
         // limit is honoured, newest first.
         let (status, limited) = respond(get_topups(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Query(LimitQuery { limit: Some(1) }),
         ))
         .await;
@@ -2450,7 +2457,7 @@ mod tests {
 
         let (status, body) = respond(get_recent_usage(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Query(LimitQuery { limit: None }),
         ))
         .await;
@@ -2560,7 +2567,7 @@ mod tests {
             let state = live_app_state(pool.clone());
             let (status, body) = respond(create_topup(
                 State(state),
-                cookie_header(&primary.token),
+                test_support::session_request_headers(&primary.token),
                 Json(CreateTopupRequest {
                     amount_idr: configured_wallet().min_first_deposit as i64,
                 }),
@@ -2602,7 +2609,7 @@ mod tests {
         let state = live_app_state(pool.clone());
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest { amount_idr: amount }),
         ))
         .await;
@@ -2711,7 +2718,7 @@ mod tests {
         let state = live_app_state(pool.clone());
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest {
                 amount_idr: wallet.min_topup as i64,
             }),
@@ -2766,7 +2773,7 @@ mod tests {
         let state = live_app_state(pool.clone());
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest {
                 amount_idr: wallet.min_topup as i64,
             }),
@@ -3049,7 +3056,7 @@ mod tests {
 
         let (status, body) = respond(export_account_data(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
         ))
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -3089,7 +3096,7 @@ mod tests {
 
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&account.token),
+            test_support::session_request_headers(&account.token),
             Json(CreateTopupRequest { amount_idr: amount }),
         ))
         .await;
@@ -3188,7 +3195,7 @@ mod tests {
         // the documented order, not an incidental detail.
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest { amount_idr: 1 }),
         ))
         .await;
@@ -3309,7 +3316,7 @@ mod tests {
 
         let (status, body) = respond(create_topup(
             State(state),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Json(CreateTopupRequest { amount_idr: amount }),
         ))
         .await;
@@ -3392,7 +3399,7 @@ mod tests {
         // The customer sees it through the read path, as pending.
         let (status, history) = respond(get_topups(
             State(pool.clone()),
-            cookie_header(&token),
+            test_support::session_request_headers(&token),
             Query(LimitQuery { limit: None }),
         ))
         .await;
@@ -3620,7 +3627,7 @@ mod tests {
 
         let (status, body) = respond(export_account_data(
             State(pool.clone()),
-            cookie_header(&mine.token),
+            test_support::session_request_headers(&mine.token),
         ))
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");

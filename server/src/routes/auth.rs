@@ -1766,15 +1766,6 @@ mod tests {
         LiveAccount { account_id, token }
     }
 
-    fn cookie_header(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            format!("a=1; session={token}; b=2").parse().unwrap(),
-        );
-        headers
-    }
-
     /// The fixed client address the tests drive through `ConnectInfo`.
     ///
     /// `exchange_token` resolves its client address from the TCP peer, so a test
@@ -2011,7 +2002,11 @@ mod tests {
         );
 
         // --- the real logout ---
-        let response = call(logout(State(pool.clone()), cookie_header(&victim_token))).await;
+        let response = call(logout(
+            State(pool.clone()),
+            test_support::session_request_headers(&victim_token),
+        ))
+        .await;
         assert_eq!(response.status, StatusCode::NO_CONTENT);
         assert!(response.body.is_empty(), "logout answers 204, no body");
         assert_eq!(
@@ -2036,18 +2031,24 @@ mod tests {
         // The revoked session stops resolving - this is what "real revocation"
         // means for every authenticated endpoint, which all share this reader.
         assert!(
-            resolve_account_from_cookie(&pool, &cookie_header(&victim_token))
-                .await
-                .is_err(),
+            resolve_account_from_cookie(
+                &pool,
+                &test_support::session_request_headers(&victim_token)
+            )
+            .await
+            .is_err(),
             "a revoked session must not resolve an account"
         );
 
         // The sibling session on the OTHER account is untouched, so the UPDATE
         // cannot be revoking more than the row it names.
         assert_eq!(
-            resolve_account_from_cookie(&pool, &cookie_header(&sibling_token))
-                .await
-                .expect("the other account's session must survive"),
+            resolve_account_from_cookie(
+                &pool,
+                &test_support::session_request_headers(&sibling_token)
+            )
+            .await
+            .expect("the other account's session must survive"),
             sibling_id
         );
         let sibling_live: i64 = sqlx::query_scalar(
@@ -2061,7 +2062,11 @@ mod tests {
 
         // A second logout is idempotent AND must not move the revocation
         // timestamp: that is the "AND revoked_at IS NULL" guard doing its job.
-        let second = call(logout(State(pool.clone()), cookie_header(&victim_token))).await;
+        let second = call(logout(
+            State(pool.clone()),
+            test_support::session_request_headers(&victim_token),
+        ))
+        .await;
         assert_eq!(second.status, StatusCode::NO_CONTENT);
         let revoked_again: Option<DateTime<Utc>> =
             sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE token_hash = ?")
@@ -2112,7 +2117,11 @@ mod tests {
 
         // The caller is live, so logout_all's SELECT resolves it and the bulk UPDATE runs over the
         // account - including the sibling, which is ALREADY revoked.
-        let response = call(logout_all(State(pool.clone()), cookie_header(&caller))).await;
+        let response = call(logout_all(
+            State(pool.clone()),
+            test_support::session_request_headers(&caller),
+        ))
+        .await;
         assert_eq!(response.status, StatusCode::NO_CONTENT);
 
         let sibling_after: Option<DateTime<Utc>> =
@@ -2207,7 +2216,11 @@ mod tests {
         );
 
         // --- sign out everywhere, driven by ONE of them ---
-        let response = call(logout_all(State(pool.clone()), cookie_header(&token_a))).await;
+        let response = call(logout_all(
+            State(pool.clone()),
+            test_support::session_request_headers(&token_a),
+        ))
+        .await;
         assert_eq!(response.status, StatusCode::NO_CONTENT);
         assert!(
             response.body.is_empty(),
@@ -2238,7 +2251,7 @@ mod tests {
         // is now dead.
         for (label, token) in [("a", &token_a), ("b", &token_b), ("c", &token_c)] {
             assert!(
-                resolve_account_from_cookie(&pool, &cookie_header(token))
+                resolve_account_from_cookie(&pool, &test_support::session_request_headers(token))
                     .await
                     .is_err(),
                 "session {label} must be revoked"
@@ -2248,14 +2261,21 @@ mod tests {
         // The OTHER account's session is untouched: the UPDATE is scoped by
         // account_id, not global.
         assert_eq!(
-            resolve_account_from_cookie(&pool, &cookie_header(&other_token))
-                .await
-                .expect("another account's session must survive logout-all"),
+            resolve_account_from_cookie(
+                &pool,
+                &test_support::session_request_headers(&other_token)
+            )
+            .await
+            .expect("another account's session must survive logout-all"),
             other_id
         );
 
         // A second logout-all has nothing left to revoke and is still a 204.
-        let second = call(logout_all(State(pool.clone()), cookie_header(&token_a))).await;
+        let second = call(logout_all(
+            State(pool.clone()),
+            test_support::session_request_headers(&token_a),
+        ))
+        .await;
         assert_eq!(
             second.status,
             StatusCode::NO_CONTENT,
@@ -2326,7 +2346,7 @@ mod tests {
     ) {
         // The fixture must be the case that matters: unexpired, but idle.
         assert!(
-            resolve_account_from_cookie(&pool, &cookie_header(&idle_token))
+            resolve_account_from_cookie(&pool, &test_support::session_request_headers(&idle_token))
                 .await
                 .is_err(),
             "the fixture's idle session must not resolve: if it does, this test is \
@@ -2344,7 +2364,11 @@ mod tests {
              the expires_at test again"
         );
 
-        let idle = call(logout_all(State(pool.clone()), cookie_header(&idle_token))).await;
+        let idle = call(logout_all(
+            State(pool.clone()),
+            test_support::session_request_headers(&idle_token),
+        ))
+        .await;
         assert_eq!(
             idle.status,
             StatusCode::NO_CONTENT,
@@ -2388,7 +2412,7 @@ mod tests {
 
         // ...and the live session still works, so nothing was silently killed.
         assert_eq!(
-            resolve_account_from_cookie(&pool, &cookie_header(&live_token))
+            resolve_account_from_cookie(&pool, &test_support::session_request_headers(&live_token))
                 .await
                 .expect("the live session must survive"),
             account_id
@@ -2481,15 +2505,18 @@ mod tests {
 
         // A revoked session must not resolve; it is no longer a credential anywhere.
         assert!(
-            resolve_account_from_cookie(&pool, &cookie_header(&revoked_token))
-                .await
-                .is_err(),
+            resolve_account_from_cookie(
+                &pool,
+                &test_support::session_request_headers(&revoked_token)
+            )
+            .await
+            .is_err(),
             "the fixture's revoked session must not resolve"
         );
 
         let response = call(logout_all(
             State(pool.clone()),
-            cookie_header(&revoked_token),
+            test_support::session_request_headers(&revoked_token),
         ))
         .await;
         assert_eq!(
@@ -2510,9 +2537,12 @@ mod tests {
 
         // ...and the surviving session still works, so nothing was silently killed.
         assert_eq!(
-            resolve_account_from_cookie(&pool, &cookie_header(&survivor_token))
-                .await
-                .expect("the surviving session must still resolve"),
+            resolve_account_from_cookie(
+                &pool,
+                &test_support::session_request_headers(&survivor_token)
+            )
+            .await
+            .expect("the surviving session must still resolve"),
             account_id
         );
     }
@@ -2526,15 +2556,18 @@ mod tests {
         // An expired session cannot resolve an account, so it must not be able
         // to revoke anything.
         assert!(
-            resolve_account_from_cookie(&pool, &cookie_header(&expired_token))
-                .await
-                .is_err(),
+            resolve_account_from_cookie(
+                &pool,
+                &test_support::session_request_headers(&expired_token)
+            )
+            .await
+            .is_err(),
             "the fixture's expired session must not resolve"
         );
 
         let expired = call(logout_all(
             State(pool.clone()),
-            cookie_header(&expired_token),
+            test_support::session_request_headers(&expired_token),
         ))
         .await;
         assert_eq!(
@@ -2560,7 +2593,7 @@ mod tests {
 
         // ...and the live session still works, so nothing was silently killed.
         assert_eq!(
-            resolve_account_from_cookie(&pool, &cookie_header(&live_token))
+            resolve_account_from_cookie(&pool, &test_support::session_request_headers(&live_token))
                 .await
                 .expect("the live session must be untouched"),
             account_id
@@ -2880,7 +2913,7 @@ mod tests {
         let response = call(change_password(
             State(state.clone()),
             peer(),
-            cookie_header(&victim.token),
+            test_support::session_request_headers(&victim.token),
             change_request(old_password, "the-replacement-password"),
         ))
         .await;
@@ -2933,9 +2966,12 @@ mod tests {
         // The sibling token is dead at the RESOLVER, not merely marked. That is the
         // difference between a revocation and a column write.
         assert!(
-            crate::routes::resolve_account_from_cookie(&pool, &cookie_header(&other_token))
-                .await
-                .is_err(),
+            crate::routes::resolve_account_from_cookie(
+                &pool,
+                &test_support::session_request_headers(&other_token)
+            )
+            .await
+            .is_err(),
             "a revoked sibling session must no longer resolve to an account"
         );
 
@@ -2966,7 +3002,7 @@ mod tests {
         let response = call(change_password(
             State(state.clone()),
             peer(),
-            cookie_header(&victim.token),
+            test_support::session_request_headers(&victim.token),
             change_request("not-the-current-password", "the-replacement-password"),
         ))
         .await;
@@ -3028,7 +3064,7 @@ mod tests {
         let response = call(change_password(
             State(state.clone()),
             peer(),
-            cookie_header(&victim.token),
+            test_support::session_request_headers(&victim.token),
             change_request("anything-at-all", "the-replacement-password"),
         ))
         .await;
@@ -3110,7 +3146,7 @@ mod tests {
         let signed_in = call(change_password(
             State(state.clone()),
             peer(),
-            cookie_header(&victim.token),
+            test_support::session_request_headers(&victim.token),
             change_request(old_password, "the-replacement-password"),
         ))
         .await;
@@ -3141,7 +3177,7 @@ mod tests {
         let rejected = call(change_password(
             State(state.clone()),
             peer(),
-            cookie_header(&victim.token),
+            test_support::session_request_headers(&victim.token),
             Err(
                 axum::extract::rejection::JsonRejection::MissingJsonContentType(
                     axum::extract::rejection::MissingJsonContentType::default(),
@@ -3318,7 +3354,7 @@ mod tests {
         let changed = call(change_password(
             State(state.clone()),
             peer(),
-            cookie_header(&account.token),
+            test_support::session_request_headers(&account.token),
             change_request("old-password-123", "new-password-456"),
         ))
         .await;
@@ -3362,7 +3398,7 @@ mod tests {
         let third = call(change_password(
             State(state.clone()),
             peer(),
-            cookie_header(&caller_token),
+            test_support::session_request_headers(&caller_token),
             change_request("new-password-456", "third-password-789"),
         ))
         .await;
@@ -3440,7 +3476,7 @@ mod tests {
 
         let mine = call(list_providers(
             State(state.clone()),
-            cookie_header(&password_account.token),
+            test_support::session_request_headers(&password_account.token),
         ))
         .await;
         assert_eq!(mine.status, StatusCode::OK);
@@ -3452,7 +3488,7 @@ mod tests {
 
         let theirs = call(list_providers(
             State(state.clone()),
-            cookie_header(&google_account.token),
+            test_support::session_request_headers(&google_account.token),
         ))
         .await;
         assert_eq!(theirs.status, StatusCode::OK);
@@ -3494,7 +3530,7 @@ mod tests {
         let state = state_for(&pool);
         let response = call(list_providers(
             State(state.clone()),
-            cookie_header(&account.token),
+            test_support::session_request_headers(&account.token),
         ))
         .await;
 
@@ -4325,9 +4361,12 @@ mod tests {
             "a reset must revoke the sessions that were opened with the old password"
         );
         assert!(
-            crate::routes::resolve_account_from_cookie(&pool, &cookie_header(&token))
-                .await
-                .is_err(),
+            crate::routes::resolve_account_from_cookie(
+                &pool,
+                &test_support::session_request_headers(&token)
+            )
+            .await
+            .is_err(),
             "and the specific token from before the reset must no longer resolve"
         );
 
