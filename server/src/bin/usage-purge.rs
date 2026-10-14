@@ -101,30 +101,7 @@ async fn run(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-    use std::str::FromStr;
     use uuid::Uuid;
-
-    /// A migrated on-disk SQLite URL in the system temp directory.
-    async fn migrated_temp_db() -> (String, std::path::PathBuf) {
-        let path =
-            std::env::temp_dir().join(format!("apikita-usage-purge-test-{}.db", Uuid::new_v4()));
-        let url = format!("sqlite://{}", path.to_str().unwrap().replace('\\', "/"));
-        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
-            .unwrap()
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open temp db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("apply migrations");
-        pool.close().await;
-        (url, path)
-    }
 
     #[tokio::test]
     async fn run_rejects_a_database_that_cannot_be_opened() {
@@ -135,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_purges_against_a_migrated_database() {
-        let (url, path) = migrated_temp_db().await;
+        let (url, path) = bin_prelude::migrated_temp_db("usage-purge").await;
         run(&url)
             .await
             .expect("the sweep must complete against a migrated database");
@@ -172,7 +149,7 @@ mod tests {
     /// days away would pass under both directions.
     #[tokio::test]
     async fn run_expires_against_the_instant_not_the_start_of_the_day() {
-        let (url, path) = migrated_temp_db().await;
+        let (url, path) = bin_prelude::migrated_temp_db("usage-purge").await;
         let pool = db::init_pool(&url).await.expect("open the migrated db");
 
         // The fixture is built inline because `test_support` is `#[cfg(test)]` and private to

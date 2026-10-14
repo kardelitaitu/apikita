@@ -1749,22 +1749,13 @@ mod tests {
     // The three fields that ADDRESS a provider: url, upstream_model, name
     // -----------------------------------------------------------------------
 
-    /// Every one of these loads a REAL config and breaks exactly one field, so the
-    /// failure is provably caused by the field and not by a hand-built fixture that
-    /// would pass whatever the validator happened to check.
-    fn loadable_config() -> AppConfig {
-        AppConfig::load_from_file("../config/apikita.toml")
-            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
-            .expect("config/apikita.toml must load")
-    }
-
     /// AN EMPTY upstream_model WRITES \"model\": \"\" INTO EVERY REQUEST BODY, so the
     /// provider refuses every call on that endpoint. The operator learned it from a
     /// customer, mid-flight; this makes it a boot error naming the field.
     #[test]
     fn an_empty_upstream_model_is_refused_at_validate() {
         for bad in ["", "   "] {
-            let mut config = loadable_config();
+            let mut config = shipped_config();
             config.models[0].endpoints[0].upstream_model = bad.to_string();
             let err = config
                 .validate()
@@ -1783,7 +1774,7 @@ mod tests {
     #[test]
     fn a_url_without_a_scheme_is_refused_at_validate() {
         for bad in ["", "api.example.com/v1", "ftp://api.example.com/v1"] {
-            let mut config = loadable_config();
+            let mut config = shipped_config();
             config.models[0].endpoints[0].url = bad.to_string();
             let err = config
                 .validate()
@@ -1801,7 +1792,7 @@ mod tests {
     /// talks to a fake upstream over plain http.
     #[test]
     fn both_http_and_https_urls_are_accepted() {
-        let mut config = loadable_config();
+        let mut config = shipped_config();
         config.models[0].endpoints[0].url = "http://127.0.0.1:8787/v1".to_string();
         config
             .validate()
@@ -1814,7 +1805,7 @@ mod tests {
     #[test]
     fn a_blank_endpoint_name_is_refused_at_validate() {
         for bad in ["", "  "] {
-            let mut config = loadable_config();
+            let mut config = shipped_config();
             config.models[0].endpoints[0].name = bad.to_string();
             let err = config
                 .validate()
@@ -1832,7 +1823,7 @@ mod tests {
     /// reject the config that ships.
     #[test]
     fn a_duplicate_endpoint_name_within_a_model_is_refused() {
-        let mut config = loadable_config();
+        let mut config = shipped_config();
         let model = &mut config.models[0];
         assert!(
             model.endpoints.len() >= 2,
@@ -1854,7 +1845,7 @@ mod tests {
     /// legal, and the shipped config relies on it.
     #[test]
     fn the_same_endpoint_name_in_two_models_is_accepted() {
-        let config = loadable_config();
+        let config = shipped_config();
         let names: Vec<&str> = config
             .models
             .iter()
@@ -1880,7 +1871,7 @@ mod tests {
     /// weight 0, and the alert was structurally unable to fire.
     #[test]
     fn a_routable_endpoint_with_no_keys_is_refused() {
-        let mut config = loadable_config();
+        let mut config = shipped_config();
         let endpoint = &mut config.models[0].endpoints[0];
         assert!(
             endpoint.weight > 0.0,
@@ -1916,7 +1907,7 @@ mod tests {
         // a mutable endpoint borrow across a validate() that needs the whole config —
         // and taking them one at a time also keeps each assertion about exactly one
         // field, so a failure names its own cause.
-        let mut config = loadable_config();
+        let mut config = shipped_config();
         {
             let endpoint = &mut config.models[0].endpoints[0];
             assert!(
@@ -1931,7 +1922,7 @@ mod tests {
             .validate()
             .expect("a weight-0 endpoint with no keys must validate: a placeholder names a key nobody has bought");
 
-        let mut config = loadable_config();
+        let mut config = shipped_config();
         {
             let endpoint = &mut config.models[0].endpoints[0];
             endpoint.weight = 0.0;
@@ -1943,7 +1934,7 @@ mod tests {
             .to_string();
         assert!(err.contains("not an absolute http(s) URL"), "got {err}");
 
-        let mut config = loadable_config();
+        let mut config = shipped_config();
         {
             let endpoint = &mut config.models[0].endpoints[0];
             endpoint.weight = 0.0;
@@ -1995,7 +1986,7 @@ mod tests {
     fn the_argon2_parameters_are_refused_at_load() {
         // 8 KiB is Argon2's own floor, so anything below it cannot produce a working hash.
         for bad in [0, 1, 7] {
-            let mut config = load_shipped_config();
+            let mut config = shipped_config();
             config.auth.argon2_memory_kib = bad;
             let err = config
                 .validate()
@@ -2008,7 +1999,7 @@ mod tests {
         }
 
         // A single pass is not a work factor.
-        let mut config = load_shipped_config();
+        let mut config = shipped_config();
         config.auth.argon2_iterations = 0;
         let err = config
             .validate()
@@ -2017,7 +2008,7 @@ mod tests {
         assert!(err.contains("argon2_iterations"), "got {err}");
 
         // Argon2 divides by the lane count.
-        let mut config = load_shipped_config();
+        let mut config = shipped_config();
         config.auth.argon2_parallelism = 0;
         let err = config
             .validate()
@@ -2027,7 +2018,7 @@ mod tests {
 
         // And the shipped values must survive their own validation, or the checks above could be
         // passing for the wrong reason - a config that is refused for something else entirely.
-        load_shipped_config()
+        shipped_config()
             .validate()
             .expect("the shipped config must pass its own validation");
     }
@@ -2042,7 +2033,7 @@ mod tests {
     /// whole suite at 656 passed, so the published promise had no test behind it.
     #[test]
     fn the_published_password_minimum_is_enforced_server_side() {
-        let mut config = load_shipped_config();
+        let mut config = shipped_config();
         config.auth.password_min_length = 7;
         let err = config
             .validate()
@@ -2054,22 +2045,11 @@ mod tests {
         );
 
         // The safe direction: stricter than published is allowed, and must NOT be refused.
-        let mut config = load_shipped_config();
+        let mut config = shipped_config();
         config.auth.password_min_length = 12;
         config
             .validate()
             .expect("a floor stricter than the published one is safe and must be accepted");
-    }
-
-    /// `config/apikita.toml`, from whichever of the two working directories the test runs in.
-    ///
-    /// `cargo test` runs with the crate root as the CWD, but some harnesses run one level up, and
-    /// three existing tests in this module carry both spellings. Named once here rather than
-    /// copied a fourth and fifth time.
-    fn load_shipped_config() -> AppConfig {
-        AppConfig::load_from_file("../config/apikita.toml")
-            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
-            .expect("config/apikita.toml must load")
     }
 
     /// A NaN or infinite price is NOT caught by the "<= 0" guard, and it is not a
@@ -2874,6 +2854,17 @@ mod tests {
 
     /// The shipped config, which every test above starts from - so a mutation there cannot be
     /// mistaken for a bug in the test.
+    ///
+    /// THE ONE COPY, and it replaces THREE byte-identical functions in this module:
+    /// `loadable_config`, `load_shipped_config` and this one, all five lines, all loading the same
+    /// file. A note further up in the file said "Named once here rather than copied a fourth and fifth
+    /// time" - and the fourth and fifth copies had already shipped, because the note was written where
+    /// the copies were not.
+    ///
+    /// The TWO PATH SPELLINGS inside it are deliberate and not duplication: `cargo test` runs with the
+    /// crate root as the working directory, while some harnesses run one level up, so the `or_else` is
+    /// what lets the same test pass under both. A single path would make the suite depend on the
+    /// invoker, which is the opposite of what a fixture is for.
     fn shipped_config() -> AppConfig {
         AppConfig::load_from_file("../config/apikita.toml")
             .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))

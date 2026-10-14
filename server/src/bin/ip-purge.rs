@@ -60,30 +60,6 @@ mod tests {
     // `from_str` is the `FromStr` trait method, so the trait belongs in scope
     // where it is USED. At crate scope it compiled the binary with an unused
     // import, which `cargo clippy -- -D warnings` - the CI gate - rejects.
-    use sqlx::sqlite::SqlitePoolOptions;
-    use std::str::FromStr;
-    use uuid::Uuid;
-
-    /// A migrated on-disk SQLite URL in the system temp directory.
-    async fn migrated_temp_db() -> (String, std::path::PathBuf) {
-        let path =
-            std::env::temp_dir().join(format!("apikita-ip-purge-test-{}.db", Uuid::new_v4()));
-        let url = format!("sqlite://{}", path.to_str().unwrap().replace('\\', "/"));
-        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
-            .unwrap()
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open temp db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("apply migrations");
-        pool.close().await;
-        (url, path)
-    }
 
     #[tokio::test]
     async fn run_rejects_a_database_that_cannot_be_opened() {
@@ -94,7 +70,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_purges_against_a_migrated_database() {
-        let (url, path) = migrated_temp_db().await;
+        let (url, path) = bin_prelude::migrated_temp_db("ip-purge").await;
         run(&url)
             .await
             .expect("the sweep must complete against a migrated database");

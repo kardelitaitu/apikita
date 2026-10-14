@@ -79,6 +79,48 @@ pub fn start() -> Result<String, Box<dyn std::error::Error>> {
     let database_url = database_url()?;
     Ok(database_url)
 }
+
+/// A migrated temp database for a sweep binary's own test, as (url, path).
+///
+/// ONE COPY, from `bin/ip-purge.rs` and `bin/usage-purge.rs`, which each carried these 19 lines -
+/// the same connect options, the same `max_connections(1)`, the same `sqlx::migrate!` call, the same
+/// `pool.close()`. The near-duplicate cost real lines rather than a byte copy because the ONE
+/// difference is the temp file's prefix (`apikita-ip-purge-test-` versus `apikita-usage-purge-test-`),
+/// which is why a body-equality sweep did not flag it.
+///
+/// `max_connections(1)` is not decoration: the sweeps are single-writer, and a pool wider than one
+/// would let a test's own connections queue where the real deployment's do not - which is the
+/// difference between testing the sweep and testing the pool.
+///
+/// The caller owns the returned PATH and should delete it. This deliberately does not, because a
+/// test that wants to inspect the database after a failed run needs the file to still be there.
+pub async fn migrated_temp_db(prefix: &str) -> (String, std::path::PathBuf) {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    let path =
+        std::env::temp_dir().join(format!("apikita-{prefix}-test-{}.db", uuid::Uuid::new_v4()));
+    let url = format!(
+        "sqlite://{}",
+        path.to_str()
+            .expect("the temp dir is UTF-8")
+            .replace('\\', "/")
+    );
+    let options = SqliteConnectOptions::from_str(&url)
+        .expect("a sqlite:// URL this function built")
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open temp db");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("apply migrations");
+    pool.close().await;
+    (url, path)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
