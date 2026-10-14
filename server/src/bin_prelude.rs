@@ -60,6 +60,28 @@ pub fn database_url() -> Result<String, Box<dyn std::error::Error>> {
     env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set".into())
 }
 
+
+
+
+/// The two lines that open EVERY scheduled binary: initialise logging, then resolve the database.
+///
+/// ONE COPY, and this is the duplication that round 57's consolidation CREATED rather than fixed - it
+/// absorbed the prologue `bin/ip-purge.rs`, `bin/migrate.rs` and `bin/usage-purge.rs` each carried
+/// into this module, and their three `main` functions became identical five-line wrappers calling
+/// `init_tracing` and `database_url`. The tools kept two copies; now they keep one.
+///
+/// IT IS A PRINTABLE STEP RATHER THAN A WRAPPER ON PURPOSE. Round 57's other finding was that a
+/// helper calling `database_url` and exiting takes the decision away from `main`, and `main` returning
+/// `Err` is what makes the process exit non-zero - a scheduler noticing a sweep that did not run is
+/// the whole point. So this returns the URL and the caller still owns what a failure means.
+///
+/// `hold-sweep.rs` does NOT use it: that binary parses `--` options and its own usage text, so its
+/// main is a different shape. Consolidating it would be a false one.
+pub fn start() -> Result<String, Box<dyn std::error::Error>> {
+    init_tracing(TOOL_LOG);
+    let database_url = database_url()?;
+    Ok(database_url)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

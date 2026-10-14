@@ -44,9 +44,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    bin_prelude::init_tracing(bin_prelude::TOOL_LOG);
-
-    let database_url = bin_prelude::database_url()?;
+    let database_url = bin_prelude::start()?;
 
     run(&database_url).await
 }
