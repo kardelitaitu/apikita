@@ -9,9 +9,29 @@ restore"* into a measured, repeatable, logged result - and the number the doc
 actually asks for: **how long we would be down**.
 
 ```sh
+# RUN THIS FROM server/. A relative DATABASE_URL resolves against the CALLER's
+# working directory - see "Where a relative DATABASE_URL resolves" below.
 export DATABASE_URL='sqlite://data/server.db'   # or sqlite:///abs/path.db
 sh tools/drill/drill.sh --target apikita_drill_scratch.db
 ```
+
+## Where a relative DATABASE_URL resolves
+
+**Against the working directory you run from, and this README did not say so.** MEASURED: from the
+repository root, `sqlite://data/drill-src.db` resolves to `<repo>/data/drill-src.db` - which does not
+exist - and the drill fails with exit `6` and a message telling you to `cargo run --bin migrate`. From
+`server/` the same URL resolves to `<repo>/server/data/drill-src.db` and the drill passes.
+
+**`tools/backup/backup.sh` USES A DIFFERENT RULE FOR THE SAME VARIABLE, and states it.** It PREPENDS
+`server/` to a relative path, because `docs/local-development.md` defines `DATABASE_URL` as relative to
+`server/`. So the two tools disagree about what `sqlite://data/server.db` means - and only one of them
+says which it is. A reader who learned the convention from `backup.sh` would run this one from the
+repository root and get a failure that reads as a missing database.
+
+Which behaviour is right is a separate question. What is not defensible is a documented convention
+implemented two ways with the difference unstated, so this section states this tool's half. The
+practical rule: **run the drill from `server/`, or pass an absolute `sqlite:///...` URL** (the third
+slash is what makes it absolute), or set `--source` explicitly.
 
 ## What it does, in the doc's order
 
@@ -130,6 +150,25 @@ Codes `3`, `4` and `6` keep their meanings from
 | `6` | **bad artifact / no database** - the artifact or the source is missing, empty, or not a readable SQLite database. |
 | `7` | **restore failed** - the restore itself failed, **or the RESTORED file failed `PRAGMA integrity_check`**. |
 | `8` | **teardown failed** - the scratch file could not be deleted and **is still there**. |
+
+### Which codes have been seen running
+
+MEASURED, one round drove five of the nine against a migrated source database:
+
+| code | how it was produced |
+| --- | --- |
+| `0` | a real drill from `server/` - `drift check PASSED - reconcile.sh exited 0`, `result PASS` |
+| `2` | no `--target`; `--target /abs/path.db`; and `DRILL_ROW_TOLERANCE=abc` (each refuses before touching a database) |
+| `5` | `--target server.db` against `DATABASE_URL=sqlite://data/server.db` - `the drill would DELETE it. nothing was read, created or deleted.` |
+| `6` | a valid URL naming a file that is not there |
+
+**`5` IS THE ONE WORTH SEEING WORK**, and the interesting part is its ORDER: the refusal happens at
+step 1, before the source is read and before the scratch file is created. A guard that ran after the
+restore would have already deleted the live database by the time it objected.
+
+`1`, `3`, `4`, `7` and `8` were NOT staged - they need real drift in the restored copy, `sqlite3` off
+the `PATH`, a `sqlite3` failure, a corrupt artifact, and an undeletable scratch file. They are listed
+as untested so a reader can tell which rows have been exercised from which have only been read.
 
 `6` means "bad artifact" here and "no such database file" in `reconcile.sh` -
 deliberately the same news (there is no usable database to work with), so the two
