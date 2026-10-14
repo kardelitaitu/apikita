@@ -730,7 +730,7 @@ pub async fn revoke_key(
 mod tests {
     use super::*;
     use crate::test_support::ledger_drift_rows;
-    use crate::test_support::{self, TestDb};
+    use crate::test_support::{self, shipped_config, TestDb};
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -887,7 +887,6 @@ mod tests {
     //   DATABASE_URL=... cargo test --lib routes::keys:: -- --ignored
     // -----------------------------------------------------------------------
 
-    use crate::config::AppConfig;
     use crate::db::{
         credit_topup_transaction, debit_usage_transaction, TopupCreditResult, UsageSettlement,
         SHIPPED_CREDIT_EXPIRY_MONTHS,
@@ -933,20 +932,14 @@ mod tests {
         }
     }
 
-    fn live_config() -> Arc<AppConfig> {
-        for path in ["../config/apikita.toml", "config/apikita.toml"] {
-            if std::path::Path::new(path).exists() {
-                return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
-            }
-        }
-        panic!("could not find apikita.toml for testing");
-    }
+    // The shipped config now lives in `crate::test_support::shipped_config`; the callers
+    // below reached for a live config through this local copy for five modules.
 
     /// The real application state, built the way main.rs builds it, so the
     /// handlers run against the same cache instance and the same config the
     /// process serves with.
     fn test_state(pool: SqlitePool) -> AppState {
-        let config = live_config();
+        let config = shipped_config();
         let events = Arc::new(RealtimeHub::new(&config.realtime));
         let trusted_proxies: Arc<[IpCidr]> = Arc::from(
             parse_cidrs(&config.network.trusted_proxy_cidrs)

@@ -1038,12 +1038,11 @@ mod tests {
     use axum::Router;
     use tower::ServiceExt;
 
-    use crate::config::AppConfig;
     use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
     use crate::routes::events::RealtimeHub;
     use crate::routes::hash_token;
     use crate::routes::keys::{create_key, CreateKeyRequest};
-    use crate::test_support::{self, TestDb};
+    use crate::test_support::{self, shipped_config, TestDb};
     use serde_json::Value;
     use sqlx::SqlitePool;
 
@@ -1068,19 +1067,13 @@ mod tests {
     // the suite runs with no live server and no row-by-row teardown.
     // -----------------------------------------------------------------------
 
-    fn live_config() -> Arc<AppConfig> {
-        for path in ["../config/apikita.toml", "config/apikita.toml"] {
-            if std::path::Path::new(path).exists() {
-                return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
-            }
-        }
-        panic!("could not find apikita.toml for testing");
-    }
+    // The shipped config now lives in `crate::test_support::shipped_config`; the callers
+    // below reached for a live config through this local copy for five modules.
 
     /// The real application state, built the way main.rs builds it, so the
     /// handler evicts from the same process-wide key cache the proxy reads.
     fn test_state(pool: SqlitePool) -> AppState {
-        let config = live_config();
+        let config = shipped_config();
         let events = Arc::new(RealtimeHub::new(&config.realtime));
         let trusted_proxies: Arc<[IpCidr]> = Arc::from(
             parse_cidrs(&config.network.trusted_proxy_cidrs)
@@ -2492,7 +2485,7 @@ mod tests {
         // A real password identity, created through the same production helper the
         // signup handler uses, so the credential the login below presents is a real
         // Argon2id hash and not a fixture value the verifier happens to accept.
-        let auth = live_config().auth.clone();
+        let auth = shipped_config().auth.clone();
         let password = "correct horse battery staple".to_string();
         let hash = crate::identity::password::hash_password(auth, password.clone())
             .await

@@ -31,6 +31,7 @@
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -38,6 +39,7 @@ use sqlx::SqlitePool;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+use crate::config::AppConfig;
 use crate::db::{
     credit_topup_transaction, init_pool, TopupCreditResult, SHIPPED_CREDIT_EXPIRY_MONTHS,
 };
@@ -435,6 +437,29 @@ pub async fn ledger_drift_rows(pool: &SqlitePool, account_id: Uuid) -> i64 {
     .expect("reconciliation query")
 }
 
+/// The shipped `apikita.toml`, loaded once per test — the REAL file, not a fixture.
+///
+/// ONE COPY, from FIVE identical ones: this same eight-line function existed in
+/// `routes/admin_auth_boundary.rs`, `routes/admin.rs`, `routes/keys.rs`, `routes/proxy.rs` and
+/// `routes/webhooks.rs`. Each loaded the file two ways because the test's working directory
+/// differs between `cargo test --package apikita-server` and a run from the crate root, and each
+/// panicked with the same message. A sixth copy in `abuse.rs` returns the `limits` sub-struct
+/// instead of the whole config, so it reads through this and takes `.limits`.
+///
+/// IT IS THE SHIPPED FILE ON PURPOSE. A fixture would be a second place a config change has to
+/// land, and the tests that read a limit are testing the limit the deployment opens with.
+///
+/// The two paths are tried rather than one because `CARGO_MANIFEST_DIR`-relative is not what
+/// `std::fs` resolves against: `cargo test` runs with the CRATE directory as the working
+/// directory, and some invocations run from the repository root instead.
+pub fn shipped_config() -> Arc<AppConfig> {
+    for path in ["../config/apikita.toml", "config/apikita.toml"] {
+        if std::path::Path::new(path).exists() {
+            return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
+        }
+    }
+    panic!("could not find apikita.toml for testing");
+}
 /// The stored status of a topup, by `order_id`.
 ///
 /// ONE COPY, from `db.rs` and `routes/webhooks.rs`, where it was named `topup_status` and

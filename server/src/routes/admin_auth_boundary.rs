@@ -37,7 +37,6 @@ use sqlx::SqlitePool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use crate::config::AppConfig;
 use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
 use crate::routes::proxy::AppState;
 use crate::routes::{events::RealtimeHub, hash_token};
@@ -59,19 +58,10 @@ const ADMIN_VERBS: &[(&str, &str)] = &[
     ),
 ];
 
-fn live_config() -> Arc<AppConfig> {
-    for path in ["../config/apikita.toml", "config/apikita.toml"] {
-        if std::path::Path::new(path).exists() {
-            return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
-        }
-    }
-    panic!("could not find apikita.toml for testing");
-}
-
 /// The real application state, built the way `main.rs` builds it, so the router under test is the one
 /// that actually ships.
 fn test_state(pool: SqlitePool) -> AppState {
-    let config = live_config();
+    let config = crate::test_support::shipped_config();
     let events = Arc::new(RealtimeHub::new(&config.realtime));
     let trusted_proxies: Arc<[IpCidr]> = Arc::from(
         parse_cidrs(&config.network.trusted_proxy_cidrs)

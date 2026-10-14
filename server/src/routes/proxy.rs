@@ -2034,7 +2034,7 @@ async fn release_quietly(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{balance, ledger_drift_rows};
+    use crate::test_support::{balance, ledger_drift_rows, shipped_config};
 
     // ---------------------------------------------------------------------
     // The usage tail: what decides whether a customer is billed at all.
@@ -3109,7 +3109,7 @@ mod tests {
     /// reserved (the `clamp_debit` path in `db.rs`) and logs a Partial. Uncollected revenue.
     #[test]
     fn the_input_estimate_covers_a_utf8_dense_body() {
-        let config = live_config();
+        let config = shipped_config();
         let model = config
             .models
             .iter()
@@ -3205,7 +3205,7 @@ mod tests {
     /// the same input is one that gets deleted the first time it is inconvenient.
     #[test]
     fn the_hold_covers_the_charge_for_every_body_shape() {
-        let config = live_config();
+        let config = shipped_config();
         let model = config
             .models
             .iter()
@@ -3451,20 +3451,14 @@ mod tests {
     use crate::routes::events::RealtimeHub;
     use crate::test_support::{self, TestDb};
 
-    fn live_config() -> Arc<AppConfig> {
-        for path in ["../config/apikita.toml", "config/apikita.toml"] {
-            if std::path::Path::new(path).exists() {
-                return Arc::new(AppConfig::load_from_file(path).expect("parse apikita.toml"));
-            }
-        }
-        panic!("could not find apikita.toml for testing");
-    }
+    // The shipped config now lives in `crate::test_support::shipped_config`; the callers
+    // below reached for a live config through this local copy for five modules.
 
     /// The real application state, built the way main.rs builds it, so the
     /// handler runs against the same config and the same process-wide key cache
     /// the serving process uses.
     fn test_state(pool: SqlitePool) -> AppState {
-        test_state_with(pool, live_config())
+        test_state_with(pool, shipped_config())
     }
 
     /// The real application state over an EXPLICIT config.
@@ -5359,7 +5353,7 @@ mod tests {
     /// genuinely different peak rates, cheapest first. Returns the config and
     /// the per-endpoint holds the handler must choose between.
     fn heterogeneous_flash_config() -> Arc<AppConfig> {
-        let mut config = (*live_config()).clone();
+        let mut config = (*shipped_config()).clone();
         let flash = config
             .models
             .iter_mut()
@@ -5834,7 +5828,7 @@ mod tests {
     #[test]
     fn upstream_error_maps_every_variant_without_leaking_provider_detail() {
         let account_id = Uuid::new_v4();
-        let client = UpstreamClient::new(live_config());
+        let client = UpstreamClient::new(shipped_config());
 
         // An unknown model is an allowlist error, not an upstream outage.
         assert!(matches!(
