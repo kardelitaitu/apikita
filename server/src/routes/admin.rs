@@ -1031,15 +1031,11 @@ mod tests {
     use super::*;
     use crate::test_support::ledger_drift_rows;
 
-    use std::sync::Arc;
-
     use axum::body::Body;
     use axum::http::{header, Request};
     use axum::Router;
     use tower::ServiceExt;
 
-    use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
-    use crate::routes::events::RealtimeHub;
     use crate::routes::hash_token;
     use crate::routes::keys::{create_key, CreateKeyRequest};
     use crate::test_support::{self, shipped_config, TestDb};
@@ -1070,27 +1066,9 @@ mod tests {
     // The shipped config now lives in `crate::test_support::shipped_config`; the callers
     // below reached for a live config through this local copy for five modules.
 
-    /// The real application state, built the way main.rs builds it, so the
-    /// handler evicts from the same process-wide key cache the proxy reads.
     fn test_state(pool: SqlitePool) -> AppState {
-        let config = shipped_config();
-        let events = Arc::new(RealtimeHub::new(&config.realtime));
-        let trusted_proxies: Arc<[IpCidr]> = Arc::from(
-            parse_cidrs(&config.network.trusted_proxy_cidrs)
-                .expect("config CIDRs parse")
-                .into_boxed_slice(),
-        );
-        AppState {
-            pool,
-            config,
-            http_client: reqwest::Client::new(),
-            events,
-            ip_salt: Arc::new(DailySalt::new()),
-            trusted_proxies,
-            tasks: crate::shutdown::TaskTracker::new(),
-        }
+        test_support::app_state(pool, None, None)
     }
-
     /// An account row. The SQLite schema has no DEFAULT for id, created_at or
     /// updated_at (plan section 4.1, correction 1), so the Postgres
     /// RETURNING id shape would fail at runtime rather than here.

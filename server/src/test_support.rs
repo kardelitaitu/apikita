@@ -509,6 +509,67 @@ pub fn app(state: crate::routes::proxy::AppState) -> axum::Router {
     crate::routes::create_router(state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
 }
+/// A ready `AppState` from the shipped config and the given pool.
+///
+/// ONE COPY, from NINE test sites that each built the struct by hand: `routes/admin.rs`,
+/// `routes/keys.rs`, `routes/account.rs`, `routes/webhooks.rs`, `routes/telegram.rs`,
+/// `routes/reviews.rs`, `routes/events.rs`, `routes/health.rs` and `routes/proxy.rs`. All seven fields,
+/// set identically apart from three choices this exposes as parameters - which is what the nine were
+/// encoding by repetition.
+///
+/// WHY THE THREE PARAMETERS AND NOT ONE BUILDER. The defaults match the most common shape (plain
+/// http client, empty trusted proxies), and the two overrides exist because the tests that need them
+/// are the ones that break without them:
+///
+///   * **`trusted_proxies`** - `None` means "the CIDRs the shipped config declares", which is what
+///     `parse_cidrs` reads at startup and what every site that cared about it did by hand. `Some` is
+///     for the two shapes the config cannot express: an EMPTY list, for the tests asserting a
+///     forwarded header is NOT honoured, and an explicit one for a single-proxy case. Passing `None`
+///     keeps the test's config the same as the server's, which is the point.
+///   * **`timeout_secs`** - a test that drives a slow handler needs a client timeout that outlives it;
+///     the default `reqwest::Client::new()` has none, which is right for the tests that never wait.
+///
+/// `AppState` gains a field, this is the ONE place to update, and the compiler is what enforces it -
+/// nine call sites each with their own literal would each have been a separate silence.
+pub fn app_state(
+    pool: sqlx::SqlitePool,
+    trusted_proxies: Option<std::sync::Arc<[crate::ip_tracking::IpCidr]>>,
+    timeout_secs: Option<u64>,
+) -> crate::routes::proxy::AppState {
+    use std::sync::Arc;
+
+    let config = Arc::new(
+        crate::config::AppConfig::load_from_file("../config/apikita.toml")
+            .expect("the shipped config parses"),
+    );
+    let http_client = match timeout_secs {
+        Some(secs) => reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(secs))
+            .build()
+            .expect("build a test HTTP client"),
+        None => reqwest::Client::new(),
+    };
+
+    // `None` asks for the config's own list, resolved the way `main.rs` does - so a test that cares
+    // about a forwarded header is looking at the same CIDRs the server would honour.
+    let trusted_proxies = trusted_proxies.unwrap_or_else(|| {
+        Arc::from(
+            crate::ip_tracking::parse_cidrs(&config.network.trusted_proxy_cidrs)
+                .expect("config CIDRs parse")
+                .into_boxed_slice(),
+        )
+    });
+
+    crate::routes::proxy::AppState {
+        pool,
+        config: Arc::clone(&config),
+        http_client,
+        events: Arc::new(crate::routes::events::RealtimeHub::new(&config.realtime)),
+        ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
+        trusted_proxies,
+        tasks: crate::shutdown::TaskTracker::new(),
+    }
+}
 /// A real `sessions` row for the account, returning the PLAINTEXT token its cookie carries.
 ///
 /// ONE COPY, from FOUR sites under THREE names: `issue_session` in `routes/admin.rs` and

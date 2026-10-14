@@ -1304,11 +1304,9 @@ mod tests {
     use crate::db::{
         credit_topup_transaction, debit_usage_transaction, SHIPPED_CREDIT_EXPIRY_MONTHS,
     };
-    use crate::routes::events::RealtimeHub;
     use crate::routes::test_env::{EnvGuard, EnvLock};
     use crate::test_support::{self, TestDb};
     use axum::body::to_bytes;
-    use std::sync::Arc;
 
     /// The key both Snap-failure tests install: deliberately invalid, so the
     /// outcome cannot depend on whatever the developer shell exports.
@@ -1469,29 +1467,12 @@ mod tests {
         (status, body)
     }
 
-    /// The AppState the router would hand create_topup, built from the same
-    /// config file the server loads.
     fn live_app_state(pool: SqlitePool) -> AppState {
-        let config = AppConfig::load_from_file("../config/apikita.toml")
-            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
-            .expect("config/apikita.toml must load for the live tests");
-        let trusted = crate::ip_tracking::parse_cidrs(&config.network.trusted_proxy_cidrs)
-            .expect("the config validates its own trusted proxy rules");
-
-        AppState {
-            pool,
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()
-                .expect("build a test HTTP client"),
-            events: Arc::new(RealtimeHub::new(&config.realtime)),
-            config: Arc::new(config),
-            ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
-            trusted_proxies: Arc::from(trusted.into_boxed_slice()),
-            tasks: crate::shutdown::TaskTracker::new(),
-        }
+        // The config's own trusted-proxy CIDRs and a client timeout that outlives a slow
+        // handler - the two parameters `test_support::app_state` exposes, because these
+        // tests resolve a forwarded header AND wait for the mail path.
+        test_support::app_state(pool, None, Some(15))
     }
-
     /// The configured minimums, read from the real config file. The deposit
     /// tests assert against THESE rather than hardcoded numbers, so a config
     /// change cannot silently invalidate them.

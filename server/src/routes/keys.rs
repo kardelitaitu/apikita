@@ -730,7 +730,7 @@ pub async fn revoke_key(
 mod tests {
     use super::*;
     use crate::test_support::ledger_drift_rows;
-    use crate::test_support::{self, shipped_config, TestDb};
+    use crate::test_support::{self, TestDb};
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -893,10 +893,8 @@ mod tests {
     };
     // Postgres keeps timestamptz at microsecond resolution, so the live tests
     // truncate a computed instant before comparing it to the stored value.
-    use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
-    use crate::routes::events::RealtimeHub;
     use chrono::SubsecRound;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Mutex, MutexGuard};
 
     /// The ONE process-wide lock over the proxy's key-metadata cache.
     ///
@@ -935,28 +933,9 @@ mod tests {
     // The shipped config now lives in `crate::test_support::shipped_config`; the callers
     // below reached for a live config through this local copy for five modules.
 
-    /// The real application state, built the way main.rs builds it, so the
-    /// handlers run against the same cache instance and the same config the
-    /// process serves with.
     fn test_state(pool: SqlitePool) -> AppState {
-        let config = shipped_config();
-        let events = Arc::new(RealtimeHub::new(&config.realtime));
-        let trusted_proxies: Arc<[IpCidr]> = Arc::from(
-            parse_cidrs(&config.network.trusted_proxy_cidrs)
-                .expect("config CIDRs parse")
-                .into_boxed_slice(),
-        );
-        AppState {
-            pool,
-            config,
-            http_client: reqwest::Client::new(),
-            events,
-            ip_salt: Arc::new(DailySalt::new()),
-            trusted_proxies,
-            tasks: crate::shutdown::TaskTracker::new(),
-        }
+        test_support::app_state(pool, None, None)
     }
-
     async fn create_account(pool: &SqlitePool) -> Uuid {
         test_support::account(pool).await
     }

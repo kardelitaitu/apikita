@@ -785,24 +785,15 @@ mod tests {
     // would prove nothing at all.
     // -----------------------------------------------------------------------
 
-    /// The AppState the handlers run on: real config file, real pool.
     fn state_for(pool: SqlitePool) -> AppState {
-        let config = std::sync::Arc::new(
-            crate::config::AppConfig::load_from_file("../config/apikita.toml")
-                .expect("the shipped config parses"),
-        );
-        let events = std::sync::Arc::new(crate::routes::events::RealtimeHub::new(&config.realtime));
-        AppState {
+        // An EMPTY trusted-proxy list, deliberately: these tests assert a forwarded header is
+        // NOT honoured. See `test_support::app_state` for the three choices it exposes.
+        test_support::app_state(
             pool,
-            config,
-            http_client: reqwest::Client::new(),
-            events,
-            ip_salt: std::sync::Arc::new(crate::ip_tracking::DailySalt::new()),
-            trusted_proxies: std::sync::Arc::from(Vec::new().into_boxed_slice()),
-            tasks: crate::shutdown::TaskTracker::new(),
-        }
+            Some(std::sync::Arc::from(Vec::new().into_boxed_slice())),
+            None,
+        )
     }
-
     /// Inserts a code row directly, so a test controls expiry and used state
     /// exactly. The issuer is exercised by its own test.
     async fn seed_code(

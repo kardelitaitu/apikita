@@ -640,44 +640,23 @@ mod tests {
     // (b) is the half that matters: a leaked key is worse than no test.
     // =====================================================================
 
-    use crate::config::AppConfig;
     use crate::money::compute_midtrans_signature;
-    use crate::routes::events::RealtimeHub;
     use crate::routes::test_env::{EnvGuard, EnvLock};
     use crate::test_support::{self, TestDb};
     use axum::body::to_bytes;
     use sqlx::SqlitePool;
-    use std::sync::Arc;
-    use std::time::Duration;
 
     /// The key every live test here installs. Deliberately NOT the
     /// fake-midtrans default, so a test that passes without installing it is
     /// impossible to mistake for one that did.
     const LIVE_TEST_SERVER_KEY: &str = "SB-Mid-server-WEBHOOK-LIVE-TEST";
 
-    /// The AppState the router would hand the handler, built from the same
-    /// config file the server loads.
     fn live_app_state(pool: SqlitePool) -> AppState {
-        let config = AppConfig::load_from_file("../config/apikita.toml")
-            .or_else(|_| AppConfig::load_from_file("config/apikita.toml"))
-            .expect("config/apikita.toml must load for the live tests");
-        let trusted = crate::ip_tracking::parse_cidrs(&config.network.trusted_proxy_cidrs)
-            .expect("the config validates its own trusted proxy rules");
-
-        AppState {
-            pool,
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()
-                .expect("build a test HTTP client"),
-            events: Arc::new(RealtimeHub::new(&config.realtime)),
-            config: Arc::new(config),
-            ip_salt: Arc::new(crate::ip_tracking::DailySalt::new()),
-            trusted_proxies: Arc::from(trusted.into_boxed_slice()),
-            tasks: crate::shutdown::TaskTracker::new(),
-        }
+        // The config's own trusted-proxy CIDRs and a client timeout that outlives a slow
+        // handler - the two parameters `test_support::app_state` exposes, because these
+        // tests resolve a forwarded header AND wait for the mail path.
+        test_support::app_state(pool, None, Some(15))
     }
-
     /// Takes the process-wide env lock, installs the server key, builds the
     /// fixture in its OWN migrated SQLite database, runs the assertions in their
     /// own task, then closes the database whether they passed or panicked - and

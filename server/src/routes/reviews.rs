@@ -452,31 +452,15 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    /// The AppState the handlers run on: real config file, real pool.
-    ///
-    /// CALL IT ONCE PER TEST AND REUSE THE STATE. A state built per request gets
-    /// a fresh `DailySalt` each time, which changes the `auth_attempts` hash and
-    /// makes every request look like a different client - so a rate-limit test
-    /// that rebuilds state never accumulates a count and passes while the limiter
-    /// is inert. (That defect was found in `routes/auth.rs` and is worth not
-    /// repeating.)
     fn state_for(pool: SqlitePool) -> AppState {
-        let config = std::sync::Arc::new(
-            crate::config::AppConfig::load_from_file("../config/apikita.toml")
-                .expect("the shipped config parses"),
-        );
-        let events = std::sync::Arc::new(crate::routes::events::RealtimeHub::new(&config.realtime));
-        AppState {
+        // An EMPTY trusted-proxy list, deliberately: these tests assert a forwarded header is
+        // NOT honoured. See `test_support::app_state` for the three choices it exposes.
+        test_support::app_state(
             pool,
-            config,
-            http_client: reqwest::Client::new(),
-            events,
-            ip_salt: std::sync::Arc::new(crate::ip_tracking::DailySalt::new()),
-            trusted_proxies: std::sync::Arc::from(Vec::new().into_boxed_slice()),
-            tasks: crate::shutdown::TaskTracker::new(),
-        }
+            Some(std::sync::Arc::from(Vec::new().into_boxed_slice())),
+            None,
+        )
     }
-
     fn post(uri: &str, token: &str, body: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
