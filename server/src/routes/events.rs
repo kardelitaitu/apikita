@@ -545,32 +545,26 @@ mod tests {
     use crate::test_support::{self, TestDb};
     use axum::http::{header, HeaderValue};
 
+    /// Builds the hub's config. `max_stream_seconds` is a parameter because the two values the tests
+    /// need are 1800 (the documented default, for the tests that do not read frames) and 0 (for the
+    /// ones that do). This replaced `hub_config` and `finite_stream_config`, which were two five-line
+    /// bodies differing by that one field.
+    ///
+    /// **WHY THE ZERO CASE EXISTS, and it is not a shortcut.** It is for the tests that read the
+    /// handler's FRAMES: `take_until(deadline)` is what makes the stream finite, so a zero deadline
+    /// lets the whole body be collected while still emitting every opening frame first. Those tests
+    /// therefore exercise the deadline incidentally - the mechanism `docs/realtime.md` names as how a
+    /// session revoked mid-stream is dropped. Nothing here makes the deadline observable that would
+    /// not have been observable from a real revocation.
     fn hub_config(
         replay_buffer_events: usize,
         max_connections_per_account: usize,
+        max_stream_seconds: u64,
     ) -> RealtimeConfig {
         RealtimeConfig {
             replay_buffer_events,
             max_connections_per_account,
-            max_stream_seconds: 1800,
-        }
-    }
-
-    /// The same config with a stream deadline of ZERO seconds.
-    ///
-    /// Used by the tests that read the handler's FRAMES: `take_until(deadline)`
-    /// is what makes the stream finite, so a zero deadline lets the whole body be
-    /// collected while still emitting every opening frame first. It also means
-    /// those tests incidentally exercise the deadline - the mechanism
-    /// `docs/realtime.md` names as how a session revoked mid-stream is dropped.
-    fn finite_stream_config(
-        replay_buffer_events: usize,
-        max_connections_per_account: usize,
-    ) -> RealtimeConfig {
-        RealtimeConfig {
-            replay_buffer_events,
-            max_connections_per_account,
-            max_stream_seconds: 0,
+            max_stream_seconds,
         }
     }
 
@@ -660,7 +654,7 @@ mod tests {
     }
     #[test]
     fn connection_cap_is_enforced_and_released_on_drop() {
-        let hub = Arc::new(RealtimeHub::new(&hub_config(10, 2)));
+        let hub = Arc::new(RealtimeHub::new(&hub_config(10, 2, 1800)));
         let account = Uuid::new_v4();
 
         let first = hub.acquire(account).expect("first connection");
@@ -680,7 +674,7 @@ mod tests {
 
     #[test]
     fn resume_replays_only_events_after_the_client_id() {
-        let hub = RealtimeHub::new(&hub_config(10, 5));
+        let hub = RealtimeHub::new(&hub_config(10, 5, 1800));
         let owner = Uuid::new_v4();
         for i in 1..=4i64 {
             hub.publish(RealtimeEvent::balance(owner, i));
@@ -701,7 +695,7 @@ mod tests {
 
     #[test]
     fn resume_snapshots_when_the_buffer_was_evicted_past_the_client() {
-        let hub = RealtimeHub::new(&hub_config(2, 5));
+        let hub = RealtimeHub::new(&hub_config(2, 5, 1800));
         let owner = Uuid::new_v4();
         for i in 1..=5i64 {
             hub.publish(RealtimeEvent::balance(owner, i));
@@ -725,7 +719,7 @@ mod tests {
     /// build from one hand-crafted reconnect header.
     #[test]
     fn resume_survives_a_client_sent_u64_max_last_event_id() {
-        let hub = RealtimeHub::new(&hub_config(10, 5));
+        let hub = RealtimeHub::new(&hub_config(10, 5, 1800));
         let owner = Uuid::new_v4();
         for i in 1..=3i64 {
             hub.publish(RealtimeEvent::balance(owner, i));
@@ -748,13 +742,13 @@ mod tests {
         // against, so the safe answer is a snapshot - not an empty replay,
         // which would read to the client as "nothing happened while you were
         // gone" no matter how long the hub has actually been running.
-        let hub = RealtimeHub::new(&hub_config(10, 5));
+        let hub = RealtimeHub::new(&hub_config(10, 5, 1800));
         assert!(matches!(hub.resume(Some(1)), Resume::Snapshot));
     }
 
     #[test]
     fn event_ids_are_monotonic_and_snapshots_carry_the_latest() {
-        let hub = RealtimeHub::new(&hub_config(10, 5));
+        let hub = RealtimeHub::new(&hub_config(10, 5, 1800));
         let owner = Uuid::new_v4();
         assert_eq!(hub.current_id(), 0);
 
@@ -844,7 +838,7 @@ mod tests {
     /// handler was true only until the handler changed.
     #[test]
     fn a_subscriber_only_sees_its_own_account_events() {
-        let hub = Arc::new(RealtimeHub::new(&hub_config(64, 5)));
+        let hub = Arc::new(RealtimeHub::new(&hub_config(64, 5, 1800)));
         let account_x = Uuid::new_v4();
         let account_y = Uuid::new_v4();
 
@@ -1112,7 +1106,7 @@ mod tests {
     #[tokio::test]
     async fn the_handler_refuses_without_a_session_cookie() {
         let db = TestDb::new().await;
-        let config = hub_config(10, 2);
+        let config = hub_config(10, 2, 1800);
         let state = state_for(db.pool.clone(), &config);
 
         let result = sse_events_handler(State(state.clone()), HeaderMap::new()).await;
@@ -1139,7 +1133,7 @@ mod tests {
     #[tokio::test]
     async fn the_snapshot_carries_the_real_balance_and_todays_usage() {
         let db = TestDb::new().await;
-        let config = finite_stream_config(10, 2);
+        let config = hub_config(10, 2, 0);
         let state = state_for(db.pool.clone(), &config);
 
         let account = test_support::account_with_wallet(&db.pool).await;
@@ -1188,7 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_revoked_mid_stream_cannot_reconnect() {
         let db = TestDb::new().await;
-        let config = finite_stream_config(10, 2);
+        let config = hub_config(10, 2, 0);
         let state = state_for(db.pool.clone(), &config);
 
         let account = test_support::account_with_wallet(&db.pool).await;
@@ -1236,7 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn a_replayed_buffer_never_leaks_another_accounts_events() {
         let db = TestDb::new().await;
-        let config = finite_stream_config(50, 5);
+        let config = hub_config(50, 5, 0);
         let state = state_for(db.pool.clone(), &config);
 
         let alice = test_support::account_with_wallet(&db.pool).await;
@@ -1288,7 +1282,7 @@ mod tests {
     #[tokio::test]
     async fn the_live_stream_never_forwards_another_accounts_events() {
         let db = TestDb::new().await;
-        let config = finite_stream_config(50, 5);
+        let config = hub_config(50, 5, 0);
         let state = state_for(db.pool.clone(), &config);
 
         let alice = test_support::account_with_wallet(&db.pool).await;
@@ -1337,7 +1331,7 @@ mod tests {
     #[tokio::test]
     async fn the_handler_refuses_more_streams_than_the_account_may_hold() {
         let db = TestDb::new().await;
-        let config = hub_config(10, 2);
+        let config = hub_config(10, 2, 1800);
         let state = state_for(db.pool.clone(), &config);
 
         let account = test_support::account_with_wallet(&db.pool).await;
@@ -1441,7 +1435,7 @@ mod tests {
     fn a_zero_replay_capacity_hub_keeps_no_history_and_snapshots_on_reconnect() {
         // replay_capacity 0 means the `if capacity > 0` guard is skipped, so a
         // published event is dropped and a reconnecting client must be snapshotted.
-        let hub = RealtimeHub::new(&hub_config(0, 5));
+        let hub = RealtimeHub::new(&hub_config(0, 5, 1800));
         let owner = Uuid::new_v4();
         hub.publish(RealtimeEvent::balance(owner, 100));
         assert!(matches!(hub.resume(Some(1)), Resume::Snapshot));

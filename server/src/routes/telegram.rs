@@ -869,26 +869,6 @@ mod tests {
         headers
     }
 
-    /// A session for the account, returning its plaintext token.
-    async fn session_for(pool: &SqlitePool, account_id: Uuid) -> String {
-        let token = format!("apk_sess_{}", Uuid::new_v4().simple());
-        let now = Utc::now();
-        sqlx::query(
-            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(Uuid::new_v4().hyphenated())
-        .bind(account_id.hyphenated())
-        .bind(crate::routes::hash_token(&token))
-        .bind(now + Duration::days(30))
-        .bind(now)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("create session");
-        token
-    }
-
     /// The bot token every redemption test installs.
     const BOT_TOKEN: &str = "test-bot-token-0123456789";
 
@@ -1215,7 +1195,7 @@ mod tests {
         assert!(matches!(wrong, Err(AppError::Unauthenticated)));
 
         // A COOKIE is a human credential, not a bot one.
-        let session = session_for(&db.pool, account).await;
+        let session = test_support::issue_session(&db.pool, account).await;
         let cookie = redeem_link_code(
             State(state.clone()),
             peer(),
@@ -1313,7 +1293,7 @@ mod tests {
         let db = TestDb::new().await;
         let account = test_support::account(&db.pool).await;
         let state = state_for(db.pool.clone());
-        let session = session_for(&db.pool, account).await;
+        let session = test_support::issue_session(&db.pool, account).await;
 
         let limit = state.config.limits.link_code_issuance_per_hour;
         assert!(limit > 0, "the fixture assumes a configured hourly cap");
@@ -1408,7 +1388,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0, "an unauthenticated issue must write nothing");
 
-        let session = session_for(&db.pool, account).await;
+        let session = test_support::issue_session(&db.pool, account).await;
 
         let first = issue_link_code(
             State(state.clone()),
@@ -1462,7 +1442,7 @@ mod tests {
         let balance_before = test_support::balance(&db.pool, account).await;
         let ledger_before = test_support::ledger_sum(&db.pool, account).await;
 
-        let session = session_for(&db.pool, account).await;
+        let session = test_support::issue_session(&db.pool, account).await;
         unlink_telegram(
             State(state.clone()),
             test_support::session_request_headers(&session),

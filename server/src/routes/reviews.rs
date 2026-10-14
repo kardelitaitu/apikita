@@ -447,9 +447,9 @@ fn normalize_body(body: Option<&str>) -> Result<Option<String>, AppError> {
 mod tests {
     use super::*;
     use crate::routes::proxy::AppState;
+    use crate::test_support;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use chrono::{Duration, Utc};
     use tower::ServiceExt;
 
     /// The AppState the handlers run on: real config file, real pool.
@@ -475,26 +475,6 @@ mod tests {
             trusted_proxies: std::sync::Arc::from(Vec::new().into_boxed_slice()),
             tasks: crate::shutdown::TaskTracker::new(),
         }
-    }
-
-    /// A session cookie for an account, so requests arrive authenticated.
-    async fn session_for(pool: &SqlitePool, account_id: Uuid) -> String {
-        let token = format!("apk_sess_{}", Uuid::new_v4().simple());
-        let now = Utc::now();
-        sqlx::query(
-            "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(Uuid::new_v4().hyphenated())
-        .bind(account_id.hyphenated())
-        .bind(crate::routes::hash_token(&token))
-        .bind(now + Duration::days(30))
-        .bind(now)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("create session");
-        token
     }
 
     fn post(uri: &str, token: &str, body: &str) -> Request<Body> {
@@ -574,7 +554,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         let created = app(state.clone())
             .oneshot(post(
@@ -636,7 +616,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         app(state.clone())
             .oneshot(post(
@@ -680,7 +660,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         app(state.clone())
             .oneshot(post(
@@ -718,7 +698,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         app(state.clone())
             .oneshot(post("/api/reviews", &token, r#"{"rating":5}"#))
@@ -764,7 +744,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         // A client that tries to award itself the badge. The field is not in the
         // request type at all, so this is the honest check: the extra key is
@@ -797,7 +777,7 @@ mod tests {
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account_with_wallet(&db.pool).await;
         crate::test_support::fund(&db.pool, account_id, 50_000).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         app(state.clone())
             .oneshot(post("/api/reviews", &token, r#"{"rating":5}"#))
@@ -834,7 +814,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         for bad in ["0", "6", "-1"] {
             let response = app(state.clone())
@@ -864,7 +844,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         let long = "x".repeat(BODY_MAX_CHARS + 1);
         let response = app(state.clone())
@@ -895,7 +875,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         let exact = "x".repeat(BODY_MAX_CHARS);
         let response = app(state.clone())
@@ -919,7 +899,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         app(state.clone())
             .oneshot(post("/api/reviews", &token, r#"{"rating":5,"body":"   "}"#))
@@ -973,7 +953,7 @@ mod tests {
         let state = state_for(db.pool.clone());
 
         let mine = crate::test_support::account(&db.pool).await;
-        let my_token = session_for(&db.pool, mine).await;
+        let my_token = test_support::issue_session(&db.pool, mine).await;
         app(state.clone())
             .oneshot(post(
                 "/api/reviews",
@@ -984,7 +964,7 @@ mod tests {
             .expect("write");
 
         let theirs = crate::test_support::account(&db.pool).await;
-        let their_token = session_for(&db.pool, theirs).await;
+        let their_token = test_support::issue_session(&db.pool, theirs).await;
 
         let response = app(state.clone())
             .oneshot(get("/api/reviews/mine", Some(&their_token)))
@@ -1007,7 +987,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         app(state.clone())
             .oneshot(post(
@@ -1059,7 +1039,7 @@ mod tests {
         let db = crate::test_support::TestDb::new().await;
         let state = state_for(db.pool.clone());
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         app(state.clone())
             .oneshot(post(
@@ -1146,7 +1126,7 @@ mod tests {
         // already has one - the index, not the cap, is what bounds it there. So
         // this test proves the cap is wired by exercising the window directly.
         let account_id = crate::test_support::account(&db.pool).await;
-        let token = session_for(&db.pool, account_id).await;
+        let token = test_support::issue_session(&db.pool, account_id).await;
 
         // Seed the account's history to the cap by inserting rows directly, then
         // confirm a creation from zero history is allowed: this is the positive

@@ -34,11 +34,10 @@ use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use sqlx::SqlitePool;
 use tower::ServiceExt;
-use uuid::Uuid;
 
 use crate::ip_tracking::{parse_cidrs, DailySalt, IpCidr};
+use crate::routes::events::RealtimeHub;
 use crate::routes::proxy::AppState;
-use crate::routes::{events::RealtimeHub, hash_token};
 use crate::test_support as support;
 use crate::test_support;
 
@@ -77,27 +76,6 @@ fn test_state(pool: SqlitePool) -> AppState {
         trusted_proxies,
         tasks: crate::shutdown::TaskTracker::new(),
     }
-}
-
-/// A real sessions row plus the token its cookie resolves to, so the request below travels the
-/// production authentication path rather than a shortcut.
-async fn issue_session(pool: &SqlitePool, account_id: Uuid) -> String {
-    let token = format!("apk_sess_{}", Uuid::new_v4().simple());
-    let now = chrono::Utc::now();
-    sqlx::query(
-        "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(Uuid::new_v4().hyphenated())
-    .bind(account_id.hyphenated())
-    .bind(hash_token(&token))
-    .bind(now + chrono::Duration::days(30))
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("create session");
-    token
 }
 
 /// Drive a request through the real router, with or without a cookie.
@@ -158,7 +136,7 @@ async fn every_admin_verb_refuses_an_ordinary_authenticated_customer() {
     let pool = &db.pool;
 
     let account = support::account_with_wallet(pool).await;
-    let token = issue_session(pool, account).await;
+    let token = test_support::issue_session(pool, account).await;
 
     // PRECONDITION, asserted rather than assumed: the fixture really is a non-operator, so a refusal
     // below is about authorization rather than a malformed fixture.
@@ -208,7 +186,7 @@ async fn an_operator_session_gets_past_the_authorization_layer() {
         .execute(pool)
         .await
         .expect("promote to operator");
-    let token = issue_session(pool, operator).await;
+    let token = test_support::issue_session(pool, operator).await;
 
     let app = test_support::app(test_state(pool.clone()));
     let mut got_past = 0;

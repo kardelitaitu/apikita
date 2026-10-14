@@ -509,6 +509,43 @@ pub fn app(state: crate::routes::proxy::AppState) -> axum::Router {
     crate::routes::create_router(state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
 }
+/// A real `sessions` row for the account, returning the PLAINTEXT token its cookie carries.
+///
+/// ONE COPY, from FOUR sites under THREE names: `issue_session` in `routes/admin.rs` and
+/// `routes/admin_auth_boundary.rs`, and `session_for` in `routes/reviews.rs` and
+/// `routes/telegram.rs` - each byte-identical, each with the same `hash_token` call and the same
+/// `Duration::days(30)` expiry the config ships.
+///
+/// THE ROW IS SEEDED DIRECTLY RATHER THAN DRIVEN THROUGH THE LOGIN HANDLER, deliberately, and the
+/// difference is worth stating so nobody "fixes" it: a test that needs the handler's behaviour
+/// should call the handler. A test that needs an AUTHENTICATED request uses this, because the
+/// handler adds an HTTP round trip, a response body, and its own assertion about the login - none of
+/// which is what the caller is testing.
+///
+/// `Duration::days(30)` matches `[sessions] absolute_days`, so the row is indistinguishable from one
+/// the login path wrote. `hash_token` is the crate's single definition - the credential hash round 52
+/// de-duplicated - so this and the login handler cannot disagree about a session's identity.
+pub async fn issue_session(pool: &SqlitePool, account_id: Uuid) -> String {
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    let token = format!("apk_sess_{}", Uuid::new_v4().simple());
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO sessions (id, account_id, token_hash, expires_at, last_seen_at, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().hyphenated())
+    .bind(account_id.hyphenated())
+    .bind(crate::routes::hash_token(&token))
+    .bind(now + Duration::days(30))
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("create session");
+    token
+}
 /// Give an account a wallet funded with `opening_idr` - the two steps in one call.
 ///
 /// ONE COPY, from `routes/admin.rs` and `routes/proxy.rs`, where it was named `open_wallet` and was
