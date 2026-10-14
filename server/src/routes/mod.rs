@@ -972,6 +972,126 @@ mod tests {
         assert_ne!(hash_token("apk_sess_abc"), hash_token("apk_sess_abd"));
     }
 
+    /// THERE IS ONE CREDENTIAL HASH, AND NOTHING USED TO SAY SO.
+    ///
+    /// `routes/proxy.rs` claimed the guarantee was structural - "there is only one function" -
+    /// while `routes/auth.rs` carried a BYTE-IDENTICAL PRIVATE COPY of this one, with 20 call sites
+    /// on the copy. The two wrote and read the same `sessions.token_hash` column: `auth.rs` wrote
+    /// with its copy, `routes/mod.rs` and `routes/account.rs` read with this one, and
+    /// `proxy.rs` authenticated the API key with this one. Nothing failed because the bodies were
+    /// identical - which is precisely what makes the defect invisible until someone edits one of
+    /// them, at which point every key or session stops authenticating with no compile error.
+    ///
+    /// THE PATTERN WAS ALREADY FIXED ONCE IN THIS FILE: the cookie PARSER the note above describes
+    /// was "folded into this module, so there is no second implementation to compare against". The
+    /// hash got the same treatment now, and this is the guard that keeps it.
+    ///
+    /// A test that the two AGREE would have passed on the duplicates, which is why the assertion is
+    /// on the count of DEFINITIONS rather than on behaviour: two identical copies agree perfectly
+    /// and are still two copies.
+    #[test]
+    fn there_is_one_credential_hash() {
+        use std::path::PathBuf;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut definitions: Vec<String> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let shown = path.strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR"))).unwrap_or(&path);
+                for (i, line) in text.lines().enumerate() {
+                    // The definition, not a call: a `pub fn` or a module-private `fn` named exactly
+                    // hash_token. A call is `hash_token(`, which this excludes because a definition
+                    // is followed by a parameter list too - so the discriminator is `fn hash_token`.
+                    let l = line.trim_start();
+                    if (l.starts_with("pub fn hash_token") || l.starts_with("fn hash_token"))
+                        && !defined_in_a_test_module(&text, i)
+                    {
+                        // Forward slashes and only the last two components: a Windows checkout
+                        // renders backslashes, and the depth of the checkout root differs between
+                        // contributors, so the path is normalised rather than compared as text.
+                        let rel = shown
+                            .display()
+                            .to_string()
+                            .replace('\\', "/");
+                        let tail = rel
+                            .rsplit('/')
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        definitions.push(format!("{tail}:{}", i + 1));
+                    }
+                }
+            }
+        }
+
+        // The FILE each definition lives in, not the line: the line is what the message needs to
+        // print, and comparing it would fail the day the file grows.
+        let files: Vec<String> = definitions
+            .iter()
+            .map(|d| d.split(':').next().unwrap_or("").to_string())
+            .collect();
+        assert!(
+            !definitions.is_empty(),
+            "the guard found nothing, which is the vacuous answer - it would pass on a file with no credential hash at all"
+        );
+        assert_eq!(
+            files,
+            vec!["routes/mod.rs".to_string()],
+            "EXACTLY ONE production definition of `hash_token` may exist, in `routes/mod.rs`. Found: {definitions:?}. A second copy - even byte-identical - splits the credential hash into two, and the one that drifts stops every key or session authenticating with no compile error. Forward the callers through `crate::routes::hash_token`."
+        );
+    }
+
+    /// Whether line `i` of `text` is inside a `#[cfg(test)] mod tests` block.
+    ///
+    /// A test may define its own helper named `hash_token` without splitting the production hash,
+    /// so the count above has to exclude them. The boundary is the attribute rather than the string
+    /// "mod tests", which appears in prose and resolves to the wrong place.
+    fn defined_in_a_test_module(text: &str, i: usize) -> bool {
+
+        // The line AFTER an attribute must declare `mod tests`, not `mod <anything_else>`.
+        let mut attr = false;
+        for (n, line) in text.lines().enumerate() {
+            if line.contains("#[cfg(test)]") {
+                attr = true;
+                continue;
+            }
+            if !attr {
+                continue;
+            }
+            attr = false;
+            let trimmed = line.trim();
+            if !(trimmed.starts_with("mod tests") || trimmed.starts_with("pub mod tests")) {
+                continue;
+            }
+            // INSIDE means the definition comes AFTER the module's opening line, so the
+            // comparison is `i > n` and not the reverse. MEASURED the reverse direction first: it
+            // returned true for every definition in the file, the guard found ZERO production
+            // definitions, and it failed as a vacuous answer inverted - passing on a file with no
+            // credential hash at all.
+            if i > n {
+                return true;
+            }
+        }
+        false
+    }
     /// auth.rs's parser was FOLDED INTO this module, so there is no second
     /// implementation to compare against - the login path now resolves the
     /// cookie through the function tested above. What can still drift is the

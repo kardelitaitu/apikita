@@ -1381,12 +1381,19 @@ pub async fn chat_completions(
     // key worked; a future edit to either would have made EVERY API KEY stop
     // authenticating, with no compile error and no obvious cause.
     //
-    // It is worth being honest about what pins this now: a TEST CANNOT. A test
-    // asserting the two ends agree would call one function and compare it to the
-    // other, which is true by construction the moment they are the same function
-    // and says nothing if someone reintroduces a copy. The guarantee is STRUCTURAL -
-    // there is only one function - and the comment is here so the next reader knows
-    // that is what is holding it, rather than assuming a test is.
+    // It is worth being honest about what pins this now, because THIS COMMENT USED TO CLAIM
+    // SOMETHING THAT WAS FALSE. It read "the guarantee is STRUCTURAL - there is only one
+    // function", and MEASURED, there were TWO: `routes/auth.rs` carried a byte-identical PRIVATE
+    // copy of this function with no doc comment of its own, and 20 call sites in that file used the
+    // copy while `routes/mod.rs` and `routes/account.rs` used this one - the same
+    // `sessions.token_hash` column, accepted by one function and written by another. Nothing
+    // failed, because the two bodies were identical, which is exactly what makes the defect
+    // invisible until someone edits one of them.
+    //
+    // A test asserting the two ends AGREE is not what pins it either: two copies that agree pass
+    // such a test happily. What pins it is that there is now ONE definition, and
+    // `there_is_one_credential_hash` counts the definitions of `hash_token` in the crate rather
+    // than trusting this comment - the same lesson the rest of the crate took from counts in prose.
     let key_hash = crate::routes::hash_token(presented_key);
 
     // Served from the TTL cache when warm, from the database otherwise. The

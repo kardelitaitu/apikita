@@ -9,7 +9,6 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -20,7 +19,7 @@ use crate::error::AppError;
 use crate::identity;
 use crate::ip_tracking::resolve_client_ip;
 use crate::routes::proxy::AppState;
-use crate::routes::{session_token_from_cookie_header, SESSION_COOKIE};
+use crate::routes::{hash_token, session_token_from_cookie_header, SESSION_COOKIE};
 
 /// SHA-256 hex of a session token, the value the sessions row stores.
 /// The account a request's session cookie resolves to, against SQLite.
@@ -139,12 +138,6 @@ async fn resolve_account_from_cookie(
         .await?;
 
     Ok(account_id)
-}
-
-fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 /// The session body the native sign-in endpoints return.
