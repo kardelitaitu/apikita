@@ -13,10 +13,38 @@ moves no money and changes no balance. The payout steps are in
 Step 5 and takes no action on what it finds.
 
 ```sh
+# RUN THIS FROM server/. A relative DATABASE_URL resolves against the CALLER's
+# working directory - see the section below.
 export DATABASE_URL='sqlite://data/server.db'
 export CLOSURE_USD_IDR_RATE='<the frozen JISDOR rate>'
 sh tools/wind-down/report.sh
 ```
+
+## Run it from `server/`, and this README's command did not say so
+
+**The snippet above fails from the repository root and works from `server/`.** MEASURED with a
+migrated database at `server/data/wd.db` and the documented form `sqlite://data/wd.db`:
+
+| run from | result |
+| --- | --- |
+| the repository root | exit `6` - *no such database file: data/wd.db*, then *create it with `cargo run --bin migrate`* |
+| `server/` | exit `0` - *OK - report complete: 0 eligible, 0 sub-threshold, 0 accounts changed* |
+
+**THE MESSAGE MAKES IT WORSE THAN A CONFIGURATION ERROR.** `create it with cargo run --bin migrate`
+sends an operator to migrate a database that EXISTS, and the second attempt produces the same message
+because the directory is still wrong. Nothing names the directory, and the snippet - the thing an
+operator copies - is the failing form.
+
+**THIS IS THE SERVER'S RULE, so it is not this tool being odd.** `server/src/main.rs` passes
+`DATABASE_URL` to `db::init_pool`, which calls `SqliteConnectOptions::from_str` with no rewriting, so
+sqlx resolves a relative path against the process's working directory. `docs/local-development.md:230`'s
+"relative to `server/`" describes WHERE BINARIES ARE RUN FROM, not a rule a tool applies.
+
+**AND UNLIKE `tools/reconcile/reconcile.sh` THERE IS NOTHING DOWNSTREAM TO CATCH IT.**
+`.docker/maintenance/entrypoint.sh:530-535` absolutises the path before calling reconcile, because that
+one is scheduler-driven. This report is run BY HAND, so there is no wrapper and the documented command
+is the whole contract. `tools/drill/README.md` and `tools/reconcile/README.md` state their rules; this
+one did not, and its snippet is the one that fails.
 
 `sqlite3` must be on `PATH`. It is not a dependency of the Rust build, so a CI image
 needs it installed explicitly — a missing `sqlite3` is exit `3`, not a silent pass.
