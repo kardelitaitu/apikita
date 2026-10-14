@@ -185,7 +185,48 @@ the code should be taught `6`.
 database this needs the `-shm` file to be creatable; where the volume forbids
 that, run the gate against a backup copy instead (`docs/backup-and-restore.md`).
 
-**It refuses a non-SQLite `DATABASE_URL` loudly.** The prefix is matched with a
+**It refuses a non-SQLite `DATABASE_URL` loudly.**
+
+## Where a relative `DATABASE_URL` resolves, and which tools differ
+
+**Against the working directory you run this from** - and this README did not say so. MEASURED, the
+documented form `DATABASE_URL='sqlite://data/server.db'` against a database at `server/data/`:
+
+| tool | run from the repository root | run from `server/` |
+| --- | --- | --- |
+| `tools/reconcile/reconcile.sh` | exit `6` - *no such database file* | exit `0` - the gate passes |
+| `tools/drill/drill.sh` | exit `6` | exit `0` - *result PASS* |
+| `tools/backup/backup.sh` | **works** | **works** |
+
+**THIS MATCHES THE SERVER**, which is the reason it is the right rule rather than a preference:
+`server/src/main.rs` passes `DATABASE_URL` to `db::init_pool`, which calls
+`SqliteConnectOptions::from_str` with NO path rewriting, so sqlx resolves a relative path against the
+process's working directory. `docs/local-development.md:230`'s "relative to `server/`" describes WHERE
+BINARIES ARE RUN FROM - its `First run` block runs `cargo run --bin migrate` from `server/` - not a rule
+a tool has to apply.
+
+**`tools/backup/backup.sh` IS THE ONE THAT DIFFERS**: it prefixes `server/` to a relative path so it
+works from either directory, and states that it does. So one string has two meanings across the tools,
+and the failure is quiet in the direction that matters: from the repository root this gate says *"no
+such database file"*, which is the same message a genuinely absent database produces - it does not say
+the resolution was not what you expected.
+
+**Run this gate from `server/`**, the same directory the server runs from, or pass an absolute
+`sqlite:///...` URL (the third slash makes it absolute).
+
+**THE SCHEDULER ALREADY KNEW, AND THAT IS WHERE THIS IS DANGEROUS.**
+`.docker/maintenance/entrypoint.sh:530-535` says it outright: *"run from any other directory, the job
+reports exit 6 and NOTHING IS VERIFIED. The other four jobs in this schedule resolve their own file
+(`run_retention`, `run_hold_sweep`, `run_credit_expiry` and `run_alert_checks` all call
+`db_file_from_url`), so reconcile was the odd one out - and it is the GATE 2 MONEY CHECK, the job it
+would be worst to have quietly depend on a directory set in a different file. Absolutising it here makes
+all five agree."**
+
+So the deployment absolutises the path before calling this script, and the fix is already recorded - in
+the entrypoint rather than here. That is why this README can describe the rule as a HUMAN concern: an
+operator typing `DATABASE_URL=... sh tools/reconcile/reconcile.sh` from the wrong directory is the case
+that remains, and the message they get says the database is missing rather than that the directory was
+wrong. The prefix is matched with a
 `case`, not stripped blindly, because a leftover `postgres://…` URL would
 otherwise be rewritten into a relative path that happens to be a plausible
 filename — and the gate would quietly check nothing.
