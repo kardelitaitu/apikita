@@ -134,7 +134,33 @@ so this is called out rather than assumed.
 | `3`  | **DELIVERY FAILED** - a channel was configured and did not accept the alert (connection error, non-2xx, or a Telegram non-200). |
 | `4`  | Usage error: unknown alert id, missing argument, or a non-integer cooldown. |
 
-Code `2` is the point of the tool. The failure mode that matters for an alert
+Code `2` is the point of the tool.
+
+### All five, exercised
+
+A CODE NO RUN PRODUCES IS A PROMISE NOBODY HAS KEPT, and this is the tool whose job is to not be
+silently ignored. MEASURED, one round drove every one of `alert.sh`'s five codes:
+
+| code | how it was produced | what it printed |
+| --- | --- | --- |
+| `0` | `ALERT_SINK_STDOUT=1`, a fresh `ALERT_STATE_DIR` | `DELIVERED 'db_disk' via stdout (key 'testkey1', cooldown 900s)` |
+| `1` | the SAME key again, one second later | `THROTTLED 'db_disk' (key 'testkey1'): last delivered 1s ago, cooldown 900s; nothing sent` |
+| `2` | no channel variable set at all | the entire alert rendered to stderr, then exit 2 |
+| `3` | `WEBHOOK_URL=http://127.0.0.1:9/nothing` | `webhook delivery FAILED (curl exit 7)` and `DELIVERY FAILED for 'error_rate' on channel 'webhook' - the alert was NOT delivered` |
+| `4` | `--alert not_a_real_id` | the known-ids list, then exit 4 |
+
+**THE CHANNEL VARIABLES HAVE NO PREFIX, WHICH COST THIS ROUND THREE ATTEMPTS.** They are `WEBHOOK_URL`,
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, `ALERT_SINK_FILE` and `ALERT_SINK_STDOUT` - NOT
+`ALERT_WEBHOOK_URL`. Setting the wrong name is indistinguishable from setting none, so the tool
+reported the correct exit `2` (**no channel configured**) three times while the round believed it was
+testing `3`. That is the failure the tool is built for, working exactly as designed - and it is why the
+table above names the variable rather than assuming it.
+
+**`--observed` IS A FREE-TEXT STRING, NOT A NUMBER.** `--observed notanumber` is accepted and rendered
+verbatim, because the documented examples are `"1 drifting account: c8c2859c 60000 vs 50000"` and
+`"84%"` - the value an operator supplies comes from a check's own output. Only `--observed -` takes the
+stdin path, which is where a number is parsed. Passing a non-numeric string and expecting a usage error
+is a misreading of the contract rather than a gap in it. The failure mode that matters for an alert
 system is not "the alert was wrong" - it is **"the alert was silently dropped"**,
 because a dropped alert is believed. That is the same reasoning as
 `tools/backup/backup.sh` refusing to write a plaintext dump (exit 6 there): the
