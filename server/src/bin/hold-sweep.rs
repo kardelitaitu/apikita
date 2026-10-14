@@ -67,13 +67,11 @@
 //! Idempotent: it reads, and unless `--release` is passed it writes nothing, so
 //! running it twice reports the same holds twice. Scheduled alongside `ip-purge`.
 
-use std::env;
-
-use apikita_server::db;
+use apikita_server::{bin_prelude, db};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
+use std::env;
 use tracing::{error, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 /// Default bound: 15 minutes. See the module comment for the derivation from
@@ -397,15 +395,7 @@ fn format_age(seconds: i64) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
-
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,apikita_server=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    bin_prelude::init_tracing(bin_prelude::TOOL_LOG);
 
     let options = match parse_args() {
         Ok(options) => options,
@@ -417,7 +407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
+    let database_url = bin_prelude::database_url()?;
     let pool = match db::init_pool(&database_url).await {
         Ok(pool) => pool,
         Err(err) => {

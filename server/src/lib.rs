@@ -117,6 +117,7 @@
 
 pub mod abuse;
 pub mod auth_attempts;
+pub mod bin_prelude;
 pub mod config;
 pub mod db;
 /// Test-only: checks claims the OPERATIONAL documents make about this code, so a

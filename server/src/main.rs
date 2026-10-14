@@ -15,6 +15,19 @@ use crate::routes::proxy::AppState;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
+    // THIS FALLBACK IS `debug` AND THE FOUR TOOLS' IS `info`, WHICH IS DELIBERATE AND WAS
+    // UNDOCUMENTED. MEASURED: `main.rs` defaults `apikita_server` to DEBUG while `bin/ip-purge.rs`,
+    // `bin/migrate.rs`, `bin/usage-purge.rs` and `bin/hold-sweep.rs` all default it to INFO - the same
+    // expression with one level changed and nothing anywhere saying why.
+    //
+    // The reason it is safe is that the fallback is nearly unreachable in production:
+    // `server/Dockerfile` sets `RUST_LOG=info,apikita_server=info` in the image, and `.env.example`
+    // carries `RUST_LOG` for local work, so this arm fires only for a developer running the binary with
+    // no `.env`. `debug` is the right default there - it is the server a person is watching, and the
+    // tools are the ones a scheduler runs unattended, where a debug flood is a cost with no reader.
+    //
+    // The difference is now written down rather than inferred from an expression that differs by one
+    // word in five files, which is the shape that reads as a typo to everyone who is not the author.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()

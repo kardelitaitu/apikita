@@ -30,14 +30,13 @@
 //! connection (same file, line 185), and it is asserted explicitly below so that a
 //! future non-sqlx connection cannot quietly remove the backstop.
 
-use std::env;
+use apikita_server::bin_prelude;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Resolved at compile time from `CARGO_MANIFEST_DIR`, so the binary does not
 /// depend on the process working directory.
@@ -45,17 +44,9 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    bin_prelude::init_tracing(bin_prelude::TOOL_LOG);
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,apikita_server=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
+    let database_url = bin_prelude::database_url()?;
 
     run(&database_url).await
 }
