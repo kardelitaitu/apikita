@@ -217,9 +217,45 @@ jobs:
       # NOT quoted here: naming it would put a stale count back into the file,
       # and the guard that rejects retired figures elsewhere would reject it here
       # the moment this file joins that list.
+      # ZERO IGNORED IS ASSERTED, NOT ASSUMED, and this assertion was missing. MEASURED: adding
+      # `#[ignore]` to one test in the crate leaves `cargo test --lib` at exit 0 reporting
+      # `802 passed / 0 failed / 1 ignored`, and leaves `cargo test --lib -- --list` at **803
+      # tests** - so the count step above PASSES TOO. A skip is a green tick over an assertion that
+      # did not run, which is what the website side already fail-closes on: that step reads
+      # `# skipped` from the summary and errors when it is not 0. Same rule, same reason, on the
+      # suite with three times as many tests.
+      #
+      # ZERO FAILED IS ASSERTED FOR THE SAME REASON: `cargo test` exits 0 when a test is ignored,
+      # so "the step is green" was never evidence that every test ran.
       - name: Integration tests (bundled SQLite)
         working-directory: server
-        run: cargo test --lib
+        run: |
+          set -euo pipefail
+
+          cargo test --lib 2>&1 | tee /tmp/server-tests.log
+
+          summary=$(grep -E '^test result: ' /tmp/server-tests.log | tail -1)
+          if [ -z "$summary" ]; then
+            echo "::error::no 'test result:' line in the output, so nothing below was checked"
+            exit 1
+          fi
+
+          ignored=$(printf '%s' "$summary" | sed -n 's/.*; \([0-9][0-9]*\) ignored;.*/\1/p')
+          failed=$(printf '%s' "$summary" | sed -n 's/.*\([0-9][0-9]*\) failed;.*/\1/p')
+          if [ -z "$ignored" ] || [ -z "$failed" ]; then
+            echo "::error::could not read the ignored/failed counts from '$summary', so this step is checking nothing"
+            exit 1
+          fi
+
+          if [ "$ignored" != "0" ]; then
+            echo "::error::$ignored test(s) IGNORED. An ignored test reports as a pass and verifies nothing. Remove the #[ignore] or delete the test."
+            exit 1
+          fi
+          if [ "$failed" != "0" ]; then
+            echo "::error::$failed test(s) FAILED"
+            exit 1
+          fi
+          echo "server library tests: 0 failed, 0 ignored"
 
       # The deployable artifact must BUILD, and it must RUN.
       #
