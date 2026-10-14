@@ -39,7 +39,19 @@ cargo build --bin loadgen
 
 ## The measured floor, and why the flag must match
 
-Against `/health` on a 32-logical-core Ryzen 9 7950X, loopback:
+**Linux**, on a 32-logical-core Ryzen 9 7950X, loopback. **THE OPERATING SYSTEM IS PART OF THE
+CONDITION AND THIS TABLE OMITTED IT**, which a re-measurement exposed: the same tool on Windows, same
+CPU class, reports a floor of **0.750 ms at concurrency 8 and 0.672 ms at 32** - flat, and BOTH below
+the 1.500 ms bar - where this table has 1.231 ms and 1.892 ms, crossing it.
+
+So the conclusion below (*"past concurrency ~16 the floor crosses the bar"*) is a property of THAT
+HOST, not of the tool and not of loopback. The honest shape is a range across machines, and a run that
+needs the boundary should MEASURE it rather than import it from here.
+
+`loadgen` is OS-aware in the one place that matters and says so at run time: `host_load()` reads
+`/proc/loadavg` under `#[cfg(target_os = "linux")]` and returns *"NOT AVAILABLE on this platform - a
+floor taken here cannot state its host state"* everywhere else. A Windows floor is a number without its
+load context, which is the second reason not to compare it to a Linux one.
 
 | concurrency | floor p99 | server p99 |
 | --- | --- | --- |
@@ -49,10 +61,23 @@ Against `/health` on a 32-logical-core Ryzen 9 7950X, loopback:
 | 16 | 1.377 ms | 1.597 ms |
 | 32 | 1.892 ms | 1.910 ms |
 
-Two things follow. The floor is **effectively flat against rate** at fixed concurrency (10–1000 req/s all
-land within 1.1–1.4 ms), so it is client-side queueing rather than throughput. And **past concurrency
-~16 the floor crosses the bar** — a run at 32 workers cannot produce a p99 verdict about the server, and
-the tool says so rather than reporting its own contention as latency.
+Two things were said to follow from that table, and **BOTH ARE WITHDRAWN — by
+`docs/load-test.md` itself, which this README had not caught up with.** The table above is kept as the
+record of what was first measured; the conclusions read differently now:
+
+1. *"The floor is effectively flat against rate"* — TRUE, and stronger than stated. The verified
+   measurement in `docs/load-test.md` gives medians of **0.664 / 0.698 / 0.658 / 0.681 / 0.675 ms** at
+   concurrency 1/4/8/16/32 — flat across the whole range, not merely across rate at one concurrency.
+2. *"Past concurrency ~16 the floor crosses the bar, so a run at 32 workers cannot produce a verdict"*
+   — **RETRACTED.** MEASURED, and the retraction is in `docs/load-test.md`: 7 trials per concurrency
+   gave non-monotonic medians, concurrency 32 landed **UNDER** the 1.5 ms bar, and the quoted 1.892 ms
+   was a one-shot artifact on a host running a crypto-miner (the same command read 13.7–23.7 ms under
+   that load). **A single run on one host is a coin flip."
+
+What replaces it is a RULE rather than a table: every figure must be a **median of repeated interleaved
+trials, with the host's CPU stated**. This round's independent reading on Windows — same CPU class,
+no `/proc/loadavg`, so no host-load figure at all — reported 0.750 ms at concurrency 8 and 0.672 ms at
+32, which corroborates the flat conclusion rather than the crossing one.
 
 ## What makes it trustworthy, and where each property came from
 
